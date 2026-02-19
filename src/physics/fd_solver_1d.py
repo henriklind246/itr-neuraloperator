@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.linalg import solve_banded
-from numpy.typing import ArrayLike
 
 
 
