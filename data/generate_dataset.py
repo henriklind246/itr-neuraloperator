@@ -1,5 +1,5 @@
 import numpy as np
-from physics.fd_solver_1d import FDSolver1D
+from src.physics.fd_solver_1d import FDSolver1D
 
 # data consists of temp at time_final
 
@@ -27,7 +27,6 @@ def main():
     # make sure to generate the same # of simulations as train/val/test split in fno
     n_train, n_val, n_test = 128, 32, 256
     n_samples = n_train + n_val + n_test
-
 
     # fixed PDE + BCs parameters (so mapping is learnable from u0)
     sim = FDSolver1D(
