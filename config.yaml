@@ -1,0 +1,45 @@
+# file for data paths and hyperparameters
+
+config_id: 0
+
+model:
+  type: 1D FNO
+  parameters:
+    modes: 16
+    width: 64
+    in_channels: 2
+    out_channels: 1
+    layers: 4
+    activation: 'Tanh'
+
+training:
+  batch_size: 10
+  epochs: 250
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  scheduler:
+      step_size: 50
+      gamma: 0.5
+  optimizer: 'Adam'
+  loss_function: 'MSELoss'
+  validate_every: 10
+  patience: 10
+  checkpoint_metric: 'val_rel_l2'
+  seeds: [0, 1, 2, 3, 4, 5]
+  run:
+    run_dir: '/Users/henriklind/Desktop/no-tps-ihcp/runs/experiment0/config0'
+
+evaluation:
+  validation:
+
+  test:
+
+data:
+  x_data_path: '/Users/henriklind/Desktop/no-tps-ihcp/data/x_data.npy'
+  y_data_path: '/Users/henriklind/Desktop/no-tps-ihcp/data/y_data.npy'
+  train_split: 128
+  val_split: 32
+  test_split: 256
+  x_shape: 'samples, N, (T0, x)'
+  y_shape: 'samples, N, T_final'
+
