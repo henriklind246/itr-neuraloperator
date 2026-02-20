@@ -6,6 +6,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 
 # TODO: expose a function to plot stored temperature history (heatmaps or time series)
+# TODO: prediction vs true plots for a trained fno model on test dataset
 
 # Utility to load the solver module by file path so this script works regardless of package layout.
 def load_fd_solver_module() -> object:
