@@ -1,0 +1,6 @@
+
+Current Limitations:
+
+- Uniform sampling of parameters in generate_dataset.py -> LHS sampling
+- Path pointing towards the "best" config. is hard-coded -> need to be made more flexible
+-
