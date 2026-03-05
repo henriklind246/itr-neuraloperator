@@ -59,9 +59,10 @@ if __name__ == '__main__':
     # data shape = (# samples, # of grid points, # of in_channels)
     x_data, y_data = load_numpy_data(x_path="/Users/henriklind/Desktop/no-tps-ihcp/data/x_data.npy", y_path="/Users/henriklind/Desktop/no-tps-ihcp/data/y_data.npy")
 
-    n_train = 128
-    n_val = 32
-    n_test = 256
+    n_samples = 1000
+    n_train = int(n_samples * 0.7)
+    n_val = int(n_samples * 0.15)
+    n_test = int(n_samples * 0.15)
     batch_size = 10
 
     in_f_train, out_f_train, in_f_val, out_f_val, in_f_test, out_f_test = split_tensors(x_data=x_data, y_data=y_data, n_train=n_train, n_val=n_val, n_test=n_test)
