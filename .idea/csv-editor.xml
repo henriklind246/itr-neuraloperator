@@ -3,6 +3,13 @@
   <component name="CsvFileAttributes">
     <option name="attributeMap">
       <map>
+        <entry key="/conf/generated/experiment1/index.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="/runs/experiment0/config0/seed0/train_metrics.csv">
           <value>
             <Attribute>
@@ -10,49 +17,28 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="/runs/seed0/train_metrics.csv">
+        <entry key="/runs/experiment1/conf0/seed0/train_metrics.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="/runs/seed1/train_metrics.csv">
+        <entry key="/runs/experiment1/conf3/seed5/train_metrics.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="/runs/seed2/train_metrics.csv">
+        <entry key="/runs/experiment1/conf3/seed6/train_metrics.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="/runs/seed3/train_metrics.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/runs/seed4/train_metrics.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/runs/seed5/train_metrics.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/runs/train_metrics.csv">
+        <entry key="/runs/experiment1/conf5/seed9/train_metrics.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
