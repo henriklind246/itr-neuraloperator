@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
@@ -57,7 +59,8 @@ def create_dataloaders(
 
 if __name__ == '__main__':
     # data shape = (# samples, # of grid points, # of in_channels)
-    x_data, y_data = load_numpy_data(x_path="/Users/henriklind/Desktop/no-tps-ihcp/data/x_data.npy", y_path="/Users/henriklind/Desktop/no-tps-ihcp/data/y_data.npy")
+    project_root = Path(__file__).resolve().parents[1]
+    x_data, y_data = load_numpy_data(x_path=str(project_root / "data" / "x_data.npy"), y_path=str(project_root / "data" / "y_data.npy"))
 
     n_samples = 1000
     n_train = int(n_samples * 0.7)
