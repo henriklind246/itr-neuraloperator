@@ -2,5 +2,5 @@
 Current Limitations:
 
 - Uniform sampling of parameters in generate_dataset.py -> LHS sampling
-- Path pointing towards the "best" config. is hard-coded -> need to be made more flexible
--
+- Right-side BC is constant in fd_solver_1d.py -> allow for functions
+- Implement time-conditioning or space-time for fno1 for full trajectory prediction
