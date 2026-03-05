@@ -2,7 +2,6 @@ import numpy as np
 from scipy.linalg import solve_banded
 
 
-
 # initial condition
 def ic(x : np.ndarray,  a: float, b: float) -> np.ndarray:
     L = b - a
@@ -37,39 +36,63 @@ class FDSolver1D:
             flux_A: float,
             t_on: float,
             t_off: float,
-            phase: float
+            phase: float,
+            dt=None,
+            source=None,
+            q_left_fn=None,
+            T_right_fn=None
     ):
 
         self.a = a
         self.b = b
         self.N = N
         self.k = k
+        self.rho = rho
+        self.cp = cp
         self.alpha = k/(rho*cp)
         self.flux_f = flux_f
         self.flux_A = flux_A
         self.t_on = t_on
         self.t_off = t_off
+        self.t_final = t_final
         self.phase = phase
+
+        # -------- SPACE & TIME GRID + DT & DX ---------
 
         self.grid = np.linspace(self.a, self.b, self.N)
         self.h = self.grid[1] - self.grid[0]
 
-        self.t_final = t_final
-        self.dt = compute_dt(self.h, self.alpha, lam_target, flux_f)
-        self.lam = self.alpha * self.dt / (self.h**2)
+        # allow for dt to be passed int explicitly
+        if dt is not None:
+            self.dt = dt
+        else:
+            self.dt = compute_dt(self.h, self.alpha, lam_target, flux_f)
 
-        # time grid
         self.t = np.arange(0.0, t_final + 1e-12, self.dt) # + 1e-12 because np.arnage() does NOT include the stop point
 
-        # boundary flux function q(t)
-        self.q_left = windowed_sin_flux(flux_f, flux_A, t_on, t_off, phase)
+        self.lam = self.alpha * self.dt / (self.h ** 2)
 
-        # build ab once
+        # --------- BANDED MATRIX -------
+
+        # build ab once since rho, cp, and k are constant
         self.ab = self.build_A_banded()
 
-        # right Dirichlet function T_R(t)
-        # for now, i'm just going to have T_right be a constant
-        self.T_right = 300.0 # in Kelvin
+        # --------- BCs -------------
+
+        # boundary flux function q(t) with optional MMS flux input
+        if q_left_fn is not None:
+            self.q_left = q_left_fn
+        else:
+            self.q_left = windowed_sin_flux(flux_f, flux_A, t_on, t_off, phase)
+
+        # right Dirichlet function T_R(t) with optional MMS right-side BC
+        if T_right_fn is not None:
+            self.T_right = T_right_fn
+        else:
+            self.T_right = 300.0 # in Kelvin
+
+        # source term, default is None
+        self.source = source
 
     def build_A_banded(self) -> np.ndarray:
         """build banded matrix ab with shape (l + u + 1, N)"""
@@ -101,7 +124,7 @@ class FDSolver1D:
 
     # alpha is constant for now so ab just needs to be built once
     def cn_step_banded(self, Tn: np.ndarray, tn: float) -> np.ndarray:
-        """One CN solving AT^{n+1} = rhs"""
+        """One CN solving AT^{n+1} = rhs, with optional manufactured/source term. """
         N = self.N
 
         rhs = np.zeros(N, dtype=float)
@@ -109,11 +132,20 @@ class FDSolver1D:
         # row 0: Neumann BC with time-averaged flux
         qn = self.q_left(tn)
         qnp1 = self.q_left(tn + self.dt)
-        q_half = (qnp1+qn)/2
-        rhs[0] = (2*self.h*q_half)/self.k
+
+        # CN consistent neumann left-side BC
+        rhs[0] = (2.0 * self.h * qnp1) / self.k
 
         # interior rows cn nodes: left neighbors + centers + right neighbors
         rhs[1:-1] = (self.lam/2)*Tn[:-2] + (1.0 - self.lam)*Tn[1:-1] + (self.lam/2)*Tn[2:]
+
+        # add source term (robust CN time-centering + correct scaling) s(x, t)
+        if self.source is not None:
+            interior_x = self.grid[1:-1]
+            # source at time-step n
+            s_n = self.source(interior_x, tn)
+            s_np1 = self.source(interior_x, tn + self.dt)
+            rhs[1:-1] += (self.dt / (self.rho * self.cp)) * 0.5 * (s_n + s_np1)
 
         # row N-1
         rhs[-1] = self.T_right
@@ -131,6 +163,8 @@ class FDSolver1D:
         """
         Nt = len(self.t)
         N = self.N
+
+        T_hist = None
 
         if T0 is None:
             T = ic(self.grid, self.a, self.b).astype(float)
@@ -176,10 +210,3 @@ if __name__ == '__main__':
 
     t, x, T_final = sim.solve(store_history=False)
     print("Ok:", t.shape, x.shape, T_final.shape)
-
-
-
-
-
-
-
