@@ -54,7 +54,7 @@ def eval_all_seeds(run_root: str):
             continue
 
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        config = ckpt['config']
+        config = ckpt['conf']
 
         test_loader = build_test_loader(config)
 
@@ -134,7 +134,7 @@ def save_report(run_root: str, results: list[dict], summary: dict) -> None:
 
 if __name__ == '__main__':
     run_root = "/Users/henriklind/Desktop/no-tps-ihcp/runs/experiment0/config0"
-    # get results from evaluating model with a config on all seeds
+    # get results from evaluating model with a conf on all seeds
     results = eval_all_seeds(run_root)
 
     for r in results:
