@@ -5,7 +5,7 @@ from src.physics.fd_solver_1d import FDSolver1D
 
 # Input: X[i, :, 0] = T0, X[i, :, 1] = x, that is the initial condition and the spatial points
 
-# I want to take the linear combination of the initial condition because thats all i'm going to vary
+# TODO: implement LHS distribution for heat flux, material properties, and ICs?
 
 def random_ic(a: float, b: float, grid: np.ndarray, rng) -> np.ndarray:
     L = a - b
@@ -25,8 +25,11 @@ def main():
     rng = np.random.default_rng(0)
 
     # make sure to generate the same # of simulations as train/val/test split in fno
-    n_train, n_val, n_test = 128, 32, 256
-    n_samples = n_train + n_val + n_test
+    # roughly 70/15/15 split
+    n_samples = 1000
+    n_train = int(n_samples*0.7)
+    n_val = int(n_samples*0.15)
+    n_test = int(n_samples*0.15)
 
     # fixed PDE + BCs parameters (so mapping is learnable from u0)
     sim = FDSolver1D(
