@@ -9,6 +9,7 @@ from torch.optim import Adam
 
 from data.dataset import create_dataloaders, load_numpy_data, split_tensors
 from src.operators.fno1d import FNO1d
+from src.operators.utils import resolve_device
 
 
 def load_config(config_path: str | None = None) -> dict:
@@ -35,11 +36,12 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn) -> float:
+def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> float:
     model.train()
     training_loss = 0.0
 
     for x_batch, y_batch in train_loader:
+        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
         y_pred = model(x_batch)
         loss = loss_fn(y_pred, y_batch)
@@ -51,13 +53,14 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn) -> float:
     return training_loss
 
 
-def validate(model, val_loader) -> float:
+def validate(model, val_loader, device) -> float:
     """Output val_rel_l2 after validation."""
     with torch.no_grad():
         model.eval()
         val_loss = 0.0
 
         for x_batch, y_batch in val_loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             y_pred = model(x_batch)
             val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
             val_loss += val_rel_l2.item()
@@ -104,7 +107,10 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         batch_size=batch_size,
     )
 
+    device = resolve_device(config["training"].get("device", "auto"))
+
     fno = FNO1d(config["model"]["parameters"]["modes"], config["model"]["parameters"]["width"])
+    fno.to(device)
 
     optimizer = Adam(
         fno.parameters(),
@@ -127,7 +133,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     bad_epochs = 0
 
     for epoch in range(epochs):
-        train_loss = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn)
+        train_loss = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn, device=device)
         scheduler.step()
 
         print(f"Training loss for epoch {epoch} is {train_loss}")
@@ -136,7 +142,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         should_stop = False
 
         if (epoch % validate_every) == 0:
-            val_loss = validate(model=fno, val_loader=validation_set)
+            val_loss = validate(model=fno, val_loader=validation_set, device=device)
             print(f"Validation loss for epoch {epoch} is {val_loss}")
 
             if val_loss < best_val_loss:
