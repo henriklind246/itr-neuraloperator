@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from data.dataset import load_numpy_data, split_tensors
 from src.operators.fno1d import FNO1d
+from src.operators.utils import resolve_device
 from pathlib import Path
 import math
 import json
@@ -23,13 +24,14 @@ def build_test_loader(config):
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
-def evaluate(model, test_loader):
+def evaluate(model, test_loader, device):
 
     with torch.no_grad():
         model.eval()
         test_loss = 0.0
 
         for x_batch, y_batch in test_loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             y_pred = model(x_batch)
 
             test_rel_l2 = (torch.mean((y_pred - y_batch)**2)/torch.mean(y_batch**2))**0.5 * 100
@@ -55,13 +57,15 @@ def eval_all_seeds(run_root: str):
 
         ckpt = torch.load(ckpt_path, map_location="cpu")
         config = ckpt['conf']
+        device = resolve_device(config.get("training", {}).get("device", "auto"))
 
         test_loader = build_test_loader(config)
 
         fno = FNO1d(config['model']['parameters']['modes'], config['model']['parameters']['width'])
         fno.load_state_dict(ckpt['model_state'])
+        fno.to(device)
 
-        test_rel_l2 = evaluate(model=fno, test_loader=test_loader)
+        test_rel_l2 = evaluate(model=fno, test_loader=test_loader, device=device)
 
         results.append(
             {
