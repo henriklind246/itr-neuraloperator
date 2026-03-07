@@ -10,6 +10,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 import yaml
 from src.operators.train import run_config_seeds
+from src.operators.utils import resolve_device
 
 EXPERIMENT_ENV_VAR = "EXPERIMENT_NAME"
 
@@ -118,8 +119,12 @@ def run_train(cfg: DictConfig) -> float:
     resolved_cfg.setdefault("experiment", {})
     resolved_cfg["experiment"]["name"] = experiment_name
     resolved_cfg.setdefault("training", {})
+    resolved_cfg["training"].setdefault("device", "auto")
     resolved_cfg["training"].setdefault("run", {})
     resolved_cfg["training"]["run"]["run_dir"] = str(run_dir)
+
+    device = resolve_device(resolved_cfg["training"]["device"])
+    print(f"Device: {device}")
 
     seeds = resolved_cfg["training"]["seeds"]
     if not isinstance(seeds, list) or not seeds:
