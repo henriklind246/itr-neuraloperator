@@ -213,3 +213,6 @@ runs/
 *.npy
 *.pt
 .claude/
+.DS_Store
+conf/generated/
+visual/*.png
