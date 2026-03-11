@@ -1,0 +1,8 @@
+# @package search_space
+params:
+  training.learning_rate: tag(log, interval(1e-4, 5e-3))
+  training.weight_decay: tag(log, interval(1e-7, 1e-3))
+  training.batch_size: choice(8, 10, 16, 20)
+  model.parameters.modes1: choice(8, 12, 16, 20, 24)
+  model.parameters.modes2: choice(8, 12, 16, 20, 24)
+  model.parameters.width: choice(32, 48, 64, 96)
