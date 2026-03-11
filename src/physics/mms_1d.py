@@ -14,18 +14,22 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
     phase = 0.0
     flux_A = 50.0
 
-    # choose A such that it matches flux amplitude
-    A = flux_A/(2.0 * k * L)
+    # choose A such that flux amplitude matches flux_A:
+    # q_star = 4*k*A*L^3*sin(...), so |q_star|_max = flux_A => A = flux_A/(4*k*L^3)
+    A = flux_A / (4.0 * k * L**3)
 
     # define T*(x,t)
     def T_star(x: np.ndarray, t: float) -> np.ndarray:
         return 300.0 + A * np.sin(omega * t + phase) * (b - x)**4
 
+    # left flux: q = -k * dT*/dx |_{x=a} = 4*k*A*L^3*sin(omega*t + phase)
     def q_star(t: float) -> float:
-        return 2.0 * k * A * L * np.sin(omega * t + phase)
+        return 4.0 * k * A * L**3 * np.sin(omega * t + phase)
 
+    # source: s = rho*cp*dT*/dt - k*d^2T*/dx^2
     def s_star(x: np.ndarray, t: float) -> np.ndarray:
-        return rho * cp * (A* omega*  np.cos(omega * t + phase)*(b-x)**2) - k * (2.0 * A * np.sin(omega * t + phase))
+        return (rho * cp * A * omega * np.cos(omega * t + phase) * (b - x)**4
+                - k * 12.0 * A * np.sin(omega * t + phase) * (b - x)**2)
 
     # create instance of fd solver class to solve forcing equation
     sim = FDSolver1D(
@@ -58,12 +62,12 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
 
     return sim.h, sim.dt, max_abs_err, l2_err
 
-# fix dt
+# fix dt — must be small enough that temporal error << spatial error at all grid levels
 def space_order_test(N_list: list) -> float:
     results = []
     hs = []
     for N in N_list:
-        h, _, _, l2_error = run_mms_once(N, dt=.00000002)
+        h, _, _, l2_error = run_mms_once(N, dt=0.0005)
 
         results.append(l2_error)
         hs.append(h)
@@ -72,12 +76,12 @@ def space_order_test(N_list: list) -> float:
     p_x = np.log(results[0]/results[1])/np.log(hs[0]/hs[1])
     return p_x
 
-# fix dx
+# fix dx — must be fine enough that spatial error << temporal error at all dt levels
 def time_order_test(dt_list: list) -> float:
-    """Keep N high so that dt is small"""
+    """Keep N high so that spatial error is negligible."""
     t_results = []
     for t in dt_list:
-        _, _, _, l2_error = run_mms_once(N = 404, dt=t)
+        _, _, _, l2_error = run_mms_once(N=801, dt=t)
 
         t_results.append(l2_error)
 
@@ -93,7 +97,7 @@ if __name__ == '__main__':
     order_x = space_order_test(N_list=N_list)
     print(f"Spatial order of FD solver is roughly {order_x}")
 
-    dt_list = [.005, .0025]
+    dt_list = [0.02, 0.01]
     order_t = time_order_test(dt_list=dt_list)
     print(f"Temporal order of FD solver is roughly {order_t}")
 
