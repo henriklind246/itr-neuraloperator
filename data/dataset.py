@@ -2,75 +2,233 @@ from pathlib import Path
 
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 
-# ----------- DATA Loader -----------
+# Important constraint: s + k + H <= Nt
 
-def load_numpy_data(x_path: str, y_path: str) -> tuple[torch.Tensor, torch.Tensor]:
-    x_data = torch.from_numpy(np.load(x_path)).type(torch.float32)
-    y_data = torch.from_numpy(np.load(y_path)).type(torch.float32)
-    return x_data, y_data
+# output for one sample (window): (Nx, H, 1)
+# input for one sample (window): (Nx, H, 12)
+# history tensor shape: (Nx, H, 10)
+
+# Take raw data from simulations (x_grid, t_grid, trajectories) and create samples
+# from them defined by the sim_id and a valid starting index s (sim_id, s)
+
+# trajectories.shape = (num_sims, Nt, Nx)
+# t_grid.shape = (Nt,)
+# x_grid.shape = (Nx,)
+
+class WindowedForecastDataset(Dataset):
+    def __init__(
+            self,
+            trajectories: np.ndarray,
+            t_grid: np.ndarray,
+            x_grid: np.ndarray,
+            sim_ids: np.ndarray,
+            k: int = 10,
+            H: int = 40,
+            random_window: bool = True,
+            windows_per_sim_per_epoch: int = 1,
+            normalize_time: bool = True,
+            seed: int = 0
+    ):
+        self.trajectories = trajectories
+        self.t_grid = t_grid.astype(dtype=np.float32)
+        self.x_grid = x_grid.astype(dtype=np.float32)
+        self.sim_ids = sim_ids.astype(dtype=np.int64)
+
+        self.k = k
+        self.H = H
+        self.random_window = random_window
+        self.windows_per_sim_per_epoch = windows_per_sim_per_epoch
+        self.normalize_time = normalize_time
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+
+        self.num_sims, self.Nt, self.Nx = self.trajectories.shape
+
+        # largest starting index that satisfies the restriction
+        self.max_s = self.Nt - self.H - self.k
+
+        # np array with all valid starting indices
+        self.all_s = np.arange(self.max_s + 1, dtype=np.int64)
+
+    def __len__(self):
+        """
+        Function that determines the total length of the dataset
+        """
+        if self.random_window:
+            return len(self.sim_ids) * self.windows_per_sim_per_epoch
+        return len(self.sim_ids) * len(self.all_s)
 
 
-def split_tensors(x_data: torch.Tensor, y_data: torch.Tensor, n_train: int, n_val: int, n_test: int) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor
-]:
+    def __getitem__(self, idx):
+        """
+        Function that fetches a data sample given a key (index)
 
-    # safe guarding tensor sizes
-    if x_data.ndim != 3 or x_data.shape[-1] != 2:
-        raise ValueError(
-            f"Input data dimension must be 3 and there must be 2 in_channels, given dim: {x_data.ndim}; number of in_channels: {x_data.shape[-1]}")
-    if y_data.ndim != 3 or y_data.shape[-1] != 1:
-        raise ValueError(
-            f"Output data dimension must be 3 and there must be 1 out_channel, given dim: {y_data.ndim}; number of out_channels: {y_data.shape[-1]}")
+        Chooses sim -> choose or decode valid starting index -> slice history -> slice target -> normalize coords. -> broadcast k/x/t -> concatenate to (Nx, H, 12)
+        """
+        if self.random_window:
+            # use mod in case idx > len(sim_ids)
+            sim_id = self.sim_ids[idx % len(self.sim_ids)]
+            s = self.rng.integers(0, self.max_s + 1)
+        else:
+            # only use the slice of sim_ids == max_s in size
+            sim_pos = idx // len(self.all_s)
+            start_pos = idx % len(self.all_s)
+            sim_id = self.sim_ids[sim_pos]
+            s = self.all_s[start_pos]
 
-    # splitting the dataset
-    input_function_train = x_data[:n_train, :]
-    output_function_train = y_data[:n_train, :]
-    input_function_val = x_data[n_train:n_train + n_val, :]
-    output_function_val = y_data[n_train:n_train + n_val, :]
-    input_function_test = x_data[n_train + n_val:n_train + n_val + n_test]
-    output_function_test = y_data[n_train + n_val:n_train + n_val + n_test]
+        T_hist = self.trajectories[sim_id] # shape (Nt, Nx)
 
-    return input_function_train, output_function_train, input_function_val, output_function_val, input_function_test, output_function_test
+        # history with shape (Nx, k)
+        history = T_hist[s:s + self.k, :].T
 
+        # target with shape (Nx, H)
+        target = T_hist[s + self.k:s + self.k + self.H, :].T
+
+        # future time coords. for prediction slab: shape (H,)
+        t_future = self.t_grid[s + self.k: s + self.k + self.H]
+
+        # normalize spatial domain: shape (Nx,)
+        x_norm = (self.x_grid - self.x_grid[0]) / (self.x_grid[-1] - self.x_grid[0])
+
+        if self.normalize_time:
+            t_norm = (t_future - self.t_grid[0]) / (self.t_grid[-1] - self.t_grid[0])
+
+        # Broadcast to (Nx, H, Channels)
+        history_grid = np.broadcast_to(history[:, None, :], (self.Nx, self.H, self.k)) # None adds a dim. before broadcasting
+        x_channel = np.broadcast_to(x_norm[:, None, None], (self.Nx, self.H, 1))
+        t_channel = np.broadcast_to(t_norm[None, :, None], (self.Nx, self.H, 1))
+
+        # Concatenate into X: shape (Nx, H, 12)
+        X = np.concatenate([history_grid, x_channel, t_channel], axis=-1).astype(np.float32)
+
+        # Y: shape (Nx, H, 1)
+        Y = target[:, :, None].astype(np.float32)
+
+        return torch.from_numpy(X), torch.from_numpy(Y)
+
+
+# --------- LOAD RAW SIM. DATA --------
+
+def load_sim_data(
+        sim_traj_path: str,
+        x_grid_path: str,
+        t_grid_path: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+    trajectories = np.load(sim_traj_path) # (num_sims, Nt, Nx)
+    x_grid = np.load(x_grid_path) # (Nx,)
+    t_grid = np.load(t_grid_path) # (Nt,)
+
+    # size safeguards
+    if trajectories.ndim != 3:
+        raise ValueError(f"Expected trajectories with ndim=3, got shape {trajectories.shape}")
+    if x_grid.ndim != 1:
+        raise ValueError(f"Expected x_grid with ndim=1, got shape {x_grid.shape}")
+    if t_grid.ndim != 1:
+        raise ValueError(f"Expected t_grid with ndim=1, got shape {t_grid.shape}")
+
+    # length safeguards
+    n_sims, Nt_total, Nx = trajectories.shape
+    if x_grid.shape[0] != Nx:
+        raise ValueError(f"x_grid length {x_grid.shape[0]} does not match Nx={Nx}")
+    if t_grid.shape[0] != Nt_total:
+        raise ValueError(f"t_grid length {t_grid.shape[0]} does not match Nt_total={Nt_total}")
+
+    return trajectories, x_grid, t_grid
+
+# ------- SLICE ALL SIMS INTO TRAIN/VAL/TEST SPLITS -------
+
+def split_sim_ids(
+        num_sims: int,
+        train_frac: float = 0.7,
+        val_frac: float = 0.15,
+        seed: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+    ids = np.arange(num_sims)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(ids)
+
+    n_train = int(num_sims*train_frac)
+    n_val = int(num_sims*val_frac)
+    n_test = num_sims - n_train - n_val
+
+    train_ids = ids[:n_train]
+    val_ids = ids[n_train:n_train + n_val]
+    test_ids = ids[n_train + n_val: n_train + n_val + n_test]
+
+    return train_ids, val_ids, test_ids
+
+# ------- CREATE INDEX SAMPLERS FOR TRAIN, VAL, AND TEST -------
 
 def create_dataloaders(
-        in_f_train: torch.Tensor,
-        out_f_train: torch.Tensor,
-        in_f_val: torch.Tensor,
-        out_f_val: torch.Tensor,
-        in_f_test: torch.Tensor,
-        out_f_test: torch.Tensor,
-        batch_size: int
+        trajectories: np.ndarray,
+        x_grid: np.ndarray,
+        t_grid: np.ndarray,
+        train_ids: np.ndarray,
+        val_ids: np.ndarray,
+        test_ids: np.ndarray,
+        batch_size: int,
+        k: int = 10,
+        H: int = 40
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
 
-    # creating dataloaders (X[i], Y[i]) pairs
-    training_set = DataLoader(TensorDataset(in_f_train, out_f_train), batch_size=batch_size, shuffle=True)
-    validation_set = DataLoader(TensorDataset(in_f_val, out_f_val), batch_size=batch_size, shuffle=False)
-    test_set = DataLoader(TensorDataset(in_f_test, out_f_test), batch_size=batch_size, shuffle=False)
+    train_dataset = WindowedForecastDataset(
+        trajectories=trajectories,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        sim_ids=train_ids,
+        k=k,
+        H=H,
+        random_window=True
+    )
 
-    return training_set, validation_set, test_set
+    val_dataset = WindowedForecastDataset(
+        trajectories=trajectories,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        sim_ids=val_ids,
+        k=k,
+        H=H,
+        windows_per_sim_per_epoch=8,
+        random_window=True
+    )
+
+    test_dataset = WindowedForecastDataset(
+        trajectories=trajectories,
+        x_grid=x_grid,
+        t_grid=t_grid,
+        sim_ids=test_ids,
+        k=k,
+        H=H,
+        random_window=False
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size, shuffle=False)
+
+    return train_loader, val_loader, test_loader
+
 
 if __name__ == '__main__':
-    # data shape = (# samples, # of grid points, # of in_channels)
     project_root = Path(__file__).resolve().parents[1]
-    x_data, y_data = load_numpy_data(x_path=str(project_root / "data" / "x_data.npy"), y_path=str(project_root / "data" / "y_data.npy"))
+    trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=str(project_root/"data"/"trajectories.npy"), x_grid_path=str(project_root/"data"/"x_grid.npy"), t_grid_path=str(project_root/"data"/"t_grid.npy"))
 
-    n_samples = 1000
-    n_train = int(n_samples * 0.7)
-    n_val = int(n_samples * 0.15)
-    n_test = int(n_samples * 0.15)
+    train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
+
     batch_size = 10
+    k = 10
+    H = 40
 
-    in_f_train, out_f_train, in_f_val, out_f_val, in_f_test, out_f_test = split_tensors(x_data=x_data, y_data=y_data, n_train=n_train, n_val=n_val, n_test=n_test)
+    train_loader, val_loader, test_loader = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=batch_size, k=k, H=H)
 
-    training_set, validation_set, test_set = create_dataloaders(in_f_train=in_f_train, out_f_train=out_f_train, in_f_val=in_f_val, out_f_val=out_f_val, in_f_test=in_f_test, out_f_test=out_f_test, batch_size=batch_size)
+    # Add batches to tensors
+    xb, yb = next(iter(train_loader))
+    print(f"Train batch X shape: {xb.shape}") # (B, Nx, H, 12)
+    print(f"Train batch Y shape: {yb.shape}") # (B, Nx, H, 1)
 
 
 

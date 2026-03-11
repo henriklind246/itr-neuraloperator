@@ -3,4 +3,4 @@ Current Limitations:
 
 - Uniform sampling of parameters in generate_dataset.py -> LHS sampling
 - Right-side BC is constant in fd_solver_1d.py -> allow for functions
-- Implement time-conditioning or space-time for fno1 for full trajectory prediction
+- Vary A, f in heat flux to allow the model to learn it

@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.linalg import solve_banded
 
-
 # initial condition
 def ic(x : np.ndarray,  a: float, b: float) -> np.ndarray:
     L = b - a
@@ -154,9 +153,9 @@ class FDSolver1D:
         Tnp1 = solve_banded((1, 2), self.ab, rhs)
         return Tnp1
 
-    def solve(self, T0: np.ndarray | None = None, store_history: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def solve(self, T0: np.ndarray | None = None, store_trajectory: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        If store_history:
+        If store_trajectory:
             return (t, grid, T_hist) with T_hist shape = (Nt, N).
         else:
             return (t, grid, T_final) with T_final shape = (N,)
@@ -174,17 +173,17 @@ class FDSolver1D:
             if T.shape != (N,):
                 raise ValueError(f"The shape of T0 msut be ({N}), but got {T.shape}")
 
-        if store_history:
+        if store_trajectory:
             T_hist = np.zeros((Nt, N), dtype=float)
             T_hist[0, :] = T # its also equal to T_hist[0] because that returns the whole row (column) of nodes at time step 0
 
         # time stepping
         for n in range(Nt - 1):
             T = self.cn_step_banded(T, self.t[n])
-            if store_history:
+            if store_trajectory:
                 T_hist[n+1, :] = T
 
-        if store_history:
+        if store_trajectory:
             return self.t, self.grid, T_hist
         else:
             return self.t, self.grid, T
@@ -208,5 +207,5 @@ if __name__ == '__main__':
         phase=0.0
     )
 
-    t, x, T_final = sim.solve(store_history=False)
+    t, x, T_final = sim.solve(store_trajectory=False)
     print("Ok:", t.shape, x.shape, T_final.shape)
