@@ -4,25 +4,37 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 from torch.optim import Adam
 
-from data.dataset import create_dataloaders, load_numpy_data, split_tensors
-from src.operators.fno1d import FNO1d
+from data.dataset import create_dataloaders, load_sim_data, split_sim_ids
+from src.operators.fno2d import FNO2d
 from src.operators.utils import resolve_device
+
+from omegaconf import OmegaConf
 
 
 def load_config(config_path: str | None = None) -> dict:
     # train.py -> src/operators -> project root is parents[2]
     project_root = Path(__file__).resolve().parents[2]
-    path = Path(config_path) if config_path else (project_root / "conf" / "conf.yaml")
+    path = Path(config_path) if config_path else (project_root / "conf" / "config.yaml")
     path = path.expanduser().resolve()
 
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    import os
+    os.environ.setdefault("PROJECT_ROOT", str(project_root))
+
+    cfg = OmegaConf.load(path)
+    paths_cfg = OmegaConf.load(project_root / "conf" / "paths" / "default.yaml")
+    cfg = OmegaConf.merge({"paths": paths_cfg}, cfg)
+
+    # Remove Hydra-only sections that can't resolve outside Hydra
+    for key in ("hydra", "defaults"):
+        if key in cfg:
+            del cfg[key]
+
+    cfg = OmegaConf.to_container(cfg, resolve=True)
 
     if not isinstance(cfg, dict):
         raise ValueError(f"Config must be a mapping/dict, got: {type(cfg)}")
@@ -83,33 +95,16 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     )
     csv_writer.writeheader()
 
-    batch_size = config["training"]["batch_size"]
-    x_data, y_data = load_numpy_data(config["data"]["x_data_path"], config["data"]["y_data_path"])
-    n_train, n_val, n_test = (
-        config["data"]["train_split"],
-        config["data"]["val_split"],
-        config["data"]["test_split"],
-    )
-    in_f_train, out_f_train, in_f_val, out_f_val, in_f_test, out_f_test = split_tensors(
-        x_data=x_data,
-        y_data=y_data,
-        n_train=n_train,
-        n_val=n_val,
-        n_test=n_test,
-    )
-    training_set, validation_set, _ = create_dataloaders(
-        in_f_train=in_f_train,
-        out_f_train=out_f_train,
-        in_f_val=in_f_val,
-        out_f_val=out_f_val,
-        in_f_test=in_f_test,
-        out_f_test=out_f_test,
-        batch_size=batch_size,
-    )
+
+    trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=config["data"]["trajectories.npy"], x_grid_path=config["data"]["x_grid_path"], t_grid_path=config["data"]["t_grid_path"])
+
+    train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
+
+    training_set, validation_set, _ = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=config["training"]["batch_size"], k=config["training"]["k"], H=config["training"]["H"])
 
     device = resolve_device(config["training"].get("device", "auto"))
 
-    fno = FNO1d(config["model"]["parameters"]["modes"], config["model"]["parameters"]["width"])
+    fno = FNO2d(config["model"]["parameters"]["modes1"], config["model"]["parameters"]["modes2"], config["model"]["parameters"]["width"])
     fno.to(device)
 
     optimizer = Adam(
@@ -129,7 +124,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     patience = config["training"]["patience"]
 
     best_val_loss = float("inf")
-    best_path = run_path / "fno1d_best.pt"
+    best_path = run_path / "fno2d_best.pt"
     bad_epochs = 0
 
     for epoch in range(epochs):
@@ -175,7 +170,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
                 "train_loss": float(train_loss),
                 "val_rel_l2": "" if val_loss is None else float(val_loss),
                 "lr": float(lr),
-                "is_best": int(is_best),
+                "is_best": int(is_best)
             }
         )
         csv_file.flush()
