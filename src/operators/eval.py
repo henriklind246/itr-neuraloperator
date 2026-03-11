@@ -53,6 +53,8 @@ def eval_all_seeds(run_root: str):
     run_root = Path(run_root)
     results = []
 
+    print("Testing started.")
+
     for seed_dir in sorted(run_root.glob("seed*")):
         ckpt_path = seed_dir / "fno2d_best.pt"
         if not ckpt_path.exists():
