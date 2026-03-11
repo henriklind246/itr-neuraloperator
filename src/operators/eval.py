@@ -1,7 +1,6 @@
 import torch
-from torch.utils.data import DataLoader, TensorDataset
-from data.dataset import load_numpy_data, split_tensors
-from src.operators.fno1d import FNO1d
+from data.dataset import load_sim_data, split_sim_ids, create_dataloaders
+from src.operators.fno2d import FNO2d
 from src.operators.utils import resolve_device
 from pathlib import Path
 import math
@@ -13,14 +12,18 @@ from datetime import datetime
 # -------- LOAD TEST SET ---------
 
 def build_test_loader(config):
+    trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=config["data"]["trajectories.npy"],
+                                                 x_grid_path=config["data"]["x_grid_path"],
+                                                 t_grid_path=config["data"]["t_grid_path"])
 
-    # not calling create_dataloaders because only test dataloader is needed
-    x_data, y_data = load_numpy_data(config['data']['x_data_path'], config['data']['y_data_path'])
-    _, _, _, _, in_f_test, out_f_test = split_tensors(x_data, y_data, config['data']['train_split'], config['data']['val_split'], config['data']['test_split'])
+    train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
-    # create test set data loader
-    test_set = DataLoader(TensorDataset(in_f_test, out_f_test), batch_size=config['training']['batch_size'], shuffle=False)
-    return test_set
+    _, _, testing_set = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+                                                         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
+                                                         batch_size=config["training"]["batch_size"],
+                                                         k=config["training"]["k"], H=config["training"]["H"])
+
+    return testing_set
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
@@ -51,7 +54,7 @@ def eval_all_seeds(run_root: str):
     results = []
 
     for seed_dir in sorted(run_root.glob("seed*")):
-        ckpt_path = seed_dir / "fno1d_best.pt"
+        ckpt_path = seed_dir / "fno2d_best.pt"
         if not ckpt_path.exists():
             continue
 
@@ -61,7 +64,7 @@ def eval_all_seeds(run_root: str):
 
         test_loader = build_test_loader(config)
 
-        fno = FNO1d(config['model']['parameters']['modes'], config['model']['parameters']['width'])
+        fno = FNO2d(config['model']['parameters']['modes1'], config['model']['parameters']['modes2'], config['model']['parameters']['width'])
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
