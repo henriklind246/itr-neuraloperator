@@ -48,7 +48,7 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
     )
 
     T0 = T_star(sim.grid, sim.t[0])
-    t, x, T_final_num = sim.solve(T0=T0, store_history=False)
+    t, x, T_final_num = sim.solve(T0=T0, store_trajectory=False)
 
     T_final_exact = T_star(sim.grid, sim.t[-1])
 
@@ -63,7 +63,7 @@ def space_order_test(N_list: list) -> float:
     results = []
     hs = []
     for N in N_list:
-        h, _, _, l2_error = run_mms_once(N, dt=.00002)
+        h, _, _, l2_error = run_mms_once(N, dt=.00000002)
 
         results.append(l2_error)
         hs.append(h)
