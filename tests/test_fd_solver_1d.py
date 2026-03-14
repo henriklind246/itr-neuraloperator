@@ -25,31 +25,65 @@ class TestIC:
 # ===================== windowed_sin_flux() =====================
 
 class TestWindowedSinFlux:
+    """Tests with alpha=0 (rectangular window, backward-compatible behavior)."""
+
     def test_inside_window(self):
-        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, phase=0.0)
+        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, phase=0.0, tukey_alpha=0.0)
         t = 0.25
         expected = 50.0 * np.sin(2 * np.pi * 2.0 * t)
         assert pytest.approx(q(t), abs=1e-12) == expected
 
     def test_outside_window_before(self):
-        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.5, t_off=1.0)
+        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.5, t_off=1.0, tukey_alpha=0.0)
         assert q(0.1) == 0.0
 
     def test_outside_window_after(self):
-        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=0.5)
+        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=0.5, tukey_alpha=0.0)
         assert q(0.6) == 0.0
 
     def test_at_window_boundaries(self):
-        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.2, t_off=0.8)
+        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.2, t_off=0.8, tukey_alpha=0.0)
         # t_on and t_off are inside the window (<=)
         assert q(0.2) == 50.0 * np.sin(2 * np.pi * 2.0 * 0.2)
         assert q(0.8) == 50.0 * np.sin(2 * np.pi * 2.0 * 0.8)
 
     def test_phase_shift(self):
-        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, phase=np.pi / 2)
+        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, phase=np.pi / 2, tukey_alpha=0.0)
         t = 0.0
         expected = 50.0 * np.sin(np.pi / 2)  # = 50.0
         assert pytest.approx(q(t), abs=1e-12) == expected
+
+
+class TestWindowedSinFluxTukey:
+    """Tests for the Tukey (tapered cosine) window envelope."""
+
+    def test_alpha_zero_is_rectangular(self):
+        q_rect = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, tukey_alpha=0.0)
+        q_tukey = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, tukey_alpha=0.0)
+        for t in np.linspace(0.0, 1.0, 50):
+            assert pytest.approx(q_rect(t), abs=1e-14) == q_tukey(t)
+
+    def test_smooth_taper_region(self):
+        q = windowed_sin_flux(f=1.0, A=1.0, t_on=0.0, t_off=1.0, tukey_alpha=0.5)
+        # at t=0 (start of taper), envelope should be 0
+        assert q(0.0) == 0.0
+        # slightly inside, envelope should be between 0 and 1
+        val = q(0.1)  # tau=0.1, inside taper (alpha/2=0.25)
+        sin_val = np.sin(2 * np.pi * 1.0 * 0.1)
+        assert abs(val) < abs(sin_val)  # attenuated by envelope < 1
+        assert abs(val) > 0.0  # but not zero
+
+    def test_flat_top_is_unity(self):
+        q = windowed_sin_flux(f=1.0, A=1.0, t_on=0.0, t_off=1.0, tukey_alpha=0.4)
+        # tau=0.5 is well inside the flat region (alpha/2=0.2 to 1-alpha/2=0.8)
+        t = 0.5
+        expected = np.sin(2 * np.pi * 1.0 * t)  # envelope = 1.0
+        assert pytest.approx(q(t), abs=1e-14) == expected
+
+    def test_outside_window_still_zero(self):
+        q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.2, t_off=0.8, tukey_alpha=0.5)
+        assert q(0.1) == 0.0
+        assert q(0.9) == 0.0
 
 
 # ===================== compute_dt() =====================

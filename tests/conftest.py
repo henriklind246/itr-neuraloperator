@@ -42,6 +42,22 @@ def synthetic_trajectories():
 
 
 @pytest.fixture
+def synthetic_sim_params(synthetic_trajectories):
+    """Synthetic sim_params matching synthetic_trajectories (20 sims)."""
+    trajectories, x_grid, _ = synthetic_trajectories
+    num_sims = trajectories.shape[0]
+    Nx = x_grid.shape[0]
+    rng = np.random.default_rng(42)
+    params = []
+    for _ in range(num_sims):
+        amp = np.float32(rng.uniform(50.0, 300.0))
+        freq = np.float32(rng.uniform(1.0, 20.0))
+        T0 = rng.standard_normal(Nx).astype(np.float32)
+        params.append((amp, freq, T0))
+    return np.array(params, dtype=object)
+
+
+@pytest.fixture
 def tmp_npy_data(tmp_path, synthetic_trajectories):
     """Save synthetic data as .npy files and return paths."""
     trajectories, x_grid, t_grid = synthetic_trajectories

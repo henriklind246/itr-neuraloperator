@@ -71,9 +71,9 @@ class TestLoadConfig:
 def tiny_training_setup():
     """Tiny model + synthetic dataloader for fast training tests."""
     Nx, H, k = 11, 10, 5
-    in_channels = k + 2  # 7
+    in_channels = k + 3  # 8 (history + x + t + q)
     model = FNO2d(modes1=2, modes2=2, width=8)
-    # Override the lift layer to accept 7 channels instead of 12
+    # Override the lift layer to accept 8 channels instead of 13
     model.linear_p = torch.nn.Linear(in_channels, 8)
 
     # Synthetic data: 4 samples
