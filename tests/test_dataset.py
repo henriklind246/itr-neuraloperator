@@ -109,22 +109,24 @@ class TestSplitSimIds:
 
 class TestWindowedForecastDataset:
     @pytest.fixture
-    def dataset_random(self, synthetic_trajectories):
+    def dataset_random(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         return WindowedForecastDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
-            sim_ids=sim_ids, k=5, H=10, random_window=True,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            k=5, H=10, random_window=True,
             windows_per_sim_per_epoch=1,
         )
 
     @pytest.fixture
-    def dataset_exhaustive(self, synthetic_trajectories):
+    def dataset_exhaustive(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         return WindowedForecastDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
-            sim_ids=sim_ids, k=5, H=10, random_window=False,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            k=5, H=10, random_window=False,
         )
 
     def test_len_random(self, dataset_random):
@@ -138,7 +140,7 @@ class TestWindowedForecastDataset:
         X, Y = dataset_random[0]
         Nx = 11
         H = 10
-        assert X.shape == (Nx, H, 5 + 1 + 1)  # k=5 history + x + t = 7
+        assert X.shape == (Nx, H, 5 + 1 + 1 + 1)  # k=5 history + x + t + q = 8
         assert Y.shape == (Nx, H, 1)
 
     def test_getitem_dtypes(self, dataset_random):
@@ -148,23 +150,25 @@ class TestWindowedForecastDataset:
 
     def test_x_coord_normalized(self, dataset_random):
         X, _ = dataset_random[0]
-        x_channel = X[:, 0, -2]  # second-to-last channel, first time step
+        x_channel = X[:, 0, -3]  # third-to-last channel (x), first time step
         assert x_channel.min() >= -1e-6
         assert x_channel.max() <= 1.0 + 1e-6
 
     def test_t_coord_normalized(self, dataset_random):
         X, _ = dataset_random[0]
-        t_channel = X[0, :, -1]  # last channel, first spatial point
+        t_channel = X[0, :, -2]  # second-to-last channel (t), first spatial point
         assert t_channel.min() >= -1e-6
         assert t_channel.max() <= 1.0 + 1e-6
 
-    def test_seed_determinism(self, synthetic_trajectories):
+    def test_seed_determinism(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         ds1 = WindowedForecastDataset(trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
-                                       sim_ids=sim_ids, k=5, H=10, random_window=True, seed=0)
+                                       sim_ids=sim_ids, sim_params=synthetic_sim_params,
+                                       k=5, H=10, random_window=True, seed=0)
         ds2 = WindowedForecastDataset(trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
-                                       sim_ids=sim_ids, k=5, H=10, random_window=True, seed=0)
+                                       sim_ids=sim_ids, sim_params=synthetic_sim_params,
+                                       k=5, H=10, random_window=True, seed=0)
         X1, Y1 = ds1[0]
         X2, Y2 = ds2[0]
         assert torch.equal(X1, X2)
@@ -177,33 +181,35 @@ class TestWindowedForecastDataset:
 # ===================== create_dataloaders =====================
 
 class TestCreateDataloaders:
-    def test_returns_three(self, synthetic_trajectories):
+    def test_returns_three(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         loaders = create_dataloaders(trajectories, x_grid, t_grid,
                                      train_ids, val_ids, test_ids,
-                                     batch_size=4, k=5, H=10)
+                                     batch_size=4, sim_params=synthetic_sim_params,
+                                     k=5, H=10)
         assert len(loaders) == 3
 
-    def test_batch_shapes(self, synthetic_trajectories):
+    def test_batch_shapes(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, _, _ = create_dataloaders(trajectories, x_grid, t_grid,
                                                  train_ids, val_ids, test_ids,
-                                                 batch_size=4, k=5, H=10)
+                                                 batch_size=4, sim_params=synthetic_sim_params,
+                                                 k=5, H=10)
         X, Y = next(iter(train_loader))
         assert X.shape[0] <= 4
         assert X.shape[1] == 11  # Nx
         assert X.shape[2] == 10  # H
-        assert X.shape[3] == 7   # k + 2
+        assert X.shape[3] == 8   # k + 3 (history + x + t + q)
         assert Y.shape[-1] == 1
 
-    def test_no_data_leakage(self, synthetic_trajectories):
+    def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, val_loader, test_loader = create_dataloaders(
             trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
-            batch_size=4, k=5, H=10)
+            batch_size=4, sim_params=synthetic_sim_params, k=5, H=10)
         train_sims = set(train_loader.dataset.sim_ids.tolist())
         val_sims = set(val_loader.dataset.sim_ids.tolist())
         test_sims = set(test_loader.dataset.sim_ids.tolist())

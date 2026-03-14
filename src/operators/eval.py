@@ -12,15 +12,19 @@ from datetime import datetime
 # -------- LOAD TEST SET ---------
 
 def build_test_loader(config):
+    import numpy as np
+
     trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=config["data"]["trajectories.npy"],
                                                  x_grid_path=config["data"]["x_grid_path"],
                                                  t_grid_path=config["data"]["t_grid_path"])
+    sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
     _, _, testing_set = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
                                                          train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
                                                          batch_size=config["training"]["batch_size"],
+                                                         sim_params=sim_params,
                                                          k=config["training"]["k"], H=config["training"]["H"])
 
     return testing_set

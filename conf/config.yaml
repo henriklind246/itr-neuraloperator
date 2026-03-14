@@ -22,7 +22,7 @@ model:
     modes1: 16
     modes2: 16
     width: 64
-    in_channels: 12
+    in_channels: 13
     out_channels: 1
     layers: 4
     activation: "Tanh"
@@ -55,10 +55,11 @@ data:
   t_grid_path: ${paths.data_dir}/t_grid.npy
   x_grid_path: ${paths.data_dir}/x_grid.npy
   trajectories.npy: ${paths.data_dir}/trajectories.npy
+  sim_params_path: ${paths.data_dir}/sim_params.npy
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "samples, Nx, H, 12"
+  x_shape: "samples, Nx, H, 13"
   y_shape: "samples, Nx, H, 1"
 
 hydra:

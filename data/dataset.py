@@ -3,11 +3,12 @@ from pathlib import Path
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
+from src.physics.fd_solver_1d import windowed_sin_flux
 
 # Important constraint: s + k + H <= Nt
 
 # output for one sample (window): (Nx, H, 1)
-# input for one sample (window): (Nx, H, 12)
+# input for one sample (window): (Nx, H, 13)
 # history tensor shape: (Nx, H, 10)
 
 # Take raw data from simulations (x_grid, t_grid, trajectories) and create samples
@@ -24,6 +25,7 @@ class WindowedForecastDataset(Dataset):
             t_grid: np.ndarray,
             x_grid: np.ndarray,
             sim_ids: np.ndarray,
+            sim_params: np.ndarray,
             k: int = 10,
             H: int = 40,
             random_window: bool = True,
@@ -32,6 +34,7 @@ class WindowedForecastDataset(Dataset):
             seed: int = 0
     ):
         self.trajectories = trajectories
+        self.sim_params = sim_params
         self.t_grid = t_grid.astype(dtype=np.float32)
         self.x_grid = x_grid.astype(dtype=np.float32)
         self.sim_ids = sim_ids.astype(dtype=np.int64)
@@ -65,7 +68,7 @@ class WindowedForecastDataset(Dataset):
         """
         Function that fetches a data sample given a key (index)
 
-        Chooses sim -> choose or decode valid starting index -> slice history -> slice target -> normalize coords. -> broadcast k/x/t -> concatenate to (Nx, H, 12)
+        Chooses sim -> choose or decode valid starting index -> slice history -> slice target -> normalize coords. -> broadcast k/x/t/q -> concatenate to (Nx, H, 13)
         """
         if self.random_window:
             # use mod in case idx > len(sim_ids)
@@ -89,6 +92,17 @@ class WindowedForecastDataset(Dataset):
         # future time coords. for prediction slab: shape (H,)
         t_future = self.t_grid[s + self.k: s + self.k + self.H]
 
+
+        # future boundary force heat flux values
+        # q_future = q(t_{s+k}:t_{s+k+H})
+        amp, freq, _ = self.sim_params[sim_id]
+        amp = np.float32(amp)
+        freq = np.float32(freq)
+
+        q_left = windowed_sin_flux(f=float(freq), A=float(amp), t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)
+        # shape: (H,)
+        q_future = np.array([q_left(t) for t in t_future], dtype=np.float32)
+
         # normalize spatial domain: shape (Nx,)
         x_norm = (self.x_grid - self.x_grid[0]) / (self.x_grid[-1] - self.x_grid[0])
 
@@ -99,9 +113,10 @@ class WindowedForecastDataset(Dataset):
         history_grid = np.broadcast_to(history[:, None, :], (self.Nx, self.H, self.k)) # None adds a dim. before broadcasting
         x_channel = np.broadcast_to(x_norm[:, None, None], (self.Nx, self.H, 1))
         t_channel = np.broadcast_to(t_norm[None, :, None], (self.Nx, self.H, 1))
+        q_channel = np.broadcast_to(q_future[None, :, None], (self.Nx, self.H, 1))
 
-        # Concatenate into X: shape (Nx, H, 12)
-        X = np.concatenate([history_grid, x_channel, t_channel], axis=-1).astype(np.float32)
+        # Concatenate into X: shape (Nx, H, 13)
+        X = np.concatenate([history_grid, x_channel, t_channel, q_channel], axis=-1).astype(np.float32)
 
         # Y: shape (Nx, H, 1)
         Y = target[:, :, None].astype(np.float32)
@@ -171,6 +186,7 @@ def create_dataloaders(
         val_ids: np.ndarray,
         test_ids: np.ndarray,
         batch_size: int,
+        sim_params: np.ndarray,
         k: int = 10,
         H: int = 40
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
@@ -180,6 +196,7 @@ def create_dataloaders(
         x_grid=x_grid,
         t_grid=t_grid,
         sim_ids=train_ids,
+        sim_params=sim_params,
         k=k,
         H=H,
         random_window=True
@@ -190,6 +207,7 @@ def create_dataloaders(
         x_grid=x_grid,
         t_grid=t_grid,
         sim_ids=val_ids,
+        sim_params=sim_params,
         k=k,
         H=H,
         windows_per_sim_per_epoch=8,
@@ -201,6 +219,7 @@ def create_dataloaders(
         x_grid=x_grid,
         t_grid=t_grid,
         sim_ids=test_ids,
+        sim_params=sim_params,
         k=k,
         H=H,
         random_window=False
@@ -216,6 +235,7 @@ def create_dataloaders(
 if __name__ == '__main__':
     project_root = Path(__file__).resolve().parents[1]
     trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=str(project_root/"data"/"trajectories.npy"), x_grid_path=str(project_root/"data"/"x_grid.npy"), t_grid_path=str(project_root/"data"/"t_grid.npy"))
+    sim_params = np.load(str(project_root/"data"/"sim_params.npy"), allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
@@ -223,11 +243,11 @@ if __name__ == '__main__':
     k = 10
     H = 40
 
-    train_loader, val_loader, test_loader = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=batch_size, k=k, H=H)
+    train_loader, val_loader, test_loader = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=batch_size, sim_params=sim_params, k=k, H=H)
 
     # Add batches to tensors
     xb, yb = next(iter(train_loader))
-    print(f"Train batch X shape: {xb.shape}") # (B, Nx, H, 12)
+    print(f"Train batch X shape: {xb.shape}") # (B, Nx, H, 13)
     print(f"Train batch Y shape: {yb.shape}") # (B, Nx, H, 1)
 
 
