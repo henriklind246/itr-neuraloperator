@@ -486,22 +486,236 @@ def plot_mms_order_estimation(save_path: str | Path | None = None):
     plt.close(fig)
 
 
+# ---------- 8. LHS PARAMETER SCATTER ----------
+
+def plot_lhs_scatter(
+    sim_params: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """Scatter plot of LHS-sampled (amplitude, frequency) pairs.
+
+    Args:
+        sim_params: object array from sim_params.npy — each element is (amplitude, frequency, T0)
+    """
+    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
+    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(amplitudes, frequencies, s=12, alpha=0.6, edgecolors="none")
+    ax.set_xlabel("Flux Amplitude (A)")
+    ax.set_ylabel("Flux Frequency (f)")
+    ax.set_title(f"LHS Parameter Space — {len(amplitudes)} simulations")
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "lhs_scatter.png"
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved LHS scatter to: {save_path}")
+    plt.close(fig)
+
+
+# ---------- 9. HEAT FLUX PROFILE COMPARISON ----------
+
+def plot_flux_profiles(
+    t_on: float = 0.0,
+    t_off: float = 0.2,
+    t_final: float = 1.0,
+    save_path: str | Path | None = None,
+):
+    """Plot q(t) for representative (A, f) combos at corners and center of the parameter space."""
+    from src.physics.fd_solver_1d import windowed_sin_flux
+
+    combos = [
+        (50.0, 1.0, "A=50, f=1 (low-low)"),
+        (50.0, 20.0, "A=50, f=20 (low-high)"),
+        (300.0, 1.0, "A=300, f=1 (high-low)"),
+        (300.0, 20.0, "A=300, f=20 (high-high)"),
+        (175.0, 10.5, "A=175, f=10.5 (center)"),
+    ]
+
+    t = np.linspace(0.0, t_final, 2000)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for A, f, label in combos:
+        q_fn = windowed_sin_flux(f, A, t_on, t_off, tukey_alpha=0.5)
+        q_vals = np.array([q_fn(ti) for ti in t])
+        ax.plot(t, q_vals, linewidth=1.2, label=label)
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Heat Flux q(t)")
+    ax.set_title(f"Windowed Sinusoidal Flux Profiles (t_on={t_on}, t_off={t_off})")
+    ax.legend(fontsize=8)
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "flux_profiles.png"
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved flux profiles to: {save_path}")
+    plt.close(fig)
+
+
+# ---------- 10. TRAJECTORY COMPARISON GRID ----------
+
+def plot_trajectory_comparison_grid(
+    trajectories: np.ndarray,
+    sim_params: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """2x2 grid of trajectory heatmaps at the parameter space corners.
+
+    Args:
+        trajectories: (num_sims, Nt, Nx)
+        sim_params: object array — each element is (amplitude, frequency, T0)
+        x_grid: (Nx,)
+        t_grid: (Nt,)
+    """
+    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
+    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
+
+    # find sims closest to each corner
+    corners = [
+        ("Low A, Low f", 50.0, 1.0),
+        ("Low A, High f", 50.0, 20.0),
+        ("High A, Low f", 300.0, 1.0),
+        ("High A, High f", 300.0, 20.0),
+    ]
+
+    T_mesh, X_mesh = np.meshgrid(t_grid, x_grid)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=True, sharey=True)
+
+    for ax, (label, target_A, target_f) in zip(axes.flat, corners):
+        dist = (amplitudes - target_A) ** 2 + (frequencies - target_f) ** 2
+        sim_id = int(np.argmin(dist))
+        T = trajectories[sim_id]  # (Nt, Nx)
+
+        pc = ax.pcolormesh(T_mesh, X_mesh, T.T, cmap="inferno", shading="auto")
+        fig.colorbar(pc, ax=ax, shrink=0.8)
+        ax.set_title(f"{label}\nSim {sim_id}: A={amplitudes[sim_id]:.0f}, f={frequencies[sim_id]:.1f}")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("x")
+
+    fig.suptitle("Trajectory Comparison — Parameter Space Corners", fontsize=13)
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "trajectory_comparison_grid.png"
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved trajectory comparison grid to: {save_path}")
+    plt.close(fig)
+
+
+# ---------- 11. BOUNDARY TEMPERATURE RESPONSE ----------
+
+def plot_boundary_temperature(
+    trajectories: np.ndarray,
+    sim_params: np.ndarray,
+    t_grid: np.ndarray,
+    n_samples: int = 20,
+    color_by: str = "amplitude",
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Plot T(x=0, t) for multiple simulations, colored by amplitude or frequency.
+
+    Args:
+        trajectories: (num_sims, Nt, Nx)
+        sim_params: object array — each element is (amplitude, frequency, T0)
+        t_grid: (Nt,)
+        n_samples: number of curves to overlay
+        color_by: "amplitude" or "frequency"
+    """
+    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
+    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
+
+    rng = np.random.default_rng(seed)
+    num_sims = trajectories.shape[0]
+    selected = rng.choice(num_sims, size=min(n_samples, num_sims), replace=False)
+
+    color_vals = amplitudes[selected] if color_by == "amplitude" else frequencies[selected]
+    color_label = "Amplitude (A)" if color_by == "amplitude" else "Frequency (f)"
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    norm = plt.Normalize(vmin=color_vals.min(), vmax=color_vals.max())
+    cmap = plt.cm.viridis
+
+    for i, sim_id in enumerate(selected):
+        T_boundary = trajectories[sim_id, :, 0]  # T(x=0, t)
+        ax.plot(t_grid, T_boundary, color=cmap(norm(color_vals[i])), alpha=0.7, linewidth=0.8)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    fig.colorbar(sm, ax=ax, label=color_label)
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Temperature at x=0")
+    ax.set_title(f"Boundary Temperature Response — {len(selected)} simulations (colored by {color_by})")
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "boundary_temperature.png"
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved boundary temperature to: {save_path}")
+    plt.close(fig)
+
+
+# ---------- 12. PARAMETER–RESPONSE SUMMARY ----------
+
+def plot_parameter_response(
+    trajectories: np.ndarray,
+    sim_params: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """2D scatter of (amplitude, frequency) colored by peak boundary temperature.
+
+    Args:
+        trajectories: (num_sims, Nt, Nx)
+        sim_params: object array — each element is (amplitude, frequency, T0)
+    """
+    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
+    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
+
+    # response metric: peak temperature at x=0
+    peak_T = trajectories[:, :, 0].max(axis=1)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc = ax.scatter(amplitudes, frequencies, c=peak_T, s=15, cmap="inferno", alpha=0.8, edgecolors="none")
+    fig.colorbar(sc, ax=ax, label="Peak T at x=0")
+
+    ax.set_xlabel("Flux Amplitude (A)")
+    ax.set_ylabel("Flux Frequency (f)")
+    ax.set_title("Parameter–Response: Peak Boundary Temperature")
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "parameter_response.png"
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved parameter-response to: {save_path}")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
 
 
     """
-    How to run (--data, --csv, and --report are optional):
-    python -m visual.plots.py \
-  --data path/to/trajectories.npy \
-  --csv path/to/train_metrics.csv \
-  --report path/to/seed_report.json \
-  --out path/to/output_dir
+    How to run (--data, --csv, --params, and --report are optional):
+    python -m visual.plots \
+  --data "/Users/henriklind/Desktop/no-tps-ihcp/data/trajectories.npy" \
+  --params "/Users/henriklind/Desktop/no-tps-ihcp/data/sim_params.npy" \
+  --csv "/Users/henriklind/Desktop/no-tps-ihcp/runs/experiment0/config0/seed0/train_metrics.csv" \
+  --report "/Users/henriklind/Desktop/no-tps-ihcp/runs/experiment0/config0/seed_report.json" \
+  --out "/Users/henriklind/Desktop/no-tps-ihcp/visual"
     """
 
     import argparse
 
     parser = argparse.ArgumentParser(description="Generate all plots")
     parser.add_argument("--data", type=str, default=None, help="Path to trajectories .npy file")
+    parser.add_argument("--params", type=str, default=None, help="Path to sim_params .npy file")
     parser.add_argument("--csv", type=str, default=None, help="Path to train_metrics.csv")
     parser.add_argument("--report", type=str, default=None, help="Path to seed_report.json")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
@@ -533,6 +747,10 @@ if __name__ == "__main__":
         print("Skipping seed comparison (no --report provided)")
 
     # 5. Data-dependent plots (trajectories)
+    sim_params = None
+    if args.params:
+        sim_params = np.load(args.params, allow_pickle=True)
+
     if args.data:
         data_path = Path(args.data)
         print(f"Loading trajectories from {data_path} ...")
@@ -550,8 +768,31 @@ if __name__ == "__main__":
         print("--- Plot 6: Initial Conditions ---")
         plot_initial_conditions(trajectories, x_grid=x_grid,
                                 save_path=out_dir / "initial_conditions.png")
+
+        # plots requiring sim_params
+        if sim_params is not None:
+            print("--- Plot 8: LHS Parameter Scatter ---")
+            plot_lhs_scatter(sim_params, save_path=out_dir / "lhs_scatter.png")
+
+            print("--- Plot 10: Trajectory Comparison Grid ---")
+            plot_trajectory_comparison_grid(trajectories, sim_params, x_grid, t_grid,
+                                            save_path=out_dir / "trajectory_comparison_grid.png")
+
+            print("--- Plot 11: Boundary Temperature Response ---")
+            plot_boundary_temperature(trajectories, sim_params, t_grid,
+                                       save_path=out_dir / "boundary_temperature.png")
+
+            print("--- Plot 12: Parameter-Response Summary ---")
+            plot_parameter_response(trajectories, sim_params,
+                                     save_path=out_dir / "parameter_response.png")
+        else:
+            print("Skipping param-dependent plots (no --params provided)")
     else:
         print("Skipping trajectory/initial-condition plots (no --data provided)")
+
+    # 9. Flux profiles (no data dependency)
+    print("--- Plot 9: Flux Profiles ---")
+    plot_flux_profiles(save_path=out_dir / "flux_profiles.png")
 
     # 6. Final temperature (FD solver)
     print("--- Plot: Final Temperature (FD Solver) ---")
