@@ -67,8 +67,8 @@ class FNO2d(nn.Module):
         Goal: forecasting operator (predict "slab" of temperature given the last k=10 values at each spatial location)
         
         This 2D FNO model with have 4 fourier layers including the lift and projection lin. transformations
-        Input: solution of the first 10 timesteps + 2 locations (u(1, x), .... u(10,x), t, x)
-        Input Shape: (batchsize, Nx, H, 12)
+        Input: solution of the first 10 timesteps + 2 locations (u(1, x), .... u(10,x), t, x, q(t)), where t in {s+k, s+k+1, ...., s+k+H-1}
+        Input Shape: (batchsize, Nx, H, 13)
         Output: the solution of the next 40 timesteps 
         Output Shape: (batchsize, Nx, H, 1) one scalar per (x,t)
         """
@@ -78,7 +78,7 @@ class FNO2d(nn.Module):
         self.width = width
         self.padding_x = 8  # pad the domain is input is non-periodic
 
-        self.linear_p = nn.Linear(12, self.width)
+        self.linear_p = nn.Linear(13, self.width)
 
         self.spect0 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
         self.spect1 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)  # choosing to have same channel dim. through the fourier layers
