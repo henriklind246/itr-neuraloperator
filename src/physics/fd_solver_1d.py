@@ -6,12 +6,23 @@ def ic(x : np.ndarray,  a: float, b: float) -> np.ndarray:
     L = b - a
     return np.cos((np.pi*x)/(2*L)) + 0.1*np.sin((np.pi*x)/L)
 
-# create sinusoid function with a window
-def windowed_sin_flux(f : float, A : float, t_on : float, t_off: float, phase = 0.0):
+# create sinusoid function with a Tukey (tapered cosine) window
+def windowed_sin_flux(f : float, A : float, t_on : float, t_off: float, phase = 0.0, tukey_alpha: float = 0.5):
     def q(t):
-        if (t_on <= t) and (t <= t_off):
-            return A * np.sin(2 * np.pi * f * t + phase)
-        return 0.0
+        if t < t_on or t > t_off:
+            return 0.0
+        W = t_off - t_on
+        tau = (t - t_on) / W  # normalized position in time domain
+        # tukey envelope: tukey_alpha=0 -> rectangular, tukey_alpha=1 -> Hann
+        if tukey_alpha <= 0.0:
+            w = 1.0
+        elif tau < tukey_alpha / 2:
+            w = 0.5 * (1 - np.cos(2 * np.pi * tau / tukey_alpha))
+        elif tau > 1 - tukey_alpha / 2:
+            w = 0.5 * (1 + np.cos(2 * np.pi * (tau - 1 + tukey_alpha / 2) / tukey_alpha))
+        else:
+            w = 1.0
+        return w * A * np.sin(2 * np.pi * f * t + phase)
     return q
 
 def compute_dt(h : float, alpha_val : float, lam : float, flux_frequency : float) -> float:
@@ -36,6 +47,7 @@ class FDSolver1D:
             t_on: float,
             t_off: float,
             phase: float,
+            tukey_alpha: float = 0.5,
             dt=None,
             source=None,
             q_left_fn=None,
@@ -55,6 +67,7 @@ class FDSolver1D:
         self.t_off = t_off
         self.t_final = t_final
         self.phase = phase
+        self.tukey_alpha = tukey_alpha
 
         # -------- SPACE & TIME GRID + DT & DX ---------
 
@@ -82,7 +95,7 @@ class FDSolver1D:
         if q_left_fn is not None:
             self.q_left = q_left_fn
         else:
-            self.q_left = windowed_sin_flux(flux_f, flux_A, t_on, t_off, phase)
+            self.q_left = windowed_sin_flux(flux_f, flux_A, t_on, t_off, phase, tukey_alpha)
 
         # right Dirichlet function T_R(t) with optional MMS right-side BC
         if T_right_fn is not None:
@@ -203,7 +216,7 @@ if __name__ == '__main__':
         flux_f=2.0,
         flux_A=50,
         t_on=0.0,
-        t_off=1.0,
+        t_off=0.2,
         phase=0.0
     )
 
