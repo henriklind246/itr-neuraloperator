@@ -1,6 +1,7 @@
 
 Current Limitations:
 
-- Uniform sampling of parameters in generate_dataset.py -> LHS sampling
 - Right-side BC is constant in fd_solver_1d.py -> allow for functions
-- Vary A, f in heat flux to allow the model to learn it
+- Implement rel_l2 for training error as well
+- Implement LHS + grouped parameter sampling for different material conductivities
+- Add one layer to the domain
