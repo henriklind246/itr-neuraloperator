@@ -1,6 +1,6 @@
 import numpy as np
 from src.physics.fd_solver_1d import windowed_sin_flux
-from src.physics.fd_solver_1d import FDSolver1D
+from src.physics.fd_solver_1d import FDSolver1D, Layer1D
 from scipy.stats import qmc
 
 
@@ -65,14 +65,13 @@ def generate_sim_data(num_sims: int = 1000) -> None:
     rng = np.random.default_rng(0)
 
     # fixed PDE + BCs parameters + Nt = 200 (so mapping is learnable)
+    layer = [Layer1D(x_left=0.0, x_right=0.5, rho=1, cp=1, k=1), Layer1D(x_left=0.5, x_right=1.0, rho=2.0, cp=1.5, k=1.5)]
     sim = FDSolver1D(
         a=0.0,
         b=1.0,
-        N=101,
-        cp=1,
-        rho=1,
-        k=1,
+        N=100,
         lam_target=0.8,
+        layers=layer,
         t_final=1.0,
         flux_f=2.0,
         flux_A=1.0,
@@ -99,7 +98,7 @@ def generate_sim_data(num_sims: int = 1000) -> None:
         t, x, T_hist = sim.solve(T0=T0, store_trajectory=True)
 
         trajectories[i, :, :] = T_hist.astype(np.float32)
-        print(f"Finished {i} simulation with trajectories shape {trajectories.shape}.")
+        print(f"Finished simulation {i}.")
 
     # x and t are the same for all simulations, so just use the last ones
     x_grid = x.astype(np.float32)

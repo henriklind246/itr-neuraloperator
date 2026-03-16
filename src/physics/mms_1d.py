@@ -1,4 +1,4 @@
-from src.physics.fd_solver_1d import FDSolver1D
+from src.physics.fd_solver_1d import FDSolver1D, Layer1D
 import numpy as np
 
 # T_star input is (x_grid, t_grid) output is
@@ -32,14 +32,13 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
                 - k * 12.0 * A * np.sin(omega * t + phase) * (b - x)**2)
 
     # create instance of fd solver class to solve forcing equation
+    layer = Layer1D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
     sim = FDSolver1D(
         a=a,
         b=b,
         N=N,
-        rho=rho,
-        cp=cp,
-        k=k,
         lam_target=0.5,
+        layers=[layer],
         t_final=1.0,
         flux_f=flux_f,
         flux_A=flux_A,

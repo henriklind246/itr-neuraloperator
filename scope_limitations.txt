@@ -1,7 +1,10 @@
 
 Current Limitations:
 
-- Right-side BC is constant in fd_solver_1d.py -> allow for functions
 - Implement rel_l2 for training error as well
-- Implement LHS + grouped parameter sampling for different material conductivities
-- Add one layer to the domain
+- Implement LHS + grouped parameter sampling for different material conductivities (vary k, rho*cp in generate_dataset.py)
+- Vary interface locations in generate_datset.py
+- Add k(x) - spatial conductivity field to fno2d
+- Add rho_cp(x) - volumetric heat capacity field to fno2d
+- Implement version 2 fd solver to allow for varying interface locations
+- Implement interfacial thermal resistance into solver

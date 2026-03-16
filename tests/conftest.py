@@ -2,14 +2,17 @@ import numpy as np
 import pytest
 import torch
 
-from src.physics.fd_solver_1d import FDSolver1D
+from src.physics.fd_solver_1d import FDSolver1D, Layer1D
 from src.operators.fno2d import FNO2d
 
 
 # ---------- solver fixtures ----------
 
+SINGLE_LAYER = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
+
 SOLVER_DEFAULTS = dict(
-    a=0.0, b=1.0, rho=1.0, cp=1.0, k=1.0,
+    a=0.0, b=1.0,
+    layers=SINGLE_LAYER,
     lam_target=0.5, t_final=0.5,
     flux_f=2.0, flux_A=50.0,
     t_on=0.0, t_off=0.5, phase=0.0,
