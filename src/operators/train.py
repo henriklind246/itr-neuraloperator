@@ -112,6 +112,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     training_set, validation_set, _ = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=config["training"]["batch_size"], sim_params=sim_params, k=config["training"]["k"], H=config["training"]["H"])
 
     device = resolve_device(config["training"].get("device", "auto"))
+    print(f"Training on: {device}")
 
     fno = FNO2d(config["model"]["parameters"]["modes1"], config["model"]["parameters"]["modes2"], config["model"]["parameters"]["width"],
                 in_channels=config["model"]["parameters"]["in_channels"], out_channels=config["model"]["parameters"]["out_channels"])
