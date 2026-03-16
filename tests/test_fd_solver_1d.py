@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.physics.fd_solver_1d import FDSolver1D, ic, windowed_sin_flux, compute_dt
+from src.physics.fd_solver_1d import FDSolver1D, Layer1D, ic, windowed_sin_flux, compute_dt
 
 
 # ===================== ic() =====================
@@ -122,13 +122,16 @@ class TestSolverInit:
         np.testing.assert_allclose(small_solver.h, expected_h)
 
     def test_dt_explicit_override(self):
-        solver = FDSolver1D(N=11, dt=0.001, a=0, b=1, rho=1, cp=1, k=1,
+        layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
+        solver = FDSolver1D(N=11, dt=0.001, a=0, b=1, layers=layers,
                             lam_target=0.5, t_final=0.5, flux_f=2.0, flux_A=50.0,
                             t_on=0.0, t_off=0.5, phase=0.0)
         assert solver.dt == 0.001
 
-    def test_alpha_computation(self, small_solver):
-        assert small_solver.alpha == 1.0 / (1.0 * 1.0)
+    def test_diffusivity_at_nodes(self, small_solver):
+        expected_alpha = 1.0 / (1.0 * 1.0)  # k/(rho*cp) for uniform material
+        alpha_nodes = small_solver.k_nodes / (small_solver.rho_nodes * small_solver.cp_nodes)
+        np.testing.assert_allclose(alpha_nodes, expected_alpha)
 
 
 # ===================== build_A_banded =====================
@@ -138,13 +141,15 @@ class TestBuildABanded:
         assert small_solver.ab.shape == (4, 11)
 
     def test_N_less_than_3_raises(self):
+        layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
         with pytest.raises(ValueError, match="N must be >= 3"):
-            FDSolver1D(N=2, a=0, b=1, rho=1, cp=1, k=1,
+            FDSolver1D(N=2, a=0, b=1, layers=layers,
                         lam_target=0.5, t_final=0.1, flux_f=2.0, flux_A=50.0,
                         t_on=0.0, t_off=0.1, phase=0.0)
 
     def test_N_equals_3_succeeds(self):
-        solver = FDSolver1D(N=3, a=0, b=1, rho=1, cp=1, k=1,
+        layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
+        solver = FDSolver1D(N=3, a=0, b=1, layers=layers,
                             lam_target=0.5, t_final=0.1, flux_f=2.0, flux_A=50.0,
                             t_on=0.0, t_off=0.1, phase=0.0)
         assert solver.ab.shape == (4, 3)
@@ -164,16 +169,17 @@ class TestBuildABanded:
     def test_interior_main_diagonal(self, small_solver):
         ab = small_solver.ab
         N = small_solver.N
-        lam = small_solver.lam
-        expected = 1 + lam
-        np.testing.assert_allclose(ab[2, 1:N - 1], expected)
+        for i in range(1, N - 1):
+            rm = small_solver.r_minus[i]
+            rp = small_solver.r_plus[i]
+            np.testing.assert_allclose(ab[2, i], 1.0 + rm + rp)
 
     def test_interior_off_diagonals(self, small_solver):
         ab = small_solver.ab
         N = small_solver.N
-        lam = small_solver.lam
-        np.testing.assert_allclose(ab[1, 2:N], -lam / 2)
-        np.testing.assert_allclose(ab[3, 0:N - 2], -lam / 2)
+        for i in range(1, N - 1):
+            np.testing.assert_allclose(ab[3, i - 1], -small_solver.r_minus[i])
+            np.testing.assert_allclose(ab[1, i + 1], -small_solver.r_plus[i])
 
 
 # ===================== cn_step_banded =====================
