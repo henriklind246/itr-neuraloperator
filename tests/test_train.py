@@ -91,20 +91,25 @@ def tiny_training_setup():
 # ===================== train_one_epoch =====================
 
 class TestTrainOneEpoch:
-    def test_returns_float(self, tiny_training_setup):
+    def test_returns_tuple_of_floats(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device = tiny_training_setup
-        loss = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        result = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        assert isinstance(result, tuple) and len(result) == 2
+        loss, rel_l2 = result
         assert isinstance(loss, float)
+        assert isinstance(rel_l2, float)
 
     def test_loss_is_finite(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device = tiny_training_setup
-        loss = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        loss, rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
         assert np.isfinite(loss)
+        assert np.isfinite(rel_l2)
 
     def test_loss_is_nonnegative(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device = tiny_training_setup
-        loss = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        loss, rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
         assert loss >= 0
+        assert rel_l2 >= 0
 
     def test_updates_parameters(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device = tiny_training_setup
