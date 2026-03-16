@@ -57,32 +57,32 @@ class TestSpectralConv2d:
 
 class TestFNO2d:
     def test_output_shape_standard(self, small_fno):
-        x = torch.randn(2, 101, 40, 13)
+        x = torch.randn(2, 101, 40, 15)
         with torch.no_grad():
             y = small_fno(x)
         assert y.shape == (2, 101, 40, 1)
 
     def test_output_shape_batch_1(self, small_fno):
-        x = torch.randn(1, 101, 40, 13)
+        x = torch.randn(1, 101, 40, 15)
         with torch.no_grad():
             y = small_fno(x)
         assert y.shape == (1, 101, 40, 1)
 
     def test_output_shape_batch_16(self, small_fno):
-        x = torch.randn(16, 101, 40, 13)
+        x = torch.randn(16, 101, 40, 15)
         with torch.no_grad():
             y = small_fno(x)
         assert y.shape == (16, 101, 40, 1)
 
     def test_output_finite(self, small_fno):
-        x = torch.randn(2, 101, 40, 13)
+        x = torch.randn(2, 101, 40, 15)
         with torch.no_grad():
             y = small_fno(x)
         assert torch.all(torch.isfinite(y))
 
     def test_padding_removed(self, small_fno):
         """Nx in output matches input despite internal padding."""
-        x = torch.randn(1, 101, 40, 13)
+        x = torch.randn(1, 101, 40, 15)
         with torch.no_grad():
             y = small_fno(x)
         assert y.shape[1] == 101  # Nx preserved
@@ -92,7 +92,7 @@ class TestFNO2d:
         assert n_params > 0
 
     def test_gradients_flow(self, small_fno):
-        x = torch.randn(2, 101, 40, 13)
+        x = torch.randn(2, 101, 40, 15)
         y = small_fno(x)
         loss = y.mean()
         loss.backward()
@@ -100,15 +100,15 @@ class TestFNO2d:
             assert p.grad is not None, f"No gradient for {name}"
 
     def test_different_width(self):
-        model = FNO2d(modes1=2, modes2=2, width=32)
-        x = torch.randn(1, 101, 40, 13)
+        model = FNO2d(modes1=2, modes2=2, width=32, in_channels=15)
+        x = torch.randn(1, 101, 40, 15)
         with torch.no_grad():
             y = model(x)
         assert y.shape == (1, 101, 40, 1)
 
     def test_eval_mode_deterministic(self, small_fno):
         small_fno.eval()
-        x = torch.randn(1, 101, 40, 13)
+        x = torch.randn(1, 101, 40, 15)
         with torch.no_grad():
             y1 = small_fno(x)
             y2 = small_fno(x)

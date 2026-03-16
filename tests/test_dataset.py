@@ -140,7 +140,7 @@ class TestWindowedForecastDataset:
         X, Y = dataset_random[0]
         Nx = 11
         H = 10
-        assert X.shape == (Nx, H, 5 + 1 + 1 + 1)  # k=5 history + x + t + q = 8
+        assert X.shape == (Nx, H, 5 + 1 + 1 + 1 + 1 + 1)  # k=5 history + x + t + q + k_field + rcp_field = 10
         assert Y.shape == (Nx, H, 1)
 
     def test_getitem_dtypes(self, dataset_random):
@@ -150,13 +150,13 @@ class TestWindowedForecastDataset:
 
     def test_x_coord_normalized(self, dataset_random):
         X, _ = dataset_random[0]
-        x_channel = X[:, 0, -3]  # third-to-last channel (x), first time step
+        x_channel = X[:, 0, -5]  # fifth-to-last channel (x), first time step
         assert x_channel.min() >= -1e-6
         assert x_channel.max() <= 1.0 + 1e-6
 
     def test_t_coord_normalized(self, dataset_random):
         X, _ = dataset_random[0]
-        t_channel = X[0, :, -2]  # second-to-last channel (t), first spatial point
+        t_channel = X[0, :, -4]  # fourth-to-last channel (t), first spatial point
         assert t_channel.min() >= -1e-6
         assert t_channel.max() <= 1.0 + 1e-6
 
@@ -201,7 +201,7 @@ class TestCreateDataloaders:
         assert X.shape[0] <= 4
         assert X.shape[1] == 11  # Nx
         assert X.shape[2] == 10  # H
-        assert X.shape[3] == 8   # k + 3 (history + x + t + q)
+        assert X.shape[3] == 10  # k + 5 (history + x + t + q + k_field + rcp_field)
         assert Y.shape[-1] == 1
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
