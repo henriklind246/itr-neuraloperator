@@ -46,6 +46,8 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
 
 
 def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> tuple[float, float]:

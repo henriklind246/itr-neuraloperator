@@ -1,10 +1,12 @@
 
 Current Limitations:
 
-- Implement rel_l2 for training error as well
 - Implement LHS + grouped parameter sampling for different material conductivities (vary k, rho*cp in generate_dataset.py)
-- Vary interface locations in generate_datset.py
 - Add k(x) - spatial conductivity field to fno2d
 - Add rho_cp(x) - volumetric heat capacity field to fno2d
 - Implement version 2 fd solver to allow for varying interface locations
+- Vary interface locations in generate_datset.py
 - Implement interfacial thermal resistance into solver
+- Implement time conditioning for fno2d
+- Add time normalizations per fourier layer using linear layers to not let the model forget about time
+- Implement autoregressive inference for fno2d
