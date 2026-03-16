@@ -60,25 +60,27 @@ class SpectralConv2d(nn.Module):
 
 
 class FNO2d(nn.Module):
-    def __init__(self, modes1, modes2, width):
+    def __init__(self, modes1, modes2, width, in_channels=15, out_channels=1):
         super().__init__()
 
         """
         Goal: forecasting operator (predict "slab" of temperature given the last k=10 values at each spatial location)
-        
+
         This 2D FNO model with have 4 fourier layers including the lift and projection lin. transformations
-        Input: solution of the first 10 timesteps + 2 locations (u(1, x), .... u(10,x), t, x, q(t)), where t in {s+k, s+k+1, ...., s+k+H-1}
-        Input Shape: (batchsize, Nx, H, 13)
-        Output: the solution of the next 40 timesteps 
-        Output Shape: (batchsize, Nx, H, 1) one scalar per (x,t)
+        Input: solution of the first 10 timesteps + coordinates + forcing + material fields
+        Input Shape: (batchsize, Nx, H, in_channels)
+        Output: the solution of the next 40 timesteps
+        Output Shape: (batchsize, Nx, H, out_channels) one scalar per (x,t)
         """
 
         self.modes1 = modes1
         self.modes2 = modes2
         self.width = width
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.padding_x = 8  # pad the domain is input is non-periodic
 
-        self.linear_p = nn.Linear(13, self.width)
+        self.linear_p = nn.Linear(in_channels, self.width)
 
         self.spect0 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
         self.spect1 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)  # choosing to have same channel dim. through the fourier layers
@@ -90,7 +92,7 @@ class FNO2d(nn.Module):
         self.lin3 = nn.Conv2d(self.width, self.width, 1)
 
         self.linear_q = nn.Linear(self.width, 32)
-        self.output_layer = nn.Linear(32, 1)
+        self.output_layer = nn.Linear(32, out_channels)
 
         self.activation = nn.Tanh()
 
