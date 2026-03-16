@@ -22,7 +22,7 @@ model:
     modes1: 16
     modes2: 16
     width: 64
-    in_channels: 13
+    in_channels: 15
     out_channels: 1
     layers: 4
     activation: "Tanh"
@@ -59,7 +59,7 @@ data:
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "samples, Nx, H, 13"
+  x_shape: "samples, Nx, H, 15"
   y_shape: "samples, Nx, H, 1"
 
 hydra:
