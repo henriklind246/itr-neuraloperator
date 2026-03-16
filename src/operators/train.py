@@ -48,9 +48,10 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> float:
+def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> tuple[float, float]:
     model.train()
     training_loss = 0.0
+    train_rel_l2 = 0.0
 
     for x_batch, y_batch in train_loader:
         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
@@ -61,8 +62,13 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> float:
         optimizer.step()
         training_loss += loss.item()
 
+        with torch.no_grad():
+            batch_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
+            train_rel_l2 += batch_rel_l2.item()
+
     training_loss /= len(train_loader)
-    return training_loss
+    train_rel_l2 /= len(train_loader)
+    return training_loss, train_rel_l2
 
 
 def validate(model, val_loader, device) -> float:
@@ -91,7 +97,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     csv_file = csv_path.open("w", newline="")
     csv_writer = csv.DictWriter(
         csv_file,
-        fieldnames=["epoch", "train_loss", "val_rel_l2", "lr", "is_best"],
+        fieldnames=["epoch", "train_loss", "train_rel_l2", "val_rel_l2", "lr", "is_best"],
     )
     csv_writer.writeheader()
 
@@ -129,10 +135,10 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     bad_epochs = 0
 
     for epoch in range(epochs):
-        train_loss = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn, device=device)
+        train_loss, train_rel_l2 = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn, device=device)
         scheduler.step()
 
-        print(f"Training loss for epoch {epoch} is {train_loss}")
+        print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%")
         is_best = 0
         val_loss = None
         should_stop = False
@@ -169,9 +175,10 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
             {
                 "epoch": epoch,
                 "train_loss": float(train_loss),
+                "train_rel_l2": float(train_rel_l2),
                 "val_rel_l2": "" if val_loss is None else float(val_loss),
                 "lr": float(lr),
-                "is_best": int(is_best)
+                "is_best": int(is_best),
             }
         )
         csv_file.flush()
