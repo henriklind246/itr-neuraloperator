@@ -1,4 +1,4 @@
 # @package paths
-project_root: ${oc.env:PROJECT_ROOT,${oc.env:PWD}}
+project_root: ${oc.env:PROJECT_ROOT}
 data_dir: ${paths.project_root}/data
 runs_root: ${paths.project_root}/runs
