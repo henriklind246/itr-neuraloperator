@@ -111,7 +111,8 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     device = resolve_device(config["training"].get("device", "auto"))
 
-    fno = FNO2d(config["model"]["parameters"]["modes1"], config["model"]["parameters"]["modes2"], config["model"]["parameters"]["width"])
+    fno = FNO2d(config["model"]["parameters"]["modes1"], config["model"]["parameters"]["modes2"], config["model"]["parameters"]["width"],
+                in_channels=config["model"]["parameters"]["in_channels"], out_channels=config["model"]["parameters"]["out_channels"])
     fno.to(device)
 
     optimizer = Adam(

@@ -70,7 +70,9 @@ def eval_all_seeds(run_root: str):
 
         test_loader = build_test_loader(config)
 
-        fno = FNO2d(config['model']['parameters']['modes1'], config['model']['parameters']['modes2'], config['model']['parameters']['width'])
+        fno = FNO2d(config['model']['parameters']['modes1'], config['model']['parameters']['modes2'], config['model']['parameters']['width'],
+                    in_channels=config['model']['parameters']['in_channels'],
+                    out_channels=config['model']['parameters']['out_channels'])
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
