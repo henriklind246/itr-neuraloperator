@@ -41,7 +41,7 @@ training:
   optimizer: "Adam"
   loss_function: "MSELoss"
   validate_every: 10
-  patience: 10
+  patience: 15
   checkpoint_metric: "val_rel_l2"
   seeds: [0]
   run:
