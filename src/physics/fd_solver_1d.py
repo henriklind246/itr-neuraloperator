@@ -410,7 +410,7 @@ if __name__ == '__main__':
     # define layers
     layers = [
         Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=1.0),
-        Layer1D(x_left=0.5, x_right=1.0, rho=2.0, cp=1.5, k=0.2)
+        Layer1D(x_left=0.5, x_right=1.0, rho=2.0, cp=1.5, k=1.5)
     ]
 
     # init simulation

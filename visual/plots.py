@@ -53,9 +53,9 @@ def _should_run(name: str, groups: list[str], individual: list[str] | None) -> b
 def create_demo_multilayer_solver() -> FDSolver1D:
     """Create a 2-layer demo solver for physics visualisation plots.
 
-    Matches the __main__ block in fd_solver_1d.py:
+    Matches the layer configuration in generate_dataset.py:
       Layer 1: [0.0, 0.5], rho=1.0, cp=1.0, k=1.0
-      Layer 2: [0.5, 1.0], rho=2.0, cp=1.5, k=0.2
+      Layer 2: [0.5, 1.0], rho=2.0, cp=1.5, k=1.5
     N=100 ensures x=0.5 lies on a cell face (required by the solver).
     """
     layers = [
