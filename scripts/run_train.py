@@ -38,6 +38,8 @@ def _ensure_experiment_name(project_root: Path) -> str:
     runs_root = project_root / "runs"
     experiment_name = _next_experiment_name(runs_root)
     os.environ[EXPERIMENT_ENV_VAR] = experiment_name
+    # Create the experiment directory so Optuna can write its SQLite DB
+    (runs_root / experiment_name).mkdir(parents=True, exist_ok=True)
     return experiment_name
 
 
@@ -177,7 +179,7 @@ def run_train(cfg: DictConfig) -> float:
 
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parents[1]
-    os.environ.setdefault("PROJECT_ROOT", str(project_root))
+    os.environ.setdefault("PROJECT_ROOT", project_root.as_posix())
     experiment_name = _ensure_experiment_name(project_root)
     print(f"Using experiment namespace: {experiment_name}")
     run_train()

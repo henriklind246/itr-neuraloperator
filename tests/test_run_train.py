@@ -206,3 +206,8 @@ class TestEnsureExperimentName:
         (tmp_path / "runs" / "experiment1").mkdir()
         name = _ensure_experiment_name(tmp_path)
         assert name == "experiment2"
+
+    def test_creates_experiment_directory(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(EXPERIMENT_ENV_VAR, raising=False)
+        name = _ensure_experiment_name(tmp_path)
+        assert (tmp_path / "runs" / name).is_dir()
