@@ -2,8 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------- FNO MODEL ---------
+#TODO: refactor operator learning mapping to (u(x,t_s), q_[t_s:t_{s+t_bar}, k(x), r_cp(x), t_bar) -> u(x, t_s + t_bar)
 
+#TODO: add conditional normalization linear layers after each fourier layer
+
+# t_bar represents the lead time
+
+# --------- FNO MODEL ---------
 class SpectralConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, modes1, modes2):
         super().__init__()
