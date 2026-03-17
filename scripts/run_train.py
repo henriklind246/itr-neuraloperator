@@ -53,6 +53,24 @@ def _job_number() -> int:
         return 0
 
 
+def _next_config_index(experiment_dir: Path) -> int:
+    """Find the next config index by scanning existing confN directories.
+
+    Used to offset job_num when resuming a sweep so that new configs
+    don't overwrite existing ones.
+    """
+    if not experiment_dir.exists():
+        return 0
+    pattern = re.compile(r"^conf(\d+)$")
+    indices: list[int] = []
+    for entry in experiment_dir.iterdir():
+        if entry.is_dir():
+            match = pattern.fullmatch(entry.name)
+            if match:
+                indices.append(int(match.group(1)))
+    return (max(indices) + 1) if indices else 0
+
+
 def _write_yaml(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -107,7 +125,8 @@ def run_train(cfg: DictConfig) -> float:
     experiment_name = _ensure_experiment_name(project_root)
 
     job_num = _job_number()
-    config_name = f"conf{job_num}"
+    offset = _next_config_index(project_root / "runs" / experiment_name)
+    config_name = f"conf{job_num + offset}"
     run_dir = project_root / "runs" / experiment_name / config_name
     generated_dir = project_root / "conf" / "generated" / experiment_name
 
