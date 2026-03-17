@@ -213,6 +213,7 @@ def create_dataloaders(
         sim_params=sim_params,
         k=k,
         H=H,
+        windows_per_sim_per_epoch=7,
         random_window=True
     )
 

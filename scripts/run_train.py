@@ -158,6 +158,7 @@ def run_train(cfg: DictConfig) -> float:
 
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parents[1]
+    os.environ.setdefault("PROJECT_ROOT", str(project_root))
     experiment_name = _ensure_experiment_name(project_root)
     print(f"Using experiment namespace: {experiment_name}")
     run_train()

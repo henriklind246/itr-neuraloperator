@@ -67,7 +67,7 @@ def build_sim_params(a: float, b: float, grid: np.ndarray, num_sims: int, rng, l
     return sim_params
 
 
-def generate_sim_data(num_sims: int = 2500) -> None:
+def generate_sim_data(num_sims: int = 1024) -> None:
     # seed 0 for reproducibility after I generate all simulations
     rng = np.random.default_rng(0)
 
@@ -126,4 +126,4 @@ def generate_sim_data(num_sims: int = 2500) -> None:
     print("Saved:", x_grid.shape, t_grid.shape, trajectories.shape)
 
 if __name__ == '__main__':
-    generate_sim_data(num_sims=2500)
+    generate_sim_data(num_sims=1024)
