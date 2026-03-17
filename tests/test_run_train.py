@@ -15,6 +15,7 @@ from scripts.run_train import (
     _read_index_rows,
     _update_index_and_best,
     _ensure_experiment_name,
+    _validate_optuna_db,
     _config_sort_key,
     EXPERIMENT_ENV_VAR,
 )
@@ -211,3 +212,70 @@ class TestEnsureExperimentName:
         monkeypatch.delenv(EXPERIMENT_ENV_VAR, raising=False)
         name = _ensure_experiment_name(tmp_path)
         assert (tmp_path / "runs" / name).is_dir()
+
+    def test_removes_corrupt_optuna_db_with_env_var(self, tmp_path, monkeypatch):
+        """Corrupt DB is removed even when experiment name comes from env var."""
+        monkeypatch.setenv(EXPERIMENT_ENV_VAR, "experiment2")
+        exp_dir = tmp_path / "runs" / "experiment2"
+        exp_dir.mkdir(parents=True)
+        db_path = exp_dir / "optuna_study.db"
+        db_path.touch()  # 0-byte corrupt file
+
+        name = _ensure_experiment_name(tmp_path)
+        assert name == "experiment2"
+        assert exp_dir.is_dir()
+        assert not db_path.exists()  # corrupt DB removed
+
+    def test_keeps_valid_optuna_db(self, tmp_path, monkeypatch):
+        """A valid Optuna DB is not removed."""
+        import sqlite3
+        monkeypatch.setenv(EXPERIMENT_ENV_VAR, "experiment0")
+        exp_dir = tmp_path / "runs" / "experiment0"
+        exp_dir.mkdir(parents=True)
+        db_path = exp_dir / "optuna_study.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        conn.execute("INSERT INTO alembic_version VALUES ('v3.1.0')")
+        conn.commit()
+        conn.close()
+
+        _ensure_experiment_name(tmp_path)
+        assert db_path.exists()  # valid DB preserved
+
+
+# ===================== _validate_optuna_db =====================
+
+class TestValidateOptunaDb:
+    def test_missing_file_is_valid(self, tmp_path):
+        assert _validate_optuna_db(tmp_path / "nonexistent.db") is True
+
+    def test_empty_file_is_invalid(self, tmp_path):
+        db = tmp_path / "optuna_study.db"
+        db.touch()
+        assert _validate_optuna_db(db) is False
+
+    def test_corrupt_file_is_invalid(self, tmp_path):
+        db = tmp_path / "optuna_study.db"
+        db.write_bytes(b"not a sqlite database")
+        assert _validate_optuna_db(db) is False
+
+    def test_valid_sqlite_without_alembic_is_invalid(self, tmp_path):
+        """A valid SQLite DB that lacks Optuna's alembic_version table."""
+        import sqlite3
+        db = tmp_path / "optuna_study.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE dummy (id INTEGER)")
+        conn.commit()
+        conn.close()
+        assert _validate_optuna_db(db) is False
+
+    def test_valid_optuna_db(self, tmp_path):
+        """A SQLite DB with the alembic_version table is valid."""
+        import sqlite3
+        db = tmp_path / "optuna_study.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        conn.execute("INSERT INTO alembic_version VALUES ('v3.1.0')")
+        conn.commit()
+        conn.close()
+        assert _validate_optuna_db(db) is True

@@ -30,16 +30,40 @@ def _next_experiment_name(runs_root: Path) -> str:
     return f"experiment{next_index}"
 
 
-def _ensure_experiment_name(project_root: Path) -> str:
-    existing = os.environ.get(EXPERIMENT_ENV_VAR)
-    if existing:
-        return existing
+def _validate_optuna_db(db_path: Path) -> bool:
+    """Return True if db_path doesn't exist or is a valid Optuna SQLite DB."""
+    if not db_path.exists():
+        return True
+    if db_path.stat().st_size == 0:
+        return False
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT version_num FROM alembic_version LIMIT 1")
+        conn.close()
+        return True
+    except Exception:
+        return False
 
-    runs_root = project_root / "runs"
-    experiment_name = _next_experiment_name(runs_root)
-    os.environ[EXPERIMENT_ENV_VAR] = experiment_name
+
+def _ensure_experiment_name(project_root: Path) -> str:
+    experiment_name = os.environ.get(EXPERIMENT_ENV_VAR)
+    if not experiment_name:
+        runs_root = project_root / "runs"
+        experiment_name = _next_experiment_name(runs_root)
+        os.environ[EXPERIMENT_ENV_VAR] = experiment_name
+
     # Create the experiment directory so Optuna can write its SQLite DB
-    (runs_root / experiment_name).mkdir(parents=True, exist_ok=True)
+    experiment_dir = project_root / "runs" / experiment_name
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove corrupt Optuna DB left by a failed prior run
+    db_path = experiment_dir / "optuna_study.db"
+    if not _validate_optuna_db(db_path):
+        print(f"Warning: removing corrupt Optuna DB at {db_path}")
+        db_path.unlink(missing_ok=True)
+
     return experiment_name
 
 

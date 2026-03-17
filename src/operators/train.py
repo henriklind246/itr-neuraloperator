@@ -23,7 +23,7 @@ def load_config(config_path: str | None = None) -> dict:
         raise FileNotFoundError(f"Config file not found: {path}")
 
     import os
-    os.environ.setdefault("PROJECT_ROOT", str(project_root))
+    os.environ.setdefault("PROJECT_ROOT", project_root.as_posix())
 
     cfg = OmegaConf.load(path)
     paths_cfg = OmegaConf.load(project_root / "conf" / "paths" / "default.yaml")
