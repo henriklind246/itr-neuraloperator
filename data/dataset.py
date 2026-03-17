@@ -8,8 +8,13 @@ from src.physics.fd_solver_1d import windowed_sin_flux
 # Important constraint: s + k + H <= Nt
 
 # output for one sample (window): (Nx, H, 1)
-# input for one sample (window): (Nx, H, 13)
-# history tensor shape: (Nx, H, 10)
+# input for one sample (window): (Nx, H, k+5) where 5 = x + t + q + k_field + rcp_field
+# history tensor shape: (Nx, H, k)
+
+# normalization bounds for material property channels (match LHS ranges in generate_dataset.py)
+K_RANGE = (0.5, 5.0)
+RCP_RANGE = (0.5, 5.0)
+INTERFACE_X = 0.5
 
 # Take raw data from simulations (x_grid, t_grid, trajectories) and create samples
 # from them defined by the sim_id and a valid starting index s (sim_id, s)
@@ -68,7 +73,7 @@ class WindowedForecastDataset(Dataset):
         """
         Function that fetches a data sample given a key (index)
 
-        Chooses sim -> choose or decode valid starting index -> slice history -> slice target -> normalize coords. -> broadcast k/x/t/q -> concatenate to (Nx, H, 13)
+        Chooses sim -> choose or decode valid starting index -> slice history -> slice target -> normalize coords. -> broadcast channels -> concatenate to (Nx, H, k+5)
         """
         if self.random_window:
             # use mod in case idx > len(sim_ids)
@@ -92,13 +97,13 @@ class WindowedForecastDataset(Dataset):
         # future time coords. for prediction slab: shape (H,)
         t_future = self.t_grid[s + self.k: s + self.k + self.H]
 
-
-        # future boundary force heat flux values
-        # q_future = q(t_{s+k}:t_{s+k+H})
-        amp, freq, _ = self.sim_params[sim_id]
+        # fetch first 6 params that will be used as NO model input
+        amp, freq, k1, k2, rcp1, rcp2, _ = self.sim_params[sim_id]
         amp = np.float32(amp)
         freq = np.float32(freq)
 
+        # future boundary force heat flux values
+        # q_future = q(t_{s+k}:t_{s+k+H})
         q_left = windowed_sin_flux(f=float(freq), A=float(amp), t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)
         # shape: (H,)
         q_future = np.array([q_left(t) for t in t_future], dtype=np.float32)
@@ -109,14 +114,23 @@ class WindowedForecastDataset(Dataset):
         if self.normalize_time:
             t_norm = (t_future - self.t_grid[0]) / (self.t_grid[-1] - self.t_grid[0])
 
+        # material property fields: step functions normalized to [0,1] using LHS bounds
+        k_field = np.where(self.x_grid < INTERFACE_X, float(k1), float(k2))
+        k_norm_field = ((k_field - K_RANGE[0]) / (K_RANGE[1] - K_RANGE[0])).astype(np.float32)
+
+        rcp_field = np.where(self.x_grid < INTERFACE_X, float(rcp1), float(rcp2))
+        rcp_norm_field = ((rcp_field - RCP_RANGE[0]) / (RCP_RANGE[1] - RCP_RANGE[0])).astype(np.float32)
+
         # Broadcast to (Nx, H, Channels)
         history_grid = np.broadcast_to(history[:, None, :], (self.Nx, self.H, self.k)) # None adds a dim. before broadcasting
         x_channel = np.broadcast_to(x_norm[:, None, None], (self.Nx, self.H, 1))
         t_channel = np.broadcast_to(t_norm[None, :, None], (self.Nx, self.H, 1))
         q_channel = np.broadcast_to(q_future[None, :, None], (self.Nx, self.H, 1))
+        k_channel = np.broadcast_to(k_norm_field[:, None, None], (self.Nx, self.H, 1))
+        rcp_channel = np.broadcast_to(rcp_norm_field[:, None, None], (self.Nx, self.H, 1))
 
-        # Concatenate into X: shape (Nx, H, 13)
-        X = np.concatenate([history_grid, x_channel, t_channel, q_channel], axis=-1).astype(np.float32)
+        # Concatenate into X: shape (Nx, H, k+5) where 5 = x + t + q + k_field + rcp_field
+        X = np.concatenate([history_grid, x_channel, t_channel, q_channel, k_channel, rcp_channel], axis=-1).astype(np.float32)
 
         # Y: shape (Nx, H, 1)
         Y = target[:, :, None].astype(np.float32)
@@ -199,6 +213,7 @@ def create_dataloaders(
         sim_params=sim_params,
         k=k,
         H=H,
+        windows_per_sim_per_epoch=7,
         random_window=True
     )
 
@@ -225,9 +240,12 @@ def create_dataloaders(
         random_window=False
     )
 
-    train_loader = DataLoader(train_dataset, batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size, shuffle=False)
+    pin = torch.cuda.is_available()
+    workers = 2 if pin else 0
+
+    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, pin_memory=pin, num_workers=workers)
+    val_loader = DataLoader(val_dataset, batch_size, shuffle=False, pin_memory=pin, num_workers=workers)
+    test_loader = DataLoader(test_dataset, batch_size, shuffle=False, pin_memory=pin, num_workers=workers)
 
     return train_loader, val_loader, test_loader
 
@@ -247,7 +265,7 @@ if __name__ == '__main__':
 
     # Add batches to tensors
     xb, yb = next(iter(train_loader))
-    print(f"Train batch X shape: {xb.shape}") # (B, Nx, H, 13)
+    print(f"Train batch X shape: {xb.shape}") # (B, Nx, H, 15)
     print(f"Train batch Y shape: {yb.shape}") # (B, Nx, H, 1)
 
 

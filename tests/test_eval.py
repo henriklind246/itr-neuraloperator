@@ -14,8 +14,7 @@ from src.operators.fno2d import FNO2d
 def eval_setup():
     """Tiny model + loader for eval tests."""
     Nx, H, in_ch = 11, 10, 7
-    model = FNO2d(modes1=2, modes2=2, width=8)
-    model.linear_p = torch.nn.Linear(in_ch, 8)
+    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=in_ch)
     model.eval()
 
     X = torch.randn(4, Nx, H, in_ch)

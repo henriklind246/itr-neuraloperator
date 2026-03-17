@@ -55,8 +55,12 @@ def synthetic_sim_params(synthetic_trajectories):
     for _ in range(num_sims):
         amp = np.float32(rng.uniform(50.0, 300.0))
         freq = np.float32(rng.uniform(1.0, 20.0))
+        k1 = np.float32(rng.uniform(0.5, 5.0))
+        k2 = np.float32(rng.uniform(0.5, 5.0))
+        rcp1 = np.float32(rng.uniform(0.5, 5.0))
+        rcp2 = np.float32(rng.uniform(0.5, 5.0))
         T0 = rng.standard_normal(Nx).astype(np.float32)
-        params.append((amp, freq, T0))
+        params.append((amp, freq, k1, k2, rcp1, rcp2, T0))
     return np.array(params, dtype=object)
 
 
@@ -78,4 +82,4 @@ def tmp_npy_data(tmp_path, synthetic_trajectories):
 @pytest.fixture
 def small_fno():
     """Tiny FNO2d for fast tests."""
-    return FNO2d(modes1=2, modes2=2, width=8)
+    return FNO2d(modes1=2, modes2=2, width=8, in_channels=15)
