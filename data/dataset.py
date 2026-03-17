@@ -5,19 +5,20 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from src.physics.fd_solver_1d import windowed_sin_flux
 
-# Important constraint: s + k + H <= Nt
+# --------- REFACTOR ---------
 
-# output for one sample (window): (Nx, H, 1)
-# input for one sample (window): (Nx, H, k+5) where 5 = x + t + q + k_field + rcp_field
-# history tensor shape: (Nx, H, k)
+# operator-learning task changed to: (T(x, t_s), q(t_j), k(x), rho_cp(x), t_bar_j, x) -> T(x, t_j = t_bar_j + t_s)
+
+# new variables:
+# (1) source time t_s
+# (2) future queryable time t_j_m
+# (3)
+
 
 # normalization bounds for material property channels (match LHS ranges in generate_dataset.py)
 K_RANGE = (0.5, 5.0)
 RCP_RANGE = (0.5, 5.0)
 INTERFACE_X = 0.5
-
-# Take raw data from simulations (x_grid, t_grid, trajectories) and create samples
-# from them defined by the sim_id and a valid starting index s (sim_id, s)
 
 # trajectories.shape = (num_sims, Nt, Nx)
 # t_grid.shape = (Nt,)

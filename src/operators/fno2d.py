@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#TODO: refactor operator learning mapping to (u(x,t_s), q_[t_s:t_{s+t_bar}, k(x), r_cp(x), t_bar) -> u(x, t_s + t_bar)
+#TODO: refactor operator learning mapping to (u(x,t_s), q_t_j, k(x), r_cp(x), t_bar) -> u(x, t_j = t_s + t_bar)
 
 #TODO: add conditional normalization linear layers after each fourier layer
 
