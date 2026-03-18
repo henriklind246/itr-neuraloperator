@@ -41,8 +41,29 @@ def _validate_optuna_db(db_path: Path) -> bool:
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
         cursor.execute("SELECT version_num FROM alembic_version LIMIT 1")
+        row = cursor.fetchone()
         conn.close()
-        return True
+        return row is not None  # table must have at least one version row
+    except Exception:
+        return False
+
+
+def _stamp_optuna_alembic(db_path: Path) -> bool:
+    """Manually stamp alembic_version using Optuna's migration scripts.
+
+    Returns True if the DB is valid after stamping.
+    """
+    try:
+        import optuna
+        from alembic.config import Config
+        from alembic.command import stamp as alembic_stamp
+
+        optuna_rdb = Path(optuna.__file__).parent / "storages" / "_rdb"
+        config = Config(str(optuna_rdb / "alembic.ini"))
+        config.set_main_option("script_location", str(optuna_rdb / "alembic"))
+        config.set_main_option("sqlalchemy.url", f"sqlite:///{db_path.as_posix()}")
+        alembic_stamp(config, "head")
+        return _validate_optuna_db(db_path)
     except Exception:
         return False
 
@@ -51,8 +72,13 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
     """Pre-initialize the Optuna SQLite DB so the Hydra sweeper finds a valid schema.
 
     On some platforms (notably Windows), Optuna's RDBStorage may fail to properly
-    populate the alembic_version table during creation inside Hydra. Creating the
-    study here first avoids that issue.
+    populate the alembic_version table during schema creation. This function
+    uses two strategies:
+
+    1. Create the study with skip_compatibility_check=True to bypass the
+       premature version assertion.
+    2. If the DB is still invalid (empty alembic_version), manually stamp
+       the version using Optuna's own alembic migration scripts.
     """
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -60,25 +86,33 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
     db_path = project_root / "runs" / experiment_name / "optuna_study.db"
     storage_url = f"sqlite:///{db_path.as_posix()}"
 
+    # Strategy 1: skip_compatibility_check bypasses the premature version
+    # assertion that fails on fresh databases with some Optuna versions.
     try:
+        from optuna.storages import RDBStorage
+        storage = RDBStorage(url=storage_url, skip_compatibility_check=True)
         optuna.create_study(
-            storage=storage_url,
+            storage=storage,
             study_name=experiment_name,
             load_if_exists=True,
         )
         if _validate_optuna_db(db_path):
-            return  # DB created and valid
-    except Exception as e:
-        print(f"Warning: Optuna DB pre-initialization failed: {e}")
+            return
+    except Exception:
+        pass
 
-    # If we get here, creation failed or produced an invalid DB.
-    # Print diagnostics to help the user fix their environment.
+    # Strategy 2: Tables may exist but alembic_version is empty.
+    # Manually stamp the version using Optuna's alembic config.
+    if db_path.exists() and _stamp_optuna_alembic(db_path):
+        return
+
+    # Both strategies failed — print diagnostics.
+    print(f"Warning: Could not pre-initialize Optuna DB.")
     print(f"  Optuna version installed: {optuna.__version__}")
-    print(f"  Required: optuna>=3.0,<4.0  (see requirements.txt)")
-    print(f"  Fix: pip install -r requirements.txt")
+    print(f"  Storage URL: {storage_url}")
 
-    # Try to clean up the corrupt DB so a retry has a chance.
-    # On Windows, SQLite may hold a file lock, so ignore PermissionError.
+    # Clean up the corrupt DB so the Hydra sweeper can try fresh.
+    # On Windows, SQLite may hold a file lock, so ignore OSError.
     try:
         if db_path.exists():
             db_path.unlink()

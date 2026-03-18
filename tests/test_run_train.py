@@ -16,6 +16,7 @@ from scripts.run_train import (
     _update_index_and_best,
     _ensure_experiment_name,
     _validate_optuna_db,
+    _stamp_optuna_alembic,
     _pre_init_optuna_storage,
     _config_sort_key,
     EXPERIMENT_ENV_VAR,
@@ -271,7 +272,7 @@ class TestValidateOptunaDb:
         assert _validate_optuna_db(db) is False
 
     def test_valid_optuna_db(self, tmp_path):
-        """A SQLite DB with the alembic_version table is valid."""
+        """A SQLite DB with the alembic_version table and a row is valid."""
         import sqlite3
         db = tmp_path / "optuna_study.db"
         conn = sqlite3.connect(str(db))
@@ -279,6 +280,49 @@ class TestValidateOptunaDb:
         conn.execute("INSERT INTO alembic_version VALUES ('v3.1.0')")
         conn.commit()
         conn.close()
+        assert _validate_optuna_db(db) is True
+
+    def test_empty_alembic_version_is_invalid(self, tmp_path):
+        """A SQLite DB with alembic_version table but no rows is invalid."""
+        import sqlite3
+        db = tmp_path / "optuna_study.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        conn.commit()
+        conn.close()
+        assert _validate_optuna_db(db) is False
+
+
+# ===================== _stamp_optuna_alembic =====================
+
+class TestStampOptunaAlembic:
+    def test_stamps_fresh_db_with_tables(self, tmp_path):
+        """After creating tables with SQLAlchemy, alembic stamp fills alembic_version."""
+        import sqlalchemy as sa
+        from optuna.storages._rdb import models
+
+        db = tmp_path / "optuna_study.db"
+        engine = sa.create_engine(f"sqlite:///{db.as_posix()}")
+        models.BaseModel.metadata.create_all(engine)
+        engine.dispose()
+
+        # Before stamp: DB exists but has no alembic_version table
+        assert _validate_optuna_db(db) is False
+
+        # Stamp it
+        assert _stamp_optuna_alembic(db) is True
+        assert _validate_optuna_db(db) is True
+
+    def test_idempotent_on_already_stamped_db(self, tmp_path):
+        """Stamping an already-stamped DB is a no-op."""
+        import optuna
+        db = tmp_path / "optuna_study.db"
+        url = f"sqlite:///{db.as_posix()}"
+        optuna.create_study(storage=url, study_name="test")
+        assert _validate_optuna_db(db) is True
+
+        # Stamp again — should succeed and remain valid
+        assert _stamp_optuna_alembic(db) is True
         assert _validate_optuna_db(db) is True
 
 
