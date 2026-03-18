@@ -60,23 +60,30 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
     db_path = project_root / "runs" / experiment_name / "optuna_study.db"
     storage_url = f"sqlite:///{db_path.as_posix()}"
 
-    for attempt in range(2):
-        try:
-            optuna.create_study(
-                storage=storage_url,
-                study_name=experiment_name,
-                load_if_exists=True,
-            )
-            if _validate_optuna_db(db_path):
-                return  # DB created and valid
-            # DB exists but is invalid — delete and retry
-            print(f"Warning: Optuna DB invalid after creation (attempt {attempt + 1})")
-            db_path.unlink(missing_ok=True)
-        except Exception as e:
-            print(f"Warning: Optuna pre-init failed (attempt {attempt + 1}): {e}")
-            db_path.unlink(missing_ok=True)
+    try:
+        optuna.create_study(
+            storage=storage_url,
+            study_name=experiment_name,
+            load_if_exists=True,
+        )
+        if _validate_optuna_db(db_path):
+            return  # DB created and valid
+    except Exception as e:
+        print(f"Warning: Optuna DB pre-initialization failed: {e}")
 
-    print("Warning: Could not pre-initialize Optuna DB. The Hydra sweeper will attempt to create it.")
+    # If we get here, creation failed or produced an invalid DB.
+    # Print diagnostics to help the user fix their environment.
+    print(f"  Optuna version installed: {optuna.__version__}")
+    print(f"  Required: optuna>=3.0,<4.0  (see requirements.txt)")
+    print(f"  Fix: pip install -r requirements.txt")
+
+    # Try to clean up the corrupt DB so a retry has a chance.
+    # On Windows, SQLite may hold a file lock, so ignore PermissionError.
+    try:
+        if db_path.exists():
+            db_path.unlink()
+    except OSError:
+        pass
 
 
 def _ensure_experiment_name(project_root: Path) -> str:
