@@ -47,6 +47,38 @@ def _validate_optuna_db(db_path: Path) -> bool:
         return False
 
 
+def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
+    """Pre-initialize the Optuna SQLite DB so the Hydra sweeper finds a valid schema.
+
+    On some platforms (notably Windows), Optuna's RDBStorage may fail to properly
+    populate the alembic_version table during creation inside Hydra. Creating the
+    study here first avoids that issue.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    db_path = project_root / "runs" / experiment_name / "optuna_study.db"
+    storage_url = f"sqlite:///{db_path.as_posix()}"
+
+    for attempt in range(2):
+        try:
+            optuna.create_study(
+                storage=storage_url,
+                study_name=experiment_name,
+                load_if_exists=True,
+            )
+            if _validate_optuna_db(db_path):
+                return  # DB created and valid
+            # DB exists but is invalid — delete and retry
+            print(f"Warning: Optuna DB invalid after creation (attempt {attempt + 1})")
+            db_path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"Warning: Optuna pre-init failed (attempt {attempt + 1}): {e}")
+            db_path.unlink(missing_ok=True)
+
+    print("Warning: Could not pre-initialize Optuna DB. The Hydra sweeper will attempt to create it.")
+
+
 def _ensure_experiment_name(project_root: Path) -> str:
     experiment_name = os.environ.get(EXPERIMENT_ENV_VAR)
     if not experiment_name:
@@ -206,4 +238,5 @@ if __name__ == "__main__":
     os.environ.setdefault("PROJECT_ROOT", project_root.as_posix())
     experiment_name = _ensure_experiment_name(project_root)
     print(f"Using experiment namespace: {experiment_name}")
+    _pre_init_optuna_storage(project_root, experiment_name)
     run_train()

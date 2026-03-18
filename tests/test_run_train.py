@@ -16,6 +16,7 @@ from scripts.run_train import (
     _update_index_and_best,
     _ensure_experiment_name,
     _validate_optuna_db,
+    _pre_init_optuna_storage,
     _config_sort_key,
     EXPERIMENT_ENV_VAR,
 )
@@ -279,3 +280,61 @@ class TestValidateOptunaDb:
         conn.commit()
         conn.close()
         assert _validate_optuna_db(db) is True
+
+
+# ===================== _pre_init_optuna_storage =====================
+
+class TestPreInitOptunaStorage:
+    def test_creates_valid_db_from_scratch(self, tmp_path):
+        """Fresh experiment dir → DB created and valid."""
+        exp_name = "experiment_test"
+        exp_dir = tmp_path / "runs" / exp_name
+        exp_dir.mkdir(parents=True)
+
+        _pre_init_optuna_storage(tmp_path, exp_name)
+
+        db_path = exp_dir / "optuna_study.db"
+        assert db_path.exists()
+        assert _validate_optuna_db(db_path) is True
+
+    def test_preserves_existing_valid_db(self, tmp_path):
+        """Calling pre-init on an already-valid DB does not corrupt it."""
+        import optuna
+        exp_name = "experiment_existing"
+        exp_dir = tmp_path / "runs" / exp_name
+        exp_dir.mkdir(parents=True)
+        db_path = exp_dir / "optuna_study.db"
+        storage_url = f"sqlite:///{db_path.as_posix()}"
+
+        # Create a study with one trial
+        study = optuna.create_study(storage=storage_url, study_name=exp_name)
+        study.add_trial(
+            optuna.trial.create_trial(
+                params={"x": 1.0},
+                distributions={"x": optuna.distributions.FloatDistribution(0, 10)},
+                values=[0.5],
+            )
+        )
+        assert _validate_optuna_db(db_path) is True
+
+        # Pre-init again — should not corrupt the DB or lose the trial
+        _pre_init_optuna_storage(tmp_path, exp_name)
+        assert _validate_optuna_db(db_path) is True
+
+        loaded_study = optuna.load_study(storage=storage_url, study_name=exp_name)
+        assert len(loaded_study.trials) == 1
+
+    def test_replaces_corrupt_db(self, tmp_path):
+        """Corrupt/empty DB is replaced with a valid one."""
+        exp_name = "experiment_corrupt"
+        exp_dir = tmp_path / "runs" / exp_name
+        exp_dir.mkdir(parents=True)
+        db_path = exp_dir / "optuna_study.db"
+        db_path.touch()  # 0-byte corrupt file
+
+        assert _validate_optuna_db(db_path) is False
+
+        _pre_init_optuna_storage(tmp_path, exp_name)
+
+        assert db_path.exists()
+        assert _validate_optuna_db(db_path) is True
