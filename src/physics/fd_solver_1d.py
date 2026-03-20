@@ -2,15 +2,13 @@ import numpy as np
 from scipy.linalg import solve_banded
 from dataclasses import dataclass
 
-# ---------- VERSION 1 -----------
+# ---------- SOLVER RESTRICTIONS -----------
 
 # Uniform grid
 # Interface locations must lie on the midpoint between nodes, that is, middle of cell faces
 # Interface locations on nodes are NOT allowed
 # arbitrary off-face interfaces are NOT allowed
-# ASSUMING PERFECT THERMAL CONTACT
-
-# version 2 will allow for arbitrary interface location with local geometry handling
+# Interface thermal resistance supported via interface_R parameter (default: perfect contact)
 
 # initial condition
 def ic(x : np.ndarray,  a: float, b: float) -> np.ndarray:
@@ -80,6 +78,7 @@ class FDSolver1D:
             source=None,
             q_left_fn=None,
             T_right_fn=None,
+            interface_R: list[float] | None = None,
             tol: float = 1e-12
     ):
         self.a = a
@@ -105,6 +104,25 @@ class FDSolver1D:
         self._validate_layers_cover_domain()
         self.interface_positions = self._extract_internal_interfaces()
         self.interface_face_map = self._validate_and_index_interfaces()
+
+        # --------- INTERFACE THERMAL RESISTANCE ----------
+        num_interfaces = len(self.interface_positions)
+        # if there does not exist of list of interface resistance values then zero-out the affect of R_c
+        if interface_R is None:
+            self.interface_R = [0.0] * num_interfaces
+        else:
+            if len(interface_R) != num_interfaces:
+                raise ValueError(
+                    f"interface_R has length {len(interface_R)} but there are "
+                    f"{num_interfaces} interface(s). Must match exactly."
+                )
+            for j, Rc in enumerate(interface_R):
+                if Rc < 0.0:
+                    raise ValueError(
+                        f"interface_R[{j}] = {Rc} is negative. "
+                        f"Contact resistance must be >= 0."
+                    )
+            self.interface_R = list(interface_R)
 
         # --------- BCs -------------
         # boundary flux function q(t) with optional MMS flux input
@@ -260,7 +278,9 @@ class FDSolver1D:
         """
         Build face conductance G_face[i] between node i and node i + 1
 
-        This is the conservative quantity that later generalizes naturally to interface resistance
+        At an interface with contact resistance R_c:
+            G = 1 / (h/(2*k_L) + R_c + h/(2*k_R))
+        When R_c = 0 this reduces to the harmonic mean (perfect contact).
         """
         # allocate array of size N-1 (which is the total number of faces)
         G = np.zeros(self.N - 1, dtype=float)
@@ -270,7 +290,8 @@ class FDSolver1D:
                 left_layer_idx, right_layer_idx = self.interface_face_map[i]
                 kL = self.layers[left_layer_idx].k
                 kR = self.layers[right_layer_idx].k
-                G[i] = 1.0 / ((self.h / (2.0 * kL)) + (self.h / (2.0 * kR)))
+                Rc = self.interface_R[left_layer_idx]
+                G[i] = 1.0 / ((self.h / (2.0 * kL)) + Rc + (self.h / (2.0 * kR)))
             else:
                 # not an interface, so get layer index
                 layer_idx = self._layer_index_for_face_interior(x_face)
@@ -307,7 +328,6 @@ class FDSolver1D:
         l, u = 1, 2
         # init ab by creating a numpy array with size (l + u + 1, N) filled with 0 floats
         ab = np.zeros((l + u + 1, N), dtype=float)
-
 
         # ------- ROW 0: Left-side Neumann BC ( -------
         ab[2, 0] = 3.0  # A_0,0
@@ -413,12 +433,16 @@ if __name__ == '__main__':
         Layer1D(x_left=0.5, x_right=1.0, rho=2.0, cp=1.5, k=1.5)
     ]
 
+    # define list of contact resistance
+    contact_resistance = [0.5]
+
     # init simulation
     sim = FDSolver1D(
         a=0.0,
         b=1.0,
         N=100,
         layers=layers,
+        interface_R=contact_resistance,
         lam_target=0.5,
         t_final=1.0,
         flux_f=2.0,
@@ -429,12 +453,11 @@ if __name__ == '__main__':
         dt=0.005
     )
 
-    t, x, T_final = sim.solve(store_trajectory=False)
+    t, x, T_hist = sim.solve(store_trajectory=True)
     print(f"t shape: {t.shape}")
     print(f"x shape: {x.shape}")
-    print(f"T_history shape: {T_final.shape}")
+    print(f"T_history shape: {T_hist.shape}")
     print(f"interface positions: {sim.interface_positions}")
     print(f"interface face map: {sim.interface_face_map}")
 
-    print(T_final)
 
