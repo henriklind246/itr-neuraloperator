@@ -1077,9 +1077,10 @@ def plot_interface_error(
 ):
     """Diagnose whether the model captures the temperature jump at the interface.
 
-    Layout: n_samples rows × 2 columns.
-        Left:  T(x) cross-sections near interface (truth solid, pred dashed) at selected times.
-        Right: Jump magnitude ΔT = T[right_node] - T[left_node] over the full horizon.
+    Layout: n_samples rows × 3 columns.
+        Left:   T(x) cross-sections near interface (colored=truth, red dashed=pred).
+        Middle: Residual (pred − truth) zoomed to interface — reveals error structure.
+        Right:  Jump magnitude ΔT = T[right_node] - T[left_node] over the full horizon.
     """
     import torch
     from data.dataset import split_sim_ids, windowed_sin_flux
@@ -1096,7 +1097,7 @@ def plot_interface_error(
     rng = np.random.default_rng(seed)
     chosen_sims = rng.choice(sim_ids, size=min(n_samples, len(sim_ids)), replace=False)
 
-    fig, axes = plt.subplots(n_samples, 2, figsize=(14, 4 * n_samples), squeeze=False)
+    fig, axes = plt.subplots(n_samples, 3, figsize=(20, 4 * n_samples), squeeze=False)
     cmap_snap = plt.cm.viridis
     n_snaps = 5
 
@@ -1140,27 +1141,44 @@ def plot_interface_error(
 
         Y_true = target  # (Nx, H)
 
-        # --- Left panel: T(x) cross-sections zoomed to interface ---
+        # --- Left panel: T(x) overlay (truth vs pred) zoomed to interface ---
         ax_left = axes[row_idx, 0]
         snap_indices = np.linspace(0, H - 1, n_snaps, dtype=int)
 
         for i, h_idx in enumerate(snap_indices):
             color = cmap_snap(i / max(n_snaps - 1, 1))
-            ax_left.plot(x_zoom, Y_true[zoom_mask, h_idx], color=color, linewidth=1.5,
-                         label=f"t={t_future[h_idx]:.3f} (true)")
-            ax_left.plot(x_zoom, Y_pred[zoom_mask, h_idx], color=color, linewidth=1.5,
-                         linestyle="--", alpha=0.8)
+            ax_left.plot(x_zoom, Y_true[zoom_mask, h_idx], color=color, linewidth=2.0,
+                         label=f"t={t_future[h_idx]:.3f}")
+            ax_left.plot(x_zoom, Y_pred[zoom_mask, h_idx], color="red", linewidth=1.0,
+                         linestyle="--", alpha=0.9)
 
         ax_left.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
         ax_left.set_xlabel("x")
         ax_left.set_ylabel("Temperature")
         ax_left.set_title(f"Sim {sim_id} | A={float(amp):.0f}, f={float(freq):.1f}, s={s}\n"
-                          f"Solid=truth, dashed=pred", fontsize=9)
+                          f"Colored=truth, red dashed=pred", fontsize=9)
         ax_left.legend(fontsize=6, loc="best")
         ax_left.grid(True, linestyle="--", alpha=0.3)
 
+        # --- Middle panel: residual (pred − truth) near interface ---
+        ax_mid = axes[row_idx, 1]
+
+        for i, h_idx in enumerate(snap_indices):
+            color = cmap_snap(i / max(n_snaps - 1, 1))
+            residual = Y_pred[zoom_mask, h_idx] - Y_true[zoom_mask, h_idx]
+            ax_mid.plot(x_zoom, residual, color=color, linewidth=1.5,
+                        label=f"t={t_future[h_idx]:.3f}")
+
+        ax_mid.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
+        ax_mid.axhline(0, color="gray", linestyle=":", alpha=0.5)
+        ax_mid.set_xlabel("x")
+        ax_mid.set_ylabel("Pred − Truth")
+        ax_mid.set_title("Residual at interface region", fontsize=9)
+        ax_mid.legend(fontsize=6, loc="best")
+        ax_mid.grid(True, linestyle="--", alpha=0.3)
+
         # --- Right panel: jump magnitude over time ---
-        ax_right = axes[row_idx, 1]
+        ax_right = axes[row_idx, 2]
         true_jump = Y_true[right_node, :] - Y_true[left_node, :]
         pred_jump = Y_pred[right_node, :] - Y_pred[left_node, :]
 
@@ -1180,7 +1198,7 @@ def plot_interface_error(
                         max(np.mean(true_jump ** 2), 1e-12)) ** 0.5 * 100
 
         ax_right.set_title(f"Global L2: {global_rel_l2:.3f}% | "
-                           f"Interface L2: {iface_rel_l2:.3f}% | "
+                           f"Iface L2: {iface_rel_l2:.3f}% | "
                            f"Jump err: {jump_rel_err:.1f}%", fontsize=9)
         ax_right.legend(fontsize=8)
         ax_right.grid(True, linestyle="--", alpha=0.3)
