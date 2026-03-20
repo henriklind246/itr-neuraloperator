@@ -68,6 +68,7 @@ def create_demo_multilayer_solver() -> FDSolver1D:
     ]
     return FDSolver1D(
         a=0.0, b=1.0, N=100, layers=layers, lam_target=0.5,
+        interface_R=[0.5],
         t_final=1.0, flux_f=2.0, flux_A=50.0,
         t_on=0.0, t_off=0.2, phase=0.0, dt=0.005,
     )
