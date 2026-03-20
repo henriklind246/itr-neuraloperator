@@ -143,7 +143,7 @@ def print_recommendations(results: dict) -> None:
     print("=" * 70)
 
 
-def plot_results(results: dict, orders: list[float], save_path: str = "visual/dt_convergence_study.png") -> None:
+def plot_results(results: dict, orders: list[float], save_path: str = "visual/mms/dt_convergence_study.png") -> None:
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     dt_arr = np.array(results["dt"])

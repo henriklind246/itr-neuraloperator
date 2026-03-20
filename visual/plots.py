@@ -41,6 +41,12 @@ PLOT_REGISTRY: dict[str, str] = {
 GROUPS = {"physics", "mms", "training", "data", "sweep"}
 
 
+def _ensure_parent(path: Path) -> Path:
+    """Create parent directory if needed and return path unchanged."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _should_run(name: str, groups: list[str], individual: list[str] | None) -> bool:
     """Check whether a named plot should be generated given the CLI flags."""
     if individual is not None:
@@ -107,7 +113,8 @@ def plot_final_temperature(
     ax.grid(True, linestyle="--", alpha=0.5)
 
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "final_temperature.png"
+        save_path = Path(__file__).resolve().parent / "physics" / "final_temperature.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.tight_layout()
     fig.savefig(save_path, dpi=200)
     print(f"Saved final temperature plot to: {save_path}")
@@ -167,7 +174,8 @@ def plot_layer_geometry(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "layer_geometry.png"
+        save_path = Path(__file__).resolve().parent / "physics" / "layer_geometry.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved layer geometry to: {save_path}")
     plt.close(fig)
@@ -232,7 +240,8 @@ def plot_face_conductance(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "face_conductance.png"
+        save_path = Path(__file__).resolve().parent / "physics" / "face_conductance.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved face conductance to: {save_path}")
     plt.close(fig)
@@ -294,7 +303,8 @@ def plot_multilayer_evolution(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "multilayer_evolution.png"
+        save_path = Path(__file__).resolve().parent / "physics" / "multilayer_evolution.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved multilayer evolution to: {save_path}")
     plt.close(fig)
@@ -350,7 +360,8 @@ def plot_heat_flux_profile(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "heat_flux_profile.png"
+        save_path = Path(__file__).resolve().parent / "physics" / "heat_flux_profile.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved heat flux profile to: {save_path}")
     plt.close(fig)
@@ -422,7 +433,8 @@ def plot_mms_convergence(save_path: str | Path | None = None):
     fig.suptitle("MMS Convergence — Crank-Nicolson FD Solver", fontsize=13)
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "mms_convergence.png"
+        save_path = Path(__file__).resolve().parent / "mms" / "mms_convergence.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved MMS convergence to: {save_path}")
     plt.close(fig)
@@ -495,7 +507,8 @@ def plot_mms_order_estimation(save_path: str | Path | None = None):
     fig.suptitle("MMS Order Estimation — Successive Refinement Pairs", fontsize=13)
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "mms_order_estimation.png"
+        save_path = Path(__file__).resolve().parent / "mms" / "mms_order_estimation.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved MMS order estimation to: {save_path}")
     plt.close(fig)
@@ -706,7 +719,8 @@ def plot_prediction_vs_truth(
     fig.tight_layout()
 
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "prediction_vs_truth.png"
+        save_path = Path(__file__).resolve().parent / "data" / "prediction_vs_truth.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved prediction vs truth to: {save_path}")
     plt.close(fig)
@@ -732,7 +746,8 @@ def plot_trajectory_heatmap(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "trajectory_heatmap.png"
+        save_path = Path(__file__).resolve().parent / "data" / "trajectory_heatmap.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved trajectory heatmap to: {save_path}")
     plt.close(fig)
@@ -763,7 +778,8 @@ def plot_initial_conditions(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "initial_conditions.png"
+        save_path = Path(__file__).resolve().parent / "data" / "initial_conditions.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved initial conditions plot to: {save_path}")
     plt.close(fig)
@@ -786,7 +802,8 @@ def plot_lhs_scatter(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "lhs_scatter.png"
+        save_path = Path(__file__).resolve().parent / "data" / "lhs_scatter.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved LHS scatter to: {save_path}")
     plt.close(fig)
@@ -825,7 +842,8 @@ def plot_flux_profiles(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "flux_profiles.png"
+        save_path = Path(__file__).resolve().parent / "data" / "flux_profiles.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved flux profiles to: {save_path}")
     plt.close(fig)
@@ -868,7 +886,8 @@ def plot_trajectory_comparison_grid(
     fig.suptitle("Trajectory Comparison — Parameter Space Corners", fontsize=13)
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "trajectory_comparison_grid.png"
+        save_path = Path(__file__).resolve().parent / "data" / "trajectory_comparison_grid.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved trajectory comparison grid to: {save_path}")
     plt.close(fig)
@@ -912,7 +931,8 @@ def plot_boundary_temperature(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "boundary_temperature.png"
+        save_path = Path(__file__).resolve().parent / "data" / "boundary_temperature.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved boundary temperature to: {save_path}")
     plt.close(fig)
@@ -941,7 +961,8 @@ def plot_parameter_response(
 
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "parameter_response.png"
+        save_path = Path(__file__).resolve().parent / "data" / "parameter_response.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved parameter-response to: {save_path}")
     plt.close(fig)
@@ -1084,6 +1105,7 @@ def plot_sweep_ranking(
     fig.tight_layout()
     if save_path is None:
         save_path = experiment_dir / "sweep_ranking.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved sweep ranking to: {save_path}")
     plt.close(fig)
@@ -1152,6 +1174,7 @@ def plot_sweep_convergence(
     fig.tight_layout()
     if save_path is None:
         save_path = experiment_dir / "sweep_convergence.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved sweep convergence to: {save_path}")
     plt.close(fig)
@@ -1239,6 +1262,7 @@ def plot_sweep_hyperparams(
     fig.tight_layout()
     if save_path is None:
         save_path = experiment_dir / "sweep_hyperparams.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved sweep hyperparams to: {save_path}")
     plt.close(fig)
@@ -1272,7 +1296,7 @@ if __name__ == "__main__":
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate plots for the IHCP project")
+    parser = argparse.ArgumentParser(description="Generate plots for the ITR project")
     parser.add_argument("--data", type=str, default=None, help="Path to trajectories .npy file")
     parser.add_argument("--params", type=str, default=None, help="Path to sim_params .npy file")
     parser.add_argument("--csv", type=str, default=None, help="Path to train_metrics.csv")
@@ -1307,55 +1331,61 @@ if __name__ == "__main__":
         solver = create_demo_multilayer_solver()
         t_sol, x_sol, T_hist = solver.solve(store_trajectory=True)
 
+        physics_dir = out_dir / "physics"
+
         if _should_run("final_temperature", groups, individual):
             print("--- final_temperature ---")
-            plot_final_temperature(solver, save_path=out_dir / "final_temperature.png")
+            plot_final_temperature(solver, save_path=physics_dir / "final_temperature.png")
 
         if _should_run("layer_geometry", groups, individual):
             print("--- layer_geometry ---")
-            plot_layer_geometry(solver, save_path=out_dir / "layer_geometry.png")
+            plot_layer_geometry(solver, save_path=physics_dir / "layer_geometry.png")
 
         if _should_run("face_conductance", groups, individual):
             print("--- face_conductance ---")
-            plot_face_conductance(solver, save_path=out_dir / "face_conductance.png")
+            plot_face_conductance(solver, save_path=physics_dir / "face_conductance.png")
 
         if _should_run("multilayer_evolution", groups, individual):
             print("--- multilayer_evolution ---")
-            plot_multilayer_evolution(solver, T_hist, save_path=out_dir / "multilayer_evolution.png")
+            plot_multilayer_evolution(solver, T_hist, save_path=physics_dir / "multilayer_evolution.png")
 
         if _should_run("heat_flux_profile", groups, individual):
             print("--- heat_flux_profile ---")
-            plot_heat_flux_profile(solver, T_hist, save_path=out_dir / "heat_flux_profile.png")
+            plot_heat_flux_profile(solver, T_hist, save_path=physics_dir / "heat_flux_profile.png")
 
     # ---- MMS GROUP ----
     if _should_run("mms_convergence", groups, individual) or \
        _should_run("mms_order_estimation", groups, individual):
         print("=== MMS GROUP ===")
 
+        mms_dir = out_dir / "mms"
+
         if _should_run("mms_convergence", groups, individual):
             print("--- mms_convergence ---")
-            plot_mms_convergence(save_path=out_dir / "mms_convergence.png")
+            plot_mms_convergence(save_path=mms_dir / "mms_convergence.png")
 
         if _should_run("mms_order_estimation", groups, individual):
             print("--- mms_order_estimation ---")
-            plot_mms_order_estimation(save_path=out_dir / "mms_order_estimation.png")
+            plot_mms_order_estimation(save_path=mms_dir / "mms_order_estimation.png")
 
     # ---- TRAINING GROUP ----
     if _should_run("training_curves", groups, individual) or \
        _should_run("seed_comparison", groups, individual):
         print("=== TRAINING GROUP ===")
 
+        training_dir = out_dir / "training"
+
         if _should_run("training_curves", groups, individual):
             if args.csv:
                 print("--- training_curves ---")
-                plot_training_curves(args.csv, save_path=out_dir / "training_curves.png")
+                plot_training_curves(args.csv, save_path=training_dir / "training_curves.png")
             else:
                 print("Skipping training_curves (no --csv provided)")
 
         if _should_run("seed_comparison", groups, individual):
             if args.report:
                 print("--- seed_comparison ---")
-                plot_seed_comparison(args.report, save_path=out_dir / "seed_comparison.png")
+                plot_seed_comparison(args.report, save_path=training_dir / "seed_comparison.png")
             else:
                 print("Skipping seed_comparison (no --report provided)")
 
@@ -1368,10 +1398,12 @@ if __name__ == "__main__":
     if need_data:
         print("=== DATA GROUP ===")
 
+        data_dir = out_dir / "data"
+
         # flux_profiles needs no data files
         if _should_run("flux_profiles", groups, individual):
             print("--- flux_profiles ---")
-            plot_flux_profiles(save_path=out_dir / "flux_profiles.png")
+            plot_flux_profiles(save_path=data_dir / "flux_profiles.png")
 
         sim_params = None
         if args.params:
@@ -1390,33 +1422,33 @@ if __name__ == "__main__":
             if _should_run("trajectory_heatmap", groups, individual):
                 print("--- trajectory_heatmap ---")
                 plot_trajectory_heatmap(trajectories, sim_id=0, x_grid=x_grid, t_grid=t_grid,
-                                        save_path=out_dir / "trajectory_heatmap.png")
+                                        save_path=data_dir / "trajectory_heatmap.png")
 
             if _should_run("initial_conditions", groups, individual):
                 print("--- initial_conditions ---")
                 plot_initial_conditions(trajectories, x_grid=x_grid,
-                                        save_path=out_dir / "initial_conditions.png")
+                                        save_path=data_dir / "initial_conditions.png")
 
             # plots requiring sim_params
             if sim_params is not None:
                 if _should_run("lhs_scatter", groups, individual):
                     print("--- lhs_scatter ---")
-                    plot_lhs_scatter(sim_params, save_path=out_dir / "lhs_scatter.png")
+                    plot_lhs_scatter(sim_params, save_path=data_dir / "lhs_scatter.png")
 
                 if _should_run("trajectory_comparison_grid", groups, individual):
                     print("--- trajectory_comparison_grid ---")
                     plot_trajectory_comparison_grid(trajectories, sim_params, x_grid, t_grid,
-                                                    save_path=out_dir / "trajectory_comparison_grid.png")
+                                                    save_path=data_dir / "trajectory_comparison_grid.png")
 
                 if _should_run("boundary_temperature", groups, individual):
                     print("--- boundary_temperature ---")
                     plot_boundary_temperature(trajectories, sim_params, t_grid,
-                                               save_path=out_dir / "boundary_temperature.png")
+                                               save_path=data_dir / "boundary_temperature.png")
 
                 if _should_run("parameter_response", groups, individual):
                     print("--- parameter_response ---")
                     plot_parameter_response(trajectories, sim_params,
-                                             save_path=out_dir / "parameter_response.png")
+                                             save_path=data_dir / "parameter_response.png")
             else:
                 print("Skipping param-dependent plots (no --params provided)")
         else:
@@ -1431,23 +1463,24 @@ if __name__ == "__main__":
 
         if args.experiment:
             experiment_dir = Path(args.experiment)
+            sweep_dir = out_dir / "sweep"
 
             if _should_run("sweep_ranking", groups, individual):
                 print("--- sweep_ranking ---")
-                plot_sweep_ranking(experiment_dir, save_path=out_dir / "sweep_ranking.png")
+                plot_sweep_ranking(experiment_dir, save_path=sweep_dir / "sweep_ranking.png")
 
             if _should_run("sweep_convergence", groups, individual):
                 if args.runs:
                     print("--- sweep_convergence ---")
                     plot_sweep_convergence(experiment_dir, args.runs,
                                            seed=args.sweep_seed,
-                                           save_path=out_dir / "sweep_convergence.png")
+                                           save_path=sweep_dir / "sweep_convergence.png")
                 else:
                     print("Skipping sweep_convergence (no --runs provided)")
 
             if _should_run("sweep_hyperparams", groups, individual):
                 print("--- sweep_hyperparams ---")
-                plot_sweep_hyperparams(experiment_dir, save_path=out_dir / "sweep_hyperparams.png")
+                plot_sweep_hyperparams(experiment_dir, save_path=sweep_dir / "sweep_hyperparams.png")
         else:
             print("Skipping sweep plots (no --experiment provided)")
 
