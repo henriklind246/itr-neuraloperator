@@ -215,4 +215,4 @@ runs/
 .claude/
 .DS_Store
 conf/generated/
-visual/*.png
+visual/**/*.png
