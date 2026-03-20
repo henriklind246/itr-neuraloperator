@@ -6,11 +6,12 @@ import torch.nn.functional as F
 
 #TODO: add conditional normalization linear layers after each fourier layer
 
+
 # t_bar represents the lead time
 
 # --------- FNO MODEL ---------
 class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes1, modes2):
+    def __init__(self, in_channels, out_channels, modes1):
         super().__init__()
 
         """
@@ -21,20 +22,19 @@ class SpectralConv2d(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes1 = modes1
-        self.modes2 = modes2
 
         self.scale = (1 / (in_channels * out_channels))
         self.weights1 = nn.Parameter(
-            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, dtype=torch.cfloat)
         )
         self.weights2 = nn.Parameter(
-            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, dtype=torch.cfloat)
         )
 
     # complex multiplication (this is a helper method that is going to be used in the forward pass)
     def compl_mul2d(self, input, weights):
-        # (batch, in_channels, x, t), (in_channels, out_channels, x, t) -> (batch, out_channels, x, t)
-        return torch.einsum("bixt,ioxt->boxt", input, weights)
+        # (batch, in_channels, x), (in_channels, out_channels, x) -> (batch, out_channels, x)
+        return torch.einsum("bix,iox->box", input, weights)
 
     # define the forward pass
     def forward(self, x):
@@ -43,24 +43,21 @@ class SpectralConv2d(nn.Module):
         Nx_size = x.shape[2]
         Nt_size = x.shape[3]
 
-        # transform to frequency domain (b, i, Nx, Nt) -> (b, i, kx, Nt//2+1)
-        x_ft = torch.fft.rfftn(x, dim=[-2, -1])
-        Nx_fft = x_ft.size(-2)  # full frequency range (pos + neg)
-        Nt_fft = x_ft.size(-1) # only nonnegative frequencies
+        # transform to frequency domain (b, i, Nx) -> (b, i, Nx//2+1)
+        x_ft = torch.fft.rfft(x, dim=[-1])
+        Nx_fft = x_ft.size(-1)  # only nonnegative frequencies
 
         # apply mode-wise channel mixing (b, i, N//2+1),(i, o, N//2+1) -> (b, o, N//2+1)
-        out_ft = torch.zeros(batchsize, self.out_channels, Nx_fft, Nt_fft, dtype=torch.cfloat, device=x.device)
+        out_ft = torch.zeros(batchsize, self.out_channels, Nx_fft, dtype=torch.cfloat, device=x.device)
 
         # for safety, if modes1 > N_fft
         m1 = min(self.modes1, Nx_fft)
-        m2 = min(self.modes2, Nt_fft)
 
-        # fill disjoint pieces of out_ft
-        out_ft[:, :, :m1, :m2] = self.compl_mul2d(x_ft[:, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
-        out_ft[:, :, -m1:, :m2] = self.compl_mul2d(x_ft[:, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
+        # fill disjoint piece of out_ft
+        out_ft[:, :, :m1] = self.compl_mul2d(x_ft[:, :, :m1], self.weights1[:, :, :m1])
 
-        # inverse fourier transform back to physical space: (b, o, Nx//2+1, Nt//2+1) -> (b, o, Nx, Nt)
-        x = torch.fft.irfftn(out_ft, s=(Nx_size, Nt_size), dim=[-2, -1])
+        # inverse fourier transform back to physical space: (b, o, Nx//2+1) -> (b, o, Nx)
+        x = torch.fft.irfft(out_ft, s=Nx_size, dim=[-1])
         return x
 
 
@@ -69,10 +66,10 @@ class FNO2d(nn.Module):
         super().__init__()
 
         """
-        Goal: forecasting operator (predict "slab" of temperature given the last k=10 values at each spatial location)
+        Goal: time-conditioning operator (predict any future state given any source state and forcing terms)
 
-        This 2D FNO model with have 4 fourier layers including the lift and projection lin. transformations
-        Input: solution of the first 10 timesteps + coordinates + forcing + material fields
+        This 1D FNO model with have 4 fourier layers including the lift and projection lin. transformations
+        Input: 
         Input Shape: (batchsize, Nx, H, in_channels)
         Output: the solution of the next 40 timesteps
         Output Shape: (batchsize, Nx, H, out_channels) one scalar per (x,t)
