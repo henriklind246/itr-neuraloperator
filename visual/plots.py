@@ -32,6 +32,8 @@ PLOT_REGISTRY: dict[str, str] = {
     "trajectory_comparison_grid":"data",
     "boundary_temperature":      "data",
     "parameter_response":        "data",
+    "dataset_samples":           "data",
+    "interface_error":           "data",
     # group: sweep
     "sweep_ranking":             "sweep",
     "sweep_convergence":         "sweep",
@@ -656,10 +658,18 @@ def plot_prediction_vs_truth(
     H: int = 40,
     save_path: str | Path | None = None,
 ):
-    """Plot ground truth, FNO prediction, and pointwise error as 3-panel heatmaps."""
+    """Plot ground truth, FNO prediction, pointwise error, and interface cross-section.
+
+    4-panel layout:
+        (a) Ground truth heatmap with interface marker
+        (b) FNO prediction heatmap with interface marker
+        (c) Absolute error heatmap with interface marker
+        (d) T(x) cross-section at mid-horizon timestep (truth vs prediction)
+    """
     import torch
 
     Nx = x_grid.shape[0]
+    interface_x = 0.5
 
     # build a single input sample (same logic as WindowedForecastDataset.__getitem__)
     T_hist = trajectories[sim_id]  # (Nt, Nx)
@@ -693,16 +703,18 @@ def plot_prediction_vs_truth(
     vmin = min(Y_true.min(), Y_pred.min())
     vmax = max(Y_true.max(), Y_pred.max())
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharey=True)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
 
     # ground truth
     axes[0].pcolormesh(T_mesh, X_mesh, Y_true, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
+    axes[0].axhline(interface_x, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
     axes[0].set_title("Ground Truth")
     axes[0].set_xlabel("Time")
     axes[0].set_ylabel("x")
 
     # prediction
     pc1 = axes[1].pcolormesh(T_mesh, X_mesh, Y_pred, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
+    axes[1].axhline(interface_x, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
     axes[1].set_title("FNO Prediction")
     axes[1].set_xlabel("Time")
 
@@ -711,9 +723,21 @@ def plot_prediction_vs_truth(
 
     # error
     pc2 = axes[2].pcolormesh(T_mesh, X_mesh, error, cmap="Reds", shading="auto")
+    axes[2].axhline(interface_x, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
     axes[2].set_title("Absolute Error")
     axes[2].set_xlabel("Time")
     fig.colorbar(pc2, ax=axes[2], label="|Error|", shrink=0.85)
+
+    # cross-section at mid-horizon
+    mid_h = H // 2
+    axes[3].plot(x_grid, Y_true[:, mid_h], "k-", linewidth=1.5, label="Truth")
+    axes[3].plot(x_grid, Y_pred[:, mid_h], "r--", linewidth=1.5, label="Prediction")
+    axes[3].axvline(interface_x, color="gray", linestyle=":", linewidth=1.5, alpha=0.7, label="Interface")
+    axes[3].set_xlabel("x")
+    axes[3].set_ylabel("Temperature")
+    axes[3].set_title(f"T(x) at t={t_future[mid_h]:.3f}")
+    axes[3].legend(fontsize=8)
+    axes[3].grid(True, linestyle="--", alpha=0.3)
 
     fig.suptitle(f"Sim {sim_id}, window start s={s}", fontsize=12)
     fig.tight_layout()
@@ -965,6 +989,209 @@ def plot_parameter_response(
     save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved parameter-response to: {save_path}")
+    plt.close(fig)
+
+
+def plot_dataset_samples(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    k: int = 10,
+    H: int = 40,
+    n_samples: int = 3,
+    interface_x: float = 0.5,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Plot T(x) spatial profiles from random train/val/test windows to verify interface jump.
+
+    Layout: 3 rows (train / val / test) × n_samples columns.
+    Each subplot shows T(x) at several time snapshots within one prediction window,
+    with the interface location marked by a vertical dashed line.
+    """
+    from data.dataset import split_sim_ids
+
+    num_sims = trajectories.shape[0]
+    Nt = len(t_grid)
+    max_s = Nt - H - k
+
+    train_ids, val_ids, test_ids = split_sim_ids(num_sims, 0.7, 0.15, seed=0)
+    splits = [("Train", train_ids), ("Val", val_ids), ("Test", test_ids)]
+
+    rng = np.random.default_rng(seed)
+
+    fig, axes = plt.subplots(3, n_samples, figsize=(5 * n_samples, 12), squeeze=False)
+    cmap_snap = plt.cm.viridis
+    n_snaps = 5
+
+    for row, (split_name, sim_ids) in enumerate(splits):
+        chosen_sims = rng.choice(sim_ids, size=min(n_samples, len(sim_ids)), replace=False)
+
+        for col, sim_id in enumerate(chosen_sims):
+            ax = axes[row, col]
+            s = rng.integers(0, max_s + 1)
+
+            # time indices for the prediction window
+            snap_indices = np.linspace(s + k, s + k + H - 1, n_snaps, dtype=int)
+
+            for i, t_idx in enumerate(snap_indices):
+                color = cmap_snap(i / max(n_snaps - 1, 1))
+                ax.plot(x_grid, trajectories[sim_id, t_idx, :], color=color, linewidth=1.0,
+                        label=f"t={t_grid[t_idx]:.3f}")
+
+            ax.axvline(interface_x, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
+                       label="Interface")
+
+            amp, freq = sim_params[sim_id]
+            ax.set_title(f"{split_name} | Sim {sim_id}\nA={float(amp):.0f}, f={float(freq):.1f}, s={s}",
+                         fontsize=9)
+            ax.set_xlabel("x")
+            ax.set_ylabel("Temperature")
+            ax.legend(fontsize=6, loc="best")
+            ax.grid(True, linestyle="--", alpha=0.3)
+
+    fig.suptitle("Dataset Samples — T(x) Profiles in Prediction Windows", fontsize=13)
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "data" / "dataset_samples.png"
+    save_path = _ensure_parent(Path(save_path))
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved dataset samples to: {save_path}")
+    plt.close(fig)
+
+
+def plot_interface_error(
+    model,
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    sim_ids: np.ndarray,
+    k: int = 10,
+    H: int = 40,
+    interface_x: float = 0.5,
+    n_samples: int = 4,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Diagnose whether the model captures the temperature jump at the interface.
+
+    Layout: n_samples rows × 2 columns.
+        Left:  T(x) cross-sections near interface (truth solid, pred dashed) at selected times.
+        Right: Jump magnitude ΔT = T[right_node] - T[left_node] over the full horizon.
+    """
+    import torch
+    from data.dataset import split_sim_ids, windowed_sin_flux
+
+    Nt = len(t_grid)
+    Nx = len(x_grid)
+    max_s = Nt - H - k
+
+    # find flanking nodes for the interface
+    iface_idx = int(np.argmin(np.abs(x_grid - interface_x)))
+    left_node = iface_idx - 1 if x_grid[iface_idx] >= interface_x else iface_idx
+    right_node = left_node + 1
+
+    rng = np.random.default_rng(seed)
+    chosen_sims = rng.choice(sim_ids, size=min(n_samples, len(sim_ids)), replace=False)
+
+    fig, axes = plt.subplots(n_samples, 2, figsize=(14, 4 * n_samples), squeeze=False)
+    cmap_snap = plt.cm.viridis
+    n_snaps = 5
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    # zoom region for cross-section
+    zoom_mask = (x_grid >= 0.3) & (x_grid <= 0.7)
+    x_zoom = x_grid[zoom_mask]
+
+    # interface region for interface-specific rel L2
+    iface_mask = (x_grid >= 0.4) & (x_grid <= 0.6)
+
+    for row_idx, sim_id in enumerate(chosen_sims):
+        s = rng.integers(0, max_s + 1)
+
+        # build FNO input (same logic as WindowedForecastDataset.__getitem__)
+        T_hist = trajectories[sim_id]
+        history = T_hist[s:s + k, :].T  # (Nx, k)
+        target = T_hist[s + k:s + k + H, :].T  # (Nx, H)
+        t_future = t_grid[s + k:s + k + H]
+
+        amp, freq = sim_params[sim_id]
+        q_left = windowed_sin_flux(f=float(freq), A=float(amp), t_on=0.0, t_off=0.2,
+                                    phase=0.0, tukey_alpha=0.5)
+        q_future = np.array([q_left(t) for t in t_future], dtype=np.float32)
+
+        x_norm = (x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])
+        t_norm = (t_future - t_grid[0]) / (t_grid[-1] - t_grid[0])
+
+        history_grid = np.broadcast_to(history[:, None, :], (Nx, H, k))
+        x_channel = np.broadcast_to(x_norm[:, None, None], (Nx, H, 1))
+        t_channel = np.broadcast_to(t_norm[None, :, None], (Nx, H, 1))
+        q_channel = np.broadcast_to(q_future[None, :, None], (Nx, H, 1))
+
+        X = np.concatenate([history_grid, x_channel, t_channel, q_channel], axis=-1).astype(np.float32)
+        X_tensor = torch.from_numpy(X).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            Y_pred = model(X_tensor).cpu().numpy().squeeze()  # (Nx, H)
+
+        Y_true = target  # (Nx, H)
+
+        # --- Left panel: T(x) cross-sections zoomed to interface ---
+        ax_left = axes[row_idx, 0]
+        snap_indices = np.linspace(0, H - 1, n_snaps, dtype=int)
+
+        for i, h_idx in enumerate(snap_indices):
+            color = cmap_snap(i / max(n_snaps - 1, 1))
+            ax_left.plot(x_zoom, Y_true[zoom_mask, h_idx], color=color, linewidth=1.5,
+                         label=f"t={t_future[h_idx]:.3f} (true)")
+            ax_left.plot(x_zoom, Y_pred[zoom_mask, h_idx], color=color, linewidth=1.5,
+                         linestyle="--", alpha=0.8)
+
+        ax_left.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
+        ax_left.set_xlabel("x")
+        ax_left.set_ylabel("Temperature")
+        ax_left.set_title(f"Sim {sim_id} | A={float(amp):.0f}, f={float(freq):.1f}, s={s}\n"
+                          f"Solid=truth, dashed=pred", fontsize=9)
+        ax_left.legend(fontsize=6, loc="best")
+        ax_left.grid(True, linestyle="--", alpha=0.3)
+
+        # --- Right panel: jump magnitude over time ---
+        ax_right = axes[row_idx, 1]
+        true_jump = Y_true[right_node, :] - Y_true[left_node, :]
+        pred_jump = Y_pred[right_node, :] - Y_pred[left_node, :]
+
+        ax_right.plot(t_future, true_jump, "k-", linewidth=1.5, label="True ΔT")
+        ax_right.plot(t_future, pred_jump, "r--", linewidth=1.5, label="Pred ΔT")
+        ax_right.axhline(0, color="gray", linestyle=":", alpha=0.5)
+        ax_right.set_xlabel("Time")
+        ax_right.set_ylabel("ΔT (right − left)")
+
+        # compute interface-specific metrics
+        global_rel_l2 = (np.mean((Y_pred - Y_true) ** 2) / np.mean(Y_true ** 2)) ** 0.5 * 100
+        iface_pred = Y_pred[iface_mask, :]
+        iface_true = Y_true[iface_mask, :]
+        iface_rel_l2 = (np.mean((iface_pred - iface_true) ** 2) /
+                        np.mean(iface_true ** 2)) ** 0.5 * 100
+        jump_rel_err = (np.mean((pred_jump - true_jump) ** 2) /
+                        max(np.mean(true_jump ** 2), 1e-12)) ** 0.5 * 100
+
+        ax_right.set_title(f"Global L2: {global_rel_l2:.3f}% | "
+                           f"Interface L2: {iface_rel_l2:.3f}% | "
+                           f"Jump err: {jump_rel_err:.1f}%", fontsize=9)
+        ax_right.legend(fontsize=8)
+        ax_right.grid(True, linestyle="--", alpha=0.3)
+
+    fig.suptitle("Interface Error Diagnostics — Prediction vs Truth at x=0.5", fontsize=13)
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "data" / "interface_error.png"
+    save_path = _ensure_parent(Path(save_path))
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved interface error diagnostics to: {save_path}")
     plt.close(fig)
 
 
@@ -1289,6 +1516,7 @@ if __name__ == "__main__":
       --params      Path to sim_params .npy file
       --csv         Path to train_metrics.csv
       --report      Path to seed_report.json
+      --checkpoint  Path to model checkpoint .pt (for interface_error plot)
       --experiment  Path to conf/generated/experiment{N}/ directory (sweep plots)
       --runs        Path to runs/experiment{N}/ directory (sweep convergence)
       --sweep-seed  Which seed to show in convergence plot (default: 0)
@@ -1307,6 +1535,8 @@ if __name__ == "__main__":
                         help="Path to runs/experiment{N}/ directory (sweep convergence)")
     parser.add_argument("--sweep-seed", type=int, default=0,
                         help="Which seed to show in convergence plot (default: 0)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to model checkpoint (for interface_error plot)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
                         choices=["all", "physics", "mms", "training", "data", "sweep"],
@@ -1392,7 +1622,8 @@ if __name__ == "__main__":
     # ---- DATA GROUP ----
     data_plots = ["trajectory_heatmap", "initial_conditions", "lhs_scatter",
                   "flux_profiles", "trajectory_comparison_grid",
-                  "boundary_temperature", "parameter_response"]
+                  "boundary_temperature", "parameter_response",
+                  "dataset_samples", "interface_error"]
     need_data = any(_should_run(p, groups, individual) for p in data_plots)
 
     if need_data:
@@ -1449,6 +1680,38 @@ if __name__ == "__main__":
                     print("--- parameter_response ---")
                     plot_parameter_response(trajectories, sim_params,
                                              save_path=data_dir / "parameter_response.png")
+
+                if _should_run("dataset_samples", groups, individual):
+                    print("--- dataset_samples ---")
+                    plot_dataset_samples(trajectories, x_grid, t_grid, sim_params,
+                                         save_path=data_dir / "dataset_samples.png")
+
+                if _should_run("interface_error", groups, individual):
+                    if args.checkpoint:
+                        print("--- interface_error ---")
+                        import torch
+                        from src.operators.fno2d import FNO2d
+                        from data.dataset import split_sim_ids
+
+                        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+                        conf = ckpt["conf"]
+                        model_cfg = conf.get("model", {}).get("parameters", {})
+                        model = FNO2d(
+                            modes1=model_cfg.get("modes1", 16),
+                            modes2=model_cfg.get("modes2", 16),
+                            width=model_cfg.get("width", 64),
+                            in_channels=model_cfg.get("in_channels", 13),
+                        )
+                        model.load_state_dict(ckpt["model_state"])
+                        model.eval()
+
+                        num_sims = trajectories.shape[0]
+                        _, _, test_ids = split_sim_ids(num_sims, 0.7, 0.15, seed=0)
+                        plot_interface_error(model, trajectories, x_grid, t_grid,
+                                             sim_params, test_ids,
+                                             save_path=data_dir / "interface_error.png")
+                    else:
+                        print("Skipping interface_error (no --checkpoint provided)")
             else:
                 print("Skipping param-dependent plots (no --params provided)")
         else:
