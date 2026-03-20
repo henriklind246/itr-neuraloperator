@@ -1,9 +1,6 @@
 from src.physics.fd_solver_1d import FDSolver1D, Layer1D
 import numpy as np
 
-# T_star input is (x_grid, t_grid) output is
-
-
 def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
     a, b = 0.0, 1.0
     L = b-a
@@ -89,14 +86,146 @@ def time_order_test(dt_list: list) -> float:
     return p_t
 
 
+# ============================================================
+# MMS with interface thermal resistance (piecewise solution)
+# ============================================================
+#
+# Two-layer domain [0, 1] with interface at x_I = 0.5.
+# Layer 1 (left):  k1=2, rho1=1.5, cp1=1
+# Layer 2 (right): k2=1, rho2=0.8, cp2=1
+# Interface resistance: Rc = 0.1
+#
+# Manufactured solution:
+#   T_L*(x, t) = 300 + A_L sin(wt) [(x_I - x)^4 + D_L (x_I - x)] + C_L sin(wt)
+#   T_R*(x, t) = 300 + A_R sin(wt) (1 - x)^4
+#
+# Constraints (flux continuity + temperature jump ΔT = Rc·q_I):
+#   A_R = 2 k1 A_L D_L / k2
+#   C_L = k1 A_L D_L (1/(8 k2) + Rc)
+#
+# With A_L=10, D_L=1:  A_R=40, C_L=4.5
+# q_I(t) = 20 sin(wt),  jump = 2 sin(wt) = 0.1 × 20 sin(wt)  ✓
+
+def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
+    """MMS verification for two-layer solver with interface thermal resistance.
+
+    Returns (h, dt, max_abs_error, l2_error) — same signature as run_mms_once.
+    N must be even so that the interface at x=0.5 lands on a cell face.
+    """
+    a, b, x_I = 0.0, 1.0, 0.5
+    k1, k2 = 2.0, 1.0
+    rho1, cp1 = 1.5, 1.0
+    rho2, cp2 = 0.8, 1.0
+    Rc = 0.1
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    A_L, D_L = 10.0, 1.0
+    A_R = 2.0 * k1 * A_L * D_L / k2            # = 40
+    C_L = k1 * A_L * D_L * (1.0 / (8 * k2) + Rc)  # = 4.5
+
+    # --- manufactured solution (piecewise) ---
+    def T_star(x: np.ndarray, t: float) -> np.ndarray:
+        T = np.full_like(x, 300.0)
+        g = np.sin(omega * t)
+        left = x < x_I
+        T[left] += A_L * g * ((x_I - x[left])**4 + D_L * (x_I - x[left])) + C_L * g
+        T[~left] += A_R * g * (b - x[~left])**4
+        return T
+
+    # --- left flux: q = -k1 dT_L/dx|_{x=0} ---
+    def q_left(t: float) -> float:
+        return k1 * A_L * np.sin(omega * t) * (4.0 * (x_I - a)**3 + D_L)
+
+    # --- piecewise source: s = rho cp dT*/dt - k d^2T*/dx^2 ---
+    def source(x: np.ndarray, t: float) -> np.ndarray:
+        s = np.empty_like(x)
+        g = np.sin(omega * t)
+        gp = omega * np.cos(omega * t)
+        left = x < x_I
+        xl = x[left]
+        xr = x[~left]
+        s[left] = (rho1 * cp1 * gp * (A_L * ((x_I - xl)**4 + D_L * (x_I - xl)) + C_L)
+                   - k1 * A_L * g * 12.0 * (x_I - xl)**2)
+        s[~left] = (rho2 * cp2 * A_R * gp * (b - xr)**4
+                    - k2 * A_R * g * 12.0 * (b - xr)**2)
+        return s
+
+    # --- solver setup ---
+    layers = [
+        Layer1D(x_left=a, x_right=x_I, rho=rho1, cp=cp1, k=k1),
+        Layer1D(x_left=x_I, x_right=b, rho=rho2, cp=cp2, k=k2),
+    ]
+    sim = FDSolver1D(
+        a=a, b=b, N=N,
+        lam_target=0.5,
+        layers=layers,
+        interface_R=[Rc],
+        t_final=1.0,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=source,
+        q_left_fn=q_left,
+    )
+
+    T0 = T_star(sim.grid, sim.t[0])
+    _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.grid, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error**2)))
+    return sim.h, sim.dt, max_abs_err, l2_err
+
+
+def space_order_test_interface(N_list: list) -> float:
+    """Spatial convergence order for the interface-resistance MMS.
+
+    All N values must be even so that x=0.5 lands on a face.
+    Fixes dt=0.0005 so temporal error is negligible.
+    """
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_interface(N, dt=0.0005)
+        results.append(l2)
+        hs.append(h)
+    return float(np.log(results[0] / results[1]) / np.log(hs[0] / hs[1]))
+
+
+def time_order_test_interface(dt_list: list) -> float:
+    """Temporal convergence order for the interface-resistance MMS.
+
+    Fixes N=800 (even) so spatial error is negligible.
+    """
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_interface(N=800, dt=dt_val)
+        results.append(l2)
+    return float(np.log(results[0] / results[1]) / np.log(dt_list[0] / dt_list[1]))
+
+
 if __name__ == '__main__':
-    h, dt, max_error, l2_error = run_mms_once(N = 101)
-    print(f"With h={h} and dt={dt}, max abs. error between exact soln and numerical soln is {max_error} and l2 error is {l2_error}")
+    # --- Single-layer MMS ---
+    print("=== Single-Layer MMS ===")
+    h, dt, max_error, l2_error = run_mms_once(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={max_error:.6e}, l2_err={l2_error:.6e}")
     N_list = [51, 101]
     order_x = space_order_test(N_list=N_list)
-    print(f"Spatial order of FD solver is roughly {order_x}")
+    print(f"Spatial order: {order_x:.3f}")
 
     dt_list = [0.02, 0.01]
     order_t = time_order_test(dt_list=dt_list)
-    print(f"Temporal order of FD solver is roughly {order_t}")
+    print(f"Temporal order: {order_t:.3f}")
+
+    # --- Interface resistance MMS ---
+    print("\n=== Interface Resistance MMS ===")
+    h, dt, max_error, l2_error = run_mms_interface(N=100)
+    print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={max_error:.6e}, l2_err={l2_error:.6e}")
+
+    p_x = space_order_test_interface([50, 100])
+    print(f"Spatial order: {p_x:.3f}")
+
+    p_t = time_order_test_interface([0.02, 0.01])
+    print(f"Temporal order: {p_t:.3f}")
 
