@@ -42,6 +42,11 @@ def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
         "rho_cp2":   (0.5, 5.0),
     }
 
+    # Parameters sampled log-uniformly instead of uniformly.
+    # Frequency: penetration depth delta ~ 1/sqrt(f), so log-uniform gives
+    # more uniform coverage of the physics space (deep vs shallow penetration).
+    log_uniform_params = {"frequency"}
+
     # create list of parameter names to help calculate sample dim. and lower & upper bounds
     param_names = list(param_ranges.keys())
     sample_dim = len(param_names)
@@ -52,8 +57,15 @@ def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
     sampler = qmc.LatinHypercube(d=sample_dim, seed=seed)
     samples_unit = sampler.random(n=num_sims)
 
+    # uniform scaling for all parameters first
     # samples_scaled is a np.array with shape (num_samples, sample_dim), in this case (num_samples, 6)
     samples_scaled = qmc.scale(samples_unit, lower_bounds, upper_bounds).astype(np.float32)
+
+    # override log-uniform parameters: x = lo * (hi/lo)^u, u in [0, 1]
+    for idx, name in enumerate(param_names):
+        if name in log_uniform_params:
+            lo, hi = lower_bounds[idx], upper_bounds[idx]
+            samples_scaled[:, idx] = lo * (hi / lo) ** samples_unit[:, idx]
 
     return samples_scaled
 
