@@ -2,7 +2,7 @@
 Multilayer FD Solver Validation Tests
 =====================================
 
-Seven test groups validating the conservative multilayer Crank-Nicolson solver:
+eEight test groups validating the conservative multilayer Crank-Nicolson solver:
 
 1. Constant solution preservation
 2. Geometry / interface validation
@@ -11,6 +11,7 @@ Seven test groups validating the conservative multilayer Crank-Nicolson solver:
 5. Coefficient and indexing sanity
 6. Material-jump physics sanity
 7. Grid refinement / self-convergence
+8. Interface thermal resistance
 """
 
 import numpy as np
@@ -465,3 +466,258 @@ class TestGridRefinementConvergence:
             f"err_rel_l2 did not decrease with refinement: "
             f"N=50 -> {errors_l2[0]:.6e}, N=100 -> {errors_l2[1]:.6e}"
         )
+
+
+# ==================== TEST 8: INTERFACE THERMAL RESISTANCE ====================
+
+class TestInterfaceResistance:
+    """
+    Test 8: Verify the interface thermal resistance (interface_R) parameter.
+
+    Adding R_c (m²·K/W) to the face conductance at an interface:
+        G = 1 / (h/(2*k_L) + R_c + h/(2*k_R))
+    """
+
+    # --- 8a: R_c=0 matches perfect contact (bitwise identical) ---
+
+    def test_8a_zero_resistance_matches_default(self):
+        """interface_R=[0.0] must produce identical results to default (None)."""
+        layers = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
+            Layer1D(0.5, 1.0, rho=2.0, cp=1.5, k=0.5),
+        ]
+        sim_default = FDSolver1D(
+            N=100, layers=layers, t_final=0.2, **COMMON_PARAMS,
+        )
+        sim_zero = FDSolver1D(
+            N=100, layers=layers, t_final=0.2, interface_R=[0.0], **COMMON_PARAMS,
+        )
+        T0 = np.full(100, 300.0)
+        _, _, T_default = sim_default.solve(T0=T0, store_trajectory=False)
+        _, _, T_zero = sim_zero.solve(T0=T0, store_trajectory=False)
+
+        np.testing.assert_array_equal(T_default, T_zero)
+
+    # --- 8b: Constant field preserved with R_c > 0 ---
+
+    def test_8b_constant_preserved_with_resistance(self):
+        """T=300 with zero flux and R_c=1.0 stays constant (no flux = no jump)."""
+        layers = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
+            Layer1D(0.5, 1.0, rho=2.0, cp=1.5, k=0.5),
+        ]
+        sim = FDSolver1D(
+            a=0.0, b=1.0, N=100, lam_target=0.5,
+            layers=layers, t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0,
+            interface_R=[1.0],
+        )
+        T0 = np.full(100, 300.0)
+        _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+        max_err = np.max(np.abs(T_hist - 300.0))
+        assert max_err < 1e-10, f"Constant solution drifted: max error = {max_err}"
+
+    # --- 8c: G_face coefficient with R_c ---
+
+    def test_8c_face_conductance_with_resistance(self):
+        """White-box: G_face at the interface face must equal
+        1 / (h/(2*k_L) + R_c + h/(2*k_R))."""
+        k1, k2, Rc = 1.0, 0.5, 0.05
+        layers = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=k1),
+            Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=k2),
+        ]
+        sim = FDSolver1D(
+            N=100, layers=layers, t_final=0.1, interface_R=[Rc], **COMMON_PARAMS,
+        )
+        h = sim.h
+        expected_G = 1.0 / (h / (2.0 * k1) + Rc + h / (2.0 * k2))
+        np.testing.assert_allclose(sim.G_face[49], expected_G)
+
+    # --- 8d: Steady-state analytical (strongest verification) ---
+
+    def test_8d_steady_state_preserved(self):
+        """Start at exact piecewise-linear steady state with constant flux q,
+        two layers, and R_c. The solver must preserve this profile.
+
+        Exact steady-state (constant flux q, right Dirichlet T_right):
+            Layer 1: T(x) = T_right + q * [(L1 - x)/k1 + R_c + L2/k2]
+            Layer 2: T(x) = T_right + q * [(1 - x)/k2]
+
+        Temperature drop across the interface face (nodes 49 → 50):
+            ΔT = q * (h/(2*k1) + R_c + h/(2*k2))
+        """
+        k1, k2 = 2.0, 0.5
+        Rc = 0.1
+        q = 100.0  # constant left flux
+        T_right = 300.0
+        L1, L2 = 0.5, 0.5
+        N = 100
+
+        layers = [
+            Layer1D(0.0, L1, rho=1.0, cp=1.0, k=k1),
+            Layer1D(L1, 1.0, rho=1.0, cp=1.0, k=k2),
+        ]
+
+        sim = FDSolver1D(
+            a=0.0, b=1.0, N=N, lam_target=0.5,
+            layers=layers, t_final=0.5,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=1.0, phase=0.0,
+            q_left_fn=lambda t: q,
+            T_right_fn=lambda t: T_right,
+            interface_R=[Rc],
+            dt=0.001,
+        )
+
+        # Build exact steady-state IC on the grid
+        x = sim.grid
+        T0 = np.zeros(N, dtype=float)
+        for i, xi in enumerate(x):
+            if xi < L1 - sim.tol:
+                # Layer 1
+                T0[i] = T_right + q * ((L1 - xi) / k1 + Rc + L2 / k2)
+            else:
+                # Layer 2
+                T0[i] = T_right + q * ((1.0 - xi) / k2)
+
+        _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+
+        # Solver should preserve the steady state
+        max_err = err_inf(T_final, T0)
+        assert max_err < 1e-6, f"Steady state not preserved: max error = {max_err:.2e}"
+
+        # Verify temperature drop across interface face (nodes 49 → 50)
+        h = sim.h
+        expected_dT = q * (h / (2.0 * k1) + Rc + h / (2.0 * k2))
+        actual_dT = T0[49] - T0[50]
+        np.testing.assert_allclose(actual_dT, expected_dT, rtol=1e-10)
+
+    # --- 8e: Validation errors ---
+
+    def test_8e_wrong_length_raises(self):
+        """interface_R with wrong length must raise ValueError."""
+        layers = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
+            Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        # Two-layer has 1 interface, but we pass 2 resistances
+        with pytest.raises(ValueError, match="interface_R has length 2"):
+            FDSolver1D(
+                N=100, layers=layers, t_final=0.1, interface_R=[0.0, 0.0],
+                **COMMON_PARAMS,
+            )
+
+    def test_8e_negative_resistance_raises(self):
+        """Negative R_c must raise ValueError."""
+        layers = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
+            Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        with pytest.raises(ValueError, match="negative"):
+            FDSolver1D(
+                N=100, layers=layers, t_final=0.1, interface_R=[-0.01],
+                **COMMON_PARAMS,
+            )
+
+    def test_8e_single_layer_defaults_to_empty(self):
+        """Single layer has no interfaces, so interface_R defaults to []."""
+        layers = [Layer1D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)]
+        sim = FDSolver1D(
+            N=100, layers=layers, t_final=0.1, **COMMON_PARAMS,
+        )
+        assert sim.interface_R == []
+
+    # --- 8f: Large R_c sanity ---
+
+    def test_8f_large_resistance_no_blowup(self):
+        """R_c=10.0: no NaN/Inf, finite temperatures, solution bounded."""
+        layers = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
+            Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        sim = FDSolver1D(
+            N=100, layers=layers, t_final=0.2, interface_R=[10.0], **COMMON_PARAMS,
+        )
+        T0 = np.full(100, 300.0)
+        _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+        assert np.all(np.isfinite(T_hist)), "Non-finite values with large R_c"
+        assert np.min(T_hist) > 0.0, f"Unphysical negative temperature: {np.min(T_hist)}"
+        assert np.max(T_hist) < 2000.0, f"Unphysical temperature spike: {np.max(T_hist)}"
+
+    # --- 8g: Three layers, two interfaces ---
+
+    def test_8g_three_layers_two_interfaces(self):
+        """Three layers with different R_c at each interface runs without error.
+
+        Domain [0, 1], N=99 (h=1/98). Interfaces at x=0.25 and x=0.75.
+        Face alignment: 0.25*98 - 0.5 = 24 (integer), 0.75*98 - 0.5 = 73 (integer).
+        Node check: 0.25*98 = 24.5, 0.75*98 = 73.5 (not on nodes).
+        """
+        layers_3 = [
+            Layer1D(0.0, 0.25, rho=1.0, cp=1.0, k=2.0),
+            Layer1D(0.25, 0.75, rho=1.5, cp=1.0, k=0.5),
+            Layer1D(0.75, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        sim = FDSolver1D(
+            a=0.0, b=1.0, N=99, lam_target=0.5,
+            layers=layers_3, t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            interface_R=[0.05, 0.1],
+        )
+
+        assert len(sim.interface_R) == 2
+        assert len(sim.interface_positions) == 2
+
+        T0 = np.full(99, 300.0)
+        _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+        assert np.all(np.isfinite(T_final)), "Non-finite values with three layers"
+
+
+# ============================================================
+# 9. MMS VERIFICATION — interface thermal resistance
+#    Piecewise manufactured solution with R_c, verifying
+#    2nd-order spatial and temporal convergence.
+# ============================================================
+
+from src.physics.mms_1d import (
+    run_mms_interface,
+    space_order_test_interface,
+    time_order_test_interface,
+)
+
+
+class TestMmsInterfaceResistance:
+    """MMS convergence verification for the CN scheme with interface resistance.
+
+    Uses a piecewise manufactured solution T_L*(x,t), T_R*(x,t) that
+    satisfies flux continuity and the temperature jump condition
+    ΔT = R_c · q_I at the interface.  Source terms are derived analytically.
+    """
+
+    def test_9a_moderate_grid_low_error(self):
+        """N=100 gives L2 error well below 1e-2 (≈7.5e-4 expected)."""
+        _, _, max_err, l2_err = run_mms_interface(N=100)
+        assert l2_err < 5e-3, f"L2 error {l2_err:.4e} too large for N=100"
+        assert max_err < 5e-3, f"Max error {max_err:.4e} too large for N=100"
+
+    def test_9b_fine_grid_very_low_error(self):
+        """N=400, dt=0.001 gives L2 error < 1e-3 (≈5.6e-5 expected)."""
+        _, _, max_err, l2_err = run_mms_interface(N=400, dt=0.001)
+        assert l2_err < 1e-3, f"L2 error {l2_err:.4e} too large for fine grid"
+        assert max_err < 1e-3, f"Max error {max_err:.4e} too large for fine grid"
+
+    def test_9c_spatial_order_two(self):
+        """Spatial convergence order ≈ 2 (dt fixed small, vary N)."""
+        p = space_order_test_interface(N_list=[50, 100])
+        assert 1.8 < p < 2.2, f"Spatial order {p:.3f} outside [1.8, 2.2]"
+
+    def test_9d_temporal_order_two(self):
+        """Temporal convergence order ≈ 2 (N fixed large, vary dt)."""
+        p = time_order_test_interface(dt_list=[0.02, 0.01])
+        assert 1.8 < p < 2.2, f"Temporal order {p:.3f} outside [1.8, 2.2]"
