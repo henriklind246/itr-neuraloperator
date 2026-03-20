@@ -2,6 +2,21 @@ import numpy as np
 from src.physics.fd_solver_1d import FDSolver1D, Layer1D
 from scipy.stats import qmc
 
+#TODO: sample k using log-uniform sampling
+
+# -------- IMPORT NOTES --------
+# There are a few steps to determining a realistic and reasonable sampling range for contact resistance R_c:
+# (1) fix h, and choose reasonable k ranges (with the operator-learning task in mind)
+# (2) now since conduction resistance is determined, calculate h/2k range, and then determine conduction resistance range
+# (3) the conduction resistance sampling range determines what range of contact resistance samples are realistic and meaningful using ratio resistance
+
+# Current plan:
+# k range: [0.05, 50] - log-uniform, 3 decades
+# rho*cp range: [0.5, 5] - , 1 decade
+
+# conduction resistance range: [0.0002, 0.2]
+# reasonable range for contact resistance: [0.0001, 0.5]
+
 
 def random_ic(a: float, b: float, grid: np.ndarray, rng) -> np.ndarray:
     L = b - a
