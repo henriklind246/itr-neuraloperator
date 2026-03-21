@@ -8,6 +8,7 @@ from torch.optim import Adam
 
 from data.dataset import create_dataloaders, load_sim_data, split_sim_ids
 from src.operators.fno2d import FNO2d
+from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 
 from omegaconf import OmegaConf
@@ -62,10 +63,11 @@ def _load_completed_result(run_path: Path, seed: int) -> dict[str, float | int |
     return {"seed": seed, "best_val": float(ckpt["best_val"]), "best_path": str(best_path)}
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> tuple[float, float]:
+def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_mask=None) -> tuple[float, float, float]:
     model.train()
     training_loss = 0.0
     train_rel_l2 = 0.0
+    train_iface_rel_l2 = 0.0
 
     for x_batch, y_batch in train_loader:
         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
@@ -79,26 +81,33 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device) -> tuple[fl
         with torch.no_grad():
             batch_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
             train_rel_l2 += batch_rel_l2.item()
+            if iface_mask is not None:
+                train_iface_rel_l2 += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
 
     training_loss /= len(train_loader)
     train_rel_l2 /= len(train_loader)
-    return training_loss, train_rel_l2
+    train_iface_rel_l2 /= len(train_loader)
+    return training_loss, train_rel_l2, train_iface_rel_l2
 
 
-def validate(model, val_loader, device) -> float:
-    """Output val_rel_l2 after validation."""
+def validate(model, val_loader, device, *, iface_mask=None) -> tuple[float, float]:
+    """Return (val_rel_l2, val_iface_rel_l2) after validation."""
     with torch.no_grad():
         model.eval()
         val_loss = 0.0
+        val_iface = 0.0
 
         for x_batch, y_batch in val_loader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             y_pred = model(x_batch)
             val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
             val_loss += val_rel_l2.item()
+            if iface_mask is not None:
+                val_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
 
         val_loss /= len(val_loader)
-        return val_loss
+        val_iface /= len(val_loader)
+        return val_loss, val_iface
 
 
 def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, float | int | str]:
@@ -160,7 +169,17 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         scheduler.load_state_dict(ckpt["scheduler_state"])
         print(f"Resuming seed {seed} from epoch {start_epoch} (best_val={best_val_loss:.4f}%, bad_epochs={bad_epochs})")
 
-    loss_fn = torch.nn.MSELoss()
+    loss_cfg = config["training"].get("loss", {})
+    loss_fn = SpatiallyWeightedMSE(
+        x_grid=x_grid,
+        interface_x=loss_cfg.get("interface_x", 0.5),
+        interface_half_width=loss_cfg.get("interface_half_width", 0.05),
+        interface_weight=loss_cfg.get("interface_weight", 1.0),
+    ).to(device)
+
+    iface_mask = build_interface_mask(
+        x_grid, loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
+    ).to(device)
 
     epochs = config["training"]["epochs"]
     validate_every = config["training"]["validate_every"]
@@ -170,7 +189,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     # --- CSV: truncate to start_epoch when resuming, overwrite when fresh ---
     csv_path = run_path / "train_metrics.csv"
-    fieldnames = ["epoch", "train_loss", "train_rel_l2", "val_rel_l2", "lr", "is_best"]
+    fieldnames = ["epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2", "val_rel_l2", "val_iface_rel_l2", "lr", "is_best"]
 
     if resuming and csv_path.exists():
         # Keep only rows with epoch < start_epoch (discard stale rows beyond checkpoint)
@@ -187,17 +206,18 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         csv_writer.writeheader()
 
     for epoch in range(start_epoch, epochs):
-        train_loss, train_rel_l2 = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn, device=device)
+        train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn, device=device, iface_mask=iface_mask)
         scheduler.step()
 
-        print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%")
+        print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%")
         is_best = 0
         val_loss = None
+        val_iface_rel_l2 = None
         should_stop = False
 
         if (epoch % validate_every) == 0:
-            val_loss = validate(model=fno, val_loader=validation_set, device=device)
-            print(f"Validation loss for epoch {epoch} is {val_loss}")
+            val_loss, val_iface_rel_l2 = validate(model=fno, val_loader=validation_set, device=device, iface_mask=iface_mask)
+            print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -244,7 +264,9 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
                 "epoch": epoch,
                 "train_loss": float(train_loss),
                 "train_rel_l2": float(train_rel_l2),
+                "train_iface_rel_l2": float(train_iface_rel_l2),
                 "val_rel_l2": "" if val_loss is None else float(val_loss),
+                "val_iface_rel_l2": "" if val_iface_rel_l2 is None else float(val_iface_rel_l2),
                 "lr": float(lr),
                 "is_best": int(is_best),
             }
