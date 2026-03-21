@@ -521,21 +521,26 @@ def plot_mms_order_estimation(save_path: str | Path | None = None):
 # ============================================================
 
 def plot_training_curves(csv_path: str | Path, save_path: str | Path | None = None):
-    """Plot training loss, rel L2 metrics, and learning rate from a train_metrics.csv file.
+    """Plot training loss, rel L2 metrics, interface metrics, and learning rate.
 
-    Layout: 2-row subplot
-        Top: train_loss (log, left y) and train/val rel_l2 (log, right y), best checkpoint starred
+    Layout (3-row if interface columns present, 2-row otherwise):
+        Top:    train_loss (log, left y) and train/val rel_l2 (log, right y), best checkpoint starred
+        Middle: train/val interface rel_l2 (log y) — only when CSV has iface columns
         Bottom: learning rate vs epoch (log y)
     """
     import csv as csv_mod
 
     csv_path = Path(csv_path)
     epochs, train_losses, train_rel_l2s, val_rel_l2s, lrs, is_bests = [], [], [], [], [], []
+    train_iface_rel_l2s, val_iface_rel_l2s = [], []
 
     has_train_rel_l2 = False
+    has_iface = False
     with csv_path.open("r") as f:
         reader = csv_mod.DictReader(f)
-        has_train_rel_l2 = "train_rel_l2" in (reader.fieldnames or [])
+        fieldnames = reader.fieldnames or []
+        has_train_rel_l2 = "train_rel_l2" in fieldnames
+        has_iface = "train_iface_rel_l2" in fieldnames
         for row in reader:
             epochs.append(int(row["epoch"]))
             train_losses.append(float(row["train_loss"]))
@@ -544,22 +549,40 @@ def plot_training_curves(csv_path: str | Path, save_path: str | Path | None = No
             val_rel_l2s.append(float(row["val_rel_l2"]) if row["val_rel_l2"] != "" else None)
             lrs.append(float(row["lr"]))
             is_bests.append(int(row["is_best"]))
+            if has_iface:
+                train_iface_rel_l2s.append(float(row["train_iface_rel_l2"]))
+                val_iface_rel_l2s.append(float(row["val_iface_rel_l2"]) if row["val_iface_rel_l2"] != "" else None)
 
     epochs = np.array(epochs)
     train_losses = np.array(train_losses)
     if has_train_rel_l2:
         train_rel_l2s = np.array(train_rel_l2s)
+    if has_iface:
+        train_iface_rel_l2s = np.array(train_iface_rel_l2s)
     lrs = np.array(lrs)
 
     # filter validation epochs
     val_epochs = np.array([e for e, v in zip(epochs, val_rel_l2s) if v is not None])
     val_values = np.array([v for v in val_rel_l2s if v is not None])
 
+    if has_iface:
+        val_iface_epochs = np.array([e for e, v in zip(epochs, val_iface_rel_l2s) if v is not None])
+        val_iface_values = np.array([v for v in val_iface_rel_l2s if v is not None])
+
     # best checkpoint epochs
     best_epochs = np.array([e for e, b in zip(epochs, is_bests) if b == 1])
     best_vals = np.array([v for v, b in zip(val_rel_l2s, is_bests) if b == 1 and v is not None])
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 7), gridspec_kw={"height_ratios": [3, 1]})
+    if has_iface:
+        best_iface_vals = np.array([v for v, b in zip(val_iface_rel_l2s, is_bests) if b == 1 and v is not None])
+
+    # --- build figure: 3 panels if iface data present, 2 otherwise ---
+    if has_iface:
+        fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
+            3, 1, figsize=(10, 10), gridspec_kw={"height_ratios": [3, 2, 1]})
+    else:
+        fig, (ax_top, ax_bot) = plt.subplots(
+            2, 1, figsize=(10, 7), gridspec_kw={"height_ratios": [3, 1]})
 
     # --- top panel: train MSE (left y) + rel L2 metrics (right y) ---
     color_train = "C0"
@@ -586,6 +609,24 @@ def plot_training_curves(csv_path: str | Path, save_path: str | Path | None = No
     ax_top.set_title("Training Curves")
     ax_top.grid(True, linestyle="--", alpha=0.3)
 
+    # --- middle panel: interface rel L2 (only if iface data present) ---
+    if has_iface:
+        color_iface_train = "C4"  # purple
+        color_iface_val = "C1"    # orange
+
+        ax_mid.semilogy(epochs, train_iface_rel_l2s, color=color_iface_train, alpha=0.3,
+                         linewidth=0.6, label="Train iface rel. L2 (%)")
+        ax_mid.semilogy(val_iface_epochs, val_iface_values, color=color_iface_val,
+                         linewidth=1.2, label="Val iface rel. L2 (%)")
+        if len(best_epochs) > 0 and len(best_iface_vals) > 0:
+            ax_mid.scatter(best_epochs, best_iface_vals, marker="*", s=60, color="gold",
+                           zorder=5, edgecolors="k", linewidths=0.5, label="Best checkpoint")
+        ax_mid.set_xlabel("Epoch")
+        ax_mid.set_ylabel("Interface Rel. L2 (%)")
+        ax_mid.set_title("Interface Region Error")
+        ax_mid.legend(fontsize=8, loc="upper right")
+        ax_mid.grid(True, linestyle="--", alpha=0.3)
+
     # --- bottom panel: learning rate ---
     ax_bot.semilogy(epochs, lrs, color="C2", linewidth=1.0)
     ax_bot.set_xlabel("Epoch")
@@ -596,6 +637,7 @@ def plot_training_curves(csv_path: str | Path, save_path: str | Path | None = No
     fig.tight_layout()
     if save_path is None:
         save_path = csv_path.parent / "training_curves.png"
+    save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved training curves to: {save_path}")
     plt.close(fig)
