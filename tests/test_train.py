@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.fno2d import FNO2d
+from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 import csv
 
 from src.operators.train import (
@@ -91,71 +92,84 @@ def tiny_training_setup():
     loader = DataLoader(TensorDataset(X, Y), batch_size=2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = torch.nn.MSELoss()
+    x_grid_np = np.linspace(0.0, 1.0, Nx).astype(np.float32)
+    loss_fn = SpatiallyWeightedMSE(x_grid_np, interface_weight=1.0)
+    iface_mask = build_interface_mask(x_grid_np)
     device = torch.device("cpu")
 
-    return model, loader, optimizer, loss_fn, device
+    return model, loader, optimizer, loss_fn, device, iface_mask
 
 
 # ===================== train_one_epoch =====================
 
 class TestTrainOneEpoch:
     def test_returns_tuple_of_floats(self, tiny_training_setup):
-        model, loader, optimizer, loss_fn, device = tiny_training_setup
-        result = train_one_epoch(model, loader, optimizer, loss_fn, device)
-        assert isinstance(result, tuple) and len(result) == 2
-        loss, rel_l2 = result
+        model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
+        result = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
+        assert isinstance(result, tuple) and len(result) == 3
+        loss, rel_l2, iface_rel_l2 = result
         assert isinstance(loss, float)
         assert isinstance(rel_l2, float)
+        assert isinstance(iface_rel_l2, float)
 
     def test_loss_is_finite(self, tiny_training_setup):
-        model, loader, optimizer, loss_fn, device = tiny_training_setup
-        loss, rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
+        loss, rel_l2, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
         assert np.isfinite(loss)
         assert np.isfinite(rel_l2)
+        assert np.isfinite(iface_rel_l2)
 
     def test_loss_is_nonnegative(self, tiny_training_setup):
-        model, loader, optimizer, loss_fn, device = tiny_training_setup
-        loss, rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
+        loss, rel_l2, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
         assert loss >= 0
         assert rel_l2 >= 0
+        assert iface_rel_l2 >= 0
 
     def test_updates_parameters(self, tiny_training_setup):
-        model, loader, optimizer, loss_fn, device = tiny_training_setup
+        model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
         params_before = {n: p.clone() for n, p in model.named_parameters()}
-        train_one_epoch(model, loader, optimizer, loss_fn, device)
+        train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
         changed = any(
             not torch.equal(params_before[n], p)
             for n, p in model.named_parameters()
         )
         assert changed
 
+    def test_no_iface_mask_returns_zero_iface_metric(self, tiny_training_setup):
+        model, loader, optimizer, loss_fn, device, _ = tiny_training_setup
+        _, _, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        assert iface_rel_l2 == 0.0
+
 
 # ===================== validate =====================
 
 class TestValidate:
-    def test_returns_float(self, tiny_training_setup):
-        model, loader, _, _, device = tiny_training_setup
-        val = validate(model, loader, device)
-        assert isinstance(val, float)
+    def test_returns_tuple(self, tiny_training_setup):
+        model, loader, _, _, device, iface_mask = tiny_training_setup
+        result = validate(model, loader, device, iface_mask=iface_mask)
+        assert isinstance(result, tuple) and len(result) == 2
+        val_rel_l2, val_iface = result
+        assert isinstance(val_rel_l2, float)
+        assert isinstance(val_iface, float)
 
     def test_loss_is_nonnegative(self, tiny_training_setup):
-        model, loader, _, _, device = tiny_training_setup
-        val = validate(model, loader, device)
-        assert val >= 0
+        model, loader, _, _, device, iface_mask = tiny_training_setup
+        val_rel_l2, val_iface = validate(model, loader, device, iface_mask=iface_mask)
+        assert val_rel_l2 >= 0
+        assert val_iface >= 0
 
     def test_no_gradient_accumulation(self, tiny_training_setup):
-        model, loader, _, _, device = tiny_training_setup
-        # Zero all grads first
+        model, loader, _, _, device, iface_mask = tiny_training_setup
         model.zero_grad()
-        validate(model, loader, device)
+        validate(model, loader, device, iface_mask=iface_mask)
         for p in model.parameters():
             assert p.grad is None or torch.all(p.grad == 0)
 
     def test_does_not_change_parameters(self, tiny_training_setup):
-        model, loader, _, _, device = tiny_training_setup
+        model, loader, _, _, device, iface_mask = tiny_training_setup
         params_before = {n: p.clone() for n, p in model.named_parameters()}
-        validate(model, loader, device)
+        validate(model, loader, device, iface_mask=iface_mask)
         for n, p in model.named_parameters():
             assert torch.equal(params_before[n], p)
 
