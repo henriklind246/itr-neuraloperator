@@ -39,7 +39,10 @@ training:
     step_size: 50
     gamma: 0.5
   optimizer: "Adam"
-  loss_function: "MSELoss"
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.05
+    interface_weight: 10.0
   validate_every: 10
   patience: 15
   checkpoint_metric: "val_rel_l2"
