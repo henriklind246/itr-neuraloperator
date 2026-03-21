@@ -1,13 +1,14 @@
 import torch
 from data.dataset import load_sim_data, split_sim_ids, create_dataloaders
 from src.operators.fno2d import FNO2d
+from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 from pathlib import Path
 import math
 import json
 from datetime import datetime
 
-"""File loads checkpoint, runs test metrics test_rel_l2, outputs test_rel_l2"""
+"""File loads checkpoint, runs test metrics test_rel_l2 and test_iface_rel_l2, outputs seed_report.json"""
 
 # -------- LOAD TEST SET ---------
 
@@ -27,15 +28,16 @@ def build_test_loader(config):
                                                          sim_params=sim_params,
                                                          k=config["training"]["k"], H=config["training"]["H"])
 
-    return testing_set
+    return testing_set, x_grid
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
-def evaluate(model, test_loader, device):
-
+def evaluate(model, test_loader, device, *, iface_mask=None):
+    """Return (test_rel_l2, test_iface_rel_l2) after evaluation on test set."""
     with torch.no_grad():
         model.eval()
         test_loss = 0.0
+        test_iface = 0.0
 
         for x_batch, y_batch in test_loader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
@@ -44,11 +46,14 @@ def evaluate(model, test_loader, device):
             test_rel_l2 = (torch.mean((y_pred - y_batch)**2)/torch.mean(y_batch**2))**0.5 * 100
 
             test_loss += test_rel_l2.item()
+            if iface_mask is not None:
+                test_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
 
         # average test loss across all batches
         test_loss /= len(test_loader)
+        test_iface /= len(test_loader)
 
-    return test_loss
+    return test_loss, test_iface
 
 
 # --------- EVAL ALL SEEDS IN RUNS ---------
@@ -68,7 +73,12 @@ def eval_all_seeds(run_root: str):
         config = ckpt['conf']
         device = resolve_device(config.get("training", {}).get("device", "auto"))
 
-        test_loader = build_test_loader(config)
+        test_loader, x_grid = build_test_loader(config)
+
+        loss_cfg = config.get("training", {}).get("loss", {})
+        iface_mask = build_interface_mask(
+            x_grid, loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
+        ).to(device)
 
         fno = FNO2d(config['model']['parameters']['modes1'], config['model']['parameters']['modes2'], config['model']['parameters']['width'],
                     in_channels=config['model']['parameters']['in_channels'],
@@ -76,7 +86,7 @@ def eval_all_seeds(run_root: str):
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
-        test_rel_l2 = evaluate(model=fno, test_loader=test_loader, device=device)
+        test_rel_l2, test_iface_rel_l2 = evaluate(model=fno, test_loader=test_loader, device=device, iface_mask=iface_mask)
 
         results.append(
             {
@@ -84,6 +94,7 @@ def eval_all_seeds(run_root: str):
                 "best_epoch": ckpt["epoch"],
                 "best_val": float(ckpt["best_val"]),
                 "test_rel_l2": float(test_rel_l2),
+                "test_iface_rel_l2": float(test_iface_rel_l2),
                 "ckpt": str(ckpt_path)
             }
         )
@@ -110,20 +121,23 @@ def mean_std(values: list[float]) -> tuple[float, float]:
 def print_seed_report(results: list[dict]) -> dict:
     best_vals = [r['best_val'] for r in results]
     test_rel_l2 = [r['test_rel_l2'] for r in results]
+    test_iface = [r['test_iface_rel_l2'] for r in results]
 
-    # compute the mean and std for both validation loss and test loss
+    # compute the mean and std for validation, test, and interface test
     val_mu, val_std = mean_std(best_vals)
     test_mu, test_std = mean_std(test_rel_l2)
+    iface_mu, iface_std = mean_std(test_iface)
 
     # print seed report
     print("\n===== Seed Report =====")
     print(f"Number of seeds: {len(results)}")
     print(f"best_val_loss mean & standard dist. ({val_mu}, {val_std})")
     print(f"test_rel_l2 mean & standard dist. ({test_mu}, {test_std})")
+    print(f"test_iface_rel_l2 mean & standard dist. ({iface_mu}, {iface_std})")
 
     # also print best seed by lowest test error
     best = min(results, key= lambda r: r['test_rel_l2'])
-    print(f"Best by lowest test error: seed={best['seed']} test_rel_l2={best['test_rel_l2']}")
+    print(f"Best by lowest test error: seed={best['seed']} test_rel_l2={best['test_rel_l2']} test_iface_rel_l2={best['test_iface_rel_l2']}")
 
     # return dict
     return {
@@ -131,7 +145,9 @@ def print_seed_report(results: list[dict]) -> dict:
         "best_val_loss_mean": val_mu,
         "best_val_loss_std": val_std,
         "test_rel_l2_mean": test_mu,
-        "test_rel_l2_std": test_std
+        "test_rel_l2_std": test_std,
+        "test_iface_rel_l2_mean": iface_mu,
+        "test_iface_rel_l2_std": iface_std,
     }
 
 # generated by ChatGPT 5.2 on 02/18/26
@@ -154,7 +170,7 @@ if __name__ == '__main__':
     results = eval_all_seeds(run_root)
 
     for r in results:
-        print(f"seed={r['seed']} best epoch: {r['best_epoch']} best validation loss: {r['best_val']} test_rel_l2: {r['test_rel_l2']}.")
+        print(f"seed={r['seed']} best epoch: {r['best_epoch']} best validation loss: {r['best_val']} test_rel_l2: {r['test_rel_l2']} test_iface_rel_l2: {r['test_iface_rel_l2']}.")
 
     # print summary evaluation of seeds
     summary = print_seed_report(results)

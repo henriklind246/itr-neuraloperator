@@ -25,15 +25,29 @@ def eval_setup():
 
 
 class TestEvaluate:
-    def test_returns_float(self, eval_setup):
+    def test_returns_tuple(self, eval_setup):
         model, loader, device = eval_setup
         result = evaluate(model, loader, device)
-        assert isinstance(result, float)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        test_rel_l2, test_iface_rel_l2 = result
+        assert isinstance(test_rel_l2, float)
+        assert isinstance(test_iface_rel_l2, float)
 
     def test_nonnegative(self, eval_setup):
         model, loader, device = eval_setup
-        result = evaluate(model, loader, device)
-        assert result >= 0
+        test_rel_l2, test_iface_rel_l2 = evaluate(model, loader, device)
+        assert test_rel_l2 >= 0
+        assert test_iface_rel_l2 >= 0
+
+    def test_with_iface_mask(self, eval_setup):
+        model, loader, device = eval_setup
+        Nx = 11
+        iface_mask = torch.zeros(Nx, dtype=torch.bool)
+        iface_mask[4:7] = True  # mark 3 nodes as interface
+        test_rel_l2, test_iface_rel_l2 = evaluate(model, loader, device, iface_mask=iface_mask)
+        assert isinstance(test_iface_rel_l2, float)
+        assert test_iface_rel_l2 >= 0
 
     def test_model_stays_eval(self, eval_setup):
         model, loader, device = eval_setup
@@ -73,18 +87,20 @@ class TestMeanStd:
 class TestPrintSeedReport:
     def test_returns_dict(self):
         results = [
-            {"seed": 0, "best_epoch": 10, "best_val": 0.5, "test_rel_l2": 0.6, "ckpt": "x"},
-            {"seed": 1, "best_epoch": 20, "best_val": 0.4, "test_rel_l2": 0.5, "ckpt": "y"},
+            {"seed": 0, "best_epoch": 10, "best_val": 0.5, "test_rel_l2": 0.6, "test_iface_rel_l2": 0.8, "ckpt": "x"},
+            {"seed": 1, "best_epoch": 20, "best_val": 0.4, "test_rel_l2": 0.5, "test_iface_rel_l2": 0.7, "ckpt": "y"},
         ]
         summary = print_seed_report(results)
         assert isinstance(summary, dict)
         assert "num_seeds" in summary
         assert "best_val_loss_mean" in summary
         assert "test_rel_l2_mean" in summary
+        assert "test_iface_rel_l2_mean" in summary
+        assert "test_iface_rel_l2_std" in summary
 
     def test_correct_num_seeds(self):
         results = [
-            {"seed": 0, "best_epoch": 10, "best_val": 0.5, "test_rel_l2": 0.6, "ckpt": "x"},
+            {"seed": 0, "best_epoch": 10, "best_val": 0.5, "test_rel_l2": 0.6, "test_iface_rel_l2": 0.8, "ckpt": "x"},
         ]
         summary = print_seed_report(results)
         assert summary["num_seeds"] == 1
