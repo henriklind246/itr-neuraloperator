@@ -17,8 +17,8 @@ class TestSpatiallyWeightedMSE:
         loss_fn = SpatiallyWeightedMSE(x_grid, interface_weight=1.0)
         mse_fn = torch.nn.MSELoss()
 
-        y_pred = torch.randn(2, 101, 40, 1)
-        y_true = torch.randn(2, 101, 40, 1)
+        y_pred = torch.randn(2, 101, 1)
+        y_true = torch.randn(2, 101, 1)
 
         weighted = loss_fn(y_pred, y_true)
         plain = mse_fn(y_pred, y_true)
@@ -32,10 +32,10 @@ class TestSpatiallyWeightedMSE:
 
     def test_higher_weight_increases_interface_loss(self, x_grid):
         """Error concentrated at the interface should produce higher loss with larger weight."""
-        y_true = torch.zeros(1, 101, 10, 1)
-        y_pred = torch.zeros(1, 101, 10, 1)
+        y_true = torch.zeros(1, 101, 1)
+        y_pred = torch.zeros(1, 101, 1)
         # Place error only at the interface node (index 50 for x=0.5)
-        y_pred[:, 50, :, :] = 1.0
+        y_pred[:, 50, :] = 1.0
 
         loss_w1 = SpatiallyWeightedMSE(x_grid, interface_weight=1.0)(y_pred, y_true)
         loss_w10 = SpatiallyWeightedMSE(x_grid, interface_weight=10.0)(y_pred, y_true)
@@ -49,15 +49,15 @@ class TestSpatiallyWeightedMSE:
         assert loss_fn.weights.device == device
 
     def test_weight_shape(self, x_grid):
-        """Weights should broadcast against (B, Nx, H, 1)."""
+        """Weights should broadcast against (B, Nx, 1)."""
         loss_fn = SpatiallyWeightedMSE(x_grid)
-        assert loss_fn.weights.shape == (1, 101, 1, 1)
+        assert loss_fn.weights.shape == (1, 101, 1)
 
     def test_gradient_flows(self, x_grid):
         """Loss should be differentiable."""
         loss_fn = SpatiallyWeightedMSE(x_grid, interface_weight=10.0)
-        y_pred = torch.randn(2, 101, 10, 1, requires_grad=True)
-        y_true = torch.randn(2, 101, 10, 1)
+        y_pred = torch.randn(2, 101, 1, requires_grad=True)
+        y_true = torch.randn(2, 101, 1)
         loss = loss_fn(y_pred, y_true)
         loss.backward()
         assert y_pred.grad is not None
@@ -98,34 +98,34 @@ class TestComputeInterfaceRelL2:
     def test_perfect_prediction_gives_zero(self):
         """Zero error should give 0% rel L2."""
         mask = torch.tensor([False, True, True, False, False])
-        y = torch.randn(2, 5, 10, 1)
+        y = torch.randn(2, 5, 1)
         result = compute_interface_rel_l2(y, y, mask)
         assert result == pytest.approx(0.0, abs=1e-6)
 
     def test_nonzero_error(self):
         """Non-zero error should give positive rel L2."""
         mask = torch.tensor([False, True, True, False, False])
-        y_true = torch.ones(2, 5, 10, 1)
-        y_pred = torch.ones(2, 5, 10, 1) * 1.1
+        y_true = torch.ones(2, 5, 1)
+        y_pred = torch.ones(2, 5, 1) * 1.1
         result = compute_interface_rel_l2(y_pred, y_true, mask)
         assert result > 0.0
 
     def test_returns_percentage(self):
         """Result should be in percent (multiplied by 100)."""
         mask = torch.tensor([False, True, True, False, False])
-        y_true = torch.ones(2, 5, 10, 1)
+        y_true = torch.ones(2, 5, 1)
         # 10% error everywhere
-        y_pred = torch.ones(2, 5, 10, 1) * 1.1
+        y_pred = torch.ones(2, 5, 1) * 1.1
         result = compute_interface_rel_l2(y_pred, y_true, mask)
         assert result == pytest.approx(10.0, rel=0.01)
 
     def test_only_uses_masked_nodes(self):
         """Errors outside the mask should not affect the result."""
         mask = torch.tensor([False, True, False])
-        y_true = torch.ones(1, 3, 5, 1)
+        y_true = torch.ones(1, 3, 1)
         y_pred = y_true.clone()
         # Large error only outside the mask
-        y_pred[:, 0, :, :] = 100.0
-        y_pred[:, 2, :, :] = 100.0
+        y_pred[:, 0, :] = 100.0
+        y_pred[:, 2, :] = 100.0
         result = compute_interface_rel_l2(y_pred, y_true, mask)
         assert result == pytest.approx(0.0, abs=1e-6)

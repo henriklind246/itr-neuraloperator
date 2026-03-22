@@ -1,6 +1,6 @@
 import torch
-from data.dataset import load_sim_data, split_sim_ids, create_dataloaders
-from src.operators.fno2d import FNO2d
+from data.dataset import load_sim_data, split_sim_ids, create_dataloaders, T_EPS
+from src.operators.fno2d import FNO1d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 from pathlib import Path
@@ -15,39 +15,59 @@ from datetime import datetime
 def build_test_loader(config):
     import numpy as np
 
-    trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=config["data"]["trajectories.npy"],
-                                                 x_grid_path=config["data"]["x_grid_path"],
-                                                 t_grid_path=config["data"]["t_grid_path"])
+    trajectories, x_grid, t_grid = load_sim_data(
+        sim_traj_path=config["data"]["trajectories.npy"],
+        x_grid_path=config["data"]["x_grid_path"],
+        t_grid_path=config["data"]["t_grid_path"],
+    )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
-    _, _, testing_set = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
-                                                         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
-                                                         batch_size=config["training"]["batch_size"],
-                                                         sim_params=sim_params,
-                                                         k=config["training"]["k"], H=config["training"]["H"])
+    _, _, testing_set = create_dataloaders(
+        trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+        train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
+        batch_size=config["training"]["batch_size"],
+        sim_params=sim_params,
+        pairs_per_sim_train=config["training"].get("pairs_per_sim_train", 50),
+        pairs_per_sim_val=config["training"].get("pairs_per_sim_val", 20),
+        test_stride=config["training"].get("test_stride", 5),
+    )
 
     return testing_set, x_grid
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
 def evaluate(model, test_loader, device, *, iface_mask=None):
-    """Return (test_rel_l2, test_iface_rel_l2) after evaluation on test set."""
+    """Return (test_rel_l2, test_iface_rel_l2) after evaluation on test set.
+
+    Metrics are computed in physical (denormalized) space using T_stats
+    from the dataset.
+    """
     with torch.no_grad():
         model.eval()
         test_loss = 0.0
         test_iface = 0.0
 
-        for x_batch, y_batch in test_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            y_pred = model(x_batch)
+        for x_spatial, cond, y_batch, T_stats in test_loader:
+            x_spatial = x_spatial.to(device)
+            cond = cond.to(device)
+            y_batch = y_batch.to(device)
+            T_stats = T_stats.to(device)
 
-            test_rel_l2 = (torch.mean((y_pred - y_batch)**2)/torch.mean(y_batch**2))**0.5 * 100
+            y_pred = model(x_spatial, cond)
+
+            # Denormalize to physical space
+            mu_s = T_stats[:, 0]    # (B,)
+            sigma_s = T_stats[:, 1]  # (B,)
+            y_pred_phys = y_pred * (sigma_s[:, None, None] + T_EPS) + mu_s[:, None, None]
+            y_true_phys = y_batch * (sigma_s[:, None, None] + T_EPS) + mu_s[:, None, None]
+
+            test_rel_l2 = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
 
             test_loss += test_rel_l2.item()
             if iface_mask is not None:
-                test_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+                test_iface += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
 
         # average test loss across all batches
         test_loss /= len(test_loader)
@@ -80,9 +100,16 @@ def eval_all_seeds(run_root: str):
             x_grid, loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
         ).to(device)
 
-        fno = FNO2d(config['model']['parameters']['modes1'], config['model']['parameters']['modes2'], config['model']['parameters']['width'],
-                    in_channels=config['model']['parameters']['in_channels'],
-                    out_channels=config['model']['parameters']['out_channels'])
+        model_cfg = config['model']['parameters']
+        fno = FNO1d(
+            modes=model_cfg["modes"],
+            width=model_cfg["width"],
+            in_channels=model_cfg.get("in_channels", 2),
+            out_channels=model_cfg.get("out_channels", 1),
+            n_layers=model_cfg.get("n_layers", 4),
+            cond_dim=model_cfg.get("cond_dim", 4),
+            cond_hidden=model_cfg.get("cond_hidden", 256),
+        )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
@@ -100,7 +127,7 @@ def eval_all_seeds(run_root: str):
         )
 
     # sort by test performance (done by sort() which goes from smallest -> largest)
-    results.sort(key= lambda r: r['test_rel_l2'])
+    results.sort(key=lambda r: r['test_rel_l2'])
     return results
 
 
@@ -109,13 +136,13 @@ def eval_all_seeds(run_root: str):
 def mean_std(values: list[float]) -> tuple[float, float]:
     """Sample std for small-n reporting; returns (mean, std)."""
     n = len(values)
-    if n ==0:
+    if n == 0:
         return float("nan"), float("nan")
-    mu = sum(values)/n
-    if n==1:
+    mu = sum(values) / n
+    if n == 1:
         return mu, 0.0
     # variance formula for a sample
-    var = sum((x-mu) ** 2 for x in values) / (n-1)
+    var = sum((x - mu) ** 2 for x in values) / (n - 1)
     return mu, math.sqrt(var)
 
 def print_seed_report(results: list[dict]) -> dict:
@@ -136,7 +163,7 @@ def print_seed_report(results: list[dict]) -> dict:
     print(f"test_iface_rel_l2 mean & standard dist. ({iface_mu}, {iface_std})")
 
     # also print best seed by lowest test error
-    best = min(results, key= lambda r: r['test_rel_l2'])
+    best = min(results, key=lambda r: r['test_rel_l2'])
     print(f"Best by lowest test error: seed={best['seed']} test_rel_l2={best['test_rel_l2']} test_iface_rel_l2={best['test_iface_rel_l2']}")
 
     # return dict
@@ -150,7 +177,6 @@ def print_seed_report(results: list[dict]) -> dict:
         "test_iface_rel_l2_std": iface_std,
     }
 
-# generated by ChatGPT 5.2 on 02/18/26
 def save_report(run_root: str, results: list[dict], summary: dict) -> None:
     out = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -176,7 +202,4 @@ if __name__ == '__main__':
     summary = print_seed_report(results)
 
     # save to disk
-    save_report(run_root=run_root, results = results, summary = summary)
-
-
-
+    save_report(run_root=run_root, results=results, summary=summary)

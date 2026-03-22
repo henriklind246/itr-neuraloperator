@@ -2,21 +2,6 @@ import numpy as np
 from src.physics.fd_solver_1d import FDSolver1D, Layer1D
 from scipy.stats import qmc
 
-#TODO: sample k using log-uniform sampling
-
-# -------- IMPORT NOTES --------
-# There are a few steps to determining a realistic and reasonable sampling range for contact resistance R_c:
-# (1) fix h, and choose reasonable k ranges (with the operator-learning task in mind)
-# (2) now since conduction resistance is determined, calculate h/2k range, and then determine conduction resistance range
-# (3) the conduction resistance sampling range determines what range of contact resistance samples are realistic and meaningful using ratio resistance
-
-# Current plan:
-# k range: [0.05, 50] - log-uniform, 3 decades
-# rho*cp range: [0.5, 5] - , 1 decade
-
-# conduction resistance range: [0.0002, 0.2]
-# reasonable range for contact resistance: [0.0001, 0.5]
-
 
 def random_ic(a: float, b: float, grid: np.ndarray, rng) -> np.ndarray:
     L = b - a
@@ -36,10 +21,7 @@ def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
     param_ranges = {
         "amplitude": (50.0, 300.0),
         "frequency": (1.0, 20.0),
-        "k1":        (0.5, 5.0),
-        "k2":        (0.5, 5.0),
-        "rho_cp1":   (0.5, 5.0),
-        "rho_cp2":   (0.5, 5.0),
+        "R_c":       (0.05, 1.0),
     }
 
     # Parameters sampled log-uniformly instead of uniformly.
@@ -58,7 +40,6 @@ def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
     samples_unit = sampler.random(n=num_sims)
 
     # uniform scaling for all parameters first
-    # samples_scaled is a np.array with shape (num_samples, sample_dim), in this case (num_samples, 6)
     samples_scaled = qmc.scale(samples_unit, lower_bounds, upper_bounds).astype(np.float32)
 
     # override log-uniform parameters: x = lo * (hi/lo)^u, u in [0, 1]
@@ -75,12 +56,9 @@ def build_sim_params(a: float, b: float, grid: np.ndarray, num_sims: int, rng, l
     samples_scaled = generate_lhs_samples(num_sims=num_sims, seed=lhs_seed)
 
     # -------- EXTRACT PARAMS FROM LHS SAMPLES --------
-    amplitudes   = samples_scaled[:, 0]
-    frequencies  = samples_scaled[:, 1]
-    k1_vals      = samples_scaled[:, 2]
-    k2_vals      = samples_scaled[:, 3]
-    rho_cp1_vals = samples_scaled[:, 4]
-    rho_cp2_vals = samples_scaled[:, 5]
+    amplitudes  = samples_scaled[:, 0]
+    frequencies = samples_scaled[:, 1]
+    R_c_values  = samples_scaled[:, 2]
 
     T0_list = []
 
@@ -88,8 +66,8 @@ def build_sim_params(a: float, b: float, grid: np.ndarray, num_sims: int, rng, l
         T0 = random_ic(a=a, b=b, grid=grid, rng=rng)
         T0_list.append(T0)
 
-    # shape: [(a0, f0, k1_0, k2_0, rcp1_0, rcp2_0, (Nx,)), ...]
-    sim_params = list(zip(amplitudes, frequencies, k1_vals, k2_vals, rho_cp1_vals, rho_cp2_vals, T0_list))
+    # shape: [(amp, freq, T0, R_c), ...]
+    sim_params = list(zip(amplitudes, frequencies, T0_list, R_c_values))
 
     return sim_params
 
@@ -98,7 +76,7 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     # seed 0 for reproducibility after I generate all simulations
     rng = np.random.default_rng(0)
 
-    # fixed grid geometry and time parameters (material properties vary per sim)
+    # fixed grid geometry and time parameters
     a, b, N = 0.0, 1.0, 100
     grid = np.linspace(a, b, N)
     dt = 0.005
@@ -114,26 +92,25 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     Nx = N
     Nt = len(t_grid_template)
 
+    # Fixed materials: k1=2, k2=1, rho=cp=1 for both layers
+    layers = [
+        Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
+        Layer1D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+    ]
+
     print("Building simulation parameters.")
 
-    # shape: [(a0, f0, k1_0, k2_0, rcp1_0, rcp2_0, (Nx,)), ...]
+    # shape: [(amp, freq, T0, R_c), ...]
     sim_params = build_sim_params(a=a, b=b, grid=grid, num_sims=num_sims, rng=rng, lhs_seed=0)
 
-    trajectories = np.zeros((num_sims, Nt, Nx), dtype=np.float32) # (num_sims, Nt, Nx)
+    trajectories = np.zeros((num_sims, Nt, Nx), dtype=np.float32)
 
-    # enumerate sim_params to yield (index, element) and use tuple unpacking
-    for i, (amp, freq, k1, k2, rcp1, rcp2, T0) in enumerate(sim_params):
-        # construct per-sim layers with sampled material properties
-        # rho = rho_cp (since cp=1), so rho*cp = rho_cp
-        layers = [
-            Layer1D(x_left=0.0, x_right=0.5, rho=float(rcp1), cp=1.0, k=float(k1)),
-            Layer1D(x_left=0.5, x_right=1.0, rho=float(rcp2), cp=1.0, k=float(k2)),
-        ]
-
+    for i, (amp, freq, T0, R_c) in enumerate(sim_params):
         sim = FDSolver1D(
             a=a, b=b, N=N, lam_target=0.8, layers=layers,
             t_final=t_final, flux_f=float(freq), flux_A=float(amp),
             t_on=t_on, t_off=t_off, phase=phase, dt=dt, tukey_alpha=tukey_alpha,
+            interface_R=[float(R_c)],
         )
 
         t, x, T_hist = sim.solve(T0=T0, store_trajectory=True)

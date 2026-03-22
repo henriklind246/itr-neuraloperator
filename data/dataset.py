@@ -3,153 +3,138 @@ from pathlib import Path
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-from src.physics.fd_solver_1d import windowed_sin_flux
 
-# --------- REFACTOR ---------
+# --------- NORMALIZATION CONSTANTS ---------
 
-# operator-learning task changed to: (T(x, t_s), q(t_j), k(x), rho_cp(x), t_bar_j, x) -> T(x, t_j = t_bar_j + t_s)
-
-# new variables:
-# (1) source time t_s
-# (2) future queryable time t_j_m
-# (3)
+RC_RANGE = (0.05, 1.0)
+AMP_RANGE = (50.0, 300.0)
+FREQ_RANGE = (1.0, 20.0)
+T_EPS = 1e-6  # epsilon for temperature normalization
 
 
-# normalization bounds for material property channels (match LHS ranges in generate_dataset.py)
-K_RANGE = (0.5, 5.0)
-RCP_RANGE = (0.5, 5.0)
-INTERFACE_X = 0.5
+# --------- SNAPSHOT PAIR DATASET ---------
 
-# trajectories.shape = (num_sims, Nt, Nx)
-# t_grid.shape = (Nt,)
-# x_grid.shape = (Nx,)
+class SnapshotPairDataset(Dataset):
+    """All-to-all snapshot-pair dataset for time-conditioned FNO.
 
-class WindowedForecastDataset(Dataset):
+    Each sample is a (source, target) pair: given the temperature field at
+    time t_s, predict the field at a future time t_j > t_s.
+
+    Returns 4-tuple: (x_spatial, cond, Y, T_stats)
+        x_spatial : (Nx, 2)  — [T̃_source, x_norm]
+        cond      : (4,)     — [t̄_norm, A_norm, f_norm, R_c_norm]
+        Y         : (Nx, 1)  — T̃_target (normalized)
+        T_stats   : (2,)     — [μ_s, σ_s] for denormalization
+    """
+
     def __init__(
-            self,
-            trajectories: np.ndarray,
-            t_grid: np.ndarray,
-            x_grid: np.ndarray,
-            sim_ids: np.ndarray,
-            sim_params: np.ndarray,
-            k: int = 10,
-            H: int = 40,
-            random_window: bool = True,
-            windows_per_sim_per_epoch: int = 1,
-            normalize_time: bool = True,
-            seed: int = 0
+        self,
+        trajectories: np.ndarray,
+        t_grid: np.ndarray,
+        x_grid: np.ndarray,
+        sim_ids: np.ndarray,
+        sim_params: np.ndarray,
+        pairs_per_sim: int = 50,
+        random_pairs: bool = True,
+        seed: int = 0,
+        stride: int = 1,
     ):
         self.trajectories = trajectories
         self.sim_params = sim_params
-        self.t_grid = t_grid.astype(dtype=np.float32)
-        self.x_grid = x_grid.astype(dtype=np.float32)
-        self.sim_ids = sim_ids.astype(dtype=np.int64)
+        self.t_grid = t_grid.astype(np.float32)
+        self.x_grid = x_grid.astype(np.float32)
+        self.sim_ids = sim_ids.astype(np.int64)
 
-        self.k = k
-        self.H = H
-        self.random_window = random_window
-        self.windows_per_sim_per_epoch = windows_per_sim_per_epoch
-        self.normalize_time = normalize_time
+        self.pairs_per_sim = pairs_per_sim
+        self.random_pairs = random_pairs
+        self.stride = stride
         self.seed = seed
         self.rng = np.random.default_rng(seed)
 
-        self.num_sims, self.Nt, self.Nx = self.trajectories.shape
+        self.num_sims, self.Nt, self.Nx = trajectories.shape
 
-        # largest starting index that satisfies the restriction
-        self.max_s = self.Nt - self.H - self.k
+        # Normalized spatial coordinates (fixed for all samples)
+        self.x_norm = (
+            (self.x_grid - self.x_grid[0]) / (self.x_grid[-1] - self.x_grid[0])
+        ).astype(np.float32)
 
-        # np array with all valid starting indices
-        self.all_s = np.arange(self.max_s + 1, dtype=np.int64)
+        # Pre-compute all valid pairs for deterministic mode
+        if not self.random_pairs:
+            self._build_deterministic_pairs()
+
+    def _build_deterministic_pairs(self):
+        """Enumerate all valid (s, j) pairs at given stride for each sim."""
+        pairs = []
+        for sim_pos, sim_id in enumerate(self.sim_ids):
+            for s in range(0, self.Nt, self.stride):
+                for j in range(s + 1, self.Nt, self.stride):
+                    pairs.append((int(sim_id), s, j))
+        self._det_pairs = pairs
 
     def __len__(self):
-        """
-        Function that determines the total length of the dataset
-        """
-        if self.random_window:
-            return len(self.sim_ids) * self.windows_per_sim_per_epoch
-        return len(self.sim_ids) * len(self.all_s)
-
+        if self.random_pairs:
+            return len(self.sim_ids) * self.pairs_per_sim
+        return len(self._det_pairs)
 
     def __getitem__(self, idx):
-        """
-        Function that fetches a data sample given a key (index)
-
-        Chooses sim -> choose or decode valid starting index -> slice history -> slice target -> normalize coords. -> broadcast channels -> concatenate to (Nx, H, k+5)
-        """
-        if self.random_window:
-            # use mod in case idx > len(sim_ids)
-            sim_id = self.sim_ids[idx % len(self.sim_ids)]
-            s = self.rng.integers(0, self.max_s + 1)
+        if self.random_pairs:
+            sim_id = int(self.sim_ids[idx % len(self.sim_ids)])
+            s = int(self.rng.integers(0, self.Nt - 1))
+            j = int(self.rng.integers(s + 1, self.Nt))
         else:
-            # only use the slice of sim_ids == max_s in size
-            sim_pos = idx // len(self.all_s)
-            start_pos = idx % len(self.all_s)
-            sim_id = self.sim_ids[sim_pos]
-            s = self.all_s[start_pos]
+            sim_id, s, j = self._det_pairs[idx]
 
-        T_hist = self.trajectories[sim_id] # shape (Nt, Nx)
-
-        # history with shape (Nx, k)
-        history = T_hist[s:s + self.k, :].T
-
-        # target with shape (Nx, H)
-        target = T_hist[s + self.k:s + self.k + self.H, :].T
-
-        # future time coords. for prediction slab: shape (H,)
-        t_future = self.t_grid[s + self.k: s + self.k + self.H]
-
-        # fetch first 6 params that will be used as NO model input
-        amp, freq, k1, k2, rcp1, rcp2, _ = self.sim_params[sim_id]
+        # Unpack sim params: (amp, freq, T0, R_c)
+        amp, freq, _T0, R_c = self.sim_params[sim_id]
         amp = np.float32(amp)
         freq = np.float32(freq)
 
-        # future boundary force heat flux values
-        # q_future = q(t_{s+k}:t_{s+k+H})
-        q_left = windowed_sin_flux(f=float(freq), A=float(amp), t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)
-        # shape: (H,)
-        q_future = np.array([q_left(t) for t in t_future], dtype=np.float32)
+        # Source and target snapshots
+        T_source = self.trajectories[sim_id, s, :]  # (Nx,)
+        T_target = self.trajectories[sim_id, j, :]  # (Nx,)
 
-        # normalize spatial domain: shape (Nx,)
-        x_norm = (self.x_grid - self.x_grid[0]) / (self.x_grid[-1] - self.x_grid[0])
+        # Per-sample temperature normalization (source statistics)
+        mu_s = T_source.mean()
+        sigma_s = T_source.std()
+        T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
+        T_target_norm = (T_target - mu_s) / (sigma_s + T_EPS)
 
-        if self.normalize_time:
-            t_norm = (t_future - self.t_grid[0]) / (self.t_grid[-1] - self.t_grid[0])
+        # Spatial input: (Nx, 2) — [T̃_source, x_norm]
+        x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
 
-        # material property fields: step functions normalized to [0,1] using LHS bounds
-        k_field = np.where(self.x_grid < INTERFACE_X, float(k1), float(k2))
-        k_norm_field = ((k_field - K_RANGE[0]) / (K_RANGE[1] - K_RANGE[0])).astype(np.float32)
+        # Conditioning vector: (4,) — [t̄_norm, A_norm, f_norm, R_c_norm]
+        t_bar = self.t_grid[j] - self.t_grid[s]
+        t_bar_norm = t_bar / self.t_grid[-1]
+        A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
+        f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
+        R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
+        cond = np.array([t_bar_norm, A_norm, f_norm, R_c_norm], dtype=np.float32)
 
-        rcp_field = np.where(self.x_grid < INTERFACE_X, float(rcp1), float(rcp2))
-        rcp_norm_field = ((rcp_field - RCP_RANGE[0]) / (RCP_RANGE[1] - RCP_RANGE[0])).astype(np.float32)
+        # Target: (Nx, 1)
+        Y = T_target_norm[:, None].astype(np.float32)
 
-        # Broadcast to (Nx, H, Channels)
-        history_grid = np.broadcast_to(history[:, None, :], (self.Nx, self.H, self.k)) # None adds a dim. before broadcasting
-        x_channel = np.broadcast_to(x_norm[:, None, None], (self.Nx, self.H, 1))
-        t_channel = np.broadcast_to(t_norm[None, :, None], (self.Nx, self.H, 1))
-        q_channel = np.broadcast_to(q_future[None, :, None], (self.Nx, self.H, 1))
-        k_channel = np.broadcast_to(k_norm_field[:, None, None], (self.Nx, self.H, 1))
-        rcp_channel = np.broadcast_to(rcp_norm_field[:, None, None], (self.Nx, self.H, 1))
+        # Stats for denormalization at eval time: (2,)
+        T_stats = np.array([mu_s, sigma_s], dtype=np.float32)
 
-        # Concatenate into X: shape (Nx, H, k+5) where 5 = x + t + q + k_field + rcp_field
-        X = np.concatenate([history_grid, x_channel, t_channel, q_channel, k_channel, rcp_channel], axis=-1).astype(np.float32)
-
-        # Y: shape (Nx, H, 1)
-        Y = target[:, :, None].astype(np.float32)
-
-        return torch.from_numpy(X), torch.from_numpy(Y)
+        return (
+            torch.from_numpy(x_spatial),
+            torch.from_numpy(cond),
+            torch.from_numpy(Y),
+            torch.from_numpy(T_stats),
+        )
 
 
 # --------- LOAD RAW SIM. DATA --------
 
 def load_sim_data(
-        sim_traj_path: str,
-        x_grid_path: str,
-        t_grid_path: str
+    sim_traj_path: str,
+    x_grid_path: str,
+    t_grid_path: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
-    trajectories = np.load(sim_traj_path) # (num_sims, Nt, Nx)
-    x_grid = np.load(x_grid_path) # (Nx,)
-    t_grid = np.load(t_grid_path) # (Nt,)
+    trajectories = np.load(sim_traj_path)  # (num_sims, Nt, Nx)
+    x_grid = np.load(x_grid_path)          # (Nx,)
+    t_grid = np.load(t_grid_path)          # (Nt,)
 
     # size safeguards
     if trajectories.ndim != 3:
@@ -168,77 +153,75 @@ def load_sim_data(
 
     return trajectories, x_grid, t_grid
 
+
 # ------- SLICE ALL SIMS INTO TRAIN/VAL/TEST SPLITS -------
 
 def split_sim_ids(
-        num_sims: int,
-        train_frac: float = 0.7,
-        val_frac: float = 0.15,
-        seed: int = 0
+    num_sims: int,
+    train_frac: float = 0.7,
+    val_frac: float = 0.15,
+    seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     ids = np.arange(num_sims)
     rng = np.random.default_rng(seed)
     rng.shuffle(ids)
 
-    n_train = int(num_sims*train_frac)
-    n_val = int(num_sims*val_frac)
+    n_train = int(num_sims * train_frac)
+    n_val = int(num_sims * val_frac)
     n_test = num_sims - n_train - n_val
 
     train_ids = ids[:n_train]
     val_ids = ids[n_train:n_train + n_val]
-    test_ids = ids[n_train + n_val: n_train + n_val + n_test]
+    test_ids = ids[n_train + n_val:n_train + n_val + n_test]
 
     return train_ids, val_ids, test_ids
 
-# ------- CREATE INDEX SAMPLERS FOR TRAIN, VAL, AND TEST -------
+
+# ------- CREATE DATALOADERS -------
 
 def create_dataloaders(
-        trajectories: np.ndarray,
-        x_grid: np.ndarray,
-        t_grid: np.ndarray,
-        train_ids: np.ndarray,
-        val_ids: np.ndarray,
-        test_ids: np.ndarray,
-        batch_size: int,
-        sim_params: np.ndarray,
-        k: int = 10,
-        H: int = 40
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    train_ids: np.ndarray,
+    val_ids: np.ndarray,
+    test_ids: np.ndarray,
+    batch_size: int,
+    sim_params: np.ndarray,
+    pairs_per_sim_train: int = 50,
+    pairs_per_sim_val: int = 20,
+    test_stride: int = 5,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
 
-    train_dataset = WindowedForecastDataset(
+    train_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
         t_grid=t_grid,
         sim_ids=train_ids,
         sim_params=sim_params,
-        k=k,
-        H=H,
-        windows_per_sim_per_epoch=7,
-        random_window=True
+        pairs_per_sim=pairs_per_sim_train,
+        random_pairs=True,
     )
 
-    val_dataset = WindowedForecastDataset(
+    val_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
         t_grid=t_grid,
         sim_ids=val_ids,
         sim_params=sim_params,
-        k=k,
-        H=H,
-        windows_per_sim_per_epoch=8,
-        random_window=True
+        pairs_per_sim=pairs_per_sim_val,
+        random_pairs=True,
     )
 
-    test_dataset = WindowedForecastDataset(
+    test_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
         t_grid=t_grid,
         sim_ids=test_ids,
         sim_params=sim_params,
-        k=k,
-        H=H,
-        random_window=False
+        random_pairs=False,
+        stride=test_stride,
     )
 
     pin = torch.cuda.is_available()
@@ -253,22 +236,26 @@ def create_dataloaders(
 
 if __name__ == '__main__':
     project_root = Path(__file__).resolve().parents[1]
-    trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=str(project_root/"data"/"trajectories.npy"), x_grid_path=str(project_root/"data"/"x_grid.npy"), t_grid_path=str(project_root/"data"/"t_grid.npy"))
-    sim_params = np.load(str(project_root/"data"/"sim_params.npy"), allow_pickle=True)
+    trajectories, x_grid, t_grid = load_sim_data(
+        sim_traj_path=str(project_root / "data" / "trajectories.npy"),
+        x_grid_path=str(project_root / "data" / "x_grid.npy"),
+        t_grid_path=str(project_root / "data" / "t_grid.npy"),
+    )
+    sim_params = np.load(str(project_root / "data" / "sim_params.npy"), allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
-    batch_size = 10
-    k = 10
-    H = 40
+    batch_size = 64
 
-    train_loader, val_loader, test_loader = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=batch_size, sim_params=sim_params, k=k, H=H)
+    train_loader, val_loader, test_loader = create_dataloaders(
+        trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+        train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
+        batch_size=batch_size, sim_params=sim_params,
+    )
 
-    # Add batches to tensors
-    xb, yb = next(iter(train_loader))
-    print(f"Train batch X shape: {xb.shape}") # (B, Nx, H, 15)
-    print(f"Train batch Y shape: {yb.shape}") # (B, Nx, H, 1)
-
-
-
-
+    # Verify shapes
+    x_spatial, cond, yb, t_stats = next(iter(train_loader))
+    print(f"x_spatial: {x_spatial.shape}")  # (B, Nx, 2)
+    print(f"cond: {cond.shape}")            # (B, 4)
+    print(f"Y: {yb.shape}")                 # (B, Nx, 1)
+    print(f"T_stats: {t_stats.shape}")      # (B, 2)

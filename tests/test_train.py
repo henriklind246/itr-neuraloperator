@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.operators.fno2d import FNO2d
+from src.operators.fno2d import FNO1d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 import csv
 
@@ -79,17 +79,21 @@ class TestLoadConfig:
 
 # ===================== helpers for training tests =====================
 
+def _make_4tuple_loader(Nx=11, n_samples=4, batch_size=2):
+    """Create a DataLoader yielding (x_spatial, cond, Y, T_stats) 4-tuples."""
+    x_spatial = torch.randn(n_samples, Nx, 2)
+    cond = torch.rand(n_samples, 4)
+    Y = torch.randn(n_samples, Nx, 1)
+    T_stats = torch.randn(n_samples, 2)
+    return DataLoader(TensorDataset(x_spatial, cond, Y, T_stats), batch_size=batch_size)
+
+
 @pytest.fixture
 def tiny_training_setup():
-    """Tiny model + synthetic dataloader for fast training tests."""
-    Nx, H, k = 11, 10, 5
-    in_channels = k + 5  # 10 (history + x + t + q + k_field + rcp_field)
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=in_channels)
-
-    # Synthetic data: 4 samples
-    X = torch.randn(4, Nx, H, in_channels)
-    Y = torch.randn(4, Nx, H, 1)
-    loader = DataLoader(TensorDataset(X, Y), batch_size=2)
+    """Tiny model + synthetic 4-tuple dataloader for fast training tests."""
+    Nx = 11
+    model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=4)
+    loader = _make_4tuple_loader(Nx=Nx)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     x_grid_np = np.linspace(0.0, 1.0, Nx).astype(np.float32)
@@ -226,10 +230,6 @@ class TestRunOneSeedResume:
         np.save(tmp_path / "t_grid.npy", t_grid)
         np.save(tmp_path / "sim_params.npy", synthetic_sim_params)
 
-        Nx = x_grid.shape[0]
-        k, H = 5, 10
-        in_channels = k + 5  # history + x + t + q + k_field + rcp_field
-
         return {
             "data": {
                 "trajectories.npy": str(tmp_path / "trajectories.npy"),
@@ -239,17 +239,20 @@ class TestRunOneSeedResume:
             },
             "model": {
                 "parameters": {
-                    "modes1": 2,
-                    "modes2": 2,
+                    "modes": 2,
                     "width": 8,
-                    "in_channels": in_channels,
+                    "in_channels": 2,
                     "out_channels": 1,
+                    "n_layers": 2,
+                    "cond_dim": 4,
+                    "cond_hidden": 32,
                 }
             },
             "training": {
                 "batch_size": 4,
-                "k": k,
-                "H": H,
+                "pairs_per_sim_train": 10,
+                "pairs_per_sim_val": 5,
+                "test_stride": 10,
                 "device": "cpu",
                 "epochs": 4,
                 "learning_rate": 0.001,
@@ -364,9 +367,6 @@ class TestRunConfigSeeds:
         np.save(tmp_path / "t_grid.npy", t_grid)
         np.save(tmp_path / "sim_params.npy", synthetic_sim_params)
 
-        k, H = 5, 10
-        in_channels = k + 5
-
         return {
             "data": {
                 "trajectories.npy": str(tmp_path / "trajectories.npy"),
@@ -376,17 +376,20 @@ class TestRunConfigSeeds:
             },
             "model": {
                 "parameters": {
-                    "modes1": 2,
-                    "modes2": 2,
+                    "modes": 2,
                     "width": 8,
-                    "in_channels": in_channels,
+                    "in_channels": 2,
                     "out_channels": 1,
+                    "n_layers": 2,
+                    "cond_dim": 4,
+                    "cond_hidden": 32,
                 }
             },
             "training": {
                 "batch_size": 4,
-                "k": k,
-                "H": H,
+                "pairs_per_sim_train": 10,
+                "pairs_per_sim_val": 5,
+                "test_stride": 10,
                 "device": "cpu",
                 "epochs": 4,
                 "learning_rate": 0.001,

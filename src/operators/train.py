@@ -7,7 +7,7 @@ import torch
 from torch.optim import Adam
 
 from data.dataset import create_dataloaders, load_sim_data, split_sim_ids
-from src.operators.fno2d import FNO2d
+from src.operators.fno2d import FNO1d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 
@@ -69,10 +69,13 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_ma
     train_rel_l2 = 0.0
     train_iface_rel_l2 = 0.0
 
-    for x_batch, y_batch in train_loader:
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+    for x_spatial, cond, y_batch, _T_stats in train_loader:
+        x_spatial = x_spatial.to(device)
+        cond = cond.to(device)
+        y_batch = y_batch.to(device)
+
         optimizer.zero_grad()
-        y_pred = model(x_batch)
+        y_pred = model(x_spatial, cond)
         loss = loss_fn(y_pred, y_batch)
         loss.backward()
         optimizer.step()
@@ -97,9 +100,12 @@ def validate(model, val_loader, device, *, iface_mask=None) -> tuple[float, floa
         val_loss = 0.0
         val_iface = 0.0
 
-        for x_batch, y_batch in val_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            y_pred = model(x_batch)
+        for x_spatial, cond, y_batch, _T_stats in val_loader:
+            x_spatial = x_spatial.to(device)
+            cond = cond.to(device)
+            y_batch = y_batch.to(device)
+
+            y_pred = model(x_spatial, cond)
             val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
             val_loss += val_rel_l2.item()
             if iface_mask is not None:
@@ -126,18 +132,38 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     set_seed(seed)
 
-    trajectories, x_grid, t_grid = load_sim_data(sim_traj_path=config["data"]["trajectories.npy"], x_grid_path=config["data"]["x_grid_path"], t_grid_path=config["data"]["t_grid_path"])
+    trajectories, x_grid, t_grid = load_sim_data(
+        sim_traj_path=config["data"]["trajectories.npy"],
+        x_grid_path=config["data"]["x_grid_path"],
+        t_grid_path=config["data"]["t_grid_path"],
+    )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
-    training_set, validation_set, _ = create_dataloaders(trajectories=trajectories, x_grid=x_grid, t_grid=t_grid, train_ids=train_ids, val_ids=val_ids, test_ids=test_ids, batch_size=config["training"]["batch_size"], sim_params=sim_params, k=config["training"]["k"], H=config["training"]["H"])
+    training_set, validation_set, _ = create_dataloaders(
+        trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+        train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
+        batch_size=config["training"]["batch_size"],
+        sim_params=sim_params,
+        pairs_per_sim_train=config["training"].get("pairs_per_sim_train", 50),
+        pairs_per_sim_val=config["training"].get("pairs_per_sim_val", 20),
+        test_stride=config["training"].get("test_stride", 5),
+    )
 
     device = resolve_device(config["training"].get("device", "auto"))
     print(f"Training on: {device}")
 
-    fno = FNO2d(config["model"]["parameters"]["modes1"], config["model"]["parameters"]["modes2"], config["model"]["parameters"]["width"],
-                in_channels=config["model"]["parameters"]["in_channels"], out_channels=config["model"]["parameters"]["out_channels"])
+    model_cfg = config["model"]["parameters"]
+    fno = FNO1d(
+        modes=model_cfg["modes"],
+        width=model_cfg["width"],
+        in_channels=model_cfg["in_channels"],
+        out_channels=model_cfg["out_channels"],
+        n_layers=model_cfg.get("n_layers", 4),
+        cond_dim=model_cfg.get("cond_dim", 4),
+        cond_hidden=model_cfg.get("cond_hidden", 256),
+    )
 
     # --- Resume state ---
     start_epoch = 0
@@ -206,7 +232,10 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         csv_writer.writeheader()
 
     for epoch in range(start_epoch, epochs):
-        train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(model=fno, train_loader=training_set, optimizer=optimizer, loss_fn=loss_fn, device=device, iface_mask=iface_mask)
+        train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
+            model=fno, train_loader=training_set, optimizer=optimizer,
+            loss_fn=loss_fn, device=device, iface_mask=iface_mask,
+        )
         scheduler.step()
 
         print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%")

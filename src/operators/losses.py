@@ -46,8 +46,8 @@ class SpatiallyWeightedMSE(nn.Module):
         # Normalize so mean(weights) == 1.0
         raw = raw / raw.mean()
 
-        # Shape (1, Nx, 1, 1) broadcasts against (B, Nx, H, 1)
-        weight_tensor = torch.from_numpy(raw).reshape(1, Nx, 1, 1)
+        # Shape (1, Nx, 1) broadcasts against (B, Nx, 1)
+        weight_tensor = torch.from_numpy(raw).reshape(1, Nx, 1)
         self.register_buffer("weights", weight_tensor)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -56,7 +56,7 @@ class SpatiallyWeightedMSE(nn.Module):
         Parameters
         ----------
         y_pred, y_true : torch.Tensor
-            Shape (B, Nx, H, 1).
+            Shape (B, Nx, 1).
         """
         return torch.mean(self.weights * (y_pred - y_true) ** 2)
 
@@ -85,7 +85,7 @@ def compute_interface_rel_l2(
     Parameters
     ----------
     y_pred, y_true : torch.Tensor
-        Shape (B, Nx, H, 1).
+        Shape (B, Nx, 1).
     iface_mask : torch.Tensor
         Boolean mask of shape (Nx,) — True for nodes in the interface region.
 
@@ -94,8 +94,8 @@ def compute_interface_rel_l2(
     float
         Interface-region rel L2 in percent.
     """
-    pred_iface = y_pred[:, iface_mask, :, :]
-    true_iface = y_true[:, iface_mask, :, :]
+    pred_iface = y_pred[:, iface_mask, :]
+    true_iface = y_true[:, iface_mask, :]
 
     rel_l2 = (
         torch.mean((pred_iface - true_iface) ** 2)

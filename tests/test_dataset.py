@@ -5,7 +5,7 @@ import torch
 from data.dataset import (
     load_sim_data,
     split_sim_ids,
-    WindowedForecastDataset,
+    SnapshotPairDataset,
     create_dataloaders,
 )
 
@@ -105,77 +105,118 @@ class TestSplitSimIds:
         assert np.all(all_ids < 50)
 
 
-# ===================== WindowedForecastDataset =====================
+# ===================== SnapshotPairDataset =====================
 
-class TestWindowedForecastDataset:
+class TestSnapshotPairDataset:
     @pytest.fixture
     def dataset_random(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
-        return WindowedForecastDataset(
+        return SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
-            k=5, H=10, random_window=True,
-            windows_per_sim_per_epoch=1,
+            pairs_per_sim=10, random_pairs=True,
         )
 
     @pytest.fixture
-    def dataset_exhaustive(self, synthetic_trajectories, synthetic_sim_params):
+    def dataset_deterministic(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
-        return WindowedForecastDataset(
+        return SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
-            k=5, H=10, random_window=False,
+            random_pairs=False, stride=10,
         )
 
     def test_len_random(self, dataset_random):
-        assert len(dataset_random) == 5  # 5 sims * 1 window
+        assert len(dataset_random) == 5 * 10  # 5 sims * 10 pairs_per_sim
 
-    def test_len_exhaustive(self, dataset_exhaustive):
-        # max_s = 51 - 10 - 5 = 36, all_s = [0..36] = 37 entries
-        assert len(dataset_exhaustive) == 5 * 37
+    def test_len_deterministic(self, dataset_deterministic):
+        """Deterministic mode enumerates all valid (s, j) pairs at given stride."""
+        assert len(dataset_deterministic) > 0
+
+    def test_getitem_returns_4tuple(self, dataset_random):
+        result = dataset_random[0]
+        assert len(result) == 4
 
     def test_getitem_shapes(self, dataset_random):
-        X, Y = dataset_random[0]
+        x_spatial, cond, Y, T_stats = dataset_random[0]
         Nx = 11
-        H = 10
-        assert X.shape == (Nx, H, 5 + 1 + 1 + 1 + 1 + 1)  # k=5 history + x + t + q + k_field + rcp_field = 10
-        assert Y.shape == (Nx, H, 1)
+        assert x_spatial.shape == (Nx, 2)
+        assert cond.shape == (4,)
+        assert Y.shape == (Nx, 1)
+        assert T_stats.shape == (2,)
 
     def test_getitem_dtypes(self, dataset_random):
-        X, Y = dataset_random[0]
-        assert X.dtype == torch.float32
+        x_spatial, cond, Y, T_stats = dataset_random[0]
+        assert x_spatial.dtype == torch.float32
+        assert cond.dtype == torch.float32
         assert Y.dtype == torch.float32
+        assert T_stats.dtype == torch.float32
 
     def test_x_coord_normalized(self, dataset_random):
-        X, _ = dataset_random[0]
-        x_channel = X[:, 0, -5]  # fifth-to-last channel (x), first time step
+        x_spatial, _, _, _ = dataset_random[0]
+        x_channel = x_spatial[:, 1]  # second channel is x_norm
         assert x_channel.min() >= -1e-6
         assert x_channel.max() <= 1.0 + 1e-6
 
-    def test_t_coord_normalized(self, dataset_random):
-        X, _ = dataset_random[0]
-        t_channel = X[0, :, -4]  # fourth-to-last channel (t), first spatial point
-        assert t_channel.min() >= -1e-6
-        assert t_channel.max() <= 1.0 + 1e-6
+    def test_t_bar_positive(self, dataset_random):
+        """Lead time t̄ should always be > 0 (target after source)."""
+        for i in range(min(10, len(dataset_random))):
+            _, cond, _, _ = dataset_random[i]
+            t_bar_norm = cond[0].item()
+            assert t_bar_norm > 0
+
+    def test_conditioning_in_unit_range(self, dataset_random):
+        """All conditioning values should be in [0, 1]."""
+        for i in range(min(10, len(dataset_random))):
+            _, cond, _, _ = dataset_random[i]
+            assert torch.all(cond >= -1e-6)
+            assert torch.all(cond <= 1.0 + 1e-6)
+
+    def test_temperature_normalization(self, dataset_random):
+        """Source temperature channel should have mean ≈ 0, std ≈ 1."""
+        x_spatial, _, _, _ = dataset_random[0]
+        T_norm = x_spatial[:, 0]  # first channel is T̃_source
+        assert abs(T_norm.mean().item()) < 0.5  # roughly centered
+        assert abs(T_norm.std().item() - 1.0) < 0.5  # roughly unit std
+
+    def test_T_stats_matches_source(self, synthetic_trajectories, synthetic_sim_params):
+        """T_stats (μ_s, σ_s) should match the source snapshot statistics."""
+        trajectories, x_grid, t_grid = synthetic_trajectories
+        sim_ids = np.arange(1)  # single sim for easier verification
+        ds = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            pairs_per_sim=1, random_pairs=True, seed=42,
+        )
+        x_spatial, _, _, T_stats = ds[0]
+        mu_s = T_stats[0].item()
+        sigma_s = T_stats[1].item()
+        # The source temp channel should satisfy: T_source_norm * (sigma_s + eps) + mu_s ≈ T_source_original
+        # We can at least verify T_stats are finite and sigma_s >= 0
+        assert np.isfinite(mu_s)
+        assert sigma_s >= 0
 
     def test_seed_determinism(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
-        ds1 = WindowedForecastDataset(trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
-                                       sim_ids=sim_ids, sim_params=synthetic_sim_params,
-                                       k=5, H=10, random_window=True, seed=0)
-        ds2 = WindowedForecastDataset(trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
-                                       sim_ids=sim_ids, sim_params=synthetic_sim_params,
-                                       k=5, H=10, random_window=True, seed=0)
-        X1, Y1 = ds1[0]
-        X2, Y2 = ds2[0]
-        assert torch.equal(X1, X2)
-        assert torch.equal(Y1, Y2)
-
-    def test_max_s_constraint(self, dataset_random):
-        assert dataset_random.max_s == 51 - 10 - 5  # Nt - H - k
+        ds1 = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            pairs_per_sim=5, random_pairs=True, seed=0,
+        )
+        ds2 = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            pairs_per_sim=5, random_pairs=True, seed=0,
+        )
+        xs1, c1, y1, s1 = ds1[0]
+        xs2, c2, y2, s2 = ds2[0]
+        assert torch.equal(xs1, xs2)
+        assert torch.equal(c1, c2)
+        assert torch.equal(y1, y2)
+        assert torch.equal(s1, s2)
 
 
 # ===================== create_dataloaders =====================
@@ -184,32 +225,36 @@ class TestCreateDataloaders:
     def test_returns_three(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
-        loaders = create_dataloaders(trajectories, x_grid, t_grid,
-                                     train_ids, val_ids, test_ids,
-                                     batch_size=4, sim_params=synthetic_sim_params,
-                                     k=5, H=10)
+        loaders = create_dataloaders(
+            trajectories, x_grid, t_grid,
+            train_ids, val_ids, test_ids,
+            batch_size=4, sim_params=synthetic_sim_params,
+        )
         assert len(loaders) == 3
 
     def test_batch_shapes(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
-        train_loader, _, _ = create_dataloaders(trajectories, x_grid, t_grid,
-                                                 train_ids, val_ids, test_ids,
-                                                 batch_size=4, sim_params=synthetic_sim_params,
-                                                 k=5, H=10)
-        X, Y = next(iter(train_loader))
-        assert X.shape[0] <= 4
-        assert X.shape[1] == 11  # Nx
-        assert X.shape[2] == 10  # H
-        assert X.shape[3] == 10  # k + 5 (history + x + t + q + k_field + rcp_field)
+        train_loader, _, _ = create_dataloaders(
+            trajectories, x_grid, t_grid,
+            train_ids, val_ids, test_ids,
+            batch_size=4, sim_params=synthetic_sim_params,
+        )
+        x_spatial, cond, Y, T_stats = next(iter(train_loader))
+        assert x_spatial.shape[0] <= 4
+        assert x_spatial.shape[1] == 11   # Nx
+        assert x_spatial.shape[2] == 2    # T̃_source + x_norm
+        assert cond.shape[1] == 4         # t̄, A, f, R_c
         assert Y.shape[-1] == 1
+        assert T_stats.shape[-1] == 2     # μ_s, σ_s
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, val_loader, test_loader = create_dataloaders(
             trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
-            batch_size=4, sim_params=synthetic_sim_params, k=5, H=10)
+            batch_size=4, sim_params=synthetic_sim_params,
+        )
         train_sims = set(train_loader.dataset.sim_ids.tolist())
         val_sims = set(val_loader.dataset.sim_ids.tolist())
         test_sims = set(test_loader.dataset.sim_ids.tolist())

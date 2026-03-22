@@ -5,21 +5,26 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.eval import evaluate, mean_std, print_seed_report
-from src.operators.fno2d import FNO2d
+from src.operators.fno2d import FNO1d
 
 
 # ===================== evaluate =====================
 
 @pytest.fixture
 def eval_setup():
-    """Tiny model + loader for eval tests."""
-    Nx, H, in_ch = 11, 10, 7
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=in_ch)
+    """Tiny model + 4-tuple loader for eval tests."""
+    Nx = 11
+    model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=4)
     model.eval()
 
-    X = torch.randn(4, Nx, H, in_ch)
-    Y = torch.randn(4, Nx, H, 1)
-    loader = DataLoader(TensorDataset(X, Y), batch_size=2)
+    x_spatial = torch.randn(4, Nx, 2)
+    cond = torch.rand(4, 4)
+    Y = torch.randn(4, Nx, 1)
+    T_stats = torch.stack([
+        torch.randn(4),           # mu_s
+        torch.abs(torch.randn(4)),  # sigma_s (positive)
+    ], dim=-1)  # (4, 2)
+    loader = DataLoader(TensorDataset(x_spatial, cond, Y, T_stats), batch_size=2)
     device = torch.device("cpu")
     return model, loader, device
 

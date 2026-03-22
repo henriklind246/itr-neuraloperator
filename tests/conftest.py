@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from src.physics.fd_solver_1d import FDSolver1D, Layer1D
-from src.operators.fno2d import FNO2d
+from src.operators.fno2d import FNO1d
 
 
 # ---------- solver fixtures ----------
@@ -46,7 +46,7 @@ def synthetic_trajectories():
 
 @pytest.fixture
 def synthetic_sim_params(synthetic_trajectories):
-    """Synthetic sim_params matching synthetic_trajectories (20 sims)."""
+    """Synthetic sim_params matching synthetic_trajectories (20 sims, 4-tuples)."""
     trajectories, x_grid, _ = synthetic_trajectories
     num_sims = trajectories.shape[0]
     Nx = x_grid.shape[0]
@@ -55,12 +55,9 @@ def synthetic_sim_params(synthetic_trajectories):
     for _ in range(num_sims):
         amp = np.float32(rng.uniform(50.0, 300.0))
         freq = np.float32(rng.uniform(1.0, 20.0))
-        k1 = np.float32(rng.uniform(0.5, 5.0))
-        k2 = np.float32(rng.uniform(0.5, 5.0))
-        rcp1 = np.float32(rng.uniform(0.5, 5.0))
-        rcp2 = np.float32(rng.uniform(0.5, 5.0))
         T0 = rng.standard_normal(Nx).astype(np.float32)
-        params.append((amp, freq, k1, k2, rcp1, rcp2, T0))
+        R_c = np.float32(rng.uniform(0.05, 1.0))
+        params.append((amp, freq, T0, R_c))
     return np.array(params, dtype=object)
 
 
@@ -81,5 +78,13 @@ def tmp_npy_data(tmp_path, synthetic_trajectories):
 
 @pytest.fixture
 def small_fno():
-    """Tiny FNO2d for fast tests."""
-    return FNO2d(modes1=2, modes2=2, width=8, in_channels=15)
+    """Tiny FNO1d for fast tests."""
+    return FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=4)
+
+
+# ---------- conditioning fixture ----------
+
+@pytest.fixture
+def synthetic_cond():
+    """Random conditioning vectors (4, 4) for testing."""
+    return torch.rand(4, 4)

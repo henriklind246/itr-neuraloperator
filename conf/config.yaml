@@ -17,21 +17,23 @@ tuning:
   objective: best_val_mean
 
 model:
-  type: 2D FNO
+  type: "1D FNO time-conditioned"
   parameters:
-    modes1: 16
-    modes2: 16
+    modes: 16
     width: 64
-    in_channels: 15
+    in_channels: 2
     out_channels: 1
-    layers: 4
-    activation: "Tanh"
+    n_layers: 4
+    cond_dim: 4
+    cond_hidden: 256
+    activation: "GELU"
 
 training:
-  k: 10
-  H: 40
   device: "auto"
-  batch_size: 10
+  batch_size: 64
+  pairs_per_sim_train: 50
+  pairs_per_sim_val: 20
+  test_stride: 5
   epochs: 1500
   learning_rate: 0.001
   weight_decay: 1.0e-5
@@ -62,8 +64,10 @@ data:
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "samples, Nx, H, 15"
-  y_shape: "samples, Nx, H, 1"
+  x_shape: "B, Nx, 2"
+  y_shape: "B, Nx, 1"
+  cond_shape: "B, 4"
+  t_stats_shape: "B, 2"
 
 hydra:
   mode: MULTIRUN
