@@ -1,6 +1,6 @@
 import torch
 from data.dataset import load_sim_data, split_sim_ids, create_dataloaders, T_EPS
-from src.operators.fno2d import FNO1d
+from src.operators.fno1d import FNO1d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 from pathlib import Path
@@ -31,14 +31,14 @@ def build_test_loader(config):
         sim_params=sim_params,
         pairs_per_sim_train=config["training"].get("pairs_per_sim_train", 50),
         pairs_per_sim_val=config["training"].get("pairs_per_sim_val", 20),
-        test_stride=config["training"].get("test_stride", 5),
+        test_stride=config["training"].get("test_stride", 1)
     )
 
     return testing_set, x_grid
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
-def evaluate(model, test_loader, device, *, iface_mask=None):
+def evaluate(model, test_loader, device, iface_mask=None):
     """Return (test_rel_l2, test_iface_rel_l2) after evaluation on test set.
 
     Metrics are computed in physical (denormalized) space using T_stats
@@ -85,7 +85,7 @@ def eval_all_seeds(run_root: str):
     print("Testing started.")
 
     for seed_dir in sorted(run_root.glob("seed*")):
-        ckpt_path = seed_dir / "fno2d_best.pt"
+        ckpt_path = seed_dir / "fno1d_best.pt"
         if not ckpt_path.exists():
             continue
 
