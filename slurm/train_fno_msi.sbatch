@@ -19,6 +19,7 @@ export PROJECT_ROOT="$PROJECT_DIR"
 
 # ──── Environment ────
 module load miniforge
+eval "$(conda shell.bash hook)"
 conda activate itr
 
 # ──── Optional: copy data to fast local scratch ────

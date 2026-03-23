@@ -8,6 +8,7 @@ echo "=== Setting up MSI environment for no-tps-itr ==="
 
 # Load conda
 module load miniforge
+eval "$(conda shell.bash hook)"
 
 # Create conda env with CUDA PyTorch
 conda create -n itr python=3.11 -y
