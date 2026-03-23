@@ -694,13 +694,16 @@ def plot_prediction_vs_truth(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
     t_grid: np.ndarray,
+    sim_params: np.ndarray,
     sim_id: int,
     s: int,
-    k: int = 10,
-    H: int = 40,
+    n_steps: int = 40,
     save_path: str | Path | None = None,
 ):
     """Plot ground truth, FNO prediction, pointwise error, and interface cross-section.
+
+    Uses the time-conditioned FNO1d: for a given source snapshot at time s,
+    predict n_steps future target times and assemble into a space-time field.
 
     4-panel layout:
         (a) Ground truth heatmap with interface marker
@@ -709,38 +712,64 @@ def plot_prediction_vs_truth(
         (d) T(x) cross-section at mid-horizon timestep (truth vs prediction)
     """
     import torch
+    from data.dataset import AMP_RANGE, FREQ_RANGE, RC_RANGE, T_EPS
 
     Nx = x_grid.shape[0]
+    Nt = len(t_grid)
     interface_x = 0.5
 
-    # build a single input sample (same logic as WindowedForecastDataset.__getitem__)
-    T_hist = trajectories[sim_id]  # (Nt, Nx)
-    history = T_hist[s:s + k, :].T  # (Nx, k)
-    target = T_hist[s + k:s + k + H, :].T  # (Nx, H)
+    # evenly-spaced target indices after source time s
+    target_indices = np.linspace(s + 1, Nt - 1, n_steps, dtype=int)
+    t_targets = t_grid[target_indices]
 
-    t_future = t_grid[s + k:s + k + H]
-    x_norm = (x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])
-    t_norm = (t_future - t_grid[0]) / (t_grid[-1] - t_grid[0])
+    # source snapshot and normalization stats
+    T_source = trajectories[sim_id, s, :].astype(np.float32)  # (Nx,)
+    mu_s = T_source.mean()
+    sigma_s = T_source.std()
+    T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
 
-    history_grid = np.broadcast_to(history[:, None, :], (Nx, H, k))
-    x_channel = np.broadcast_to(x_norm[:, None, None], (Nx, H, 1))
-    t_channel = np.broadcast_to(t_norm[None, :, None], (Nx, H, 1))
+    # normalized spatial coordinate
+    x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
 
-    X = np.concatenate([history_grid, x_channel, t_channel], axis=-1).astype(np.float32)
-    X_tensor = torch.from_numpy(X).unsqueeze(0)  # (1, Nx, H, 12)
+    # sim params: (amp, freq, T0, R_c)
+    amp, freq, _T0, R_c = sim_params[sim_id]
+    amp, freq, R_c = float(amp), float(freq), float(R_c)
+
+    # build batched input: same source for all targets, varying t̄
+    x_spatial_single = np.stack([T_source_norm, x_norm], axis=-1)  # (Nx, 2)
+    x_spatial_batch = np.tile(x_spatial_single[None, :, :], (n_steps, 1, 1))  # (n_steps, Nx, 2)
+
+    # conditioning vectors: [t̄_norm, A_norm, f_norm, R_c_norm]
+    t_bars = t_grid[target_indices] - t_grid[s]
+    t_bar_norms = t_bars / t_grid[-1]
+    A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
+    f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
+    Rc_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
+
+    cond_batch = np.column_stack([
+        t_bar_norms,
+        np.full(n_steps, A_norm),
+        np.full(n_steps, f_norm),
+        np.full(n_steps, Rc_norm),
+    ]).astype(np.float32)  # (n_steps, 4)
 
     device = next(model.parameters()).device
-    X_tensor = X_tensor.to(device)
+    x_tensor = torch.from_numpy(x_spatial_batch).to(device)
+    c_tensor = torch.from_numpy(cond_batch).to(device)
 
     with torch.no_grad():
         model.eval()
-        Y_pred = model(X_tensor).cpu().numpy().squeeze()  # (Nx, H)
+        Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)  # (n_steps, Nx)
 
-    Y_true = target  # (Nx, H)
+    # denormalize predictions
+    Y_pred = (Y_pred_norm * (sigma_s + T_EPS) + mu_s).T  # (Nx, n_steps)
+
+    # ground truth at target times
+    Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)  # (Nx, n_steps)
     error = np.abs(Y_pred - Y_true)
 
     # meshgrid for pcolormesh
-    T_mesh, X_mesh = np.meshgrid(t_future, x_grid)
+    T_mesh, X_mesh = np.meshgrid(t_targets, x_grid)
 
     vmin = min(Y_true.min(), Y_pred.min())
     vmax = max(Y_true.max(), Y_pred.max())
@@ -771,17 +800,17 @@ def plot_prediction_vs_truth(
     fig.colorbar(pc2, ax=axes[2], label="|Error|", shrink=0.85)
 
     # cross-section at mid-horizon
-    mid_h = H // 2
+    mid_h = n_steps // 2
     axes[3].plot(x_grid, Y_true[:, mid_h], "k-", linewidth=1.5, label="Truth")
     axes[3].plot(x_grid, Y_pred[:, mid_h], "r--", linewidth=1.5, label="Prediction")
     axes[3].axvline(interface_x, color="gray", linestyle=":", linewidth=1.5, alpha=0.7, label="Interface")
     axes[3].set_xlabel("x")
     axes[3].set_ylabel("Temperature")
-    axes[3].set_title(f"T(x) at t={t_future[mid_h]:.3f}")
+    axes[3].set_title(f"T(x) at t={t_targets[mid_h]:.3f}")
     axes[3].legend(fontsize=8)
     axes[3].grid(True, linestyle="--", alpha=0.3)
 
-    fig.suptitle(f"Sim {sim_id}, window start s={s}", fontsize=12)
+    fig.suptitle(f"Sim {sim_id}, source t_s={t_grid[s]:.3f}", fontsize=12)
     fig.tight_layout()
 
     if save_path is None:
@@ -1085,7 +1114,7 @@ def plot_dataset_samples(
             ax.axvline(interface_x, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
                        label="Interface")
 
-            amp, freq = sim_params[sim_id]
+            amp, freq, *_ = sim_params[sim_id]
             ax.set_title(f"{split_name} | Sim {sim_id}\nA={float(amp):.0f}, f={float(freq):.1f}, s={s}",
                          fontsize=9)
             ax.set_xlabel("x")
@@ -1110,26 +1139,27 @@ def plot_interface_error(
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     sim_ids: np.ndarray,
-    k: int = 10,
-    H: int = 40,
     interface_x: float = 0.5,
     n_samples: int = 4,
+    n_targets: int = 20,
     seed: int = 42,
     save_path: str | Path | None = None,
 ):
     """Diagnose whether the model captures the temperature jump at the interface.
 
+    Uses the time-conditioned FNO1d: for a given source snapshot, predict
+    multiple future target times and compare with ground truth.
+
     Layout: n_samples rows × 3 columns.
         Left:   T(x) cross-sections near interface (colored=truth, red dashed=pred).
         Middle: Residual (pred − truth) zoomed to interface — reveals error structure.
-        Right:  Jump magnitude ΔT = T[right_node] - T[left_node] over the full horizon.
+        Right:  Jump magnitude ΔT = T[right_node] - T[left_node] over target times.
     """
     import torch
-    from data.dataset import split_sim_ids, windowed_sin_flux
+    from data.dataset import AMP_RANGE, FREQ_RANGE, RC_RANGE, T_EPS
 
     Nt = len(t_grid)
     Nx = len(x_grid)
-    max_s = Nt - H - k
 
     # find flanking nodes for the interface
     iface_idx = int(np.argmin(np.abs(x_grid - interface_x)))
@@ -1141,10 +1171,13 @@ def plot_interface_error(
 
     fig, axes = plt.subplots(n_samples, 3, figsize=(20, 4 * n_samples), squeeze=False)
     cmap_snap = plt.cm.viridis
-    n_snaps = 5
+    n_snaps = 5  # number of snapshots shown in cross-section panels
 
     device = next(model.parameters()).device
     model.eval()
+
+    # normalized spatial coordinate (fixed for all samples)
+    x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
 
     # zoom region for cross-section
     zoom_mask = (x_grid >= 0.3) & (x_grid <= 0.7)
@@ -1154,50 +1187,69 @@ def plot_interface_error(
     iface_mask = (x_grid >= 0.4) & (x_grid <= 0.6)
 
     for row_idx, sim_id in enumerate(chosen_sims):
-        s = rng.integers(0, max_s + 1)
+        # pick a random source time (leave room for targets after it)
+        max_s = Nt - 2  # need at least one target after source
+        s = int(rng.integers(0, max_s + 1))
 
-        # build FNO input (same logic as WindowedForecastDataset.__getitem__)
-        T_hist = trajectories[sim_id]
-        history = T_hist[s:s + k, :].T  # (Nx, k)
-        target = T_hist[s + k:s + k + H, :].T  # (Nx, H)
-        t_future = t_grid[s + k:s + k + H]
+        # evenly-spaced target indices after s
+        target_indices = np.linspace(s + 1, Nt - 1, n_targets, dtype=int)
+        t_targets = t_grid[target_indices]
 
-        amp, freq = sim_params[sim_id]
-        q_left = windowed_sin_flux(f=float(freq), A=float(amp), t_on=0.0, t_off=0.2,
-                                    phase=0.0, tukey_alpha=0.5)
-        q_future = np.array([q_left(t) for t in t_future], dtype=np.float32)
+        # source snapshot and its normalization stats
+        T_source = trajectories[sim_id, s, :].astype(np.float32)  # (Nx,)
+        mu_s = T_source.mean()
+        sigma_s = T_source.std()
+        T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
 
-        x_norm = (x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])
-        t_norm = (t_future - t_grid[0]) / (t_grid[-1] - t_grid[0])
+        # sim params: (amp, freq, T0, R_c)
+        amp, freq, _T0, R_c = sim_params[sim_id]
+        amp, freq, R_c = float(amp), float(freq), float(R_c)
 
-        history_grid = np.broadcast_to(history[:, None, :], (Nx, H, k))
-        x_channel = np.broadcast_to(x_norm[:, None, None], (Nx, H, 1))
-        t_channel = np.broadcast_to(t_norm[None, :, None], (Nx, H, 1))
-        q_channel = np.broadcast_to(q_future[None, :, None], (Nx, H, 1))
+        # build batched input: same source for all targets, varying t̄
+        x_spatial_single = np.stack([T_source_norm, x_norm], axis=-1)  # (Nx, 2)
+        x_spatial_batch = np.tile(x_spatial_single[None, :, :], (n_targets, 1, 1))  # (n_targets, Nx, 2)
 
-        X = np.concatenate([history_grid, x_channel, t_channel, q_channel], axis=-1).astype(np.float32)
-        X_tensor = torch.from_numpy(X).unsqueeze(0).to(device)
+        # conditioning vectors: [t̄_norm, A_norm, f_norm, R_c_norm]
+        t_bars = t_grid[target_indices] - t_grid[s]
+        t_bar_norms = t_bars / t_grid[-1]
+        A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
+        f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
+        Rc_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
+
+        cond_batch = np.column_stack([
+            t_bar_norms,
+            np.full(n_targets, A_norm),
+            np.full(n_targets, f_norm),
+            np.full(n_targets, Rc_norm),
+        ]).astype(np.float32)  # (n_targets, 4)
+
+        x_tensor = torch.from_numpy(x_spatial_batch).to(device)
+        c_tensor = torch.from_numpy(cond_batch).to(device)
 
         with torch.no_grad():
-            Y_pred = model(X_tensor).cpu().numpy().squeeze()  # (Nx, H)
+            Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)  # (n_targets, Nx)
 
-        Y_true = target  # (Nx, H)
+        # denormalize predictions
+        Y_pred = (Y_pred_norm * (sigma_s + T_EPS) + mu_s).T  # (Nx, n_targets)
+
+        # ground truth at target times
+        Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)  # (Nx, n_targets)
 
         # --- Left panel: T(x) overlay (truth vs pred) zoomed to interface ---
         ax_left = axes[row_idx, 0]
-        snap_indices = np.linspace(0, H - 1, n_snaps, dtype=int)
+        snap_indices = np.linspace(0, n_targets - 1, n_snaps, dtype=int)
 
         for i, h_idx in enumerate(snap_indices):
             color = cmap_snap(i / max(n_snaps - 1, 1))
             ax_left.plot(x_zoom, Y_true[zoom_mask, h_idx], color=color, linewidth=2.0,
-                         label=f"t={t_future[h_idx]:.3f}")
+                         label=f"t={t_targets[h_idx]:.3f}")
             ax_left.plot(x_zoom, Y_pred[zoom_mask, h_idx], color="red", linewidth=1.0,
                          linestyle="--", alpha=0.9)
 
         ax_left.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
         ax_left.set_xlabel("x")
         ax_left.set_ylabel("Temperature")
-        ax_left.set_title(f"Sim {sim_id} | A={float(amp):.0f}, f={float(freq):.1f}, s={s}\n"
+        ax_left.set_title(f"Sim {sim_id} | A={amp:.0f}, f={freq:.1f}, R_c={R_c:.2f}, s={s}\n"
                           f"Colored=truth, red dashed=pred", fontsize=9)
         ax_left.legend(fontsize=6, loc="best")
         ax_left.grid(True, linestyle="--", alpha=0.3)
@@ -1209,7 +1261,7 @@ def plot_interface_error(
             color = cmap_snap(i / max(n_snaps - 1, 1))
             residual = Y_pred[zoom_mask, h_idx] - Y_true[zoom_mask, h_idx]
             ax_mid.plot(x_zoom, residual, color=color, linewidth=1.5,
-                        label=f"t={t_future[h_idx]:.3f}")
+                        label=f"t={t_targets[h_idx]:.3f}")
 
         ax_mid.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
         ax_mid.axhline(0, color="gray", linestyle=":", alpha=0.5)
@@ -1224,8 +1276,8 @@ def plot_interface_error(
         true_jump = Y_true[right_node, :] - Y_true[left_node, :]
         pred_jump = Y_pred[right_node, :] - Y_pred[left_node, :]
 
-        ax_right.plot(t_future, true_jump, "k-", linewidth=1.5, label="True ΔT")
-        ax_right.plot(t_future, pred_jump, "r--", linewidth=1.5, label="Pred ΔT")
+        ax_right.plot(t_targets, true_jump, "k-", linewidth=1.5, label="True ΔT")
+        ax_right.plot(t_targets, pred_jump, "r--", linewidth=1.5, label="Pred ΔT")
         ax_right.axhline(0, color="gray", linestyle=":", alpha=0.5)
         ax_right.set_xlabel("Time")
         ax_right.set_ylabel("ΔT (right − left)")
