@@ -39,7 +39,7 @@ class SnapshotPairDataset(Dataset):
         seed: int = 0,
         stride: int = 1
     ):
-        self.trajectories = trajectories
+        self.trajectories = trajectories # (num_sims, Nt, Nx)
         self.sim_params = sim_params
         self.t_grid = t_grid.astype(np.float32)
         self.x_grid = x_grid.astype(np.float32)
@@ -100,9 +100,12 @@ class SnapshotPairDataset(Dataset):
         T_target_norm = (T_target - mu_s) / (sigma_s + T_EPS)
 
         # Spatial input: (Nx, 2) — [T̃_source, x_norm]
+        # this takes two arrays of the same shape and joins them to make (Nx, 2)
         x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
 
         # Conditioning vector: (4,) — [t̄_norm, A_norm, f_norm, R_c_norm]
+        # Note: conditioning vector varies per-sample
+        # min-max scaling formula: (x - x_min)/(x_max - x_min)
         t_bar = self.t_grid[j] - self.t_grid[s]
         t_bar_norm = t_bar / self.t_grid[-1]
         A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
@@ -116,6 +119,7 @@ class SnapshotPairDataset(Dataset):
         # Stats for denormalization at eval time: (2,)
         T_stats = np.array([mu_s, sigma_s], dtype=np.float32)
 
+        # return the entire sample
         return (
             torch.from_numpy(x_spatial),
             torch.from_numpy(cond),
