@@ -1,5 +1,3 @@
-# YAML file for data paths and hyperparameters
-
 defaults:
   - paths: default
   - search_space: medium
@@ -51,10 +49,6 @@ training:
   seeds: [0, 1]
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
-
-evaluation:
-  validation:
-  test:
 
 data:
   t_grid_path: ${paths.data_dir}/t_grid.npy
