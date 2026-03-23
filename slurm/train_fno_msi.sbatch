@@ -19,7 +19,7 @@ export PROJECT_ROOT="$PROJECT_DIR"
 
 # ──── Environment ────
 module load miniforge
-conda activate ihcp
+conda activate itr
 
 # ──── Optional: copy data to fast local scratch ────
 # Uncomment these 2 lines if I/O is a bottleneck:
