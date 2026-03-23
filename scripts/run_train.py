@@ -14,6 +14,11 @@ from src.operators.utils import resolve_device
 
 EXPERIMENT_ENV_VAR = "EXPERIMENT_NAME"
 
+
+def _resolve_runs_root(project_root: Path) -> Path:
+    """Return RUNS_ROOT from env (HPC) or fall back to project_root/runs (local)."""
+    return Path(os.environ.get("RUNS_ROOT", project_root / "runs"))
+
 def _next_experiment_name(runs_root: Path) -> str:
     runs_root.mkdir(parents=True, exist_ok=True)
     pattern = re.compile(r"^experiment(\d+)$")
@@ -83,7 +88,7 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    db_path = project_root / "runs" / experiment_name / "optuna_study.db"
+    db_path = _resolve_runs_root(project_root) / experiment_name / "optuna_study.db"
     storage_url = f"sqlite:///{db_path.as_posix()}"
 
     # Strategy 1: skip_compatibility_check bypasses the premature version
@@ -123,12 +128,12 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
 def _ensure_experiment_name(project_root: Path) -> str:
     experiment_name = os.environ.get(EXPERIMENT_ENV_VAR)
     if not experiment_name:
-        runs_root = project_root / "runs"
+        runs_root = _resolve_runs_root(project_root)
         experiment_name = _next_experiment_name(runs_root)
         os.environ[EXPERIMENT_ENV_VAR] = experiment_name
 
     # Create the experiment directory so Optuna can write its SQLite DB
-    experiment_dir = project_root / "runs" / experiment_name
+    experiment_dir = _resolve_runs_root(project_root) / experiment_name
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     # Remove corrupt Optuna DB left by a failed prior run
@@ -223,11 +228,12 @@ def run_train(cfg: DictConfig) -> float:
     project_root = Path(__file__).resolve().parents[1]
     experiment_name = _ensure_experiment_name(project_root)
 
+    runs_root = _resolve_runs_root(project_root)
     job_num = _job_number()
-    offset = _next_config_index(project_root / "runs" / experiment_name)
+    offset = _next_config_index(runs_root / experiment_name)
     config_name = f"conf{job_num + offset}"
-    run_dir = project_root / "runs" / experiment_name / config_name
-    generated_dir = project_root / "conf" / "generated" / experiment_name
+    run_dir = runs_root / experiment_name / config_name
+    generated_dir = runs_root / experiment_name / "generated"
 
     resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(resolved_cfg, dict):
