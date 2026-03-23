@@ -1750,17 +1750,20 @@ if __name__ == "__main__":
                     if args.checkpoint:
                         print("--- interface_error ---")
                         import torch
-                        from src.operators.fno1d import FNO2d
+                        from src.operators.fno1d import FNO1d
                         from data.dataset import split_sim_ids
 
                         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
                         conf = ckpt["conf"]
                         model_cfg = conf.get("model", {}).get("parameters", {})
-                        model = FNO2d(
-                            modes1=model_cfg.get("modes1", 16),
-                            modes2=model_cfg.get("modes2", 16),
+                        model = FNO1d(
+                            modes=model_cfg.get("modes", 16),
                             width=model_cfg.get("width", 64),
-                            in_channels=model_cfg.get("in_channels", 13),
+                            in_channels=model_cfg.get("in_channels", 2),
+                            out_channels=model_cfg.get("out_channels", 1),
+                            n_layers=model_cfg.get("n_layers", 4),
+                            cond_dim=model_cfg.get("cond_dim", 4),
+                            cond_hidden=model_cfg.get("cond_hidden", 256),
                         )
                         model.load_state_dict(ckpt["model_state"])
                         model.eval()

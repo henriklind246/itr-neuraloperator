@@ -182,19 +182,19 @@ class TestValidate:
 
 class TestIsTrainingComplete:
     def test_complete_when_best_exists_no_latest(self, tmp_path):
-        (tmp_path / "fno2d_best.pt").touch()
+        (tmp_path / "fno1d_best.pt").touch()
         assert _is_training_complete(tmp_path) is True
 
     def test_incomplete_when_latest_exists(self, tmp_path):
-        (tmp_path / "fno2d_best.pt").touch()
-        (tmp_path / "fno2d_latest.pt").touch()
+        (tmp_path / "fno1d_best.pt").touch()
+        (tmp_path / "fno1d_latest.pt").touch()
         assert _is_training_complete(tmp_path) is False
 
     def test_incomplete_when_nothing_exists(self, tmp_path):
         assert _is_training_complete(tmp_path) is False
 
     def test_incomplete_when_only_latest(self, tmp_path):
-        (tmp_path / "fno2d_latest.pt").touch()
+        (tmp_path / "fno1d_latest.pt").touch()
         assert _is_training_complete(tmp_path) is False
 
 
@@ -202,7 +202,7 @@ class TestIsTrainingComplete:
 
 class TestLoadCompletedResult:
     def test_returns_correct_fields(self, tmp_path):
-        best_path = tmp_path / "fno2d_best.pt"
+        best_path = tmp_path / "fno1d_best.pt"
         torch.save({"best_val": 0.05, "epoch": 100, "seed": 0}, best_path)
         result = _load_completed_result(tmp_path, seed=0)
         assert result["seed"] == 0
@@ -210,7 +210,7 @@ class TestLoadCompletedResult:
         assert result["best_path"] == str(best_path)
 
     def test_different_seed_value(self, tmp_path):
-        torch.save({"best_val": 1.23, "epoch": 50, "seed": 7}, tmp_path / "fno2d_best.pt")
+        torch.save({"best_val": 1.23, "epoch": 50, "seed": 7}, tmp_path / "fno1d_best.pt")
         result = _load_completed_result(tmp_path, seed=7)
         assert result["seed"] == 7
         assert result["best_val"] == pytest.approx(1.23)
@@ -269,12 +269,12 @@ class TestRunOneSeedResume:
         run_dir = tmp_path / "seed0"
         run_dir.mkdir()
         # Simulate a completed run
-        torch.save({"best_val": 0.042, "epoch": 99, "seed": 0}, run_dir / "fno2d_best.pt")
+        torch.save({"best_val": 0.042, "epoch": 99, "seed": 0}, run_dir / "fno1d_best.pt")
 
         result = run_one_seed(seed_config, seed=0, run_dir=run_dir)
         assert result["best_val"] == pytest.approx(0.042)
         # No sentinel should exist
-        assert not (run_dir / "fno2d_latest.pt").exists()
+        assert not (run_dir / "fno1d_latest.pt").exists()
 
     def test_fresh_run_produces_checkpoint(self, tmp_path, seed_config):
         """A fresh run should produce best checkpoint and clean up sentinel."""
@@ -282,8 +282,8 @@ class TestRunOneSeedResume:
         result = run_one_seed(seed_config, seed=0, run_dir=run_dir)
 
         assert "best_val" in result
-        assert (run_dir / "fno2d_best.pt").exists()
-        assert not (run_dir / "fno2d_latest.pt").exists()  # sentinel removed
+        assert (run_dir / "fno1d_best.pt").exists()
+        assert not (run_dir / "fno1d_latest.pt").exists()  # sentinel removed
         assert (run_dir / "train_metrics.csv").exists()
 
     def test_resume_interrupted_run(self, tmp_path, seed_config):
@@ -296,16 +296,16 @@ class TestRunOneSeedResume:
         run_one_seed(short_config, seed=0, run_dir=run_dir)
 
         # The run completed cleanly, so simulate interruption by recreating sentinel
-        best_ckpt = torch.load(run_dir / "fno2d_best.pt", map_location="cpu", weights_only=False)
-        torch.save(best_ckpt, run_dir / "fno2d_latest.pt")
+        best_ckpt = torch.load(run_dir / "fno1d_best.pt", map_location="cpu", weights_only=False)
+        torch.save(best_ckpt, run_dir / "fno1d_latest.pt")
 
         # Now resume with more epochs
         resume_config = {**seed_config, "training": {**seed_config["training"], "epochs": 6}}
         result = run_one_seed(resume_config, seed=0, run_dir=run_dir)
 
         assert "best_val" in result
-        assert (run_dir / "fno2d_best.pt").exists()
-        assert not (run_dir / "fno2d_latest.pt").exists()  # sentinel cleaned
+        assert (run_dir / "fno1d_best.pt").exists()
+        assert not (run_dir / "fno1d_latest.pt").exists()  # sentinel cleaned
 
     def test_csv_no_duplicate_header_on_resume(self, tmp_path, seed_config):
         """Resuming should append to CSV without writing a second header row."""
@@ -315,8 +315,8 @@ class TestRunOneSeedResume:
         short_config = {**seed_config, "training": {**seed_config["training"], "epochs": 2}}
         run_one_seed(short_config, seed=0, run_dir=run_dir)
 
-        best_ckpt = torch.load(run_dir / "fno2d_best.pt", map_location="cpu", weights_only=False)
-        torch.save(best_ckpt, run_dir / "fno2d_latest.pt")
+        best_ckpt = torch.load(run_dir / "fno1d_best.pt", map_location="cpu", weights_only=False)
+        torch.save(best_ckpt, run_dir / "fno1d_latest.pt")
 
         # Resume with more epochs
         resume_config = {**seed_config, "training": {**seed_config["training"], "epochs": 6}}
@@ -336,8 +336,8 @@ class TestRunOneSeedResume:
         short_config = {**seed_config, "training": {**seed_config["training"], "epochs": 2}}
         run_one_seed(short_config, seed=0, run_dir=run_dir)
 
-        best_ckpt = torch.load(run_dir / "fno2d_best.pt", map_location="cpu", weights_only=False)
-        torch.save(best_ckpt, run_dir / "fno2d_latest.pt")
+        best_ckpt = torch.load(run_dir / "fno1d_best.pt", map_location="cpu", weights_only=False)
+        torch.save(best_ckpt, run_dir / "fno1d_latest.pt")
 
         resume_config = {**seed_config, "training": {**seed_config["training"], "epochs": 6}}
         run_one_seed(resume_config, seed=0, run_dir=run_dir)
@@ -417,11 +417,11 @@ class TestRunConfigSeeds:
         run_dir = tmp_path / "run"
         run_config_seeds(seed_config, base_run_dir=run_dir, seeds=[0, 1])
 
-        assert (run_dir / "seed0" / "fno2d_best.pt").exists()
-        assert (run_dir / "seed1" / "fno2d_best.pt").exists()
+        assert (run_dir / "seed0" / "fno1d_best.pt").exists()
+        assert (run_dir / "seed1" / "fno1d_best.pt").exists()
         # Sentinels should be cleaned up
-        assert not (run_dir / "seed0" / "fno2d_latest.pt").exists()
-        assert not (run_dir / "seed1" / "fno2d_latest.pt").exists()
+        assert not (run_dir / "seed0" / "fno1d_latest.pt").exists()
+        assert not (run_dir / "seed1" / "fno1d_latest.pt").exists()
 
     def test_mean_best_val_is_average(self, tmp_path, seed_config):
         run_dir = tmp_path / "run"
@@ -437,7 +437,7 @@ class TestRunConfigSeeds:
         # Pre-populate seed0 as complete
         seed0_dir = run_dir / "seed0"
         seed0_dir.mkdir(parents=True)
-        torch.save({"best_val": 0.01, "epoch": 99, "seed": 0}, seed0_dir / "fno2d_best.pt")
+        torch.save({"best_val": 0.01, "epoch": 99, "seed": 0}, seed0_dir / "fno1d_best.pt")
 
         summary = run_config_seeds(seed_config, base_run_dir=run_dir, seeds=[0, 1])
 
@@ -446,7 +446,7 @@ class TestRunConfigSeeds:
         seed0_result = next(r for r in summary["per_seed"] if r["seed"] == 0)
         assert seed0_result["best_val"] == pytest.approx(0.01)
         # seed1 should have been trained fresh
-        assert (run_dir / "seed1" / "fno2d_best.pt").exists()
+        assert (run_dir / "seed1" / "fno1d_best.pt").exists()
 
     def test_uses_config_seeds_when_none_provided(self, tmp_path, seed_config):
         run_dir = tmp_path / "run"

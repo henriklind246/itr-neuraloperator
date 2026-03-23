@@ -95,9 +95,9 @@ The `WindowedForecastDataset` class converts raw simulation trajectories into in
 - Validation: random windows, 8 per sim per epoch (faster than exhaustive but more signal than 1)
 - Test: deterministic, all 152 valid windows per sim (exhaustive)
 
-## 6. Neural Operator: FNO2d
+## 6. Neural Operator: FNO1d
 
-**File**: `src/operators/fno2d.py`
+**File**: `src/operators/fno1d.py`
 
 The Fourier Neural Operator learns the mapping:
 
@@ -130,7 +130,7 @@ The default configuration has approximately 8.4 million parameters.
 - Loss function: MSELoss between predicted and true temperature fields
 - Validation metric: relative L2 error (%) = sqrt(mean((pred - true)^2) / mean(true^2)) * 100
 - Early stopping: stops after 15 consecutive validation checks (every 10 epochs) with no improvement
-- Checkpointing: saves the best model (by validation rel_l2) to `fno2d_best.pt`, including the full config for reproducibility
+- Checkpointing: saves the best model (by validation rel_l2) to `fno1d_best.pt`, including the full config for reproducibility
 
 **Multi-seed wrapper** (`run_config_seeds`):
 - Trains the same configuration with multiple seeds (e.g., seed 0 and seed 1)
@@ -173,7 +173,7 @@ Each trial trains all seeds, and the sweep output includes resolved configs for 
 | `src/physics/dt_convergence_study.py` | Temporal resolution analysis script |
 | `data/generate_dataset.py` | 6D LHS sampling, per-sim solver construction, trajectory generation |
 | `data/dataset.py` | WindowedForecastDataset, data loading, splitting, DataLoader creation |
-| `src/operators/fno2d.py` | FNO2d model with SpectralConv2d layers |
+| `src/operators/fno1d.py` | FNO1d model with SpectralConv1d layers |
 | `src/operators/train.py` | Training loop, validation, early stopping, multi-seed wrapper |
 | `src/operators/eval.py` | Test evaluation, seed report generation |
 | `src/operators/utils.py` | Device resolution utility |

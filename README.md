@@ -97,7 +97,7 @@ python -m src.operators.train
 
 ## Evaluation
 
-[src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py) is the current evaluation entry point. It loads `fno2d_best.pt` checkpoints from a run directory, computes per-seed test metrics, and writes `seed_report.json`.
+[src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py) is the current evaluation entry point. It loads `fno1d_best.pt` checkpoints from a run directory, computes per-seed test metrics, and writes `seed_report.json`.
 
 ```bash
 python -m src.operators.eval
@@ -146,7 +146,7 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 - [data/dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/dataset.py): windowed dataset construction and dataloaders
 - [src/physics/fd_solver_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/fd_solver_1d.py): multilayer finite-difference solver
 - [src/physics/mms_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/mms_1d.py): manufactured-solution verification
-- [src/operators/fno2d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/fno2d.py): Fourier Neural Operator model
+- [src/operators/fno1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/fno1d.py): Fourier Neural Operator model
 - [src/operators/train.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/train.py): direct training module
 - [src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py): checkpoint evaluation and reporting
 - [scripts/run_train.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_train.py): Hydra + Optuna sweep entry point
