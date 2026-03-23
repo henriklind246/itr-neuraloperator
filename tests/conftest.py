@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from src.physics.fd_solver_1d import FDSolver1D, Layer1D
-from src.operators.fno2d import FNO1d
+from src.operators.fno1d import FNO1d
 
 
 # ---------- solver fixtures ----------

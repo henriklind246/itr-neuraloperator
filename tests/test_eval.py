@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.eval import evaluate, mean_std, print_seed_report
-from src.operators.fno2d import FNO1d
+from src.operators.fno1d import FNO1d
 
 
 # ===================== evaluate =====================

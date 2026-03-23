@@ -1750,7 +1750,7 @@ if __name__ == "__main__":
                     if args.checkpoint:
                         print("--- interface_error ---")
                         import torch
-                        from src.operators.fno2d import FNO2d
+                        from src.operators.fno1d import FNO2d
                         from data.dataset import split_sim_ids
 
                         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)

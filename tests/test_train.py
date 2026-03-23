@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.operators.fno2d import FNO1d
+from src.operators.fno1d import FNO1d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 import csv
 

@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from src.operators.fno2d import SpectralConv1d, ConditioningMLP, ConditionalInstanceNorm1d, FNO1d
+from src.operators.fno1d import SpectralConv1d, ConditioningMLP, ConditionalInstanceNorm1d, FNO1d
 
 
 # ===================== SpectralConv1d =====================
