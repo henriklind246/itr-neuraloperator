@@ -7,7 +7,7 @@ import torch
 from torch.optim import Adam
 
 from data.dataset import create_dataloaders, load_sim_data, split_sim_ids
-from src.operators.fno2d import FNO1d
+from src.operators.fno1d import FNO1d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 
@@ -53,12 +53,12 @@ def set_seed(seed: int) -> None:
 
 def _is_training_complete(run_path: Path) -> bool:
     """Training is complete if best checkpoint exists and no latest (sentinel) exists."""
-    return (run_path / "fno2d_best.pt").exists() and not (run_path / "fno2d_latest.pt").exists()
+    return (run_path / "fno1d_best.pt").exists() and not (run_path / "fno1d_latest.pt").exists()
 
 
 def _load_completed_result(run_path: Path, seed: int) -> dict[str, float | int | str]:
     """Extract result from a previously completed run's best checkpoint."""
-    best_path = run_path / "fno2d_best.pt"
+    best_path = run_path / "fno1d_best.pt"
     ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
     return {"seed": seed, "best_val": float(ckpt["best_val"]), "best_path": str(best_path)}
 
@@ -69,6 +69,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_ma
     train_rel_l2 = 0.0
     train_iface_rel_l2 = 0.0
 
+    # _T_stats is not used since error metrics are computed in z-score temp. source space
     for x_spatial, cond, y_batch, _T_stats in train_loader:
         x_spatial = x_spatial.to(device)
         cond = cond.to(device)
@@ -127,7 +128,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         return result
 
     # --- Check for interrupted run ---
-    latest_path = run_path / "fno2d_latest.pt"
+    latest_path = run_path / "fno1d_latest.pt"
     resuming = latest_path.exists()
 
     set_seed(seed)
@@ -162,7 +163,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         out_channels=model_cfg["out_channels"],
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", 4),
-        cond_hidden=model_cfg.get("cond_hidden", 256),
+        cond_hidden=model_cfg.get("cond_hidden", 256)
     )
 
     # --- Resume state ---
@@ -211,7 +212,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     validate_every = config["training"]["validate_every"]
     patience = config["training"]["patience"]
 
-    best_path = run_path / "fno2d_best.pt"
+    best_path = run_path / "fno1d_best.pt"
 
     # --- CSV: truncate to start_epoch when resuming, overwrite when fresh ---
     csv_path = run_path / "train_metrics.csv"
