@@ -16,7 +16,7 @@ from scripts.run_train import (
     _update_index_and_best,
     _ensure_experiment_name,
     _validate_optuna_db,
-    _stamp_optuna_alembic,
+    _stamp_alembic_version_direct,
     _pre_init_optuna_storage,
     _config_sort_key,
     EXPERIMENT_ENV_VAR,
@@ -293,11 +293,11 @@ class TestValidateOptunaDb:
         assert _validate_optuna_db(db) is False
 
 
-# ===================== _stamp_optuna_alembic =====================
+# ===================== _stamp_alembic_version_direct =====================
 
-class TestStampOptunaAlembic:
+class TestStampAlembicVersionDirect:
     def test_stamps_fresh_db_with_tables(self, tmp_path):
-        """After creating tables with SQLAlchemy, alembic stamp fills alembic_version."""
+        """After creating tables with SQLAlchemy, direct stamp fills alembic_version."""
         import sqlalchemy as sa
         from optuna.storages._rdb import models
 
@@ -306,11 +306,11 @@ class TestStampOptunaAlembic:
         models.BaseModel.metadata.create_all(engine)
         engine.dispose()
 
-        # Before stamp: DB exists but has no alembic_version table
+        # Before stamp: DB exists but has no alembic_version row
         assert _validate_optuna_db(db) is False
 
         # Stamp it
-        assert _stamp_optuna_alembic(db) is True
+        assert _stamp_alembic_version_direct(db) is True
         assert _validate_optuna_db(db) is True
 
     def test_idempotent_on_already_stamped_db(self, tmp_path):
@@ -322,7 +322,7 @@ class TestStampOptunaAlembic:
         assert _validate_optuna_db(db) is True
 
         # Stamp again — should succeed and remain valid
-        assert _stamp_optuna_alembic(db) is True
+        assert _stamp_alembic_version_direct(db) is True
         assert _validate_optuna_db(db) is True
 
 

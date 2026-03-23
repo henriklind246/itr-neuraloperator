@@ -53,21 +53,40 @@ def _validate_optuna_db(db_path: Path) -> bool:
         return False
 
 
-def _stamp_optuna_alembic(db_path: Path) -> bool:
-    """Manually stamp alembic_version using Optuna's migration scripts.
+def _stamp_alembic_version_direct(db_path: Path) -> bool:
+    """Directly insert the alembic head revision into the DB using sqlite3.
 
-    Returns True if the DB is valid after stamping.
+    This is more reliable than running alembic's stamp command, which can
+    silently fail to commit on some platforms / SQLite journal modes.
+    Returns True if alembic_version has a row after the operation.
     """
     try:
+        import sqlite3
         import optuna
-        from alembic.config import Config
-        from alembic.command import stamp as alembic_stamp
+        from alembic.config import Config as AlembicConfig
+        from alembic.script import ScriptDirectory
 
+        # Determine head revision from Optuna's installed alembic scripts
         optuna_rdb = Path(optuna.__file__).parent / "storages" / "_rdb"
-        config = Config(str(optuna_rdb / "alembic.ini"))
+        config = AlembicConfig(str(optuna_rdb / "alembic.ini"))
         config.set_main_option("script_location", str(optuna_rdb / "alembic"))
-        config.set_main_option("sqlalchemy.url", f"sqlite:///{db_path.as_posix()}")
-        alembic_stamp(config, "head")
+        script = ScriptDirectory.from_config(config)
+        head = script.get_current_head()
+
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        # Create table if it doesn't exist (belt-and-suspenders)
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS alembic_version "
+            "(version_num VARCHAR(32) NOT NULL)"
+        )
+        cur.execute("SELECT version_num FROM alembic_version LIMIT 1")
+        if cur.fetchone() is None:
+            cur.execute(
+                "INSERT INTO alembic_version (version_num) VALUES (?)", (head,)
+            )
+        conn.commit()
+        conn.close()
         return _validate_optuna_db(db_path)
     except Exception:
         return False
@@ -76,14 +95,12 @@ def _stamp_optuna_alembic(db_path: Path) -> bool:
 def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
     """Pre-initialize the Optuna SQLite DB so the Hydra sweeper finds a valid schema.
 
-    On some platforms (notably Windows), Optuna's RDBStorage may fail to properly
-    populate the alembic_version table during schema creation. This function
-    uses two strategies:
+    Optuna 2.10's RDBStorage fails on fresh databases because it creates tables
+    but doesn't populate alembic_version, then immediately asserts it exists.
+    This function works around the bug by:
 
-    1. Create the study with skip_compatibility_check=True to bypass the
-       premature version assertion.
-    2. If the DB is still invalid (empty alembic_version), manually stamp
-       the version using Optuna's own alembic migration scripts.
+    1. Creating the DB with skip_compatibility_check=True (tables + study).
+    2. Directly inserting the alembic head revision via sqlite3 if missing.
     """
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -91,8 +108,11 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
     db_path = _resolve_runs_root(project_root) / experiment_name / "optuna_study.db"
     storage_url = f"sqlite:///{db_path.as_posix()}"
 
-    # Strategy 1: skip_compatibility_check bypasses the premature version
-    # assertion that fails on fresh databases with some Optuna versions.
+    # Already valid — nothing to do.
+    if db_path.exists() and _validate_optuna_db(db_path):
+        return
+
+    # Step 1: Create tables and study with skip_compatibility_check.
     try:
         from optuna.storages import RDBStorage
         storage = RDBStorage(url=storage_url, skip_compatibility_check=True)
@@ -101,23 +121,18 @@ def _pre_init_optuna_storage(project_root: Path, experiment_name: str) -> None:
             study_name=experiment_name,
             load_if_exists=True,
         )
-        if _validate_optuna_db(db_path):
-            return
     except Exception:
         pass
 
-    # Strategy 2: Tables may exist but alembic_version is empty.
-    # Manually stamp the version using Optuna's alembic config.
-    if db_path.exists() and _stamp_optuna_alembic(db_path):
+    # Step 2: Ensure alembic_version is populated (direct sqlite3 INSERT).
+    if db_path.exists() and _stamp_alembic_version_direct(db_path):
         return
 
-    # Both strategies failed — print diagnostics.
+    # Both steps failed — print diagnostics and clean up.
     print(f"Warning: Could not pre-initialize Optuna DB.")
     print(f"  Optuna version installed: {optuna.__version__}")
     print(f"  Storage URL: {storage_url}")
 
-    # Clean up the corrupt DB so the Hydra sweeper can try fresh.
-    # On Windows, SQLite may hold a file lock, so ignore OSError.
     try:
         if db_path.exists():
             db_path.unlink()
