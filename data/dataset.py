@@ -17,7 +17,7 @@ T_EPS = 1e-6  # epsilon for temperature normalization
 class SnapshotPairDataset(Dataset):
     """All-to-all snapshot-pair dataset for time-conditioned FNO.
 
-    Each sample is a (source, target) pair: given the temperature field at
+    Each sample is a (input, target) pair: given the temperature field at
     time t_s, predict the field at a future time t_j > t_s.
 
     Returns 4-tuple: (x_spatial, cond, Y, T_stats)
@@ -37,7 +37,7 @@ class SnapshotPairDataset(Dataset):
         pairs_per_sim: int = 50,
         random_pairs: bool = True,
         seed: int = 0,
-        stride: int = 1,
+        stride: int = 1
     ):
         self.trajectories = trajectories
         self.sim_params = sim_params

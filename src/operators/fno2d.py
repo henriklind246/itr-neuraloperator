@@ -69,7 +69,7 @@ class ConditionalInstanceNorm1d(nn.Module):
 # --------- Conditioning MLP ---------
 
 class ConditioningMLP(nn.Module):
-    """Maps conditioning vector → per-layer CIN parameters (γ, β).
+    """Maps per-sample conditioning vector → per-layer CIN parameters (γ, β).
 
     Identity init: last linear layer has weight=0 and bias=[1…1, 0…0]
     so that at initialization γ=1, β=0 (plain InstanceNorm, model starts
@@ -79,6 +79,7 @@ class ConditioningMLP(nn.Module):
     def __init__(self, cond_dim: int, hidden_dim: int, n_layers: int, width: int):
         super().__init__()
         self.n_layers = n_layers
+        # width of fno layers
         self.width = width
 
         self.net = nn.Sequential(
