@@ -53,7 +53,7 @@ training:
   validate_every: 10
   patience: 15
   checkpoint_metric: "val_rel_l2"
-  seeds: [0, 1]
+  seeds: [42]
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
 
