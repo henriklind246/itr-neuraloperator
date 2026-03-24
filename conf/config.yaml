@@ -29,13 +29,20 @@ model:
 training:
   device: "auto"
   batch_size: 64
-  pairs_per_sim_train: 50
-  pairs_per_sim_val: 20
+  pairs_per_sim_train: 200
+  pairs_per_sim_val: 100
   test_stride: 1
+  stratified_sampling: true
   epochs: 1500
   learning_rate: 0.001
   weight_decay: 1.0e-5
+  grad_clip: 1.0
   scheduler:
+    type: "CosineWarmRestarts"
+    T_0: 100
+    T_mult: 2
+    eta_min: 1.0e-6
+    # StepLR params (used when type=StepLR):
     step_size: 50
     gamma: 0.5
   optimizer: "Adam"
