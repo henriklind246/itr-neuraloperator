@@ -16,7 +16,6 @@ from scripts.run_train import (
     _update_index_and_best,
     _ensure_experiment_name,
     _validate_optuna_db,
-    _stamp_alembic_version_direct,
     _pre_init_optuna_storage,
     _config_sort_key,
     EXPERIMENT_ENV_VAR,
@@ -293,53 +292,18 @@ class TestValidateOptunaDb:
         assert _validate_optuna_db(db) is False
 
 
-# ===================== _stamp_alembic_version_direct =====================
-
-class TestStampAlembicVersionDirect:
-    def test_stamps_fresh_db_with_tables(self, tmp_path):
-        """After creating tables with SQLAlchemy, direct stamp fills alembic_version."""
-        import sqlalchemy as sa
-        from optuna.storages._rdb import models
-
-        db = tmp_path / "optuna_study.db"
-        engine = sa.create_engine(f"sqlite:///{db.as_posix()}")
-        models.BaseModel.metadata.create_all(engine)
-        engine.dispose()
-
-        # Before stamp: DB exists but has no alembic_version row
-        assert _validate_optuna_db(db) is False
-
-        # Stamp it
-        assert _stamp_alembic_version_direct(db) is True
-        assert _validate_optuna_db(db) is True
-
-    def test_idempotent_on_already_stamped_db(self, tmp_path):
-        """Stamping an already-stamped DB is a no-op."""
-        import optuna
-        db = tmp_path / "optuna_study.db"
-        url = f"sqlite:///{db.as_posix()}"
-        optuna.create_study(storage=url, study_name="test")
-        assert _validate_optuna_db(db) is True
-
-        # Stamp again — should succeed and remain valid
-        assert _stamp_alembic_version_direct(db) is True
-        assert _validate_optuna_db(db) is True
-
-
 # ===================== _pre_init_optuna_storage =====================
 
 class TestPreInitOptunaStorage:
-    def test_creates_valid_db_from_scratch(self, tmp_path):
-        """Fresh experiment dir → DB created and valid."""
+    def test_noop_when_no_db(self, tmp_path):
+        """No DB file → pre-init does nothing (sweeper creates it)."""
         exp_name = "experiment_test"
         exp_dir = tmp_path / "runs" / exp_name
         exp_dir.mkdir(parents=True)
 
         _pre_init_optuna_storage(tmp_path, exp_name)
-
-        db_path = exp_dir / "optuna_study.db"
-        assert db_path.exists()
-        assert _validate_optuna_db(db_path) is True
+        # No DB file created — the sweeper handles creation
+        assert not (exp_dir / "optuna_study.db").exists()
 
     def test_preserves_existing_valid_db(self, tmp_path):
         """Calling pre-init on an already-valid DB does not corrupt it."""
@@ -368,8 +332,8 @@ class TestPreInitOptunaStorage:
         loaded_study = optuna.load_study(storage=storage_url, study_name=exp_name)
         assert len(loaded_study.trials) == 1
 
-    def test_handles_corrupt_db(self, tmp_path):
-        """A 0-byte corrupt DB is either replaced with a valid one or cleaned up."""
+    def test_removes_corrupt_db(self, tmp_path):
+        """A 0-byte corrupt DB is cleaned up."""
         exp_name = "experiment_corrupt"
         exp_dir = tmp_path / "runs" / exp_name
         exp_dir.mkdir(parents=True)
@@ -380,9 +344,5 @@ class TestPreInitOptunaStorage:
 
         _pre_init_optuna_storage(tmp_path, exp_name)
 
-        # Newer Optuna versions overwrite the corrupt file successfully;
-        # older versions fail, print diagnostics, and attempt cleanup.
-        # Either outcome is acceptable.
-        if db_path.exists():
-            assert _validate_optuna_db(db_path) is True  # overwritten with valid DB
-        # else: file was cleaned up after failure — also fine
+        # Corrupt file should be removed
+        assert not db_path.exists()
