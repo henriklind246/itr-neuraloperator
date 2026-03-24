@@ -218,6 +218,45 @@ class TestSnapshotPairDataset:
         assert torch.equal(y1, y2)
         assert torch.equal(s1, s2)
 
+    def test_stratified_returns_valid_samples(self, synthetic_trajectories, synthetic_sim_params):
+        """Stratified sampling should produce valid (positive lead time) samples."""
+        trajectories, x_grid, t_grid = synthetic_trajectories
+        sim_ids = np.arange(5)
+        ds = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            pairs_per_sim=20, random_pairs=True, stratified=True, seed=0,
+        )
+        for i in range(len(ds)):
+            x_spatial, cond, Y, T_stats = ds[i]
+            assert x_spatial.shape == (11, 2)
+            assert cond[0].item() > 0  # lead time > 0
+
+    def test_stratified_lead_time_more_uniform(self, synthetic_trajectories, synthetic_sim_params):
+        """Stratified mode should produce a more uniform lead-time distribution
+        than naive sampling (less triangular bias toward short lead times)."""
+        trajectories, x_grid, t_grid = synthetic_trajectories
+        Nt = t_grid.shape[0]
+        sim_ids = np.arange(1)  # single sim for clear comparison
+        n_pairs = 500
+
+        ds_naive = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            pairs_per_sim=n_pairs, random_pairs=True, stratified=False, seed=0,
+        )
+        ds_strat = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            pairs_per_sim=n_pairs, random_pairs=True, stratified=True, seed=0,
+        )
+
+        lead_naive = [ds_naive[i][1][0].item() for i in range(n_pairs)]
+        lead_strat = [ds_strat[i][1][0].item() for i in range(n_pairs)]
+
+        # Stratified should have higher mean lead time (naive is biased toward short)
+        assert np.mean(lead_strat) > np.mean(lead_naive)
+
 
 # ===================== create_dataloaders =====================
 

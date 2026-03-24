@@ -145,6 +145,22 @@ class TestTrainOneEpoch:
         _, _, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
         assert iface_rel_l2 == 0.0
 
+    def test_grad_clip_runs_without_error(self, tiny_training_setup):
+        model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
+        loss, _, _ = train_one_epoch(
+            model, loader, optimizer, loss_fn, device,
+            iface_mask=iface_mask, grad_clip=0.01,
+        )
+        assert np.isfinite(loss)
+
+    def test_grad_clip_none_is_noop(self, tiny_training_setup):
+        model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
+        loss, _, _ = train_one_epoch(
+            model, loader, optimizer, loss_fn, device,
+            iface_mask=iface_mask, grad_clip=None,
+        )
+        assert np.isfinite(loss)
+
 
 # ===================== validate =====================
 
@@ -285,6 +301,40 @@ class TestRunOneSeedResume:
         assert (run_dir / "fno1d_best.pt").exists()
         assert not (run_dir / "fno1d_latest.pt").exists()  # sentinel removed
         assert (run_dir / "train_metrics.csv").exists()
+
+    def test_cosine_warm_restarts_scheduler(self, tmp_path, seed_config):
+        """CosineWarmRestarts scheduler should complete training without error."""
+        cosine_config = {
+            **seed_config,
+            "training": {
+                **seed_config["training"],
+                "scheduler": {"type": "CosineWarmRestarts", "T_0": 2, "T_mult": 1, "eta_min": 1e-6},
+            },
+        }
+        run_dir = tmp_path / "seed0_cosine"
+        result = run_one_seed(cosine_config, seed=0, run_dir=run_dir)
+        assert "best_val" in result
+        assert (run_dir / "fno1d_best.pt").exists()
+
+    def test_grad_clip_in_full_run(self, tmp_path, seed_config):
+        """grad_clip config should be picked up and run without error."""
+        clip_config = {
+            **seed_config,
+            "training": {**seed_config["training"], "grad_clip": 0.5},
+        }
+        run_dir = tmp_path / "seed0_clip"
+        result = run_one_seed(clip_config, seed=0, run_dir=run_dir)
+        assert "best_val" in result
+
+    def test_stratified_sampling_in_full_run(self, tmp_path, seed_config):
+        """stratified_sampling config should be passed through to dataloader."""
+        strat_config = {
+            **seed_config,
+            "training": {**seed_config["training"], "stratified_sampling": True},
+        }
+        run_dir = tmp_path / "seed0_strat"
+        result = run_one_seed(strat_config, seed=0, run_dir=run_dir)
+        assert "best_val" in result
 
     def test_resume_interrupted_run(self, tmp_path, seed_config):
         """An interrupted run (sentinel exists) should resume and complete."""
