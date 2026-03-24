@@ -63,7 +63,7 @@ def _load_completed_result(run_path: Path, seed: int) -> dict[str, float | int |
     return {"seed": seed, "best_val": float(ckpt["best_val"]), "best_path": str(best_path)}
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_mask=None) -> tuple[float, float, float]:
+def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_mask=None, grad_clip=None) -> tuple[float, float, float]:
     model.train()
     training_loss = 0.0
     train_rel_l2 = 0.0
@@ -79,6 +79,8 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_ma
         y_pred = model(x_spatial, cond)
         loss = loss_fn(y_pred, y_batch)
         loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         training_loss += loss.item()
 
@@ -150,6 +152,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         pairs_per_sim_train=config["training"].get("pairs_per_sim_train", 50),
         pairs_per_sim_val=config["training"].get("pairs_per_sim_val", 20),
         test_stride=config["training"].get("test_stride", 5),
+        stratified=config["training"].get("stratified_sampling", False),
     )
 
     device = resolve_device(config["training"].get("device", "auto"))
@@ -185,11 +188,21 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         lr=config["training"]["learning_rate"],
         weight_decay=config["training"]["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer=optimizer,
-        step_size=config["training"]["scheduler"]["step_size"],
-        gamma=config["training"]["scheduler"]["gamma"],
-    )
+    sched_cfg = config["training"]["scheduler"]
+    sched_type = sched_cfg.get("type", "StepLR")
+    if sched_type == "CosineWarmRestarts":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=sched_cfg.get("T_0", 100),
+            T_mult=sched_cfg.get("T_mult", 2),
+            eta_min=sched_cfg.get("eta_min", 1e-6),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer=optimizer,
+            step_size=sched_cfg["step_size"],
+            gamma=sched_cfg["gamma"],
+        )
 
     if resuming:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -232,10 +245,13 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
 
+    grad_clip = config["training"].get("grad_clip", None)
+
     for epoch in range(start_epoch, epochs):
         train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
+            grad_clip=grad_clip,
         )
         scheduler.step()
 
