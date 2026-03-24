@@ -21,6 +21,10 @@ def _patch_optuna_210_fresh_db_bug():
     Force ``skip_compatibility_check=True`` for all RDBStorage instances
     so the sweeper can create and reuse DBs without hitting the assertion.
     Only activates for Optuna 2.x; 3.x+ fixed the issue upstream.
+
+    Also injects SQLite-specific engine kwargs (StaticPool, busy timeout)
+    to prevent ``database is locked`` errors that arise from SQLAlchemy's
+    default connection pooling opening multiple file handles.
     """
     try:
         import optuna
@@ -31,6 +35,18 @@ def _patch_optuna_210_fresh_db_bug():
 
         def _patched_init(self, url, engine_kwargs=None,
                           skip_compatibility_check=False, **kwargs):
+            if engine_kwargs is None:
+                engine_kwargs = {}
+            # SQLite: use a single shared connection (StaticPool) so
+            # SQLAlchemy never opens competing file handles, and set a
+            # 30-second busy-timeout as a safety net.
+            if url and "sqlite" in url:
+                from sqlalchemy.pool import StaticPool
+                engine_kwargs.setdefault("poolclass", StaticPool)
+                ca = engine_kwargs.get("connect_args", {})
+                ca.setdefault("timeout", 30)
+                ca.setdefault("check_same_thread", False)
+                engine_kwargs["connect_args"] = ca
             _orig_init(self, url, engine_kwargs=engine_kwargs,
                        skip_compatibility_check=True, **kwargs)
 
@@ -70,12 +86,14 @@ def _validate_optuna_db(db_path: Path) -> bool:
         return False
     try:
         import sqlite3
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
-        cursor.execute("SELECT version_num FROM alembic_version LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
-        return row is not None  # table must have at least one version row
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT version_num FROM alembic_version LIMIT 1")
+            row = cursor.fetchone()
+            return row is not None  # table must have at least one version row
+        finally:
+            conn.close()
     except Exception:
         return False
 
