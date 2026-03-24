@@ -37,7 +37,8 @@ class SnapshotPairDataset(Dataset):
         pairs_per_sim: int = 50,
         random_pairs: bool = True,
         seed: int = 0,
-        stride: int = 1
+        stride: int = 1,
+        stratified: bool = False,
     ):
         self.trajectories = trajectories # (num_sims, Nt, Nx)
         self.sim_params = sim_params
@@ -48,6 +49,7 @@ class SnapshotPairDataset(Dataset):
         self.pairs_per_sim = pairs_per_sim
         self.random_pairs = random_pairs
         self.stride = stride
+        self.stratified = stratified
         self.seed = seed
         self.rng = np.random.default_rng(seed)
 
@@ -79,8 +81,16 @@ class SnapshotPairDataset(Dataset):
     def __getitem__(self, idx):
         if self.random_pairs:
             sim_id = int(self.sim_ids[idx % len(self.sim_ids)])
-            s = int(self.rng.integers(0, self.Nt - 1))
-            j = int(self.rng.integers(s + 1, self.Nt))
+            if self.stratified:
+                # Uniform lead-time sampling: pick Δt first, then valid s.
+                # Avoids the triangular bias of naive (s, j) sampling that
+                # heavily oversamples short lead times.
+                lead_time = int(self.rng.integers(1, self.Nt))
+                s = int(self.rng.integers(0, self.Nt - lead_time))
+                j = s + lead_time
+            else:
+                s = int(self.rng.integers(0, self.Nt - 1))
+                j = int(self.rng.integers(s + 1, self.Nt))
         else:
             sim_id, s, j = self._det_pairs[idx]
 
@@ -196,6 +206,7 @@ def create_dataloaders(
     pairs_per_sim_train: int = 50,
     pairs_per_sim_val: int = 20,
     test_stride: int = 5,
+    stratified: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
 
     train_dataset = SnapshotPairDataset(
@@ -206,6 +217,7 @@ def create_dataloaders(
         sim_params=sim_params,
         pairs_per_sim=pairs_per_sim_train,
         random_pairs=True,
+        stratified=stratified,
     )
 
     val_dataset = SnapshotPairDataset(
@@ -216,6 +228,7 @@ def create_dataloaders(
         sim_params=sim_params,
         pairs_per_sim=pairs_per_sim_val,
         random_pairs=True,
+        stratified=stratified,
     )
 
     test_dataset = SnapshotPairDataset(
