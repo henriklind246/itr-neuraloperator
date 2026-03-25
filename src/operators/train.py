@@ -1,10 +1,11 @@
 import csv
+import math
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 
 from data.dataset import create_dataloaders, load_sim_data, split_sim_ids
 from src.operators.fno1d import FNO1d
@@ -63,7 +64,199 @@ def _load_completed_result(run_path: Path, seed: int) -> dict[str, float | int |
     return {"seed": seed, "best_val": float(ckpt["best_val"]), "best_path": str(best_path)}
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, device, *, iface_mask=None, grad_clip=None) -> tuple[float, float, float]:
+def _optimizer_name(config: dict) -> str:
+    return str(config.get("training", {}).get("optimizer", "Adam"))
+
+
+def _scheduler_type(config: dict) -> str:
+    return str(config.get("training", {}).get("scheduler", {}).get("type", "StepLR"))
+
+
+def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) -> None:
+    ckpt_optimizer = _optimizer_name(checkpoint_conf)
+    curr_optimizer = _optimizer_name(current_conf)
+    ckpt_scheduler = _scheduler_type(checkpoint_conf)
+    curr_scheduler = _scheduler_type(current_conf)
+
+    if ckpt_optimizer != curr_optimizer or ckpt_scheduler != curr_scheduler:
+        raise ValueError(
+            "Incompatible resume state: checkpoint uses "
+            f"optimizer={ckpt_optimizer}, scheduler={ckpt_scheduler}, "
+            f"but current config uses optimizer={curr_optimizer}, scheduler={curr_scheduler}. "
+            "Start from a fresh run directory or remove fno1d_latest.pt."
+        )
+
+
+def build_optimizer(config: dict, params) -> torch.optim.Optimizer:
+    training_cfg = config["training"]
+    optimizer_name = training_cfg.get("optimizer", "Adam")
+    optimizer_map = {
+        "Adam": Adam,
+        "AdamW": AdamW,
+    }
+    optimizer_cls = optimizer_map.get(optimizer_name)
+    if optimizer_cls is None:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+    return optimizer_cls(
+        params,
+        lr=training_cfg["learning_rate"],
+        weight_decay=training_cfg["weight_decay"],
+    )
+
+
+def _rigno_three_phase_lr_for_epoch(
+    epoch_idx: int,
+    warmup_epochs: int,
+    cosine_epochs: int,
+    exp_epochs: int,
+    init_lr: float,
+    peak_lr: float,
+    cosine_floor_lr: float,
+    final_lr: float,
+) -> float:
+    if epoch_idx < 0:
+        raise ValueError(f"epoch_idx must be >= 0, got {epoch_idx}")
+
+    if warmup_epochs > 0 and epoch_idx < warmup_epochs:
+        if warmup_epochs == 1:
+            return peak_lr
+        progress = epoch_idx / (warmup_epochs - 1)
+        return init_lr + (peak_lr - init_lr) * progress
+
+    epoch_idx -= warmup_epochs
+    if cosine_epochs > 0 and epoch_idx < cosine_epochs:
+        if cosine_epochs == 1:
+            return cosine_floor_lr
+        progress = epoch_idx / (cosine_epochs - 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return cosine_floor_lr + (peak_lr - cosine_floor_lr) * cosine
+
+    epoch_idx -= cosine_epochs
+    if exp_epochs > 0 and epoch_idx < exp_epochs:
+        if exp_epochs == 1:
+            return final_lr
+        progress = epoch_idx / (exp_epochs - 1)
+        decay_ratio = final_lr / cosine_floor_lr
+        return cosine_floor_lr * (decay_ratio ** progress)
+
+    return final_lr
+
+
+class RIGNOThreePhaseScheduler:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_epochs: int,
+        cosine_epochs: int,
+        exp_epochs: int,
+        init_lr: float,
+        peak_lr: float,
+        cosine_floor_lr: float,
+        final_lr: float,
+    ):
+        self.optimizer = optimizer
+        self.warmup_epochs = int(warmup_epochs)
+        self.cosine_epochs = int(cosine_epochs)
+        self.exp_epochs = int(exp_epochs)
+        self.init_lr = float(init_lr)
+        self.peak_lr = float(peak_lr)
+        self.cosine_floor_lr = float(cosine_floor_lr)
+        self.final_lr = float(final_lr)
+        self.next_epoch_index = 0
+        self._set_lr(self._lr_for_epoch(0))
+
+    def _lr_for_epoch(self, epoch_idx: int) -> float:
+        return _rigno_three_phase_lr_for_epoch(
+            epoch_idx,
+            warmup_epochs=self.warmup_epochs,
+            cosine_epochs=self.cosine_epochs,
+            exp_epochs=self.exp_epochs,
+            init_lr=self.init_lr,
+            peak_lr=self.peak_lr,
+            cosine_floor_lr=self.cosine_floor_lr,
+            final_lr=self.final_lr,
+        )
+
+    def _set_lr(self, lr: float) -> None:
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+    def step(self) -> None:
+        self.next_epoch_index += 1
+        self._set_lr(self._lr_for_epoch(self.next_epoch_index))
+
+    def state_dict(self) -> dict[str, int]:
+        return {"next_epoch_index": self.next_epoch_index}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.next_epoch_index = int(state_dict.get("next_epoch_index", 0))
+        self._set_lr(self._lr_for_epoch(self.next_epoch_index))
+
+
+def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
+    training_cfg = config["training"]
+    sched_cfg = training_cfg.get("scheduler", {})
+    sched_type = sched_cfg.get("type", "StepLR")
+
+    if sched_type == "CosineWarmRestarts":
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=sched_cfg.get("T_0", 100),
+            T_mult=sched_cfg.get("T_mult", 2),
+            eta_min=sched_cfg.get("eta_min", 1e-6),
+        )
+
+    if sched_type == "RIGNOThreePhase":
+        peak_lr = float(sched_cfg.get("peak_lr", training_cfg["learning_rate"]))
+        training_peak_lr = float(training_cfg["learning_rate"])
+        if "peak_lr" in sched_cfg and not math.isclose(peak_lr, training_peak_lr, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "scheduler.peak_lr must match training.learning_rate when provided explicitly."
+            )
+
+        warmup_epochs = int(sched_cfg["warmup_epochs"])
+        cosine_epochs = int(sched_cfg["cosine_epochs"])
+        exp_epochs = int(sched_cfg["exp_epochs"])
+        init_lr = float(sched_cfg["init_lr"])
+        cosine_floor_lr = float(sched_cfg["cosine_floor_lr"])
+        final_lr = float(sched_cfg["final_lr"])
+
+        if warmup_epochs <= 0 or cosine_epochs <= 0 or exp_epochs <= 0:
+            raise ValueError("RIGNOThreePhase requires positive warmup_epochs, cosine_epochs, and exp_epochs.")
+        if warmup_epochs + cosine_epochs + exp_epochs != int(training_cfg["epochs"]):
+            raise ValueError(
+                "RIGNOThreePhase phase lengths must sum to training.epochs."
+            )
+        if min(init_lr, peak_lr, cosine_floor_lr, final_lr) <= 0:
+            raise ValueError("RIGNOThreePhase LR values must all be positive.")
+        if peak_lr < init_lr:
+            raise ValueError("RIGNOThreePhase requires peak_lr >= init_lr.")
+        if peak_lr < cosine_floor_lr or cosine_floor_lr < final_lr:
+            raise ValueError("RIGNOThreePhase requires peak_lr >= cosine_floor_lr >= final_lr.")
+
+        return RIGNOThreePhaseScheduler(
+            optimizer,
+            warmup_epochs=warmup_epochs,
+            cosine_epochs=cosine_epochs,
+            exp_epochs=exp_epochs,
+            init_lr=init_lr,
+            peak_lr=peak_lr,
+            cosine_floor_lr=cosine_floor_lr,
+            final_lr=final_lr,
+        )
+
+    if sched_type == "StepLR":
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer=optimizer,
+            step_size=sched_cfg["step_size"],
+            gamma=sched_cfg["gamma"],
+        )
+
+    raise ValueError(f"Unsupported scheduler type: {sched_type}")
+
+
+def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=None, grad_clip=None) -> tuple[float, float, float]:
     model.train()
     training_loss = 0.0
     train_rel_l2 = 0.0
@@ -174,6 +367,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     if resuming:
         ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+        _validate_resume_compatibility(ckpt["conf"], config)
         fno.load_state_dict(ckpt["model_state"])
         best_val_loss = ckpt["best_val"]
         bad_epochs = ckpt.get("bad_epochs", 0)
@@ -181,26 +375,8 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     fno.to(device)
 
-    optimizer = Adam(
-        fno.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"]["weight_decay"],
-    )
-    sched_cfg = config["training"]["scheduler"]
-    sched_type = sched_cfg.get("type", "StepLR")
-    if sched_type == "CosineWarmRestarts":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=sched_cfg.get("T_0", 100),
-            T_mult=sched_cfg.get("T_mult", 2),
-            eta_min=sched_cfg.get("eta_min", 1e-6),
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer=optimizer,
-            step_size=sched_cfg["step_size"],
-            gamma=sched_cfg["gamma"],
-        )
+    optimizer = build_optimizer(config, fno.parameters())
+    scheduler = build_scheduler(config, optimizer)
 
     if resuming:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -252,6 +428,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
             frac = min(1.0, (epoch + 1) / warmup_epochs)
             training_set.dataset.set_curriculum_fraction(frac)
 
+        lr = optimizer.param_groups[0]["lr"]
         train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
@@ -308,7 +485,6 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
             latest_path,
         )
 
-        lr = optimizer.param_groups[0]["lr"]
         csv_writer.writerow(
             {
                 "epoch": epoch,
