@@ -16,6 +16,7 @@ from src.operators.train import (
     validate,
     _is_training_complete,
     _load_completed_result,
+    _rigno_three_phase_lr_for_epoch,
     run_one_seed,
     run_config_seeds,
 )
@@ -194,6 +195,38 @@ class TestValidate:
             assert torch.equal(params_before[n], p)
 
 
+# ===================== RIGNO scheduler =====================
+
+class TestRIGNOThreePhaseSchedule:
+    def test_matches_requested_sentinel_epochs(self):
+        kwargs = {
+            "warmup_epochs": 30,
+            "cosine_epochs": 1320,
+            "exp_epochs": 150,
+            "init_lr": 1.0e-4,
+            "peak_lr": 2.0e-3,
+            "cosine_floor_lr": 1.0e-4,
+            "final_lr": 1.0e-5,
+        }
+        expected = {
+            1: 1.0e-4,
+            2: 1.65517241379e-4,
+            15: 1.01724137931e-3,
+            30: 2.0e-3,
+            31: 2.0e-3,
+            100: 1.98719957948e-3,
+            500: 1.46640739533e-3,
+            1350: 1.0e-4,
+            1351: 1.0e-4,
+            1450: 2.16556124063e-5,
+            1500: 1.0e-5,
+        }
+
+        for human_epoch, target_lr in expected.items():
+            lr = _rigno_three_phase_lr_for_epoch(human_epoch - 1, **kwargs)
+            assert lr == pytest.approx(target_lr, rel=1e-10, abs=1e-12)
+
+
 # ===================== _is_training_complete =====================
 
 class TestIsTrainingComplete:
@@ -314,6 +347,39 @@ class TestRunOneSeedResume:
         assert "best_val" in result
         assert (run_dir / "fno1d_best.pt").exists()
 
+    def test_adamw_rigno_three_phase_scheduler(self, tmp_path, seed_config):
+        """AdamW + RIGNOThreePhase should complete training and log epoch-start LRs."""
+        rigno_config = {
+            **seed_config,
+            "training": {
+                **seed_config["training"],
+                "optimizer": "AdamW",
+                "epochs": 6,
+                "scheduler": {
+                    "type": "RIGNOThreePhase",
+                    "warmup_epochs": 2,
+                    "cosine_epochs": 2,
+                    "exp_epochs": 2,
+                    "init_lr": 5.0e-5,
+                    "peak_lr": 1.0e-3,
+                    "cosine_floor_lr": 1.0e-4,
+                    "final_lr": 1.0e-5,
+                },
+            },
+        }
+        run_dir = tmp_path / "seed0_rigno"
+        result = run_one_seed(rigno_config, seed=0, run_dir=run_dir)
+
+        assert "best_val" in result
+        assert (run_dir / "fno1d_best.pt").exists()
+
+        csv_path = run_dir / "train_metrics.csv"
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        assert float(rows[0]["lr"]) == pytest.approx(5.0e-5)
+        assert float(rows[-1]["lr"]) == pytest.approx(1.0e-5)
+
     def test_grad_clip_in_full_run(self, tmp_path, seed_config):
         """grad_clip config should be picked up and run without error."""
         clip_config = {
@@ -399,6 +465,38 @@ class TestRunOneSeedResume:
         assert epochs == sorted(set(epochs))
         # Should have epochs from the resumed portion (starting after epoch from checkpoint)
         assert len(epochs) > 2
+
+    def test_resume_rejects_optimizer_scheduler_mismatch(self, tmp_path, seed_config):
+        """Resuming should fail clearly when optimizer or scheduler family changes."""
+        run_dir = tmp_path / "seed0_mismatch"
+
+        short_config = {**seed_config, "training": {**seed_config["training"], "epochs": 2}}
+        run_one_seed(short_config, seed=0, run_dir=run_dir)
+
+        best_ckpt = torch.load(run_dir / "fno1d_best.pt", map_location="cpu", weights_only=False)
+        torch.save(best_ckpt, run_dir / "fno1d_latest.pt")
+
+        mismatch_config = {
+            **seed_config,
+            "training": {
+                **seed_config["training"],
+                "optimizer": "AdamW",
+                "epochs": 6,
+                "scheduler": {
+                    "type": "RIGNOThreePhase",
+                    "warmup_epochs": 2,
+                    "cosine_epochs": 2,
+                    "exp_epochs": 2,
+                    "init_lr": 5.0e-5,
+                    "peak_lr": 1.0e-3,
+                    "cosine_floor_lr": 1.0e-4,
+                    "final_lr": 1.0e-5,
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="fresh run directory|remove fno1d_latest.pt"):
+            run_one_seed(mismatch_config, seed=0, run_dir=run_dir)
 
 
 # ===================== run_config_seeds =====================
