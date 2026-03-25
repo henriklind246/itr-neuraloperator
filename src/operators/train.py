@@ -149,10 +149,8 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=config["training"]["batch_size"],
         sim_params=sim_params,
-        pairs_per_sim_train=config["training"].get("pairs_per_sim_train", 50),
-        pairs_per_sim_val=config["training"].get("pairs_per_sim_val", 20),
-        test_stride=config["training"].get("test_stride", 5),
-        stratified=config["training"].get("stratified_sampling", False),
+        n_snapshots=config["training"].get("n_snapshots", 15),
+        n_snapshots_test=config["training"].get("n_snapshots_test", None),
     )
 
     device = resolve_device(config["training"].get("device", "auto"))
@@ -246,8 +244,14 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         csv_writer.writeheader()
 
     grad_clip = config["training"].get("grad_clip", None)
+    warmup_epochs = config["training"].get("curriculum_warmup", 0)
 
     for epoch in range(start_epoch, epochs):
+        # Lead-time curriculum: progressively expose longer lead times
+        if warmup_epochs > 0:
+            frac = min(1.0, (epoch + 1) / warmup_epochs)
+            training_set.dataset.set_curriculum_fraction(frac)
+
         train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
