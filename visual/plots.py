@@ -4,7 +4,19 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
+from data.dataset import (
+    AMP_RANGE,
+    FREQ_RANGE,
+    RC_RANGE,
+    T_EPS,
+    SnapshotPairDataset,
+    load_sim_data,
+    split_sim_ids,
+)
+from src.operators.train import load_config
 from src.physics.fd_solver_1d import FDSolver1D, Layer1D
+from src.operators.fno1d import FNO1d
+
 
 
 # ============================================================
@@ -29,11 +41,12 @@ PLOT_REGISTRY: dict[str, str] = {
     "initial_conditions":        "data",
     "lhs_scatter":               "data",
     "flux_profiles":             "data",
-    "trajectory_comparison_grid":"data",
-    "boundary_temperature":      "data",
-    "parameter_response":        "data",
-    "dataset_samples":           "data",
+    "snapshot_pair_samples":     "data",
+    "prediction_vs_truth":       "data",
     "interface_error":           "data",
+    "lead_time_coverage":        "data",
+    "lead_time_error":           "data",
+    "parameter_error_slices":    "data",
     # group: sweep
     "sweep_ranking":             "sweep",
     "sweep_convergence":         "sweep",
@@ -66,16 +79,16 @@ def create_demo_multilayer_solver() -> FDSolver1D:
     """Create a 2-layer demo solver for physics visualisation plots.
 
     Matches the layer configuration in generate_dataset.py:
-      Layer 1: [0.0, 0.5], rho=1.0, cp=1.0, k=1.0
-      Layer 2: [0.5, 1.0], rho=2.0, cp=1.5, k=1.5
+      Layer 1: [0.0, 0.5], rho=1.0, cp=1.0, k=2.0
+      Layer 2: [0.5, 1.0], rho=1.0, cp=1.0, k=1.0
     N=100 ensures x=0.5 lies on a cell face (required by the solver).
     """
     layers = [
-        Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=1.0),
-        Layer1D(x_left=0.5, x_right=1.0, rho=2.0, cp=1.5, k=1.5),
+        Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
+        Layer1D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
     return FDSolver1D(
-        a=0.0, b=1.0, N=100, layers=layers, lam_target=0.5,
+        a=0.0, b=1.0, N=100, layers=layers, lam_target=0.8,
         interface_R=[0.5],
         t_final=1.0, flux_f=2.0, flux_A=50.0,
         t_on=0.0, t_off=0.2, phase=0.0, dt=0.005,
@@ -88,6 +101,284 @@ def _interface_flanking_nodes(solver: FDSolver1D) -> list[tuple[int, int, float]
         (f, f + 1, solver.face_positions[f])
         for f in sorted(solver.interface_face_map.keys())
     ]
+
+
+def _load_plot_data(
+    data_path: str | Path,
+    x_grid_path: str | Path,
+    t_grid_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load trajectories and saved grids for plot generation."""
+    trajectories, x_grid, t_grid = load_sim_data(
+        sim_traj_path=str(Path(data_path)),
+        x_grid_path=str(Path(x_grid_path)),
+        t_grid_path=str(Path(t_grid_path)),
+    )
+    return trajectories, x_grid, t_grid
+
+
+def _resolve_plot_config(checkpoint_conf: dict | None = None) -> dict:
+    """Prefer checkpoint config when available, otherwise load the default project config."""
+    return checkpoint_conf if checkpoint_conf is not None else load_config()
+
+
+def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO1d, dict]:
+    """Load a checkpoint and reconstruct the matching FNO model on CPU."""
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    conf = ckpt["conf"]
+    model_cfg = conf.get("model", {}).get("parameters", {})
+    model = FNO1d(
+        modes=model_cfg.get("modes", 16),
+        width=model_cfg.get("width", 64),
+        in_channels=model_cfg.get("in_channels", 2),
+        out_channels=model_cfg.get("out_channels", 1),
+        n_layers=model_cfg.get("n_layers", 4),
+        cond_dim=model_cfg.get("cond_dim", 4),
+        cond_hidden=model_cfg.get("cond_hidden", 256),
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return model, conf
+
+
+def _build_split_datasets(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict,
+) -> dict[str, SnapshotPairDataset]:
+    """Build train/val/test snapshot-pair datasets that mirror training-time sampling."""
+    num_sims = trajectories.shape[0]
+    data_cfg = config.get("data", {})
+    training_cfg = config.get("training", {})
+    train_ids, val_ids, test_ids = split_sim_ids(
+        num_sims=num_sims,
+        train_frac=data_cfg.get("train_split", 0.7),
+        val_frac=data_cfg.get("val_split", 0.15),
+        seed=0,
+    )
+    n_snapshots = training_cfg.get("n_snapshots", 15)
+    n_snapshots_test = training_cfg.get("n_snapshots_test", None)
+    test_snapshots = n_snapshots_test if n_snapshots_test is not None else n_snapshots
+    return {
+        "train": SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            sim_ids=train_ids,
+            sim_params=sim_params,
+            n_snapshots=n_snapshots,
+        ),
+        "val": SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            sim_ids=val_ids,
+            sim_params=sim_params,
+            n_snapshots=n_snapshots,
+        ),
+        "test": SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            sim_ids=test_ids,
+            sim_params=sim_params,
+            n_snapshots=test_snapshots,
+        ),
+    }
+
+
+def _prepare_prediction_case(
+    model,
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    sim_id: int,
+    s: int,
+    target_indices: np.ndarray,
+) -> dict[str, np.ndarray | float]:
+    """Prepare truth/prediction arrays for one source snapshot and multiple target times."""
+    import torch
+
+    interface_x = 0.5
+    t_targets = t_grid[target_indices]
+
+    T_source = trajectories[sim_id, s, :].astype(np.float32)
+    mu_s = T_source.mean()
+    sigma_s = T_source.std()
+    T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
+    x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
+
+    amp, freq, _T0, R_c = sim_params[sim_id]
+    amp = float(amp)
+    freq = float(freq)
+    R_c = float(R_c)
+
+    x_spatial_single = np.stack([T_source_norm, x_norm], axis=-1)
+    x_spatial_batch = np.tile(x_spatial_single[None, :, :], (len(target_indices), 1, 1))
+
+    t_bars = t_grid[target_indices] - t_grid[s]
+    cond_batch = np.column_stack([
+        t_bars / t_grid[-1],
+        np.full(len(target_indices), (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])),
+        np.full(len(target_indices), (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])),
+        np.full(len(target_indices), (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])),
+    ]).astype(np.float32)
+
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        x_tensor = torch.from_numpy(x_spatial_batch).to(device)
+        c_tensor = torch.from_numpy(cond_batch).to(device)
+        Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)
+
+    Y_pred = (Y_pred_norm * (sigma_s + T_EPS) + mu_s).T
+    Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)
+
+    return {
+        "interface_x": interface_x,
+        "t_targets": t_targets,
+        "t_bars": t_bars,
+        "source_time": float(t_grid[s]),
+        "Y_pred": Y_pred,
+        "Y_true": Y_true,
+        "amp": amp,
+        "freq": freq,
+        "R_c": R_c,
+    }
+
+
+def _compute_pair_error_records(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    max_samples: int = 256,
+    batch_size: int = 64,
+    seed: int = 42,
+) -> dict[str, np.ndarray]:
+    """Evaluate sampled snapshot pairs and return per-pair error records."""
+    import torch
+
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty; cannot compute error records.")
+
+    rng = np.random.default_rng(seed)
+    sample_size = min(max_samples, len(dataset))
+    sample_indices = np.arange(len(dataset))
+    if sample_size < len(dataset):
+        sample_indices = np.sort(rng.choice(sample_indices, size=sample_size, replace=False))
+
+    x_batch = []
+    cond_batch = []
+    y_batch = []
+    stats_batch = []
+    for idx in sample_indices:
+        x_spatial, cond, Y, T_stats = dataset[idx]
+        x_batch.append(x_spatial)
+        cond_batch.append(cond)
+        y_batch.append(Y)
+        stats_batch.append(T_stats)
+
+    x_tensor = torch.stack(x_batch, dim=0)
+    cond_tensor = torch.stack(cond_batch, dim=0)
+    y_tensor = torch.stack(y_batch, dim=0)
+    stats_tensor = torch.stack(stats_batch, dim=0)
+
+    iface_mask = torch.from_numpy((x_grid >= 0.4) & (x_grid <= 0.6))
+    device = next(model.parameters()).device
+    model.eval()
+
+    preds = []
+    for start in range(0, sample_size, batch_size):
+        stop = min(start + batch_size, sample_size)
+        with torch.no_grad():
+            pred = model(
+                x_tensor[start:stop].to(device),
+                cond_tensor[start:stop].to(device),
+            ).cpu()
+        preds.append(pred)
+    y_pred = torch.cat(preds, dim=0)
+
+    mu_s = stats_tensor[:, 0][:, None, None]
+    sigma_s = stats_tensor[:, 1][:, None, None]
+    y_pred_phys = y_pred * (sigma_s + T_EPS) + mu_s
+    y_true_phys = y_tensor * (sigma_s + T_EPS) + mu_s
+
+    global_rel = (
+        torch.mean((y_pred_phys - y_true_phys) ** 2, dim=(1, 2))
+        / torch.clamp(torch.mean(y_true_phys ** 2, dim=(1, 2)), min=1e-12)
+    ).sqrt() * 100.0
+    iface_rel = (
+        torch.mean((y_pred_phys[:, iface_mask, :] - y_true_phys[:, iface_mask, :]) ** 2, dim=(1, 2))
+        / torch.clamp(torch.mean(y_true_phys[:, iface_mask, :] ** 2, dim=(1, 2)), min=1e-12)
+    ).sqrt() * 100.0
+
+    sim_ids = np.array([dataset._pairs[idx][0] for idx in sample_indices], dtype=np.int64)
+    params = dataset.sim_params[sim_ids]
+
+    return {
+        "lead_time": np.array([dataset._lead_times[idx] for idx in sample_indices], dtype=np.float32),
+        "global_rel_l2": global_rel.numpy(),
+        "iface_rel_l2": iface_rel.numpy(),
+        "amplitude": np.array([float(p[0]) for p in params], dtype=np.float32),
+        "frequency": np.array([float(p[1]) for p in params], dtype=np.float32),
+        "R_c": np.array([float(p[3]) for p in params], dtype=np.float32),
+    }
+
+
+def _compute_binned_means(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bin x and return (centers, mean_y, counts) for non-empty bins."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    if x.size == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    x_min = float(x.min())
+    x_max = float(x.max())
+    if np.isclose(x_min, x_max):
+        return np.array([x_min]), np.array([float(y.mean())]), np.array([len(x)])
+
+    bins = np.linspace(x_min, x_max, n_bins + 1)
+    bin_ids = np.clip(np.digitize(x, bins[1:-1], right=False), 0, n_bins - 1)
+
+    centers = []
+    means = []
+    counts = []
+    for idx in range(n_bins):
+        mask = bin_ids == idx
+        if not np.any(mask):
+            continue
+        centers.append(0.5 * (bins[idx] + bins[idx + 1]))
+        means.append(float(y[mask].mean()))
+        counts.append(int(mask.sum()))
+    return np.array(centers), np.array(means), np.array(counts)
+
+
+def _lead_time_coverage_counts(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict,
+) -> dict[str, np.ndarray]:
+    """Return lead-time arrays and pair counts for split-aware coverage plots/tests."""
+    datasets = _build_split_datasets(trajectories, x_grid, t_grid, sim_params, config)
+    return {
+        "train": datasets["train"]._lead_times.copy(),
+        "val": datasets["val"]._lead_times.copy(),
+        "test": datasets["test"]._lead_times.copy(),
+        "train_count": np.array([len(datasets["train"])]),
+        "val_count": np.array([len(datasets["val"])]),
+        "test_count": np.array([len(datasets["test"])]),
+    }
 
 
 # ============================================================
@@ -644,7 +935,7 @@ def plot_training_curves(csv_path: str | Path, save_path: str | Path | None = No
 
 
 def plot_seed_comparison(report_path: str | Path, save_path: str | Path | None = None):
-    """Plot grouped bar chart of val and test rel L2 per seed from a seed_report.json."""
+    """Plot grouped bar chart of val, test, and interface test metrics per seed."""
     import json
 
     report_path = Path(report_path)
@@ -657,17 +948,20 @@ def plot_seed_comparison(report_path: str | Path, save_path: str | Path | None =
     seeds = [str(r["seed"]) for r in per_seed]
     val_losses = [r["best_val"] for r in per_seed]
     test_losses = [r["test_rel_l2"] for r in per_seed]
+    test_iface_losses = [r["test_iface_rel_l2"] for r in per_seed]
 
     x = np.arange(len(seeds))
-    width = 0.35
+    width = 0.25
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(x - width / 2, val_losses, width, label="Val rel. L2 (%)", color="C0", alpha=0.8)
-    ax.bar(x + width / 2, test_losses, width, label="Test rel. L2 (%)", color="C3", alpha=0.8)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(x - width, val_losses, width, label="Val rel. L2 (%)", color="C0", alpha=0.8)
+    ax.bar(x, test_losses, width, label="Test rel. L2 (%)", color="C3", alpha=0.8)
+    ax.bar(x + width, test_iface_losses, width, label="Test iface rel. L2 (%)", color="C1", alpha=0.8)
 
     # mean lines
     ax.axhline(summary["best_val_loss_mean"], color="C0", linestyle="--", alpha=0.6, label=f"Val mean: {summary['best_val_loss_mean']:.3f}")
     ax.axhline(summary["test_rel_l2_mean"], color="C3", linestyle="--", alpha=0.6, label=f"Test mean: {summary['test_rel_l2_mean']:.3f}")
+    ax.axhline(summary["test_iface_rel_l2_mean"], color="C1", linestyle="--", alpha=0.6, label=f"Iface mean: {summary['test_iface_rel_l2_mean']:.3f}")
 
     ax.set_xlabel("Seed")
     ax.set_ylabel("Relative L2 Error (%)")
@@ -711,61 +1005,14 @@ def plot_prediction_vs_truth(
         (c) Absolute error heatmap with interface marker
         (d) T(x) cross-section at mid-horizon timestep (truth vs prediction)
     """
-    import torch
-    from data.dataset import AMP_RANGE, FREQ_RANGE, RC_RANGE, T_EPS
-
-    Nx = x_grid.shape[0]
     Nt = len(t_grid)
-    interface_x = 0.5
 
     # evenly-spaced target indices after source time s
     target_indices = np.linspace(s + 1, Nt - 1, n_steps, dtype=int)
-    t_targets = t_grid[target_indices]
-
-    # source snapshot and normalization stats
-    T_source = trajectories[sim_id, s, :].astype(np.float32)  # (Nx,)
-    mu_s = T_source.mean()
-    sigma_s = T_source.std()
-    T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
-
-    # normalized spatial coordinate
-    x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
-
-    # sim params: (amp, freq, T0, R_c)
-    amp, freq, _T0, R_c = sim_params[sim_id]
-    amp, freq, R_c = float(amp), float(freq), float(R_c)
-
-    # build batched input: same source for all targets, varying t̄
-    x_spatial_single = np.stack([T_source_norm, x_norm], axis=-1)  # (Nx, 2)
-    x_spatial_batch = np.tile(x_spatial_single[None, :, :], (n_steps, 1, 1))  # (n_steps, Nx, 2)
-
-    # conditioning vectors: [t̄_norm, A_norm, f_norm, R_c_norm]
-    t_bars = t_grid[target_indices] - t_grid[s]
-    t_bar_norms = t_bars / t_grid[-1]
-    A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
-    f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
-    Rc_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-
-    cond_batch = np.column_stack([
-        t_bar_norms,
-        np.full(n_steps, A_norm),
-        np.full(n_steps, f_norm),
-        np.full(n_steps, Rc_norm),
-    ]).astype(np.float32)  # (n_steps, 4)
-
-    device = next(model.parameters()).device
-    x_tensor = torch.from_numpy(x_spatial_batch).to(device)
-    c_tensor = torch.from_numpy(cond_batch).to(device)
-
-    with torch.no_grad():
-        model.eval()
-        Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)  # (n_steps, Nx)
-
-    # denormalize predictions
-    Y_pred = (Y_pred_norm * (sigma_s + T_EPS) + mu_s).T  # (Nx, n_steps)
-
-    # ground truth at target times
-    Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)  # (Nx, n_steps)
+    case = _prepare_prediction_case(model, trajectories, x_grid, t_grid, sim_params, sim_id, s, target_indices)
+    t_targets = case["t_targets"]
+    Y_pred = case["Y_pred"]
+    Y_true = case["Y_true"]
     error = np.abs(Y_pred - Y_true)
 
     # meshgrid for pcolormesh
@@ -778,14 +1025,14 @@ def plot_prediction_vs_truth(
 
     # ground truth
     axes[0].pcolormesh(T_mesh, X_mesh, Y_true, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
-    axes[0].axhline(interface_x, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
+    axes[0].axhline(case["interface_x"], color="white", linestyle="--", linewidth=1.0, alpha=0.8)
     axes[0].set_title("Ground Truth")
     axes[0].set_xlabel("Time")
     axes[0].set_ylabel("x")
 
     # prediction
     pc1 = axes[1].pcolormesh(T_mesh, X_mesh, Y_pred, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
-    axes[1].axhline(interface_x, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
+    axes[1].axhline(case["interface_x"], color="white", linestyle="--", linewidth=1.0, alpha=0.8)
     axes[1].set_title("FNO Prediction")
     axes[1].set_xlabel("Time")
 
@@ -794,7 +1041,7 @@ def plot_prediction_vs_truth(
 
     # error
     pc2 = axes[2].pcolormesh(T_mesh, X_mesh, error, cmap="Reds", shading="auto")
-    axes[2].axhline(interface_x, color="black", linestyle="--", linewidth=1.0, alpha=0.8)
+    axes[2].axhline(case["interface_x"], color="black", linestyle="--", linewidth=1.0, alpha=0.8)
     axes[2].set_title("Absolute Error")
     axes[2].set_xlabel("Time")
     fig.colorbar(pc2, ax=axes[2], label="|Error|", shrink=0.85)
@@ -803,14 +1050,18 @@ def plot_prediction_vs_truth(
     mid_h = n_steps // 2
     axes[3].plot(x_grid, Y_true[:, mid_h], "k-", linewidth=1.5, label="Truth")
     axes[3].plot(x_grid, Y_pred[:, mid_h], "r--", linewidth=1.5, label="Prediction")
-    axes[3].axvline(interface_x, color="gray", linestyle=":", linewidth=1.5, alpha=0.7, label="Interface")
+    axes[3].axvline(case["interface_x"], color="gray", linestyle=":", linewidth=1.5, alpha=0.7, label="Interface")
     axes[3].set_xlabel("x")
     axes[3].set_ylabel("Temperature")
     axes[3].set_title(f"T(x) at t={t_targets[mid_h]:.3f}")
     axes[3].legend(fontsize=8)
     axes[3].grid(True, linestyle="--", alpha=0.3)
 
-    fig.suptitle(f"Sim {sim_id}, source t_s={t_grid[s]:.3f}", fontsize=12)
+    fig.suptitle(
+        f"Prediction vs Truth — Sim {sim_id}, t_s={case['source_time']:.3f}, "
+        f"A={case['amp']:.0f}, f={case['freq']:.2f}, R_c={case['R_c']:.2f}",
+        fontsize=12,
+    )
     fig.tight_layout()
 
     if save_path is None:
@@ -884,16 +1135,28 @@ def plot_lhs_scatter(
     sim_params: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Scatter plot of LHS-sampled (amplitude, frequency) pairs."""
+    """Pairwise scatter overview of sampled conditioning parameters."""
     amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
     frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
+    contact_resistance = np.array([p[3] for p in sim_params], dtype=np.float32)
 
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(amplitudes, frequencies, s=12, alpha=0.6, edgecolors="none")
-    ax.set_xlabel("Flux Amplitude (A)")
-    ax.set_ylabel("Flux Frequency (f)")
-    ax.set_title(f"LHS Parameter Space — {len(amplitudes)} simulations")
-    ax.grid(True, linestyle="--", alpha=0.3)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    scatter_specs = [
+        (axes[0], amplitudes, frequencies, contact_resistance, "Flux Amplitude (A)", "Flux Frequency (f)", "R_c"),
+        (axes[1], amplitudes, contact_resistance, frequencies, "Flux Amplitude (A)", "Contact Resistance (R_c)", "f"),
+        (axes[2], frequencies, contact_resistance, amplitudes, "Flux Frequency (f)", "Contact Resistance (R_c)", "A"),
+    ]
+
+    for ax, x_vals, y_vals, colors, x_label, y_label, color_label in scatter_specs:
+        sc = ax.scatter(x_vals, y_vals, c=colors, s=14, alpha=0.7, cmap="viridis", edgecolors="none")
+        fig.colorbar(sc, ax=ax, label=color_label)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        if x_label.endswith("(f)"):
+            ax.set_xscale("log")
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+    fig.suptitle(f"Conditioning Parameter Coverage — {len(amplitudes)} simulations")
 
     fig.tight_layout()
     if save_path is None:
@@ -1063,72 +1326,78 @@ def plot_parameter_response(
     plt.close(fig)
 
 
-def plot_dataset_samples(
+def plot_snapshot_pair_samples(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
     t_grid: np.ndarray,
     sim_params: np.ndarray,
-    k: int = 10,
-    H: int = 40,
+    config: dict,
     n_samples: int = 3,
     interface_x: float = 0.5,
     seed: int = 42,
     save_path: str | Path | None = None,
 ):
-    """Plot T(x) spatial profiles from random train/val/test windows to verify interface jump.
+    """Plot sampled source/target snapshot pairs from train/val/test splits.
 
     Layout: 3 rows (train / val / test) × n_samples columns.
-    Each subplot shows T(x) at several time snapshots within one prediction window,
-    with the interface location marked by a vertical dashed line.
+    Each panel shows the source snapshot and one future target snapshot from the
+    actual all-to-all pair dataset, with conditioning values annotated in-place.
     """
-    from data.dataset import split_sim_ids
-
-    num_sims = trajectories.shape[0]
-    Nt = len(t_grid)
-    max_s = Nt - H - k
-
-    train_ids, val_ids, test_ids = split_sim_ids(num_sims, 0.7, 0.15, seed=0)
-    splits = [("Train", train_ids), ("Val", val_ids), ("Test", test_ids)]
-
+    datasets = _build_split_datasets(trajectories, x_grid, t_grid, sim_params, config)
     rng = np.random.default_rng(seed)
+    splits = [("Train", datasets["train"]), ("Val", datasets["val"]), ("Test", datasets["test"])]
 
-    fig, axes = plt.subplots(3, n_samples, figsize=(5 * n_samples, 12), squeeze=False)
-    cmap_snap = plt.cm.viridis
-    n_snaps = 5
+    fig, axes = plt.subplots(3, n_samples, figsize=(5 * n_samples, 11), squeeze=False)
 
-    for row, (split_name, sim_ids) in enumerate(splits):
-        chosen_sims = rng.choice(sim_ids, size=min(n_samples, len(sim_ids)), replace=False)
+    for row, (split_name, dataset) in enumerate(splits):
+        if len(dataset) == 0:
+            for col in range(n_samples):
+                axes[row, col].set_axis_off()
+            continue
 
-        for col, sim_id in enumerate(chosen_sims):
+        sample_size = min(n_samples, len(dataset))
+        chosen_indices = rng.choice(len(dataset), size=sample_size, replace=False)
+
+        for col in range(n_samples):
             ax = axes[row, col]
-            s = rng.integers(0, max_s + 1)
+            if col >= sample_size:
+                ax.set_axis_off()
+                continue
+            pair_idx = int(chosen_indices[col])
+            sim_id, s, j = dataset._pairs[pair_idx]
+            lead_time = dataset._lead_times[pair_idx]
+            source = trajectories[sim_id, s, :]
+            target = trajectories[sim_id, j, :]
+            amp, freq, _T0, R_c = sim_params[sim_id]
 
-            # time indices for the prediction window
-            snap_indices = np.linspace(s + k, s + k + H - 1, n_snaps, dtype=int)
+            ax.plot(x_grid, source, color="black", linewidth=1.4, label=f"source t={t_grid[s]:.3f}")
+            ax.plot(x_grid, target, color="C3", linewidth=1.4, linestyle="--", label=f"target t={t_grid[j]:.3f}")
+            ax.axvline(interface_x, color="gray", linestyle=":", linewidth=1.2, alpha=0.8)
 
-            for i, t_idx in enumerate(snap_indices):
-                color = cmap_snap(i / max(n_snaps - 1, 1))
-                ax.plot(x_grid, trajectories[sim_id, t_idx, :], color=color, linewidth=1.0,
-                        label=f"t={t_grid[t_idx]:.3f}")
-
-            ax.axvline(interface_x, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
-                       label="Interface")
-
-            amp, freq, *_ = sim_params[sim_id]
-            ax.set_title(f"{split_name} | Sim {sim_id}\nA={float(amp):.0f}, f={float(freq):.1f}, s={s}",
-                         fontsize=9)
+            text = f"Δt={lead_time:.3f}\nA={float(amp):.0f}\nf={float(freq):.2f}\nR_c={float(R_c):.2f}"
+            ax.text(
+                0.03,
+                0.97,
+                text,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8,
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
+            )
+            ax.set_title(f"{split_name} | Sim {sim_id}", fontsize=9)
             ax.set_xlabel("x")
             ax.set_ylabel("Temperature")
             ax.legend(fontsize=6, loc="best")
             ax.grid(True, linestyle="--", alpha=0.3)
 
-    fig.suptitle("Dataset Samples — T(x) Profiles in Prediction Windows", fontsize=13)
+    fig.suptitle("Snapshot Pair Samples — All-to-All Conditioning View", fontsize=13)
     fig.tight_layout()
     if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "dataset_samples.png"
+        save_path = Path(__file__).resolve().parent / "data" / "snapshot_pair_samples.png"
     save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
-    print(f"Saved dataset samples to: {save_path}")
+    print(f"Saved snapshot pair samples to: {save_path}")
     plt.close(fig)
 
 
@@ -1155,11 +1424,7 @@ def plot_interface_error(
         Middle: Residual (pred − truth) zoomed to interface — reveals error structure.
         Right:  Jump magnitude ΔT = T[right_node] - T[left_node] over target times.
     """
-    import torch
-    from data.dataset import AMP_RANGE, FREQ_RANGE, RC_RANGE, T_EPS
-
     Nt = len(t_grid)
-    Nx = len(x_grid)
 
     # find flanking nodes for the interface
     iface_idx = int(np.argmin(np.abs(x_grid - interface_x)))
@@ -1172,12 +1437,6 @@ def plot_interface_error(
     fig, axes = plt.subplots(n_samples, 3, figsize=(20, 4 * n_samples), squeeze=False)
     cmap_snap = plt.cm.viridis
     n_snaps = 5  # number of snapshots shown in cross-section panels
-
-    device = next(model.parameters()).device
-    model.eval()
-
-    # normalized spatial coordinate (fixed for all samples)
-    x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
 
     # zoom region for cross-section
     zoom_mask = (x_grid >= 0.3) & (x_grid <= 0.7)
@@ -1193,47 +1452,13 @@ def plot_interface_error(
 
         # evenly-spaced target indices after s
         target_indices = np.linspace(s + 1, Nt - 1, n_targets, dtype=int)
-        t_targets = t_grid[target_indices]
-
-        # source snapshot and its normalization stats
-        T_source = trajectories[sim_id, s, :].astype(np.float32)  # (Nx,)
-        mu_s = T_source.mean()
-        sigma_s = T_source.std()
-        T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
-
-        # sim params: (amp, freq, T0, R_c)
-        amp, freq, _T0, R_c = sim_params[sim_id]
-        amp, freq, R_c = float(amp), float(freq), float(R_c)
-
-        # build batched input: same source for all targets, varying t̄
-        x_spatial_single = np.stack([T_source_norm, x_norm], axis=-1)  # (Nx, 2)
-        x_spatial_batch = np.tile(x_spatial_single[None, :, :], (n_targets, 1, 1))  # (n_targets, Nx, 2)
-
-        # conditioning vectors: [t̄_norm, A_norm, f_norm, R_c_norm]
-        t_bars = t_grid[target_indices] - t_grid[s]
-        t_bar_norms = t_bars / t_grid[-1]
-        A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
-        f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
-        Rc_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-
-        cond_batch = np.column_stack([
-            t_bar_norms,
-            np.full(n_targets, A_norm),
-            np.full(n_targets, f_norm),
-            np.full(n_targets, Rc_norm),
-        ]).astype(np.float32)  # (n_targets, 4)
-
-        x_tensor = torch.from_numpy(x_spatial_batch).to(device)
-        c_tensor = torch.from_numpy(cond_batch).to(device)
-
-        with torch.no_grad():
-            Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)  # (n_targets, Nx)
-
-        # denormalize predictions
-        Y_pred = (Y_pred_norm * (sigma_s + T_EPS) + mu_s).T  # (Nx, n_targets)
-
-        # ground truth at target times
-        Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)  # (Nx, n_targets)
+        case = _prepare_prediction_case(model, trajectories, x_grid, t_grid, sim_params, sim_id, s, target_indices)
+        t_targets = case["t_targets"]
+        Y_pred = case["Y_pred"]
+        Y_true = case["Y_true"]
+        amp = case["amp"]
+        freq = case["freq"]
+        R_c = case["R_c"]
 
         # --- Left panel: T(x) overlay (truth vs pred) zoomed to interface ---
         ax_left = axes[row_idx, 0]
@@ -1297,13 +1522,157 @@ def plot_interface_error(
         ax_right.legend(fontsize=8)
         ax_right.grid(True, linestyle="--", alpha=0.3)
 
-    fig.suptitle("Interface Error Diagnostics — Prediction vs Truth at x=0.5", fontsize=13)
+    fig.suptitle("Interface Diagnostic — Prediction vs Truth at x=0.5", fontsize=13)
     fig.tight_layout()
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "data" / "interface_error.png"
     save_path = _ensure_parent(Path(save_path))
     fig.savefig(save_path, dpi=200)
     print(f"Saved interface error diagnostics to: {save_path}")
+    plt.close(fig)
+
+
+def plot_lead_time_coverage(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict,
+    bins: int = 20,
+    save_path: str | Path | None = None,
+):
+    """Visualize train/test pair coverage across lead times and curriculum cutoffs."""
+    coverage = _lead_time_coverage_counts(trajectories, x_grid, t_grid, sim_params, config)
+    train_leads = coverage["train"]
+    test_leads = coverage["test"]
+
+    fig, (ax_hist, ax_frac) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]})
+    ax_hist.hist(train_leads, bins=bins, alpha=0.65, color="C0", label=f"Train pairs ({len(train_leads)})")
+    ax_hist.hist(test_leads, bins=bins, alpha=0.5, color="C3", label=f"Test pairs ({len(test_leads)})")
+    ax_hist.set_xlabel("Lead time Δt")
+    ax_hist.set_ylabel("Pair count")
+    ax_hist.set_title("Lead-Time Coverage for All-to-All Snapshot Pairs")
+    ax_hist.legend()
+    ax_hist.grid(True, linestyle="--", alpha=0.3)
+
+    warmup_epochs = int(config.get("training", {}).get("curriculum_warmup", 0))
+    max_lead = float(train_leads.max()) if len(train_leads) > 0 else float(t_grid[-1] - t_grid[0])
+    fractions = np.array([0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+    cutoff_positions = fractions * max_lead
+    for frac, cutoff in zip(fractions, cutoff_positions):
+        epoch_label = int(round(frac * warmup_epochs)) if warmup_epochs > 0 else 0
+        ax_hist.axvline(cutoff, color="k", linestyle=":", alpha=0.35)
+        label = f"{int(frac * 100)}% pairs"
+        if warmup_epochs > 0:
+            label += f" (epoch {epoch_label})"
+        ax_frac.scatter(cutoff, frac, color="C2", s=35)
+        ax_frac.text(cutoff, frac + 0.03, label, ha="center", va="bottom", fontsize=8)
+
+    ax_frac.plot(cutoff_positions, fractions, color="C2", linewidth=1.2)
+    ax_frac.set_xlabel("Lead time Δt")
+    ax_frac.set_ylabel("Curriculum fraction")
+    ax_frac.set_ylim(0.0, 1.1)
+    ax_frac.grid(True, linestyle="--", alpha=0.3)
+
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "data" / "lead_time_coverage.png"
+    save_path = _ensure_parent(Path(save_path))
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved lead-time coverage plot to: {save_path}")
+    plt.close(fig)
+
+
+def plot_lead_time_error(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    n_bins: int = 8,
+    max_samples: int = 256,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Plot held-out error as a function of lead time."""
+    records = _compute_pair_error_records(
+        model=model,
+        dataset=dataset,
+        x_grid=x_grid,
+        max_samples=max_samples,
+        seed=seed,
+    )
+    centers, global_mean, counts = _compute_binned_means(records["lead_time"], records["global_rel_l2"], n_bins)
+    _, iface_mean, _ = _compute_binned_means(records["lead_time"], records["iface_rel_l2"], n_bins)
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]})
+    ax_top.plot(centers, global_mean, marker="o", color="C0", label="Global rel. L2 (%)")
+    ax_top.plot(centers, iface_mean, marker="s", color="C3", label="Interface rel. L2 (%)")
+    ax_top.set_xlabel("Lead time Δt")
+    ax_top.set_ylabel("Mean error (%)")
+    ax_top.set_title("Held-Out Error vs Lead Time")
+    ax_top.legend()
+    ax_top.grid(True, linestyle="--", alpha=0.3)
+
+    width = 0.8 * (centers[1] - centers[0]) if len(centers) > 1 else 0.02
+    ax_bot.bar(centers, counts, width=width, color="0.6")
+    ax_bot.set_xlabel("Lead time Δt")
+    ax_bot.set_ylabel("Samples")
+    ax_bot.grid(True, axis="y", linestyle="--", alpha=0.3)
+
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "data" / "lead_time_error.png"
+    save_path = _ensure_parent(Path(save_path))
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved lead-time error plot to: {save_path}")
+    plt.close(fig)
+
+
+def plot_parameter_error_slices(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    max_samples: int = 256,
+    n_bins: int = 6,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Plot held-out error against amplitude, frequency, and contact resistance."""
+    records = _compute_pair_error_records(
+        model=model,
+        dataset=dataset,
+        x_grid=x_grid,
+        max_samples=max_samples,
+        seed=seed,
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    specs = [
+        ("amplitude", "Flux Amplitude (A)", False),
+        ("frequency", "Flux Frequency (f)", True),
+        ("R_c", "Contact Resistance (R_c)", False),
+    ]
+
+    for ax, (key, x_label, use_log) in zip(axes, specs):
+        x_vals = records[key]
+        ax.scatter(x_vals, records["global_rel_l2"], s=14, alpha=0.25, color="0.5", label="Per-pair global")
+        centers, global_mean, _ = _compute_binned_means(x_vals, records["global_rel_l2"], n_bins)
+        _, iface_mean, _ = _compute_binned_means(x_vals, records["iface_rel_l2"], n_bins)
+        ax.plot(centers, global_mean, color="C0", linewidth=1.8, marker="o", label="Binned global")
+        ax.plot(centers, iface_mean, color="C3", linewidth=1.8, marker="s", label="Binned interface")
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Error (%)")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        if use_log:
+            ax.set_xscale("log")
+
+    axes[0].legend(fontsize=8)
+    fig.suptitle("Held-Out Error Across Conditioning Dimensions", fontsize=13)
+    fig.tight_layout()
+    if save_path is None:
+        save_path = Path(__file__).resolve().parent / "data" / "parameter_error_slices.png"
+    save_path = _ensure_parent(Path(save_path))
+    fig.savefig(save_path, dpi=200)
+    print(f"Saved parameter error slices to: {save_path}")
     plt.close(fig)
 
 
@@ -1619,16 +1988,18 @@ if __name__ == "__main__":
       python -m visual.plots --group physics --out visual/          # physics diagnostics only
       python -m visual.plots --group mms --out visual/              # MMS convergence only
       python -m visual.plots --group training --csv <path> --out visual/
-      python -m visual.plots --group data --data <path> --params <path> --out visual/
+      python -m visual.plots --group data --data <path> --x-grid <path> --t-grid <path> --params <path> --out visual/
       python -m visual.plots --group sweep --experiment <path> --runs <path> --out visual/
-      python -m visual.plots --plots layer_geometry heat_flux_profile --out visual/
+      python -m visual.plots --plots prediction_vs_truth lead_time_error --checkpoint <path> --out visual/
 
     Optional data flags:
       --data        Path to trajectories .npy file
+      --x-grid      Path to x_grid .npy file
+      --t-grid      Path to t_grid .npy file
       --params      Path to sim_params .npy file
       --csv         Path to train_metrics.csv
       --report      Path to seed_report.json
-      --checkpoint  Path to model checkpoint .pt (for interface_error plot)
+      --checkpoint  Path to model checkpoint .pt (for model diagnostic plots)
       --experiment  Path to conf/generated/experiment{N}/ directory (sweep plots)
       --runs        Path to runs/experiment{N}/ directory (sweep convergence)
       --sweep-seed  Which seed to show in convergence plot (default: 0)
@@ -1638,6 +2009,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Generate plots for the ITR project")
     parser.add_argument("--data", type=str, default=None, help="Path to trajectories .npy file")
+    parser.add_argument("--x-grid", type=str, default=None, help="Path to x_grid .npy file")
+    parser.add_argument("--t-grid", type=str, default=None, help="Path to t_grid .npy file")
     parser.add_argument("--params", type=str, default=None, help="Path to sim_params .npy file")
     parser.add_argument("--csv", type=str, default=None, help="Path to train_metrics.csv")
     parser.add_argument("--report", type=str, default=None, help="Path to seed_report.json")
@@ -1732,16 +2105,26 @@ if __name__ == "__main__":
                 print("Skipping seed_comparison (no --report provided)")
 
     # ---- DATA GROUP ----
-    data_plots = ["trajectory_heatmap", "initial_conditions", "lhs_scatter",
-                  "flux_profiles", "trajectory_comparison_grid",
-                  "boundary_temperature", "parameter_response",
-                  "dataset_samples", "interface_error"]
+    data_plots = [
+        "trajectory_heatmap",
+        "initial_conditions",
+        "lhs_scatter",
+        "flux_profiles",
+        "snapshot_pair_samples",
+        "prediction_vs_truth",
+        "interface_error",
+        "lead_time_coverage",
+        "lead_time_error",
+        "parameter_error_slices",
+    ]
     need_data = any(_should_run(p, groups, individual) for p in data_plots)
 
     if need_data:
         print("=== DATA GROUP ===")
 
         data_dir = out_dir / "data"
+        checkpoint_conf = None
+        model = None
 
         # flux_profiles needs no data files
         if _should_run("flux_profiles", groups, individual):
@@ -1752,16 +2135,46 @@ if __name__ == "__main__":
         if args.params:
             sim_params = np.load(args.params, allow_pickle=True)
 
-        if args.data:
-            data_path = Path(args.data)
-            print(f"Loading trajectories from {data_path} ...")
-            trajectories = np.load(data_path)
+        grid_data_plots = {
+            "trajectory_heatmap",
+            "initial_conditions",
+            "snapshot_pair_samples",
+            "prediction_vs_truth",
+            "interface_error",
+            "lead_time_coverage",
+            "lead_time_error",
+            "parameter_error_slices",
+        }
+        needs_grid_data = any(_should_run(name, groups, individual) for name in grid_data_plots)
+        trajectories = None
+        x_grid = None
+        t_grid = None
+        plot_config = None
+        split_datasets = None
 
-            # infer grids from shape (num_sims, Nt, Nx)
-            _, Nt, Nx = trajectories.shape
-            x_grid = np.linspace(0.0, 1.0, Nx)
-            t_grid = np.linspace(0.0, 1.0, Nt)
+        if needs_grid_data:
+            if args.data and args.x_grid and args.t_grid:
+                print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.t_grid} ...")
+                trajectories, x_grid, t_grid = _load_plot_data(args.data, args.x_grid, args.t_grid)
+            else:
+                print("Skipping grid-based data plots (need --data, --x-grid, and --t-grid)")
 
+        model_plots = {"prediction_vs_truth", "interface_error", "lead_time_error", "parameter_error_slices"}
+        needs_model = any(_should_run(name, groups, individual) for name in model_plots)
+        if needs_model and args.checkpoint:
+            model, checkpoint_conf = _load_checkpoint_model(args.checkpoint)
+        elif needs_model:
+            print("Skipping checkpoint-based model plots (need --checkpoint)")
+
+        if trajectories is not None and sim_params is not None:
+            plot_config = _resolve_plot_config(checkpoint_conf)
+            split_datasets = _build_split_datasets(trajectories, x_grid, t_grid, sim_params, plot_config)
+
+        if sim_params is not None and _should_run("lhs_scatter", groups, individual):
+            print("--- lhs_scatter ---")
+            plot_lhs_scatter(sim_params, save_path=data_dir / "lhs_scatter.png")
+
+        if trajectories is not None:
             if _should_run("trajectory_heatmap", groups, individual):
                 print("--- trajectory_heatmap ---")
                 plot_trajectory_heatmap(trajectories, sim_id=0, x_grid=x_grid, t_grid=t_grid,
@@ -1774,63 +2187,81 @@ if __name__ == "__main__":
 
             # plots requiring sim_params
             if sim_params is not None:
-                if _should_run("lhs_scatter", groups, individual):
-                    print("--- lhs_scatter ---")
-                    plot_lhs_scatter(sim_params, save_path=data_dir / "lhs_scatter.png")
+                if split_datasets is not None and _should_run("snapshot_pair_samples", groups, individual):
+                    print("--- snapshot_pair_samples ---")
+                    plot_snapshot_pair_samples(
+                        trajectories,
+                        x_grid,
+                        t_grid,
+                        sim_params,
+                        config=plot_config,
+                        save_path=data_dir / "snapshot_pair_samples.png",
+                    )
 
-                if _should_run("trajectory_comparison_grid", groups, individual):
-                    print("--- trajectory_comparison_grid ---")
-                    plot_trajectory_comparison_grid(trajectories, sim_params, x_grid, t_grid,
-                                                    save_path=data_dir / "trajectory_comparison_grid.png")
+                if split_datasets is not None and _should_run("lead_time_coverage", groups, individual):
+                    print("--- lead_time_coverage ---")
+                    plot_lead_time_coverage(
+                        trajectories,
+                        x_grid,
+                        t_grid,
+                        sim_params,
+                        config=plot_config,
+                        save_path=data_dir / "lead_time_coverage.png",
+                    )
 
-                if _should_run("boundary_temperature", groups, individual):
-                    print("--- boundary_temperature ---")
-                    plot_boundary_temperature(trajectories, sim_params, t_grid,
-                                               save_path=data_dir / "boundary_temperature.png")
-
-                if _should_run("parameter_response", groups, individual):
-                    print("--- parameter_response ---")
-                    plot_parameter_response(trajectories, sim_params,
-                                             save_path=data_dir / "parameter_response.png")
-
-                if _should_run("dataset_samples", groups, individual):
-                    print("--- dataset_samples ---")
-                    plot_dataset_samples(trajectories, x_grid, t_grid, sim_params,
-                                         save_path=data_dir / "dataset_samples.png")
-
-                if _should_run("interface_error", groups, individual):
-                    if args.checkpoint:
-                        print("--- interface_error ---")
-                        import torch
-                        from src.operators.fno1d import FNO1d
-                        from data.dataset import split_sim_ids
-
-                        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-                        conf = ckpt["conf"]
-                        model_cfg = conf.get("model", {}).get("parameters", {})
-                        model = FNO1d(
-                            modes=model_cfg.get("modes", 16),
-                            width=model_cfg.get("width", 64),
-                            in_channels=model_cfg.get("in_channels", 2),
-                            out_channels=model_cfg.get("out_channels", 1),
-                            n_layers=model_cfg.get("n_layers", 4),
-                            cond_dim=model_cfg.get("cond_dim", 4),
-                            cond_hidden=model_cfg.get("cond_hidden", 256),
+                if model is not None and split_datasets is not None:
+                    test_dataset = split_datasets["test"]
+                    if _should_run("prediction_vs_truth", groups, individual):
+                        print("--- prediction_vs_truth ---")
+                        representative_idx = min(len(test_dataset) // 2, len(test_dataset) - 1)
+                        sim_id, s, _ = test_dataset._pairs[representative_idx]
+                        n_steps = max(2, min(40, len(t_grid) - s - 1))
+                        plot_prediction_vs_truth(
+                            model,
+                            trajectories,
+                            x_grid,
+                            t_grid,
+                            sim_params,
+                            sim_id=sim_id,
+                            s=s,
+                            n_steps=n_steps,
+                            save_path=data_dir / "prediction_vs_truth.png",
                         )
-                        model.load_state_dict(ckpt["model_state"])
-                        model.eval()
 
-                        num_sims = trajectories.shape[0]
-                        _, _, test_ids = split_sim_ids(num_sims, 0.7, 0.15, seed=0)
-                        plot_interface_error(model, trajectories, x_grid, t_grid,
-                                             sim_params, test_ids,
-                                             save_path=data_dir / "interface_error.png")
-                    else:
-                        print("Skipping interface_error (no --checkpoint provided)")
+                    if _should_run("interface_error", groups, individual):
+                        print("--- interface_error ---")
+                        plot_interface_error(
+                            model,
+                            trajectories,
+                            x_grid,
+                            t_grid,
+                            sim_params,
+                            test_dataset.sim_ids,
+                            save_path=data_dir / "interface_error.png",
+                        )
+
+                    if _should_run("lead_time_error", groups, individual):
+                        print("--- lead_time_error ---")
+                        plot_lead_time_error(
+                            model,
+                            test_dataset,
+                            x_grid,
+                            save_path=data_dir / "lead_time_error.png",
+                        )
+
+                    if _should_run("parameter_error_slices", groups, individual):
+                        print("--- parameter_error_slices ---")
+                        plot_parameter_error_slices(
+                            model,
+                            test_dataset,
+                            x_grid,
+                            save_path=data_dir / "parameter_error_slices.png",
+                        )
             else:
                 print("Skipping param-dependent plots (no --params provided)")
         else:
-            print("Skipping trajectory/initial-condition plots (no --data provided)")
+            if needs_grid_data:
+                print("Skipping trajectory-dependent plots (data/grids not available)")
 
     # ---- SWEEP GROUP ----
     sweep_plots = ["sweep_ranking", "sweep_convergence", "sweep_hyperparams"]
