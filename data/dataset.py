@@ -20,6 +20,10 @@ class SnapshotPairDataset(Dataset):
     Each sample is a (input, target) pair: given the temperature field at
     time t_s, predict the field at a future time t_j > t_s.
 
+    When n_snapshots is provided, uniformly subsamples that many time steps
+    from the full trajectory and enumerates all possible pairs per
+    simulation.  Pairs are sorted by lead time to support curriculum slicing.
+
     Returns 4-tuple: (x_spatial, cond, Y, T_stats)
         x_spatial : (Nx, 2)  — [T̃_source, x_norm]
         cond      : (4,)     — [t̄_norm, A_norm, f_norm, R_c_norm]
@@ -34,24 +38,13 @@ class SnapshotPairDataset(Dataset):
         x_grid: np.ndarray,
         sim_ids: np.ndarray,
         sim_params: np.ndarray,
-        pairs_per_sim: int = 50,
-        random_pairs: bool = True,
-        seed: int = 0,
-        stride: int = 1,
-        stratified: bool = False,
+        n_snapshots: int | None = None,
     ):
-        self.trajectories = trajectories # (num_sims, Nt, Nx)
+        self.trajectories = trajectories  # (num_sims, Nt, Nx)
         self.sim_params = sim_params
         self.t_grid = t_grid.astype(np.float32)
         self.x_grid = x_grid.astype(np.float32)
         self.sim_ids = sim_ids.astype(np.int64)
-
-        self.pairs_per_sim = pairs_per_sim
-        self.random_pairs = random_pairs
-        self.stride = stride
-        self.stratified = stratified
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
 
         self.num_sims, self.Nt, self.Nx = trajectories.shape
 
@@ -60,39 +53,47 @@ class SnapshotPairDataset(Dataset):
             (self.x_grid - self.x_grid[0]) / (self.x_grid[-1] - self.x_grid[0])
         ).astype(np.float32)
 
-        # Pre-compute all valid pairs for deterministic mode
-        if not self.random_pairs:
-            self._build_deterministic_pairs()
+        # Determine which time indices to use
+        if n_snapshots is not None and n_snapshots < self.Nt:
+            self.t_indices = np.round(
+                np.linspace(0, self.Nt - 1, n_snapshots)
+            ).astype(int)
+        else:
+            self.t_indices = np.arange(self.Nt)
 
-    def _build_deterministic_pairs(self):
-        """Enumerate all valid (s, j) pairs at given stride for each sim."""
+        # Build ALL valid (sim_id, s_idx, j_idx) pairs, sorted by lead time
+        self._build_all_pairs()
+        # active pairs represents the amount of pairs actually seen during a certain epoch
+        self._active_len = len(self._pairs)
+
+    def _build_all_pairs(self):
+        """Enumerate all valid (sim_id, s, j) pairs from subsampled time indices."""
         pairs = []
-        for sim_pos, sim_id in enumerate(self.sim_ids):
-            for s in range(0, self.Nt, self.stride):
-                for j in range(s + 1, self.Nt, self.stride):
-                    pairs.append((int(sim_id), s, j))
-        self._det_pairs = pairs
+        for sim_id in self.sim_ids:
+            for i, s_idx in enumerate(self.t_indices):
+                for j_idx in self.t_indices[i + 1:]:
+                    lead = float(self.t_grid[j_idx] - self.t_grid[s_idx])
+                    pairs.append((int(sim_id), int(s_idx), int(j_idx), lead))
+        # Sort by lead time for curriculum slicing
+        pairs.sort(key=lambda p: p[3])
+        self._pairs = [(p[0], p[1], p[2]) for p in pairs]
+        self._lead_times = np.array([p[3] for p in pairs], dtype=np.float32)
+
+    def set_curriculum_fraction(self, frac: float):
+        """Expose only pairs with lead time <= frac * max_lead_time.
+        frac=1.0 means all pairs (no curriculum restriction)."""
+        if frac >= 1.0:
+            self._active_len = len(self._pairs)
+        else:
+            max_lead = self._lead_times[-1]
+            cutoff = frac * max_lead
+            self._active_len = max(1, int(np.searchsorted(self._lead_times, cutoff, side='right')))
 
     def __len__(self):
-        if self.random_pairs:
-            return len(self.sim_ids) * self.pairs_per_sim
-        return len(self._det_pairs)
+        return self._active_len
 
     def __getitem__(self, idx):
-        if self.random_pairs:
-            sim_id = int(self.sim_ids[idx % len(self.sim_ids)])
-            if self.stratified:
-                # Uniform lead-time sampling: pick Δt first, then valid s.
-                # Avoids the triangular bias of naive (s, j) sampling that
-                # heavily oversamples short lead times.
-                lead_time = int(self.rng.integers(1, self.Nt))
-                s = int(self.rng.integers(0, self.Nt - lead_time))
-                j = s + lead_time
-            else:
-                s = int(self.rng.integers(0, self.Nt - 1))
-                j = int(self.rng.integers(s + 1, self.Nt))
-        else:
-            sim_id, s, j = self._det_pairs[idx]
+        sim_id, s, j = self._pairs[idx]
 
         # Unpack sim params: (amp, freq, T0, R_c)
         amp, freq, _T0, R_c = self.sim_params[sim_id]
@@ -110,12 +111,9 @@ class SnapshotPairDataset(Dataset):
         T_target_norm = (T_target - mu_s) / (sigma_s + T_EPS)
 
         # Spatial input: (Nx, 2) — [T̃_source, x_norm]
-        # this takes two arrays of the same shape and joins them to make (Nx, 2)
         x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
 
         # Conditioning vector: (4,) — [t̄_norm, A_norm, f_norm, R_c_norm]
-        # Note: conditioning vector varies per-sample
-        # min-max scaling formula: (x - x_min)/(x_max - x_min)
         t_bar = self.t_grid[j] - self.t_grid[s]
         t_bar_norm = t_bar / self.t_grid[-1]
         A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
@@ -129,7 +127,6 @@ class SnapshotPairDataset(Dataset):
         # Stats for denormalization at eval time: (2,)
         T_stats = np.array([mu_s, sigma_s], dtype=np.float32)
 
-        # return the entire sample
         return (
             torch.from_numpy(x_spatial),
             torch.from_numpy(cond),
@@ -203,11 +200,11 @@ def create_dataloaders(
     test_ids: np.ndarray,
     batch_size: int,
     sim_params: np.ndarray,
-    pairs_per_sim_train: int = 50,
-    pairs_per_sim_val: int = 20,
-    test_stride: int = 5,
-    stratified: bool = False,
+    n_snapshots: int = 15,
+    n_snapshots_test: int | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
+
+    n_test = n_snapshots_test if n_snapshots_test is not None else n_snapshots
 
     train_dataset = SnapshotPairDataset(
         trajectories=trajectories,
@@ -215,9 +212,7 @@ def create_dataloaders(
         t_grid=t_grid,
         sim_ids=train_ids,
         sim_params=sim_params,
-        pairs_per_sim=pairs_per_sim_train,
-        random_pairs=True,
-        stratified=stratified,
+        n_snapshots=n_snapshots,
     )
 
     val_dataset = SnapshotPairDataset(
@@ -226,9 +221,7 @@ def create_dataloaders(
         t_grid=t_grid,
         sim_ids=val_ids,
         sim_params=sim_params,
-        pairs_per_sim=pairs_per_sim_val,
-        random_pairs=True,
-        stratified=stratified,
+        n_snapshots=n_snapshots,
     )
 
     test_dataset = SnapshotPairDataset(
@@ -237,8 +230,7 @@ def create_dataloaders(
         t_grid=t_grid,
         sim_ids=test_ids,
         sim_params=sim_params,
-        random_pairs=False,
-        stride=test_stride,
+        n_snapshots=n_test,
     )
 
     pin = torch.cuda.is_available()
