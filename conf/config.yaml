@@ -28,11 +28,10 @@ model:
 
 training:
   device: "auto"
-  batch_size: 64
-  pairs_per_sim_train: 200
-  pairs_per_sim_val: 100
-  test_stride: 1
-  stratified_sampling: true
+  batch_size: 256
+  n_snapshots: 15
+  n_snapshots_test: 40
+  curriculum_warmup: 50
   epochs: 1500
   learning_rate: 0.001
   weight_decay: 1.0e-5
