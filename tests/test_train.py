@@ -1,4 +1,6 @@
+import csv
 import random
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -7,7 +9,6 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.fno1d import FNO1d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
-import csv
 
 from src.operators.train import (
     load_config,
@@ -17,6 +18,10 @@ from src.operators.train import (
     _is_training_complete,
     _load_completed_result,
     _rigno_three_phase_lr_for_epoch,
+    _resolve_rigno_lr_values,
+    _resolve_rigno_phase_lengths,
+    build_optimizer,
+    build_scheduler,
     run_one_seed,
     run_config_seeds,
 )
@@ -226,6 +231,103 @@ class TestRIGNOThreePhaseSchedule:
             lr = _rigno_three_phase_lr_for_epoch(human_epoch - 1, **kwargs)
             assert lr == pytest.approx(target_lr, rel=1e-10, abs=1e-12)
 
+    def test_fraction_based_phase_lengths_match_default_schedule(self):
+        training_cfg = {"epochs": 1500}
+        sched_cfg = {
+            "warmup_fraction": 0.02,
+            "cosine_fraction": 0.88,
+            "exp_fraction": 0.10,
+        }
+
+        assert _resolve_rigno_phase_lengths(training_cfg, sched_cfg) == (30, 1320, 150)
+
+    def test_fraction_based_phase_lengths_support_epoch_override(self):
+        training_cfg = {"epochs": 900}
+        sched_cfg = {
+            "warmup_fraction": 0.02,
+            "cosine_fraction": 0.88,
+            "exp_fraction": 0.10,
+        }
+
+        assert _resolve_rigno_phase_lengths(training_cfg, sched_cfg) == (18, 792, 90)
+
+    @pytest.mark.parametrize(
+        ("learning_rate", "expected"),
+        [
+            (2.0e-3, (2.0e-3, 1.0e-4, 1.0e-4, 1.0e-5)),
+            (1.0e-3, (1.0e-3, 5.0e-5, 5.0e-5, 5.0e-6)),
+        ],
+    )
+    def test_ratio_based_lr_values_track_learning_rate(self, learning_rate, expected):
+        training_cfg = {"learning_rate": learning_rate}
+        sched_cfg = {
+            "init_lr_ratio": 0.05,
+            "cosine_floor_lr_ratio": 0.05,
+            "final_lr_ratio": 0.005,
+        }
+
+        assert _resolve_rigno_lr_values(training_cfg, sched_cfg) == pytest.approx(expected)
+
+    def test_fraction_ratio_scheduler_accepts_swept_lr_and_epochs(self):
+        config = {
+            "training": {
+                "learning_rate": 1.0e-3,
+                "weight_decay": 1.0e-5,
+                "epochs": 900,
+                "optimizer": "AdamW",
+                "scheduler": {
+                    "type": "RIGNOThreePhase",
+                    "warmup_fraction": 0.02,
+                    "cosine_fraction": 0.88,
+                    "exp_fraction": 0.10,
+                    "init_lr_ratio": 0.05,
+                    "cosine_floor_lr_ratio": 0.05,
+                    "final_lr_ratio": 0.005,
+                },
+            }
+        }
+        model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=4)
+        optimizer = build_optimizer(config, model.parameters())
+
+        scheduler = build_scheduler(config, optimizer)
+
+        assert scheduler is not None
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(5.0e-5)
+
+    def test_peak_lr_mismatch_still_raises(self):
+        config = {
+            "training": {
+                "learning_rate": 1.0e-3,
+                "weight_decay": 1.0e-5,
+                "epochs": 6,
+                "optimizer": "AdamW",
+                "scheduler": {
+                    "type": "RIGNOThreePhase",
+                    "warmup_epochs": 2,
+                    "cosine_epochs": 2,
+                    "exp_epochs": 2,
+                    "peak_lr": 2.0e-3,
+                    "init_lr": 5.0e-5,
+                    "cosine_floor_lr": 1.0e-4,
+                    "final_lr": 1.0e-5,
+                },
+            }
+        }
+        model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=4)
+        optimizer = build_optimizer(config, model.parameters())
+
+        with pytest.raises(ValueError, match="scheduler.peak_lr must match training.learning_rate"):
+            build_scheduler(config, optimizer)
+
+
+class TestSearchSpaceConfig:
+    def test_search_space_drops_stale_cosine_restart_params(self):
+        search_space_path = Path(__file__).resolve().parents[1] / "conf" / "search_space" / "medium.yaml"
+        text = search_space_path.read_text(encoding="utf-8")
+
+        assert "training.scheduler.T_0" not in text
+        assert "training.scheduler.T_mult" not in text
+
 
 # ===================== _is_training_complete =====================
 
@@ -348,7 +450,39 @@ class TestRunOneSeedResume:
         assert (run_dir / "fno1d_best.pt").exists()
 
     def test_adamw_rigno_three_phase_scheduler(self, tmp_path, seed_config):
-        """AdamW + RIGNOThreePhase should complete training and log epoch-start LRs."""
+        """AdamW + RIGNOThreePhase should complete training with fraction/ratio config."""
+        rigno_config = {
+            **seed_config,
+            "training": {
+                **seed_config["training"],
+                "optimizer": "AdamW",
+                "epochs": 10,
+                "scheduler": {
+                    "type": "RIGNOThreePhase",
+                    "warmup_fraction": 0.2,
+                    "cosine_fraction": 0.6,
+                    "exp_fraction": 0.2,
+                    "init_lr_ratio": 0.05,
+                    "cosine_floor_lr_ratio": 0.05,
+                    "final_lr_ratio": 0.005,
+                },
+            },
+        }
+        run_dir = tmp_path / "seed0_rigno"
+        result = run_one_seed(rigno_config, seed=0, run_dir=run_dir)
+
+        assert "best_val" in result
+        assert (run_dir / "fno1d_best.pt").exists()
+
+        csv_path = run_dir / "train_metrics.csv"
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        assert float(rows[0]["lr"]) == pytest.approx(5.0e-5)
+        assert float(rows[-1]["lr"]) == pytest.approx(5.0e-6)
+
+    def test_legacy_adamw_rigno_three_phase_scheduler(self, tmp_path, seed_config):
+        """Explicit RIGNO phase lengths and LR endpoints should remain supported."""
         rigno_config = {
             **seed_config,
             "training": {

@@ -143,6 +143,91 @@ def _rigno_three_phase_lr_for_epoch(
     return final_lr
 
 
+def _resolve_rigno_phase_lengths(training_cfg: dict, sched_cfg: dict) -> tuple[int, int, int]:
+    total_epochs = int(training_cfg["epochs"])
+    fraction_keys = ("warmup_fraction", "cosine_fraction", "exp_fraction")
+    epoch_keys = ("warmup_epochs", "cosine_epochs", "exp_epochs")
+
+    if any(key in sched_cfg for key in fraction_keys):
+        if not all(key in sched_cfg for key in fraction_keys):
+            raise ValueError(
+                "RIGNOThreePhase fraction schedule requires warmup_fraction, cosine_fraction, and exp_fraction."
+            )
+
+        warmup_fraction = float(sched_cfg["warmup_fraction"])
+        cosine_fraction = float(sched_cfg["cosine_fraction"])
+        exp_fraction = float(sched_cfg["exp_fraction"])
+        if min(warmup_fraction, cosine_fraction, exp_fraction) <= 0:
+            raise ValueError("RIGNOThreePhase fractions must all be positive.")
+        if not math.isclose(
+            warmup_fraction + cosine_fraction + exp_fraction,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("RIGNOThreePhase fractions must sum to 1.0.")
+
+        warmup_epochs = max(1, int(round(total_epochs * warmup_fraction)))
+        exp_epochs = max(1, int(round(total_epochs * exp_fraction)))
+        cosine_epochs = total_epochs - warmup_epochs - exp_epochs
+        if cosine_epochs <= 0:
+            raise ValueError("RIGNOThreePhase derived cosine_epochs must be positive.")
+        return warmup_epochs, cosine_epochs, exp_epochs
+
+    if any(key in sched_cfg for key in epoch_keys):
+        if not all(key in sched_cfg for key in epoch_keys):
+            raise ValueError(
+                "RIGNOThreePhase explicit phase lengths require warmup_epochs, cosine_epochs, and exp_epochs."
+            )
+
+        warmup_epochs = int(sched_cfg["warmup_epochs"])
+        cosine_epochs = int(sched_cfg["cosine_epochs"])
+        exp_epochs = int(sched_cfg["exp_epochs"])
+        if warmup_epochs <= 0 or cosine_epochs <= 0 or exp_epochs <= 0:
+            raise ValueError("RIGNOThreePhase requires positive warmup_epochs, cosine_epochs, and exp_epochs.")
+        if warmup_epochs + cosine_epochs + exp_epochs != total_epochs:
+            raise ValueError("RIGNOThreePhase phase lengths must sum to training.epochs.")
+        return warmup_epochs, cosine_epochs, exp_epochs
+
+    raise ValueError(
+        "RIGNOThreePhase requires either warmup_fraction/cosine_fraction/exp_fraction "
+        "or warmup_epochs/cosine_epochs/exp_epochs."
+    )
+
+
+def _resolve_rigno_lr_values(training_cfg: dict, sched_cfg: dict) -> tuple[float, float, float, float]:
+    peak_lr = float(training_cfg["learning_rate"])
+    if "peak_lr" in sched_cfg and not math.isclose(
+        float(sched_cfg["peak_lr"]),
+        peak_lr,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("scheduler.peak_lr must match training.learning_rate when provided explicitly.")
+
+    def _resolve_lr_value(abs_key: str, ratio_key: str) -> float:
+        if ratio_key in sched_cfg:
+            ratio = float(sched_cfg[ratio_key])
+            if ratio <= 0:
+                raise ValueError(f"RIGNOThreePhase requires positive {ratio_key}.")
+            return peak_lr * ratio
+        if abs_key not in sched_cfg:
+            raise ValueError(f"RIGNOThreePhase requires {abs_key} or {ratio_key}.")
+        return float(sched_cfg[abs_key])
+
+    init_lr = _resolve_lr_value("init_lr", "init_lr_ratio")
+    cosine_floor_lr = _resolve_lr_value("cosine_floor_lr", "cosine_floor_lr_ratio")
+    final_lr = _resolve_lr_value("final_lr", "final_lr_ratio")
+
+    if min(init_lr, peak_lr, cosine_floor_lr, final_lr) <= 0:
+        raise ValueError("RIGNOThreePhase LR values must all be positive.")
+    if peak_lr < init_lr:
+        raise ValueError("RIGNOThreePhase requires peak_lr >= init_lr.")
+    if peak_lr < cosine_floor_lr or cosine_floor_lr < final_lr:
+        raise ValueError("RIGNOThreePhase requires peak_lr >= cosine_floor_lr >= final_lr.")
+    return peak_lr, init_lr, cosine_floor_lr, final_lr
+
+
 class RIGNOThreePhaseScheduler:
     def __init__(
         self,
@@ -208,32 +293,8 @@ def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
         )
 
     if sched_type == "RIGNOThreePhase":
-        peak_lr = float(sched_cfg.get("peak_lr", training_cfg["learning_rate"]))
-        training_peak_lr = float(training_cfg["learning_rate"])
-        if "peak_lr" in sched_cfg and not math.isclose(peak_lr, training_peak_lr, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError(
-                "scheduler.peak_lr must match training.learning_rate when provided explicitly."
-            )
-
-        warmup_epochs = int(sched_cfg["warmup_epochs"])
-        cosine_epochs = int(sched_cfg["cosine_epochs"])
-        exp_epochs = int(sched_cfg["exp_epochs"])
-        init_lr = float(sched_cfg["init_lr"])
-        cosine_floor_lr = float(sched_cfg["cosine_floor_lr"])
-        final_lr = float(sched_cfg["final_lr"])
-
-        if warmup_epochs <= 0 or cosine_epochs <= 0 or exp_epochs <= 0:
-            raise ValueError("RIGNOThreePhase requires positive warmup_epochs, cosine_epochs, and exp_epochs.")
-        if warmup_epochs + cosine_epochs + exp_epochs != int(training_cfg["epochs"]):
-            raise ValueError(
-                "RIGNOThreePhase phase lengths must sum to training.epochs."
-            )
-        if min(init_lr, peak_lr, cosine_floor_lr, final_lr) <= 0:
-            raise ValueError("RIGNOThreePhase LR values must all be positive.")
-        if peak_lr < init_lr:
-            raise ValueError("RIGNOThreePhase requires peak_lr >= init_lr.")
-        if peak_lr < cosine_floor_lr or cosine_floor_lr < final_lr:
-            raise ValueError("RIGNOThreePhase requires peak_lr >= cosine_floor_lr >= final_lr.")
+        warmup_epochs, cosine_epochs, exp_epochs = _resolve_rigno_phase_lengths(training_cfg, sched_cfg)
+        peak_lr, init_lr, cosine_floor_lr, final_lr = _resolve_rigno_lr_values(training_cfg, sched_cfg)
 
         return RIGNOThreePhaseScheduler(
             optimizer,

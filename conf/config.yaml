@@ -38,14 +38,14 @@ training:
   grad_clip: 1.0
   scheduler:
     type: "RIGNOThreePhase"
-    warmup_epochs: 30
-    cosine_epochs: 1320
-    exp_epochs: 150
-    init_lr: 1.0e-4
-    peak_lr: 2.0e-3
-    cosine_floor_lr: 1.0e-4
-    final_lr: 1.0e-5
+    warmup_fraction: 0.02
+    cosine_fraction: 0.88
+    exp_fraction: 0.10
+    init_lr_ratio: 0.05
+    cosine_floor_lr_ratio: 0.05
+    final_lr_ratio: 0.005
     # training.learning_rate remains the source of truth for the peak LR.
+    # Ratio fields scale the schedule cleanly during Optuna sweeps.
     # StepLR params (used when type=StepLR):
     step_size: 50
     gamma: 0.5
