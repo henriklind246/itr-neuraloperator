@@ -31,20 +31,25 @@ training:
   batch_size: 512
   n_snapshots: 15
   n_snapshots_test: 40
-  curriculum_warmup: 100
+  curriculum_warmup: 200
   epochs: 1500
-  learning_rate: 0.001
+  learning_rate: 0.002
   weight_decay: 1.0e-5
   grad_clip: 1.0
   scheduler:
-    type: "CosineWarmRestarts"
-    T_0: 500
-    T_mult: 2
-    eta_min: 1.0e-6
+    type: "RIGNOThreePhase"
+    warmup_epochs: 30
+    cosine_epochs: 1320
+    exp_epochs: 150
+    init_lr: 1.0e-4
+    peak_lr: 2.0e-3
+    cosine_floor_lr: 1.0e-4
+    final_lr: 1.0e-5
+    # training.learning_rate remains the source of truth for the peak LR.
     # StepLR params (used when type=StepLR):
     step_size: 50
     gamma: 0.5
-  optimizer: "Adam"
+  optimizer: "AdamW"
   loss:
     interface_x: 0.5
     interface_half_width: 0.05
@@ -68,6 +73,7 @@ data:
   y_shape: "B, Nx, 1"
   cond_shape: "B, 4"
   t_stats_shape: "B, 2"
+  num_sims: 4000
 
 hydra:
   mode: MULTIRUN
