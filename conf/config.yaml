@@ -38,7 +38,7 @@ training:
   grad_clip: 1.0
   scheduler:
     type: "CosineWarmRestarts"
-    T_0: 100
+    T_0: 300
     T_mult: 2
     eta_min: 1.0e-6
     # StepLR params (used when type=StepLR):
