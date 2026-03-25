@@ -266,9 +266,7 @@ class TestRunOneSeedResume:
             },
             "training": {
                 "batch_size": 4,
-                "pairs_per_sim_train": 10,
-                "pairs_per_sim_val": 5,
-                "test_stride": 10,
+                "n_snapshots": 5,
                 "device": "cpu",
                 "epochs": 4,
                 "learning_rate": 0.001,
@@ -326,14 +324,14 @@ class TestRunOneSeedResume:
         result = run_one_seed(clip_config, seed=0, run_dir=run_dir)
         assert "best_val" in result
 
-    def test_stratified_sampling_in_full_run(self, tmp_path, seed_config):
-        """stratified_sampling config should be passed through to dataloader."""
-        strat_config = {
+    def test_curriculum_warmup_in_full_run(self, tmp_path, seed_config):
+        """curriculum_warmup config should complete training without error."""
+        curriculum_config = {
             **seed_config,
-            "training": {**seed_config["training"], "stratified_sampling": True},
+            "training": {**seed_config["training"], "curriculum_warmup": 2},
         }
-        run_dir = tmp_path / "seed0_strat"
-        result = run_one_seed(strat_config, seed=0, run_dir=run_dir)
+        run_dir = tmp_path / "seed0_curriculum"
+        result = run_one_seed(curriculum_config, seed=0, run_dir=run_dir)
         assert "best_val" in result
 
     def test_resume_interrupted_run(self, tmp_path, seed_config):
@@ -437,9 +435,7 @@ class TestRunConfigSeeds:
             },
             "training": {
                 "batch_size": 4,
-                "pairs_per_sim_train": 10,
-                "pairs_per_sim_val": 5,
-                "test_stride": 10,
+                "n_snapshots": 5,
                 "device": "cpu",
                 "epochs": 4,
                 "learning_rate": 0.001,

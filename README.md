@@ -1,6 +1,6 @@
 # itr-neuraloperator
 
-Repository for modeling interfacial thermal resistance (ITR) and multilayer heat conduction with neural operators. Simulation data is generated with a finite-difference solver, the learning model is a Fourier Neural Operator (FNO) trained on windowed trajectory data, and the repository includes training, evaluation, and plotting utilities. The long-term goal is to provide clean entry points for the full pipeline, but the current interface is still uneven and is documented here as it exists today.
+Repository for modeling interfacial thermal resistance (ITR) and multilayer heat conduction with neural operators. Simulation data is generated with a finite-difference solver, the learning model is a time-conditioned Fourier Neural Operator (FNO) trained on all-to-all snapshot pairs, and the repository includes training, evaluation, and plotting utilities. The long-term goal is to provide clean entry points for the full pipeline, but the current interface is still uneven and is documented here as it exists today.
 
 ## Project Status
 
@@ -112,9 +112,12 @@ Currently, the module `__main__` assumes `runs/experiment0/config0`, which is a 
 Important flags:
 
 - `--data`
+- `--x-grid`
+- `--t-grid`
 - `--params`
 - `--csv`
 - `--report`
+- `--checkpoint`
 - `--out`
 - `--group`
 - `--plots`
@@ -125,10 +128,11 @@ Examples:
 python -m visual.plots --out visual/
 python -m visual.plots --group physics --out visual/
 python -m visual.plots --group training --csv runs/experiment0/conf0/seed0/train_metrics.csv --report runs/experiment0/conf0/seed_report.json --out visual/
-python -m visual.plots --group data --data trajectories.npy --params sim_params.npy --out visual/
+python -m visual.plots --group data --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
+python -m visual.plots --plots prediction_vs_truth lead_time_error --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
 ```
 
-Some plots require extra inputs and will be skipped if the relevant arguments are not provided. For example, training plots need `--csv` or `--report`, and data plots need `--data` and `--params`.
+Some plots require extra inputs and will be skipped if the relevant arguments are not provided. Training plots need `--csv` or `--report`. Grid-based data plots need `--data`, `--x-grid`, and `--t-grid`. Checkpoint-based diagnostics such as `prediction_vs_truth`, `interface_error`, `lead_time_error`, and `parameter_error_slices` also need `--checkpoint`.
 
 ## Configuration and Outputs
 
@@ -143,7 +147,7 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 ## Project Layout
 
 - [data/generate_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/generate_dataset.py): synthetic trajectory generation
-- [data/dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/dataset.py): windowed dataset construction and dataloaders
+- [data/dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/dataset.py): all-to-all snapshot-pair dataset construction and dataloaders
 - [src/physics/fd_solver_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/fd_solver_1d.py): multilayer finite-difference solver
 - [src/physics/mms_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/mms_1d.py): manufactured-solution verification
 - [src/operators/fno1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/fno1d.py): Fourier Neural Operator model

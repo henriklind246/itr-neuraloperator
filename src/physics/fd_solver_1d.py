@@ -170,7 +170,6 @@ class FDSolver1D:
         self.ab = self.build_A_banded()
 
     # ---------- GEOMETRY / VALIDATION ---------
-
     def _validate_layers_cover_domain(self) -> None:
         """
         Determines whether predefined layers cover the whole domain and other checks
@@ -459,5 +458,3 @@ if __name__ == '__main__':
     print(f"T_history shape: {T_hist.shape}")
     print(f"interface positions: {sim.interface_positions}")
     print(f"interface face map: {sim.interface_face_map}")
-
-
