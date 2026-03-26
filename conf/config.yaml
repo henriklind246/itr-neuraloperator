@@ -55,9 +55,9 @@ training:
     interface_half_width: 0.05
     interface_weight: 10.0
   validate_every: 10
-  patience: 30
+  patience: 20
   checkpoint_metric: "val_rel_l2"
-  seeds: [42]
+  seeds: [0, 1, 2]
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
 

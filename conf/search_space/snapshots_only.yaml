@@ -1,0 +1,3 @@
+# @package search_space
+params:
+  training.n_snapshots: choice(10, 15, 20, 25)
