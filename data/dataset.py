@@ -39,12 +39,14 @@ class SnapshotPairDataset(Dataset):
         sim_ids: np.ndarray,
         sim_params: np.ndarray,
         n_snapshots: int | None = None,
+        noise_std: float = 0.0,
     ):
         self.trajectories = trajectories  # (num_sims, Nt, Nx)
         self.sim_params = sim_params
         self.t_grid = t_grid.astype(np.float32)
         self.x_grid = x_grid.astype(np.float32)
         self.sim_ids = sim_ids.astype(np.int64)
+        self.noise_std = noise_std
 
         self.num_sims, self.Nt, self.Nx = trajectories.shape
 
@@ -109,6 +111,10 @@ class SnapshotPairDataset(Dataset):
         sigma_s = T_source.std()
         T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
         T_target_norm = (T_target - mu_s) / (sigma_s + T_EPS)
+
+        # Input noise augmentation (training only, controlled by noise_std)
+        if self.noise_std > 0:
+            T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
 
         # Spatial input: (Nx, 2) — [T̃_source, x_norm]
         x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
@@ -202,6 +208,7 @@ def create_dataloaders(
     sim_params: np.ndarray,
     n_snapshots: int = 15,
     n_snapshots_test: int | None = None,
+    noise_std: float = 0.0,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
 
     n_test = n_snapshots_test if n_snapshots_test is not None else n_snapshots
@@ -213,6 +220,7 @@ def create_dataloaders(
         sim_ids=train_ids,
         sim_params=sim_params,
         n_snapshots=n_snapshots,
+        noise_std=noise_std,
     )
 
     val_dataset = SnapshotPairDataset(
