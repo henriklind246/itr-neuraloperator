@@ -1,0 +1,3 @@
+# @package search_space
+params:
+  model.parameters.width: choice(32, 48, 64)
