@@ -29,9 +29,8 @@ def build_test_loader(config):
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=config["training"]["batch_size"],
         sim_params=sim_params,
-        pairs_per_sim_train=config["training"].get("pairs_per_sim_train", 50),
-        pairs_per_sim_val=config["training"].get("pairs_per_sim_val", 20),
-        test_stride=config["training"].get("test_stride", 1)
+        n_snapshots=10,
+        n_snapshots_test=40
     )
 
     return testing_set, x_grid
