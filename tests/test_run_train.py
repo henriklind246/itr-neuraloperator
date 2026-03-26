@@ -5,6 +5,7 @@ import os
 import pytest
 import yaml
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.run_train import (
     _next_experiment_name,
@@ -19,6 +20,13 @@ from scripts.run_train import (
     _pre_init_optuna_storage,
     _config_sort_key,
     EXPERIMENT_ENV_VAR,
+)
+from scripts.run_train_fixed import (
+    _parse_override_value,
+    _apply_override,
+    _validate_fixed_run_config,
+    _resolve_run_dir,
+    main as fixed_main,
 )
 
 
@@ -346,3 +354,136 @@ class TestPreInitOptunaStorage:
 
         # Corrupt file should be removed
         assert not db_path.exists()
+
+
+class TestRunTrainFixedHelpers:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("10", 10),
+            ("0.001", 0.001),
+            ("true", True),
+            ("false", False),
+            ("[42]", [42]),
+            ("snapshots_ablation_300ep", "snapshots_ablation_300ep"),
+        ],
+    )
+    def test_parse_override_value(self, raw, expected):
+        assert _parse_override_value(raw) == expected
+
+    def test_apply_override_updates_nested_value(self):
+        config = {"training": {"n_snapshots": 15, "loss": {"interface_weight": 10.0}}}
+        _apply_override(config, "training.n_snapshots", 20)
+        _apply_override(config, "training.loss.interface_weight", 5.0)
+
+        assert config["training"]["n_snapshots"] == 20
+        assert config["training"]["loss"]["interface_weight"] == pytest.approx(5.0)
+
+    def test_apply_override_rejects_unknown_path(self):
+        config = {"training": {"n_snapshots": 15}}
+        with pytest.raises(KeyError, match="Unknown config path"):
+            _apply_override(config, "training.missing.value", 1)
+
+    def test_validate_fixed_run_requires_experiment_name(self):
+        config = {
+            "experiment": {"name": ""},
+            "config_id": 10,
+            "training": {"seeds": [42], "run": {"run_dir": "/tmp/run"}},
+        }
+        with pytest.raises(ValueError, match="experiment.name"):
+            _validate_fixed_run_config(config)
+
+    def test_validate_fixed_run_requires_config_id(self):
+        config = {
+            "experiment": {"name": "test"},
+            "config_id": None,
+            "training": {"seeds": [42], "run": {"run_dir": "/tmp/run"}},
+        }
+        with pytest.raises(ValueError, match="config_id"):
+            _validate_fixed_run_config(config)
+
+    def test_validate_fixed_run_requires_nonempty_seeds(self):
+        config = {
+            "experiment": {"name": "test"},
+            "config_id": 10,
+            "training": {"seeds": [], "run": {"run_dir": "/tmp/run"}},
+        }
+        with pytest.raises(ValueError, match="training.seeds"):
+            _validate_fixed_run_config(config)
+
+    def test_resolve_run_dir_uses_experiment_and_config_id(self, tmp_path):
+        config = {
+            "paths": {"runs_root": str(tmp_path / "runs")},
+            "experiment": {"name": "snapshots_ablation_300ep"},
+            "config_id": 20,
+        }
+        run_dir = _resolve_run_dir(config)
+        assert run_dir == tmp_path / "runs" / "snapshots_ablation_300ep" / "config20"
+
+    def test_two_config_ids_resolve_to_distinct_run_dirs(self, tmp_path):
+        base = {
+            "paths": {"runs_root": str(tmp_path / "runs")},
+            "experiment": {"name": "snapshots_ablation_300ep"},
+        }
+        cfg10 = {**base, "config_id": 10}
+        cfg15 = {**base, "config_id": 15}
+
+        assert _resolve_run_dir(cfg10) != _resolve_run_dir(cfg15)
+
+
+class TestRunTrainFixedMain:
+    def test_main_applies_overrides_and_calls_run_config_seeds(self, tmp_path, monkeypatch, capsys):
+        base_config = {
+            "paths": {"runs_root": str(tmp_path / "runs")},
+            "experiment": {"name": "placeholder"},
+            "config_id": 0,
+            "training": {
+                "device": "cpu",
+                "seeds": [0],
+                "run": {"run_dir": "placeholder"},
+                "n_snapshots": 15,
+                "epochs": 1500,
+            },
+            "model": {"parameters": {"width": 64}},
+        }
+
+        monkeypatch.setattr("scripts.run_train_fixed.load_config", lambda: base_config)
+        monkeypatch.setattr(
+            "scripts.run_train_fixed.run_config_seeds",
+            lambda config, base_run_dir, seeds: {
+                "num_seeds": len(seeds),
+                "mean_best_val": 1.23,
+                "per_seed": [],
+            },
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "run_train_fixed.py",
+                "experiment.name=test_ablation",
+                "config_id=10",
+                "training.n_snapshots=10",
+                "training.seeds=[42]",
+            ],
+        )
+
+        exit_code = fixed_main()
+        captured = capsys.readouterr()
+
+        assert exit_code == 0
+        assert "Using fixed experiment namespace: test_ablation" in captured.out
+        assert "config10" in captured.out
+        assert '"mean_best_val": 1.23' in captured.out
+
+    def test_main_rejects_malformed_override(self, tmp_path, monkeypatch):
+        base_config = {
+            "paths": {"runs_root": str(tmp_path / "runs")},
+            "experiment": {"name": "placeholder"},
+            "config_id": 0,
+            "training": {"device": "cpu", "seeds": [0], "run": {"run_dir": "placeholder"}},
+        }
+        monkeypatch.setattr("scripts.run_train_fixed.load_config", lambda: base_config)
+        monkeypatch.setattr("sys.argv", ["run_train_fixed.py", "not_an_override"])
+
+        with pytest.raises(ValueError, match="Expected key=value"):
+            fixed_main()
