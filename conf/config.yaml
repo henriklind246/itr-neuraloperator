@@ -25,6 +25,8 @@ model:
     cond_dim: 4
     cond_hidden: 256
     activation: "GELU"
+    dropout: 0.1
+    spectral_dropout: 0.1
 
 training:
   device: "auto"
@@ -34,7 +36,8 @@ training:
   curriculum_warmup: 200
   epochs: 1500
   learning_rate: 0.002
-  weight_decay: 1.0e-5
+  weight_decay: 1.0e-4
+  noise_std: 0.05
   grad_clip: 1.0
   scheduler:
     type: "RIGNOThreePhase"
