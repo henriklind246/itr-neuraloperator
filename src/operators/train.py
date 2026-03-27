@@ -405,6 +405,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         sim_params=sim_params,
         n_snapshots=config["training"].get("n_snapshots", 15),
         n_snapshots_test=config["training"].get("n_snapshots_test", None),
+        noise_std=config["training"].get("noise_std", 0.0),
     )
 
     device = resolve_device(config["training"].get("device", "auto"))
@@ -418,7 +419,9 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         out_channels=model_cfg["out_channels"],
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", 4),
-        cond_hidden=model_cfg.get("cond_hidden", 256)
+        cond_hidden=model_cfg.get("cond_hidden", 256),
+        dropout=model_cfg.get("dropout", 0.0),
+        spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
     )
 
     # --- Resume state ---
