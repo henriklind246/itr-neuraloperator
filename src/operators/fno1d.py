@@ -5,7 +5,7 @@ import torch.nn.functional as F
 # --------- Time-conditioned 1D FNO ---------
 #
 # Operator-learning task:
-#   G_θ(T̃(x, t_s), x, t̄, t_s, A, f, R_c) → T̃(x, t_j)
+#   G_θ(T̃(x, t_s), x, t̄, t_s, A, f, R_c, μ_s, σ_s) → T̃(x, t_j)
 #
 # where t̄ = t_j − t_s is the lead time, t_s is the absolute source
 # time, and T̃ denotes per-sample normalized temperature.  The
@@ -127,7 +127,7 @@ class FNO1d(nn.Module):
         model(x_spatial, cond) → y_pred
 
     x_spatial : (B, Nx, C_spatial)   — T̃(x,t_s) and x_norm
-    cond      : (B, C_cond)         — (t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm)
+    cond      : (B, C_cond)         — (t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm, μ_s_norm, σ_s_norm)
     y_pred    : (B, Nx, out_channels) — predicted T̃(x, t_j)
     """
 
@@ -138,7 +138,7 @@ class FNO1d(nn.Module):
         in_channels: int = 2,
         out_channels: int = 1,
         n_layers: int = 4,
-        cond_dim: int = 5,
+        cond_dim: int = 7,
         cond_hidden: int = 256,
         dropout: float = 0.0,
         spectral_dropout: float = 0.0,
