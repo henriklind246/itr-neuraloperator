@@ -186,3 +186,65 @@ class TestFNO1d:
             y1 = small_fno(x, cond)
             y2 = small_fno(x, cond)
         assert torch.equal(y1, y2)
+
+    def test_dropout_output_shape(self):
+        model = FNO1d(modes=2, width=8, in_channels=2, n_layers=2, cond_dim=4, dropout=0.2)
+        x = torch.randn(4, 101, 2)
+        cond = torch.rand(4, 4)
+        with torch.no_grad():
+            y = model(x, cond)
+        assert y.shape == (4, 101, 1)
+
+    def test_dropout_train_vs_eval_differs(self):
+        """Model with dropout should produce different outputs in train vs eval mode."""
+        model = FNO1d(modes=2, width=8, in_channels=2, n_layers=2, cond_dim=4, dropout=0.5)
+        x = torch.randn(4, 101, 2)
+        cond = torch.rand(4, 4)
+
+        model.eval()
+        with torch.no_grad():
+            y_eval = model(x, cond)
+
+        model.train()
+        torch.manual_seed(0)
+        with torch.no_grad():
+            y_train1 = model(x, cond)
+        torch.manual_seed(1)
+        with torch.no_grad():
+            y_train2 = model(x, cond)
+
+        # Training outputs should differ due to dropout randomness
+        assert not torch.equal(y_train1, y_train2)
+
+    def test_spectral_dropout_output_shape(self):
+        model = FNO1d(modes=2, width=8, in_channels=2, n_layers=2, cond_dim=4, spectral_dropout=0.3)
+        x = torch.randn(4, 101, 2)
+        cond = torch.rand(4, 4)
+        with torch.no_grad():
+            y = model(x, cond)
+        assert y.shape == (4, 101, 1)
+
+    def test_combined_dropout_and_spectral_dropout(self):
+        model = FNO1d(modes=2, width=8, in_channels=2, n_layers=2, cond_dim=4, dropout=0.2, spectral_dropout=0.2)
+        x = torch.randn(4, 101, 2)
+        cond = torch.rand(4, 4)
+        with torch.no_grad():
+            y = model(x, cond)
+        assert y.shape == (4, 101, 1)
+        assert torch.all(torch.isfinite(y))
+
+    def test_zero_dropout_matches_default(self):
+        """dropout=0.0 should behave identically to no dropout."""
+        torch.manual_seed(42)
+        model_no_drop = FNO1d(modes=2, width=8, in_channels=2, n_layers=2, cond_dim=4)
+        torch.manual_seed(42)
+        model_zero_drop = FNO1d(modes=2, width=8, in_channels=2, n_layers=2, cond_dim=4, dropout=0.0)
+
+        model_no_drop.eval()
+        model_zero_drop.eval()
+        x = torch.randn(1, 101, 2)
+        cond = torch.rand(1, 4)
+        with torch.no_grad():
+            y1 = model_no_drop(x, cond)
+            y2 = model_zero_drop(x, cond)
+        assert torch.equal(y1, y2)

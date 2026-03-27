@@ -313,3 +313,32 @@ class TestCreateDataloaders:
         # Test dataset should use n_snapshots_test=10 -> C(10,2)=45 pairs per sim
         n_test_sims = len(test_ids)
         assert len(test_loader.dataset) == n_test_sims * 45
+
+    def test_noise_std_only_on_train(self, synthetic_trajectories, synthetic_sim_params):
+        """noise_std should only be applied to training set, not val/test."""
+        trajectories, x_grid, t_grid = synthetic_trajectories
+        train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
+        train_loader, val_loader, test_loader = create_dataloaders(
+            trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
+            batch_size=4, sim_params=synthetic_sim_params,
+            n_snapshots=6, noise_std=0.1,
+        )
+        assert train_loader.dataset.noise_std == 0.1
+        assert val_loader.dataset.noise_std == 0.0
+        assert test_loader.dataset.noise_std == 0.0
+
+    def test_noise_augmentation_changes_source(self, synthetic_trajectories, synthetic_sim_params):
+        """With noise_std > 0, two reads of the same sample should differ."""
+        trajectories, x_grid, t_grid = synthetic_trajectories
+        sim_ids = np.arange(5)
+        ds = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            n_snapshots=6, noise_std=0.5,
+        )
+        x1, _, _, _ = ds[0]
+        x2, _, _, _ = ds[0]
+        # Source temperature channel should differ due to noise
+        assert not torch.equal(x1[:, 0], x2[:, 0])
+        # x_norm channel should be identical (no noise on spatial coords)
+        assert torch.equal(x1[:, 1], x2[:, 1])
