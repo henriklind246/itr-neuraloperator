@@ -1,0 +1,10 @@
+# @package search_space
+params:
+  # --- Model capacity ---
+  model.parameters.width: choice(32, 48, 64)
+
+  # --- Regularization ---
+  model.parameters.dropout: choice(0.0, 0.05, 0.1, 0.2, 0.3)
+  model.parameters.spectral_dropout: choice(0.0, 0.05, 0.1, 0.2)
+  training.weight_decay: choice(1e-5, 1e-4, 1e-3)
+  training.noise_std: choice(0.0, 0.02, 0.05, 0.1)
