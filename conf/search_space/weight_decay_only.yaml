@@ -1,0 +1,3 @@
+# @package search_space
+params:
+  training.weight_decay: choice(1e-5, 1e-4, 1e-3)
