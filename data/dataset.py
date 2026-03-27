@@ -209,6 +209,7 @@ def create_dataloaders(
     n_snapshots: int = 15,
     n_snapshots_test: int | None = None,
     noise_std: float = 0.0,
+    num_workers: int | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
 
     n_test = n_snapshots_test if n_snapshots_test is not None else n_snapshots
@@ -242,7 +243,7 @@ def create_dataloaders(
     )
 
     pin = torch.cuda.is_available()
-    workers = 2 if pin else 0
+    workers = num_workers if num_workers is not None else (4 if pin else 0)
 
     train_loader = DataLoader(train_dataset, batch_size, shuffle=True, pin_memory=pin, num_workers=workers)
     val_loader = DataLoader(val_dataset, batch_size, shuffle=False, pin_memory=pin, num_workers=workers)
