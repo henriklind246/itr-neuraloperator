@@ -25,8 +25,8 @@ model:
     cond_dim: 4
     cond_hidden: 256
     activation: "GELU"
-    dropout: 0.1
-    spectral_dropout: 0.1
+    dropout: 0.0
+    spectral_dropout: 0.0
 
 training:
   device: "auto"
@@ -36,8 +36,8 @@ training:
   curriculum_warmup: 35
   epochs: 1500
   learning_rate: 0.002
-  weight_decay: 1.0e-4
-  noise_std: 0.05
+  weight_decay: 1.0e-5
+  noise_std: 0.0
   grad_clip: 1.0
   scheduler:
     type: "RIGNOThreePhase"
@@ -58,7 +58,7 @@ training:
     interface_half_width: 0.05
     interface_weight: 10.0
   validate_every: 10
-  patience: 20
+  patience: 30
   checkpoint_metric: "val_rel_l2"
   seeds: [42]
   run:
