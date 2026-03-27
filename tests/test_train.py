@@ -88,7 +88,7 @@ class TestLoadConfig:
 def _make_4tuple_loader(Nx=11, n_samples=4, batch_size=2):
     """Create a DataLoader yielding (x_spatial, cond, Y, T_stats) 4-tuples."""
     x_spatial = torch.randn(n_samples, Nx, 2)
-    cond = torch.rand(n_samples, 5)
+    cond = torch.rand(n_samples, 7)
     Y = torch.randn(n_samples, Nx, 1)
     T_stats = torch.randn(n_samples, 2)
     return DataLoader(TensorDataset(x_spatial, cond, Y, T_stats), batch_size=batch_size)
@@ -98,7 +98,7 @@ def _make_4tuple_loader(Nx=11, n_samples=4, batch_size=2):
 def tiny_training_setup():
     """Tiny model + synthetic 4-tuple dataloader for fast training tests."""
     Nx = 11
-    model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=5)
+    model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=7)
     loader = _make_4tuple_loader(Nx=Nx)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -286,7 +286,7 @@ class TestRIGNOThreePhaseSchedule:
                 },
             }
         }
-        model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=5)
+        model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=7)
         optimizer = build_optimizer(config, model.parameters())
 
         scheduler = build_scheduler(config, optimizer)
@@ -313,7 +313,7 @@ class TestRIGNOThreePhaseSchedule:
                 },
             }
         }
-        model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=5)
+        model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=7)
         optimizer = build_optimizer(config, model.parameters())
 
         with pytest.raises(ValueError, match="scheduler.peak_lr must match training.learning_rate"):
@@ -395,7 +395,7 @@ class TestRunOneSeedResume:
                     "in_channels": 2,
                     "out_channels": 1,
                     "n_layers": 2,
-                    "cond_dim": 5,
+                    "cond_dim": 7,
                     "cond_hidden": 32,
                 }
             },
@@ -661,7 +661,7 @@ class TestRunConfigSeeds:
                     "in_channels": 2,
                     "out_channels": 1,
                     "n_layers": 2,
-                    "cond_dim": 5,
+                    "cond_dim": 7,
                     "cond_hidden": 32,
                 }
             },

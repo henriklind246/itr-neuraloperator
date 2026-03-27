@@ -146,7 +146,7 @@ class TestSnapshotPairDataset:
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx = 11
         assert x_spatial.shape == (Nx, 2)
-        assert cond.shape == (5,)
+        assert cond.shape == (7,)
         assert Y.shape == (Nx, 1)
         assert T_stats.shape == (2,)
 
@@ -171,11 +171,16 @@ class TestSnapshotPairDataset:
             assert t_bar_norm > 0
 
     def test_conditioning_in_unit_range(self, dataset_subsampled):
-        """All conditioning values should be in [0, 1]."""
+        """First 5 conditioning values (min-max normalized) should be in [0, 1].
+        μ_s_norm and σ_s_norm (indices 5-6) use linear scaling, not min-max."""
         for i in range(min(10, len(dataset_subsampled))):
             _, cond, _, _ = dataset_subsampled[i]
-            assert torch.all(cond >= -1e-6)
-            assert torch.all(cond <= 1.0 + 1e-6)
+            # First 5 elements are min-max normalized to [0, 1]
+            assert torch.all(cond[:5] >= -1e-6)
+            assert torch.all(cond[:5] <= 1.0 + 1e-6)
+            # μ_s_norm = μ_s / 400.0 — can be negative for synthetic data
+            # σ_s_norm = σ_s / 200.0 — always non-negative
+            assert cond[6].item() >= 0  # σ_s_norm is non-negative
 
     def test_temperature_normalization(self, dataset_subsampled):
         """Source temperature channel should have mean ~ 0, std ~ 1."""
@@ -282,7 +287,7 @@ class TestCreateDataloaders:
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 2    # T_source + x_norm
-        assert cond.shape[1] == 5         # t_bar, t_s, A, f, R_c
+        assert cond.shape[1] == 7         # t_bar, t_s, A, f, R_c, mu_s, sigma_s
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_s, sigma_s
 

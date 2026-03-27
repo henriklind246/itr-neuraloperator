@@ -135,7 +135,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO1d, dict]:
         in_channels=model_cfg.get("in_channels", 2),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", 5),
+        cond_dim=model_cfg.get("cond_dim", 7),
         cond_hidden=model_cfg.get("cond_hidden", 256),
     )
     model.load_state_dict(ckpt["model_state"])
@@ -223,12 +223,16 @@ def _prepare_prediction_case(
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
+    mu_s_norm = mu_s / 400.0
+    sigma_s_norm = sigma_s / 200.0
     cond_batch = np.column_stack([
         t_bars / t_grid[-1],
         np.full(len(target_indices), t_s_norm),
         np.full(len(target_indices), (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])),
         np.full(len(target_indices), (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])),
         np.full(len(target_indices), (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])),
+        np.full(len(target_indices), mu_s_norm),
+        np.full(len(target_indices), sigma_s_norm),
     ]).astype(np.float32)
 
     device = next(model.parameters()).device
