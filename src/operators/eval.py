@@ -106,7 +106,7 @@ def eval_all_seeds(run_root: str):
             in_channels=model_cfg.get("in_channels", 2),
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
-            cond_dim=model_cfg.get("cond_dim", 4),
+            cond_dim=model_cfg.get("cond_dim", 5),
             cond_hidden=model_cfg.get("cond_hidden", 256),
         )
         fno.load_state_dict(ckpt['model_state'])

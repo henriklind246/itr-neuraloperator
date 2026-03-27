@@ -418,7 +418,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         in_channels=model_cfg["in_channels"],
         out_channels=model_cfg["out_channels"],
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", 4),
+        cond_dim=model_cfg.get("cond_dim", 5),
         cond_hidden=model_cfg.get("cond_hidden", 256),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
