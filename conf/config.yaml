@@ -22,7 +22,7 @@ model:
     in_channels: 2
     out_channels: 1
     n_layers: 4
-    cond_dim: 4
+    cond_dim: 5
     cond_hidden: 256
     activation: "GELU"
     dropout: 0.0
@@ -74,7 +74,7 @@ data:
   test_split: 0.15
   x_shape: "B, Nx, 2"
   y_shape: "B, Nx, 1"
-  cond_shape: "B, 4"
+  cond_shape: "B, 5"
   t_stats_shape: "B, 2"
   num_sims: 4000
 

@@ -79,12 +79,12 @@ def tmp_npy_data(tmp_path, synthetic_trajectories):
 @pytest.fixture
 def small_fno():
     """Tiny FNO1d for fast tests."""
-    return FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=4)
+    return FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=5)
 
 
 # ---------- conditioning fixture ----------
 
 @pytest.fixture
 def synthetic_cond():
-    """Random conditioning vectors (4, 4) for testing."""
-    return torch.rand(4, 4)
+    """Random conditioning vectors (4, 5) for testing."""
+    return torch.rand(4, 5)

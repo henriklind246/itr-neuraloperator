@@ -146,7 +146,7 @@ class TestSnapshotPairDataset:
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx = 11
         assert x_spatial.shape == (Nx, 2)
-        assert cond.shape == (4,)
+        assert cond.shape == (5,)
         assert Y.shape == (Nx, 1)
         assert T_stats.shape == (2,)
 
@@ -282,7 +282,7 @@ class TestCreateDataloaders:
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 2    # T_source + x_norm
-        assert cond.shape[1] == 4         # t_bar, A, f, R_c
+        assert cond.shape[1] == 5         # t_bar, t_s, A, f, R_c
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_s, sigma_s
 
