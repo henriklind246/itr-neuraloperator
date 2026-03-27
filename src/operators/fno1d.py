@@ -15,13 +15,18 @@ import torch.nn.functional as F
 # --------- SpectralConv1d ---------
 
 class SpectralConv1d(nn.Module):
-    """1D Fourier convolution: FFT → mode-wise channel mixing → IFFT."""
+    """1D Fourier convolution: FFT → mode-wise channel mixing → IFFT.
 
-    def __init__(self, in_channels: int, out_channels: int, modes: int):
+    When ``spectral_dropout > 0``, random Fourier modes are zeroed during
+    training, preventing the model from relying on specific frequencies.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, modes: int, spectral_dropout: float = 0.0):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes = modes
+        self.spectral_dropout = spectral_dropout
 
         self.scale = 1.0 / (in_channels * out_channels)
         self.weights = nn.Parameter(
@@ -46,6 +51,11 @@ class SpectralConv1d(nn.Module):
             dtype=torch.cfloat, device=x.device,
         )
         out_ft[:, :, :m] = self.compl_mul1d(x_ft[:, :, :m], self.weights[:, :, :m])
+
+        # Spectral dropout: randomly zero modes during training
+        if self.training and self.spectral_dropout > 0:
+            mask = (torch.rand(m, device=x.device) >= self.spectral_dropout).to(out_ft.dtype)
+            out_ft[:, :, :m] = out_ft[:, :, :m] * mask
 
         # IFFT back to physical space
         return torch.fft.irfft(out_ft, n=Nx, dim=-1)
@@ -129,6 +139,8 @@ class FNO1d(nn.Module):
         n_layers: int = 4,
         cond_dim: int = 4,
         cond_hidden: int = 256,
+        dropout: float = 0.0,
+        spectral_dropout: float = 0.0,
     ):
         super().__init__()
         self.modes = modes
@@ -143,7 +155,8 @@ class FNO1d(nn.Module):
 
         # Fourier layers
         self.spectral_layers = nn.ModuleList([
-            SpectralConv1d(width, width, modes) for _ in range(n_layers)
+            SpectralConv1d(width, width, modes, spectral_dropout=spectral_dropout)
+            for _ in range(n_layers)
         ])
         self.conv_layers = nn.ModuleList([
             nn.Conv1d(width, width, 1) for _ in range(n_layers)
@@ -160,6 +173,7 @@ class FNO1d(nn.Module):
         self.output_layer = nn.Linear(128, out_channels)
 
         self.activation = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x_spatial, cond):
         """
@@ -186,11 +200,11 @@ class FNO1d(nn.Module):
             x2 = self.conv_layers[l](x)
             x = x1 + x2
             x = self.cin_layers[l](x, gamma, beta)
-            x = self.activation(x)
+            x = self.drop(self.activation(x))
 
         # Unpad + Project
         x = x[:, :, :Nx0]                 # (B, width, Nx)
         x = x.permute(0, 2, 1)            # (B, Nx, width)
-        x = self.activation(self.linear_q(x))  # (B, Nx, 128)
+        x = self.drop(self.activation(self.linear_q(x)))  # (B, Nx, 128)
         x = self.output_layer(x)           # (B, Nx, out_channels)
         return x
