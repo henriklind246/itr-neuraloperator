@@ -2,9 +2,9 @@
 #SBATCH --job-name=fno_train_fixed
 #SBATCH --partition=msigpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=10:00:00
 #SBATCH --tmp=50G
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
