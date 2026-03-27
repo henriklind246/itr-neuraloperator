@@ -26,7 +26,7 @@ class SnapshotPairDataset(Dataset):
 
     Returns 4-tuple: (x_spatial, cond, Y, T_stats)
         x_spatial : (Nx, 2)  — [T̃_source, x_norm]
-        cond      : (4,)     — [t̄_norm, A_norm, f_norm, R_c_norm]
+        cond      : (5,)     — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
         Y         : (Nx, 1)  — T̃_target (normalized)
         T_stats   : (2,)     — [μ_s, σ_s] for denormalization
     """
@@ -119,13 +119,14 @@ class SnapshotPairDataset(Dataset):
         # Spatial input: (Nx, 2) — [T̃_source, x_norm]
         x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
 
-        # Conditioning vector: (4,) — [t̄_norm, A_norm, f_norm, R_c_norm]
+        # Conditioning vector: (5,) — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
         t_bar = self.t_grid[j] - self.t_grid[s]
         t_bar_norm = t_bar / self.t_grid[-1]
+        t_s_norm = self.t_grid[s] / self.t_grid[-1]
         A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
         f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
         R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-        cond = np.array([t_bar_norm, A_norm, f_norm, R_c_norm], dtype=np.float32)
+        cond = np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm], dtype=np.float32)
 
         # Target: (Nx, 1)
         Y = T_target_norm[:, None].astype(np.float32)
@@ -274,6 +275,6 @@ if __name__ == '__main__':
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
     print(f"x_spatial: {x_spatial.shape}")  # (B, Nx, 2)
-    print(f"cond: {cond.shape}")            # (B, 4)
+    print(f"cond: {cond.shape}")            # (B, 5)
     print(f"Y: {yb.shape}")                 # (B, Nx, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
