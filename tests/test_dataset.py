@@ -3,11 +3,16 @@ import pytest
 import torch
 
 from data.dataset import (
+    compute_global_stats,
     load_sim_data,
     split_sim_ids,
     SnapshotPairDataset,
     create_dataloaders,
 )
+
+# Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
+_SYNTH_MU = 0.0
+_SYNTH_SIGMA = 1.0
 
 
 # ===================== load_sim_data =====================
@@ -116,6 +121,7 @@ class TestSnapshotPairDataset:
         return SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
 
@@ -127,6 +133,7 @@ class TestSnapshotPairDataset:
         return SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=None,
         )
 
@@ -146,7 +153,7 @@ class TestSnapshotPairDataset:
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx = 11
         assert x_spatial.shape == (Nx, 2)
-        assert cond.shape == (7,)
+        assert cond.shape == (5,)
         assert Y.shape == (Nx, 1)
         assert T_stats.shape == (2,)
 
@@ -171,38 +178,34 @@ class TestSnapshotPairDataset:
             assert t_bar_norm > 0
 
     def test_conditioning_in_unit_range(self, dataset_subsampled):
-        """First 5 conditioning values (min-max normalized) should be in [0, 1].
-        μ_s_norm and σ_s_norm (indices 5-6) use linear scaling, not min-max."""
+        """All 5 conditioning values (min-max normalized) should be in [0, 1]."""
         for i in range(min(10, len(dataset_subsampled))):
             _, cond, _, _ = dataset_subsampled[i]
-            # First 5 elements are min-max normalized to [0, 1]
-            assert torch.all(cond[:5] >= -1e-6)
-            assert torch.all(cond[:5] <= 1.0 + 1e-6)
-            # μ_s_norm = μ_s / 400.0 — can be negative for synthetic data
-            # σ_s_norm = σ_s / 200.0 — always non-negative
-            assert cond[6].item() >= 0  # σ_s_norm is non-negative
+            assert torch.all(cond >= -1e-6)
+            assert torch.all(cond <= 1.0 + 1e-6)
 
     def test_temperature_normalization(self, dataset_subsampled):
-        """Source temperature channel should have mean ~ 0, std ~ 1."""
+        """Source temperature should be globally normalized (finite values)."""
         x_spatial, _, _, _ = dataset_subsampled[0]
         T_norm = x_spatial[:, 0]  # first channel is T_source_norm
-        assert abs(T_norm.mean().item()) < 0.5  # roughly centered
-        assert abs(T_norm.std().item() - 1.0) < 0.5  # roughly unit std
+        assert torch.all(torch.isfinite(T_norm))
 
-    def test_T_stats_matches_source(self, synthetic_trajectories, synthetic_sim_params):
-        """T_stats (mu_s, sigma_s) should match the source snapshot statistics."""
+    def test_T_stats_returns_global_stats(self, synthetic_trajectories, synthetic_sim_params):
+        """T_stats should return (mu_global, sigma_global), constant across samples."""
         trajectories, x_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(1)  # single sim for easier verification
         ds = SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
-        x_spatial, _, _, T_stats = ds[0]
-        mu_s = T_stats[0].item()
-        sigma_s = T_stats[1].item()
-        assert np.isfinite(mu_s)
-        assert sigma_s >= 0
+        _, _, _, T_stats_0 = ds[0]
+        _, _, _, T_stats_1 = ds[1]
+        # T_stats should be constant (global stats, not per-sample)
+        assert torch.equal(T_stats_0, T_stats_1)
+        assert T_stats_0[0].item() == pytest.approx(_SYNTH_MU)
+        assert T_stats_0[1].item() == pytest.approx(_SYNTH_SIGMA)
 
     def test_n_snapshots_uniform_spacing(self, dataset_subsampled):
         """Subsampled t_indices should be uniformly spaced."""
@@ -250,11 +253,13 @@ class TestSnapshotPairDataset:
         ds_train = SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
         ds_test = SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=10,
         )
         assert len(ds_test) > len(ds_train)
@@ -270,6 +275,7 @@ class TestCreateDataloaders:
             trajectories, x_grid, t_grid,
             train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
         assert len(loaders) == 3
@@ -281,15 +287,16 @@ class TestCreateDataloaders:
             trajectories, x_grid, t_grid,
             train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
         x_spatial, cond, Y, T_stats = next(iter(train_loader))
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 2    # T_source + x_norm
-        assert cond.shape[1] == 7         # t_bar, t_s, A, f, R_c, mu_s, sigma_s
+        assert cond.shape[1] == 5         # t_bar, t_s, A, f, R_c
         assert Y.shape[-1] == 1
-        assert T_stats.shape[-1] == 2     # mu_s, sigma_s
+        assert T_stats.shape[-1] == 2     # mu_global, sigma_global
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, t_grid = synthetic_trajectories
@@ -297,6 +304,7 @@ class TestCreateDataloaders:
         train_loader, val_loader, test_loader = create_dataloaders(
             trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
         train_sims = set(train_loader.dataset.sim_ids.tolist())
@@ -313,6 +321,7 @@ class TestCreateDataloaders:
         _, _, test_loader = create_dataloaders(
             trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, n_snapshots_test=10,
         )
         # Test dataset should use n_snapshots_test=10 -> C(10,2)=45 pairs per sim
@@ -326,6 +335,7 @@ class TestCreateDataloaders:
         train_loader, val_loader, test_loader = create_dataloaders(
             trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, noise_std=0.1,
         )
         assert train_loader.dataset.noise_std == 0.1
@@ -339,6 +349,7 @@ class TestCreateDataloaders:
         ds = SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, noise_std=0.5,
         )
         x1, _, _, _ = ds[0]
