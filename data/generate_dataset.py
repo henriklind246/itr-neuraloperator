@@ -1,5 +1,5 @@
 import numpy as np
-from src.physics.fd_solver_1d import FDSolver1D, Layer1D
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 from scipy.stats import qmc
 
 
@@ -106,7 +106,7 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     trajectories = np.zeros((num_sims, Nt, Nx), dtype=np.float32)
 
     for i, (amp, freq, T0, R_c) in enumerate(sim_params):
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             a=a, b=b, N=N, lam_target=0.8, layers=layers,
             t_final=t_final, flux_f=float(freq), flux_A=float(amp),
             t_on=t_on, t_off=t_off, phase=phase, dt=dt, tukey_alpha=tukey_alpha,

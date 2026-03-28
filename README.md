@@ -148,7 +148,7 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 
 - [data/generate_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/generate_dataset.py): synthetic trajectory generation
 - [data/dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/dataset.py): all-to-all snapshot-pair dataset construction and dataloaders
-- [src/physics/fd_solver_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/fd_solver_1d.py): multilayer finite-difference solver
+- [src/physics/fv_solver_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/fv_solver_1d.py): multilayer finite-volume solver
 - [src/physics/mms_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/mms_1d.py): manufactured-solution verification
 - [src/operators/fno1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/fno1d.py): Fourier Neural Operator model
 - [src/operators/train.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/train.py): direct training module

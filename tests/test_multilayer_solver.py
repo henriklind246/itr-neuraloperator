@@ -1,5 +1,5 @@
 """
-Multilayer FD Solver Validation Tests
+Multilayer FV Solver Validation Tests
 =====================================
 
 eEight test groups validating the conservative multilayer Crank-Nicolson solver:
@@ -17,7 +17,7 @@ eEight test groups validating the conservative multilayer Crank-Nicolson solver:
 import numpy as np
 import pytest
 
-from src.physics.fd_solver_1d import FDSolver1D, Layer1D
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 
 
 # ==================== SHARED METRICS ====================
@@ -54,7 +54,7 @@ class TestConstantSolution:
     @staticmethod
     def _make_const_solver(layers, N, t_final=0.1):
         """Build a solver with zero flux, constant right BC, no source."""
-        return FDSolver1D(
+        return FVSolver1D(
             a=0.0, b=1.0, N=N, lam_target=0.5,
             layers=layers, t_final=t_final,
             flux_f=0.0, flux_A=0.0,
@@ -105,7 +105,7 @@ class TestGeometryValidation:
             Layer1D(0.0, 0.5, 1.0, 1.0, 1.0),
             Layer1D(0.5, 1.0, 1.0, 1.0, 1.0),
         ]
-        sim = FDSolver1D(N=100, layers=layers, **self.COMMON)
+        sim = FVSolver1D(N=100, layers=layers, **self.COMMON)
         assert 49 in sim.interface_face_map
         assert sim.interface_face_map[49] == (0, 1)
         assert len(sim.interface_positions) == 1
@@ -118,7 +118,7 @@ class TestGeometryValidation:
             Layer1D(0.5, 1.0, 1.0, 1.0, 1.0),
         ]
         with pytest.raises(ValueError, match="lies on a grid node"):
-            FDSolver1D(N=101, layers=layers, **self.COMMON)
+            FVSolver1D(N=101, layers=layers, **self.COMMON)
 
     def test_2c_off_face_interface_raises(self):
         """N=100, interface at 0.37 -> not face-aligned. Should fail."""
@@ -127,7 +127,7 @@ class TestGeometryValidation:
             Layer1D(0.37, 1.0, 1.0, 1.0, 1.0),
         ]
         with pytest.raises(ValueError, match="not face-aligned"):
-            FDSolver1D(N=100, layers=layers, **self.COMMON)
+            FVSolver1D(N=100, layers=layers, **self.COMMON)
 
     def test_2d_gap_between_layers_raises(self):
         """Layer1 ends at 0.49, layer2 starts at 0.50 -> gap. Should fail."""
@@ -136,7 +136,7 @@ class TestGeometryValidation:
             Layer1D(0.50, 1.0, 1.0, 1.0, 1.0),
         ]
         with pytest.raises(ValueError, match="not contiguous"):
-            FDSolver1D(N=100, layers=layers, **self.COMMON)
+            FVSolver1D(N=100, layers=layers, **self.COMMON)
 
     def test_2e_overlap_between_layers_raises(self):
         """Layer1 ends at 0.55, layer2 starts at 0.50 -> overlap. Should fail."""
@@ -145,17 +145,17 @@ class TestGeometryValidation:
             Layer1D(0.50, 1.0, 1.0, 1.0, 1.0),
         ]
         with pytest.raises(ValueError, match="not contiguous"):
-            FDSolver1D(N=100, layers=layers, **self.COMMON)
+            FVSolver1D(N=100, layers=layers, **self.COMMON)
 
     def test_2f_domain_not_covered_raises(self):
         """First layer starts at 0.1 or last layer ends at 0.9. Should fail."""
         layers_bad_left = [Layer1D(0.1, 1.0, 1.0, 1.0, 1.0)]
         with pytest.raises(ValueError, match="First layer must start"):
-            FDSolver1D(N=100, layers=layers_bad_left, **self.COMMON)
+            FVSolver1D(N=100, layers=layers_bad_left, **self.COMMON)
 
         layers_bad_right = [Layer1D(0.0, 0.9, 1.0, 1.0, 1.0)]
         with pytest.raises(ValueError, match="Last layer must end"):
-            FDSolver1D(N=100, layers=layers_bad_right, **self.COMMON)
+            FVSolver1D(N=100, layers=layers_bad_right, **self.COMMON)
 
 
 # ==================== TEST 3: MMS REGRESSION ====================
@@ -183,7 +183,7 @@ class TestMMSRegression:
         from src.physics.mms_1d import run_mms_once
 
         hs, errs = [], []
-        for N in [21, 41, 81]:
+        for N in [21, 41, 81, 161]:
             h, _, _, l2 = run_mms_once(N, dt=0.0005)
             hs.append(h)
             errs.append(l2)
@@ -194,12 +194,12 @@ class TestMMSRegression:
             orders.append(p)
 
         mean_order = np.mean(orders)
-        assert 1.5 < mean_order < 2.5, f"Expected order ~2, got {mean_order:.2f}"
+        assert 1.9 < mean_order < 2.1, f"Expected order ~2, got {mean_order:.3f}"
 
     def test_solve_properties_new_api(self):
         """Basic solve output properties with the new Layer1D API."""
         layer = Layer1D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             a=0.0, b=1.0, N=51, lam_target=0.5,
             layers=[layer], t_final=0.5,
             flux_f=2.0, flux_A=50.0,
@@ -231,7 +231,7 @@ class TestIdenticalLayerEquivalence:
     @pytest.fixture
     def one_layer_solver(self):
         layers = [Layer1D(0.0, 1.0, 1.0, 1.0, 1.0)]
-        return FDSolver1D(
+        return FVSolver1D(
             N=100, layers=layers, t_final=0.2, **COMMON_PARAMS,
         )
 
@@ -241,7 +241,7 @@ class TestIdenticalLayerEquivalence:
             Layer1D(0.0, 0.5, 1.0, 1.0, 1.0),
             Layer1D(0.5, 1.0, 1.0, 1.0, 1.0),
         ]
-        return FDSolver1D(
+        return FVSolver1D(
             N=100, layers=layers, t_final=0.2, **COMMON_PARAMS,
         )
 
@@ -283,7 +283,7 @@ class TestCoefficientIndexing:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
             Layer1D(0.5, 1.0, rho=2.0, cp=1.5, k=0.2),
         ]
-        return FDSolver1D(
+        return FVSolver1D(
             N=100, layers=layers, t_final=0.1, **COMMON_PARAMS,
         )
 
@@ -357,7 +357,7 @@ class TestMaterialJumpSanity:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
             Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=0.05),
         ]
-        return FDSolver1D(
+        return FVSolver1D(
             N=100, layers=layers, t_final=0.5,
             a=0.0, b=1.0, lam_target=0.5,
             flux_f=2.0, flux_A=50.0,
@@ -421,7 +421,7 @@ class TestGridRefinementConvergence:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
             Layer1D(0.5, 1.0, rho=2.0, cp=1.5, k=0.5),
         ]
-        return FDSolver1D(
+        return FVSolver1D(
             a=0.0, b=1.0, N=N, lam_target=0.5,
             layers=layers, t_final=0.2,
             flux_f=2.0, flux_A=50.0,
@@ -486,10 +486,10 @@ class TestInterfaceResistance:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
             Layer1D(0.5, 1.0, rho=2.0, cp=1.5, k=0.5),
         ]
-        sim_default = FDSolver1D(
+        sim_default = FVSolver1D(
             N=100, layers=layers, t_final=0.2, **COMMON_PARAMS,
         )
-        sim_zero = FDSolver1D(
+        sim_zero = FVSolver1D(
             N=100, layers=layers, t_final=0.2, interface_R=[0.0], **COMMON_PARAMS,
         )
         T0 = np.full(100, 300.0)
@@ -506,7 +506,7 @@ class TestInterfaceResistance:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
             Layer1D(0.5, 1.0, rho=2.0, cp=1.5, k=0.5),
         ]
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             a=0.0, b=1.0, N=100, lam_target=0.5,
             layers=layers, t_final=0.1,
             flux_f=0.0, flux_A=0.0,
@@ -530,7 +530,7 @@ class TestInterfaceResistance:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=k1),
             Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=k2),
         ]
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             N=100, layers=layers, t_final=0.1, interface_R=[Rc], **COMMON_PARAMS,
         )
         h = sim.h
@@ -562,7 +562,7 @@ class TestInterfaceResistance:
             Layer1D(L1, 1.0, rho=1.0, cp=1.0, k=k2),
         ]
 
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             a=0.0, b=1.0, N=N, lam_target=0.5,
             layers=layers, t_final=0.5,
             flux_f=0.0, flux_A=0.0,
@@ -606,7 +606,7 @@ class TestInterfaceResistance:
         ]
         # Two-layer has 1 interface, but we pass 2 resistances
         with pytest.raises(ValueError, match="interface_R has length 2"):
-            FDSolver1D(
+            FVSolver1D(
                 N=100, layers=layers, t_final=0.1, interface_R=[0.0, 0.0],
                 **COMMON_PARAMS,
             )
@@ -618,7 +618,7 @@ class TestInterfaceResistance:
             Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
         ]
         with pytest.raises(ValueError, match="negative"):
-            FDSolver1D(
+            FVSolver1D(
                 N=100, layers=layers, t_final=0.1, interface_R=[-0.01],
                 **COMMON_PARAMS,
             )
@@ -626,7 +626,7 @@ class TestInterfaceResistance:
     def test_8e_single_layer_defaults_to_empty(self):
         """Single layer has no interfaces, so interface_R defaults to []."""
         layers = [Layer1D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)]
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             N=100, layers=layers, t_final=0.1, **COMMON_PARAMS,
         )
         assert sim.interface_R == []
@@ -639,7 +639,7 @@ class TestInterfaceResistance:
             Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=1.0),
             Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
         ]
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             N=100, layers=layers, t_final=0.2, interface_R=[10.0], **COMMON_PARAMS,
         )
         T0 = np.full(100, 300.0)
@@ -663,7 +663,7 @@ class TestInterfaceResistance:
             Layer1D(0.25, 0.75, rho=1.5, cp=1.0, k=0.5),
             Layer1D(0.75, 1.0, rho=1.0, cp=1.0, k=1.0),
         ]
-        sim = FDSolver1D(
+        sim = FVSolver1D(
             a=0.0, b=1.0, N=99, lam_target=0.5,
             layers=layers_3, t_final=0.1,
             flux_f=2.0, flux_A=50.0,
@@ -714,10 +714,55 @@ class TestMmsInterfaceResistance:
 
     def test_9c_spatial_order_two(self):
         """Spatial convergence order ≈ 2 (dt fixed small, vary N)."""
-        p = space_order_test_interface(N_list=[50, 100])
-        assert 1.8 < p < 2.2, f"Spatial order {p:.3f} outside [1.8, 2.2]"
+        p = space_order_test_interface(N_list=[50, 100, 200])
+        assert 1.9 < p < 2.1, f"Spatial order {p:.3f} outside [1.9, 2.1]"
 
     def test_9d_temporal_order_two(self):
         """Temporal convergence order ≈ 2 (N fixed large, vary dt)."""
-        p = time_order_test_interface(dt_list=[0.02, 0.01])
-        assert 1.8 < p < 2.2, f"Temporal order {p:.3f} outside [1.8, 2.2]"
+        p = time_order_test_interface(dt_list=[0.02, 0.01, 0.005])
+        assert 1.9 < p < 2.1, f"Temporal order {p:.3f} outside [1.9, 2.1]"
+
+
+@pytest.mark.slow
+class TestMmsInterfaceConvergenceTable:
+    """Print interface MMS convergence tables for audit / CI logs.
+
+    These tests always pass; their purpose is to capture the raw
+    convergence data in the test output so it can be inspected.
+    Run with ``pytest -s`` to see the tables.
+    """
+
+    def test_print_interface_spatial_table(self):
+        """Spatial convergence table for interface-resistance MMS."""
+        N_list = [50, 100, 200]
+        fixed_dt = 0.0005
+        hs, errs = [], []
+        for N in N_list:
+            h, _, _, l2 = run_mms_interface(N, dt=fixed_dt)
+            hs.append(h)
+            errs.append(l2)
+
+        print("\n--- Interface spatial convergence (dt=0.0005) ---")
+        print(f"{'N':>6}  {'h':>12}  {'L2 error':>12}  {'order':>8}")
+        print("-" * 46)
+        print(f"{N_list[0]:>6}  {hs[0]:>12.6f}  {errs[0]:>12.4e}  {'--':>8}")
+        for i in range(1, len(N_list)):
+            p = np.log(errs[i - 1] / errs[i]) / np.log(hs[i - 1] / hs[i])
+            print(f"{N_list[i]:>6}  {hs[i]:>12.6f}  {errs[i]:>12.4e}  {p:>8.3f}")
+
+    def test_print_interface_temporal_table(self):
+        """Temporal convergence table for interface-resistance MMS."""
+        dt_list = [0.02, 0.01, 0.005]
+        N_fixed = 800
+        errs = []
+        for dt in dt_list:
+            _, _, _, l2 = run_mms_interface(N_fixed, dt=dt)
+            errs.append(l2)
+
+        print("\n--- Interface temporal convergence (N=800) ---")
+        print(f"{'dt':>10}  {'L2 error':>12}  {'order':>8}")
+        print("-" * 34)
+        print(f"{dt_list[0]:>10.4f}  {errs[0]:>12.4e}  {'--':>8}")
+        for i in range(1, len(dt_list)):
+            p = np.log(errs[i - 1] / errs[i]) / np.log(dt_list[i - 1] / dt_list[i])
+            print(f"{dt_list[i]:>10.4f}  {errs[i]:>12.4e}  {p:>8.3f}")

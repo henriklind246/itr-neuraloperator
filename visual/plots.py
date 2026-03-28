@@ -15,7 +15,7 @@ from data.dataset import (
     split_sim_ids,
 )
 from src.operators.train import load_config
-from src.physics.fd_solver_1d import FDSolver1D, Layer1D
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 from src.operators.fno1d import FNO1d
 
 
@@ -76,7 +76,7 @@ def _should_run(name: str, groups: list[str], individual: list[str] | None) -> b
 # HELPERS — Demo solver + interface utilities
 # ============================================================
 
-def create_demo_multilayer_solver() -> FDSolver1D:
+def create_demo_multilayer_solver() -> FVSolver1D:
     """Create a 2-layer demo solver for physics visualisation plots.
 
     Matches the layer configuration in generate_dataset.py:
@@ -88,7 +88,7 @@ def create_demo_multilayer_solver() -> FDSolver1D:
         Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
         Layer1D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
-    return FDSolver1D(
+    return FVSolver1D(
         a=0.0, b=1.0, N=100, layers=layers, lam_target=0.8,
         interface_R=[0.5],
         t_final=1.0, flux_f=2.0, flux_A=50.0,
@@ -96,7 +96,7 @@ def create_demo_multilayer_solver() -> FDSolver1D:
     )
 
 
-def _interface_flanking_nodes(solver: FDSolver1D) -> list[tuple[int, int, float]]:
+def _interface_flanking_nodes(solver: FVSolver1D) -> list[tuple[int, int, float]]:
     """Return (left_node, right_node, interface_x) for each internal interface."""
     return [
         (f, f + 1, solver.face_positions[f])
@@ -402,11 +402,11 @@ def _lead_time_coverage_counts(
 
 
 # ============================================================
-# SECTION: PHYSICS — Multilayer FD Solver Diagnostics
+# SECTION: PHYSICS — Multilayer FV Solver Diagnostics
 # ============================================================
 
 def plot_final_temperature(
-    solver: FDSolver1D,
+    solver: FVSolver1D,
     save_path: Optional[Path] = None,
     title: str = "Final temperature vs spatial nodes",
 ):
@@ -435,7 +435,7 @@ def plot_final_temperature(
 
 
 def plot_layer_geometry(
-    solver: FDSolver1D,
+    solver: FVSolver1D,
     save_path: str | Path | None = None,
 ):
     """Layer geometry and material properties for a multilayer domain.
@@ -495,7 +495,7 @@ def plot_layer_geometry(
 
 
 def plot_face_conductance(
-    solver: FDSolver1D,
+    solver: FVSolver1D,
     save_path: str | Path | None = None,
 ):
     """Face conductance and Crank-Nicolson coupling coefficients.
@@ -561,7 +561,7 @@ def plot_face_conductance(
 
 
 def plot_multilayer_evolution(
-    solver: FDSolver1D,
+    solver: FVSolver1D,
     T_hist: np.ndarray,
     save_path: str | Path | None = None,
 ):
@@ -624,7 +624,7 @@ def plot_multilayer_evolution(
 
 
 def plot_heat_flux_profile(
-    solver: FDSolver1D,
+    solver: FVSolver1D,
     T_hist: np.ndarray,
     save_path: str | Path | None = None,
 ):
@@ -743,7 +743,7 @@ def plot_mms_convergence(save_path: str | Path | None = None):
     _plot_convergence(ax_x, h_vals, h_l2_errors, r"$\Delta x$", f"Spatial Convergence (dt={fixed_dt})")
     _plot_convergence(ax_t, dt_vals, dt_l2_errors, r"$\Delta t$", f"Temporal Convergence (N={fixed_N})")
 
-    fig.suptitle("MMS Convergence — Crank-Nicolson FD Solver", fontsize=13)
+    fig.suptitle("MMS Convergence — Crank-Nicolson FV Solver", fontsize=13)
     fig.tight_layout()
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "mms" / "mms_convergence.png"
@@ -1194,7 +1194,7 @@ def plot_flux_profiles(
     save_path: str | Path | None = None,
 ):
     """Plot q(t) for representative (A, f) combos at corners and center of the parameter space."""
-    from src.physics.fd_solver_1d import windowed_sin_flux
+    from src.physics.fv_solver_1d import windowed_sin_flux
 
     combos = [
         (50.0, 1.0, "A=50, f=1 (low-low)"),

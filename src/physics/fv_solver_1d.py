@@ -48,10 +48,10 @@ class Layer1D:
     cp: float
     k: float
 
-# create class FDSolver1D so it contains all functions above and implementation is straight forward
-class FDSolver1D:
+# create class FVSolver1D so it contains all functions above and implementation is straight forward
+class FVSolver1D:
     """
-    1D Conservative Multilayer FD Solver
+    1D Conservative Multilayer FV Solver
 
     Baseline Qualities:
     (1) Uniform grid
@@ -436,7 +436,7 @@ if __name__ == '__main__':
     contact_resistance = [0.5]
 
     # init simulation
-    sim = FDSolver1D(
+    sim = FVSolver1D(
         a=0.0,
         b=1.0,
         N=100,

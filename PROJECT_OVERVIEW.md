@@ -24,13 +24,13 @@ where T(x,t) is temperature, k(x) is thermal conductivity, rho(x) is density, cp
 
 ## 3. Finite-Difference Solver
 
-**File**: `src/physics/fd_solver_1d.py`
+**File**: `src/physics/fv_solver_1d.py`
 
 The solver uses the Crank-Nicolson (CN) method, which is implicit, unconditionally stable, and second-order accurate in both space and time. This was verified via the Method of Manufactured Solutions (MMS) in `src/physics/mms_1d.py`.
 
 **Key components**:
 - `Layer1D` dataclass: defines one material layer with (x_left, x_right, rho, cp, k)
-- `FDSolver1D` class: takes a list of layers, validates geometry, builds per-node material arrays and face conductances, assembles the banded CN system, and time-steps via LAPACK's banded solver
+- `FVSolver1D` class: takes a list of layers, validates geometry, builds per-node material arrays and face conductances, assembles the banded CN system, and time-steps via LAPACK's banded solver
 - Interface handling: at a face between two materials, the face conductance uses the harmonic mean of the two conductivities rather than a simple average, which preserves conservation
 
 **Discretization parameters for the training dataset**:
@@ -59,7 +59,7 @@ The volumetric heat capacity rho*cp is sampled as a single product. In the solve
 
 Initial conditions are random superpositions of cosine and sine modes, different per simulation.
 
-For each of the 2500 simulations, a fresh two-layer `FDSolver1D` is constructed with the sampled material properties, and the full trajectory is solved and stored.
+For each of the 2500 simulations, a fresh two-layer `FVSolver1D` is constructed with the sampled material properties, and the full trajectory is solved and stored.
 
 **Output files** (saved to `data/`):
 - `trajectories.npy`: shape (2500, 201, 100) — all simulation trajectories
@@ -168,7 +168,7 @@ Each trial trains all seeds, and the sweep output includes resolved configs for 
 
 | File | Role |
 |------|------|
-| `src/physics/fd_solver_1d.py` | Conservative multilayer Crank-Nicolson FD solver (Layer1D, FDSolver1D) |
+| `src/physics/fv_solver_1d.py` | Conservative multilayer Crank-Nicolson FV solver (Layer1D, FVSolver1D) |
 | `src/physics/mms_1d.py` | Method of Manufactured Solutions verification (spatial + temporal order tests) |
 | `src/physics/dt_convergence_study.py` | Temporal resolution analysis script |
 | `data/generate_dataset.py` | 6D LHS sampling, per-sim solver construction, trajectory generation |

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.physics.fd_solver_1d import FDSolver1D, Layer1D
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 from src.operators.fno1d import FNO1d
 
 
@@ -22,13 +22,13 @@ SOLVER_DEFAULTS = dict(
 @pytest.fixture
 def small_solver():
     """N=11 solver for fast tests."""
-    return FDSolver1D(N=11, **SOLVER_DEFAULTS)
+    return FVSolver1D(N=11, **SOLVER_DEFAULTS)
 
 
 @pytest.fixture
 def default_solver():
     """N=101 solver for accuracy tests."""
-    return FDSolver1D(N=101, **SOLVER_DEFAULTS)
+    return FVSolver1D(N=101, **SOLVER_DEFAULTS)
 
 
 # ---------- synthetic data fixtures ----------

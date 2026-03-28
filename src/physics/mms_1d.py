@@ -1,4 +1,4 @@
-from src.physics.fd_solver_1d import FDSolver1D, Layer1D
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 import numpy as np
 
 def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
@@ -28,9 +28,9 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
         return (rho * cp * A * omega * np.cos(omega * t + phase) * (b - x)**4
                 - k * 12.0 * A * np.sin(omega * t + phase) * (b - x)**2)
 
-    # create instance of fd solver class to solve forcing equation
+    # create instance of fv solver class to solve forcing equation
     layer = Layer1D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
-    sim = FDSolver1D(
+    sim = FVSolver1D(
         a=a,
         b=b,
         N=N,
@@ -68,9 +68,12 @@ def space_order_test(N_list: list) -> float:
         results.append(l2_error)
         hs.append(h)
 
-    # use generic formula for estimating the order
-    p_x = np.log(results[0]/results[1])/np.log(hs[0]/hs[1])
-    return p_x
+    # compute pairwise orders across all adjacent levels and return the mean
+    orders = []
+    for i in range(len(results) - 1):
+        p = np.log(results[i] / results[i + 1]) / np.log(hs[i] / hs[i + 1])
+        orders.append(p)
+    return float(np.mean(orders))
 
 # fix dx — must be fine enough that spatial error << temporal error at all dt levels
 def time_order_test(dt_list: list) -> float:
@@ -81,9 +84,12 @@ def time_order_test(dt_list: list) -> float:
 
         t_results.append(l2_error)
 
-    # use generic formula for estimating the order
-    p_t = np.log(t_results[0]/t_results[1])/np.log(dt_list[0]/dt_list[1])
-    return p_t
+    # compute pairwise orders across all adjacent levels and return the mean
+    orders = []
+    for i in range(len(t_results) - 1):
+        p = np.log(t_results[i] / t_results[i + 1]) / np.log(dt_list[i] / dt_list[i + 1])
+        orders.append(p)
+    return float(np.mean(orders))
 
 
 # ============================================================
@@ -156,7 +162,7 @@ def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
         Layer1D(x_left=a, x_right=x_I, rho=rho1, cp=cp1, k=k1),
         Layer1D(x_left=x_I, x_right=b, rho=rho2, cp=cp2, k=k2),
     ]
-    sim = FDSolver1D(
+    sim = FVSolver1D(
         a=a, b=b, N=N,
         lam_target=0.5,
         layers=layers,
@@ -190,7 +196,11 @@ def space_order_test_interface(N_list: list) -> float:
         h, _, _, l2 = run_mms_interface(N, dt=0.0005)
         results.append(l2)
         hs.append(h)
-    return float(np.log(results[0] / results[1]) / np.log(hs[0] / hs[1]))
+    orders = []
+    for i in range(len(results) - 1):
+        p = np.log(results[i] / results[i + 1]) / np.log(hs[i] / hs[i + 1])
+        orders.append(p)
+    return float(np.mean(orders))
 
 
 def time_order_test_interface(dt_list: list) -> float:
@@ -202,7 +212,11 @@ def time_order_test_interface(dt_list: list) -> float:
     for dt_val in dt_list:
         _, _, _, l2 = run_mms_interface(N=800, dt=dt_val)
         results.append(l2)
-    return float(np.log(results[0] / results[1]) / np.log(dt_list[0] / dt_list[1]))
+    orders = []
+    for i in range(len(results) - 1):
+        p = np.log(results[i] / results[i + 1]) / np.log(dt_list[i] / dt_list[i + 1])
+        orders.append(p)
+    return float(np.mean(orders))
 
 
 if __name__ == '__main__':
@@ -210,22 +224,22 @@ if __name__ == '__main__':
     print("=== Single-Layer MMS ===")
     h, dt, max_error, l2_error = run_mms_once(N=101)
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={max_error:.6e}, l2_err={l2_error:.6e}")
-    N_list = [51, 101]
+    N_list = [21, 41, 81, 161]
     order_x = space_order_test(N_list=N_list)
-    print(f"Spatial order: {order_x:.3f}")
+    print(f"Spatial order (mean): {order_x:.3f}")
 
-    dt_list = [0.02, 0.01]
+    dt_list = [0.02, 0.01, 0.005]
     order_t = time_order_test(dt_list=dt_list)
-    print(f"Temporal order: {order_t:.3f}")
+    print(f"Temporal order (mean): {order_t:.3f}")
 
     # --- Interface resistance MMS ---
     print("\n=== Interface Resistance MMS ===")
     h, dt, max_error, l2_error = run_mms_interface(N=100)
     print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={max_error:.6e}, l2_err={l2_error:.6e}")
 
-    p_x = space_order_test_interface([50, 100])
-    print(f"Spatial order: {p_x:.3f}")
+    p_x = space_order_test_interface([50, 100, 200])
+    print(f"Spatial order (mean): {p_x:.3f}")
 
-    p_t = time_order_test_interface([0.02, 0.01])
-    print(f"Temporal order: {p_t:.3f}")
+    p_t = time_order_test_interface([0.02, 0.01, 0.005])
+    print(f"Temporal order (mean): {p_t:.3f}")
 

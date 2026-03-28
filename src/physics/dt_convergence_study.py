@@ -1,5 +1,5 @@
 """
-Temporal resolution analysis for the Crank-Nicolson FD solver.
+Temporal resolution analysis for the Crank-Nicolson FV solver.
 
 Answers: "What dt does the CN solver need for high-fidelity applications?"
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.physics.fd_solver_1d import FDSolver1D, Layer1D, ic, windowed_sin_flux, compute_dt
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D, ic, windowed_sin_flux, compute_dt
 
 
 # ===================== ic() =====================
@@ -107,7 +107,7 @@ class TestComputeDt:
         assert compute_dt(0.01, 1.0, 0.5, 2.0) > 0
 
 
-# ===================== FDSolver1D.__init__ =====================
+# ===================== FVSolver1D.__init__ =====================
 
 class TestSolverInit:
     def test_grid_shape(self, small_solver):
@@ -123,7 +123,7 @@ class TestSolverInit:
 
     def test_dt_explicit_override(self):
         layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
-        solver = FDSolver1D(N=11, dt=0.001, a=0, b=1, layers=layers,
+        solver = FVSolver1D(N=11, dt=0.001, a=0, b=1, layers=layers,
                             lam_target=0.5, t_final=0.5, flux_f=2.0, flux_A=50.0,
                             t_on=0.0, t_off=0.5, phase=0.0)
         assert solver.dt == 0.001
@@ -143,13 +143,13 @@ class TestBuildABanded:
     def test_N_less_than_3_raises(self):
         layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
         with pytest.raises(ValueError, match="N must be >= 3"):
-            FDSolver1D(N=2, a=0, b=1, layers=layers,
+            FVSolver1D(N=2, a=0, b=1, layers=layers,
                         lam_target=0.5, t_final=0.1, flux_f=2.0, flux_A=50.0,
                         t_on=0.0, t_off=0.1, phase=0.0)
 
     def test_N_equals_3_succeeds(self):
         layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
-        solver = FDSolver1D(N=3, a=0, b=1, layers=layers,
+        solver = FVSolver1D(N=3, a=0, b=1, layers=layers,
                             lam_target=0.5, t_final=0.1, flux_f=2.0, flux_A=50.0,
                             t_on=0.0, t_off=0.1, phase=0.0)
         assert solver.ab.shape == (4, 3)
