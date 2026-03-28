@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.optim import Adam, AdamW
 
-from data.dataset import create_dataloaders, load_sim_data, split_sim_ids
+from data.dataset import compute_global_stats, create_dataloaders, load_sim_data, split_sim_ids
 from src.operators.fno1d import FNO1d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
@@ -397,12 +397,15 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
+    mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
     training_set, validation_set, _ = create_dataloaders(
         trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=config["training"]["batch_size"],
         sim_params=sim_params,
+        mu_global=mu_global,
+        sigma_global=sigma_global,
         n_snapshots=config["training"].get("n_snapshots", 15),
         n_snapshots_test=config["training"].get("n_snapshots_test", None),
         noise_std=config["training"].get("noise_std", 0.0),
@@ -418,7 +421,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         in_channels=model_cfg["in_channels"],
         out_channels=model_cfg["out_channels"],
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", 7),
+        cond_dim=model_cfg.get("cond_dim", 5),
         cond_hidden=model_cfg.get("cond_hidden", 256),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
@@ -524,6 +527,8 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
                         "scheduler_state": scheduler.state_dict(),
                         "best_val": best_val_loss,
                         "bad_epochs": bad_epochs,
+                        "mu_global": mu_global,
+                        "sigma_global": sigma_global,
                     },
                     best_path,
                 )
@@ -545,6 +550,8 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
                 "scheduler_state": scheduler.state_dict(),
                 "best_val": best_val_loss,
                 "bad_epochs": bad_epochs,
+                "mu_global": mu_global,
+                "sigma_global": sigma_global,
             },
             latest_path,
         )
