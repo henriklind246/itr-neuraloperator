@@ -20,15 +20,20 @@ class SnapshotPairDataset(Dataset):
     Each sample is a (input, target) pair: given the temperature field at
     time t_s, predict the field at a future time t_j > t_s.
 
+    Uses **global normalization**: T̃ = (T - μ_global) / σ_global, where
+    μ_global and σ_global are computed once from the training set. This
+    preserves absolute temperature scale in the field (unlike per-sample
+    z-score) so the model can learn BC- and IC-dependent dynamics.
+
     When n_snapshots is provided, uniformly subsamples that many time steps
     from the full trajectory and enumerates all possible pairs per
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
     Returns 4-tuple: (x_spatial, cond, Y, T_stats)
         x_spatial : (Nx, 2)  — [T̃_source, x_norm]
-        cond      : (7,)     — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm, μ_s_norm, σ_s_norm]
-        Y         : (Nx, 1)  — T̃_target (normalized)
-        T_stats   : (2,)     — [μ_s, σ_s] for denormalization
+        cond      : (5,)     — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
+        Y         : (Nx, 1)  — T̃_target (globally normalized)
+        T_stats   : (2,)     — [μ_global, σ_global] for denormalization
     """
 
     def __init__(
@@ -38,6 +43,8 @@ class SnapshotPairDataset(Dataset):
         x_grid: np.ndarray,
         sim_ids: np.ndarray,
         sim_params: np.ndarray,
+        mu_global: float,
+        sigma_global: float,
         n_snapshots: int | None = None,
         noise_std: float = 0.0,
     ):
@@ -46,6 +53,8 @@ class SnapshotPairDataset(Dataset):
         self.t_grid = t_grid.astype(np.float32)
         self.x_grid = x_grid.astype(np.float32)
         self.sim_ids = sim_ids.astype(np.int64)
+        self.mu_global = np.float32(mu_global)
+        self.sigma_global = np.float32(sigma_global)
         self.noise_std = noise_std
 
         self.num_sims, self.Nt, self.Nx = trajectories.shape
@@ -106,11 +115,9 @@ class SnapshotPairDataset(Dataset):
         T_source = self.trajectories[sim_id, s, :]  # (Nx,)
         T_target = self.trajectories[sim_id, j, :]  # (Nx,)
 
-        # Per-sample temperature normalization (source statistics)
-        mu_s = T_source.mean()
-        sigma_s = T_source.std()
-        T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
-        T_target_norm = (T_target - mu_s) / (sigma_s + T_EPS)
+        # Global temperature normalization (training-set statistics)
+        T_source_norm = (T_source - self.mu_global) / (self.sigma_global + T_EPS)
+        T_target_norm = (T_target - self.mu_global) / (self.sigma_global + T_EPS)
 
         # Input noise augmentation (training only, controlled by noise_std)
         if self.noise_std > 0:
@@ -119,22 +126,20 @@ class SnapshotPairDataset(Dataset):
         # Spatial input: (Nx, 2) — [T̃_source, x_norm]
         x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
 
-        # Conditioning vector: (7,) — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm, μ_s_norm, σ_s_norm]
+        # Conditioning vector: (5,) — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
         t_bar = self.t_grid[j] - self.t_grid[s]
         t_bar_norm = t_bar / self.t_grid[-1]
         t_s_norm = self.t_grid[s] / self.t_grid[-1]
         A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
         f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
         R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-        mu_s_norm = mu_s / 400.0        # μ_s ∈ [~0, ~400]
-        sigma_s_norm = sigma_s / 200.0  # σ_s ∈ [~1, ~200]
-        cond = np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm, mu_s_norm, sigma_s_norm], dtype=np.float32)
+        cond = np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm], dtype=np.float32)
 
         # Target: (Nx, 1)
         Y = T_target_norm[:, None].astype(np.float32)
 
-        # Stats for denormalization at eval time: (2,)
-        T_stats = np.array([mu_s, sigma_s], dtype=np.float32)
+        # Stats for denormalization at eval time: (2,) — global, constant across samples
+        T_stats = np.array([self.mu_global, self.sigma_global], dtype=np.float32)
 
         return (
             torch.from_numpy(x_spatial),
@@ -198,6 +203,22 @@ def split_sim_ids(
     return train_ids, val_ids, test_ids
 
 
+# ------- GLOBAL NORMALIZATION STATISTICS -------
+
+def compute_global_stats(
+    trajectories: np.ndarray,
+    train_ids: np.ndarray,
+) -> tuple[float, float]:
+    """Compute global mean/std from training simulations only (avoids data leakage).
+
+    Returns (mu_global, sigma_global) as Python floats.
+    """
+    train_data = trajectories[train_ids]  # (N_train, Nt, Nx)
+    mu_global = float(train_data.mean())
+    sigma_global = float(train_data.std())
+    return mu_global, sigma_global
+
+
 # ------- CREATE DATALOADERS -------
 
 def create_dataloaders(
@@ -209,6 +230,8 @@ def create_dataloaders(
     test_ids: np.ndarray,
     batch_size: int,
     sim_params: np.ndarray,
+    mu_global: float,
+    sigma_global: float,
     n_snapshots: int = 15,
     n_snapshots_test: int | None = None,
     noise_std: float = 0.0,
@@ -223,6 +246,8 @@ def create_dataloaders(
         t_grid=t_grid,
         sim_ids=train_ids,
         sim_params=sim_params,
+        mu_global=mu_global,
+        sigma_global=sigma_global,
         n_snapshots=n_snapshots,
         noise_std=noise_std,
     )
@@ -233,6 +258,8 @@ def create_dataloaders(
         t_grid=t_grid,
         sim_ids=val_ids,
         sim_params=sim_params,
+        mu_global=mu_global,
+        sigma_global=sigma_global,
         n_snapshots=n_snapshots,
     )
 
@@ -242,6 +269,8 @@ def create_dataloaders(
         t_grid=t_grid,
         sim_ids=test_ids,
         sim_params=sim_params,
+        mu_global=mu_global,
+        sigma_global=sigma_global,
         n_snapshots=n_test,
     )
 
@@ -265,6 +294,8 @@ if __name__ == '__main__':
     sim_params = np.load(str(project_root / "data" / "sim_params.npy"), allow_pickle=True)
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
+    mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+    print(f"Global stats: mu={mu_global:.4f}, sigma={sigma_global:.4f}")
 
     batch_size = 64
 
@@ -272,11 +303,12 @@ if __name__ == '__main__':
         trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=batch_size, sim_params=sim_params,
+        mu_global=mu_global, sigma_global=sigma_global,
     )
 
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
     print(f"x_spatial: {x_spatial.shape}")  # (B, Nx, 2)
-    print(f"cond: {cond.shape}")            # (B, 7)
+    print(f"cond: {cond.shape}")            # (B, 5)
     print(f"Y: {yb.shape}")                 # (B, Nx, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
