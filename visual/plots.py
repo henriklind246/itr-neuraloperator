@@ -10,6 +10,7 @@ from data.dataset import (
     RC_RANGE,
     T_EPS,
     SnapshotPairDataset,
+    compute_global_stats,
     load_sim_data,
     split_sim_ids,
 )
@@ -135,11 +136,14 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO1d, dict]:
         in_channels=model_cfg.get("in_channels", 2),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", 7),
+        cond_dim=model_cfg.get("cond_dim", 5),
         cond_hidden=model_cfg.get("cond_hidden", 256),
     )
     model.load_state_dict(ckpt["model_state"])
     model.eval()
+    # Attach global normalization stats from checkpoint (if present)
+    model._mu_global = ckpt.get("mu_global")
+    model._sigma_global = ckpt.get("sigma_global")
     return model, conf
 
 
@@ -163,6 +167,7 @@ def _build_split_datasets(
     n_snapshots = training_cfg.get("n_snapshots", 15)
     n_snapshots_test = training_cfg.get("n_snapshots_test", None)
     test_snapshots = n_snapshots_test if n_snapshots_test is not None else n_snapshots
+    mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
     return {
         "train": SnapshotPairDataset(
             trajectories=trajectories,
@@ -170,6 +175,8 @@ def _build_split_datasets(
             x_grid=x_grid,
             sim_ids=train_ids,
             sim_params=sim_params,
+            mu_global=mu_global,
+            sigma_global=sigma_global,
             n_snapshots=n_snapshots,
         ),
         "val": SnapshotPairDataset(
@@ -178,6 +185,8 @@ def _build_split_datasets(
             x_grid=x_grid,
             sim_ids=val_ids,
             sim_params=sim_params,
+            mu_global=mu_global,
+            sigma_global=sigma_global,
             n_snapshots=n_snapshots,
         ),
         "test": SnapshotPairDataset(
@@ -186,6 +195,8 @@ def _build_split_datasets(
             x_grid=x_grid,
             sim_ids=test_ids,
             sim_params=sim_params,
+            mu_global=mu_global,
+            sigma_global=sigma_global,
             n_snapshots=test_snapshots,
         ),
     }
@@ -207,10 +218,17 @@ def _prepare_prediction_case(
     interface_x = 0.5
     t_targets = t_grid[target_indices]
 
+    # Use global normalization stats from model (attached during checkpoint loading)
+    mu_global = getattr(model, "_mu_global", None)
+    sigma_global = getattr(model, "_sigma_global", None)
+    if mu_global is None or sigma_global is None:
+        # Fallback: compute from training split
+        from data.dataset import split_sim_ids as _split
+        train_ids, _, _ = _split(trajectories.shape[0], 0.7, 0.15, seed=0)
+        mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+
     T_source = trajectories[sim_id, s, :].astype(np.float32)
-    mu_s = T_source.mean()
-    sigma_s = T_source.std()
-    T_source_norm = (T_source - mu_s) / (sigma_s + T_EPS)
+    T_source_norm = (T_source - mu_global) / (sigma_global + T_EPS)
     x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
 
     amp, freq, _T0, R_c = sim_params[sim_id]
@@ -223,16 +241,12 @@ def _prepare_prediction_case(
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
-    mu_s_norm = mu_s / 400.0
-    sigma_s_norm = sigma_s / 200.0
     cond_batch = np.column_stack([
         t_bars / t_grid[-1],
         np.full(len(target_indices), t_s_norm),
         np.full(len(target_indices), (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])),
         np.full(len(target_indices), (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])),
         np.full(len(target_indices), (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])),
-        np.full(len(target_indices), mu_s_norm),
-        np.full(len(target_indices), sigma_s_norm),
     ]).astype(np.float32)
 
     device = next(model.parameters()).device
@@ -241,7 +255,7 @@ def _prepare_prediction_case(
         c_tensor = torch.from_numpy(cond_batch).to(device)
         Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)
 
-    Y_pred = (Y_pred_norm * (sigma_s + T_EPS) + mu_s).T
+    Y_pred = (Y_pred_norm * (sigma_global + T_EPS) + mu_global).T
     Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)
 
     return {
