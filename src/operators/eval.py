@@ -1,5 +1,5 @@
 import torch
-from data.dataset import load_sim_data, split_sim_ids, create_dataloaders, T_EPS
+from data.dataset import compute_global_stats, load_sim_data, split_sim_ids, create_dataloaders, T_EPS
 from src.operators.fno1d import FNO1d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
@@ -12,7 +12,7 @@ from datetime import datetime
 
 # -------- LOAD TEST SET ---------
 
-def build_test_loader(config):
+def build_test_loader(config, mu_global=None, sigma_global=None):
     import numpy as np
 
     trajectories, x_grid, t_grid = load_sim_data(
@@ -24,11 +24,17 @@ def build_test_loader(config):
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
+    # Use provided global stats or recompute from training set
+    if mu_global is None or sigma_global is None:
+        mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+
     _, _, testing_set = create_dataloaders(
         trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=config["training"]["batch_size"],
         sim_params=sim_params,
+        mu_global=mu_global,
+        sigma_global=sigma_global,
         n_snapshots=10,
         n_snapshots_test=40
     )
@@ -92,7 +98,11 @@ def eval_all_seeds(run_root: str):
         config = ckpt['conf']
         device = resolve_device(config.get("training", {}).get("device", "auto"))
 
-        test_loader, x_grid = build_test_loader(config)
+        test_loader, x_grid = build_test_loader(
+            config,
+            mu_global=ckpt.get("mu_global"),
+            sigma_global=ckpt.get("sigma_global"),
+        )
 
         loss_cfg = config.get("training", {}).get("loss", {})
         iface_mask = build_interface_mask(
@@ -106,7 +116,7 @@ def eval_all_seeds(run_root: str):
             in_channels=model_cfg.get("in_channels", 2),
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
-            cond_dim=model_cfg.get("cond_dim", 7),
+            cond_dim=model_cfg.get("cond_dim", 5),
             cond_hidden=model_cfg.get("cond_hidden", 256),
         )
         fno.load_state_dict(ckpt['model_state'])
