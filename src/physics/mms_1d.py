@@ -29,6 +29,8 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
                 - k * 12.0 * A * np.sin(omega * t + phase) * (b - x)**2)
 
     # create instance of fv solver class to solve forcing equation
+    # t_final=0.37 chosen so sin(omega*t_final) ≈ -0.998, i.e. the manufactured
+    # signal is near its peak amplitude at measurement time (not zero).
     layer = Layer1D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
     sim = FVSolver1D(
         a=a,
@@ -36,7 +38,7 @@ def run_mms_once(N: int, dt=None) -> tuple[float, float, float, float]:
         N=N,
         lam_target=0.5,
         layers=[layer],
-        t_final=1.0,
+        t_final=0.37,
         flux_f=flux_f,
         flux_A=flux_A,
         dt=dt,
@@ -63,7 +65,7 @@ def space_order_test(N_list: list) -> float:
     results = []
     hs = []
     for N in N_list:
-        h, _, _, l2_error = run_mms_once(N, dt=0.0005)
+        h, _, _, l2_error = run_mms_once(N, dt=0.0001)
 
         results.append(l2_error)
         hs.append(h)
@@ -106,11 +108,13 @@ def time_order_test(dt_list: list) -> float:
 #   T_R*(x, t) = 300 + A_R sin(wt) (1 - x)^4
 #
 # Constraints (flux continuity + temperature jump ΔT = Rc·q_I):
+#   # flux continuity across the face
 #   A_R = 2 k1 A_L D_L / k2
+#   # temperature jump
 #   C_L = k1 A_L D_L (1/(8 k2) + Rc)
 #
 # With A_L=10, D_L=1:  A_R=40, C_L=4.5
-# q_I(t) = 20 sin(wt),  jump = 2 sin(wt) = 0.1 × 20 sin(wt)  ✓
+# q_I(t) = 20 sin(wt),  jump = 2 sin(wt) = 0.1 × 20 sin(wt)
 
 def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
     """MMS verification for two-layer solver with interface thermal resistance.
@@ -136,6 +140,7 @@ def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
         g = np.sin(omega * t)
         left = x < x_I
         T[left] += A_L * g * ((x_I - x[left])**4 + D_L * (x_I - x[left])) + C_L * g
+        # ~ is the bit-wise not operator, and in this context chooses point that are not in the left domain
         T[~left] += A_R * g * (b - x[~left])**4
         return T
 
@@ -162,12 +167,15 @@ def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
         Layer1D(x_left=a, x_right=x_I, rho=rho1, cp=cp1, k=k1),
         Layer1D(x_left=x_I, x_right=b, rho=rho2, cp=cp2, k=k2),
     ]
+    # t_final=0.37: sin(omega*t_final) ≈ -0.998, so interface jump
+    # ΔT ≈ -2.0 is near its peak — a stronger test than t_final=1.0
+    # where sin(4π)=0 would give zero jump at measurement time.
     sim = FVSolver1D(
         a=a, b=b, N=N,
         lam_target=0.5,
         layers=layers,
         interface_R=[Rc],
-        t_final=1.0,
+        t_final=0.37,
         flux_f=flux_f, flux_A=0.0,
         dt=dt,
         t_on=0.0, t_off=0.2, phase=0.0,
@@ -189,11 +197,11 @@ def space_order_test_interface(N_list: list) -> float:
     """Spatial convergence order for the interface-resistance MMS.
 
     All N values must be even so that x=0.5 lands on a face.
-    Fixes dt=0.0005 so temporal error is negligible.
+    Fixes dt=0.0001 so temporal error is negligible at all grid levels.
     """
     results, hs = [], []
     for N in N_list:
-        h, _, _, l2 = run_mms_interface(N, dt=0.0005)
+        h, _, _, l2 = run_mms_interface(N, dt=0.0001)
         results.append(l2)
         hs.append(h)
     orders = []
