@@ -166,6 +166,12 @@ class FVSolver1D:
         # -------- LOCAL CN COEFFICIENTS ------
         self.r_minus, self.r_plus = self._build_local_cn_coefficients()
 
+        # -------- HALF-CELL BC COEFFICIENT ------
+        # r0_bc = dt * G_face[0] / (rho_0 * cp_0 * h)
+        # This is exactly twice the equivalent interior coefficient because the
+        # half-cell (width h/2) has half the thermal capacity of a full cell.
+        self.r0_bc = self.dt * self.G_face[0] / (self.rho_nodes[0] * self.cp_nodes[0] * self.h)
+
         # --------- BANDED MATRIX -------
         self.ab = self.build_A_banded()
 
@@ -318,70 +324,83 @@ class FVSolver1D:
         return r_minus, r_plus
 
     def build_A_banded(self) -> np.ndarray:
-        """build banded matrix ab with shape (l + u + 1, N)"""
+        """Build tridiagonal banded matrix ab with shape (3, N).
+
+        Uses half-cell energy balance at node 0 (left Neumann BC),
+        standard conservative CN for interior nodes, and Dirichlet at node N-1.
+        """
         N = self.N
 
         if N<3:
             raise ValueError("N must be >= 3 for second-order accurate.")
 
-        l, u = 1, 2
-        # init ab by creating a numpy array with size (l + u + 1, N) filled with 0 floats
+        l, u = 1, 1
         ab = np.zeros((l + u + 1, N), dtype=float)
 
-        # ------- ROW 0: Left-side Neumann BC ( -------
-        ab[2, 0] = 3.0  # A_0,0
-        ab[1, 1] = -4.0  # A_0,1
-        ab[0, 2] = 1.0  # A_0,2
+        # ------- ROW 0: Half-cell energy balance (left Neumann BC) -------
+        # (1 + r0) T_0^{n+1}  -  r0 T_1^{n+1}  =  RHS
+        r0 = self.r0_bc
+        ab[1, 0] = 1.0 + r0  # main diagonal  A[0, 0]
+        ab[0, 1] = -r0  # super-diagonal A[0, 1]
 
         # ------- INTERIOR ROWS: CONSERVATIVE CN ----------
         for i in range(1, N-1):
             rm = self.r_minus[i]
             rp = self.r_plus[i]
 
-            ab[2, i] = 1.0 + rm + rp # A[i, i]
-            ab[3, i - 1] = -rm # A[i, i-1]
-            ab[1, i + 1] = -rp # A[i, i+1]
+            ab[1, i]     = 1.0 + rm + rp  # main diagonal  A[i, i]
+            ab[2, i - 1] = -rm             # sub-diagonal   A[i, i-1]
+            ab[0, i + 1] = -rp             # super-diagonal A[i, i+1]
 
         # ----- ROW N-1: Right side Dirichlet BC -------
-        ab[2, N-1] = 1.0 # A_N-1,N-1 = 1
-        ab[3, N-2] = 0.0 # removing coupling A_N-1, N-2
+        ab[1, N-1] = 1.0  # A[N-1, N-1] = 1
+        ab[2, N-2] = 0.0  # removing coupling A[N-1, N-2]
 
         return ab
 
     def cn_step_banded(self, Tn: np.ndarray, tn: float) -> np.ndarray:
-        """One CN solving AT^{n+1} = rhs, with optional manufactured/source term. """
+        """One CN step: solve A T^{n+1} = rhs, with optional source term."""
         rhs = np.zeros(self.N, dtype=float)
 
-        # row 0: Neumann BC with time-averaged flux
+        # row 0: half-cell energy balance (left Neumann BC, CN time-averaged)
+        # RHS = (1 - r0) T_0^n  +  r0 T_1^n  +  dt (q^n + q^{n+1}) / (rho_0 cp_0 h)
+        r0 = self.r0_bc
+        qn = self.q_left(tn)
         qnp1 = self.q_left(tn + self.dt)
-        k_left_boundary = self.layers[0].k
-        # CN consistent neumann left-side BC in conservative form
-        rhs[0] = (2.0 * self.h * qnp1) / k_left_boundary
+        C_denom = self.rho_nodes[0] * self.cp_nodes[0] * self.h  # = 2 * C_half
+        rhs[0] = (1.0 - r0) * Tn[0] + r0 * Tn[1] + self.dt * (qn + qnp1) / C_denom
 
-        # interior rows cn nodes: left neighbors + centers + right neighbors
+        # interior rows: conservative CN
         for i in range(1, self.N - 1):
             rm = self.r_minus[i]
             rp = self.r_plus[i]
+            rhs[i] = rm * Tn[i - 1] + (1.0 - rm - rp) * Tn[i] + rp * Tn[i + 1]
 
-            rhs[i] = (rm * Tn[i - 1] + (1.0 - rm - rp) * Tn[i] + rp * Tn[i + 1])
-
-        # add source term (robust CN time-centering + correct scaling) s(x, t)
+        # source term s(x, t): CN time-averaging on nodes 0 through N-2
         if self.source is not None:
-            interior_x = self.grid[1:-1]
-            # source at time-step n
-            s_n = np.asarray(self.source(interior_x, tn), dtype=float)
-            s_np1 = np.asarray(self.source(interior_x, tn + self.dt), dtype=float)
+            # evaluate source at all nodes except the Dirichlet node (N-1)
+            active_x = self.grid[:-1]
+            s_n = np.asarray(self.source(active_x, tn), dtype=float)
+            s_np1 = np.asarray(self.source(active_x, tn + self.dt), dtype=float)
 
-            if s_n.shape != (self.N - 2,) or s_np1.shape != (self.N - 2,):
-                raise ValueError("source(x_interior, t) must return an array of shape (N-2,) for interior nodes.")
+            if s_n.shape != (self.N - 1,) or s_np1.shape != (self.N - 1,):
+                raise ValueError(
+                    f"source(x, t) must return array of shape ({self.N - 1},) "
+                    f"for active nodes, got {s_n.shape}."
+                )
 
-            rhs[1:-1] += self.dt * self.h * 0.5 * (s_n + s_np1) / self.C_node[1:-1]
+            # node 0 (half-cell): dt * 0.5 * (s_n + s_np1) / (rho_0 * cp_0)
+            # the h/2 cell width cancels with C_half = rho*cp*h/2
+            rhs[0] += self.dt * 0.5 * (s_n[0] + s_np1[0]) / (self.rho_nodes[0] * self.cp_nodes[0])
 
-        # row N-1
+            # interior nodes 1..N-2 (full cells): dt * h * 0.5 * (s_n + s_np1) / C_node
+            rhs[1:-1] += self.dt * self.h * 0.5 * (s_n[1:] + s_np1[1:]) / self.C_node[1:-1]
+
+        # row N-1: Dirichlet BC
         rhs[-1] = self.T_right(tn + self.dt)
 
-        # solve banded system with (l=1, u=2)
-        Tnp1 = solve_banded((1, 2), self.ab, rhs)
+        # solve tridiagonal system (l=1, u=1)
+        Tnp1 = solve_banded((1, 1), self.ab, rhs)
         return Tnp1
 
     def solve(self, T0: np.ndarray | None = None, store_trajectory: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

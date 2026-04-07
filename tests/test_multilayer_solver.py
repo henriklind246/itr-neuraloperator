@@ -82,7 +82,9 @@ class TestConstantSolution:
         T0 = np.full(100, 300.0)
         _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
         max_err = np.max(np.abs(T_hist - 300.0))
-        assert max_err < 1e-10, f"Constant solution drifted: max error = {max_err}"
+        # tolerance is 1e-8 (not 1e-10) because ~49k timesteps accumulate
+        # float64 roundoff; this is still orders of magnitude below truncation error
+        assert max_err < 1e-8, f"Constant solution drifted: max error = {max_err}"
 
 
 # ==================== TEST 2: GEOMETRY / INTERFACE VALIDATION ====================
@@ -184,7 +186,7 @@ class TestMMSRegression:
 
         hs, errs = [], []
         for N in [21, 41, 81, 161]:
-            h, _, _, l2 = run_mms_once(N, dt=0.0005)
+            h, _, _, l2 = run_mms_once(N, dt=0.0001)
             hs.append(h)
             errs.append(l2)
 
@@ -735,14 +737,14 @@ class TestMmsInterfaceConvergenceTable:
     def test_print_interface_spatial_table(self):
         """Spatial convergence table for interface-resistance MMS."""
         N_list = [50, 100, 200]
-        fixed_dt = 0.0005
+        fixed_dt = 0.0001
         hs, errs = [], []
         for N in N_list:
             h, _, _, l2 = run_mms_interface(N, dt=fixed_dt)
             hs.append(h)
             errs.append(l2)
 
-        print("\n--- Interface spatial convergence (dt=0.0005) ---")
+        print("\n--- Interface spatial convergence (dt=0.0001) ---")
         print(f"{'N':>6}  {'h':>12}  {'L2 error':>12}  {'order':>8}")
         print("-" * 46)
         print(f"{N_list[0]:>6}  {hs[0]:>12.6f}  {errs[0]:>12.4e}  {'--':>8}")

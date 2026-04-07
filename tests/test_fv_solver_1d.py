@@ -138,7 +138,7 @@ class TestSolverInit:
 
 class TestBuildABanded:
     def test_shape(self, small_solver):
-        assert small_solver.ab.shape == (4, 11)
+        assert small_solver.ab.shape == (3, 11)
 
     def test_N_less_than_3_raises(self):
         layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
@@ -152,19 +152,20 @@ class TestBuildABanded:
         solver = FVSolver1D(N=3, a=0, b=1, layers=layers,
                             lam_target=0.5, t_final=0.1, flux_f=2.0, flux_A=50.0,
                             t_on=0.0, t_off=0.1, phase=0.0)
-        assert solver.ab.shape == (4, 3)
+        assert solver.ab.shape == (3, 3)
 
     def test_neumann_row(self, small_solver):
+        """Row 0: half-cell energy balance coefficients."""
         ab = small_solver.ab
-        assert ab[2, 0] == 3
-        assert ab[1, 1] == -4
-        assert ab[0, 2] == 1
+        r0 = small_solver.r0_bc
+        np.testing.assert_allclose(ab[1, 0], 1.0 + r0)
+        np.testing.assert_allclose(ab[0, 1], -r0)
 
     def test_dirichlet_row(self, small_solver):
         ab = small_solver.ab
         N = small_solver.N
-        assert ab[2, N - 1] == 1.0
-        assert ab[3, N - 2] == 0.0
+        assert ab[1, N - 1] == 1.0
+        assert ab[2, N - 2] == 0.0
 
     def test_interior_main_diagonal(self, small_solver):
         ab = small_solver.ab
@@ -172,14 +173,14 @@ class TestBuildABanded:
         for i in range(1, N - 1):
             rm = small_solver.r_minus[i]
             rp = small_solver.r_plus[i]
-            np.testing.assert_allclose(ab[2, i], 1.0 + rm + rp)
+            np.testing.assert_allclose(ab[1, i], 1.0 + rm + rp)
 
     def test_interior_off_diagonals(self, small_solver):
         ab = small_solver.ab
         N = small_solver.N
         for i in range(1, N - 1):
-            np.testing.assert_allclose(ab[3, i - 1], -small_solver.r_minus[i])
-            np.testing.assert_allclose(ab[1, i + 1], -small_solver.r_plus[i])
+            np.testing.assert_allclose(ab[2, i - 1], -small_solver.r_minus[i])
+            np.testing.assert_allclose(ab[0, i + 1], -small_solver.r_plus[i])
 
 
 # ===================== cn_step_banded =====================
