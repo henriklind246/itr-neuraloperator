@@ -140,11 +140,12 @@ def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
         g = np.sin(omega * t)
         left = x < x_I
         T[left] += A_L * g * ((x_I - x[left])**4 + D_L * (x_I - x[left])) + C_L * g
-        # ~ is the bit-wise not operator, and in this context chooses point that are not in the left domain
+        # ~ is the bit-wise not operator, and in this context, chooses point that are not in the left domain
+        # this convention has the interf
         T[~left] += A_R * g * (b - x[~left])**4
         return T
 
-    # --- left flux: q = -k1 dT_L/dx|_{x=0} ---
+    # --- left boundary flux: q = -k1 dT_L/dx|_{x=0} ---
     def q_left(t: float) -> float:
         return k1 * A_L * np.sin(omega * t) * (4.0 * (x_I - a)**3 + D_L)
 
@@ -156,10 +157,8 @@ def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
         left = x < x_I
         xl = x[left]
         xr = x[~left]
-        s[left] = (rho1 * cp1 * gp * (A_L * ((x_I - xl)**4 + D_L * (x_I - xl)) + C_L)
-                   - k1 * A_L * g * 12.0 * (x_I - xl)**2)
-        s[~left] = (rho2 * cp2 * A_R * gp * (b - xr)**4
-                    - k2 * A_R * g * 12.0 * (b - xr)**2)
+        s[left] = (rho1 * cp1 * gp * (A_L * ((x_I - xl)**4 + D_L * (x_I - xl)) + C_L) - k1 * A_L * g * 12.0 * (x_I - xl)**2)
+        s[~left] = (rho2 * cp2 * A_R * gp * (b - xr)**4 - k2 * A_R * g * 12.0 * (b - xr)**2)
         return s
 
     # --- solver setup ---
@@ -167,7 +166,7 @@ def run_mms_interface(N: int, dt=None) -> tuple[float, float, float, float]:
         Layer1D(x_left=a, x_right=x_I, rho=rho1, cp=cp1, k=k1),
         Layer1D(x_left=x_I, x_right=b, rho=rho2, cp=cp2, k=k2),
     ]
-    # t_final=0.37: sin(omega*t_final) ≈ -0.998, so interface jump
+    # t_final=0.37: sin(omega*t_final) approx= -0.998, so interface jump
     # ΔT ≈ -2.0 is near its peak — a stronger test than t_final=1.0
     # where sin(4π)=0 would give zero jump at measurement time.
     sim = FVSolver1D(
