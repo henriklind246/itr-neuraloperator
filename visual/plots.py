@@ -93,7 +93,7 @@ def create_demo_multilayer_solver() -> FVSolver2D:
         a=0.0, b=1.0, c=0.0, d=1.0,
         Nx=100, Ny=100,
         lam_target=0.8, layers=layers, interface_R=[0.5],
-        t_final=1.0, flux_f=2.0, flux_A=50.0,
+        t_final=0.3, flux_f=2.0, flux_A=50.0,
         t_on=0.0, t_off=0.2, phase=0.0, dt=0.005,
     )
 
@@ -595,23 +595,23 @@ def plot_multilayer_evolution(
     n_snaps = 6
     snap_indices = np.linspace(0, Nt - 1, n_snaps, dtype=int)
 
-    vmin = float(T_hist[snap_indices].min())
-    vmax = float(T_hist[snap_indices].max())
-
     fig, axes = plt.subplots(2, 3, figsize=(15, 9))
 
     for idx, (ax, t_idx) in enumerate(zip(axes.ravel(), snap_indices)):
-        pc = ax.pcolormesh(solver.X, solver.Y, T_hist[t_idx],
-                           cmap="inferno", shading="auto", vmin=vmin, vmax=vmax)
+        snap = T_hist[t_idx]
+        pc = ax.pcolormesh(solver.X, solver.Y, snap,
+                           cmap="inferno", shading="auto",
+                           vmin=float(snap.min()), vmax=float(snap.max()))
         for xi in solver.interface_positions:
             ax.axvline(xi, color="white", linestyle="--", linewidth=0.8, alpha=0.7)
         ax.set_title(f"t = {solver.t[t_idx]:.3f}", fontsize=10)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_aspect("equal")
+        fig.colorbar(pc, ax=ax, shrink=0.85, pad=0.03)
 
-    fig.colorbar(pc, ax=axes, label="Temperature", shrink=0.6, pad=0.02)
-    fig.suptitle("Temperature Evolution", fontsize=13)
+    fig.suptitle("Temperature Evolution (per-panel colorbar)", fontsize=13)
+    fig.tight_layout()
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "physics" / "multilayer_evolution.png"
     save_path = _ensure_parent(Path(save_path))
