@@ -15,7 +15,7 @@ from data.dataset import (
     split_sim_ids,
 )
 from src.operators.train import load_config
-from src.physics.fv_solver_1d import FVSolver1D, Layer1D
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.operators.fno1d import FNO1d
 
 
@@ -76,30 +76,32 @@ def _should_run(name: str, groups: list[str], individual: list[str] | None) -> b
 # HELPERS — Demo solver + interface utilities
 # ============================================================
 
-def create_demo_multilayer_solver() -> FVSolver1D:
-    """Create a 2-layer demo solver for physics visualisation plots.
+def create_demo_multilayer_solver() -> FVSolver2D:
+    """Create a 2-layer 2D demo solver for physics visualisation plots.
 
     Matches the layer configuration in generate_dataset.py:
       Layer 1: [0.0, 0.5], rho=1.0, cp=1.0, k=2.0
       Layer 2: [0.5, 1.0], rho=1.0, cp=1.0, k=1.0
-    N=100 ensures x=0.5 lies on a cell face (required by the solver).
+    Nx=100 (even) ensures x=0.5 lies on a cell face (required by the solver).
+    Ny=100 matches for isotropic grid on [0,1]x[0,1].
     """
     layers = [
-        Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
-        Layer1D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+        Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
+        Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
-    return FVSolver1D(
-        a=0.0, b=1.0, N=100, layers=layers, lam_target=0.8,
-        interface_R=[0.5],
+    return FVSolver2D(
+        a=0.0, b=1.0, c=0.0, d=1.0,
+        Nx=100, Ny=100,
+        lam_target=0.8, layers=layers, interface_R=[0.5],
         t_final=1.0, flux_f=2.0, flux_A=50.0,
         t_on=0.0, t_off=0.2, phase=0.0, dt=0.005,
     )
 
 
-def _interface_flanking_nodes(solver: FVSolver1D) -> list[tuple[int, int, float]]:
+def _interface_flanking_nodes(solver: FVSolver2D) -> list[tuple[int, int, float]]:
     """Return (left_node, right_node, interface_x) for each internal interface."""
     return [
-        (f, f + 1, solver.face_positions[f])
+        (f, f + 1, solver.face_positions_x[f])
         for f in sorted(solver.interface_face_map.keys())
     ]
 
@@ -406,24 +408,23 @@ def _lead_time_coverage_counts(
 # ============================================================
 
 def plot_final_temperature(
-    solver: FVSolver1D,
+    solver: FVSolver2D,
     save_path: Optional[Path] = None,
-    title: str = "Final temperature vs spatial nodes",
 ):
-    """Run solver to final time and plot spatial grid (x) vs final temperature (T)."""
-    t, x, T_final = solver.solve(store_trajectory=False)
+    """2D temperature field at final time as a pcolormesh heatmap."""
+    _, _, _, T_final = solver.solve(store_trajectory=False)
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(x, T_final, marker="o", linestyle="-", color="C0", markersize=5)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    pc = ax.pcolormesh(solver.X, solver.Y, T_final, cmap="inferno", shading="auto")
+    fig.colorbar(pc, ax=ax, label="Temperature")
 
-    # mark interfaces
     for xi in solver.interface_positions:
-        ax.axvline(xi, color="gray", linestyle="--", alpha=0.5)
+        ax.axvline(xi, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
 
-    ax.set_xlabel("x (spatial nodes)")
-    ax.set_ylabel("Temperature")
-    ax.set_title(title)
-    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(f"Final Temperature at t = {solver.t[-1]:.3f}")
+    ax.set_aspect("equal")
 
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "physics" / "final_temperature.png"
@@ -435,19 +436,18 @@ def plot_final_temperature(
 
 
 def plot_layer_geometry(
-    solver: FVSolver1D,
+    solver: FVSolver2D,
     save_path: str | Path | None = None,
 ):
-    """Layer geometry and material properties for a multilayer domain.
+    """Layer geometry and material properties for a 2D multilayer domain.
 
     3-panel layout:
-        (a) Domain schematic with colored layer regions, grid nodes, interface markers
-        (b) Material properties k, rho, cp vs x as step-style lines
+        (a) Domain schematic with colored layers, subsampled grid nodes, interface lines
+        (b) Material properties k, rho, cp vs x (1D slice at mid-y)
         (c) Thermal diffusivity alpha = k/(rho*cp) vs x
     """
     fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(14, 4.5))
 
-    # color palette for layers
     layer_colors = plt.cm.Pastel1(np.linspace(0, 1, max(len(solver.layers), 3)))
 
     # --- Panel (a): Domain schematic ---
@@ -456,17 +456,25 @@ def plot_layer_geometry(
                      label=f"Layer {j} (k={layer.k})")
     for xi in solver.interface_positions:
         ax_a.axvline(xi, color="red", linestyle="--", linewidth=1.5, alpha=0.8)
-    ax_a.plot(solver.grid, np.zeros(solver.N), "|", color="black", markersize=8, alpha=0.5)
+    # subsampled grid nodes
+    step = max(1, solver.Nx // 20)
+    ax_a.plot(solver.X[::step, ::step].ravel(), solver.Y[::step, ::step].ravel(),
+              ".", color="black", markersize=2, alpha=0.4)
     ax_a.set_xlabel("x")
+    ax_a.set_ylabel("y")
     ax_a.set_title("(a) Domain Schematic")
-    ax_a.set_yticks([])
     ax_a.legend(fontsize=7, loc="upper right")
     ax_a.set_xlim(solver.a, solver.b)
+    ax_a.set_ylim(solver.c, solver.d)
+    ax_a.set_aspect("equal")
 
-    # --- Panel (b): Material properties ---
-    ax_b.plot(solver.grid, solver.k_nodes, drawstyle="steps-mid", label="k", linewidth=1.5)
-    ax_b.plot(solver.grid, solver.rho_nodes, drawstyle="steps-mid", label=r"$\rho$", linewidth=1.5)
-    ax_b.plot(solver.grid, solver.cp_nodes, drawstyle="steps-mid", label=r"$c_p$", linewidth=1.5)
+    # --- Panel (b): Material properties (1D slice at mid-y) ---
+    ax_b.plot(solver.grid_x, solver.k_nodes[:, 0], drawstyle="steps-mid",
+              label="k", linewidth=1.5)
+    ax_b.plot(solver.grid_x, solver.rho_nodes[:, 0], drawstyle="steps-mid",
+              label=r"$\rho$", linewidth=1.5)
+    ax_b.plot(solver.grid_x, solver.cp_nodes[:, 0], drawstyle="steps-mid",
+              label=r"$c_p$", linewidth=1.5)
     for xi in solver.interface_positions:
         ax_b.axvline(xi, color="gray", linestyle=":", alpha=0.5)
     ax_b.set_xlabel("x")
@@ -476,8 +484,8 @@ def plot_layer_geometry(
     ax_b.grid(True, linestyle="--", alpha=0.3)
 
     # --- Panel (c): Thermal diffusivity ---
-    alpha_nodes = solver.k_nodes / (solver.rho_nodes * solver.cp_nodes)
-    ax_c.plot(solver.grid, alpha_nodes, drawstyle="steps-mid", color="C2", linewidth=1.5)
+    alpha_nodes = solver.k_nodes[:, 0] / (solver.rho_nodes[:, 0] * solver.cp_nodes[:, 0])
+    ax_c.plot(solver.grid_x, alpha_nodes, drawstyle="steps-mid", color="C2", linewidth=1.5)
     for xi in solver.interface_positions:
         ax_c.axvline(xi, color="gray", linestyle=":", alpha=0.5)
     ax_c.set_xlabel("x")
@@ -495,61 +503,75 @@ def plot_layer_geometry(
 
 
 def plot_face_conductance(
-    solver: FVSolver1D,
+    solver: FVSolver2D,
     save_path: str | Path | None = None,
 ):
-    """Face conductance and Crank-Nicolson coupling coefficients.
+    """Face conductance and CN coefficients for the 2D solver.
 
-    3-panel layout:
-        (a) G_face vs face position — interface faces highlighted
-        (b) r_minus and r_plus vs node index (interior nodes only)
-        (c) Diagonal dominance margin: 1 - r_minus - r_plus
+    2x2 layout:
+        (a) G_x heatmap (x-direction face conductance)
+        (b) G_y heatmap (y-direction face conductance)
+        (c) CN coefficients r_w, r_e at mid-y slice (1D view)
+        (d) Diagonal dominance margin heatmap
     """
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(14, 4.5))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    ax_a, ax_b = axes[0]
+    ax_c, ax_d = axes[1]
 
-    interface_faces = set(solver.interface_face_map.keys())
-    interior_mask = np.array([i not in interface_faces for i in range(solver.N - 1)])
-    iface_mask = ~interior_mask
-
-    # --- Panel (a): G_face ---
-    ax_a.plot(solver.face_positions[interior_mask], solver.G_face[interior_mask],
-              "o", color="C0", markersize=4, alpha=0.6, label="Interior faces")
-    if np.any(iface_mask):
-        ax_a.plot(solver.face_positions[iface_mask], solver.G_face[iface_mask],
-                  "o", color="red", markersize=7, zorder=5, label="Interface faces")
-    ax_a.set_xlabel("Face position")
-    ax_a.set_ylabel(r"$G_{\mathrm{face}}$ (conductance / area)")
-    ax_a.set_title("(a) Face Conductance")
-    ax_a.legend(fontsize=8)
-    ax_a.grid(True, linestyle="--", alpha=0.3)
-
-    # --- Panel (b): r_minus, r_plus ---
-    interior_idx = np.arange(1, solver.N - 1)
-    ax_b.plot(interior_idx, solver.r_minus[1:-1], "-", color="C0", linewidth=1.2, label=r"$r^-$")
-    ax_b.plot(interior_idx, solver.r_plus[1:-1], "-", color="C3", linewidth=1.2, label=r"$r^+$")
+    # --- Panel (a): G_x heatmap ---
+    # G_x has shape (Nx-1, Ny), face positions between nodes
+    face_x = solver.face_positions_x
+    pc_a = ax_a.pcolormesh(
+        face_x, solver.grid_y, solver.G_x.T,
+        cmap="viridis", shading="nearest",
+    )
+    fig.colorbar(pc_a, ax=ax_a, label=r"$G_x$ [W/(m$^2$K)]", shrink=0.85)
     for xi in solver.interface_positions:
-        # convert x to node index (approximate)
-        node_approx = (xi - solver.a) / solver.h
-        ax_b.axvline(node_approx, color="gray", linestyle=":", alpha=0.5)
-    ax_b.set_xlabel("Node index")
-    ax_b.set_ylabel("CN coefficient")
-    ax_b.set_title(r"(b) Local CN Coefficients $r^-$, $r^+$")
-    ax_b.legend(fontsize=8)
-    ax_b.grid(True, linestyle="--", alpha=0.3)
+        ax_a.axvline(xi, color="red", linestyle="--", linewidth=1.0, alpha=0.8)
+    ax_a.set_xlabel("x (face position)")
+    ax_a.set_ylabel("y")
+    ax_a.set_title("(a) x-Face Conductance $G_x$")
 
-    # --- Panel (c): Diagonal dominance margin ---
-    margin = 1.0 - solver.r_minus[1:-1] - solver.r_plus[1:-1]
-    ax_c.fill_between(interior_idx, margin, 0, where=(margin >= 0),
-                      color="green", alpha=0.3, label="Stable")
-    ax_c.fill_between(interior_idx, margin, 0, where=(margin < 0),
-                      color="red", alpha=0.3, label="Unstable")
-    ax_c.plot(interior_idx, margin, "-", color="black", linewidth=0.8)
-    ax_c.axhline(0, color="red", linestyle="--", linewidth=0.8)
-    ax_c.set_xlabel("Node index")
-    ax_c.set_ylabel(r"$1 - r^- - r^+$")
-    ax_c.set_title("(c) Diagonal Dominance Margin")
+    # --- Panel (b): G_y heatmap ---
+    face_y = (solver.grid_y[:-1] + solver.grid_y[1:]) / 2.0
+    pc_b = ax_b.pcolormesh(
+        solver.grid_x, face_y, solver.G_y.T,
+        cmap="viridis", shading="nearest",
+    )
+    fig.colorbar(pc_b, ax=ax_b, label=r"$G_y$ [W/(m$^2$K)]", shrink=0.85)
+    ax_b.set_xlabel("x")
+    ax_b.set_ylabel("y (face position)")
+    ax_b.set_title("(b) y-Face Conductance $G_y$")
+
+    # --- Panel (c): r_w, r_e at mid-y ---
+    j_mid = solver.Ny // 2
+    interior_idx = np.arange(0, solver.Nx - 1)
+    ax_c.plot(interior_idx, solver.r_w[:solver.Nx - 1, j_mid], "-", color="C0",
+              linewidth=1.2, label=r"$r_w$")
+    ax_c.plot(interior_idx, solver.r_e[:solver.Nx - 1, j_mid], "-", color="C3",
+              linewidth=1.2, label=r"$r_e$")
+    for xi in solver.interface_positions:
+        node_approx = (xi - solver.a) / solver.hx
+        ax_c.axvline(node_approx, color="gray", linestyle=":", alpha=0.5)
+    ax_c.set_xlabel("Node index i")
+    ax_c.set_ylabel("CN coefficient")
+    ax_c.set_title(f"(c) CN Coefficients at j={j_mid}")
     ax_c.legend(fontsize=8)
     ax_c.grid(True, linestyle="--", alpha=0.3)
+
+    # --- Panel (d): Diagonal dominance margin heatmap ---
+    margin = (1.0 - solver.r_w - solver.r_e - solver.r_s - solver.r_n)
+    # exclude Dirichlet column (i=Nx-1) which is always 1
+    margin_active = margin[:solver.Nx - 1, :]
+    vmax = float(np.max(np.abs(margin_active)))
+    pc_d = ax_d.pcolormesh(
+        solver.grid_x[:solver.Nx - 1], solver.grid_y, margin_active.T,
+        cmap="RdYlGn", vmin=-vmax, vmax=vmax, shading="nearest",
+    )
+    fig.colorbar(pc_d, ax=ax_d, label=r"$1 - r_w - r_e - r_s - r_n$", shrink=0.85)
+    ax_d.set_xlabel("x")
+    ax_d.set_ylabel("y")
+    ax_d.set_title("(d) Diagonal Dominance Margin")
 
     fig.tight_layout()
     if save_path is None:
@@ -561,60 +583,35 @@ def plot_face_conductance(
 
 
 def plot_multilayer_evolution(
-    solver: FVSolver1D,
+    solver: FVSolver2D,
     T_hist: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Temperature evolution through a multilayer domain.
+    """Temperature evolution as 2D snapshots at 6 time points.
 
-    3-panel layout:
-        (a) T(x,t) heatmap with interface dashed lines
-        (b) T(x) spatial profiles at selected time snapshots
-        (c) T(t) at nodes flanking each interface (continuity check)
+    2x3 grid of pcolormesh heatmaps with shared colorbar range.
     """
     Nt = len(solver.t)
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(15, 5))
-
-    # --- Panel (a): Heatmap ---
-    T_mesh, X_mesh = np.meshgrid(solver.t, solver.grid)
-    pc = ax_a.pcolormesh(T_mesh, X_mesh, T_hist.T, cmap="inferno", shading="auto")
-    fig.colorbar(pc, ax=ax_a, label="Temperature", shrink=0.85)
-    for xi in solver.interface_positions:
-        ax_a.axhline(xi, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
-    ax_a.set_xlabel("Time")
-    ax_a.set_ylabel("x")
-    ax_a.set_title("(a) T(x, t)")
-
-    # --- Panel (b): Spatial profiles at selected times ---
     n_snaps = 6
     snap_indices = np.linspace(0, Nt - 1, n_snaps, dtype=int)
-    cmap_snap = plt.cm.viridis
-    for i, t_idx in enumerate(snap_indices):
-        color = cmap_snap(i / max(n_snaps - 1, 1))
-        ax_b.plot(solver.grid, T_hist[t_idx, :], color=color, linewidth=1.2,
-                  label=f"t={solver.t[t_idx]:.3f}")
-    for xi in solver.interface_positions:
-        ax_b.axvline(xi, color="gray", linestyle="--", alpha=0.5)
-    ax_b.set_xlabel("x")
-    ax_b.set_ylabel("Temperature")
-    ax_b.set_title("(b) Spatial Profiles")
-    ax_b.legend(fontsize=7, loc="best")
-    ax_b.grid(True, linestyle="--", alpha=0.3)
 
-    # --- Panel (c): Temperature at flanking nodes ---
-    flanks = _interface_flanking_nodes(solver)
-    for left_i, right_i, xi in flanks:
-        ax_c.plot(solver.t, T_hist[:, left_i], linewidth=1.2,
-                  label=f"Node {left_i} (left of x={xi:.2f})")
-        ax_c.plot(solver.t, T_hist[:, right_i], "--", linewidth=1.2,
-                  label=f"Node {right_i} (right of x={xi:.2f})")
-    ax_c.set_xlabel("Time")
-    ax_c.set_ylabel("Temperature")
-    ax_c.set_title("(c) Flanking Node Temperatures")
-    ax_c.legend(fontsize=7, loc="best")
-    ax_c.grid(True, linestyle="--", alpha=0.3)
+    vmin = float(T_hist[snap_indices].min())
+    vmax = float(T_hist[snap_indices].max())
 
-    fig.tight_layout()
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+
+    for idx, (ax, t_idx) in enumerate(zip(axes.ravel(), snap_indices)):
+        pc = ax.pcolormesh(solver.X, solver.Y, T_hist[t_idx],
+                           cmap="inferno", shading="auto", vmin=vmin, vmax=vmax)
+        for xi in solver.interface_positions:
+            ax.axvline(xi, color="white", linestyle="--", linewidth=0.8, alpha=0.7)
+        ax.set_title(f"t = {solver.t[t_idx]:.3f}", fontsize=10)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_aspect("equal")
+
+    fig.colorbar(pc, ax=axes, label="Temperature", shrink=0.6, pad=0.02)
+    fig.suptitle("Temperature Evolution", fontsize=13)
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "physics" / "multilayer_evolution.png"
     save_path = _ensure_parent(Path(save_path))
@@ -624,51 +621,52 @@ def plot_multilayer_evolution(
 
 
 def plot_heat_flux_profile(
-    solver: FVSolver1D,
+    solver: FVSolver2D,
     T_hist: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Numerical heat flux profiles and applied boundary forcing.
+    """Applied boundary flux and numerical x-direction flux at mid-y.
 
     2-panel layout:
-        (a) Face flux q = -G_face * (T[i+1] - T[i]) at selected time snapshots
-        (b) Applied left boundary flux q_left(t) over full simulation time
+        (a) Applied left boundary flux q_left(t) over full simulation time
+        (b) Numerical x-flux at y=mid at selected time snapshots
     """
     Nt = len(solver.t)
+    j_mid = solver.Ny // 2
     fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # --- Panel (a): Numerical flux at snapshots ---
+    # --- Panel (a): Applied boundary flux ---
+    q_left_vals = np.array([solver.q_left(ti) for ti in solver.t])
+    ax_a.plot(solver.t, q_left_vals, color="C3", linewidth=1.2)
+    ax_a.axvline(solver.t_on, color="green", linestyle=":", alpha=0.7, label=f"t_on={solver.t_on}")
+    ax_a.axvline(solver.t_off, color="red", linestyle=":", alpha=0.7, label=f"t_off={solver.t_off}")
+    ax_a.set_xlabel("Time")
+    ax_a.set_ylabel("q_left(t)")
+    ax_a.set_title("(a) Applied Boundary Flux")
+    ax_a.legend(fontsize=8)
+    ax_a.grid(True, linestyle="--", alpha=0.3)
+
+    # --- Panel (b): Numerical x-flux at mid-y ---
     n_snaps = 6
     snap_indices = np.linspace(0, Nt - 1, n_snaps, dtype=int)
-    # skip t=0 if IC is uniform (flux = 0 everywhere, not interesting)
     if snap_indices[0] == 0 and n_snaps > 1:
         snap_indices = snap_indices[1:]
 
     cmap_snap = plt.cm.viridis
     for i, t_idx in enumerate(snap_indices):
-        dT = T_hist[t_idx, 1:] - T_hist[t_idx, :-1]
-        q_face = -solver.G_face * dT
+        dT = T_hist[t_idx, 1:, j_mid] - T_hist[t_idx, :-1, j_mid]
+        G_x_mid = solver.G_x[:, j_mid]
+        q_face = -G_x_mid * dT
         color = cmap_snap(i / max(len(snap_indices) - 1, 1))
-        ax_a.plot(solver.face_positions, q_face, color=color, linewidth=1.2,
+        ax_b.plot(solver.face_positions_x, q_face, color=color, linewidth=1.2,
                   label=f"t={solver.t[t_idx]:.3f}")
 
     for xi in solver.interface_positions:
-        ax_a.axvline(xi, color="gray", linestyle="--", alpha=0.5)
-    ax_a.set_xlabel("Face position")
-    ax_a.set_ylabel("Heat flux q")
-    ax_a.set_title("(a) Numerical Face Flux")
-    ax_a.legend(fontsize=7, loc="best")
-    ax_a.grid(True, linestyle="--", alpha=0.3)
-
-    # --- Panel (b): Applied boundary flux ---
-    q_left_vals = np.array([solver.q_left(ti) for ti in solver.t])
-    ax_b.plot(solver.t, q_left_vals, color="C3", linewidth=1.2)
-    ax_b.axvline(solver.t_on, color="green", linestyle=":", alpha=0.7, label=f"t_on={solver.t_on}")
-    ax_b.axvline(solver.t_off, color="red", linestyle=":", alpha=0.7, label=f"t_off={solver.t_off}")
-    ax_b.set_xlabel("Time")
-    ax_b.set_ylabel("q_left(t)")
-    ax_b.set_title("(b) Applied Boundary Flux")
-    ax_b.legend(fontsize=8)
+        ax_b.axvline(xi, color="gray", linestyle="--", alpha=0.5)
+    ax_b.set_xlabel("Face position (x)")
+    ax_b.set_ylabel("Heat flux q")
+    ax_b.set_title(f"(b) Numerical x-Flux at y = {solver.grid_y[j_mid]:.2f}")
+    ax_b.legend(fontsize=7, loc="best")
     ax_b.grid(True, linestyle="--", alpha=0.3)
 
     fig.tight_layout()
@@ -681,69 +679,83 @@ def plot_heat_flux_profile(
 
 
 # ============================================================
-# SECTION: MMS — Method of Manufactured Solutions
+# SECTION: MMS — Method of Manufactured Solutions (2D)
 # ============================================================
 
 def plot_mms_convergence(save_path: str | Path | None = None):
-    """Run MMS at multiple refinement levels and plot L2 error convergence in log-log space.
+    """MMS convergence for all three 2D test cases in log-log space.
 
-    Left panel: spatial convergence (varying dx, fixed dt)
-    Right panel: temporal convergence (varying dt, fixed N)
-    Each panel includes data points, linear regression fit, and ideal O(h^2) reference.
+    2x3 layout:
+        Top row: spatial convergence (varying N, fixed dt) for y-independent, full 2D, interface
+        Bottom row: temporal convergence (varying dt, fixed N) for the same 3 cases
     """
-    from src.physics.mms_1d import run_mms_once
-
-    # --- spatial convergence (fix dt small enough that temporal error is negligible) ---
-    N_list = [26, 51, 101, 201, 401]
-    fixed_dt = 0.0005
-    h_vals, h_l2_errors = [], []
-    for N in N_list:
-        h, _, _, l2 = run_mms_once(N, dt=fixed_dt)
-        h_vals.append(h)
-        h_l2_errors.append(l2)
-    h_vals = np.array(h_vals)
-    h_l2_errors = np.array(h_l2_errors)
-
-    # --- temporal convergence (fix N fine enough that spatial error is negligible) ---
-    dt_list = [0.04, 0.02, 0.01, 0.005, 0.0025]
-    fixed_N = 801
-    dt_vals, dt_l2_errors = [], []
-    for dt in dt_list:
-        _, dt_val, _, l2 = run_mms_once(fixed_N, dt=dt)
-        dt_vals.append(dt_val)
-        dt_l2_errors.append(l2)
-    dt_vals = np.array(dt_vals)
-    dt_l2_errors = np.array(dt_l2_errors)
-
-    fig, (ax_x, ax_t) = plt.subplots(1, 2, figsize=(12, 5))
+    from src.physics.mms_2d import (
+        run_mms_y_independent,
+        run_mms_2d,
+        run_mms_2d_interface,
+    )
 
     # helper for log-log regression + plotting
     def _plot_convergence(ax, refinement, errors, xlabel, title):
         log_r = np.log10(refinement)
         log_e = np.log10(errors)
-
-        # linear regression in log-log
         coeffs = np.polyfit(log_r, log_e, 1)
         slope = coeffs[0]
         fit_line = 10 ** np.polyval(coeffs, log_r)
 
         ax.loglog(refinement, errors, "ko", markersize=7, label="MMS data")
         ax.loglog(refinement, fit_line, "C0-", linewidth=1.5, label=f"Fit: slope = {slope:.2f}")
-
-        # ideal O(h^2) reference
         ref = errors[-1] * (refinement / refinement[-1]) ** 2
         ax.loglog(refinement, ref, "k--", alpha=0.4, linewidth=1, label="$O(h^2)$ reference")
-
         ax.set_xlabel(xlabel)
         ax.set_ylabel("L2 error")
         ax.set_title(title)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
         ax.grid(True, which="both", linestyle="--", alpha=0.3)
 
-    _plot_convergence(ax_x, h_vals, h_l2_errors, r"$\Delta x$", f"Spatial Convergence (dt={fixed_dt})")
-    _plot_convergence(ax_t, dt_vals, dt_l2_errors, r"$\Delta t$", f"Temporal Convergence (N={fixed_N})")
+    cases = [
+        ("y-independent", run_mms_y_independent),
+        ("Full 2D", run_mms_2d),
+        ("Interface", run_mms_2d_interface),
+    ]
 
-    fig.suptitle("MMS Convergence — Crank-Nicolson FV Solver", fontsize=13)
+    # N lists: interface requires even N
+    N_lists = {
+        "y-independent": [21, 41, 81, 161],
+        "Full 2D": [21, 41, 81, 161],
+        "Interface": [50, 100, 200],
+    }
+    fixed_dt = 0.0001
+    dt_list = [0.02, 0.01, 0.005]
+    fixed_N_map = {
+        "y-independent": 201,
+        "Full 2D": 201,
+        "Interface": 200,
+    }
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+
+    for col, (name, run_fn) in enumerate(cases):
+        # spatial convergence
+        h_vals, h_l2 = [], []
+        for N in N_lists[name]:
+            h, _, _, l2 = run_fn(N, dt=fixed_dt)
+            h_vals.append(h)
+            h_l2.append(l2)
+        _plot_convergence(axes[0, col], np.array(h_vals), np.array(h_l2),
+                          r"$\Delta x$", f"{name} — Spatial (dt={fixed_dt})")
+
+        # temporal convergence
+        dt_vals, dt_l2 = [], []
+        fixed_N = fixed_N_map[name]
+        for dt_val in dt_list:
+            _, _, _, l2 = run_fn(fixed_N, dt=dt_val)
+            dt_vals.append(dt_val)
+            dt_l2.append(l2)
+        _plot_convergence(axes[1, col], np.array(dt_vals), np.array(dt_l2),
+                          r"$\Delta t$", f"{name} — Temporal (N={fixed_N})")
+
+    fig.suptitle("2D MMS Convergence — Crank-Nicolson FV Solver", fontsize=13)
     fig.tight_layout()
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "mms" / "mms_convergence.png"
@@ -754,70 +766,90 @@ def plot_mms_convergence(save_path: str | Path | None = None):
 
 
 def plot_mms_order_estimation(save_path: str | Path | None = None):
-    """Estimate spatial and temporal order from successive refinement pairs across 5+ levels.
+    """Pairwise order estimates for all three 2D MMS cases.
 
-    Left panel: estimated spatial order p_x vs dx
-    Right panel: estimated temporal order p_t vs dt
-    Horizontal reference line at p=2 (expected for Crank-Nicolson).
+    2x3 layout:
+        Top row: estimated spatial order p_x vs dx for 3 cases
+        Bottom row: estimated temporal order p_t vs dt for 3 cases
     """
-    from src.physics.mms_1d import run_mms_once
+    from src.physics.mms_2d import (
+        run_mms_y_independent,
+        run_mms_2d,
+        run_mms_2d_interface,
+    )
 
-    # --- spatial order estimation (fix dt small enough for spatial error to dominate) ---
-    N_list = [26, 51, 101, 201, 401]
-    fixed_dt = 0.0005
-    h_vals, h_l2_errors = [], []
-    for N in N_list:
-        h, _, _, l2 = run_mms_once(N, dt=fixed_dt)
-        h_vals.append(h)
-        h_l2_errors.append(l2)
+    cases = [
+        ("y-independent", run_mms_y_independent),
+        ("Full 2D", run_mms_2d),
+        ("Interface", run_mms_2d_interface),
+    ]
 
-    # pairwise order from successive refinements: p = log(e1/e2) / log(h1/h2)
-    px_vals, px_h_midpoints = [], []
-    for i in range(len(h_vals) - 1):
-        p = np.log(h_l2_errors[i] / h_l2_errors[i + 1]) / np.log(h_vals[i] / h_vals[i + 1])
-        px_vals.append(p)
-        px_h_midpoints.append(np.sqrt(h_vals[i] * h_vals[i + 1]))  # geometric midpoint
+    N_lists = {
+        "y-independent": [21, 41, 81, 161],
+        "Full 2D": [21, 41, 81, 161],
+        "Interface": [50, 100, 200],
+    }
+    fixed_dt = 0.0001
+    dt_list = [0.02, 0.01, 0.005]
+    fixed_N_map = {
+        "y-independent": 201,
+        "Full 2D": 201,
+        "Interface": 200,
+    }
 
-    # --- temporal order estimation (fix N fine enough for temporal error to dominate) ---
-    dt_list = [0.04, 0.02, 0.01, 0.005, 0.0025]
-    fixed_N = 801
-    dt_vals, dt_l2_errors = [], []
-    for dt in dt_list:
-        _, dt_val, _, l2 = run_mms_once(fixed_N, dt=dt)
-        dt_vals.append(dt_val)
-        dt_l2_errors.append(l2)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
 
-    pt_vals, pt_dt_midpoints = [], []
-    for i in range(len(dt_vals) - 1):
-        p = np.log(dt_l2_errors[i] / dt_l2_errors[i + 1]) / np.log(dt_vals[i] / dt_vals[i + 1])
-        pt_vals.append(p)
-        pt_dt_midpoints.append(np.sqrt(dt_vals[i] * dt_vals[i + 1]))
+    for col, (name, run_fn) in enumerate(cases):
+        # spatial order
+        h_vals, h_l2 = [], []
+        for N in N_lists[name]:
+            h, _, _, l2 = run_fn(N, dt=fixed_dt)
+            h_vals.append(h)
+            h_l2.append(l2)
 
-    fig, (ax_x, ax_t) = plt.subplots(1, 2, figsize=(12, 5))
+        px_vals, px_mid = [], []
+        for i in range(len(h_vals) - 1):
+            p = np.log(h_l2[i] / h_l2[i + 1]) / np.log(h_vals[i] / h_vals[i + 1])
+            px_vals.append(p)
+            px_mid.append(np.sqrt(h_vals[i] * h_vals[i + 1]))
 
-    # spatial order
-    ax_x.plot(px_h_midpoints, px_vals, "ko-", markersize=7)
-    ax_x.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
-    ax_x.set_xscale("log")
-    ax_x.set_xlabel(r"$\Delta x$ (geometric midpoint)")
-    ax_x.set_ylabel("Estimated order $p_x$")
-    ax_x.set_title(f"Spatial Order Estimation (dt={fixed_dt})")
-    ax_x.legend(fontsize=8)
-    ax_x.grid(True, linestyle="--", alpha=0.3)
-    ax_x.set_ylim(0, 4)
+        ax = axes[0, col]
+        ax.plot(px_mid, px_vals, "ko-", markersize=7)
+        ax.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
+        ax.set_xscale("log")
+        ax.set_xlabel(r"$\Delta x$ (geometric midpoint)")
+        ax.set_ylabel("Estimated order $p_x$")
+        ax.set_title(f"{name} — Spatial (dt={fixed_dt})")
+        ax.legend(fontsize=7)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.set_ylim(0, 4)
 
-    # temporal order
-    ax_t.plot(pt_dt_midpoints, pt_vals, "ko-", markersize=7)
-    ax_t.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
-    ax_t.set_xscale("log")
-    ax_t.set_xlabel(r"$\Delta t$ (geometric midpoint)")
-    ax_t.set_ylabel("Estimated order $p_t$")
-    ax_t.set_title(f"Temporal Order Estimation (N={fixed_N})")
-    ax_t.legend(fontsize=8)
-    ax_t.grid(True, linestyle="--", alpha=0.3)
-    ax_t.set_ylim(0, 4)
+        # temporal order
+        fixed_N = fixed_N_map[name]
+        dt_vals, dt_l2 = [], []
+        for dt_val in dt_list:
+            _, _, _, l2 = run_fn(fixed_N, dt=dt_val)
+            dt_vals.append(dt_val)
+            dt_l2.append(l2)
 
-    fig.suptitle("MMS Order Estimation — Successive Refinement Pairs", fontsize=13)
+        pt_vals, pt_mid = [], []
+        for i in range(len(dt_vals) - 1):
+            p = np.log(dt_l2[i] / dt_l2[i + 1]) / np.log(dt_vals[i] / dt_vals[i + 1])
+            pt_vals.append(p)
+            pt_mid.append(np.sqrt(dt_vals[i] * dt_vals[i + 1]))
+
+        ax = axes[1, col]
+        ax.plot(pt_mid, pt_vals, "ko-", markersize=7)
+        ax.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
+        ax.set_xscale("log")
+        ax.set_xlabel(r"$\Delta t$ (geometric midpoint)")
+        ax.set_ylabel("Estimated order $p_t$")
+        ax.set_title(f"{name} — Temporal (N={fixed_N})")
+        ax.legend(fontsize=7)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.set_ylim(0, 4)
+
+    fig.suptitle("2D MMS Order Estimation — Successive Refinement Pairs", fontsize=13)
     fig.tight_layout()
     if save_path is None:
         save_path = Path(__file__).resolve().parent / "mms" / "mms_order_estimation.png"
@@ -2064,7 +2096,7 @@ if __name__ == "__main__":
     if need_physics:
         print("=== PHYSICS GROUP ===")
         solver = create_demo_multilayer_solver()
-        t_sol, x_sol, T_hist = solver.solve(store_trajectory=True)
+        t_sol, gx_sol, gy_sol, T_hist = solver.solve(store_trajectory=True)
 
         physics_dir = out_dir / "physics"
 
