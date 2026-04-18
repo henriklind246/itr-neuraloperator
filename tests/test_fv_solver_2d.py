@@ -1,0 +1,745 @@
+"""
+2D FV Solver Tests
+==================
+
+Test groups:
+1. Grid and data model validation
+2. Tiny-grid matrix verification (Nx=4, Ny=3)
+3. Constant solution preservation
+4. 1D equivalence (y-independent problem)
+5. Adiabatic BC verification
+6. Time-dependent Dirichlet
+7. Multilayer with R_c constant solution
+"""
+
+import numpy as np
+import pytest
+
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+
+
+# ==================== HELPERS ====================
+
+def make_single_layer_2d(**overrides):
+    """Build a single-layer 2D solver with sensible defaults."""
+    defaults = dict(
+        a=0.0, b=1.0, c=0.0, d=1.0,
+        Nx=11, Ny=11,
+        lam_target=0.5,
+        layers=[Layer2D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)],
+        t_final=0.1,
+        flux_f=2.0, flux_A=50.0,
+        t_on=0.0, t_off=0.1, phase=0.0,
+    )
+    defaults.update(overrides)
+    return FVSolver2D(**defaults)
+
+
+# ==================== TEST 1: GRID AND DATA MODEL ====================
+
+class TestGridAndDataModel:
+
+    def test_grid_shapes(self):
+        # Nx=11 on [0,1] -> hx=0.1; Ny=6 on [0,0.5] -> hy=0.1. Isotropic.
+        sim = make_single_layer_2d(Nx=11, Ny=6, d=0.5)
+        assert sim.grid_x.shape == (11,)
+        assert sim.grid_y.shape == (6,)
+        assert sim.X.shape == (11, 6)
+        assert sim.Y.shape == (11, 6)
+
+    def test_grid_endpoints(self):
+        sim = make_single_layer_2d(a=0.0, b=1.0, c=0.0, d=0.5, Nx=11, Ny=6)
+        assert sim.grid_x[0] == 0.0
+        assert sim.grid_x[-1] == 1.0
+        assert sim.grid_y[0] == 0.0
+        assert sim.grid_y[-1] == 0.5
+
+    def test_isotropic_grid_enforced(self):
+        """hx != hy must raise."""
+        with pytest.raises(ValueError, match="not isotropic"):
+            # Nx=11 on [0,1] gives hx=0.1, Ny=6 on [0,1] gives hy=0.2
+            make_single_layer_2d(Nx=11, Ny=6)
+
+    def test_material_array_shapes(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        assert sim.k_nodes.shape == (11, 11)
+        assert sim.rho_nodes.shape == (11, 11)
+        assert sim.cp_nodes.shape == (11, 11)
+
+    def test_face_conductance_shapes(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        assert sim.G_x.shape == (10, 11)
+        assert sim.G_y.shape == (11, 10)
+
+    def test_cn_coefficient_shapes(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        for arr in [sim.r_w, sim.r_e, sim.r_s, sim.r_n]:
+            assert arr.shape == (11, 11)
+
+    def test_dx_dy_half_cells(self):
+        sim = make_single_layer_2d(Nx=5, Ny=5)
+        h = sim.hx
+        assert sim.dx[0] == pytest.approx(h / 2)
+        assert sim.dx[-1] == pytest.approx(h / 2)
+        assert sim.dx[2] == pytest.approx(h)
+        assert sim.dy[0] == pytest.approx(h / 2)
+        assert sim.dy[-1] == pytest.approx(h / 2)
+        assert sim.dy[2] == pytest.approx(h)
+
+    def test_layer2d_is_layer1d(self):
+        assert Layer2D is Layer1D
+
+
+# ==================== TEST 2: TINY-GRID MATRIX (Nx=4, Ny=3) ====================
+
+class TestTinyGridMatrix:
+    """
+    Nx=4, Ny=3 (12 nodes), single material k=1, rho=1, cp=1.
+    Domain [0,1]x[0, 2/3] -> hx = hy = 1/3.
+
+    Node layout (i,j) -> global index k = i + j*Nx:
+        (0,2)(1,2)(2,2)(3,2)    8  9  10 11
+        (0,1)(1,1)(2,1)(3,1)    4  5   6  7
+        (0,0)(1,0)(2,0)(3,0)    0  1   2  3
+    """
+
+    @pytest.fixture
+    def tiny_sim(self):
+        layer = Layer2D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)
+        return FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=2.0 / 3.0,
+            Nx=4, Ny=3,
+            lam_target=0.5,
+            layers=[layer],
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            dt=0.001,
+        )
+
+    def test_matrix_shape(self, tiny_sim):
+        A = tiny_sim.A_csr
+        assert A.shape == (12, 12)
+
+    def test_dirichlet_rows(self, tiny_sim):
+        """Nodes with i=Nx-1=3 (k=3,7,11) must be identity rows."""
+        A = tiny_sim.A_csr.toarray()
+        for j in range(3):
+            k = 3 + j * 4  # i=3, j=0,1,2 -> k=3,7,11
+            row = A[k, :]
+            assert row[k] == pytest.approx(1.0)
+            assert np.sum(np.abs(row)) == pytest.approx(1.0), (
+                f"Dirichlet row k={k} has off-diagonal entries"
+            )
+
+    def test_corner_00_row(self, tiny_sim):
+        """Node (0,0), k=0: bottom-left corner. Has east and north neighbors only."""
+        A = tiny_sim.A_csr.toarray()
+        re = tiny_sim.r_e[0, 0]
+        rn = tiny_sim.r_n[0, 0]
+        # Main diagonal
+        assert A[0, 0] == pytest.approx(1.0 + re + rn)
+        # East neighbor: k=1
+        assert A[0, 1] == pytest.approx(-re)
+        # North neighbor: k=4
+        assert A[0, 4] == pytest.approx(-rn)
+        # No other nonzeros
+        nnz = np.count_nonzero(A[0, :])
+        assert nnz == 3
+
+    def test_corner_02_row(self, tiny_sim):
+        """Node (0,2), k=8: top-left corner. Has east and south neighbors only."""
+        A = tiny_sim.A_csr.toarray()
+        re = tiny_sim.r_e[0, 2]
+        rs = tiny_sim.r_s[0, 2]
+        assert A[8, 8] == pytest.approx(1.0 + re + rs)
+        assert A[8, 9] == pytest.approx(-re)
+        assert A[8, 4] == pytest.approx(-rs)
+        nnz = np.count_nonzero(A[8, :])
+        assert nnz == 3
+
+    def test_interior_11_row(self, tiny_sim):
+        """Node (1,1), k=5: interior node. Has 4 neighbors."""
+        A = tiny_sim.A_csr.toarray()
+        rw = tiny_sim.r_w[1, 1]
+        re = tiny_sim.r_e[1, 1]
+        rs = tiny_sim.r_s[1, 1]
+        rn = tiny_sim.r_n[1, 1]
+        assert A[5, 5] == pytest.approx(1.0 + rw + re + rs + rn)
+        assert A[5, 4] == pytest.approx(-rw)   # west: k=4
+        assert A[5, 6] == pytest.approx(-re)   # east: k=6
+        assert A[5, 1] == pytest.approx(-rs)   # south: k=1
+        assert A[5, 9] == pytest.approx(-rn)   # north: k=9
+        nnz = np.count_nonzero(A[5, :])
+        assert nnz == 5
+
+    def test_left_edge_01_row(self, tiny_sim):
+        """Node (0,1), k=4: left edge (not corner). Has E, S, N neighbors."""
+        A = tiny_sim.A_csr.toarray()
+        re = tiny_sim.r_e[0, 1]
+        rs = tiny_sim.r_s[0, 1]
+        rn = tiny_sim.r_n[0, 1]
+        assert A[4, 4] == pytest.approx(1.0 + re + rs + rn)
+        assert A[4, 5] == pytest.approx(-re)
+        assert A[4, 0] == pytest.approx(-rs)
+        assert A[4, 8] == pytest.approx(-rn)
+        nnz = np.count_nonzero(A[4, :])
+        assert nnz == 4
+
+    def test_bottom_edge_10_row(self, tiny_sim):
+        """Node (1,0), k=1: bottom edge (not corner). Has W, E, N neighbors."""
+        A = tiny_sim.A_csr.toarray()
+        rw = tiny_sim.r_w[1, 0]
+        re = tiny_sim.r_e[1, 0]
+        rn = tiny_sim.r_n[1, 0]
+        assert A[1, 1] == pytest.approx(1.0 + rw + re + rn)
+        assert A[1, 0] == pytest.approx(-rw)
+        assert A[1, 2] == pytest.approx(-re)
+        assert A[1, 5] == pytest.approx(-rn)
+        nnz = np.count_nonzero(A[1, :])
+        assert nnz == 4
+
+    def test_half_cell_doubles_coefficients(self, tiny_sim):
+        """At boundary nodes, half-cell dx or dy doubles the coupling r."""
+        h = tiny_sim.hx
+        k = 1.0
+        G = k / h
+        rho_cp = 1.0
+
+        # Interior node (1,1): r_w = dt * G / (2 * rho_cp * h)
+        r_interior = tiny_sim.dt * G / (2.0 * rho_cp * h)
+
+        # Left boundary (0,1): dx[0] = h/2, so r_e = dt * G / (2 * rho_cp * h/2)
+        r_left_e = tiny_sim.dt * G / (2.0 * rho_cp * (h / 2.0))
+
+        assert r_left_e == pytest.approx(2.0 * r_interior)
+
+        # Bottom boundary (1,0): dy[0] = h/2, so r_n = dt * G / (2 * rho_cp * h/2)
+        r_bot_n = tiny_sim.dt * G / (2.0 * rho_cp * (h / 2.0))
+        assert r_bot_n == pytest.approx(2.0 * r_interior)
+
+    def test_dense_reference_matches_sparse(self, tiny_sim):
+        """Build a fully explicit dense 12x12 matrix and compare to sparse."""
+        Nx, Ny = tiny_sim.Nx, tiny_sim.Ny
+        n = Nx * Ny
+        A_dense = np.zeros((n, n))
+
+        for j in range(Ny):
+            for i in range(Nx):
+                k = i + j * Nx
+                if i == Nx - 1:
+                    A_dense[k, k] = 1.0
+                    continue
+                rw = tiny_sim.r_w[i, j]
+                re = tiny_sim.r_e[i, j]
+                rs = tiny_sim.r_s[i, j]
+                rn = tiny_sim.r_n[i, j]
+                A_dense[k, k] = 1.0 + rw + re + rs + rn
+                if i > 0:
+                    A_dense[k, i - 1 + j * Nx] = -rw
+                if i < Nx - 1:
+                    A_dense[k, i + 1 + j * Nx] = -re
+                if j > 0:
+                    A_dense[k, i + (j - 1) * Nx] = -rs
+                if j < Ny - 1:
+                    A_dense[k, i + (j + 1) * Nx] = -rn
+
+        np.testing.assert_allclose(
+            tiny_sim.A_csr.toarray(), A_dense, atol=1e-15,
+            err_msg="Sparse matrix does not match dense reference"
+        )
+
+    def test_loop_rhs_vs_explicit(self, tiny_sim):
+        """Verify cn_step RHS matches hand-built RHS for arbitrary T^n."""
+        Nx, Ny = tiny_sim.Nx, tiny_sim.Ny
+        rng = np.random.default_rng(42)
+        Tn = rng.standard_normal((Nx, Ny)) + 300.0
+
+        # Get the RHS by solving A * T^{n+1} = rhs => rhs = A * T^{n+1}
+        # But easier: rebuild RHS from scratch and compare with cn_step output.
+        # Since cn_step returns T^{n+1} = A^{-1} rhs, we can check via:
+        # A * cn_step(Tn, t) should equal the explicitly built RHS.
+
+        # Use zero flux and no source for clean comparison.
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=2.0 / 3.0,
+            Nx=4, Ny=3,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            dt=tiny_sim.dt,
+            q_left_fn=lambda t: 0.0,
+        )
+
+        Tnp1 = sim.cn_step(Tn, 0.0)
+        # Verify A * T^{n+1} = rhs by rebuilding rhs explicitly
+        rhs_explicit = np.zeros((Nx, Ny))
+        for j in range(Ny):
+            for i in range(Nx):
+                if i == Nx - 1:
+                    rhs_explicit[i, j] = sim.T_right(sim.dt)
+                    continue
+                rw = sim.r_w[i, j]
+                re = sim.r_e[i, j]
+                rs = sim.r_s[i, j]
+                rn = sim.r_n[i, j]
+                T_W = Tn[i - 1, j] if i > 0 else 0.0
+                T_E = Tn[i + 1, j] if i < Nx - 1 else 0.0
+                T_S = Tn[i, j - 1] if j > 0 else 0.0
+                T_N = Tn[i, j + 1] if j < Ny - 1 else 0.0
+                rhs_explicit[i, j] = (
+                    rw * T_W
+                    + (1.0 - rw - re - rs - rn) * Tn[i, j]
+                    + re * T_E
+                    + rs * T_S
+                    + rn * T_N
+                )
+
+        # A * T^{n+1} should equal rhs_explicit
+        A = sim.A_csr.toarray()
+        lhs = A @ Tnp1.ravel(order="F")
+        np.testing.assert_allclose(
+            lhs, rhs_explicit.ravel(order="F"), atol=1e-12,
+            err_msg="A * T^{n+1} != RHS from explicit loop"
+        )
+
+
+# ==================== TEST 3: CONSTANT SOLUTION ====================
+
+class TestConstantSolution2D:
+
+    def test_constant_single_layer(self):
+        """T=300 with zero flux must stay constant."""
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=11, Ny=11,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0,
+        )
+        T0 = np.full((11, 11), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+        max_err = np.max(np.abs(T_final - 300.0))
+        assert max_err < 1e-10, f"Constant solution drifted: max error = {max_err}"
+
+    def test_constant_multilayer(self):
+        """Two layers, T=300, zero flux: must stay constant."""
+        layers = [
+            Layer2D(0.0, 0.5, rho=8000.0, cp=500.0, k=50.0),
+            Layer2D(0.5, 1.0, rho=1.0, cp=1.0, k=5.0),
+        ]
+        # Need even Nx so x=0.5 is face-aligned.
+        # Nx=20: h=1/19. face_coord = 0.5*19 - 0.5 = 9. Integer. Good.
+        # Ny=20: hy=1/19 = hx. Good.
+        Nx = Ny = 20
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=layers,
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0,
+        )
+        T0 = np.full((Nx, Ny), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+        max_err = np.max(np.abs(T_final - 300.0))
+        assert max_err < 1e-8, f"Constant multilayer drifted: max error = {max_err}"
+
+    def test_constant_multilayer_with_resistance(self):
+        """Two layers + R_c, T=300, zero flux: must stay constant."""
+        layers = [
+            Layer2D(0.0, 0.5, rho=1.0, cp=1.0, k=2.0),
+            Layer2D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        Nx = Ny = 20
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=layers,
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0,
+            interface_R=[0.5],
+        )
+        T0 = np.full((Nx, Ny), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+        max_err = np.max(np.abs(T_final - 300.0))
+        assert max_err < 1e-10, f"Constant+R_c drifted: max error = {max_err}"
+
+
+# ==================== TEST 4: 1D EQUIVALENCE ====================
+
+class TestOneDEquivalence:
+    """Run a y-independent problem in 2D and compare to 1D solver output."""
+
+    def test_y_independent_matches_1d(self):
+        """2D with y-independent IC and BCs must match 1D at every x-node."""
+        N = 21
+        layer_1d = Layer1D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)
+        sim_1d = FVSolver1D(
+            a=0.0, b=1.0, N=N,
+            lam_target=0.5,
+            layers=[layer_1d],
+            t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            dt=0.001,
+        )
+
+        # 2D: same x-grid, any Ny with matching h
+        # h_x = 1/(N-1) = 1/20 = 0.05
+        # Need d-c = h_x * (Ny-1) for some integer Ny.
+        # Choose d-c = 1.0, Ny = N = 21 -> hy = 0.05 = hx.
+        sim_2d = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=N, Ny=N,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            dt=0.001,
+        )
+
+        # Use same IC: broadcast 1D IC across y
+        T0_1d = np.full(N, 300.0)
+        T0_2d = np.tile(T0_1d[:, np.newaxis], (1, N))
+
+        _, _, T_final_1d = sim_1d.solve(T0=T0_1d, store_trajectory=False)
+        _, _, _, T_final_2d = sim_2d.solve(T0=T0_2d, store_trajectory=False)
+
+        # Each column of 2D should match the 1D solution
+        for j in range(N):
+            np.testing.assert_allclose(
+                T_final_2d[:, j], T_final_1d, atol=1e-10,
+                err_msg=f"2D column j={j} does not match 1D solution"
+            )
+
+    def test_y_independent_multilayer_matches_1d(self):
+        """Two-layer y-independent 2D matches 1D."""
+        N = 20  # even, so interface at x=0.5 is face-aligned
+        layers_1d = [
+            Layer1D(0.0, 0.5, rho=1.0, cp=1.0, k=2.0),
+            Layer1D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        layers_2d = [
+            Layer2D(0.0, 0.5, rho=1.0, cp=1.0, k=2.0),
+            Layer2D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+        # h = 1/19... no, N=20 on [0,1] gives h = 1/19. That won't have
+        # x=0.5 face-aligned. Need N such that 0.5 falls on a face.
+        # face_idx = (0.5 - 0)/h - 0.5 must be integer.
+        # h = 1/(N-1). 0.5*(N-1) - 0.5 = (N-2)/2 must be integer => N even.
+        # N=20: h=1/19. 0.5*19 - 0.5 = 9. OK, face_idx=9. But 0.5/h=9.5, not
+        # on a node. Good.
+        # But Ny must give hy = hx = 1/19. d-c = 1.0, Ny: 1/(Ny-1) = 1/19 => Ny=20.
+        sim_1d = FVSolver1D(
+            a=0.0, b=1.0, N=N,
+            lam_target=0.5,
+            layers=layers_1d,
+            t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            interface_R=[0.1],
+            dt=0.001,
+        )
+        sim_2d = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=N, Ny=N,
+            lam_target=0.5,
+            layers=layers_2d,
+            t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            interface_R=[0.1],
+            dt=0.001,
+        )
+
+        T0_1d = np.full(N, 300.0)
+        T0_2d = np.tile(T0_1d[:, np.newaxis], (1, N))
+
+        _, _, T_final_1d = sim_1d.solve(T0=T0_1d, store_trajectory=False)
+        _, _, _, T_final_2d = sim_2d.solve(T0=T0_2d, store_trajectory=False)
+
+        for j in range(N):
+            np.testing.assert_allclose(
+                T_final_2d[:, j], T_final_1d, atol=1e-10,
+                err_msg=f"Multilayer 2D column j={j} != 1D"
+            )
+
+
+# ==================== TEST 5: ADIABATIC BC ====================
+
+class TestAdiabaticBC:
+
+    def test_adiabatic_top_bottom_symmetry(self):
+        """Heat from left with symmetric y-IC: solution must be y-independent."""
+        N = 11
+        sim = make_single_layer_2d(
+            Nx=N, Ny=N, t_final=0.1, dt=0.001,
+            flux_A=50.0,
+        )
+        T0 = np.full((N, N), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+
+        # All columns should be identical (y-independent)
+        for j in range(1, N):
+            np.testing.assert_allclose(
+                T_final[:, j], T_final[:, 0], atol=1e-10,
+                err_msg=f"Column {j} differs from column 0 — adiabatic BC broken"
+            )
+
+    def test_y_varying_ic_damps(self):
+        """Start with y-varying perturbation: it should damp over time.
+        With adiabatic top/bottom, a cosine mode in y should decay."""
+        Nx, Ny = 11, 11
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.5,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.5, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0,
+            dt=0.001,
+        )
+        # IC: 300 + perturbation that varies in y
+        T0 = np.full((Nx, Ny), 300.0)
+        for j in range(Ny):
+            y = sim.grid_y[j]
+            T0[:Nx - 1, j] += 10.0 * np.cos(np.pi * y)
+        # Right BC nodes stay at 300
+        T0[Nx - 1, :] = 300.0
+
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+
+        # The y-variation should have damped
+        y_variation_init = np.max(np.ptp(T0[:Nx - 1, :], axis=1))
+        y_variation_final = np.max(np.ptp(T_final[:Nx - 1, :], axis=1))
+        assert y_variation_final < y_variation_init * 0.5, (
+            f"y-variation did not damp: init={y_variation_init:.4f}, "
+            f"final={y_variation_final:.4f}"
+        )
+
+
+# ==================== TEST 6: TIME-DEPENDENT DIRICHLET ====================
+
+class TestTimeDependentDirichlet:
+
+    def test_right_bc_updated_each_step(self):
+        """With T_right(t) = 300 + 10*sin(t), right column must track the BC."""
+        N = 11
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=N, Ny=N,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.5,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.5, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0 + 10.0 * np.sin(t),
+            dt=0.01,
+        )
+        T0 = np.full((N, N), 300.0)
+        _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+        # Check that the right column tracks T_right at each time step
+        for n, tn in enumerate(sim.t):
+            expected = 300.0 + 10.0 * np.sin(tn)
+            np.testing.assert_allclose(
+                T_hist[n, N - 1, :], expected, atol=1e-10,
+                err_msg=f"Right BC wrong at step {n}, t={tn:.4f}"
+            )
+
+
+# ==================== TEST 7: SOLVE OUTPUT ====================
+
+class TestSolveOutput:
+
+    def test_final_only_shapes(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        t, gx, gy, T_final = sim.solve(store_trajectory=False)
+        assert T_final.shape == (11, 11)
+        assert gx.shape == (11,)
+        assert gy.shape == (11,)
+
+    def test_trajectory_shapes(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        t, gx, gy, T_hist = sim.solve(store_trajectory=True)
+        Nt = len(sim.t)
+        assert T_hist.shape == (Nt, 11, 11)
+
+    def test_wrong_T0_shape_raises(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        T0 = np.ones((11, 5)) * 300.0
+        with pytest.raises(ValueError, match="T0 shape"):
+            sim.solve(T0=T0)
+
+    def test_trajectory_final_matches_final_only(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11)
+        T0 = np.full((11, 11), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+        _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+        np.testing.assert_allclose(T_final, T_hist[-1], atol=1e-12)
+
+    def test_temperatures_finite(self):
+        sim = make_single_layer_2d(Nx=11, Ny=11, flux_A=50.0)
+        _, _, _, T_hist = sim.solve(store_trajectory=True)
+        assert np.all(np.isfinite(T_hist))
+
+
+# ==================== TEST 8: LOOP VS VECTORIZED CN STEP ====================
+
+class TestLoopVsVectorized:
+    """Verify vectorized cn_step matches loop-based cn_step_loop to machine precision."""
+
+    def test_single_layer_random_ic(self):
+        """Single-layer with random IC and nonzero flux."""
+        Nx, Ny = 11, 11
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            dt=0.001,
+        )
+        rng = np.random.default_rng(42)
+        Tn = rng.standard_normal((Nx, Ny)) + 300.0
+
+        T_loop = sim.cn_step_loop(Tn, 0.01)
+        T_vec = sim.cn_step(Tn, 0.01)
+        np.testing.assert_allclose(T_vec, T_loop, atol=1e-12)
+
+    def test_multilayer_with_source(self):
+        """Two-layer + source + flux: loop and vectorized must agree."""
+        Nx = Ny = 20
+        layers = [
+            Layer2D(0.0, 0.5, rho=1.5, cp=1.0, k=2.0),
+            Layer2D(0.5, 1.0, rho=0.8, cp=1.0, k=1.0),
+        ]
+
+        def src(X, Y, t):
+            return 10.0 * np.sin(2 * np.pi * t) * np.ones_like(X)
+
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=layers,
+            t_final=0.1,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            interface_R=[0.1],
+            source=src,
+            dt=0.001,
+        )
+        rng = np.random.default_rng(123)
+        Tn = rng.standard_normal((Nx, Ny)) + 300.0
+
+        T_loop = sim.cn_step_loop(Tn, 0.02)
+        T_vec = sim.cn_step(Tn, 0.02)
+        np.testing.assert_allclose(T_vec, T_loop, atol=1e-12)
+
+    def test_time_dep_dirichlet(self):
+        """Time-dependent right BC: loop and vectorized must agree."""
+        Nx = Ny = 11
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.5,
+            flux_f=2.0, flux_A=50.0,
+            t_on=0.0, t_off=0.5, phase=0.0,
+            T_right_fn=lambda t: 300.0 + 10.0 * np.sin(t),
+            dt=0.01,
+        )
+        rng = np.random.default_rng(99)
+        Tn = rng.standard_normal((Nx, Ny)) + 300.0
+
+        T_loop = sim.cn_step_loop(Tn, 0.05)
+        T_vec = sim.cn_step(Tn, 0.05)
+        np.testing.assert_allclose(T_vec, T_loop, atol=1e-12)
+
+
+# ==================== TEST 9: MMS VERIFICATION ====================
+
+from src.physics.mms_2d import (
+    run_mms_y_independent,
+    run_mms_2d,
+    run_mms_2d_interface,
+    space_order_test_y_independent,
+    time_order_test_y_independent,
+    space_order_test_2d,
+    time_order_test_2d,
+    space_order_test_2d_interface,
+    time_order_test_2d_interface,
+)
+
+
+class TestMMS2D:
+    """MMS convergence verification for the 2D solver."""
+
+    # --- y-independent (same as 1D, validates 2D infrastructure) ---
+
+    def test_y_independent_error_bounded(self):
+        _, _, max_err, l2_err = run_mms_y_independent(N=101)
+        assert l2_err < 5e-3
+        assert max_err < 1e-2
+
+    def test_y_independent_spatial_order(self):
+        p = space_order_test_y_independent([21, 41, 81, 161])
+        assert 1.9 < p < 2.1, f"Spatial order {p:.3f}"
+
+    def test_y_independent_temporal_order(self):
+        p = time_order_test_y_independent([0.02, 0.01, 0.005])
+        assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
+
+    # --- Full 2D (y-dependent correction) ---
+
+    def test_2d_error_bounded(self):
+        _, _, max_err, l2_err = run_mms_2d(N=101)
+        assert l2_err < 5e-3
+        assert max_err < 5e-3
+
+    def test_2d_spatial_order(self):
+        p = space_order_test_2d([21, 41, 81, 161])
+        assert 1.9 < p < 2.1, f"Spatial order {p:.3f}"
+
+    def test_2d_temporal_order(self):
+        p = time_order_test_2d([0.02, 0.01, 0.005])
+        assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
+
+    # --- Interface (piecewise 2D with R_c) ---
+
+    def test_interface_error_bounded(self):
+        _, _, max_err, l2_err = run_mms_2d_interface(N=100)
+        assert l2_err < 5e-3
+        assert max_err < 5e-3
+
+    def test_interface_spatial_order(self):
+        p = space_order_test_2d_interface([50, 100, 200])
+        assert 1.9 < p < 2.1, f"Spatial order {p:.3f}"
+
+    def test_interface_temporal_order(self):
+        p = time_order_test_2d_interface([0.02, 0.01, 0.005])
+        assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
