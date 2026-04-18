@@ -6,7 +6,6 @@ from src.physics.fv_solver_1d import (
     Layer1D,
     windowed_sin_flux,
     compute_dt,
-    ic,
 )
 
 # ---------- SOLVER RESTRICTIONS -----------
@@ -23,6 +22,15 @@ from src.physics.fv_solver_1d import (
 
 # Alias for clarity — layers are identical to 1D (x-slabs).
 Layer2D = Layer1D
+
+
+def ic(X: np.ndarray, Y: np.ndarray, a: float, b: float, c: float, d: float) -> np.ndarray:
+    # returns a 2d array with shape (Nx, Ny)
+    Lx = b - a
+    Ly = d - c
+    fx = np.cos((np.pi * X) / (2 * Lx)) + 0.1 * np.sin((np.pi * X) / Lx)
+    fy = np.cos((np.pi * Y) / (2 * Ly)) + 0.1 * np.sin((np.pi * Y) / Ly)
+    return fx * fy
 
 
 class FVSolver2D:
@@ -602,10 +610,7 @@ class FVSolver2D:
         Nx, Ny = self.Nx, self.Ny
 
         if T0 is None:
-            # Default IC: broadcast 1D ic across y, add right BC offset
-            T = np.tile(
-                ic(self.grid_x, self.a, self.b)[:, np.newaxis], (1, Ny)
-            ).astype(float)
+            T = ic(self.X, self.Y, self.a, self.b, self.c, self.d).astype(float)
             T += self.T_right(0.0)
         else:
             T = np.asarray(T0, dtype=float)
