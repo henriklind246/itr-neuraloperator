@@ -156,11 +156,23 @@ class FVSolver2D:
         self.dx[0] = self.hx / 2.0
         self.dx[Nx - 1] = self.hx / 2.0
 
+        # Off-center interface adjustment: when an interface at face slot face_idx shifts from the node midpoint, the cells flanking it get
+        # wider/narrower. Interfaces are forbidden in face slots 0 and Nx-2,
+        # so only interior full-width cells are ever touched here.
+        for face_idx, (h_L, h_R) in self.interface_offsets.items():
+            self.dx[face_idx]     = 0.5 * self.hx + h_L
+            self.dx[face_idx + 1] = h_R + 0.5 * self.hx
+
         # dy[j] = h/2 at boundaries, h otherwise
         # create an arary with length Ny with sizes of control volumes in the y-dir.
         self.dy = np.full(Ny, self.hx)
         self.dy[0] = self.hx / 2.0
         self.dy[Ny - 1] = self.hx / 2.0
+
+        # Patch face_positions_x at interface slots to reflect the actual
+        # x_int rather than the midpoint (cosmetic: used by diagnostic plots).
+        for face_idx, (layer_L, _) in self.interface_face_map.items():
+            self.face_positions_x[face_idx] = self.interface_positions[layer_L]
 
         # -------- FACE CONDUCTANCE --------
         # x-face conductance's allow for contact resistance, that is, interface handling R_c
@@ -236,9 +248,25 @@ class FVSolver2D:
         return [self.layers[j].x_right for j in range(len(self.layers) - 1)]
 
     def _validate_and_index_interfaces(self) -> dict[int, tuple[int, int]]:
-        interface_face_map: dict[int, tuple[int, int]] = {}
+        """
+        Validate interfaces and assign each to a face slot.
 
+        Interfaces may lie anywhere strictly between two adjacent nodes
+        (face slot face_idx lies between nodes face_idx and face_idx+1).
+        Off-midpoint interfaces are supported via per-interface offsets
+        (h_L, h_R) stored in self.interface_offsets, where h_L + h_R = hx.
+
+        Restrictions:
+        (1) interfaces on nodes are invalid (degenerate),
+        (2) interfaces in the first or last face slot are invalid — those
+            slots touch the Neumann/Dirichlet half-cell BCs.
+        """
+        interface_face_map: dict[int, tuple[int, int]] = {}
+        interface_offsets: dict[int, tuple[float, float]] = {}
+
+        # first validate the interface location
         for j, x_int in enumerate(self.interface_positions):
+            # Reject on-node interfaces (degenerate).
             node_coord = (x_int - self.a) / self.hx
             if np.isclose(
                 node_coord, round(node_coord), atol=self.tol, rtol=0.0
@@ -248,24 +276,32 @@ class FVSolver2D:
                     f"That is not allowed."
                 )
 
-            face_coord = (x_int - self.a) / self.hx - 0.5
-            face_idx = int(round(face_coord))
-            if not np.isclose(
-                face_coord, face_idx, atol=self.tol, rtol=0.0
-            ):
+            # Locate the face slot: interface sits between nodes
+            # face_idx and face_idx+1.
+            face_idx = int(np.floor((x_int - self.a) / self.hx))
+            if face_idx < 1 or face_idx > self.Nx - 3:
                 raise ValueError(
-                    f"Internal interface x={x_int} is not face-aligned. "
-                    f"That is not allowed."
+                    f"Interface x={x_int} falls in a boundary-adjacent face "
+                    f"slot (face_idx={face_idx}); must satisfy "
+                    f"1 <= face_idx <= {self.Nx - 3} so the Neumann/Dirichlet "
+                    f"half-cell BCs stay intact."
                 )
 
-            if face_idx < 0 or face_idx > self.Nx - 2:
+            x_left_node = self.a + face_idx * self.hx
+            x_right_node = self.a + (face_idx + 1) * self.hx
+            h_L = x_int - x_left_node
+            h_R = x_right_node - x_int
+            if h_L <= self.tol or h_R <= self.tol:
                 raise ValueError(
-                    f"Computed face index {face_idx} out of range for "
-                    f"interface x={x_int}"
+                    f"Interface x={x_int} is too close to a node "
+                    f"(h_L={h_L}, h_R={h_R})."
                 )
 
+            # after validation, create face map and dict of interface offsets
             interface_face_map[face_idx] = (j, j + 1)
+            interface_offsets[face_idx] = (float(h_L), float(h_R))
 
+        self.interface_offsets = interface_offsets
         return interface_face_map
 
     def _layer_index_for_position(self, x: float) -> int:
@@ -319,12 +355,11 @@ class FVSolver2D:
         for i, x_face in enumerate(self.face_positions_x):
             if i in self.interface_face_map:
                 left_idx, right_idx = self.interface_face_map[i]
+                h_L, h_R = self.interface_offsets[i]
                 kL = self.layers[left_idx].k
                 kR = self.layers[right_idx].k
                 Rc = self.interface_R[left_idx]
-                G_x_1d[i] = 1.0 / (
-                    self.hx / (2.0 * kL) + Rc + self.hx / (2.0 * kR)
-                )
+                G_x_1d[i] = 1.0 / (h_L / kL + Rc + h_R / kR)
             else:
                 layer_idx = self._layer_index_for_face_interior(x_face)
                 G_x_1d[i] = self.layers[layer_idx].k / self.hx
