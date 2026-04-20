@@ -1,19 +1,27 @@
 import numpy as np
-from src.physics.fv_solver_1d import FVSolver1D, Layer1D
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from scipy.stats import qmc
 
 
-def random_ic(a: float, b: float, grid: np.ndarray, rng) -> np.ndarray:
-    L = b - a
+def random_ic(a: float, b: float, c: float, d: float,
+              X: np.ndarray, Y: np.ndarray, rng) -> np.ndarray:
+    Lx = b - a
+    Ly = d - c
 
-    # random linear combination, simple but random
-    c0 = rng.uniform(0.5, 1.5)
-    c1 = rng.uniform(-0.3, 0.3)
-    c2 = rng.uniform(-0.3, 0.3)
+    # x-direction random combination
+    cx0 = rng.uniform(0.5, 1.5)
+    cx1 = rng.uniform(-0.3, 0.3)
+    cx2 = rng.uniform(-0.3, 0.3)
+    fx = (cx0 * np.cos((np.pi * X) / (2.0 * Lx)) + cx1 * np.sin((np.pi * X) / Lx) + cx2 * np.cos((2.0 * np.pi * X) / Lx))
 
-    return (
-        c0 * np.cos((np.pi * grid)/(2.0*L)) + c1 * np.sin((np.pi * grid)/L) + c2 * np.cos((2*np.pi*grid)/L)
-    ).astype(np.float32)
+    # y-direction random combination
+    cy0 = rng.uniform(0.5, 1.5)
+    cy1 = rng.uniform(-0.3, 0.3)
+    cy2 = rng.uniform(-0.3, 0.3)
+    fy = (cy0 * np.cos((np.pi * Y) / (2.0 * Ly)) + cy1 * np.sin((np.pi * Y) / Ly) + cy2 * np.cos((2.0 * np.pi * Y) / Ly))
+
+    return (fx * fy).astype(np.float32)
+
 
 def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
 
@@ -51,7 +59,7 @@ def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
     return samples_scaled
 
 
-def build_sim_params(a: float, b: float, grid: np.ndarray, num_sims: int, rng, lhs_seed: int = 0) -> list:
+def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: np.ndarray, num_sims: int, rng, lhs_seed: int = 0) -> list:
 
     samples_scaled = generate_lhs_samples(num_sims=num_sims, seed=lhs_seed)
 
@@ -60,11 +68,7 @@ def build_sim_params(a: float, b: float, grid: np.ndarray, num_sims: int, rng, l
     frequencies = samples_scaled[:, 1]
     R_c_values  = samples_scaled[:, 2]
 
-    T0_list = []
-
-    for _ in range(num_sims):
-        T0 = random_ic(a=a, b=b, grid=grid, rng=rng)
-        T0_list.append(T0)
+    T0_list = [random_ic(a, b, c, d, X, Y, rng) for _ in range(num_sims)]
 
     # shape: [(amp, freq, T0, R_c), ...]
     sim_params = list(zip(amplitudes, frequencies, T0_list, R_c_values))
@@ -77,8 +81,8 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     rng = np.random.default_rng(0)
 
     # fixed grid geometry and time parameters
-    a, b, N = 0.0, 1.0, 100
-    grid = np.linspace(a, b, N)
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    Nx, Ny = 100, 100
     dt = 0.005
     t_final = 1.0
 
@@ -87,47 +91,55 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     phase = 0.0
     tukey_alpha = 0.5
 
+    x_grid = np.linspace(a, b, Nx)
+    y_grid = np.linspace(c, d, Ny)
+    X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
+
     # compute Nt from the time grid (same for all sims since dt and t_final are fixed)
     t_grid_template = np.arange(0.0, t_final + 1e-12, dt)
-    Nx = N
     Nt = len(t_grid_template)
 
     # Fixed materials: k1=2, k2=1, rho=cp=1 for both layers
     layers = [
-        Layer1D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
-        Layer1D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+        Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
+        Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
 
     print("Building simulation parameters.")
 
     # shape: [(amp, freq, T0, R_c), ...]
-    sim_params = build_sim_params(a=a, b=b, grid=grid, num_sims=num_sims, rng=rng, lhs_seed=0)
+    sim_params = build_sim_params(a=a, b=b, c=c, d=d, X=X, Y=Y,
+                                  num_sims=num_sims, rng=rng, lhs_seed=0)
 
-    trajectories = np.zeros((num_sims, Nt, Nx), dtype=np.float32)
+    trajectories = np.zeros((num_sims, Nt, Nx, Ny), dtype=np.float32)
 
     for i, (amp, freq, T0, R_c) in enumerate(sim_params):
-        sim = FVSolver1D(
-            a=a, b=b, N=N, lam_target=0.8, layers=layers,
+        sim = FVSolver2D(
+            a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
+            lam_target=0.8, layers=layers,
             t_final=t_final, flux_f=float(freq), flux_A=float(amp),
-            t_on=t_on, t_off=t_off, phase=phase, dt=dt, tukey_alpha=tukey_alpha,
+            t_on=t_on, t_off=t_off, phase=phase,
+            dt=dt, tukey_alpha=tukey_alpha,
             interface_R=[float(R_c)],
         )
 
-        t, x, T_hist = sim.solve(T0=T0, store_trajectory=True)
+        t, x, y, T_hist = sim.solve(T0=T0, store_trajectory=True)
 
-        trajectories[i, :, :] = T_hist.astype(np.float32)
+        trajectories[i] = T_hist.astype(np.float32)
 
         print(f"Finished simulation {i}")
 
-    # x and t are the same for all simulations, so just use the last ones
+    # x, y, and t are the same for all simulations, so just use the last ones
     x_grid = x.astype(np.float32)
+    y_grid = y.astype(np.float32)
     t_grid = t.astype(np.float32)
 
     np.save("x_grid.npy", x_grid)
+    np.save("y_grid.npy", y_grid)
     np.save("t_grid.npy", t_grid)
     np.save("trajectories.npy", trajectories)
     np.save("sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
-    print("Saved:", x_grid.shape, t_grid.shape, trajectories.shape)
+    print("Saved:", x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape)
 
 if __name__ == '__main__':
     generate_sim_data(num_sims=4000)
