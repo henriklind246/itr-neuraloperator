@@ -3,6 +3,7 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import TwoSlopeNorm
 
 from data.dataset import (
     AMP_RANGE,
@@ -48,6 +49,8 @@ PLOT_REGISTRY: dict[str, str] = {
     "lead_time_coverage":        "data",
     "lead_time_error":           "data",
     "parameter_error_slices":    "data",
+    "dataset_summary":           "data",
+    "interface_jump_summary":    "data",
     # group: sweep
     "sweep_ranking":             "sweep",
     "sweep_convergence":         "sweep",
@@ -56,11 +59,53 @@ PLOT_REGISTRY: dict[str, str] = {
 
 GROUPS = {"physics", "mms", "training", "data", "sweep"}
 
+PLOT_STYLE = {
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "legend.fontsize": 8,
+    "lines.linewidth": 1.6,
+    "grid.alpha": 0.3,
+    "grid.linestyle": "--",
+    "legend.frameon": False,
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+}
+
 
 def _ensure_parent(path: Path) -> Path:
     """Create parent directory if needed and return path unchanged."""
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _default_plot_path(group: str, name: str) -> Path:
+    """Return the default output path for a named plot."""
+    return Path(__file__).resolve().parent / group / f"{name}.png"
+
+
+def _save_figure(
+    fig,
+    save_path: str | Path | None,
+    group: str,
+    name: str,
+    layout: str = "tight",
+) -> Path:
+    """Finalize, save, and close a figure using a consistent output policy."""
+    if layout == "tight":
+        fig.tight_layout()
+    elif layout == "constrained":
+        pass
+    elif layout == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown layout mode: {layout}")
+
+    resolved = _ensure_parent(Path(save_path) if save_path is not None else _default_plot_path(group, name))
+    fig.savefig(resolved, dpi=300)
+    print(f"Saved {name} to: {resolved}")
+    plt.close(fig)
+    return resolved
 
 
 def _should_run(name: str, groups: list[str], individual: list[str] | None) -> bool:
@@ -70,6 +115,167 @@ def _should_run(name: str, groups: list[str], individual: list[str] | None) -> b
     if "all" in groups:
         return True
     return PLOT_REGISTRY.get(name) in groups
+
+
+def _plots_for_group(group: str) -> list[str]:
+    """Return plot names belonging to one registry group."""
+    return [name for name, plot_group in PLOT_REGISTRY.items() if plot_group == group]
+
+
+def _print_skip(name: str, reason: str) -> None:
+    """Standardized skip message for CLI-driven plots."""
+    print(f"Skipping {name} ({reason})")
+
+
+def _add_interface_lines(ax, positions: list[float], axis: str = "x") -> None:
+    """Draw interface markers on an axis."""
+    draw = ax.axvline if axis == "x" else ax.axhline
+    for position in positions:
+        draw(position, color="0.35", linestyle=":", linewidth=1.2, alpha=0.9)
+
+
+def _future_target_indices(start_idx: int, n_requested: int, n_total: int) -> np.ndarray:
+    """Return unique, increasing future indices after start_idx."""
+    if start_idx >= n_total - 1:
+        raise ValueError("Source index must leave at least one future target.")
+
+    available = np.arange(start_idx + 1, n_total, dtype=int)
+    if n_requested >= len(available):
+        return available
+
+    positions = np.linspace(0, len(available) - 1, n_requested)
+    indices = np.unique(np.round(positions).astype(int))
+    while len(indices) < n_requested:
+        indices = np.unique(np.concatenate([indices, np.arange(len(available), dtype=int)]))
+        indices = indices[:n_requested]
+    return available[indices]
+
+
+def _resolve_interface_metadata(config: dict | None = None, solver=None) -> dict:
+    """Resolve interface metadata from solver geometry first, then config."""
+    positions: list[float] = []
+    if solver is not None and hasattr(solver, "interface_positions"):
+        positions = [float(pos) for pos in solver.interface_positions]
+
+    loss_cfg = {}
+    if config is not None:
+        loss_cfg = config.get("training", {}).get("loss", {})
+
+    # Defaults match src/operators/{losses,train,eval}.py so older configs/checkpoints
+    # that don't serialize these keys still plot instead of raising.
+    interface_x = loss_cfg.get("interface_x", 0.5)
+    interface_half_width = loss_cfg.get("interface_half_width", 0.05)
+
+    if positions:
+        resolved_x = float(interface_x) if interface_x is not None else positions[0]
+    else:
+        resolved_x = float(interface_x)
+        positions = [resolved_x]
+
+    return {
+        "positions": positions,
+        "interface_x": resolved_x,
+        "interface_half_width": float(interface_half_width),
+    }
+
+
+def _build_interface_mask(x_grid: np.ndarray, interface_x: float, interface_half_width: float) -> np.ndarray:
+    """Return a boolean mask for the configured interface region."""
+    return np.abs(x_grid - interface_x) <= interface_half_width
+
+
+def _interface_flanking_nodes_from_grid(x_grid: np.ndarray, interface_x: float) -> tuple[int, int]:
+    """Return node indices immediately flanking an interface location."""
+    iface_idx = int(np.argmin(np.abs(x_grid - interface_x)))
+    left_node = iface_idx - 1 if x_grid[iface_idx] >= interface_x else iface_idx
+    right_node = left_node + 1
+    if left_node < 0 or right_node >= len(x_grid):
+        raise ValueError("Interface location is outside the interior of the provided x_grid.")
+    return left_node, right_node
+
+
+def _relative_l2_percent(y_pred: np.ndarray, y_true: np.ndarray) -> float:
+    """Return relative L2 error in percent."""
+    denom = max(float(np.mean(y_true ** 2)), 1e-12)
+    return float(np.sqrt(np.mean((y_pred - y_true) ** 2) / denom) * 100.0)
+
+
+def _compute_binned_quantiles(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Bin x and return centers, median, q25, q75, counts for non-empty bins."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    if x.size == 0:
+        empty = np.array([])
+        return empty, empty, empty, empty, empty
+
+    x_min = float(x.min())
+    x_max = float(x.max())
+    if np.isclose(x_min, x_max):
+        q25, median, q75 = np.percentile(y, [25, 50, 75])
+        return (
+            np.array([x_min]),
+            np.array([median]),
+            np.array([q25]),
+            np.array([q75]),
+            np.array([len(x)]),
+        )
+
+    bins = np.linspace(x_min, x_max, n_bins + 1)
+    bin_ids = np.clip(np.digitize(x, bins[1:-1], right=False), 0, n_bins - 1)
+
+    centers = []
+    medians = []
+    q25s = []
+    q75s = []
+    counts = []
+    for idx in range(n_bins):
+        mask = bin_ids == idx
+        if not np.any(mask):
+            continue
+        y_bin = y[mask]
+        centers.append(0.5 * (bins[idx] + bins[idx + 1]))
+        q25, median, q75 = np.percentile(y_bin, [25, 50, 75])
+        q25s.append(float(q25))
+        medians.append(float(median))
+        q75s.append(float(q75))
+        counts.append(int(mask.sum()))
+
+    return (
+        np.array(centers),
+        np.array(medians),
+        np.array(q25s),
+        np.array(q75s),
+        np.array(counts),
+    )
+
+
+def _parameter_arrays(sim_params: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return amplitude, frequency, and contact resistance arrays."""
+    amplitudes = np.array([float(p[0]) for p in sim_params], dtype=np.float32)
+    frequencies = np.array([float(p[1]) for p in sim_params], dtype=np.float32)
+    contact_resistance = np.array([float(p[3]) for p in sim_params], dtype=np.float32)
+    return amplitudes, frequencies, contact_resistance
+
+
+def _select_representative_sim_id(sim_params: np.ndarray) -> int:
+    """Choose a deterministic representative simulation near the median condition point."""
+    amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
+    stacked = np.column_stack(
+        [
+            (amplitudes - amplitudes.min()) / max(amplitudes.max() - amplitudes.min(), 1e-12),
+            (np.log10(frequencies) - np.log10(frequencies).min())
+            / max(np.log10(frequencies).max() - np.log10(frequencies).min(), 1e-12),
+            (contact_resistance - contact_resistance.min())
+            / max(contact_resistance.max() - contact_resistance.min(), 1e-12),
+        ]
+    )
+    target = np.median(stacked, axis=0)
+    return int(np.argmin(np.sum((stacked - target) ** 2, axis=1)))
 
 
 # ============================================================
@@ -109,15 +315,17 @@ def _interface_flanking_nodes(solver: FVSolver2D) -> list[tuple[int, int, float]
 def _load_plot_data(
     data_path: str | Path,
     x_grid_path: str | Path,
+    y_grid_path: str | Path,
     t_grid_path: str | Path,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load trajectories and saved grids for plot generation."""
-    trajectories, x_grid, t_grid = load_sim_data(
+    trajectories, x_grid, y_grid, t_grid = load_sim_data(
         sim_traj_path=str(Path(data_path)),
         x_grid_path=str(Path(x_grid_path)),
+        y_grid_path=str(Path(y_grid_path)),
         t_grid_path=str(Path(t_grid_path)),
     )
-    return trajectories, x_grid, t_grid
+    return trajectories, x_grid, y_grid, t_grid
 
 
 def _resolve_plot_config(checkpoint_conf: dict | None = None) -> dict:
@@ -152,6 +360,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO1d, dict]:
 def _build_split_datasets(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
+    y_grid: np.ndarray,
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     config: dict,
@@ -175,6 +384,7 @@ def _build_split_datasets(
             trajectories=trajectories,
             t_grid=t_grid,
             x_grid=x_grid,
+            y_grid=y_grid,
             sim_ids=train_ids,
             sim_params=sim_params,
             mu_global=mu_global,
@@ -185,6 +395,7 @@ def _build_split_datasets(
             trajectories=trajectories,
             t_grid=t_grid,
             x_grid=x_grid,
+            y_grid=y_grid,
             sim_ids=val_ids,
             sim_params=sim_params,
             mu_global=mu_global,
@@ -195,6 +406,7 @@ def _build_split_datasets(
             trajectories=trajectories,
             t_grid=t_grid,
             x_grid=x_grid,
+            y_grid=y_grid,
             sim_ids=test_ids,
             sim_params=sim_params,
             mu_global=mu_global,
@@ -213,11 +425,12 @@ def _prepare_prediction_case(
     sim_id: int,
     s: int,
     target_indices: np.ndarray,
+    config: dict | None = None,
 ) -> dict[str, np.ndarray | float]:
     """Prepare truth/prediction arrays for one source snapshot and multiple target times."""
     import torch
 
-    interface_x = 0.5
+    interface_meta = _resolve_interface_metadata(config=_resolve_plot_config(config))
     t_targets = t_grid[target_indices]
 
     # Use global normalization stats from model (attached during checkpoint loading)
@@ -229,7 +442,10 @@ def _prepare_prediction_case(
         train_ids, _, _ = _split(trajectories.shape[0], 0.7, 0.15, seed=0)
         mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
-    T_source = trajectories[sim_id, s, :].astype(np.float32)
+    # Scaffolding for 1D FNO against 4D trajectories: take a mid-y slice until
+    # the 2D FNO lands.
+    y_mid = trajectories.shape[-1] // 2
+    T_source = trajectories[sim_id, s, :, y_mid].astype(np.float32)
     T_source_norm = (T_source - mu_global) / (sigma_global + T_EPS)
     x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
 
@@ -258,10 +474,12 @@ def _prepare_prediction_case(
         Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy().squeeze(-1)
 
     Y_pred = (Y_pred_norm * (sigma_global + T_EPS) + mu_global).T
-    Y_true = trajectories[sim_id, target_indices, :].T.astype(np.float32)
+    Y_true = trajectories[sim_id, target_indices, :, y_mid].T.astype(np.float32)
 
     return {
-        "interface_x": interface_x,
+        "interface_x": interface_meta["interface_x"],
+        "interface_positions": interface_meta["positions"],
+        "interface_half_width": interface_meta["interface_half_width"],
         "t_targets": t_targets,
         "t_bars": t_bars,
         "source_time": float(t_grid[s]),
@@ -277,6 +495,7 @@ def _compute_pair_error_records(
     model,
     dataset: SnapshotPairDataset,
     x_grid: np.ndarray,
+    config: dict | None = None,
     max_samples: int = 256,
     batch_size: int = 64,
     seed: int = 42,
@@ -297,11 +516,15 @@ def _compute_pair_error_records(
     cond_batch = []
     y_batch = []
     stats_batch = []
+    # Scaffolding: FNO1d expects (Nx, 2)=[T̃_source, x_norm] and target (Nx, 1).
+    # The 2D dataset returns (Nx, Ny, 3) / (Nx, Ny, 1); take a mid-y slice
+    # and drop the y_norm channel until the 2D FNO exists.
+    y_mid = dataset.Ny // 2
     for idx in sample_indices:
         x_spatial, cond, Y, T_stats = dataset[idx]
-        x_batch.append(x_spatial)
+        x_batch.append(x_spatial[:, y_mid, :2])
         cond_batch.append(cond)
-        y_batch.append(Y)
+        y_batch.append(Y[:, y_mid, :])
         stats_batch.append(T_stats)
 
     x_tensor = torch.stack(x_batch, dim=0)
@@ -309,7 +532,11 @@ def _compute_pair_error_records(
     y_tensor = torch.stack(y_batch, dim=0)
     stats_tensor = torch.stack(stats_batch, dim=0)
 
-    iface_mask = torch.from_numpy((x_grid >= 0.4) & (x_grid <= 0.6))
+    interface_meta = _resolve_interface_metadata(config=_resolve_plot_config(config))
+    interface_metric_mask = torch.from_numpy(
+        _build_interface_mask(x_grid, interface_meta["interface_x"], interface_meta["interface_half_width"])
+    )
+    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_meta["interface_x"])
     device = next(model.parameters()).device
     model.eval()
 
@@ -334,20 +561,33 @@ def _compute_pair_error_records(
         / torch.clamp(torch.mean(y_true_phys ** 2, dim=(1, 2)), min=1e-12)
     ).sqrt() * 100.0
     iface_rel = (
-        torch.mean((y_pred_phys[:, iface_mask, :] - y_true_phys[:, iface_mask, :]) ** 2, dim=(1, 2))
-        / torch.clamp(torch.mean(y_true_phys[:, iface_mask, :] ** 2, dim=(1, 2)), min=1e-12)
+        torch.mean(
+            (y_pred_phys[:, interface_metric_mask, :] - y_true_phys[:, interface_metric_mask, :]) ** 2,
+            dim=(1, 2),
+        )
+        / torch.clamp(torch.mean(y_true_phys[:, interface_metric_mask, :] ** 2, dim=(1, 2)), min=1e-12)
     ).sqrt() * 100.0
+    pred_jump = y_pred_phys[:, right_node, 0] - y_pred_phys[:, left_node, 0]
+    true_jump = y_true_phys[:, right_node, 0] - y_true_phys[:, left_node, 0]
+    jump_rel = torch.abs(pred_jump - true_jump) / torch.clamp(torch.abs(true_jump), min=1e-12) * 100.0
 
     sim_ids = np.array([dataset._pairs[idx][0] for idx in sample_indices], dtype=np.int64)
     params = dataset.sim_params[sim_ids]
+    source_indices = np.array([dataset._pairs[idx][1] for idx in sample_indices], dtype=np.int64)
+    target_indices = np.array([dataset._pairs[idx][2] for idx in sample_indices], dtype=np.int64)
 
     return {
         "lead_time": np.array([dataset._lead_times[idx] for idx in sample_indices], dtype=np.float32),
         "global_rel_l2": global_rel.numpy(),
         "iface_rel_l2": iface_rel.numpy(),
+        "jump_rel_l2": jump_rel.numpy(),
         "amplitude": np.array([float(p[0]) for p in params], dtype=np.float32),
         "frequency": np.array([float(p[1]) for p in params], dtype=np.float32),
         "R_c": np.array([float(p[3]) for p in params], dtype=np.float32),
+        "true_jump": true_jump.numpy(),
+        "pred_jump": pred_jump.numpy(),
+        "source_index": source_indices,
+        "target_index": target_indices,
     }
 
 
@@ -387,12 +627,13 @@ def _compute_binned_means(
 def _lead_time_coverage_counts(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
+    y_grid: np.ndarray,
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     config: dict,
 ) -> dict[str, np.ndarray]:
     """Return lead-time arrays and pair counts for split-aware coverage plots/tests."""
-    datasets = _build_split_datasets(trajectories, x_grid, t_grid, sim_params, config)
+    datasets = _build_split_datasets(trajectories, x_grid, y_grid, t_grid, sim_params, config)
     return {
         "train": datasets["train"]._lead_times.copy(),
         "val": datasets["val"]._lead_times.copy(),
@@ -413,26 +654,18 @@ def plot_final_temperature(
 ):
     """2D temperature field at final time as a pcolormesh heatmap."""
     _, _, _, T_final = solver.solve(store_trajectory=False)
+    interface_meta = _resolve_interface_metadata(solver=solver)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    pc = ax.pcolormesh(solver.X, solver.Y, T_final, cmap="inferno", shading="auto")
-    fig.colorbar(pc, ax=ax, label="Temperature")
-
-    for xi in solver.interface_positions:
-        ax.axvline(xi, color="white", linestyle="--", linewidth=1.0, alpha=0.8)
-
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title(f"Final Temperature at t = {solver.t[-1]:.3f}")
-    ax.set_aspect("equal")
-
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "physics" / "final_temperature.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved final temperature plot to: {save_path}")
-    plt.close(fig)
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(8, 6))
+        pc = ax.pcolormesh(solver.X, solver.Y, T_final, cmap="inferno", shading="auto")
+        fig.colorbar(pc, ax=ax, label="Temperature")
+        _add_interface_lines(ax, interface_meta["positions"])
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_title(f"Final Temperature at t = {solver.t[-1]:.3f}")
+        ax.set_aspect("equal")
+        _save_figure(fig, save_path, "physics", "final_temperature")
 
 
 def plot_layer_geometry(
@@ -446,60 +679,58 @@ def plot_layer_geometry(
         (b) Material properties k, rho, cp vs x (1D slice at mid-y)
         (c) Thermal diffusivity alpha = k/(rho*cp) vs x
     """
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(14, 4.5))
+    interface_meta = _resolve_interface_metadata(solver=solver)
 
-    layer_colors = plt.cm.Pastel1(np.linspace(0, 1, max(len(solver.layers), 3)))
+    with plt.rc_context(PLOT_STYLE):
+        fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(14, 4.5))
 
-    # --- Panel (a): Domain schematic ---
-    for j, layer in enumerate(solver.layers):
-        ax_a.axvspan(layer.x_left, layer.x_right, alpha=0.4, color=layer_colors[j],
-                     label=f"Layer {j} (k={layer.k})")
-    for xi in solver.interface_positions:
-        ax_a.axvline(xi, color="red", linestyle="--", linewidth=1.5, alpha=0.8)
-    # subsampled grid nodes
-    step = max(1, solver.Nx // 20)
-    ax_a.plot(solver.X[::step, ::step].ravel(), solver.Y[::step, ::step].ravel(),
-              ".", color="black", markersize=2, alpha=0.4)
-    ax_a.set_xlabel("x")
-    ax_a.set_ylabel("y")
-    ax_a.set_title("(a) Domain Schematic")
-    ax_a.legend(fontsize=7, loc="upper right")
-    ax_a.set_xlim(solver.a, solver.b)
-    ax_a.set_ylim(solver.c, solver.d)
-    ax_a.set_aspect("equal")
+        layer_colors = plt.cm.Pastel1(np.linspace(0, 1, max(len(solver.layers), 3)))
 
-    # --- Panel (b): Material properties (1D slice at mid-y) ---
-    ax_b.plot(solver.grid_x, solver.k_nodes[:, 0], drawstyle="steps-mid",
-              label="k", linewidth=1.5)
-    ax_b.plot(solver.grid_x, solver.rho_nodes[:, 0], drawstyle="steps-mid",
-              label=r"$\rho$", linewidth=1.5)
-    ax_b.plot(solver.grid_x, solver.cp_nodes[:, 0], drawstyle="steps-mid",
-              label=r"$c_p$", linewidth=1.5)
-    for xi in solver.interface_positions:
-        ax_b.axvline(xi, color="gray", linestyle=":", alpha=0.5)
-    ax_b.set_xlabel("x")
-    ax_b.set_ylabel("Property value")
-    ax_b.set_title(r"(b) Material Properties")
-    ax_b.legend(fontsize=8)
-    ax_b.grid(True, linestyle="--", alpha=0.3)
+        for j, layer in enumerate(solver.layers):
+            ax_a.axvspan(
+                layer.x_left,
+                layer.x_right,
+                alpha=0.4,
+                color=layer_colors[j],
+                label=f"Layer {j + 1} (k={layer.k})",
+            )
+        step = max(1, solver.Nx // 20)
+        ax_a.plot(
+            solver.X[::step, ::step].ravel(),
+            solver.Y[::step, ::step].ravel(),
+            ".",
+            color="black",
+            markersize=2,
+            alpha=0.35,
+        )
+        _add_interface_lines(ax_a, interface_meta["positions"])
+        ax_a.set_xlabel("x")
+        ax_a.set_ylabel("y")
+        ax_a.set_title("Domain Schematic")
+        ax_a.legend(loc="upper right")
+        ax_a.set_xlim(solver.a, solver.b)
+        ax_a.set_ylim(solver.c, solver.d)
+        ax_a.set_aspect("equal")
 
-    # --- Panel (c): Thermal diffusivity ---
-    alpha_nodes = solver.k_nodes[:, 0] / (solver.rho_nodes[:, 0] * solver.cp_nodes[:, 0])
-    ax_c.plot(solver.grid_x, alpha_nodes, drawstyle="steps-mid", color="C2", linewidth=1.5)
-    for xi in solver.interface_positions:
-        ax_c.axvline(xi, color="gray", linestyle=":", alpha=0.5)
-    ax_c.set_xlabel("x")
-    ax_c.set_ylabel(r"$\alpha = k / (\rho \, c_p)$")
-    ax_c.set_title("(c) Thermal Diffusivity")
-    ax_c.grid(True, linestyle="--", alpha=0.3)
+        ax_b.plot(solver.grid_x, solver.k_nodes[:, 0], drawstyle="steps-mid", label="k")
+        ax_b.plot(solver.grid_x, solver.rho_nodes[:, 0], drawstyle="steps-mid", label=r"$\rho$")
+        ax_b.plot(solver.grid_x, solver.cp_nodes[:, 0], drawstyle="steps-mid", label=r"$c_p$")
+        _add_interface_lines(ax_b, interface_meta["positions"])
+        ax_b.set_xlabel("x")
+        ax_b.set_ylabel("Property value")
+        ax_b.set_title("Material Properties")
+        ax_b.legend()
+        ax_b.grid(True)
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "physics" / "layer_geometry.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved layer geometry to: {save_path}")
-    plt.close(fig)
+        alpha_nodes = solver.k_nodes[:, 0] / (solver.rho_nodes[:, 0] * solver.cp_nodes[:, 0])
+        ax_c.plot(solver.grid_x, alpha_nodes, drawstyle="steps-mid", color="C2")
+        _add_interface_lines(ax_c, interface_meta["positions"])
+        ax_c.set_xlabel("x")
+        ax_c.set_ylabel(r"$\alpha = k / (\rho \, c_p)$")
+        ax_c.set_title("Thermal Diffusivity")
+        ax_c.grid(True)
+
+        _save_figure(fig, save_path, "physics", "layer_geometry")
 
 
 def plot_face_conductance(
@@ -514,72 +745,59 @@ def plot_face_conductance(
         (c) CN coefficients r_w, r_e at mid-y slice (1D view)
         (d) Diagonal dominance margin heatmap
     """
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    ax_a, ax_b = axes[0]
-    ax_c, ax_d = axes[1]
+    interface_meta = _resolve_interface_metadata(solver=solver)
 
-    # --- Panel (a): G_x heatmap ---
-    # G_x has shape (Nx-1, Ny), face positions between nodes
-    face_x = solver.face_positions_x
-    pc_a = ax_a.pcolormesh(
-        face_x, solver.grid_y, solver.G_x.T,
-        cmap="viridis", shading="nearest",
-    )
-    fig.colorbar(pc_a, ax=ax_a, label=r"$G_x$ [W/(m$^2$K)]", shrink=0.85)
-    for xi in solver.interface_positions:
-        ax_a.axvline(xi, color="red", linestyle="--", linewidth=1.0, alpha=0.8)
-    ax_a.set_xlabel("x (face position)")
-    ax_a.set_ylabel("y")
-    ax_a.set_title("(a) x-Face Conductance $G_x$")
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
+        ax_a, ax_b = axes[0]
+        ax_c, ax_d = axes[1]
 
-    # --- Panel (b): G_y heatmap ---
-    face_y = (solver.grid_y[:-1] + solver.grid_y[1:]) / 2.0
-    pc_b = ax_b.pcolormesh(
-        solver.grid_x, face_y, solver.G_y.T,
-        cmap="viridis", shading="nearest",
-    )
-    fig.colorbar(pc_b, ax=ax_b, label=r"$G_y$ [W/(m$^2$K)]", shrink=0.85)
-    ax_b.set_xlabel("x")
-    ax_b.set_ylabel("y (face position)")
-    ax_b.set_title("(b) y-Face Conductance $G_y$")
+        face_x = solver.face_positions_x
+        pc_a = ax_a.pcolormesh(face_x, solver.grid_y, solver.G_x.T, cmap="viridis", shading="nearest")
+        fig.colorbar(pc_a, ax=ax_a, label=r"$G_x$ [W/(m$^2$K)]", shrink=0.85)
+        _add_interface_lines(ax_a, interface_meta["positions"])
+        ax_a.set_xlabel("x (face position)")
+        ax_a.set_ylabel("y")
+        ax_a.set_title("x-Face Conductance")
 
-    # --- Panel (c): r_w, r_e at mid-y ---
-    j_mid = solver.Ny // 2
-    interior_idx = np.arange(0, solver.Nx - 1)
-    ax_c.plot(interior_idx, solver.r_w[:solver.Nx - 1, j_mid], "-", color="C0",
-              linewidth=1.2, label=r"$r_w$")
-    ax_c.plot(interior_idx, solver.r_e[:solver.Nx - 1, j_mid], "-", color="C3",
-              linewidth=1.2, label=r"$r_e$")
-    for xi in solver.interface_positions:
-        node_approx = (xi - solver.a) / solver.hx
-        ax_c.axvline(node_approx, color="gray", linestyle=":", alpha=0.5)
-    ax_c.set_xlabel("Node index i")
-    ax_c.set_ylabel("CN coefficient")
-    ax_c.set_title(f"(c) CN Coefficients at j={j_mid}")
-    ax_c.legend(fontsize=8)
-    ax_c.grid(True, linestyle="--", alpha=0.3)
+        face_y = (solver.grid_y[:-1] + solver.grid_y[1:]) / 2.0
+        pc_b = ax_b.pcolormesh(solver.grid_x, face_y, solver.G_y.T, cmap="viridis", shading="nearest")
+        fig.colorbar(pc_b, ax=ax_b, label=r"$G_y$ [W/(m$^2$K)]", shrink=0.85)
+        ax_b.set_xlabel("x")
+        ax_b.set_ylabel("y (face position)")
+        ax_b.set_title("y-Face Conductance")
 
-    # --- Panel (d): Diagonal dominance margin heatmap ---
-    margin = (1.0 - solver.r_w - solver.r_e - solver.r_s - solver.r_n)
-    # exclude Dirichlet column (i=Nx-1) which is always 1
-    margin_active = margin[:solver.Nx - 1, :]
-    vmax = float(np.max(np.abs(margin_active)))
-    pc_d = ax_d.pcolormesh(
-        solver.grid_x[:solver.Nx - 1], solver.grid_y, margin_active.T,
-        cmap="RdYlGn", vmin=-vmax, vmax=vmax, shading="nearest",
-    )
-    fig.colorbar(pc_d, ax=ax_d, label=r"$1 - r_w - r_e - r_s - r_n$", shrink=0.85)
-    ax_d.set_xlabel("x")
-    ax_d.set_ylabel("y")
-    ax_d.set_title("(d) Diagonal Dominance Margin")
+        j_mid = solver.Ny // 2
+        interior_idx = np.arange(0, solver.Nx - 1)
+        ax_c.plot(interior_idx, solver.r_w[:solver.Nx - 1, j_mid], color="C0", label=r"$r_w$")
+        ax_c.plot(interior_idx, solver.r_e[:solver.Nx - 1, j_mid], color="C3", label=r"$r_e$")
+        for xi in interface_meta["positions"]:
+            node_approx = (xi - solver.a) / solver.hx
+            ax_c.axvline(node_approx, color="0.35", linestyle=":", alpha=0.8)
+        ax_c.set_xlabel("Node index i")
+        ax_c.set_ylabel("CN coefficient")
+        ax_c.set_title(f"CN Coefficients at j={j_mid}")
+        ax_c.legend()
+        ax_c.grid(True)
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "physics" / "face_conductance.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved face conductance to: {save_path}")
-    plt.close(fig)
+        margin = 1.0 - solver.r_w - solver.r_e - solver.r_s - solver.r_n
+        margin_active = margin[:solver.Nx - 1, :]
+        vmax = float(np.max(np.abs(margin_active)))
+        pc_d = ax_d.pcolormesh(
+            solver.grid_x[:solver.Nx - 1],
+            solver.grid_y,
+            margin_active.T,
+            cmap="RdYlGn",
+            vmin=-vmax,
+            vmax=vmax,
+            shading="nearest",
+        )
+        fig.colorbar(pc_d, ax=ax_d, label=r"$1 - r_w - r_e - r_s - r_n$", shrink=0.85)
+        ax_d.set_xlabel("x")
+        ax_d.set_ylabel("y")
+        ax_d.set_title("Diagonal Dominance Margin")
+
+        _save_figure(fig, save_path, "physics", "face_conductance", layout="constrained")
 
 
 def plot_multilayer_evolution(
@@ -587,37 +805,37 @@ def plot_multilayer_evolution(
     T_hist: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Temperature evolution as 2D snapshots at 6 time points.
-
-    2x3 grid of pcolormesh heatmaps with shared colorbar range.
-    """
+    """Temperature evolution as 2D snapshots with one shared temperature scale per figure."""
     Nt = len(solver.t)
     n_snaps = 6
     snap_indices = np.linspace(0, Nt - 1, n_snaps, dtype=int)
+    snapshots = T_hist[snap_indices]
+    vmin = float(np.min(snapshots))
+    vmax = float(np.max(snapshots))
+    interface_meta = _resolve_interface_metadata(solver=solver)
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+        pcm = None
+        for ax, t_idx, snap in zip(axes.ravel(), snap_indices, snapshots):
+            pcm = ax.pcolormesh(
+                solver.X,
+                solver.Y,
+                snap,
+                cmap="inferno",
+                shading="auto",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            _add_interface_lines(ax, interface_meta["positions"])
+            ax.set_title(f"t = {solver.t[t_idx]:.3f}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.set_aspect("equal")
 
-    for idx, (ax, t_idx) in enumerate(zip(axes.ravel(), snap_indices)):
-        snap = T_hist[t_idx]
-        pc = ax.pcolormesh(solver.X, solver.Y, snap,
-                           cmap="inferno", shading="auto",
-                           vmin=float(snap.min()), vmax=float(snap.max()))
-        for xi in solver.interface_positions:
-            ax.axvline(xi, color="white", linestyle="--", linewidth=0.8, alpha=0.7)
-        ax.set_title(f"t = {solver.t[t_idx]:.3f}", fontsize=10)
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_aspect("equal")
-        fig.colorbar(pc, ax=ax, shrink=0.85, pad=0.03)
-
-    fig.suptitle("Temperature Evolution (per-panel colorbar)", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "physics" / "multilayer_evolution.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved multilayer evolution to: {save_path}")
-    plt.close(fig)
+        fig.colorbar(pcm, ax=axes.ravel().tolist(), label="Temperature", shrink=0.9)
+        fig.suptitle("Temperature Evolution")
+        _save_figure(fig, save_path, "physics", "multilayer_evolution", layout="constrained")
 
 
 def plot_heat_flux_profile(
@@ -633,49 +851,41 @@ def plot_heat_flux_profile(
     """
     Nt = len(solver.t)
     j_mid = solver.Ny // 2
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 5))
+    interface_meta = _resolve_interface_metadata(solver=solver)
 
-    # --- Panel (a): Applied boundary flux ---
-    q_left_vals = np.array([solver.q_left(ti) for ti in solver.t])
-    ax_a.plot(solver.t, q_left_vals, color="C3", linewidth=1.2)
-    ax_a.axvline(solver.t_on, color="green", linestyle=":", alpha=0.7, label=f"t_on={solver.t_on}")
-    ax_a.axvline(solver.t_off, color="red", linestyle=":", alpha=0.7, label=f"t_off={solver.t_off}")
-    ax_a.set_xlabel("Time")
-    ax_a.set_ylabel("q_left(t)")
-    ax_a.set_title("(a) Applied Boundary Flux")
-    ax_a.legend(fontsize=8)
-    ax_a.grid(True, linestyle="--", alpha=0.3)
+    with plt.rc_context(PLOT_STYLE):
+        fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # --- Panel (b): Numerical x-flux at mid-y ---
-    n_snaps = 6
-    snap_indices = np.linspace(0, Nt - 1, n_snaps, dtype=int)
-    if snap_indices[0] == 0 and n_snaps > 1:
-        snap_indices = snap_indices[1:]
+        q_left_vals = np.array([solver.q_left(ti) for ti in solver.t])
+        ax_a.plot(solver.t, q_left_vals, color="C3")
+        ax_a.axvline(solver.t_on, color="C2", linestyle=":", alpha=0.8, label=f"t_on={solver.t_on}")
+        ax_a.axvline(solver.t_off, color="C1", linestyle=":", alpha=0.8, label=f"t_off={solver.t_off}")
+        ax_a.set_xlabel("Time")
+        ax_a.set_ylabel("q_left(t)")
+        ax_a.set_title("Applied Boundary Flux")
+        ax_a.legend()
+        ax_a.grid(True)
 
-    cmap_snap = plt.cm.viridis
-    for i, t_idx in enumerate(snap_indices):
-        dT = T_hist[t_idx, 1:, j_mid] - T_hist[t_idx, :-1, j_mid]
-        G_x_mid = solver.G_x[:, j_mid]
-        q_face = -G_x_mid * dT
-        color = cmap_snap(i / max(len(snap_indices) - 1, 1))
-        ax_b.plot(solver.face_positions_x, q_face, color=color, linewidth=1.2,
-                  label=f"t={solver.t[t_idx]:.3f}")
+        snap_indices = np.linspace(1, Nt - 1, min(5, Nt - 1), dtype=int)
+        cmap_snap = plt.cm.viridis
+        for i, t_idx in enumerate(snap_indices):
+            dT = T_hist[t_idx, 1:, j_mid] - T_hist[t_idx, :-1, j_mid]
+            q_face = -solver.G_x[:, j_mid] * dT
+            ax_b.plot(
+                solver.face_positions_x,
+                q_face,
+                color=cmap_snap(i / max(len(snap_indices) - 1, 1)),
+                label=f"t={solver.t[t_idx]:.3f}",
+            )
 
-    for xi in solver.interface_positions:
-        ax_b.axvline(xi, color="gray", linestyle="--", alpha=0.5)
-    ax_b.set_xlabel("Face position (x)")
-    ax_b.set_ylabel("Heat flux q")
-    ax_b.set_title(f"(b) Numerical x-Flux at y = {solver.grid_y[j_mid]:.2f}")
-    ax_b.legend(fontsize=7, loc="best")
-    ax_b.grid(True, linestyle="--", alpha=0.3)
+        _add_interface_lines(ax_b, interface_meta["positions"])
+        ax_b.set_xlabel("Face position (x)")
+        ax_b.set_ylabel("Heat flux q")
+        ax_b.set_title(f"Numerical x-Flux at y = {solver.grid_y[j_mid]:.2f}")
+        ax_b.legend(loc="best")
+        ax_b.grid(True)
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "physics" / "heat_flux_profile.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved heat flux profile to: {save_path}")
-    plt.close(fig)
+        _save_figure(fig, save_path, "physics", "heat_flux_profile")
 
 
 # ============================================================
@@ -733,36 +943,29 @@ def plot_mms_convergence(save_path: str | Path | None = None):
         "Interface": 200,
     }
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
 
-    for col, (name, run_fn) in enumerate(cases):
-        # spatial convergence
-        h_vals, h_l2 = [], []
-        for N in N_lists[name]:
-            h, _, _, l2 = run_fn(N, dt=fixed_dt)
-            h_vals.append(h)
-            h_l2.append(l2)
-        _plot_convergence(axes[0, col], np.array(h_vals), np.array(h_l2),
-                          r"$\Delta x$", f"{name} — Spatial (dt={fixed_dt})")
+        for col, (name, run_fn) in enumerate(cases):
+            h_vals, h_l2 = [], []
+            for N in N_lists[name]:
+                h, _, _, l2 = run_fn(N, dt=fixed_dt)
+                h_vals.append(h)
+                h_l2.append(l2)
+            _plot_convergence(axes[0, col], np.array(h_vals), np.array(h_l2),
+                              r"$\Delta x$", f"{name} — Spatial (dt={fixed_dt})")
 
-        # temporal convergence
-        dt_vals, dt_l2 = [], []
-        fixed_N = fixed_N_map[name]
-        for dt_val in dt_list:
-            _, _, _, l2 = run_fn(fixed_N, dt=dt_val)
-            dt_vals.append(dt_val)
-            dt_l2.append(l2)
-        _plot_convergence(axes[1, col], np.array(dt_vals), np.array(dt_l2),
-                          r"$\Delta t$", f"{name} — Temporal (N={fixed_N})")
+            dt_vals, dt_l2 = [], []
+            fixed_N = fixed_N_map[name]
+            for dt_val in dt_list:
+                _, _, _, l2 = run_fn(fixed_N, dt=dt_val)
+                dt_vals.append(dt_val)
+                dt_l2.append(l2)
+            _plot_convergence(axes[1, col], np.array(dt_vals), np.array(dt_l2),
+                              r"$\Delta t$", f"{name} — Temporal (N={fixed_N})")
 
-    fig.suptitle("2D MMS Convergence — Crank-Nicolson FV Solver", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "mms" / "mms_convergence.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved MMS convergence to: {save_path}")
-    plt.close(fig)
+        fig.suptitle("2D MMS Convergence — Crank-Nicolson FV Solver")
+        _save_figure(fig, save_path, "mms", "mms_convergence")
 
 
 def plot_mms_order_estimation(save_path: str | Path | None = None):
@@ -797,66 +1000,59 @@ def plot_mms_order_estimation(save_path: str | Path | None = None):
         "Interface": 200,
     }
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
 
-    for col, (name, run_fn) in enumerate(cases):
-        # spatial order
-        h_vals, h_l2 = [], []
-        for N in N_lists[name]:
-            h, _, _, l2 = run_fn(N, dt=fixed_dt)
-            h_vals.append(h)
-            h_l2.append(l2)
+        for col, (name, run_fn) in enumerate(cases):
+            h_vals, h_l2 = [], []
+            for N in N_lists[name]:
+                h, _, _, l2 = run_fn(N, dt=fixed_dt)
+                h_vals.append(h)
+                h_l2.append(l2)
 
-        px_vals, px_mid = [], []
-        for i in range(len(h_vals) - 1):
-            p = np.log(h_l2[i] / h_l2[i + 1]) / np.log(h_vals[i] / h_vals[i + 1])
-            px_vals.append(p)
-            px_mid.append(np.sqrt(h_vals[i] * h_vals[i + 1]))
+            px_vals, px_mid = [], []
+            for i in range(len(h_vals) - 1):
+                p = np.log(h_l2[i] / h_l2[i + 1]) / np.log(h_vals[i] / h_vals[i + 1])
+                px_vals.append(p)
+                px_mid.append(np.sqrt(h_vals[i] * h_vals[i + 1]))
 
-        ax = axes[0, col]
-        ax.plot(px_mid, px_vals, "ko-", markersize=7)
-        ax.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
-        ax.set_xscale("log")
-        ax.set_xlabel(r"$\Delta x$ (geometric midpoint)")
-        ax.set_ylabel("Estimated order $p_x$")
-        ax.set_title(f"{name} — Spatial (dt={fixed_dt})")
-        ax.legend(fontsize=7)
-        ax.grid(True, linestyle="--", alpha=0.3)
-        ax.set_ylim(0, 4)
+            ax = axes[0, col]
+            ax.plot(px_mid, px_vals, "ko-", markersize=7)
+            ax.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
+            ax.set_xscale("log")
+            ax.set_xlabel(r"$\Delta x$ (geometric midpoint)")
+            ax.set_ylabel("Estimated order $p_x$")
+            ax.set_title(f"{name} — Spatial (dt={fixed_dt})")
+            ax.legend(fontsize=7)
+            ax.grid(True)
+            ax.set_ylim(0, 4)
 
-        # temporal order
-        fixed_N = fixed_N_map[name]
-        dt_vals, dt_l2 = [], []
-        for dt_val in dt_list:
-            _, _, _, l2 = run_fn(fixed_N, dt=dt_val)
-            dt_vals.append(dt_val)
-            dt_l2.append(l2)
+            fixed_N = fixed_N_map[name]
+            dt_vals, dt_l2 = [], []
+            for dt_val in dt_list:
+                _, _, _, l2 = run_fn(fixed_N, dt=dt_val)
+                dt_vals.append(dt_val)
+                dt_l2.append(l2)
 
-        pt_vals, pt_mid = [], []
-        for i in range(len(dt_vals) - 1):
-            p = np.log(dt_l2[i] / dt_l2[i + 1]) / np.log(dt_vals[i] / dt_vals[i + 1])
-            pt_vals.append(p)
-            pt_mid.append(np.sqrt(dt_vals[i] * dt_vals[i + 1]))
+            pt_vals, pt_mid = [], []
+            for i in range(len(dt_vals) - 1):
+                p = np.log(dt_l2[i] / dt_l2[i + 1]) / np.log(dt_vals[i] / dt_vals[i + 1])
+                pt_vals.append(p)
+                pt_mid.append(np.sqrt(dt_vals[i] * dt_vals[i + 1]))
 
-        ax = axes[1, col]
-        ax.plot(pt_mid, pt_vals, "ko-", markersize=7)
-        ax.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
-        ax.set_xscale("log")
-        ax.set_xlabel(r"$\Delta t$ (geometric midpoint)")
-        ax.set_ylabel("Estimated order $p_t$")
-        ax.set_title(f"{name} — Temporal (N={fixed_N})")
-        ax.legend(fontsize=7)
-        ax.grid(True, linestyle="--", alpha=0.3)
-        ax.set_ylim(0, 4)
+            ax = axes[1, col]
+            ax.plot(pt_mid, pt_vals, "ko-", markersize=7)
+            ax.axhline(2.0, color="C3", linestyle="--", alpha=0.6, label="Expected order = 2")
+            ax.set_xscale("log")
+            ax.set_xlabel(r"$\Delta t$ (geometric midpoint)")
+            ax.set_ylabel("Estimated order $p_t$")
+            ax.set_title(f"{name} — Temporal (N={fixed_N})")
+            ax.legend(fontsize=7)
+            ax.grid(True)
+            ax.set_ylim(0, 4)
 
-    fig.suptitle("2D MMS Order Estimation — Successive Refinement Pairs", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "mms" / "mms_order_estimation.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved MMS order estimation to: {save_path}")
-    plt.close(fig)
+        fig.suptitle("2D MMS Order Estimation — Successive Refinement Pairs")
+        _save_figure(fig, save_path, "mms", "mms_order_estimation")
 
 
 # ============================================================
@@ -919,71 +1115,59 @@ def plot_training_curves(csv_path: str | Path, save_path: str | Path | None = No
     if has_iface:
         best_iface_vals = np.array([v for v, b in zip(val_iface_rel_l2s, is_bests) if b == 1 and v is not None])
 
-    # --- build figure: 3 panels if iface data present, 2 otherwise ---
-    if has_iface:
-        fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
-            3, 1, figsize=(10, 10), gridspec_kw={"height_ratios": [3, 2, 1]})
-    else:
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1, figsize=(10, 7), gridspec_kw={"height_ratios": [3, 1]})
+    best_epoch = int(best_epochs[-1]) if len(best_epochs) > 0 else None
+    best_val = float(best_vals[-1]) if len(best_vals) > 0 else None
+    nrows = 4 if has_iface else 3
 
-    # --- top panel: train MSE (left y) + rel L2 metrics (right y) ---
-    color_train = "C0"
-    color_val = "C3"
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(nrows, 1, figsize=(10, 2.8 * nrows), sharex=True)
+        axes = np.atleast_1d(axes)
 
-    ax_top.semilogy(epochs, train_losses, color=color_train, alpha=0.7, linewidth=0.8, label="Train MSE")
-    ax_top.set_xlabel("Epoch")
-    ax_top.set_ylabel("Train MSE", color=color_train)
-    ax_top.tick_params(axis="y", labelcolor=color_train)
+        ax_loss = axes[0]
+        ax_rel = axes[1]
+        ax_lr = axes[-1]
 
-    ax_val = ax_top.twinx()
-    if has_train_rel_l2:
-        ax_val.semilogy(epochs, train_rel_l2s, color=color_val, alpha=0.3, linewidth=0.6, label="Train rel. L2 (%)")
-    ax_val.semilogy(val_epochs, val_values, color=color_val, linewidth=1.2, label="Val rel. L2 (%)")
-    if len(best_epochs) > 0 and len(best_vals) > 0:
-        ax_val.scatter(best_epochs, best_vals, marker="*", s=60, color="gold", zorder=5, edgecolors="k", linewidths=0.5, label="Best checkpoint")
-    ax_val.set_ylabel("Rel. L2 (%)", color=color_val)
-    ax_val.tick_params(axis="y", labelcolor=color_val)
+        ax_loss.semilogy(epochs, train_losses, color="C0", label="Train MSE")
+        ax_loss.set_ylabel("Train MSE")
+        ax_loss.set_title("Training Loss")
+        ax_loss.legend(loc="upper right")
+        ax_loss.grid(True)
 
-    # combine legends
-    lines_1, labels_1 = ax_top.get_legend_handles_labels()
-    lines_2, labels_2 = ax_val.get_legend_handles_labels()
-    ax_val.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right", fontsize=8)
-    ax_top.set_title("Training Curves")
-    ax_top.grid(True, linestyle="--", alpha=0.3)
+        if has_train_rel_l2:
+            ax_rel.semilogy(epochs, train_rel_l2s, color="C0", alpha=0.4, label="Train rel. L2 (%)")
+        ax_rel.semilogy(val_epochs, val_values, color="C3", label="Val rel. L2 (%)")
+        if best_epoch is not None and best_val is not None:
+            ax_rel.scatter([best_epoch], [best_val], color="gold", edgecolors="black", zorder=5, s=60)
+            ax_rel.annotate(
+                f"best @ epoch {best_epoch}\n{best_val:.3f}%",
+                xy=(best_epoch, best_val),
+                xytext=(6, 8),
+                textcoords="offset points",
+                fontsize=8,
+            )
+        ax_rel.set_ylabel("Rel. L2 (%)")
+        ax_rel.set_title("Global Error")
+        ax_rel.legend(loc="upper right")
+        ax_rel.grid(True)
 
-    # --- middle panel: interface rel L2 (only if iface data present) ---
-    if has_iface:
-        color_iface_train = "C4"  # purple
-        color_iface_val = "C1"    # orange
+        if has_iface:
+            ax_iface = axes[2]
+            ax_iface.semilogy(epochs, train_iface_rel_l2s, color="C1", alpha=0.4, label="Train iface rel. L2 (%)")
+            ax_iface.semilogy(val_iface_epochs, val_iface_values, color="C4", label="Val iface rel. L2 (%)")
+            if best_epoch is not None and len(best_iface_vals) > 0:
+                ax_iface.scatter([best_epoch], [best_iface_vals[-1]], color="gold", edgecolors="black", zorder=5, s=60)
+            ax_iface.set_ylabel("Iface rel. L2 (%)")
+            ax_iface.set_title("Interface Region Error")
+            ax_iface.legend(loc="upper right")
+            ax_iface.grid(True)
 
-        ax_mid.semilogy(epochs, train_iface_rel_l2s, color=color_iface_train, alpha=0.3,
-                         linewidth=0.6, label="Train iface rel. L2 (%)")
-        ax_mid.semilogy(val_iface_epochs, val_iface_values, color=color_iface_val,
-                         linewidth=1.2, label="Val iface rel. L2 (%)")
-        if len(best_epochs) > 0 and len(best_iface_vals) > 0:
-            ax_mid.scatter(best_epochs, best_iface_vals, marker="*", s=60, color="gold",
-                           zorder=5, edgecolors="k", linewidths=0.5, label="Best checkpoint")
-        ax_mid.set_xlabel("Epoch")
-        ax_mid.set_ylabel("Interface Rel. L2 (%)")
-        ax_mid.set_title("Interface Region Error")
-        ax_mid.legend(fontsize=8, loc="upper right")
-        ax_mid.grid(True, linestyle="--", alpha=0.3)
+        ax_lr.semilogy(epochs, lrs, color="C2", label="Learning rate")
+        ax_lr.set_xlabel("Epoch")
+        ax_lr.set_ylabel("Learning rate")
+        ax_lr.set_title("Learning Rate")
+        ax_lr.grid(True)
 
-    # --- bottom panel: learning rate ---
-    ax_bot.semilogy(epochs, lrs, color="C2", linewidth=1.0)
-    ax_bot.set_xlabel("Epoch")
-    ax_bot.set_ylabel("Learning rate")
-    ax_bot.set_title("Learning Rate Schedule")
-    ax_bot.grid(True, linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = csv_path.parent / "training_curves.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved training curves to: {save_path}")
-    plt.close(fig)
+        _save_figure(fig, save_path if save_path is not None else csv_path.parent / "training_curves.png", "training", "training_curves")
 
 
 def plot_seed_comparison(report_path: str | Path, save_path: str | Path | None = None):
@@ -1002,33 +1186,30 @@ def plot_seed_comparison(report_path: str | Path, save_path: str | Path | None =
     test_losses = [r["test_rel_l2"] for r in per_seed]
     test_iface_losses = [r["test_iface_rel_l2"] for r in per_seed]
 
-    x = np.arange(len(seeds))
-    width = 0.25
+    x = np.arange(len(seeds), dtype=float)
+    series = [
+        ("Val rel. L2 (%)", np.array(val_losses, dtype=float), "C0", -0.18, summary["best_val_loss_mean"], summary["best_val_loss_std"]),
+        ("Test rel. L2 (%)", np.array(test_losses, dtype=float), "C3", 0.0, summary["test_rel_l2_mean"], summary["test_rel_l2_std"]),
+        ("Test iface rel. L2 (%)", np.array(test_iface_losses, dtype=float), "C1", 0.18, summary["test_iface_rel_l2_mean"], summary["test_iface_rel_l2_std"]),
+    ]
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x - width, val_losses, width, label="Val rel. L2 (%)", color="C0", alpha=0.8)
-    ax.bar(x, test_losses, width, label="Test rel. L2 (%)", color="C3", alpha=0.8)
-    ax.bar(x + width, test_iface_losses, width, label="Test iface rel. L2 (%)", color="C1", alpha=0.8)
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        x_band = np.array([-0.5, len(seeds) - 0.5], dtype=float)
+        for label, values, color, offset, mean_val, std_val in series:
+            ax.fill_between(x_band, mean_val - std_val, mean_val + std_val, color=color, alpha=0.08)
+            ax.axhline(mean_val, color=color, linestyle="--", alpha=0.6)
+            ax.scatter(x + offset, values, color=color, s=50, label=f"{label} (mean {mean_val:.3f}%)")
 
-    # mean lines
-    ax.axhline(summary["best_val_loss_mean"], color="C0", linestyle="--", alpha=0.6, label=f"Val mean: {summary['best_val_loss_mean']:.3f}")
-    ax.axhline(summary["test_rel_l2_mean"], color="C3", linestyle="--", alpha=0.6, label=f"Test mean: {summary['test_rel_l2_mean']:.3f}")
-    ax.axhline(summary["test_iface_rel_l2_mean"], color="C1", linestyle="--", alpha=0.6, label=f"Iface mean: {summary['test_iface_rel_l2_mean']:.3f}")
+        ax.set_xlabel("Seed")
+        ax.set_ylabel("Relative L2 Error (%)")
+        ax.set_title("Model Performance Across Seeds")
+        ax.set_xticks(x)
+        ax.set_xticklabels(seeds)
+        ax.grid(True, axis="y")
+        ax.legend(loc="upper right")
 
-    ax.set_xlabel("Seed")
-    ax.set_ylabel("Relative L2 Error (%)")
-    ax.set_title("Model Performance Across Seeds")
-    ax.set_xticks(x)
-    ax.set_xticklabels(seeds)
-    ax.legend(fontsize=8)
-    ax.grid(True, axis="y", linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = report_path.parent / "seed_comparison.png"
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved seed comparison to: {save_path}")
-    plt.close(fig)
+        _save_figure(fig, save_path if save_path is not None else report_path.parent / "seed_comparison.png", "training", "seed_comparison")
 
 
 # ============================================================
@@ -1044,6 +1225,7 @@ def plot_prediction_vs_truth(
     sim_id: int,
     s: int,
     n_steps: int = 40,
+    config: dict | None = None,
     save_path: str | Path | None = None,
 ):
     """Plot ground truth, FNO prediction, pointwise error, and interface cross-section.
@@ -1057,71 +1239,87 @@ def plot_prediction_vs_truth(
         (c) Absolute error heatmap with interface marker
         (d) T(x) cross-section at mid-horizon timestep (truth vs prediction)
     """
-    Nt = len(t_grid)
-
-    # evenly-spaced target indices after source time s
-    target_indices = np.linspace(s + 1, Nt - 1, n_steps, dtype=int)
-    case = _prepare_prediction_case(model, trajectories, x_grid, t_grid, sim_params, sim_id, s, target_indices)
+    config = _resolve_plot_config(config)
+    target_indices = _future_target_indices(s, n_steps, len(t_grid))
+    case = _prepare_prediction_case(
+        model,
+        trajectories,
+        x_grid,
+        t_grid,
+        sim_params,
+        sim_id,
+        s,
+        target_indices,
+        config=config,
+    )
     t_targets = case["t_targets"]
     Y_pred = case["Y_pred"]
     Y_true = case["Y_true"]
-    error = np.abs(Y_pred - Y_true)
-
-    # meshgrid for pcolormesh
+    residual = Y_pred - Y_true
     T_mesh, X_mesh = np.meshgrid(t_targets, x_grid)
-
     vmin = min(Y_true.min(), Y_pred.min())
     vmax = max(Y_true.max(), Y_pred.max())
+    interface_metric_mask = _build_interface_mask(x_grid, case["interface_x"], case["interface_half_width"])
+    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, case["interface_x"])
+    true_jump = Y_true[right_node, :] - Y_true[left_node, :]
+    pred_jump = Y_pred[right_node, :] - Y_pred[left_node, :]
+    global_rel = _relative_l2_percent(Y_pred, Y_true)
+    iface_rel = _relative_l2_percent(Y_pred[interface_metric_mask, :], Y_true[interface_metric_mask, :])
+    jump_rel = _relative_l2_percent(pred_jump, true_jump)
+    residual_limit = max(float(np.max(np.abs(residual))), 1e-8)
+    residual_norm = TwoSlopeNorm(vcenter=0.0, vmin=-residual_limit, vmax=residual_limit)
+    mid_h = len(target_indices) // 2
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 4, figsize=(20, 4.8), constrained_layout=True)
+        pcm_truth = axes[0].pcolormesh(T_mesh, X_mesh, Y_true, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
+        _add_interface_lines(axes[0], case["interface_positions"], axis="y")
+        axes[0].set_title("Ground Truth")
+        axes[0].set_xlabel("Time")
+        axes[0].set_ylabel("x")
 
-    # ground truth
-    axes[0].pcolormesh(T_mesh, X_mesh, Y_true, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
-    axes[0].axhline(case["interface_x"], color="white", linestyle="--", linewidth=1.0, alpha=0.8)
-    axes[0].set_title("Ground Truth")
-    axes[0].set_xlabel("Time")
-    axes[0].set_ylabel("x")
+        pcm_pred = axes[1].pcolormesh(T_mesh, X_mesh, Y_pred, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
+        _add_interface_lines(axes[1], case["interface_positions"], axis="y")
+        axes[1].set_title("Prediction")
+        axes[1].set_xlabel("Time")
+        fig.colorbar(pcm_pred, ax=axes[:2].tolist(), label="Temperature", shrink=0.9)
 
-    # prediction
-    pc1 = axes[1].pcolormesh(T_mesh, X_mesh, Y_pred, cmap="inferno", vmin=vmin, vmax=vmax, shading="auto")
-    axes[1].axhline(case["interface_x"], color="white", linestyle="--", linewidth=1.0, alpha=0.8)
-    axes[1].set_title("FNO Prediction")
-    axes[1].set_xlabel("Time")
+        pcm_resid = axes[2].pcolormesh(
+            T_mesh,
+            X_mesh,
+            residual,
+            cmap="coolwarm",
+            shading="auto",
+            norm=residual_norm,
+        )
+        _add_interface_lines(axes[2], case["interface_positions"], axis="y")
+        axes[2].set_title("Signed Residual")
+        axes[2].set_xlabel("Time")
+        fig.colorbar(pcm_resid, ax=axes[2], label="Pred - Truth", shrink=0.85)
+        axes[2].text(
+            0.03,
+            0.03,
+            f"Global rel. L2: {global_rel:.2f}%\nIface rel. L2: {iface_rel:.2f}%\nJump rel. err.: {jump_rel:.2f}%",
+            transform=axes[2].transAxes,
+            va="bottom",
+            ha="left",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+        )
 
-    # shared colorbar for truth/pred
-    fig.colorbar(pc1, ax=axes[:2].tolist(), label="Temperature", shrink=0.85)
+        axes[3].plot(x_grid, Y_true[:, mid_h], color="black", label="Truth")
+        axes[3].plot(x_grid, Y_pred[:, mid_h], color="C3", linestyle="--", label="Prediction")
+        _add_interface_lines(axes[3], case["interface_positions"])
+        axes[3].set_xlabel("x")
+        axes[3].set_ylabel("Temperature")
+        axes[3].set_title(f"T(x) at t={t_targets[mid_h]:.3f}")
+        axes[3].legend(loc="best")
+        axes[3].grid(True)
 
-    # error
-    pc2 = axes[2].pcolormesh(T_mesh, X_mesh, error, cmap="Reds", shading="auto")
-    axes[2].axhline(case["interface_x"], color="black", linestyle="--", linewidth=1.0, alpha=0.8)
-    axes[2].set_title("Absolute Error")
-    axes[2].set_xlabel("Time")
-    fig.colorbar(pc2, ax=axes[2], label="|Error|", shrink=0.85)
-
-    # cross-section at mid-horizon
-    mid_h = n_steps // 2
-    axes[3].plot(x_grid, Y_true[:, mid_h], "k-", linewidth=1.5, label="Truth")
-    axes[3].plot(x_grid, Y_pred[:, mid_h], "r--", linewidth=1.5, label="Prediction")
-    axes[3].axvline(case["interface_x"], color="gray", linestyle=":", linewidth=1.5, alpha=0.7, label="Interface")
-    axes[3].set_xlabel("x")
-    axes[3].set_ylabel("Temperature")
-    axes[3].set_title(f"T(x) at t={t_targets[mid_h]:.3f}")
-    axes[3].legend(fontsize=8)
-    axes[3].grid(True, linestyle="--", alpha=0.3)
-
-    fig.suptitle(
-        f"Prediction vs Truth — Sim {sim_id}, t_s={case['source_time']:.3f}, "
-        f"A={case['amp']:.0f}, f={case['freq']:.2f}, R_c={case['R_c']:.2f}",
-        fontsize=12,
-    )
-    fig.tight_layout()
-
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "prediction_vs_truth.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved prediction vs truth to: {save_path}")
-    plt.close(fig)
+        fig.suptitle(
+            f"Prediction vs Truth — Sim {sim_id}, t_s={case['source_time']:.3f}, "
+            f"A={case['amp']:.0f}, f={case['freq']:.2f}, R_c={case['R_c']:.2f}"
+        )
+        _save_figure(fig, save_path, "data", "prediction_vs_truth", layout="constrained")
 
 
 def plot_trajectory_heatmap(
@@ -1131,24 +1329,19 @@ def plot_trajectory_heatmap(
     t_grid: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Plot a single simulation's full temperature evolution as a 2D heatmap."""
-    T = trajectories[sim_id]  # (Nt, Nx)
+    """Plot a single simulation's full temperature evolution as a 2D heatmap (mid-y slice)."""
+    y_mid = trajectories.shape[-1] // 2
+    T = trajectories[sim_id, :, :, y_mid]  # (Nt, Nx)
     T_mesh, X_mesh = np.meshgrid(t_grid, x_grid)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    pc = ax.pcolormesh(T_mesh, X_mesh, T.T, cmap="inferno", shading="auto")
-    fig.colorbar(pc, ax=ax, label="Temperature")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("x")
-    ax.set_title(f"Temperature Evolution — Simulation {sim_id}")
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "trajectory_heatmap.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved trajectory heatmap to: {save_path}")
-    plt.close(fig)
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        pc = ax.pcolormesh(T_mesh, X_mesh, T.T, cmap="inferno", shading="auto")
+        fig.colorbar(pc, ax=ax, label="Temperature")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("x")
+        ax.set_title(f"Temperature Evolution — Simulation {sim_id} (mid-y slice)")
+        _save_figure(fig, save_path, "data", "trajectory_heatmap")
 
 
 def plot_initial_conditions(
@@ -1161,62 +1354,64 @@ def plot_initial_conditions(
     """Plot overlaid initial conditions T(x, t=0) for n randomly selected simulations."""
     rng = np.random.default_rng(seed)
     num_sims = trajectories.shape[0]
+    y_mid = trajectories.shape[-1] // 2
     selected = rng.choice(num_sims, size=min(n_samples, num_sims), replace=False)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    cmap = plt.cm.viridis
-    for i, sim_id in enumerate(sorted(selected)):
-        color = cmap(i / max(len(selected) - 1, 1))
-        ax.plot(x_grid, trajectories[sim_id, 0, :], color=color, alpha=0.7, linewidth=0.8)
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(9, 5))
+        cmap = plt.cm.viridis
+        for i, sim_id in enumerate(sorted(selected)):
+            color = cmap(i / max(len(selected) - 1, 1))
+            ax.plot(x_grid, trajectories[sim_id, 0, :, y_mid], color=color, alpha=0.7, linewidth=0.9)
 
-    ax.set_xlabel("x")
-    ax.set_ylabel("Temperature")
-    ax.set_title(f"Initial Conditions T(x, t=0) — {len(selected)} simulations")
-    ax.grid(True, linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "initial_conditions.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved initial conditions plot to: {save_path}")
-    plt.close(fig)
+        ax.set_xlabel("x")
+        ax.set_ylabel("Temperature")
+        ax.set_title(f"Initial Conditions T(x, t=0) — {len(selected)} simulations (mid-y slice)")
+        ax.grid(True)
+        _save_figure(fig, save_path, "data", "initial_conditions")
 
 
 def plot_lhs_scatter(
     sim_params: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Pairwise scatter overview of sampled conditioning parameters."""
-    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
-    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
-    contact_resistance = np.array([p[3] for p in sim_params], dtype=np.float32)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    scatter_specs = [
-        (axes[0], amplitudes, frequencies, contact_resistance, "Flux Amplitude (A)", "Flux Frequency (f)", "R_c"),
-        (axes[1], amplitudes, contact_resistance, frequencies, "Flux Amplitude (A)", "Contact Resistance (R_c)", "f"),
-        (axes[2], frequencies, contact_resistance, amplitudes, "Flux Frequency (f)", "Contact Resistance (R_c)", "A"),
+    """Coverage summary for sampled conditioning parameters."""
+    amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
+    normalized_marginals = [
+        ("A", (amplitudes - amplitudes.min()) / max(amplitudes.max() - amplitudes.min(), 1e-12), "C0"),
+        ("log10(f)", (np.log10(frequencies) - np.log10(frequencies).min()) / max(np.ptp(np.log10(frequencies)), 1e-12), "C3"),
+        ("R_c", (contact_resistance - contact_resistance.min()) / max(contact_resistance.max() - contact_resistance.min(), 1e-12), "C2"),
     ]
 
-    for ax, x_vals, y_vals, colors, x_label, y_label, color_label in scatter_specs:
-        sc = ax.scatter(x_vals, y_vals, c=colors, s=14, alpha=0.7, cmap="viridis", edgecolors="none")
-        fig.colorbar(sc, ax=ax, label=color_label)
-        ax.set_xlabel(x_label)
-        ax.set_ylabel(y_label)
-        if x_label.endswith("(f)"):
-            ax.set_xscale("log")
-        ax.grid(True, linestyle="--", alpha=0.3)
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+        scatter_specs = [
+            (axes[0, 0], amplitudes, frequencies, "Flux Amplitude (A)", "Flux Frequency (f)"),
+            (axes[0, 1], amplitudes, contact_resistance, "Flux Amplitude (A)", "Contact Resistance (R_c)"),
+            (axes[1, 0], frequencies, contact_resistance, "Flux Frequency (f)", "Contact Resistance (R_c)"),
+        ]
+        for ax, x_vals, y_vals, x_label, y_label in scatter_specs:
+            ax.scatter(x_vals, y_vals, s=16, alpha=0.45, color="C0", edgecolors="none")
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.grid(True)
+            if "Frequency" in x_label:
+                ax.set_xscale("log")
+            if "Frequency" in y_label:
+                ax.set_yscale("log")
 
-    fig.suptitle(f"Conditioning Parameter Coverage — {len(amplitudes)} simulations")
+        hist_ax = axes[1, 1]
+        bins = np.linspace(0.0, 1.0, 12)
+        for label, values, color in normalized_marginals:
+            hist_ax.hist(values, bins=bins, histtype="step", linewidth=1.8, label=label, color=color)
+        hist_ax.set_xlabel("Normalized parameter value")
+        hist_ax.set_ylabel("Count")
+        hist_ax.set_title("Marginal Coverage")
+        hist_ax.legend(loc="upper center")
+        hist_ax.grid(True)
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "lhs_scatter.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved LHS scatter to: {save_path}")
-    plt.close(fig)
+        fig.suptitle(f"Conditioning Parameter Coverage — {len(amplitudes)} simulations")
+        _save_figure(fig, save_path, "data", "lhs_scatter", layout="constrained")
 
 
 def plot_flux_profiles(
@@ -1238,154 +1433,29 @@ def plot_flux_profiles(
 
     t = np.linspace(0.0, t_final, 2000)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for A, f, label in combos:
-        q_fn = windowed_sin_flux(f, A, t_on, t_off, tukey_alpha=0.5)
-        q_vals = np.array([q_fn(ti) for ti in t])
-        ax.plot(t, q_vals, linewidth=1.2, label=label)
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for A, f, label in combos:
+            q_fn = windowed_sin_flux(f, A, t_on, t_off, tukey_alpha=0.5)
+            q_vals = np.array([q_fn(ti) for ti in t])
+            ax.plot(t, q_vals, label=label)
 
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Heat Flux q(t)")
-    ax.set_title(f"Windowed Sinusoidal Flux Profiles (t_on={t_on}, t_off={t_off})")
-    ax.legend(fontsize=8)
-    ax.grid(True, linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "flux_profiles.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved flux profiles to: {save_path}")
-    plt.close(fig)
-
-
-def plot_trajectory_comparison_grid(
-    trajectories: np.ndarray,
-    sim_params: np.ndarray,
-    x_grid: np.ndarray,
-    t_grid: np.ndarray,
-    save_path: str | Path | None = None,
-):
-    """2x2 grid of trajectory heatmaps at the parameter space corners."""
-    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
-    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
-
-    # find sims closest to each corner
-    corners = [
-        ("Low A, Low f", 50.0, 1.0),
-        ("Low A, High f", 50.0, 20.0),
-        ("High A, Low f", 300.0, 1.0),
-        ("High A, High f", 300.0, 20.0),
-    ]
-
-    T_mesh, X_mesh = np.meshgrid(t_grid, x_grid)
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=True, sharey=True)
-
-    for ax, (label, target_A, target_f) in zip(axes.flat, corners):
-        dist = (amplitudes - target_A) ** 2 + (frequencies - target_f) ** 2
-        sim_id = int(np.argmin(dist))
-        T = trajectories[sim_id]  # (Nt, Nx)
-
-        pc = ax.pcolormesh(T_mesh, X_mesh, T.T, cmap="inferno", shading="auto")
-        fig.colorbar(pc, ax=ax, shrink=0.8)
-        ax.set_title(f"{label}\nSim {sim_id}: A={amplitudes[sim_id]:.0f}, f={frequencies[sim_id]:.1f}")
         ax.set_xlabel("Time")
-        ax.set_ylabel("x")
-
-    fig.suptitle("Trajectory Comparison — Parameter Space Corners", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "trajectory_comparison_grid.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved trajectory comparison grid to: {save_path}")
-    plt.close(fig)
-
-
-def plot_boundary_temperature(
-    trajectories: np.ndarray,
-    sim_params: np.ndarray,
-    t_grid: np.ndarray,
-    n_samples: int = 20,
-    color_by: str = "amplitude",
-    seed: int = 42,
-    save_path: str | Path | None = None,
-):
-    """Plot T(x=0, t) for multiple simulations, colored by amplitude or frequency."""
-    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
-    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
-
-    rng = np.random.default_rng(seed)
-    num_sims = trajectories.shape[0]
-    selected = rng.choice(num_sims, size=min(n_samples, num_sims), replace=False)
-
-    color_vals = amplitudes[selected] if color_by == "amplitude" else frequencies[selected]
-    color_label = "Amplitude (A)" if color_by == "amplitude" else "Frequency (f)"
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    norm = plt.Normalize(vmin=color_vals.min(), vmax=color_vals.max())
-    cmap = plt.cm.viridis
-
-    for i, sim_id in enumerate(selected):
-        T_boundary = trajectories[sim_id, :, 0]  # T(x=0, t)
-        ax.plot(t_grid, T_boundary, color=cmap(norm(color_vals[i])), alpha=0.7, linewidth=0.8)
-
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    fig.colorbar(sm, ax=ax, label=color_label)
-
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Temperature at x=0")
-    ax.set_title(f"Boundary Temperature Response — {len(selected)} simulations (colored by {color_by})")
-    ax.grid(True, linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "boundary_temperature.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved boundary temperature to: {save_path}")
-    plt.close(fig)
-
-
-def plot_parameter_response(
-    trajectories: np.ndarray,
-    sim_params: np.ndarray,
-    save_path: str | Path | None = None,
-):
-    """2D scatter of (amplitude, frequency) colored by peak boundary temperature."""
-    amplitudes = np.array([p[0] for p in sim_params], dtype=np.float32)
-    frequencies = np.array([p[1] for p in sim_params], dtype=np.float32)
-
-    # response metric: peak temperature at x=0
-    peak_T = trajectories[:, :, 0].max(axis=1)
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sc = ax.scatter(amplitudes, frequencies, c=peak_T, s=15, cmap="inferno", alpha=0.8, edgecolors="none")
-    fig.colorbar(sc, ax=ax, label="Peak T at x=0")
-
-    ax.set_xlabel("Flux Amplitude (A)")
-    ax.set_ylabel("Flux Frequency (f)")
-    ax.set_title("Parameter–Response: Peak Boundary Temperature")
-    ax.grid(True, linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "parameter_response.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved parameter-response to: {save_path}")
-    plt.close(fig)
+        ax.set_ylabel("Heat Flux q(t)")
+        ax.set_title(f"Windowed Sinusoidal Flux Profiles (t_on={t_on}, t_off={t_off})")
+        ax.legend(loc="upper right")
+        ax.grid(True)
+        _save_figure(fig, save_path, "data", "flux_profiles")
 
 
 def plot_snapshot_pair_samples(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
+    y_grid: np.ndarray,
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     config: dict,
     n_samples: int = 3,
-    interface_x: float = 0.5,
     seed: int = 42,
     save_path: str | Path | None = None,
 ):
@@ -1395,62 +1465,59 @@ def plot_snapshot_pair_samples(
     Each panel shows the source snapshot and one future target snapshot from the
     actual all-to-all pair dataset, with conditioning values annotated in-place.
     """
-    datasets = _build_split_datasets(trajectories, x_grid, t_grid, sim_params, config)
+    config = _resolve_plot_config(config)
+    interface_meta = _resolve_interface_metadata(config=config)
+    datasets = _build_split_datasets(trajectories, x_grid, y_grid, t_grid, sim_params, config)
     rng = np.random.default_rng(seed)
     splits = [("Train", datasets["train"]), ("Val", datasets["val"]), ("Test", datasets["test"])]
 
-    fig, axes = plt.subplots(3, n_samples, figsize=(5 * n_samples, 11), squeeze=False)
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(3, n_samples, figsize=(5 * n_samples, 11), squeeze=False)
 
-    for row, (split_name, dataset) in enumerate(splits):
-        if len(dataset) == 0:
-            for col in range(n_samples):
-                axes[row, col].set_axis_off()
-            continue
-
-        sample_size = min(n_samples, len(dataset))
-        chosen_indices = rng.choice(len(dataset), size=sample_size, replace=False)
-
-        for col in range(n_samples):
-            ax = axes[row, col]
-            if col >= sample_size:
-                ax.set_axis_off()
+        for row, (split_name, dataset) in enumerate(splits):
+            if len(dataset) == 0:
+                for col in range(n_samples):
+                    axes[row, col].set_axis_off()
                 continue
-            pair_idx = int(chosen_indices[col])
-            sim_id, s, j = dataset._pairs[pair_idx]
-            lead_time = dataset._lead_times[pair_idx]
-            source = trajectories[sim_id, s, :]
-            target = trajectories[sim_id, j, :]
-            amp, freq, _T0, R_c = sim_params[sim_id]
 
-            ax.plot(x_grid, source, color="black", linewidth=1.4, label=f"source t={t_grid[s]:.3f}")
-            ax.plot(x_grid, target, color="C3", linewidth=1.4, linestyle="--", label=f"target t={t_grid[j]:.3f}")
-            ax.axvline(interface_x, color="gray", linestyle=":", linewidth=1.2, alpha=0.8)
+            sample_size = min(n_samples, len(dataset))
+            chosen_indices = rng.choice(len(dataset), size=sample_size, replace=False)
 
-            text = f"Δt={lead_time:.3f}\nA={float(amp):.0f}\nf={float(freq):.2f}\nR_c={float(R_c):.2f}"
-            ax.text(
-                0.03,
-                0.97,
-                text,
-                transform=ax.transAxes,
-                va="top",
-                ha="left",
-                fontsize=8,
-                bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
-            )
-            ax.set_title(f"{split_name} | Sim {sim_id}", fontsize=9)
-            ax.set_xlabel("x")
-            ax.set_ylabel("Temperature")
-            ax.legend(fontsize=6, loc="best")
-            ax.grid(True, linestyle="--", alpha=0.3)
+            for col in range(n_samples):
+                ax = axes[row, col]
+                if col >= sample_size:
+                    ax.set_axis_off()
+                    continue
+                pair_idx = int(chosen_indices[col])
+                sim_id, s, j = dataset._pairs[pair_idx]
+                lead_time = dataset._lead_times[pair_idx]
+                y_mid = trajectories.shape[-1] // 2
+                source = trajectories[sim_id, s, :, y_mid]
+                target = trajectories[sim_id, j, :, y_mid]
+                amp, freq, _T0, R_c = sim_params[sim_id]
 
-    fig.suptitle("Snapshot Pair Samples — All-to-All Conditioning View", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "snapshot_pair_samples.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved snapshot pair samples to: {save_path}")
-    plt.close(fig)
+                ax.plot(x_grid, source, color="black", label=f"source t={t_grid[s]:.3f}")
+                ax.plot(x_grid, target, color="C3", linestyle="--", label=f"target t={t_grid[j]:.3f}")
+                _add_interface_lines(ax, interface_meta["positions"])
+
+                text = f"Δt={lead_time:.3f}\nA={float(amp):.0f}\nf={float(freq):.2f}\nR_c={float(R_c):.2f}"
+                ax.text(
+                    0.03,
+                    0.97,
+                    text,
+                    transform=ax.transAxes,
+                    va="top",
+                    ha="left",
+                    bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.85"},
+                )
+                ax.set_title(f"{split_name} | Sim {sim_id}")
+                ax.set_xlabel("x")
+                ax.set_ylabel("Temperature")
+                ax.legend(loc="best")
+                ax.grid(True)
+
+        fig.suptitle("Snapshot Pair Samples — All-to-All Conditioning View")
+        _save_figure(fig, save_path, "data", "snapshot_pair_samples")
 
 
 def plot_interface_error(
@@ -1460,10 +1527,10 @@ def plot_interface_error(
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     sim_ids: np.ndarray,
-    interface_x: float = 0.5,
     n_samples: int = 4,
     n_targets: int = 20,
     seed: int = 42,
+    config: dict | None = None,
     save_path: str | Path | None = None,
 ):
     """Diagnose whether the model captures the temperature jump at the interface.
@@ -1476,117 +1543,123 @@ def plot_interface_error(
         Middle: Residual (pred − truth) zoomed to interface — reveals error structure.
         Right:  Jump magnitude ΔT = T[right_node] - T[left_node] over target times.
     """
-    Nt = len(t_grid)
-
-    # find flanking nodes for the interface
-    iface_idx = int(np.argmin(np.abs(x_grid - interface_x)))
-    left_node = iface_idx - 1 if x_grid[iface_idx] >= interface_x else iface_idx
-    right_node = left_node + 1
+    config = _resolve_plot_config(config)
+    interface_meta = _resolve_interface_metadata(config=config)
+    interface_x = interface_meta["interface_x"]
+    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_x)
+    interface_metric_mask = _build_interface_mask(x_grid, interface_x, interface_meta["interface_half_width"])
+    zoom_half_width = max(float(interface_meta["interface_half_width"]) * 2.5, 0.12)
+    interface_zoom_mask = np.abs(x_grid - interface_x) <= zoom_half_width
+    x_zoom = x_grid[interface_zoom_mask]
 
     rng = np.random.default_rng(seed)
     chosen_sims = rng.choice(sim_ids, size=min(n_samples, len(sim_ids)), replace=False)
+    cases = []
+    for sim_id in chosen_sims:
+        s = int(rng.integers(0, len(t_grid) - 1))
+        target_indices = _future_target_indices(s, n_targets, len(t_grid))
+        case = _prepare_prediction_case(
+            model,
+            trajectories,
+            x_grid,
+            t_grid,
+            sim_params,
+            sim_id,
+            s,
+            target_indices,
+            config=config,
+        )
+        cases.append(case)
 
-    fig, axes = plt.subplots(n_samples, 3, figsize=(20, 4 * n_samples), squeeze=False)
-    cmap_snap = plt.cm.viridis
-    n_snaps = 5  # number of snapshots shown in cross-section panels
-
-    # zoom region for cross-section
-    zoom_mask = (x_grid >= 0.3) & (x_grid <= 0.7)
-    x_zoom = x_grid[zoom_mask]
-
-    # interface region for interface-specific rel L2
-    iface_mask = (x_grid >= 0.4) & (x_grid <= 0.6)
-
-    for row_idx, sim_id in enumerate(chosen_sims):
-        # pick a random source time (leave room for targets after it)
-        max_s = Nt - 2  # need at least one target after source
-        s = int(rng.integers(0, max_s + 1))
-
-        # evenly-spaced target indices after s
-        target_indices = np.linspace(s + 1, Nt - 1, n_targets, dtype=int)
-        case = _prepare_prediction_case(model, trajectories, x_grid, t_grid, sim_params, sim_id, s, target_indices)
-        t_targets = case["t_targets"]
-        Y_pred = case["Y_pred"]
+    n_snapshots = max(1, min(5, min(case["Y_true"].shape[1] for case in cases)))
+    left_limits = []
+    residual_limits = []
+    jump_limits = []
+    for case in cases:
         Y_true = case["Y_true"]
-        amp = case["amp"]
-        freq = case["freq"]
-        R_c = case["R_c"]
-
-        # --- Left panel: T(x) overlay (truth vs pred) zoomed to interface ---
-        ax_left = axes[row_idx, 0]
-        snap_indices = np.linspace(0, n_targets - 1, n_snaps, dtype=int)
-
-        for i, h_idx in enumerate(snap_indices):
-            color = cmap_snap(i / max(n_snaps - 1, 1))
-            ax_left.plot(x_zoom, Y_true[zoom_mask, h_idx], color=color, linewidth=2.0,
-                         label=f"t={t_targets[h_idx]:.3f}")
-            ax_left.plot(x_zoom, Y_pred[zoom_mask, h_idx], color="red", linewidth=1.0,
-                         linestyle="--", alpha=0.9)
-
-        ax_left.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
-        ax_left.set_xlabel("x")
-        ax_left.set_ylabel("Temperature")
-        ax_left.set_title(f"Sim {sim_id} | A={amp:.0f}, f={freq:.1f}, R_c={R_c:.2f}, s={s}\n"
-                          f"Colored=truth, red dashed=pred", fontsize=9)
-        ax_left.legend(fontsize=6, loc="best")
-        ax_left.grid(True, linestyle="--", alpha=0.3)
-
-        # --- Middle panel: residual (pred − truth) near interface ---
-        ax_mid = axes[row_idx, 1]
-
-        for i, h_idx in enumerate(snap_indices):
-            color = cmap_snap(i / max(n_snaps - 1, 1))
-            residual = Y_pred[zoom_mask, h_idx] - Y_true[zoom_mask, h_idx]
-            ax_mid.plot(x_zoom, residual, color=color, linewidth=1.5,
-                        label=f"t={t_targets[h_idx]:.3f}")
-
-        ax_mid.axvline(interface_x, color="red", linestyle=":", linewidth=1.5, alpha=0.7)
-        ax_mid.axhline(0, color="gray", linestyle=":", alpha=0.5)
-        ax_mid.set_xlabel("x")
-        ax_mid.set_ylabel("Pred − Truth")
-        ax_mid.set_title("Residual at interface region", fontsize=9)
-        ax_mid.legend(fontsize=6, loc="best")
-        ax_mid.grid(True, linestyle="--", alpha=0.3)
-
-        # --- Right panel: jump magnitude over time ---
-        ax_right = axes[row_idx, 2]
+        Y_pred = case["Y_pred"]
+        residual = Y_pred - Y_true
         true_jump = Y_true[right_node, :] - Y_true[left_node, :]
         pred_jump = Y_pred[right_node, :] - Y_pred[left_node, :]
+        left_limits.extend([float(np.min(Y_true[interface_zoom_mask, :])), float(np.max(Y_true[interface_zoom_mask, :]))])
+        left_limits.extend([float(np.min(Y_pred[interface_zoom_mask, :])), float(np.max(Y_pred[interface_zoom_mask, :]))])
+        residual_limits.extend([float(np.min(residual[interface_zoom_mask, :])), float(np.max(residual[interface_zoom_mask, :]))])
+        jump_limits.extend([float(np.min(true_jump)), float(np.max(true_jump)), float(np.min(pred_jump)), float(np.max(pred_jump))])
 
-        ax_right.plot(t_targets, true_jump, "k-", linewidth=1.5, label="True ΔT")
-        ax_right.plot(t_targets, pred_jump, "r--", linewidth=1.5, label="Pred ΔT")
-        ax_right.axhline(0, color="gray", linestyle=":", alpha=0.5)
-        ax_right.set_xlabel("Time")
-        ax_right.set_ylabel("ΔT (right − left)")
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(len(cases), 3, figsize=(18, 4.1 * len(cases)), squeeze=False)
+        cmap_snap = plt.cm.viridis
+        for row_idx, case in enumerate(cases):
+            ax_left, ax_mid, ax_right = axes[row_idx]
+            t_targets = case["t_targets"]
+            Y_true = case["Y_true"]
+            Y_pred = case["Y_pred"]
+            residual = Y_pred - Y_true
+            true_jump = Y_true[right_node, :] - Y_true[left_node, :]
+            pred_jump = Y_pred[right_node, :] - Y_pred[left_node, :]
+            global_rel = _relative_l2_percent(Y_pred, Y_true)
+            iface_rel = _relative_l2_percent(Y_pred[interface_metric_mask, :], Y_true[interface_metric_mask, :])
+            jump_rel = _relative_l2_percent(pred_jump, true_jump)
+            snap_indices = np.linspace(0, Y_true.shape[1] - 1, n_snapshots, dtype=int)
 
-        # compute interface-specific metrics
-        global_rel_l2 = (np.mean((Y_pred - Y_true) ** 2) / np.mean(Y_true ** 2)) ** 0.5 * 100
-        iface_pred = Y_pred[iface_mask, :]
-        iface_true = Y_true[iface_mask, :]
-        iface_rel_l2 = (np.mean((iface_pred - iface_true) ** 2) /
-                        np.mean(iface_true ** 2)) ** 0.5 * 100
-        jump_rel_err = (np.mean((pred_jump - true_jump) ** 2) /
-                        max(np.mean(true_jump ** 2), 1e-12)) ** 0.5 * 100
+            for i, snap_idx in enumerate(snap_indices):
+                color = cmap_snap(i / max(len(snap_indices) - 1, 1))
+                label = f"t={t_targets[snap_idx]:.3f}"
+                ax_left.plot(x_zoom, Y_true[interface_zoom_mask, snap_idx], color=color, label=label if row_idx == 0 else None)
+                ax_left.plot(x_zoom, Y_pred[interface_zoom_mask, snap_idx], color="C3", linestyle="--", alpha=0.9)
+                ax_mid.plot(x_zoom, residual[interface_zoom_mask, snap_idx], color=color, label=label if row_idx == 0 else None)
 
-        ax_right.set_title(f"Global L2: {global_rel_l2:.3f}% | "
-                           f"Iface L2: {iface_rel_l2:.3f}% | "
-                           f"Jump err: {jump_rel_err:.1f}%", fontsize=9)
-        ax_right.legend(fontsize=8)
-        ax_right.grid(True, linestyle="--", alpha=0.3)
+            _add_interface_lines(ax_left, case["interface_positions"])
+            ax_left.set_xlim(x_zoom[0], x_zoom[-1])
+            ax_left.set_ylim(min(left_limits), max(left_limits))
+            ax_left.set_xlabel("x")
+            ax_left.set_ylabel("Temperature")
+            ax_left.set_title("Interface Profiles")
+            ax_left.grid(True)
+            if row_idx == 0:
+                ax_left.legend(loc="best")
 
-    fig.suptitle("Interface Diagnostic — Prediction vs Truth at x=0.5", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "interface_error.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved interface error diagnostics to: {save_path}")
-    plt.close(fig)
+            _add_interface_lines(ax_mid, case["interface_positions"])
+            ax_mid.axhline(0.0, color="0.45", linestyle=":", linewidth=1.0)
+            ax_mid.set_xlim(x_zoom[0], x_zoom[-1])
+            ax_mid.set_ylim(min(residual_limits), max(residual_limits))
+            ax_mid.set_xlabel("x")
+            ax_mid.set_ylabel("Pred - Truth")
+            ax_mid.set_title("Residual Near Interface")
+            ax_mid.grid(True)
+            if row_idx == 0:
+                ax_mid.legend(loc="best")
+
+            ax_right.plot(t_targets, true_jump, color="black", label="True ΔT")
+            ax_right.plot(t_targets, pred_jump, color="C3", linestyle="--", label="Pred ΔT")
+            ax_right.axhline(0.0, color="0.45", linestyle=":", linewidth=1.0)
+            ax_right.set_ylim(min(jump_limits), max(jump_limits))
+            ax_right.set_xlabel("Time")
+            ax_right.set_ylabel("ΔT (right - left)")
+            ax_right.set_title("Jump Over Target Time")
+            ax_right.grid(True)
+            if row_idx == 0:
+                ax_right.legend(loc="best")
+
+            ax_right.text(
+                0.03,
+                0.05,
+                f"Sim {row_idx + 1}: A={case['amp']:.0f}, f={case['freq']:.2f}, R_c={case['R_c']:.2f}\n"
+                f"Global rel. L2: {global_rel:.2f}%\nIface rel. L2: {iface_rel:.2f}%\nJump rel. err.: {jump_rel:.2f}%",
+                transform=ax_right.transAxes,
+                va="bottom",
+                ha="left",
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+            )
+
+        fig.suptitle(f"Interface Diagnostic — x = {interface_x:.3f}")
+        _save_figure(fig, save_path, "data", "interface_error")
 
 
 def plot_lead_time_coverage(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
+    y_grid: np.ndarray,
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     config: dict,
@@ -1594,45 +1667,55 @@ def plot_lead_time_coverage(
     save_path: str | Path | None = None,
 ):
     """Visualize train/test pair coverage across lead times and curriculum cutoffs."""
-    coverage = _lead_time_coverage_counts(trajectories, x_grid, t_grid, sim_params, config)
+    coverage = _lead_time_coverage_counts(trajectories, x_grid, y_grid, t_grid, sim_params, config)
     train_leads = coverage["train"]
+    val_leads = coverage["val"]
     test_leads = coverage["test"]
-
-    fig, (ax_hist, ax_frac) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]})
-    ax_hist.hist(train_leads, bins=bins, alpha=0.65, color="C0", label=f"Train pairs ({len(train_leads)})")
-    ax_hist.hist(test_leads, bins=bins, alpha=0.5, color="C3", label=f"Test pairs ({len(test_leads)})")
-    ax_hist.set_xlabel("Lead time Δt")
-    ax_hist.set_ylabel("Pair count")
-    ax_hist.set_title("Lead-Time Coverage for All-to-All Snapshot Pairs")
-    ax_hist.legend()
-    ax_hist.grid(True, linestyle="--", alpha=0.3)
-
+    max_lead = max(
+        float(train_leads.max()) if len(train_leads) > 0 else 0.0,
+        float(val_leads.max()) if len(val_leads) > 0 else 0.0,
+        float(test_leads.max()) if len(test_leads) > 0 else 0.0,
+        float(t_grid[-1] - t_grid[0]),
+    )
+    hist_bins = np.linspace(0.0, max_lead, bins + 1)
+    bin_centers = 0.5 * (hist_bins[:-1] + hist_bins[1:])
     warmup_epochs = int(config.get("training", {}).get("curriculum_warmup", 0))
-    max_lead = float(train_leads.max()) if len(train_leads) > 0 else float(t_grid[-1] - t_grid[0])
     fractions = np.array([0.25, 0.5, 0.75, 1.0], dtype=np.float32)
     cutoff_positions = fractions * max_lead
-    for frac, cutoff in zip(fractions, cutoff_positions):
-        epoch_label = int(round(frac * warmup_epochs)) if warmup_epochs > 0 else 0
-        ax_hist.axvline(cutoff, color="k", linestyle=":", alpha=0.35)
-        label = f"{int(frac * 100)}% pairs"
-        if warmup_epochs > 0:
-            label += f" (epoch {epoch_label})"
-        ax_frac.scatter(cutoff, frac, color="C2", s=35)
-        ax_frac.text(cutoff, frac + 0.03, label, ha="center", va="bottom", fontsize=8)
 
-    ax_frac.plot(cutoff_positions, fractions, color="C2", linewidth=1.2)
-    ax_frac.set_xlabel("Lead time Δt")
-    ax_frac.set_ylabel("Curriculum fraction")
-    ax_frac.set_ylim(0.0, 1.1)
-    ax_frac.grid(True, linestyle="--", alpha=0.3)
+    with plt.rc_context(PLOT_STYLE):
+        fig, (ax_hist, ax_frac) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        split_series = [
+            ("Train", train_leads, "C0"),
+            ("Val", val_leads, "C2"),
+            ("Test", test_leads, "C3"),
+        ]
+        for label, values, color in split_series:
+            counts, _ = np.histogram(values, bins=hist_bins)
+            ax_hist.step(bin_centers, counts, where="mid", color=color, linewidth=1.8, label=f"{label} ({len(values)})")
+            fractions_hist = counts / max(len(values), 1)
+            ax_frac.step(bin_centers, fractions_hist, where="mid", color=color, linewidth=1.8, label=label)
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "lead_time_coverage.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved lead-time coverage plot to: {save_path}")
-    plt.close(fig)
+        for frac, cutoff in zip(fractions, cutoff_positions):
+            epoch_label = int(round(frac * warmup_epochs)) if warmup_epochs > 0 else 0
+            label = "curriculum lead-time cutoff"
+            if warmup_epochs > 0:
+                label += f" (epoch {epoch_label})"
+            ax_hist.axvline(cutoff, color="0.35", linestyle=":", alpha=0.8)
+            ax_frac.axvline(cutoff, color="0.35", linestyle=":", alpha=0.8)
+            ax_frac.text(cutoff, 1.02 * max(ax_frac.get_ylim()[1], 1.0), label, rotation=90, va="bottom", ha="center", fontsize=8)
+
+        ax_hist.set_ylabel("Pair count")
+        ax_hist.set_title("Lead-Time Coverage by Split")
+        ax_hist.legend(loc="upper right")
+        ax_hist.grid(True)
+
+        ax_frac.set_xlabel("Lead time Δt")
+        ax_frac.set_ylabel("Fraction of split")
+        ax_frac.set_title("Normalized Coverage")
+        ax_frac.legend(loc="upper right")
+        ax_frac.grid(True)
+        _save_figure(fig, save_path, "data", "lead_time_coverage")
 
 
 def plot_lead_time_error(
@@ -1642,41 +1725,45 @@ def plot_lead_time_error(
     n_bins: int = 8,
     max_samples: int = 256,
     seed: int = 42,
+    config: dict | None = None,
     save_path: str | Path | None = None,
 ):
-    """Plot held-out error as a function of lead time."""
+    """Plot held-out error as a function of lead time using raw points, binned medians, and IQR bands."""
     records = _compute_pair_error_records(
         model=model,
         dataset=dataset,
         x_grid=x_grid,
+        config=config,
         max_samples=max_samples,
         seed=seed,
     )
-    centers, global_mean, counts = _compute_binned_means(records["lead_time"], records["global_rel_l2"], n_bins)
-    _, iface_mean, _ = _compute_binned_means(records["lead_time"], records["iface_rel_l2"], n_bins)
+    centers, global_med, global_q25, global_q75, counts = _compute_binned_quantiles(
+        records["lead_time"], records["global_rel_l2"], n_bins
+    )
+    _, iface_med, iface_q25, iface_q75, _ = _compute_binned_quantiles(
+        records["lead_time"], records["iface_rel_l2"], n_bins
+    )
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]})
-    ax_top.plot(centers, global_mean, marker="o", color="C0", label="Global rel. L2 (%)")
-    ax_top.plot(centers, iface_mean, marker="s", color="C3", label="Interface rel. L2 (%)")
-    ax_top.set_xlabel("Lead time Δt")
-    ax_top.set_ylabel("Mean error (%)")
-    ax_top.set_title("Held-Out Error vs Lead Time")
-    ax_top.legend()
-    ax_top.grid(True, linestyle="--", alpha=0.3)
+    with plt.rc_context(PLOT_STYLE):
+        fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
+        ax_top.scatter(records["lead_time"], records["global_rel_l2"], s=16, alpha=0.18, color="0.55", label="Raw global")
+        ax_top.scatter(records["lead_time"], records["iface_rel_l2"], s=16, alpha=0.12, color="C3", label="Raw interface")
+        ax_top.plot(centers, global_med, marker="o", color="C0", label="Binned median global")
+        ax_top.fill_between(centers, global_q25, global_q75, color="C0", alpha=0.15, label="Global IQR")
+        ax_top.plot(centers, iface_med, marker="s", color="C3", label="Binned median interface")
+        ax_top.fill_between(centers, iface_q25, iface_q75, color="C3", alpha=0.12, label="Interface IQR")
+        ax_top.set_ylabel("Error (%)")
+        ax_top.set_title("Held-Out Error vs Lead Time")
+        ax_top.legend(loc="upper left")
+        ax_top.grid(True)
 
-    width = 0.8 * (centers[1] - centers[0]) if len(centers) > 1 else 0.02
-    ax_bot.bar(centers, counts, width=width, color="0.6")
-    ax_bot.set_xlabel("Lead time Δt")
-    ax_bot.set_ylabel("Samples")
-    ax_bot.grid(True, axis="y", linestyle="--", alpha=0.3)
+        width = 0.8 * (centers[1] - centers[0]) if len(centers) > 1 else 0.02
+        ax_bot.bar(centers, counts, width=width, color="0.65")
+        ax_bot.set_xlabel("Lead time Δt")
+        ax_bot.set_ylabel("Samples")
+        ax_bot.grid(True, axis="y")
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "lead_time_error.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved lead-time error plot to: {save_path}")
-    plt.close(fig)
+        _save_figure(fig, save_path, "data", "lead_time_error")
 
 
 def plot_parameter_error_slices(
@@ -1686,46 +1773,190 @@ def plot_parameter_error_slices(
     max_samples: int = 256,
     n_bins: int = 6,
     seed: int = 42,
+    config: dict | None = None,
     save_path: str | Path | None = None,
 ):
-    """Plot held-out error against amplitude, frequency, and contact resistance."""
+    """Plot held-out error against amplitude, frequency, and contact resistance using medians and IQR bands."""
     records = _compute_pair_error_records(
         model=model,
         dataset=dataset,
         x_grid=x_grid,
+        config=config,
         max_samples=max_samples,
         seed=seed,
     )
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
     specs = [
         ("amplitude", "Flux Amplitude (A)", False),
         ("frequency", "Flux Frequency (f)", True),
         ("R_c", "Contact Resistance (R_c)", False),
     ]
 
-    for ax, (key, x_label, use_log) in zip(axes, specs):
-        x_vals = records[key]
-        ax.scatter(x_vals, records["global_rel_l2"], s=14, alpha=0.25, color="0.5", label="Per-pair global")
-        centers, global_mean, _ = _compute_binned_means(x_vals, records["global_rel_l2"], n_bins)
-        _, iface_mean, _ = _compute_binned_means(x_vals, records["iface_rel_l2"], n_bins)
-        ax.plot(centers, global_mean, color="C0", linewidth=1.8, marker="o", label="Binned global")
-        ax.plot(centers, iface_mean, color="C3", linewidth=1.8, marker="s", label="Binned interface")
-        ax.set_xlabel(x_label)
-        ax.set_ylabel("Error (%)")
-        ax.grid(True, linestyle="--", alpha=0.3)
-        if use_log:
-            ax.set_xscale("log")
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+        for ax, (key, x_label, use_log) in zip(axes, specs):
+            x_vals = records[key]
+            ax.scatter(x_vals, records["global_rel_l2"], s=14, alpha=0.18, color="0.55", label="Raw global")
+            ax.scatter(x_vals, records["iface_rel_l2"], s=14, alpha=0.12, color="C3", label="Raw interface")
+            centers, global_med, global_q25, global_q75, _ = _compute_binned_quantiles(x_vals, records["global_rel_l2"], n_bins)
+            _, iface_med, iface_q25, iface_q75, _ = _compute_binned_quantiles(x_vals, records["iface_rel_l2"], n_bins)
+            ax.plot(centers, global_med, color="C0", linewidth=1.8, marker="o", label="Binned median global")
+            ax.fill_between(centers, global_q25, global_q75, color="C0", alpha=0.14, label="Global IQR")
+            ax.plot(centers, iface_med, color="C3", linewidth=1.8, marker="s", label="Binned median interface")
+            ax.fill_between(centers, iface_q25, iface_q75, color="C3", alpha=0.12, label="Interface IQR")
+            ax.set_xlabel(x_label)
+            ax.set_ylabel("Error (%)")
+            ax.grid(True)
+            if use_log:
+                ax.set_xscale("log")
 
-    axes[0].legend(fontsize=8)
-    fig.suptitle("Held-Out Error Across Conditioning Dimensions", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = Path(__file__).resolve().parent / "data" / "parameter_error_slices.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved parameter error slices to: {save_path}")
-    plt.close(fig)
+        axes[0].legend(loc="upper left")
+        fig.suptitle("Held-Out Error Across Conditioning Dimensions")
+        _save_figure(fig, save_path, "data", "parameter_error_slices")
+
+
+def plot_dataset_summary(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict,
+    representative_sim_id: int | None = None,
+    save_path: str | Path | None = None,
+):
+    """Report-style overview of the dataset: representative trajectory, IC spread, parameter coverage, and lead-time coverage."""
+    config = _resolve_plot_config(config)
+    amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
+    sim_id = _select_representative_sim_id(sim_params) if representative_sim_id is None else int(representative_sim_id)
+    T_mesh, X_mesh = np.meshgrid(t_grid, x_grid)
+    # 2D trajectories (num_sims, Nt, Nx, Ny): take a mid-y slice for the 1D envelope/heatmap
+    y_mid = trajectories.shape[-1] // 2
+    initial_profiles = trajectories[:, 0, :, y_mid]
+    p10 = np.percentile(initial_profiles, 10, axis=0)
+    p50 = np.percentile(initial_profiles, 50, axis=0)
+    p90 = np.percentile(initial_profiles, 90, axis=0)
+    coverage = _lead_time_coverage_counts(trajectories, x_grid, y_grid, t_grid, sim_params, config)
+    max_lead = max(
+        float(coverage["train"].max()) if len(coverage["train"]) > 0 else 0.0,
+        float(coverage["val"].max()) if len(coverage["val"]) > 0 else 0.0,
+        float(coverage["test"].max()) if len(coverage["test"]) > 0 else 0.0,
+        float(t_grid[-1] - t_grid[0]),
+    )
+    hist_bins = np.linspace(0.0, max_lead, 16)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+
+        # (Nt, Nx, Ny) → mid-y slice → (Nt, Nx) → transpose for (x, t)
+        pc = axes[0, 0].pcolormesh(T_mesh, X_mesh, trajectories[sim_id, :, :, y_mid].T, cmap="inferno", shading="auto")
+        fig.colorbar(pc, ax=axes[0, 0], label="Temperature")
+        axes[0, 0].set_title(f"Representative Trajectory — Sim {sim_id} (mid-y slice)")
+        axes[0, 0].set_xlabel("Time")
+        axes[0, 0].set_ylabel("x")
+
+        axes[0, 1].fill_between(x_grid, p10, p90, color="C0", alpha=0.18, label="10th-90th percentile")
+        axes[0, 1].plot(x_grid, p50, color="C0", label="Median initial condition")
+        axes[0, 1].set_title("Initial Condition Envelope")
+        axes[0, 1].set_xlabel("x")
+        axes[0, 1].set_ylabel("Temperature")
+        axes[0, 1].legend(loc="best")
+        axes[0, 1].grid(True)
+
+        scatter = axes[1, 0].scatter(amplitudes, frequencies, c=contact_resistance, cmap="viridis", s=18, alpha=0.7, edgecolors="none")
+        fig.colorbar(scatter, ax=axes[1, 0], label="R_c")
+        axes[1, 0].set_title("Parameter-Space Coverage")
+        axes[1, 0].set_xlabel("Flux Amplitude (A)")
+        axes[1, 0].set_ylabel("Flux Frequency (f)")
+        axes[1, 0].set_yscale("log")
+        axes[1, 0].grid(True)
+
+        for label, values, color in [("Train", coverage["train"], "C0"), ("Val", coverage["val"], "C2"), ("Test", coverage["test"], "C3")]:
+            axes[1, 1].hist(values, bins=hist_bins, histtype="step", linewidth=1.8, label=label, color=color)
+        axes[1, 1].set_title("Lead-Time Coverage by Split")
+        axes[1, 1].set_xlabel("Lead time Δt")
+        axes[1, 1].set_ylabel("Pair count")
+        axes[1, 1].legend(loc="upper right")
+        axes[1, 1].grid(True)
+
+        fig.suptitle("Dataset Summary")
+        _save_figure(fig, save_path, "data", "dataset_summary", layout="constrained")
+
+
+def plot_interface_jump_summary(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    config: dict,
+    max_samples: int = 256,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Aggregate held-out interface-jump diagnostics over sampled test pairs."""
+    config = _resolve_plot_config(config)
+    records = _compute_pair_error_records(
+        model=model,
+        dataset=dataset,
+        x_grid=x_grid,
+        config=config,
+        max_samples=max_samples,
+        seed=seed,
+    )
+
+    lead_centers, lead_med, lead_q25, lead_q75, _ = _compute_binned_quantiles(records["lead_time"], records["jump_rel_l2"], 8)
+    rc_centers, rc_med, rc_q25, rc_q75, _ = _compute_binned_quantiles(records["R_c"], records["jump_rel_l2"], 6)
+    jump_rel_median = float(np.median(records["jump_rel_l2"]))
+    jump_rel_p90 = float(np.percentile(records["jump_rel_l2"], 90))
+    global_rel_median = float(np.median(records["global_rel_l2"]))
+    iface_rel_median = float(np.median(records["iface_rel_l2"]))
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+
+        axes[0, 0].scatter(records["lead_time"], records["jump_rel_l2"], s=16, alpha=0.18, color="0.55")
+        axes[0, 0].plot(lead_centers, lead_med, color="C0", marker="o", label="Binned median jump rel. err.")
+        axes[0, 0].fill_between(lead_centers, lead_q25, lead_q75, color="C0", alpha=0.15, label="Jump rel. err. IQR")
+        axes[0, 0].set_title("Jump Relative Error vs Lead Time")
+        axes[0, 0].set_xlabel("Lead time Δt")
+        axes[0, 0].set_ylabel("Jump relative error (%)")
+        axes[0, 0].legend(loc="upper left")
+        axes[0, 0].grid(True)
+
+        axes[0, 1].scatter(records["R_c"], records["jump_rel_l2"], s=16, alpha=0.18, color="0.55")
+        axes[0, 1].plot(rc_centers, rc_med, color="C3", marker="o", label="Binned median jump rel. err.")
+        axes[0, 1].fill_between(rc_centers, rc_q25, rc_q75, color="C3", alpha=0.15, label="Jump rel. err. IQR")
+        axes[0, 1].set_title("Jump Relative Error vs R_c")
+        axes[0, 1].set_xlabel("Contact Resistance (R_c)")
+        axes[0, 1].set_ylabel("Jump relative error (%)")
+        axes[0, 1].legend(loc="upper left")
+        axes[0, 1].grid(True)
+
+        min_jump = min(float(np.min(records["true_jump"])), float(np.min(records["pred_jump"])))
+        max_jump = max(float(np.max(records["true_jump"])), float(np.max(records["pred_jump"])))
+        axes[1, 0].scatter(records["true_jump"], records["pred_jump"], s=18, alpha=0.25, color="C2")
+        axes[1, 0].plot([min_jump, max_jump], [min_jump, max_jump], color="black", linestyle="--", label="Identity")
+        axes[1, 0].set_title("Predicted vs True Interface Jump")
+        axes[1, 0].set_xlabel("True ΔT")
+        axes[1, 0].set_ylabel("Predicted ΔT")
+        axes[1, 0].legend(loc="upper left")
+        axes[1, 0].grid(True)
+
+        axes[1, 1].axis("off")
+        axes[1, 1].text(
+            0.02,
+            0.98,
+            "Aggregate Metrics\n\n"
+            f"Median jump rel. err.: {jump_rel_median:.2f}%\n"
+            f"90th pct jump rel. err.: {jump_rel_p90:.2f}%\n"
+            f"Median global rel. L2: {global_rel_median:.2f}%\n"
+            f"Median interface rel. L2: {iface_rel_median:.2f}%",
+            va="top",
+            ha="left",
+            fontsize=11,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "#f7f7f7", "edgecolor": "0.85"},
+        )
+
+        fig.suptitle("Interface Jump Summary")
+        _save_figure(fig, save_path, "data", "interface_jump_summary", layout="constrained")
 
 
 # ============================================================
@@ -1831,44 +2062,35 @@ def plot_sweep_ranking(
     # records already sorted best-first; reverse for bottom-to-top bar ordering
     records_plot = list(reversed(records))
 
-    fig, ax = plt.subplots(figsize=(10, max(3, 0.8 * n + 1.5)))
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(10, max(3, 0.8 * n + 1.5)))
 
-    y_pos = np.arange(n)
-    means = [r["objective"] for r in records_plot]
-    stds = [float(np.std(r["per_seed_vals"])) for r in records_plot]
-    labels = [r["config_name"] for r in records_plot]
+        y_pos = np.arange(n)
+        means = [r["objective"] for r in records_plot]
+        stds = [float(np.std(r["per_seed_vals"])) for r in records_plot]
+        labels = [r["config_name"] for r in records_plot]
 
-    # bar colors: best (last in reversed list) = green, rest = gray
-    colors = ["#b0b0b0"] * n
-    colors[-1] = "#4CAF50"  # best config (top bar)
+        colors = ["#b0b0b0"] * n
+        colors[-1] = "#4CAF50"
 
-    ax.barh(y_pos, means, xerr=stds, height=0.6, color=colors,
-            edgecolor="k", linewidth=0.5, capsize=3, ecolor="#555")
+        ax.barh(y_pos, means, xerr=stds, height=0.6, color=colors,
+                edgecolor="k", linewidth=0.5, capsize=3, ecolor="#555")
 
-    # overlay individual seed points
-    for i, r in enumerate(records_plot):
-        seed_vals = r["per_seed_vals"]
-        ax.scatter(seed_vals, [i] * len(seed_vals), color="k", s=18, zorder=5, alpha=0.7)
+        for i, r in enumerate(records_plot):
+            seed_vals = r["per_seed_vals"]
+            ax.scatter(seed_vals, [i] * len(seed_vals), color="k", s=18, zorder=5, alpha=0.7)
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=10)
-    ax.set_xlabel("Validation Rel. L2 (%)")
-    ax.set_title("Hyperparameter Sweep — Config Ranking")
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=10)
+        ax.set_xlabel("Validation Rel. L2 (%)")
+        ax.set_title("Hyperparameter Sweep — Config Ranking")
 
-    # log scale if range > 10×
-    obj_vals = [r["objective"] for r in records]
-    if len(obj_vals) >= 2 and max(obj_vals) / max(min(obj_vals), 1e-12) > 10:
-        ax.set_xscale("log")
+        obj_vals = [r["objective"] for r in records]
+        if len(obj_vals) >= 2 and max(obj_vals) / max(min(obj_vals), 1e-12) > 10:
+            ax.set_xscale("log")
 
-    ax.grid(True, axis="x", linestyle="--", alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is None:
-        save_path = experiment_dir / "sweep_ranking.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved sweep ranking to: {save_path}")
-    plt.close(fig)
+        ax.grid(True, axis="x")
+        _save_figure(fig, save_path if save_path is not None else experiment_dir / "sweep_ranking.png", "sweep", "sweep_ranking")
 
 
 def plot_sweep_convergence(
@@ -1897,47 +2119,36 @@ def plot_sweep_convergence(
     cmap = plt.cm.tab10
     color_map = {r["config_name"]: cmap(i % 10) for i, r in enumerate(records)}
 
-    fig, (ax_val, ax_train) = plt.subplots(1, 2, figsize=(14, 5))
+    with plt.rc_context(PLOT_STYLE):
+        fig, (ax_val, ax_train) = plt.subplots(1, 2, figsize=(14, 5))
 
-    for cname in config_names:
-        if cname not in curves:
-            continue
-        c = curves[cname]
-        color = color_map[cname]
+        for cname in config_names:
+            if cname not in curves:
+                continue
+            c = curves[cname]
+            color = color_map[cname]
 
-        # validation loss
-        if len(c["val_epochs"]) > 0:
-            ax_val.semilogy(c["val_epochs"], c["val_rel_l2"], color=color,
-                            linewidth=1.2, label=cname)
-            # star at best checkpoint
-            best_idx = np.argmin(c["val_rel_l2"])
-            ax_val.scatter(c["val_epochs"][best_idx], c["val_rel_l2"][best_idx],
-                           marker="*", s=80, color=color, edgecolors="k",
-                           linewidths=0.5, zorder=5)
+            if len(c["val_epochs"]) > 0:
+                ax_val.semilogy(c["val_epochs"], c["val_rel_l2"], color=color, linewidth=1.2, label=cname)
+                best_idx = np.argmin(c["val_rel_l2"])
+                ax_val.scatter(c["val_epochs"][best_idx], c["val_rel_l2"][best_idx],
+                               marker="*", s=80, color=color, edgecolors="k", linewidths=0.5, zorder=5)
 
-        # training loss
-        ax_train.semilogy(c["epochs"], c["train_loss"], color=color,
-                          linewidth=0.8, alpha=0.8, label=cname)
+            ax_train.semilogy(c["epochs"], c["train_loss"], color=color, linewidth=0.8, alpha=0.8, label=cname)
 
-    ax_val.set_xlabel("Epoch")
-    ax_val.set_ylabel("Val Rel. L2 (%)")
-    ax_val.set_title(f"Validation Loss (seed {seed})")
-    ax_val.legend(fontsize=8, loc="upper right")
-    ax_val.grid(True, linestyle="--", alpha=0.3)
+        ax_val.set_xlabel("Epoch")
+        ax_val.set_ylabel("Val Rel. L2 (%)")
+        ax_val.set_title(f"Validation Loss (seed {seed})")
+        ax_val.legend(loc="upper right")
+        ax_val.grid(True)
 
-    ax_train.set_xlabel("Epoch")
-    ax_train.set_ylabel("Train MSE")
-    ax_train.set_title(f"Training Loss (seed {seed})")
-    ax_train.legend(fontsize=8, loc="upper right")
-    ax_train.grid(True, linestyle="--", alpha=0.3)
+        ax_train.set_xlabel("Epoch")
+        ax_train.set_ylabel("Train MSE")
+        ax_train.set_title(f"Training Loss (seed {seed})")
+        ax_train.legend(loc="upper right")
+        ax_train.grid(True)
 
-    fig.tight_layout()
-    if save_path is None:
-        save_path = experiment_dir / "sweep_convergence.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved sweep convergence to: {save_path}")
-    plt.close(fig)
+        _save_figure(fig, save_path if save_path is not None else experiment_dir / "sweep_convergence.png", "sweep", "sweep_convergence")
 
 
 def plot_sweep_hyperparams(
@@ -1970,62 +2181,49 @@ def plot_sweep_hyperparams(
         ("width",         "Width",         False),
     ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
-    axes = axes.flatten()
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+        axes = axes.flatten()
 
-    for idx, (key, label, log_x) in enumerate(hp_specs):
-        ax = axes[idx]
-        vals = [r[key] for r in records]
+        for idx, (key, label, log_x) in enumerate(hp_specs):
+            ax = axes[idx]
+            vals = [r[key] for r in records]
 
-        # skip panel if all values are None
-        if all(v is None for v in vals):
+            if all(v is None for v in vals):
+                ax.set_visible(False)
+                continue
+
+            vals = np.array([v if v is not None else np.nan for v in vals], dtype=float)
+            ax.scatter(vals, objectives, c=colors, s=80, edgecolors="k", linewidths=0.5, zorder=3)
+            ax.scatter(vals[0], objectives[0], s=200, facecolors="none", edgecolors="#4CAF50", linewidths=2.0, zorder=4)
+
+            if log_x:
+                ax.set_xscale("log")
+            if objectives.max() / max(objectives.min(), 1e-12) > 10:
+                ax.set_yscale("log")
+
+            ax.set_xlabel(label)
+            ax.set_ylabel("Val Rel. L2 (%)")
+            ax.grid(True)
+
+        ax = axes[5]
+        modes_vals = np.array([r["modes"] if r["modes"] is not None else np.nan for r in records], dtype=float)
+        width_vals = np.array([r["width"] if r["width"] is not None else np.nan for r in records], dtype=float)
+        capacity = modes_vals * width_vals
+
+        if not np.all(np.isnan(capacity)):
+            ax.scatter(capacity, objectives, c=colors, s=80, edgecolors="k", linewidths=0.5, zorder=3)
+            ax.scatter(capacity[0], objectives[0], s=200, facecolors="none", edgecolors="#4CAF50", linewidths=2.0, zorder=4)
+            if objectives.max() / max(objectives.min(), 1e-12) > 10:
+                ax.set_yscale("log")
+            ax.set_xlabel("Modes × Width")
+            ax.set_ylabel("Val Rel. L2 (%)")
+            ax.grid(True)
+        else:
             ax.set_visible(False)
-            continue
 
-        vals = np.array([v if v is not None else np.nan for v in vals], dtype=float)
-        ax.scatter(vals, objectives, c=colors, s=80, edgecolors="k", linewidths=0.5, zorder=3)
-
-        # highlight best config with a circle
-        ax.scatter(vals[0], objectives[0], s=200, facecolors="none",
-                   edgecolors="#4CAF50", linewidths=2.0, zorder=4)
-
-        if log_x:
-            ax.set_xscale("log")
-
-        # y-axis log if range > 10x
-        if objectives.max() / max(objectives.min(), 1e-12) > 10:
-            ax.set_yscale("log")
-
-        ax.set_xlabel(label)
-        ax.set_ylabel("Val Rel. L2 (%)")
-        ax.grid(True, linestyle="--", alpha=0.3)
-
-    # 6th panel: modes × width (capacity proxy)
-    ax = axes[5]
-    modes_vals = np.array([r["modes"] if r["modes"] is not None else np.nan for r in records], dtype=float)
-    width_vals = np.array([r["width"] if r["width"] is not None else np.nan for r in records], dtype=float)
-    capacity = modes_vals * width_vals
-
-    if not np.all(np.isnan(capacity)):
-        ax.scatter(capacity, objectives, c=colors, s=80, edgecolors="k", linewidths=0.5, zorder=3)
-        ax.scatter(capacity[0], objectives[0], s=200, facecolors="none",
-                   edgecolors="#4CAF50", linewidths=2.0, zorder=4)
-        if objectives.max() / max(objectives.min(), 1e-12) > 10:
-            ax.set_yscale("log")
-        ax.set_xlabel("Modes × Width")
-        ax.set_ylabel("Val Rel. L2 (%)")
-        ax.grid(True, linestyle="--", alpha=0.3)
-    else:
-        ax.set_visible(False)
-
-    fig.suptitle("Hyperparameter Sensitivity", fontsize=13)
-    fig.tight_layout()
-    if save_path is None:
-        save_path = experiment_dir / "sweep_hyperparams.png"
-    save_path = _ensure_parent(Path(save_path))
-    fig.savefig(save_path, dpi=200)
-    print(f"Saved sweep hyperparams to: {save_path}")
-    plt.close(fig)
+        fig.suptitle("Hyperparameter Sensitivity")
+        _save_figure(fig, save_path if save_path is not None else experiment_dir / "sweep_hyperparams.png", "sweep", "sweep_hyperparams")
 
 
 # ============================================================
@@ -2040,13 +2238,14 @@ if __name__ == "__main__":
       python -m visual.plots --group physics --out visual/          # physics diagnostics only
       python -m visual.plots --group mms --out visual/              # MMS convergence only
       python -m visual.plots --group training --csv <path> --out visual/
-      python -m visual.plots --group data --data <path> --x-grid <path> --t-grid <path> --params <path> --out visual/
+      python -m visual.plots --group data --data <path> --x-grid <path> --y-grid <path> --t-grid <path> --params <path> --out visual/
       python -m visual.plots --group sweep --experiment <path> --runs <path> --out visual/
       python -m visual.plots --plots prediction_vs_truth lead_time_error --checkpoint <path> --out visual/
 
     Optional data flags:
       --data        Path to trajectories .npy file
       --x-grid      Path to x_grid .npy file
+      --y-grid      Path to y_grid .npy file
       --t-grid      Path to t_grid .npy file
       --params      Path to sim_params .npy file
       --csv         Path to train_metrics.csv
@@ -2062,6 +2261,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate plots for the ITR project")
     parser.add_argument("--data", type=str, default=None, help="Path to trajectories .npy file")
     parser.add_argument("--x-grid", type=str, default=None, help="Path to x_grid .npy file")
+    parser.add_argument("--y-grid", type=str, default=None, help="Path to y_grid .npy file")
     parser.add_argument("--t-grid", type=str, default=None, help="Path to t_grid .npy file")
     parser.add_argument("--params", type=str, default=None, help="Path to sim_params .npy file")
     parser.add_argument("--csv", type=str, default=None, help="Path to train_metrics.csv")
@@ -2089,8 +2289,7 @@ if __name__ == "__main__":
     individual = args.plots
 
     # ---- PHYSICS GROUP ----
-    physics_plots = ["final_temperature", "layer_geometry", "face_conductance",
-                     "multilayer_evolution", "heat_flux_profile"]
+    physics_plots = _plots_for_group("physics")
     need_physics = any(_should_run(p, groups, individual) for p in physics_plots)
 
     if need_physics:
@@ -2121,8 +2320,8 @@ if __name__ == "__main__":
             plot_heat_flux_profile(solver, T_hist, save_path=physics_dir / "heat_flux_profile.png")
 
     # ---- MMS GROUP ----
-    if _should_run("mms_convergence", groups, individual) or \
-       _should_run("mms_order_estimation", groups, individual):
+    mms_plots = _plots_for_group("mms")
+    if any(_should_run(p, groups, individual) for p in mms_plots):
         print("=== MMS GROUP ===")
 
         mms_dir = out_dir / "mms"
@@ -2136,8 +2335,8 @@ if __name__ == "__main__":
             plot_mms_order_estimation(save_path=mms_dir / "mms_order_estimation.png")
 
     # ---- TRAINING GROUP ----
-    if _should_run("training_curves", groups, individual) or \
-       _should_run("seed_comparison", groups, individual):
+    training_plots = _plots_for_group("training")
+    if any(_should_run(p, groups, individual) for p in training_plots):
         print("=== TRAINING GROUP ===")
 
         training_dir = out_dir / "training"
@@ -2147,28 +2346,17 @@ if __name__ == "__main__":
                 print("--- training_curves ---")
                 plot_training_curves(args.csv, save_path=training_dir / "training_curves.png")
             else:
-                print("Skipping training_curves (no --csv provided)")
+                _print_skip("training_curves", "need --csv")
 
         if _should_run("seed_comparison", groups, individual):
             if args.report:
                 print("--- seed_comparison ---")
                 plot_seed_comparison(args.report, save_path=training_dir / "seed_comparison.png")
             else:
-                print("Skipping seed_comparison (no --report provided)")
+                _print_skip("seed_comparison", "need --report")
 
     # ---- DATA GROUP ----
-    data_plots = [
-        "trajectory_heatmap",
-        "initial_conditions",
-        "lhs_scatter",
-        "flux_profiles",
-        "snapshot_pair_samples",
-        "prediction_vs_truth",
-        "interface_error",
-        "lead_time_coverage",
-        "lead_time_error",
-        "parameter_error_slices",
-    ]
+    data_plots = _plots_for_group("data")
     need_data = any(_should_run(p, groups, individual) for p in data_plots)
 
     if need_data:
@@ -2196,31 +2384,44 @@ if __name__ == "__main__":
             "lead_time_coverage",
             "lead_time_error",
             "parameter_error_slices",
+            "dataset_summary",
+            "interface_jump_summary",
         }
         needs_grid_data = any(_should_run(name, groups, individual) for name in grid_data_plots)
         trajectories = None
         x_grid = None
+        y_grid = None
         t_grid = None
         plot_config = None
         split_datasets = None
 
         if needs_grid_data:
-            if args.data and args.x_grid and args.t_grid:
-                print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.t_grid} ...")
-                trajectories, x_grid, t_grid = _load_plot_data(args.data, args.x_grid, args.t_grid)
+            if args.data and args.x_grid and args.y_grid and args.t_grid:
+                print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.y_grid}, {args.t_grid} ...")
+                trajectories, x_grid, y_grid, t_grid = _load_plot_data(args.data, args.x_grid, args.y_grid, args.t_grid)
             else:
-                print("Skipping grid-based data plots (need --data, --x-grid, and --t-grid)")
+                for name in grid_data_plots:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "need --data, --x-grid, --y-grid, and --t-grid")
 
-        model_plots = {"prediction_vs_truth", "interface_error", "lead_time_error", "parameter_error_slices"}
+        model_plots = {
+            "prediction_vs_truth",
+            "interface_error",
+            "lead_time_error",
+            "parameter_error_slices",
+            "interface_jump_summary",
+        }
         needs_model = any(_should_run(name, groups, individual) for name in model_plots)
         if needs_model and args.checkpoint:
             model, checkpoint_conf = _load_checkpoint_model(args.checkpoint)
         elif needs_model:
-            print("Skipping checkpoint-based model plots (need --checkpoint)")
+            for name in model_plots:
+                if _should_run(name, groups, individual):
+                    _print_skip(name, "need --checkpoint")
 
         if trajectories is not None and sim_params is not None:
             plot_config = _resolve_plot_config(checkpoint_conf)
-            split_datasets = _build_split_datasets(trajectories, x_grid, t_grid, sim_params, plot_config)
+            split_datasets = _build_split_datasets(trajectories, x_grid, y_grid, t_grid, sim_params, plot_config)
 
         if sim_params is not None and _should_run("lhs_scatter", groups, individual):
             print("--- lhs_scatter ---")
@@ -2239,11 +2440,24 @@ if __name__ == "__main__":
 
             # plots requiring sim_params
             if sim_params is not None:
+                if split_datasets is not None and _should_run("dataset_summary", groups, individual):
+                    print("--- dataset_summary ---")
+                    plot_dataset_summary(
+                        trajectories,
+                        x_grid,
+                        y_grid,
+                        t_grid,
+                        sim_params,
+                        config=plot_config,
+                        save_path=data_dir / "dataset_summary.png",
+                    )
+
                 if split_datasets is not None and _should_run("snapshot_pair_samples", groups, individual):
                     print("--- snapshot_pair_samples ---")
                     plot_snapshot_pair_samples(
                         trajectories,
                         x_grid,
+                        y_grid,
                         t_grid,
                         sim_params,
                         config=plot_config,
@@ -2255,6 +2469,7 @@ if __name__ == "__main__":
                     plot_lead_time_coverage(
                         trajectories,
                         x_grid,
+                        y_grid,
                         t_grid,
                         sim_params,
                         config=plot_config,
@@ -2277,6 +2492,7 @@ if __name__ == "__main__":
                             sim_id=sim_id,
                             s=s,
                             n_steps=n_steps,
+                            config=plot_config,
                             save_path=data_dir / "prediction_vs_truth.png",
                         )
 
@@ -2289,6 +2505,7 @@ if __name__ == "__main__":
                             t_grid,
                             sim_params,
                             test_dataset.sim_ids,
+                            config=plot_config,
                             save_path=data_dir / "interface_error.png",
                         )
 
@@ -2298,6 +2515,7 @@ if __name__ == "__main__":
                             model,
                             test_dataset,
                             x_grid,
+                            config=plot_config,
                             save_path=data_dir / "lead_time_error.png",
                         )
 
@@ -2307,16 +2525,41 @@ if __name__ == "__main__":
                             model,
                             test_dataset,
                             x_grid,
+                            config=plot_config,
                             save_path=data_dir / "parameter_error_slices.png",
                         )
+
+                    if _should_run("interface_jump_summary", groups, individual):
+                        print("--- interface_jump_summary ---")
+                        plot_interface_jump_summary(
+                            model,
+                            test_dataset,
+                            x_grid,
+                            config=plot_config,
+                            save_path=data_dir / "interface_jump_summary.png",
+                        )
             else:
-                print("Skipping param-dependent plots (no --params provided)")
+                for name in {
+                    "lhs_scatter",
+                    "snapshot_pair_samples",
+                    "lead_time_coverage",
+                    "dataset_summary",
+                    "prediction_vs_truth",
+                    "interface_error",
+                    "lead_time_error",
+                    "parameter_error_slices",
+                    "interface_jump_summary",
+                }:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "need --params")
         else:
             if needs_grid_data:
-                print("Skipping trajectory-dependent plots (data/grids not available)")
+                for name in grid_data_plots:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "trajectory grids are unavailable")
 
     # ---- SWEEP GROUP ----
-    sweep_plots = ["sweep_ranking", "sweep_convergence", "sweep_hyperparams"]
+    sweep_plots = _plots_for_group("sweep")
     need_sweep = any(_should_run(p, groups, individual) for p in sweep_plots)
 
     if need_sweep:
@@ -2333,16 +2576,21 @@ if __name__ == "__main__":
             if _should_run("sweep_convergence", groups, individual):
                 if args.runs:
                     print("--- sweep_convergence ---")
-                    plot_sweep_convergence(experiment_dir, args.runs,
-                                           seed=args.sweep_seed,
-                                           save_path=sweep_dir / "sweep_convergence.png")
+                    plot_sweep_convergence(
+                        experiment_dir,
+                        args.runs,
+                        seed=args.sweep_seed,
+                        save_path=sweep_dir / "sweep_convergence.png",
+                    )
                 else:
-                    print("Skipping sweep_convergence (no --runs provided)")
+                    _print_skip("sweep_convergence", "need --runs")
 
             if _should_run("sweep_hyperparams", groups, individual):
                 print("--- sweep_hyperparams ---")
                 plot_sweep_hyperparams(experiment_dir, save_path=sweep_dir / "sweep_hyperparams.png")
         else:
-            print("Skipping sweep plots (no --experiment provided)")
+            for name in sweep_plots:
+                if _should_run(name, groups, individual):
+                    _print_skip(name, "need --experiment")
 
     print(f"\nAll requested plots saved to: {out_dir}")
