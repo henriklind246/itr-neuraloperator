@@ -164,7 +164,7 @@ class FVSolver2D:
             self.dx[face_idx + 1] = h_R + 0.5 * self.hx
 
         # dy[j] = h/2 at boundaries, h otherwise
-        # create an arary with length Ny with sizes of control volumes in the y-dir.
+        # create an array with length Ny with sizes of control volumes in the y-dir.
         self.dy = np.full(Ny, self.hx)
         self.dy[0] = self.hx / 2.0
         self.dy[Ny - 1] = self.hx / 2.0
@@ -382,9 +382,7 @@ class FVSolver2D:
     #                    CN COEFFICIENTS
     # ================================================================
 
-    def _build_local_cn_coefficients(
-        self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _build_local_cn_coefficients(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Build CN coupling coefficients for all four face directions.
 
