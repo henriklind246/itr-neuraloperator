@@ -3,6 +3,7 @@ import pytest
 from src.physics.mms_2d import (
     run_mms_2d_interface,
     space_order_test_2d_off_center_interface,
+    time_order_test_2d_off_center_interface,
 )
 
 
@@ -20,4 +21,8 @@ class TestOffCenterInterfaceMMS:
 
     def test_spatial_convergence_is_second_order(self):
         order = space_order_test_2d_off_center_interface([50, 100, 200], x_I=0.4734)
+        assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
+
+    def test_temporal_convergence_is_second_order(self):
+        order = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005], x_I=0.4734)
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
