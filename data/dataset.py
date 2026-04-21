@@ -11,7 +11,6 @@ AMP_RANGE = (50.0, 300.0)
 FREQ_RANGE = (1.0, 20.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
 
-
 # --------- SNAPSHOT PAIR DATASET ---------
 
 class SnapshotPairDataset(Dataset):
@@ -29,10 +28,10 @@ class SnapshotPairDataset(Dataset):
     from the full trajectory and enumerates all possible pairs per
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
-    Returns 4-tuple: (x_spatial, cond, Y, T_stats)
-        x_spatial : (Nx, 2)  — [T̃_source, x_norm]
+    Returns 4-tuple: (spatial, cond, Y, T_stats)
+        spatial : (Nx, Ny, 3)  — [T̃_source, x_norm, y_norm]
         cond      : (5,)     — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
-        Y         : (Nx, 1)  — T̃_target (globally normalized)
+        Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
         T_stats   : (2,)     — [μ_global, σ_global] for denormalization
     """
 
@@ -41,6 +40,7 @@ class SnapshotPairDataset(Dataset):
         trajectories: np.ndarray,
         t_grid: np.ndarray,
         x_grid: np.ndarray,
+        y_grid: np.ndarray,
         sim_ids: np.ndarray,
         sim_params: np.ndarray,
         mu_global: float,
@@ -48,21 +48,30 @@ class SnapshotPairDataset(Dataset):
         n_snapshots: int | None = None,
         noise_std: float = 0.0,
     ):
-        self.trajectories = trajectories  # (num_sims, Nt, Nx)
+        self.trajectories = trajectories  # (num_sims, Nt, Nx, Ny)
         self.sim_params = sim_params
         self.t_grid = t_grid.astype(np.float32)
         self.x_grid = x_grid.astype(np.float32)
+        self.y_grid = y_grid.astype(np.float32)
         self.sim_ids = sim_ids.astype(np.int64)
         self.mu_global = np.float32(mu_global)
         self.sigma_global = np.float32(sigma_global)
         self.noise_std = noise_std
 
-        self.num_sims, self.Nt, self.Nx = trajectories.shape
+        self.num_sims, self.Nt, self.Nx, self.Ny = trajectories.shape
 
         # Normalized spatial coordinates (fixed for all samples)
         self.x_norm = (
             (self.x_grid - self.x_grid[0]) / (self.x_grid[-1] - self.x_grid[0])
         ).astype(np.float32)
+
+        self.y_norm = (
+            (self.y_grid - self.y_grid[0]) / (self.y_grid[-1] - self.y_grid[0])
+        ).astype(np.float32)
+
+        # Broadcast to (Nx, Ny) so they can be stacked with T_source at sample time
+        self.X_norm = np.broadcast_to(self.x_norm[:, None], (self.Nx, self.Ny)).astype(np.float32)
+        self.Y_norm = np.broadcast_to(self.y_norm[None, :], (self.Nx, self.Ny)).astype(np.float32)
 
         # Determine which time indices to use
         if n_snapshots is not None and n_snapshots < self.Nt:
@@ -112,8 +121,8 @@ class SnapshotPairDataset(Dataset):
         freq = np.float32(freq)
 
         # Source and target snapshots
-        T_source = self.trajectories[sim_id, s, :]  # (Nx,)
-        T_target = self.trajectories[sim_id, j, :]  # (Nx,)
+        T_source = self.trajectories[sim_id, s, :, :]  # (Nx, Ny)
+        T_target = self.trajectories[sim_id, j, :, :]  # (Nx, Ny)
 
         # Global temperature normalization (training-set statistics)
         T_source_norm = (T_source - self.mu_global) / (self.sigma_global + T_EPS)
@@ -123,8 +132,8 @@ class SnapshotPairDataset(Dataset):
         if self.noise_std > 0:
             T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
 
-        # Spatial input: (Nx, 2) — [T̃_source, x_norm]
-        x_spatial = np.stack([T_source_norm, self.x_norm], axis=-1).astype(np.float32)
+        # Spatial input: (Nx, Ny, 3) — [T̃_source, x_norm, y_norm]
+        spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm], axis=-1).astype(np.float32)
 
         # Conditioning vector: (5,) — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
         t_bar = self.t_grid[j] - self.t_grid[s]
@@ -135,14 +144,14 @@ class SnapshotPairDataset(Dataset):
         R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
         cond = np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm], dtype=np.float32)
 
-        # Target: (Nx, 1)
-        Y = T_target_norm[:, None].astype(np.float32)
+        # Target: (Nx, Ny, 1)
+        Y = T_target_norm[:, :, None].astype(np.float32)
 
         # Stats for denormalization at eval time: (2,) — global, constant across samples
         T_stats = np.array([self.mu_global, self.sigma_global], dtype=np.float32)
 
         return (
-            torch.from_numpy(x_spatial),
+            torch.from_numpy(spatial),
             torch.from_numpy(cond),
             torch.from_numpy(Y),
             torch.from_numpy(T_stats),
@@ -154,29 +163,35 @@ class SnapshotPairDataset(Dataset):
 def load_sim_data(
     sim_traj_path: str,
     x_grid_path: str,
+    y_grid_path: str,
     t_grid_path: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
-    trajectories = np.load(sim_traj_path)  # (num_sims, Nt, Nx)
-    x_grid = np.load(x_grid_path)          # (Nx,)
-    t_grid = np.load(t_grid_path)          # (Nt,)
+    trajectories = np.load(sim_traj_path)  # (num_sims, Nt, Nx, Ny)
+    x_grid = np.load(x_grid_path) # (Nx,)
+    y_grid = np.load(y_grid_path) # (Ny,)
+    t_grid = np.load(t_grid_path) # (Nt,)
 
     # size safeguards
-    if trajectories.ndim != 3:
-        raise ValueError(f"Expected trajectories with ndim=3, got shape {trajectories.shape}")
+    if trajectories.ndim != 4:
+        raise ValueError(f"Expected trajectories with ndim=4, got shape {trajectories.shape}")
     if x_grid.ndim != 1:
         raise ValueError(f"Expected x_grid with ndim=1, got shape {x_grid.shape}")
+    if y_grid.ndim != 1:
+        raise ValueError(f"Expected y_grid with ndim=1, got shape {y_grid.shape}")
     if t_grid.ndim != 1:
         raise ValueError(f"Expected t_grid with ndim=1, got shape {t_grid.shape}")
 
     # length safeguards
-    n_sims, Nt_total, Nx = trajectories.shape
+    n_sims, Nt_total, Nx, Ny = trajectories.shape
     if x_grid.shape[0] != Nx:
         raise ValueError(f"x_grid length {x_grid.shape[0]} does not match Nx={Nx}")
+    if y_grid.shape[0] != Ny:
+        raise ValueError(f"y_grid length {y_grid.shape[0]} does not match Ny={Ny}")
     if t_grid.shape[0] != Nt_total:
         raise ValueError(f"t_grid length {t_grid.shape[0]} does not match Nt_total={Nt_total}")
 
-    return trajectories, x_grid, t_grid
+    return trajectories, x_grid, y_grid, t_grid
 
 
 # ------- SLICE ALL SIMS INTO TRAIN/VAL/TEST SPLITS -------
@@ -213,7 +228,7 @@ def compute_global_stats(
 
     Returns (mu_global, sigma_global) as Python floats.
     """
-    train_data = trajectories[train_ids]  # (N_train, Nt, Nx)
+    train_data = trajectories[train_ids]  # (N_train, Nt, Nx, Ny)
     mu_global = float(train_data.mean())
     sigma_global = float(train_data.std())
     return mu_global, sigma_global
@@ -224,6 +239,7 @@ def compute_global_stats(
 def create_dataloaders(
     trajectories: np.ndarray,
     x_grid: np.ndarray,
+    y_grid: np.ndarray,
     t_grid: np.ndarray,
     train_ids: np.ndarray,
     val_ids: np.ndarray,
@@ -243,6 +259,7 @@ def create_dataloaders(
     train_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
+        y_grid=y_grid,
         t_grid=t_grid,
         sim_ids=train_ids,
         sim_params=sim_params,
@@ -255,6 +272,7 @@ def create_dataloaders(
     val_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
+        y_grid=y_grid,
         t_grid=t_grid,
         sim_ids=val_ids,
         sim_params=sim_params,
@@ -266,6 +284,7 @@ def create_dataloaders(
     test_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
+        y_grid=y_grid,
         t_grid=t_grid,
         sim_ids=test_ids,
         sim_params=sim_params,
@@ -286,9 +305,10 @@ def create_dataloaders(
 
 if __name__ == '__main__':
     project_root = Path(__file__).resolve().parents[1]
-    trajectories, x_grid, t_grid = load_sim_data(
+    trajectories, x_grid, y_grid, t_grid = load_sim_data(
         sim_traj_path=str(project_root / "data" / "trajectories.npy"),
         x_grid_path=str(project_root / "data" / "x_grid.npy"),
+        y_grid_path=str(project_root / "data" / "y_grid.npy"),
         t_grid_path=str(project_root / "data" / "t_grid.npy"),
     )
     sim_params = np.load(str(project_root / "data" / "sim_params.npy"), allow_pickle=True)
@@ -300,7 +320,7 @@ if __name__ == '__main__':
     batch_size = 64
 
     train_loader, val_loader, test_loader = create_dataloaders(
-        trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+        trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=batch_size, sim_params=sim_params,
         mu_global=mu_global, sigma_global=sigma_global,
@@ -308,7 +328,7 @@ if __name__ == '__main__':
 
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
-    print(f"x_spatial: {x_spatial.shape}")  # (B, Nx, 2)
+    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 3)
     print(f"cond: {cond.shape}")            # (B, 5)
-    print(f"Y: {yb.shape}")                 # (B, Nx, 1)
+    print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
