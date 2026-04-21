@@ -19,51 +19,97 @@ _SYNTH_SIGMA = 1.0
 
 class TestLoadSimData:
     def test_correct_shapes(self, tmp_npy_data):
-        traj_path, x_path, t_path = tmp_npy_data
-        trajectories, x_grid, t_grid = load_sim_data(traj_path, x_path, t_path)
-        assert trajectories.shape == (20, 51, 11)
+        traj_path, x_path, y_path, t_path = tmp_npy_data
+        trajectories, x_grid, y_grid, t_grid = load_sim_data(traj_path, x_path, y_path, t_path)
+        assert trajectories.shape == (20, 51, 11, 11)
         assert x_grid.shape == (11,)
+        assert y_grid.shape == (11,)
         assert t_grid.shape == (51,)
 
     def test_wrong_traj_ndim_raises(self, tmp_path):
-        bad = np.zeros((10, 5))
+        bad = np.zeros((10, 5, 4))  # 3D instead of 4D
         x = np.zeros(5)
+        y = np.zeros(4)
         t = np.zeros(10)
         np.save(tmp_path / "traj.npy", bad)
         np.save(tmp_path / "x.npy", x)
+        np.save(tmp_path / "y.npy", y)
         np.save(tmp_path / "t.npy", t)
-        with pytest.raises(ValueError, match="ndim=3"):
-            load_sim_data(str(tmp_path / "traj.npy"), str(tmp_path / "x.npy"), str(tmp_path / "t.npy"))
+        with pytest.raises(ValueError, match="ndim=4"):
+            load_sim_data(
+                str(tmp_path / "traj.npy"),
+                str(tmp_path / "x.npy"),
+                str(tmp_path / "y.npy"),
+                str(tmp_path / "t.npy"),
+            )
 
     def test_wrong_xgrid_ndim_raises(self, tmp_path):
-        traj = np.zeros((5, 10, 4))
+        traj = np.zeros((5, 10, 4, 3))
         bad_x = np.zeros((4, 2))
+        y = np.zeros(3)
         t = np.zeros(10)
         np.save(tmp_path / "traj.npy", traj)
         np.save(tmp_path / "x.npy", bad_x)
+        np.save(tmp_path / "y.npy", y)
         np.save(tmp_path / "t.npy", t)
         with pytest.raises(ValueError, match="x_grid.*ndim=1"):
-            load_sim_data(str(tmp_path / "traj.npy"), str(tmp_path / "x.npy"), str(tmp_path / "t.npy"))
+            load_sim_data(
+                str(tmp_path / "traj.npy"),
+                str(tmp_path / "x.npy"),
+                str(tmp_path / "y.npy"),
+                str(tmp_path / "t.npy"),
+            )
 
     def test_xgrid_length_mismatch_raises(self, tmp_path):
-        traj = np.zeros((5, 10, 4))
+        traj = np.zeros((5, 10, 4, 3))
         bad_x = np.zeros(7)  # should be 4
+        y = np.zeros(3)
         t = np.zeros(10)
         np.save(tmp_path / "traj.npy", traj)
         np.save(tmp_path / "x.npy", bad_x)
+        np.save(tmp_path / "y.npy", y)
         np.save(tmp_path / "t.npy", t)
         with pytest.raises(ValueError, match="x_grid length"):
-            load_sim_data(str(tmp_path / "traj.npy"), str(tmp_path / "x.npy"), str(tmp_path / "t.npy"))
+            load_sim_data(
+                str(tmp_path / "traj.npy"),
+                str(tmp_path / "x.npy"),
+                str(tmp_path / "y.npy"),
+                str(tmp_path / "t.npy"),
+            )
+
+    def test_ygrid_length_mismatch_raises(self, tmp_path):
+        traj = np.zeros((5, 10, 4, 3))
+        x = np.zeros(4)
+        bad_y = np.zeros(7)  # should be 3
+        t = np.zeros(10)
+        np.save(tmp_path / "traj.npy", traj)
+        np.save(tmp_path / "x.npy", x)
+        np.save(tmp_path / "y.npy", bad_y)
+        np.save(tmp_path / "t.npy", t)
+        with pytest.raises(ValueError, match="y_grid length"):
+            load_sim_data(
+                str(tmp_path / "traj.npy"),
+                str(tmp_path / "x.npy"),
+                str(tmp_path / "y.npy"),
+                str(tmp_path / "t.npy"),
+            )
 
     def test_tgrid_length_mismatch_raises(self, tmp_path):
-        traj = np.zeros((5, 10, 4))
+        traj = np.zeros((5, 10, 4, 3))
         x = np.zeros(4)
+        y = np.zeros(3)
         bad_t = np.zeros(7)  # should be 10
         np.save(tmp_path / "traj.npy", traj)
         np.save(tmp_path / "x.npy", x)
+        np.save(tmp_path / "y.npy", y)
         np.save(tmp_path / "t.npy", bad_t)
         with pytest.raises(ValueError, match="t_grid length"):
-            load_sim_data(str(tmp_path / "traj.npy"), str(tmp_path / "x.npy"), str(tmp_path / "t.npy"))
+            load_sim_data(
+                str(tmp_path / "traj.npy"),
+                str(tmp_path / "x.npy"),
+                str(tmp_path / "y.npy"),
+                str(tmp_path / "t.npy"),
+            )
 
 
 # ===================== split_sim_ids =====================
@@ -116,10 +162,10 @@ class TestSnapshotPairDataset:
     @pytest.fixture
     def dataset_subsampled(self, synthetic_trajectories, synthetic_sim_params):
         """All-to-all dataset with n_snapshots=6 -> C(6,2)=15 pairs per sim."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         return SnapshotPairDataset(
-            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
@@ -128,10 +174,10 @@ class TestSnapshotPairDataset:
     @pytest.fixture
     def dataset_full(self, synthetic_trajectories, synthetic_sim_params):
         """All-to-all dataset using all time steps."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         return SnapshotPairDataset(
-            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=None,
@@ -151,10 +197,10 @@ class TestSnapshotPairDataset:
 
     def test_getitem_shapes(self, dataset_subsampled):
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
-        Nx = 11
-        assert x_spatial.shape == (Nx, 2)
+        Nx, Ny = 11, 11
+        assert x_spatial.shape == (Nx, Ny, 3)
         assert cond.shape == (5,)
-        assert Y.shape == (Nx, 1)
+        assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
 
     def test_getitem_dtypes(self, dataset_subsampled):
@@ -166,9 +212,27 @@ class TestSnapshotPairDataset:
 
     def test_x_coord_normalized(self, dataset_subsampled):
         x_spatial, _, _, _ = dataset_subsampled[0]
-        x_channel = x_spatial[:, 1]  # second channel is x_norm
+        x_channel = x_spatial[:, :, 1]  # second channel is x_norm
         assert x_channel.min() >= -1e-6
         assert x_channel.max() <= 1.0 + 1e-6
+
+    def test_ynorm_channel_varies_along_y(self, dataset_subsampled):
+        """y_norm channel should be constant along x and monotone along y."""
+        x_spatial, _, _, _ = dataset_subsampled[0]
+        y_channel = x_spatial[:, :, 2]  # third channel is y_norm
+        # Constant along x (axis=0)
+        assert torch.allclose(y_channel[0, :], y_channel[-1, :])
+        assert torch.allclose(y_channel.std(dim=0), torch.zeros(y_channel.shape[1]), atol=1e-6)
+        # Monotone along y
+        diffs = y_channel[0, 1:] - y_channel[0, :-1]
+        assert torch.all(diffs > 0)
+
+    def test_ynorm_channel_unit_range(self, dataset_subsampled):
+        """y_norm endpoints should be 0 and 1."""
+        x_spatial, _, _, _ = dataset_subsampled[0]
+        y_channel = x_spatial[:, :, 2]
+        assert y_channel[:, 0].abs().max().item() < 1e-6
+        assert (y_channel[:, -1] - 1.0).abs().max().item() < 1e-6
 
     def test_t_bar_positive(self, dataset_subsampled):
         """Lead time t_bar should always be > 0 (target after source)."""
@@ -187,15 +251,15 @@ class TestSnapshotPairDataset:
     def test_temperature_normalization(self, dataset_subsampled):
         """Source temperature should be globally normalized (finite values)."""
         x_spatial, _, _, _ = dataset_subsampled[0]
-        T_norm = x_spatial[:, 0]  # first channel is T_source_norm
+        T_norm = x_spatial[:, :, 0]  # first channel is T_source_norm
         assert torch.all(torch.isfinite(T_norm))
 
     def test_T_stats_returns_global_stats(self, synthetic_trajectories, synthetic_sim_params):
         """T_stats should return (mu_global, sigma_global), constant across samples."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(1)  # single sim for easier verification
         ds = SnapshotPairDataset(
-            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
@@ -248,16 +312,16 @@ class TestSnapshotPairDataset:
 
     def test_n_snapshots_test_finer_than_train(self, synthetic_trajectories, synthetic_sim_params):
         """Test dataset with more snapshots should have more pairs per sim."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(1)
         ds_train = SnapshotPairDataset(
-            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
         ds_test = SnapshotPairDataset(
-            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=10,
@@ -269,10 +333,10 @@ class TestSnapshotPairDataset:
 
 class TestCreateDataloaders:
     def test_returns_three(self, synthetic_trajectories, synthetic_sim_params):
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         loaders = create_dataloaders(
-            trajectories, x_grid, t_grid,
+            trajectories, x_grid, y_grid, t_grid,
             train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
@@ -281,10 +345,10 @@ class TestCreateDataloaders:
         assert len(loaders) == 3
 
     def test_batch_shapes(self, synthetic_trajectories, synthetic_sim_params):
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, _, _ = create_dataloaders(
-            trajectories, x_grid, t_grid,
+            trajectories, x_grid, y_grid, t_grid,
             train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
@@ -293,16 +357,17 @@ class TestCreateDataloaders:
         x_spatial, cond, Y, T_stats = next(iter(train_loader))
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
-        assert x_spatial.shape[2] == 2    # T_source + x_norm
+        assert x_spatial.shape[2] == 11   # Ny
+        assert x_spatial.shape[3] == 3    # T_source + x_norm + y_norm
         assert cond.shape[1] == 5         # t_bar, t_s, A, f, R_c
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_global, sigma_global
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, val_loader, test_loader = create_dataloaders(
-            trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
+            trajectories, x_grid, y_grid, t_grid, train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
@@ -316,10 +381,10 @@ class TestCreateDataloaders:
 
     def test_n_snapshots_test_passed_through(self, synthetic_trajectories, synthetic_sim_params):
         """n_snapshots_test should give the test set a finer grid."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         _, _, test_loader = create_dataloaders(
-            trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
+            trajectories, x_grid, y_grid, t_grid, train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, n_snapshots_test=10,
@@ -330,10 +395,10 @@ class TestCreateDataloaders:
 
     def test_noise_std_only_on_train(self, synthetic_trajectories, synthetic_sim_params):
         """noise_std should only be applied to training set, not val/test."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, val_loader, test_loader = create_dataloaders(
-            trajectories, x_grid, t_grid, train_ids, val_ids, test_ids,
+            trajectories, x_grid, y_grid, t_grid, train_ids, val_ids, test_ids,
             batch_size=4, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, noise_std=0.1,
@@ -344,10 +409,10 @@ class TestCreateDataloaders:
 
     def test_noise_augmentation_changes_source(self, synthetic_trajectories, synthetic_sim_params):
         """With noise_std > 0, two reads of the same sample should differ."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         ds = SnapshotPairDataset(
-            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid,
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, noise_std=0.5,
@@ -355,6 +420,82 @@ class TestCreateDataloaders:
         x1, _, _, _ = ds[0]
         x2, _, _, _ = ds[0]
         # Source temperature channel should differ due to noise
-        assert not torch.equal(x1[:, 0], x2[:, 0])
+        assert not torch.equal(x1[:, :, 0], x2[:, :, 0])
         # x_norm channel should be identical (no noise on spatial coords)
-        assert torch.equal(x1[:, 1], x2[:, 1])
+        assert torch.equal(x1[:, :, 1], x2[:, :, 1])
+        # y_norm channel should be identical too
+        assert torch.equal(x1[:, :, 2], x2[:, :, 2])
+
+
+# ===================== Solver -> Dataset integration =====================
+
+class TestSolverDatasetIntegration:
+    """End-to-end smoke: real FVSolver2D output flows through SnapshotPairDataset
+    with matching shapes. Guards the shape contract between physics and ML pipelines."""
+
+    def test_tiny_solver_feeds_dataset(self, tmp_path):
+        from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+
+        a, b, c, d = 0.0, 1.0, 0.0, 1.0
+        # Nx=Ny=12 puts face 5|6 exactly at x=0.5 (interface between layers).
+        Nx = Ny = 12
+        dt = 0.01
+        t_final = 0.1
+        num_sims = 2
+
+        layers = [
+            Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
+            Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+        ]
+
+        sim_params_rows = []
+        T_hist_list = []
+        x_grid = y_grid = t_grid = None
+        for i in range(num_sims):
+            amp = 100.0 + 50.0 * i
+            freq = 2.0 + i
+            R_c = 0.1 + 0.1 * i
+            T0 = np.full((Nx, Ny), 300.0, dtype=np.float64)
+            solver = FVSolver2D(
+                a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
+                lam_target=0.5, layers=layers,
+                t_final=t_final, flux_f=freq, flux_A=amp,
+                t_on=0.0, t_off=t_final, phase=0.0,
+                dt=dt, interface_R=[float(R_c)],
+            )
+            t, x_grid, y_grid, T_hist = solver.solve(T0=T0, store_trajectory=True)
+            t_grid = t
+            T_hist_list.append(T_hist.astype(np.float32))
+            sim_params_rows.append((np.float32(amp), np.float32(freq), T0.astype(np.float32), np.float32(R_c)))
+
+        trajectories = np.stack(T_hist_list, axis=0)  # (num_sims, Nt, Nx, Ny)
+        sim_params = np.array(sim_params_rows, dtype=object)
+
+        # Shape contract: solver output matches the 4D trajectory the dataset expects
+        Nt = len(t_grid)
+        assert trajectories.shape == (num_sims, Nt, Nx, Ny)
+        assert x_grid.shape == (Nx,)
+        assert y_grid.shape == (Ny,)
+
+        mu_global = float(trajectories.mean())
+        sigma_global = float(trajectories.std())
+
+        ds = SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid.astype(np.float32),
+            x_grid=x_grid.astype(np.float32),
+            y_grid=y_grid.astype(np.float32),
+            sim_ids=np.arange(num_sims),
+            sim_params=sim_params,
+            mu_global=mu_global, sigma_global=sigma_global,
+            n_snapshots=5,
+        )
+        assert len(ds) == num_sims * (5 * 4 // 2)
+
+        spatial, cond, Y, T_stats = ds[0]
+        assert spatial.shape == (Nx, Ny, 3)
+        assert cond.shape == (5,)
+        assert Y.shape == (Nx, Ny, 1)
+        assert T_stats.shape == (2,)
+        assert torch.all(torch.isfinite(spatial))
+        assert torch.all(torch.isfinite(Y))

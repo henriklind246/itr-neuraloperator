@@ -375,9 +375,10 @@ class TestRunOneSeedResume:
     @pytest.fixture
     def seed_config(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
         """Build a minimal config pointing at synthetic data files."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         np.save(tmp_path / "trajectories.npy", trajectories)
         np.save(tmp_path / "x_grid.npy", x_grid)
+        np.save(tmp_path / "y_grid.npy", y_grid)
         np.save(tmp_path / "t_grid.npy", t_grid)
         np.save(tmp_path / "sim_params.npy", synthetic_sim_params)
 
@@ -385,6 +386,7 @@ class TestRunOneSeedResume:
             "data": {
                 "trajectories.npy": str(tmp_path / "trajectories.npy"),
                 "x_grid_path": str(tmp_path / "x_grid.npy"),
+                "y_grid_path": str(tmp_path / "y_grid.npy"),
                 "t_grid_path": str(tmp_path / "t_grid.npy"),
                 "sim_params_path": str(tmp_path / "sim_params.npy"),
             },
@@ -641,9 +643,10 @@ class TestRunConfigSeeds:
     @pytest.fixture
     def seed_config(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
         """Build a minimal config pointing at synthetic data files."""
-        trajectories, x_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         np.save(tmp_path / "trajectories.npy", trajectories)
         np.save(tmp_path / "x_grid.npy", x_grid)
+        np.save(tmp_path / "y_grid.npy", y_grid)
         np.save(tmp_path / "t_grid.npy", t_grid)
         np.save(tmp_path / "sim_params.npy", synthetic_sim_params)
 
@@ -651,6 +654,7 @@ class TestRunConfigSeeds:
             "data": {
                 "trajectories.npy": str(tmp_path / "trajectories.npy"),
                 "x_grid_path": str(tmp_path / "x_grid.npy"),
+                "y_grid_path": str(tmp_path / "y_grid.npy"),
                 "t_grid_path": str(tmp_path / "t_grid.npy"),
                 "sim_params_path": str(tmp_path / "sim_params.npy"),
             },

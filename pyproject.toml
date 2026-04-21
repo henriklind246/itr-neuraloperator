@@ -16,3 +16,8 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*", "data*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that take several seconds (MMS convergence studies, multilayer regression)",
+]

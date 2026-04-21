@@ -329,6 +329,13 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=
         cond = cond.to(device)
         y_batch = y_batch.to(device)
 
+        # Scaffolding for 1D FNO against 2D data: slice mid-y and drop y_norm channel.
+        # Mirrors the pattern used in visual/plots.py until FNO1d is migrated to 2D.
+        if x_spatial.dim() == 4:
+            y_mid = x_spatial.shape[2] // 2
+            x_spatial = x_spatial[:, :, y_mid, :2]
+            y_batch = y_batch[:, :, y_mid, :]
+
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond)
         loss = loss_fn(y_pred, y_batch)
@@ -362,6 +369,11 @@ def validate(model, val_loader, device, *, iface_mask=None) -> tuple[float, floa
             cond = cond.to(device)
             y_batch = y_batch.to(device)
 
+            if x_spatial.dim() == 4:
+                y_mid = x_spatial.shape[2] // 2
+                x_spatial = x_spatial[:, :, y_mid, :2]
+                y_batch = y_batch[:, :, y_mid, :]
+
             y_pred = model(x_spatial, cond)
             val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
             val_loss += val_rel_l2.item()
@@ -389,9 +401,10 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     set_seed(seed)
 
-    trajectories, x_grid, t_grid = load_sim_data(
+    trajectories, x_grid, y_grid, t_grid = load_sim_data(
         sim_traj_path=config["data"]["trajectories.npy"],
         x_grid_path=config["data"]["x_grid_path"],
+        y_grid_path=config["data"]["y_grid_path"],
         t_grid_path=config["data"]["t_grid_path"],
     )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
@@ -400,7 +413,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
     training_set, validation_set, _ = create_dataloaders(
-        trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+        trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=config["training"]["batch_size"],
         sim_params=sim_params,
