@@ -161,7 +161,7 @@ def run_mms_2d(N: int, dt=None) -> tuple[float, float, float, float]:
 # 3. Interface MMS (piecewise 2D with R_c)
 # ==============================================================
 
-def run_mms_2d_interface(N: int, dt=None) -> tuple[float, float, float, float]:
+def run_mms_2d_interface(N: int, dt=None, x_I: float = 0.5) -> tuple[float, float, float, float]:
     """
     2D MMS with two-layer interface and thermal resistance.
 
@@ -173,12 +173,12 @@ def run_mms_2d_interface(N: int, dt=None) -> tuple[float, float, float, float]:
       T_L*(x,y,t) = T_L,1D + B_L sin(wt)(x-a)^2(x_I-x)^2 cos(kappa(y-c))
       T_R*(x,y,t) = T_R,1D + B_R sin(wt)(x-x_I)^2(b-x)^2  cos(kappa(y-c))
 
-    N must be even so x=0.5 lands on a cell face.
+    The default x_I = 0.5 places the interface at a cell-face midpoint
+    (requires even N). Any other x_I is an off-center interface; choose N so x_I doesn't land on a node.
 
     Returns (h, dt, max_abs_error, l2_error).
     """
     a, b, c, d = 0.0, 1.0, 0.0, 1.0
-    x_I = 0.5
     k1, k2 = 2.0, 1.0
     rho1, cp1 = 1.5, 1.0
     rho2, cp2 = 0.8, 1.0
@@ -187,8 +187,10 @@ def run_mms_2d_interface(N: int, dt=None) -> tuple[float, float, float, float]:
     flux_f = 2.0
     omega = 2.0 * np.pi * flux_f
     A_L, D_L = 10.0, 1.0
-    A_R = 2.0 * k1 * A_L * D_L / k2           # = 40
-    C_L = k1 * A_L * D_L * (1.0 / (8 * k2) + Rc)  # = 4.5
+    # Flux continuity at x_I:  k1 A_L D_L = 4 k2 A_R (b - x_I)^3
+    A_R = k1 * A_L * D_L / (4.0 * k2 * (b - x_I) ** 3)
+    # Jump condition T_L - T_R = R_c * q_I at x_I
+    C_L = k1 * A_L * D_L * ((b - x_I) / (4.0 * k2) + Rc)
 
     B_L = 15.0   # y-correction amplitude, left
     B_R = 10.0   # y-correction amplitude, right
@@ -350,6 +352,25 @@ def time_order_test_2d_interface(dt_list: list) -> float:
     return float(np.mean(_pairwise_orders(dt_list, results)))
 
 
+def space_order_test_2d_off_center_interface(N_list: list, x_I: float = 0.4734) -> float:
+    """Spatial convergence test with interface not on a cell-face midpoint."""
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d_interface(N, dt=0.0001, x_I=x_I)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_off_center_interface(dt_list: list, x_I: float = 0.4734) -> float:
+    """Temporal convergence test with interface not on a cell-face midpoint."""
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_interface(N=200, dt=dt_val, x_I=x_I)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
 # ==============================================================
 # Main: print convergence tables
 # ==============================================================
@@ -377,4 +398,12 @@ if __name__ == '__main__':
     p = space_order_test_2d_interface([50, 100, 200])
     print(f"Spatial order: {p:.3f}")
     p = time_order_test_2d_interface([0.02, 0.01, 0.005])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Off-Center Interface MMS (x_I=0.4734) ===")
+    h, dt, me, l2 = run_mms_2d_interface(N=100, dt=0.0001, x_I=0.4734)
+    print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_off_center_interface([50, 100, 200])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005])
     print(f"Temporal order: {p:.3f}")
