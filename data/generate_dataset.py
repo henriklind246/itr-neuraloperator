@@ -76,7 +76,7 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     return sim_params
 
 
-def generate_sim_data(num_sims: int = 1024) -> None:
+def generate_sim_data(num_sims: int = 1024, save_stride: int = 5) -> None:
     # seed 0 for reproducibility after I generate all simulations
     rng = np.random.default_rng(0)
 
@@ -98,6 +98,9 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     # compute Nt from the time grid (same for all sims since dt and t_final are fixed)
     t_grid_template = np.arange(0.0, t_final + 1e-12, dt)
     Nt = len(t_grid_template)
+    # Subsample every `save_stride` steps on disk to cap file size. The solver
+    # still integrates at full dt
+    Nt_saved = len(t_grid_template[::save_stride])
 
     # Fixed materials: k1=2, k2=1, rho=cp=1 for both layers
     layers = [
@@ -108,10 +111,9 @@ def generate_sim_data(num_sims: int = 1024) -> None:
     print("Building simulation parameters.")
 
     # shape: [(amp, freq, T0, R_c), ...]
-    sim_params = build_sim_params(a=a, b=b, c=c, d=d, X=X, Y=Y,
-                                  num_sims=num_sims, rng=rng, lhs_seed=0)
+    sim_params = build_sim_params(a=a, b=b, c=c, d=d, X=X, Y=Y, num_sims=num_sims, rng=rng, lhs_seed=0)
 
-    trajectories = np.zeros((num_sims, Nt, Nx, Ny), dtype=np.float32)
+    trajectories = np.zeros((num_sims, Nt_saved, Nx, Ny), dtype=np.float32)
 
     for i, (amp, freq, T0, R_c) in enumerate(sim_params):
         sim = FVSolver2D(
@@ -125,14 +127,14 @@ def generate_sim_data(num_sims: int = 1024) -> None:
 
         t, x, y, T_hist = sim.solve(T0=T0, store_trajectory=True)
 
-        trajectories[i] = T_hist.astype(np.float32)
+        trajectories[i] = T_hist[::save_stride].astype(np.float32)
 
         print(f"Finished simulation {i}")
 
     # x, y, and t are the same for all simulations, so just use the last ones
     x_grid = x.astype(np.float32)
     y_grid = y.astype(np.float32)
-    t_grid = t.astype(np.float32)
+    t_grid = t[::save_stride].astype(np.float32)
 
     np.save("x_grid.npy", x_grid)
     np.save("y_grid.npy", y_grid)
