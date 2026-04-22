@@ -8,7 +8,7 @@ import torch
 from torch.optim import Adam, AdamW
 
 from data.dataset import compute_global_stats, create_dataloaders, load_sim_data, split_sim_ids
-from src.operators.fno1d import FNO1d
+from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 
@@ -54,12 +54,12 @@ def set_seed(seed: int) -> None:
 
 def _is_training_complete(run_path: Path) -> bool:
     """Training is complete if best checkpoint exists and no latest (sentinel) exists."""
-    return (run_path / "fno1d_best.pt").exists() and not (run_path / "fno1d_latest.pt").exists()
+    return (run_path / "fno2d_best.pt").exists() and not (run_path / "fno2d_latest.pt").exists()
 
 
 def _load_completed_result(run_path: Path, seed: int) -> dict[str, float | int | str]:
     """Extract result from a previously completed run's best checkpoint."""
-    best_path = run_path / "fno1d_best.pt"
+    best_path = run_path / "fno2d_best.pt"
     ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
     return {"seed": seed, "best_val": float(ckpt["best_val"]), "best_path": str(best_path)}
 
@@ -83,7 +83,7 @@ def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) ->
             "Incompatible resume state: checkpoint uses "
             f"optimizer={ckpt_optimizer}, scheduler={ckpt_scheduler}, "
             f"but current config uses optimizer={curr_optimizer}, scheduler={curr_scheduler}. "
-            "Start from a fresh run directory or remove fno1d_latest.pt."
+            "Start from a fresh run directory or remove fno2d_latest.pt."
         )
 
 
@@ -329,13 +329,6 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=
         cond = cond.to(device)
         y_batch = y_batch.to(device)
 
-        # Scaffolding for 1D FNO against 2D data: slice mid-y and drop y_norm channel.
-        # Mirrors the pattern used in visual/plots.py until FNO1d is migrated to 2D.
-        if x_spatial.dim() == 4:
-            y_mid = x_spatial.shape[2] // 2
-            x_spatial = x_spatial[:, :, y_mid, :2]
-            y_batch = y_batch[:, :, y_mid, :]
-
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond)
         loss = loss_fn(y_pred, y_batch)
@@ -369,11 +362,6 @@ def validate(model, val_loader, device, *, iface_mask=None) -> tuple[float, floa
             cond = cond.to(device)
             y_batch = y_batch.to(device)
 
-            if x_spatial.dim() == 4:
-                y_mid = x_spatial.shape[2] // 2
-                x_spatial = x_spatial[:, :, y_mid, :2]
-                y_batch = y_batch[:, :, y_mid, :]
-
             y_pred = model(x_spatial, cond)
             val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
             val_loss += val_rel_l2.item()
@@ -396,7 +384,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         return result
 
     # --- Check for interrupted run ---
-    latest_path = run_path / "fno1d_latest.pt"
+    latest_path = run_path / "fno2d_latest.pt"
     resuming = latest_path.exists()
 
     set_seed(seed)
@@ -428,11 +416,12 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     print(f"Training on: {device}")
 
     model_cfg = config["model"]["parameters"]
-    fno = FNO1d(
-        modes=model_cfg["modes"],
+    fno = FNO2d(
+        modes1=model_cfg["modes1"],
+        modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg["in_channels"],
-        out_channels=model_cfg["out_channels"],
+        in_channels=model_cfg.get("in_channels", 3),
+        out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", 5),
         cond_hidden=model_cfg.get("cond_hidden", 256),
@@ -466,20 +455,22 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
     loss_cfg = config["training"].get("loss", {})
     loss_fn = SpatiallyWeightedMSE(
         x_grid=x_grid,
+        y_grid=y_grid,
         interface_x=loss_cfg.get("interface_x", 0.5),
         interface_half_width=loss_cfg.get("interface_half_width", 0.05),
         interface_weight=loss_cfg.get("interface_weight", 1.0),
     ).to(device)
 
     iface_mask = build_interface_mask(
-        x_grid, loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
+        x_grid, y_grid,
+        loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
     ).to(device)
 
     epochs = config["training"]["epochs"]
     validate_every = config["training"]["validate_every"]
     patience = config["training"]["patience"]
 
-    best_path = run_path / "fno1d_best.pt"
+    best_path = run_path / "fno2d_best.pt"
 
     # --- CSV: truncate to start_epoch when resuming, overwrite when fresh ---
     csv_path = run_path / "train_metrics.csv"
