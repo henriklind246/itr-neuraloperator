@@ -6,7 +6,8 @@ params:
   training.batch_size: choice(128, 256, 512, 1024)
 
   # --- Model architecture (4 params) ---
-  model.parameters.modes: choice(8, 12, 16, 20, 24, 32)
+  model.parameters.modes1: choice(8, 12, 16, 20, 24, 32)
+  model.parameters.modes2: choice(8, 12, 16, 20, 24, 32)
   model.parameters.width: choice(32, 48, 64, 96)
   model.parameters.n_layers: choice(2, 3, 4, 5, 6)
   model.parameters.cond_hidden: choice(64, 128, 256, 384)
