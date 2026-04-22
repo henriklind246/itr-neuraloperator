@@ -1,6 +1,6 @@
 import torch
 from data.dataset import compute_global_stats, load_sim_data, split_sim_ids, create_dataloaders, T_EPS
-from src.operators.fno1d import FNO1d
+from src.operators.fno2d import FNO2d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 from pathlib import Path
@@ -15,9 +15,10 @@ from datetime import datetime
 def build_test_loader(config, mu_global=None, sigma_global=None):
     import numpy as np
 
-    trajectories, x_grid, t_grid = load_sim_data(
+    trajectories, x_grid, y_grid, t_grid = load_sim_data(
         sim_traj_path=config["data"]["trajectories.npy"],
         x_grid_path=config["data"]["x_grid_path"],
+        y_grid_path=config["data"]["y_grid_path"],
         t_grid_path=config["data"]["t_grid_path"],
     )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
@@ -29,7 +30,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
     _, _, testing_set = create_dataloaders(
-        trajectories=trajectories, x_grid=x_grid, t_grid=t_grid,
+        trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
         train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
         batch_size=config["training"]["batch_size"],
         sim_params=sim_params,
@@ -39,7 +40,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         n_snapshots_test=40
     )
 
-    return testing_set, x_grid
+    return testing_set, x_grid, y_grid
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
@@ -65,8 +66,8 @@ def evaluate(model, test_loader, device, iface_mask=None):
             # Denormalize to physical space
             mu_s = T_stats[:, 0]    # (B,)
             sigma_s = T_stats[:, 1]  # (B,)
-            y_pred_phys = y_pred * (sigma_s[:, None, None] + T_EPS) + mu_s[:, None, None]
-            y_true_phys = y_batch * (sigma_s[:, None, None] + T_EPS) + mu_s[:, None, None]
+            y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
+            y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
 
             test_rel_l2 = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
 
@@ -90,7 +91,7 @@ def eval_all_seeds(run_root: str):
     print("Testing started.")
 
     for seed_dir in sorted(run_root.glob("seed*")):
-        ckpt_path = seed_dir / "fno1d_best.pt"
+        ckpt_path = seed_dir / "fno2d_best.pt"
         if not ckpt_path.exists():
             continue
 
@@ -98,7 +99,7 @@ def eval_all_seeds(run_root: str):
         config = ckpt['conf']
         device = resolve_device(config.get("training", {}).get("device", "auto"))
 
-        test_loader, x_grid = build_test_loader(
+        test_loader, x_grid, y_grid = build_test_loader(
             config,
             mu_global=ckpt.get("mu_global"),
             sigma_global=ckpt.get("sigma_global"),
@@ -106,14 +107,16 @@ def eval_all_seeds(run_root: str):
 
         loss_cfg = config.get("training", {}).get("loss", {})
         iface_mask = build_interface_mask(
-            x_grid, loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
+            x_grid, y_grid,
+            loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
         ).to(device)
 
         model_cfg = config['model']['parameters']
-        fno = FNO1d(
-            modes=model_cfg["modes"],
+        fno = FNO2d(
+            modes1=model_cfg["modes1"],
+            modes2=model_cfg["modes2"],
             width=model_cfg["width"],
-            in_channels=model_cfg.get("in_channels", 2),
+            in_channels=model_cfg.get("in_channels", 3),
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
             cond_dim=model_cfg.get("cond_dim", 5),
