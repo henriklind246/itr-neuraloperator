@@ -1,8 +1,0 @@
-
-Current Limitations:
-
-- Vary interface locations in generate_datset.py
-- Implement fno1d: time conditioning with all2all training with time normalization after each fourier layer
-- Implement autoregressive inference for fno1d
-- Sample f using a uniform-log distribution
-- Generate simulation data with fixed grid, materials, interface location, interface resistance value, and initial condition
