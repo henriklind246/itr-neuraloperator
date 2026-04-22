@@ -15,11 +15,12 @@ tuning:
   objective: best_val_mean
 
 model:
-  type: "1D FNO time-conditioned"
+  type: "2D FNO time-conditioned"
   parameters:
-    modes: 16
+    modes1: 16
+    modes2: 16
     width: 64
-    in_channels: 2
+    in_channels: 3
     out_channels: 1
     n_layers: 4
     cond_dim: 5
@@ -67,13 +68,14 @@ training:
 data:
   t_grid_path: ${paths.data_dir}/t_grid.npy
   x_grid_path: ${paths.data_dir}/x_grid.npy
+  y_grid_path: ${paths.data_dir}/y_grid.npy
   trajectories.npy: ${paths.data_dir}/trajectories.npy
   sim_params_path: ${paths.data_dir}/sim_params.npy
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "B, Nx, 2"
-  y_shape: "B, Nx, 1"
+  x_shape: "B, Nx, Ny, 3"
+  y_shape: "B, Nx, Ny, 1"
   cond_shape: "B, 5"
   t_stats_shape: "B, 2"
   num_sims: 4000
