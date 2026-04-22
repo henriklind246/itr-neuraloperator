@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.eval import evaluate, mean_std, print_seed_report
-from src.operators.fno1d import FNO1d
+from src.operators.fno2d import FNO2d
 
 
 # ===================== evaluate =====================
@@ -14,12 +14,13 @@ from src.operators.fno1d import FNO1d
 def eval_setup():
     """Tiny model + 4-tuple loader for eval tests."""
     Nx = 11
-    model = FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=5)
+    Ny = 11
+    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=3, out_channels=1, n_layers=2, cond_dim=5)
     model.eval()
 
-    x_spatial = torch.randn(4, Nx, 2)
+    x_spatial = torch.randn(4, Nx, Ny, 3)
     cond = torch.rand(4, 5)
-    Y = torch.randn(4, Nx, 1)
+    Y = torch.randn(4, Nx, Ny, 1)
     T_stats = torch.stack([
         torch.randn(4),           # mu_s
         torch.abs(torch.randn(4)),  # sigma_s (positive)
@@ -48,8 +49,9 @@ class TestEvaluate:
     def test_with_iface_mask(self, eval_setup):
         model, loader, device = eval_setup
         Nx = 11
-        iface_mask = torch.zeros(Nx, dtype=torch.bool)
-        iface_mask[4:7] = True  # mark 3 nodes as interface
+        Ny = 11
+        iface_mask = torch.zeros(Nx, Ny, dtype=torch.bool)
+        iface_mask[4:7, :] = True  # mark 3 columns as interface
         test_rel_l2, test_iface_rel_l2 = evaluate(model, loader, device, iface_mask=iface_mask)
         assert isinstance(test_iface_rel_l2, float)
         assert test_iface_rel_l2 >= 0

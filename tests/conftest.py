@@ -4,6 +4,7 @@ import torch
 
 from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 from src.operators.fno1d import FNO1d
+from src.operators.fno2d import FNO2d
 
 
 # ---------- solver fixtures ----------
@@ -84,6 +85,51 @@ def tmp_npy_data(tmp_path, synthetic_trajectories):
 def small_fno():
     """Tiny FNO1d for fast tests."""
     return FNO1d(modes=2, width=8, in_channels=2, out_channels=1, n_layers=2, cond_dim=5)
+
+
+@pytest.fixture
+def small_fno2d():
+    """Tiny FNO2d for fast plot tests."""
+    return FNO2d(
+        modes1=2,
+        modes2=2,
+        width=8,
+        in_channels=3,
+        out_channels=1,
+        n_layers=2,
+        cond_dim=5,
+    )
+
+
+@pytest.fixture
+def small_fno2d_checkpoint(tmp_path, small_fno2d):
+    """Save a minimal 2D checkpoint for plot-loader smoke tests."""
+    ckpt_path = tmp_path / "small_fno2d.pt"
+    torch.save(
+        {
+            "model_state": small_fno2d.state_dict(),
+            "conf": {
+                "model": {
+                    "parameters": {
+                        "modes1": 2,
+                        "modes2": 2,
+                        "width": 8,
+                        "in_channels": 3,
+                        "out_channels": 1,
+                        "n_layers": 2,
+                        "cond_dim": 5,
+                        "cond_hidden": 256,
+                        "dropout": 0.0,
+                        "spectral_dropout": 0.0,
+                    }
+                }
+            },
+            "mu_global": 0.0,
+            "sigma_global": 1.0,
+        },
+        ckpt_path,
+    )
+    return ckpt_path
 
 
 # ---------- conditioning fixture ----------

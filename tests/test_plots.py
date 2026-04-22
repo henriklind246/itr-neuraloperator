@@ -4,6 +4,7 @@ from math import comb
 import matplotlib
 import numpy as np
 import pytest
+import torch
 
 matplotlib.use("Agg")
 
@@ -194,21 +195,62 @@ class TestLeadTimeCoverage:
         assert out_path.exists()
 
 
+class TestDataFieldPlots:
+    def test_trajectory_heatmap_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        out_path = tmp_path / "trajectory_heatmap.png"
+        plots.plot_trajectory_heatmap(
+            trajectories,
+            sim_id=0,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            t_grid=t_grid,
+            save_path=out_path,
+        )
+        assert out_path.exists()
+
+    def test_initial_conditions_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+    ):
+        trajectories, x_grid, y_grid, _t_grid = synthetic_trajectories
+        out_path = tmp_path / "initial_conditions.png"
+        plots.plot_initial_conditions(
+            trajectories,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            n_samples=4,
+            save_path=out_path,
+        )
+        assert out_path.exists()
+
+    def test_flux_profiles_smoke(self, tmp_path):
+        out_path = tmp_path / "flux_profiles.png"
+        plots.plot_flux_profiles(t_final=0.2, save_path=out_path)
+        assert out_path.exists()
+
+
 class TestModelDiagnosticPlots:
     def test_prediction_vs_truth_smoke(
         self,
         tmp_path,
-        small_fno,
+        small_fno2d,
         synthetic_trajectories,
         synthetic_sim_params,
         plot_config,
     ):
-        trajectories, x_grid, _y_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "prediction_vs_truth.png"
         plots.plot_prediction_vs_truth(
-            small_fno,
+            small_fno2d,
             trajectories,
             x_grid,
+            y_grid,
             t_grid,
             synthetic_sim_params,
             sim_id=0,
@@ -222,17 +264,18 @@ class TestModelDiagnosticPlots:
     def test_prediction_vs_truth_short_horizon_smoke(
         self,
         tmp_path,
-        small_fno,
+        small_fno2d,
         synthetic_trajectories,
         synthetic_sim_params,
         plot_config,
     ):
-        trajectories, x_grid, _y_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "prediction_vs_truth_short.png"
         plots.plot_prediction_vs_truth(
-            small_fno,
+            small_fno2d,
             trajectories,
             x_grid,
+            y_grid,
             t_grid,
             synthetic_sim_params,
             sim_id=0,
@@ -246,17 +289,18 @@ class TestModelDiagnosticPlots:
     def test_interface_error_short_horizon_smoke(
         self,
         tmp_path,
-        small_fno,
+        small_fno2d,
         synthetic_trajectories,
         synthetic_sim_params,
         plot_config,
     ):
-        trajectories, x_grid, _y_grid, t_grid = synthetic_trajectories
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "interface_error.png"
         plots.plot_interface_error(
-            small_fno,
+            small_fno2d,
             trajectories,
             x_grid,
+            y_grid,
             t_grid,
             synthetic_sim_params,
             np.array([0, 1, 2]),
@@ -270,7 +314,7 @@ class TestModelDiagnosticPlots:
     def test_lead_time_error_smoke(
         self,
         tmp_path,
-        small_fno,
+        small_fno2d,
         synthetic_trajectories,
         synthetic_sim_params,
         plot_config,
@@ -279,9 +323,10 @@ class TestModelDiagnosticPlots:
         datasets = plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
         out_path = tmp_path / "lead_time_error.png"
         plots.plot_lead_time_error(
-            small_fno,
+            small_fno2d,
             datasets["test"],
             x_grid,
+            y_grid,
             config=plot_config,
             max_samples=16,
             save_path=out_path,
@@ -291,7 +336,7 @@ class TestModelDiagnosticPlots:
     def test_parameter_error_slices_smoke(
         self,
         tmp_path,
-        small_fno,
+        small_fno2d,
         synthetic_trajectories,
         synthetic_sim_params,
         plot_config,
@@ -300,9 +345,10 @@ class TestModelDiagnosticPlots:
         datasets = plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
         out_path = tmp_path / "parameter_error_slices.png"
         plots.plot_parameter_error_slices(
-            small_fno,
+            small_fno2d,
             datasets["test"],
             x_grid,
+            y_grid,
             config=plot_config,
             max_samples=16,
             save_path=out_path,
@@ -373,7 +419,7 @@ class TestModelDiagnosticPlots:
     def test_interface_jump_summary_smoke(
         self,
         tmp_path,
-        small_fno,
+        small_fno2d,
         synthetic_trajectories,
         synthetic_sim_params,
         plot_config,
@@ -382,11 +428,67 @@ class TestModelDiagnosticPlots:
         datasets = plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
         out_path = tmp_path / "interface_jump_summary.png"
         plots.plot_interface_jump_summary(
-            small_fno,
+            small_fno2d,
             datasets["test"],
             x_grid,
+            y_grid,
             config=plot_config,
             max_samples=16,
+            save_path=out_path,
+        )
+        assert out_path.exists()
+
+    def test_load_checkpoint_model_loads_2d_checkpoint(self, small_fno2d_checkpoint):
+        model, conf = plots._load_checkpoint_model(small_fno2d_checkpoint)
+        assert conf["model"]["parameters"]["modes1"] == 2
+        assert conf["model"]["parameters"]["modes2"] == 2
+        assert getattr(model, "_mu_global") == 0.0
+        assert getattr(model, "_sigma_global") == 1.0
+
+    def test_load_checkpoint_model_rejects_1d_checkpoint(self, tmp_path):
+        ckpt_path = tmp_path / "legacy_fno1d.pt"
+        torch.save(
+            {
+                "conf": {
+                    "model": {
+                        "parameters": {
+                            "modes": 2,
+                            "width": 8,
+                            "in_channels": 2,
+                            "out_channels": 1,
+                            "n_layers": 2,
+                            "cond_dim": 5,
+                        }
+                    }
+                }
+            },
+            ckpt_path,
+        )
+        with pytest.raises(ValueError, match="missing modes1/modes2"):
+            plots._load_checkpoint_model(ckpt_path)
+
+    def test_checkpoint_loaded_model_prediction_smoke(
+        self,
+        tmp_path,
+        small_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_sim_params,
+        plot_config,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = plots._load_checkpoint_model(small_fno2d_checkpoint)
+        out_path = tmp_path / "prediction_vs_truth_from_ckpt.png"
+        plots.plot_prediction_vs_truth(
+            model,
+            trajectories,
+            x_grid,
+            y_grid,
+            t_grid,
+            synthetic_sim_params,
+            sim_id=0,
+            s=1,
+            n_steps=5,
+            config=plot_config,
             save_path=out_path,
         )
         assert out_path.exists()
