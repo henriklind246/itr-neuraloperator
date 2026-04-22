@@ -18,6 +18,9 @@ module load miniforge
 eval "$(conda shell.bash hook)"
 conda activate itr
 
+# Flush Python stdout line-by-line so `tail -f` shows progress in real time
+export PYTHONUNBUFFERED=1
+
 # ──── Logging ────
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
