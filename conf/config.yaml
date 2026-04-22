@@ -31,7 +31,7 @@ model:
 
 training:
   device: "auto"
-  batch_size: 512
+  batch_size: 256
   n_snapshots: 20
   n_snapshots_test: 40
   curriculum_warmup: 35
