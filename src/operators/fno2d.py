@@ -181,11 +181,11 @@ class FNO2d(nn.Module):
         # Lift: (B, Nx, Ny, in_channels) → (B, Nx, Ny, width)
         self.linear_p = nn.Linear(in_channels, width)
 
-        # Fourier layers
+        # ------- FOURIER LAYERS -------------
         self.spectral_layers = nn.ModuleList([
             SpectralConv2d(width, width, modes1, modes2, spectral_dropout=spectral_dropout) for _ in range(n_layers)
         ])
-        # essentially skip connections
+        # local linear transformations (essentially skip connections)
         self.conv_layers = nn.ModuleList([
             nn.Conv2d(width, width, 1) for _ in range(n_layers)
         ])
