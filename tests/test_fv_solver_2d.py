@@ -743,3 +743,57 @@ class TestMMS2D:
     def test_interface_temporal_order(self):
         p = time_order_test_2d_interface([0.02, 0.01, 0.005])
         assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
+
+
+# ==================== VECTOR LEFT-FLUX (q_L(y, t)) ====================
+
+class TestVectorLeftFlux:
+    """Vector-valued q_left_fn(t) -> (Ny,) — separable y-dependent boundary flux."""
+
+    def test_uniform_vector_matches_scalar(self):
+        """Constant vector flux gives bit-identical result to scalar flux."""
+        Ny = 11
+        flux_A, flux_f = 50.0, 2.0
+        # Use windowed sin to mimic the default flux exactly.
+        from src.physics.fv_solver_1d import windowed_sin_flux
+        scalar_q = windowed_sin_flux(flux_f, flux_A, 0.0, 0.1, 0.0, 0.5)
+
+        sim_scalar = make_single_layer_2d(Nx=11, Ny=Ny, q_left_fn=scalar_q)
+        T0 = np.full((11, Ny), 300.0)
+        _, _, _, T_scalar = sim_scalar.solve(T0=T0, store_trajectory=False)
+
+        sim_vec = make_single_layer_2d(
+            Nx=11, Ny=Ny,
+            q_left_fn=lambda t: np.full(Ny, scalar_q(t)),
+        )
+        _, _, _, T_vec = sim_vec.solve(T0=T0, store_trajectory=False)
+
+        assert np.allclose(T_scalar, T_vec, atol=1e-13)
+
+    def test_qleft_shape_validation(self):
+        """A wrong-sized array should raise during __init__."""
+        Ny = 11
+        with pytest.raises(ValueError, match=f"shape \\({Ny},\\)"):
+            make_single_layer_2d(
+                Nx=11, Ny=Ny,
+                q_left_fn=lambda t: np.zeros(Ny - 1),
+            )
+
+    def test_nonuniform_qleft_localizes_heating(self):
+        """A patch-localized flux raises temperature near its center more than far away."""
+        N = 41
+        y_grid = np.linspace(0.0, 1.0, N)
+        sim = make_single_layer_2d(
+            Nx=N, Ny=N, t_final=0.05,
+            q_left_fn=lambda t: 100.0 * (
+                # narrow patch around y=0.5
+                (y_grid >= 0.45) & (y_grid <= 0.55)
+            ).astype(float),
+        )
+        T0 = np.full((N, N), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+
+        j_center = N // 2  # y = 0.5
+        j_edge = 1          # near y = 0
+        # Heating should be larger near the patch than far from it (at x=0).
+        assert T_final[0, j_center] > T_final[0, j_edge] + 1e-6

@@ -110,48 +110,62 @@ class TestGenerateLHSSamples:
 
 
 class TestBuildSimParams:
-    def test_length_and_tuple_structure(self):
+    def test_length_and_dict_structure(self):
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 9, 7)
         rng = np.random.default_rng(0)
-        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=8, rng=rng, lhs_seed=0)
+        rng_profile = np.random.default_rng(1)
+        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=8,
+                                  rng=rng, rng_profile=rng_profile, lhs_seed=0)
         assert len(params) == 8
+        required_keys = {"amp", "freq", "R_c", "T0", "temporal_family",
+                         "temporal_params", "spatial_family", "spatial_params"}
         for entry in params:
-            assert len(entry) == 4
-            amp, freq, T0, R_c = entry
-            assert AMP_RANGE[0] <= float(amp) <= AMP_RANGE[1]
-            assert FREQ_RANGE[0] <= float(freq) <= FREQ_RANGE[1]
-            assert RC_RANGE[0] <= float(R_c) <= RC_RANGE[1]
-            assert isinstance(T0, np.ndarray)
+            assert isinstance(entry, dict)
+            assert required_keys.issubset(entry.keys())
+            assert AMP_RANGE[0] <= float(entry["amp"]) <= AMP_RANGE[1]
+            assert FREQ_RANGE[0] <= float(entry["freq"]) <= FREQ_RANGE[1]
+            assert RC_RANGE[0] <= float(entry["R_c"]) <= RC_RANGE[1]
+            assert isinstance(entry["T0"], np.ndarray)
+            assert entry["temporal_family"] == "sin"
+            assert entry["spatial_family"] in {"uniform", "patch", "gaussian", "triangle"}
 
     def test_T0_is_2d_with_grid_shape(self):
         """Regression guard: catches any silent revert to a 1D IC."""
         Nx, Ny = 13, 9
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, Nx, Ny)
         rng = np.random.default_rng(0)
-        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4, rng=rng, lhs_seed=0)
-        for _, _, T0, _ in params:
+        rng_profile = np.random.default_rng(1)
+        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4,
+                                  rng=rng, rng_profile=rng_profile, lhs_seed=0)
+        for entry in params:
+            T0 = entry["T0"]
             assert T0.shape == (Nx, Ny)
             assert np.issubdtype(T0.dtype, np.floating)
 
     def test_deterministic_same_rng_and_lhs_seed(self):
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 11, 11)
         p1 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=5,
-                              rng=np.random.default_rng(123), lhs_seed=0)
+                              rng=np.random.default_rng(123),
+                              rng_profile=np.random.default_rng(7), lhs_seed=0)
         p2 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=5,
-                              rng=np.random.default_rng(123), lhs_seed=0)
-        for (a1, f1, T1, r1), (a2, f2, T2, r2) in zip(p1, p2):
-            assert float(a1) == float(a2)
-            assert float(f1) == float(f2)
-            assert float(r1) == float(r2)
-            np.testing.assert_array_equal(T1, T2)
+                              rng=np.random.default_rng(123),
+                              rng_profile=np.random.default_rng(7), lhs_seed=0)
+        for e1, e2 in zip(p1, p2):
+            assert float(e1["amp"]) == float(e2["amp"])
+            assert float(e1["freq"]) == float(e2["freq"])
+            assert float(e1["R_c"]) == float(e2["R_c"])
+            np.testing.assert_array_equal(e1["T0"], e2["T0"])
+            assert e1["spatial_family"] == e2["spatial_family"]
+            assert e1["spatial_params"] == e2["spatial_params"]
 
     def test_T0_varies_across_sims(self):
         """Each sim should get its own random IC."""
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 15, 15)
         rng = np.random.default_rng(0)
-        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4, rng=rng, lhs_seed=0)
-        T0_stack = np.stack([p[2] for p in params])
-        # No two ICs should be identical
+        rng_profile = np.random.default_rng(1)
+        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4,
+                                  rng=rng, rng_profile=rng_profile, lhs_seed=0)
+        T0_stack = np.stack([p["T0"] for p in params])
         for i in range(len(params)):
             for j in range(i + 1, len(params)):
                 assert not np.array_equal(T0_stack[i], T0_stack[j])

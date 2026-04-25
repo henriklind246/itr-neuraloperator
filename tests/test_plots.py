@@ -389,12 +389,17 @@ class TestModelDiagnosticPlots:
         t_grid = np.linspace(0.0, 1.0, Nt).astype(np.float32)
         sim_params = np.array(
             [
-                (
-                    np.float32(rng.uniform(50.0, 300.0)),
-                    np.float32(rng.uniform(1.0, 20.0)),
-                    rng.standard_normal((Nx, Ny)).astype(np.float32),
-                    np.float32(rng.uniform(0.05, 1.0)),
-                )
+                {
+                    "amp": np.float32(rng.uniform(50.0, 300.0)),
+                    "freq": np.float32(rng.uniform(1.0, 20.0)),
+                    "T0": rng.standard_normal((Nx, Ny)).astype(np.float32),
+                    "R_c": np.float32(rng.uniform(0.05, 1.0)),
+                    "temporal_family": "sin",
+                    "temporal_params": {"A": 100.0, "f": 5.0, "t_on": 0.0, "t_off": 0.2,
+                                         "phase": 0.0, "tukey_alpha": 0.5},
+                    "spatial_family": "uniform",
+                    "spatial_params": {},
+                }
                 for _ in range(num_sims)
             ],
             dtype=object,

@@ -199,7 +199,7 @@ class TestSnapshotPairDataset:
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx, Ny = 11, 11
         assert x_spatial.shape == (Nx, Ny, 3)
-        assert cond.shape == (5,)
+        assert cond.shape == (13,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
 
@@ -242,7 +242,7 @@ class TestSnapshotPairDataset:
             assert t_bar_norm > 0
 
     def test_conditioning_in_unit_range(self, dataset_subsampled):
-        """All 5 conditioning values (min-max normalized) should be in [0, 1]."""
+        """All 13 conditioning values (min-max normalized + one-hot) should be in [0, 1]."""
         for i in range(min(10, len(dataset_subsampled))):
             _, cond, _, _ = dataset_subsampled[i]
             assert torch.all(cond >= -1e-6)
@@ -359,7 +359,7 @@ class TestCreateDataloaders:
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 11   # Ny
         assert x_spatial.shape[3] == 3    # T_source + x_norm + y_norm
-        assert cond.shape[1] == 5         # t_bar, t_s, A, f, R_c
+        assert cond.shape[1] == 13        # 5 base + 4 one-hot + 4 spatial-param dims
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_global, sigma_global
 
@@ -435,6 +435,7 @@ class TestSolverDatasetIntegration:
 
     def test_tiny_solver_feeds_dataset(self, tmp_path):
         from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+        from src.physics.boundary_forcing import build_qL
 
         a, b, c, d = 0.0, 1.0, 0.0, 1.0
         # Nx=Ny=12 puts face 5|6 exactly at x=0.5 (interface between layers).
@@ -447,6 +448,7 @@ class TestSolverDatasetIntegration:
             Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
             Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
         ]
+        y_grid_eval = np.linspace(c, d, Ny)
 
         sim_params_rows = []
         T_hist_list = []
@@ -456,17 +458,31 @@ class TestSolverDatasetIntegration:
             freq = 2.0 + i
             R_c = 0.1 + 0.1 * i
             T0 = np.full((Nx, Ny), 300.0, dtype=np.float64)
+            temporal_params = dict(A=amp, f=freq, t_on=0.0, t_off=t_final, phase=0.0, tukey_alpha=0.5)
+            spatial_family = "uniform"
+            spatial_params = {}
+            q_left_fn, _ = build_qL("sin", temporal_params, spatial_family, spatial_params, y_grid_eval)
             solver = FVSolver2D(
                 a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
                 lam_target=0.5, layers=layers,
                 t_final=t_final, flux_f=freq, flux_A=amp,
                 t_on=0.0, t_off=t_final, phase=0.0,
+                q_left_fn=q_left_fn,
                 dt=dt, interface_R=[float(R_c)],
             )
             t, x_grid, y_grid, T_hist = solver.solve(T0=T0, store_trajectory=True)
             t_grid = t
             T_hist_list.append(T_hist.astype(np.float32))
-            sim_params_rows.append((np.float32(amp), np.float32(freq), T0.astype(np.float32), np.float32(R_c)))
+            sim_params_rows.append({
+                "amp": np.float32(amp),
+                "freq": np.float32(freq),
+                "R_c": np.float32(R_c),
+                "T0": T0.astype(np.float32),
+                "temporal_family": "sin",
+                "temporal_params": temporal_params,
+                "spatial_family": spatial_family,
+                "spatial_params": spatial_params,
+            })
 
         trajectories = np.stack(T_hist_list, axis=0)  # (num_sims, Nt, Nx, Ny)
         sim_params = np.array(sim_params_rows, dtype=object)
@@ -494,8 +510,110 @@ class TestSolverDatasetIntegration:
 
         spatial, cond, Y, T_stats = ds[0]
         assert spatial.shape == (Nx, Ny, 3)
-        assert cond.shape == (5,)
+        assert cond.shape == (13,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
         assert torch.all(torch.isfinite(spatial))
         assert torch.all(torch.isfinite(Y))
+
+
+# ===================== Conditioning vector layout (13 dims) =====================
+
+class TestCondVectorLayout:
+    """Verifies the 13-dim conditioning vector layout: 5 base + 4 one-hot + 4 spatial params."""
+
+    def _make_dataset(self, family: str, spatial_params: dict, synthetic_trajectories):
+        """Build a 1-sim dataset where the sole sim has a chosen spatial family."""
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        sim_params = np.array([{
+            "amp": 100.0,
+            "freq": 5.0,
+            "R_c": 0.5,
+            "T0": np.zeros((trajectories.shape[2], trajectories.shape[3]), dtype=np.float32),
+            "temporal_family": "sin",
+            "temporal_params": {"A": 100.0, "f": 5.0, "t_on": 0.0, "t_off": 0.2, "phase": 0.0, "tukey_alpha": 0.5},
+            "spatial_family": family,
+            "spatial_params": spatial_params,
+        }], dtype=object)
+        return SnapshotPairDataset(
+            trajectories=trajectories[:1], t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
+            sim_ids=np.array([0]), sim_params=sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
+            n_snapshots=4,
+        )
+
+    def test_uniform_onehot_and_zero_spatial_params(self, synthetic_trajectories):
+        ds = self._make_dataset("uniform", {}, synthetic_trajectories)
+        _, cond, _, _ = ds[0]
+        assert cond.shape == (13,)
+        # one-hot at index 5 (uniform)
+        assert cond[5].item() == 1.0
+        assert cond[6].item() == 0.0
+        assert cond[7].item() == 0.0
+        assert cond[8].item() == 0.0
+        # spatial params (slots 9..13) all zero
+        assert torch.all(cond[9:13] == 0.0)
+
+    def test_patch_onehot_and_only_yc_w_populated(self, synthetic_trajectories):
+        ds = self._make_dataset("patch", {"y_c": 0.4, "w": 0.3}, synthetic_trajectories)
+        _, cond, _, _ = ds[0]
+        # one-hot at index 6 (patch)
+        assert cond[6].item() == 1.0
+        assert cond[5].item() == 0.0
+        assert cond[7].item() == 0.0
+        assert cond[8].item() == 0.0
+        # y_c and w populated; sigma_y, ell zero
+        assert cond[9].item() == pytest.approx(0.4)
+        assert cond[10].item() > 0.0
+        assert cond[11].item() == 0.0
+        assert cond[12].item() == 0.0
+
+    def test_gaussian_onehot_and_only_yc_sigma_populated(self, synthetic_trajectories):
+        ds = self._make_dataset("gaussian", {"y_c": 0.6, "sigma_y": 0.1}, synthetic_trajectories)
+        _, cond, _, _ = ds[0]
+        # one-hot at index 7 (gaussian)
+        assert cond[7].item() == 1.0
+        assert cond[5].item() == 0.0
+        assert cond[6].item() == 0.0
+        assert cond[8].item() == 0.0
+        # y_c and sigma_y populated; w, ell zero
+        assert cond[9].item() == pytest.approx(0.6)
+        assert cond[10].item() == 0.0
+        assert cond[11].item() > 0.0
+        assert cond[12].item() == 0.0
+
+    def test_triangle_onehot_and_only_yc_ell_populated(self, synthetic_trajectories):
+        ds = self._make_dataset("triangle", {"y_c": 0.5, "ell": 0.2}, synthetic_trajectories)
+        _, cond, _, _ = ds[0]
+        # one-hot at index 8 (triangle)
+        assert cond[8].item() == 1.0
+        assert cond[5].item() == 0.0
+        assert cond[6].item() == 0.0
+        assert cond[7].item() == 0.0
+        # y_c and ell populated; w, sigma_y zero
+        assert cond[9].item() == pytest.approx(0.5)
+        assert cond[10].item() == 0.0
+        assert cond[11].item() == 0.0
+        assert cond[12].item() > 0.0
+
+    def test_cond_in_unit_range_across_families(self, synthetic_trajectories):
+        """Across all four spatial families, every cond entry lands in [0, 1]."""
+        cases = [
+            ("uniform", {}),
+            ("patch", {"y_c": 0.5, "w": 0.4}),
+            ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
+            ("triangle", {"y_c": 0.5, "ell": 0.2}),
+        ]
+        for family, sp in cases:
+            ds = self._make_dataset(family, sp, synthetic_trajectories)
+            _, cond, _, _ = ds[0]
+            assert torch.all(cond >= -1e-6), f"{family}: cond has negative entry"
+            assert torch.all(cond <= 1.0 + 1e-6), f"{family}: cond has entry > 1"
+
+    def test_onehot_sums_to_one(self, synthetic_trajectories):
+        for family, sp in [("uniform", {}), ("patch", {"y_c": 0.5, "w": 0.2}),
+                           ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
+                           ("triangle", {"y_c": 0.5, "ell": 0.1})]:
+            ds = self._make_dataset(family, sp, synthetic_trajectories)
+            _, cond, _, _ = ds[0]
+            assert cond[5:9].sum().item() == pytest.approx(1.0, abs=1e-6)

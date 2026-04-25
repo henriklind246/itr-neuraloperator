@@ -2,8 +2,11 @@ import pytest
 
 from src.physics.mms_2d import (
     run_mms_2d_interface,
+    run_mms_2d_yflux,
     space_order_test_2d_off_center_interface,
+    space_order_test_2d_yflux,
     time_order_test_2d_off_center_interface,
+    time_order_test_2d_yflux,
 )
 
 
@@ -25,4 +28,23 @@ class TestOffCenterInterfaceMMS:
 
     def test_temporal_convergence_is_second_order(self):
         order = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005], x_I=0.4734)
+        assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
+
+
+class TestYFluxMMS:
+    """Verifies the vector-valued left Neumann flux path q_L(y, t) = a(t) s(y)."""
+
+    def test_runs_at_default_grid(self):
+        h, dt, max_err, l2_err = run_mms_2d_yflux(N=101, dt=0.0001)
+        assert h > 0 and dt > 0
+        assert max_err > 0 and l2_err > 0
+        assert max_err < 1e-2
+        assert l2_err < 5e-3
+
+    def test_spatial_convergence_is_second_order(self):
+        order = space_order_test_2d_yflux([21, 41, 81])
+        assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
+
+    def test_temporal_convergence_is_second_order(self):
+        order = time_order_test_2d_yflux([0.02, 0.01, 0.005])
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
