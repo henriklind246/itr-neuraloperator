@@ -28,8 +28,10 @@ def ic(X: np.ndarray, Y: np.ndarray, a: float, b: float, c: float, d: float) -> 
     # returns a 2d array with shape (Nx, Ny)
     Lx = b - a
     Ly = d - c
-    fx = np.cos((np.pi * X) / (2 * Lx)) + 0.1 * np.sin((np.pi * X) / Lx)
-    fy = np.cos((np.pi * Y) / (2 * Ly)) + 0.1 * np.sin((np.pi * Y) / Ly)
+    Xn = X - a
+    Yn = Y - c
+    fx = np.cos((np.pi * Xn) / (2 * Lx)) + 0.1 * np.sin((np.pi * Xn) / Lx)
+    fy = np.cos((np.pi * Yn) / (2 * Ly)) + 0.1 * np.sin((np.pi * Yn) / Ly)
     return fx * fy
 
 
@@ -131,6 +133,22 @@ class FVSolver2D:
             self.q_left = windowed_sin_flux(
                 flux_f, flux_A, t_on, t_off, phase, tukey_alpha
             )
+
+        # Detect whether q_left returns a scalar or a (Ny,) vector. The vector
+        # form is needed for separable q_L(y, t) = a(t) s(y); the scalar form
+        # is the legacy uniform-flux path. Both broadcast correctly into the
+        # rhs[0, :] update in cn_step.
+        q_probe = self.q_left(0.0)
+        q_arr = np.asarray(q_probe)
+        if q_arr.ndim == 0:
+            self._q_left_is_vector = False
+        else:
+            if q_arr.shape != (self.Ny,):
+                raise ValueError(
+                    f"q_left_fn(t) must return scalar or array of shape "
+                    f"({self.Ny},); got shape {q_arr.shape}"
+                )
+            self._q_left_is_vector = True
 
         self.T_right = T_right_fn if T_right_fn is not None else (lambda t: 300.0)
 
@@ -535,8 +553,14 @@ class FVSolver2D:
                 if i == 0:
                     qn = self.q_left(tn)
                     qnp1 = self.q_left(tn + dt)
+                    if self._q_left_is_vector:
+                        qn_j = qn[j]
+                        qnp1_j = qnp1[j]
+                    else:
+                        qn_j = qn
+                        qnp1_j = qnp1
                     rho_cp = self.rho_nodes[0, j] * self.cp_nodes[0, j]
-                    rhs[i, j] += dt * (qn + qnp1) / (rho_cp * h)
+                    rhs[i, j] += dt * (qn_j + qnp1_j) / (rho_cp * h)
 
         # --- Source term (CN time-averaged, V cancels for all cell types) ---
         if self.source is not None:
