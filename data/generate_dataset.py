@@ -113,14 +113,14 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     return sim_params
 
 
-def generate_sim_data(num_sims: int = 1024, save_stride: int = 5) -> None:
+def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
     rng = np.random.default_rng(0)
     rng_profile = np.random.default_rng(1)
 
     a, b, c, d = 0.0, 1.0, 0.0, 1.0
     Nx, Ny = 100, 100
     dt = 0.005
-    t_final = 1.0
+    t_final = 0.3
 
     t_on, t_off = 0.0, 0.2
     phase = 0.0
