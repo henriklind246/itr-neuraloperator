@@ -407,7 +407,7 @@ MSI cluster support (`slurm/`): `train_fno_msi.sbatch` (Optuna sweep) and `train
 
 ## 12. Visualization
 
-**File**: `visual/plots.py`
+**Files**: `visual/cli.py` (CLI entry), `visual/_common.py` (registry, style, shared helpers), and per-group modules `visual/{physics,mms,training,dataset,sweep}_plots.py`.
 
 Plot functions are grouped with a CLI dispatch system (physics, mms, training, data, sweep). Functions operate on 2D fields where applicable (`trajectory_heatmap`, `initial_conditions`, `prediction_vs_truth`, etc.). Sweep plots handle both 1D and 2D hyperparameter keys (e.g., `modes` vs. `modes1`) where needed for backward compatibility.
 
@@ -438,7 +438,7 @@ Plot functions are grouped with a CLI dispatch system (physics, mms, training, d
 | `slurm/train_fno_msi.sbatch`, `train_fno_msi_fixed.sbatch`, `setup_env_msi.sh` | MSI GPU cluster scripts |
 | `tests/test_fv_solver_2d.py`, `tests/test_mms_2d.py` | 2D physics and MMS tests |
 | `tests/test_fv_solver_1d.py`, `tests/test_mms_1d.py`, `tests/test_fno1d.py` | 1D baseline tests |
-| `visual/plots.py` | Visualization suite with CLI group dispatch |
+| `visual/cli.py`, `visual/_common.py`, `visual/{physics,mms,training,dataset,sweep}_plots.py` | Visualization suite split by group with CLI dispatch |
 
 ---
 

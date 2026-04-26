@@ -36,7 +36,7 @@ Currently, `requirements.txt` is the safest install source. `pyproject.toml` doe
 1. Generate simulation data with [data/generate_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/generate_dataset.py).
 2. Train a model or run a sweep with [scripts/run_train.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_train.py) or [src/operators/train.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/train.py).
 3. Evaluate saved checkpoints with [src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py).
-4. Generate plots with [visual/plots.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/plots.py).
+4. Generate plots with [visual/cli.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/cli.py) (per-group plot modules under `visual/`).
 
 ## Current Entry Points
 
@@ -46,7 +46,7 @@ These are the current entry points that correspond to runnable code:
 - `python scripts/run_train.py -m`
 - `python -m src.operators.train`
 - `python -m src.operators.eval`
-- `python -m visual.plots ...`
+- `python -m visual.cli ...`
 - `python scripts/collect_best_config.py`
 
 These files are present but currently empty and should not be treated as working entry points:
@@ -107,7 +107,7 @@ Currently, the module `__main__` assumes `runs/experiment0/config0`, which is a 
 
 ## Plot Generation
 
-[visual/plots.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/plots.py) provides the current plot-generation CLI. It supports grouped outputs for `physics`, `mms`, `training`, `data`, and `sweep`.
+[visual/cli.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/cli.py) provides the current plot-generation CLI. It supports grouped outputs for `physics`, `mms`, `training`, `data`, and `sweep`. Each group's plot functions live in its own module under `visual/` (`physics_plots.py`, `mms_plots.py`, `training_plots.py`, `dataset_plots.py`, `sweep_plots.py`); shared helpers live in `visual/_common.py`.
 
 Important flags:
 
@@ -125,13 +125,13 @@ Important flags:
 Examples:
 
 ```bash
-python -m visual.plots --out visual/
-python -m visual.plots --group physics --out visual/
-python -m visual.plots --group training --csv runs/experiment0/conf0/seed0/train_metrics.csv --report runs/experiment0/conf0/seed_report.json --out visual/
-python -m visual.plots --group data --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
-python -m visual.plots --plots prediction_vs_truth lead_time_error --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
-python -m visual.plots --plots dataset_summary --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
-python -m visual.plots --plots interface_jump_summary --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
+python -m visual.cli --out visual/
+python -m visual.cli --group physics --out visual/
+python -m visual.cli --group training --csv runs/experiment0/conf0/seed0/train_metrics.csv --report runs/experiment0/conf0/seed_report.json --out visual/
+python -m visual.cli --group data --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
+python -m visual.cli --plots prediction_vs_truth lead_time_error --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
+python -m visual.cli --plots dataset_summary --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
+python -m visual.cli --plots interface_jump_summary --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
 ```
 
 Some plots require extra inputs and will be skipped if the relevant arguments are not provided. Training plots need `--csv` or `--report`. Grid-based data plots need `--data`, `--x-grid`, and `--t-grid`. Parameter-space and split-aware dataset plots also need `--params`. Checkpoint-based diagnostics such as `prediction_vs_truth`, `interface_error`, `lead_time_error`, `parameter_error_slices`, and `interface_jump_summary` also need `--checkpoint`. The new `dataset_summary` plot is the recommended one-figure dataset overview, while `interface_jump_summary` is the recommended aggregate check for interface-physics fidelity.
@@ -157,7 +157,7 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 - [src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py): checkpoint evaluation and reporting
 - [scripts/run_train.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_train.py): Hydra + Optuna sweep entry point
 - [scripts/collect_best_config.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/collect_best_config.py): rebuild generated config rankings
-- [visual/plots.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/plots.py): plot-generation CLI
+- [visual/cli.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/cli.py): plot-generation CLI (dispatches to per-group modules in `visual/`)
 - [conf/config.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/config.yaml): main configuration
 - [PROJECT_OVERVIEW.md](/Users/henriklind/Desktop/no-tps-ihcp/PROJECT_OVERVIEW.md): deeper technical overview
 
