@@ -9,11 +9,18 @@ from data.dataset import (
     AMP_RANGE,
     FREQ_RANGE,
     RC_RANGE,
+    SPATIAL_FAMILY_ORDER,
     T_EPS,
     SnapshotPairDataset,
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
+)
+from src.physics.boundary_forcing import (
+    PATCH_W_RANGE,
+    GAUSS_SIGMA_RANGE,
+    TRIANGLE_ELL_RANGE,
+    build_qL,
 )
 from src.operators.train import load_config
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
@@ -179,6 +186,23 @@ def _resolve_interface_metadata(config: dict | None = None, solver=None) -> dict
     }
 
 
+def _evaluate_q_left_field(solver) -> np.ndarray:
+    """Sample solver.q_left on solver.t × solver.grid_y as shape (Nt, Ny).
+
+    Broadcasts the legacy scalar path so callers always see a 2D field.
+    """
+    Ny = solver.Ny
+    is_vector = bool(getattr(solver, "_q_left_is_vector", False))
+    Q = np.empty((len(solver.t), Ny), dtype=float)
+    for i, ti in enumerate(solver.t):
+        val = np.asarray(solver.q_left(ti), dtype=float)
+        if is_vector:
+            Q[i, :] = val
+        else:
+            Q[i, :] = float(val)
+    return Q
+
+
 def _build_interface_mask(x_grid: np.ndarray, interface_x: float, interface_half_width: float) -> np.ndarray:
     """Return a boolean mask for the configured interface region."""
     return np.abs(x_grid - interface_x) <= interface_half_width
@@ -313,11 +337,30 @@ def _compute_binned_quantiles(
     )
 
 
+def _build_spatial_cond_block(spatial_family: str, spatial_params: dict) -> list[float]:
+    """Mirror SnapshotPairDataset's spatial cond layout: 4-onehot + (y_c, w, sigma_y, ell)_norm."""
+    onehot = [0.0] * len(SPATIAL_FAMILY_ORDER)
+    onehot[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
+    y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
+    if spatial_family == "patch":
+        y_c_norm = float(spatial_params["y_c"])
+        w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
+    elif spatial_family == "gaussian":
+        y_c_norm = float(spatial_params["y_c"])
+        log_lo = float(np.log(GAUSS_SIGMA_RANGE[0]))
+        log_hi = float(np.log(GAUSS_SIGMA_RANGE[1]))
+        sigma_y_norm = (np.log(spatial_params["sigma_y"]) - log_lo) / (log_hi - log_lo)
+    elif spatial_family == "triangle":
+        y_c_norm = float(spatial_params["y_c"])
+        ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
+    return [*onehot, y_c_norm, w_norm, sigma_y_norm, ell_norm]
+
+
 def _parameter_arrays(sim_params: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return amplitude, frequency, and contact resistance arrays."""
-    amplitudes = np.array([float(p[0]) for p in sim_params], dtype=np.float32)
-    frequencies = np.array([float(p[1]) for p in sim_params], dtype=np.float32)
-    contact_resistance = np.array([float(p[3]) for p in sim_params], dtype=np.float32)
+    amplitudes = np.array([float(p["amp"]) for p in sim_params], dtype=np.float32)
+    frequencies = np.array([float(p["freq"]) for p in sim_params], dtype=np.float32)
+    contact_resistance = np.array([float(p["R_c"]) for p in sim_params], dtype=np.float32)
     return amplitudes, frequencies, contact_resistance
 
 
@@ -514,22 +557,26 @@ def _prepare_prediction_case(
     X_norm = np.broadcast_to(x_norm[:, None], T_source.shape).astype(np.float32)
     Y_norm = np.broadcast_to(y_norm[None, :], T_source.shape).astype(np.float32)
 
-    amp, freq, _T0, R_c = sim_params[sim_id]
-    amp = float(amp)
-    freq = float(freq)
-    R_c = float(R_c)
+    params = sim_params[sim_id]
+    amp = float(params["amp"])
+    freq = float(params["freq"])
+    R_c = float(params["R_c"])
+    spatial_family = params["spatial_family"]
+    spatial_params = params["spatial_params"]
 
     x_spatial_single = np.stack([T_source_norm, X_norm, Y_norm], axis=-1)
     x_spatial_batch = np.repeat(x_spatial_single[None, :, :, :], len(target_indices), axis=0)
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
+    cond_extras = _build_spatial_cond_block(spatial_family, spatial_params)
     cond_batch = np.column_stack([
         t_bars / t_grid[-1],
         np.full(len(target_indices), t_s_norm),
         np.full(len(target_indices), (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])),
         np.full(len(target_indices), (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])),
         np.full(len(target_indices), (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])),
+        *(np.full(len(target_indices), v) for v in cond_extras),
     ]).astype(np.float32)
 
     device = next(model.parameters()).device
@@ -647,9 +694,9 @@ def _compute_pair_error_records(
         "global_rel_l2": global_rel.numpy(),
         "iface_rel_l2": iface_rel.numpy(),
         "jump_rel_l2": jump_rel.numpy(),
-        "amplitude": np.array([float(p[0]) for p in params], dtype=np.float32),
-        "frequency": np.array([float(p[1]) for p in params], dtype=np.float32),
-        "R_c": np.array([float(p[3]) for p in params], dtype=np.float32),
+        "amplitude": np.array([float(p["amp"]) for p in params], dtype=np.float32),
+        "frequency": np.array([float(p["freq"]) for p in params], dtype=np.float32),
+        "R_c": np.array([float(p["R_c"]) for p in params], dtype=np.float32),
         "true_jump_rms": true_jump_rms.numpy(),
         "pred_jump_rms": pred_jump_rms.numpy(),
         "source_index": source_indices,
@@ -911,45 +958,85 @@ def plot_heat_flux_profile(
 ):
     """Applied boundary flux and numerical x-direction flux at mid-y.
 
-    2-panel layout:
-        (a) Applied left boundary flux q_left(t) over full simulation time
-        (b) Numerical x-flux at y=mid at selected time snapshots
+    2x2 layout:
+        (a) Temporal trace a(t) at the y of peak |s(y)|
+        (b) Spatial profile s(y) at the time of peak |q|
+        (c) Heatmap q_left(y, t)
+        (d) Numerical x-flux at y=mid at selected time snapshots
     """
     Nt = len(solver.t)
     j_mid = solver.Ny // 2
     interface_meta = _resolve_interface_metadata(solver=solver)
 
-    with plt.rc_context(PLOT_STYLE):
-        fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 5))
+    Q = _evaluate_q_left_field(solver)  # (Nt, Ny)
+    is_vector = bool(getattr(solver, "_q_left_is_vector", False))
 
-        q_left_vals = np.array([solver.q_left(ti) for ti in solver.t])
-        ax_a.plot(solver.t, q_left_vals, color="C3")
+    abs_max_per_y = np.max(np.abs(Q), axis=0)
+    j_peak = int(np.argmax(abs_max_per_y)) if is_vector else j_mid
+    abs_max_per_t = np.max(np.abs(Q), axis=1)
+    t_peak = int(np.argmax(abs_max_per_t))
+    q_abs = max(float(np.max(np.abs(Q))), 1e-12)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+        ax_a, ax_b = axes[0, 0], axes[0, 1]
+        ax_c, ax_d = axes[1, 0], axes[1, 1]
+
+        ax_a.plot(solver.t, Q[:, j_peak], color="C3")
         ax_a.axvline(solver.t_on, color="C2", linestyle=":", alpha=0.8, label=f"t_on={solver.t_on}")
         ax_a.axvline(solver.t_off, color="C1", linestyle=":", alpha=0.8, label=f"t_off={solver.t_off}")
         ax_a.set_xlabel("Time")
         ax_a.set_ylabel("q_left(t)")
-        ax_a.set_title("Applied Boundary Flux")
+        title_a = f"Temporal trace at y = {solver.grid_y[j_peak]:.2f}" if is_vector else "Applied Boundary Flux (uniform)"
+        ax_a.set_title(title_a)
         ax_a.legend()
         ax_a.grid(True)
+
+        if is_vector:
+            ax_b.plot(solver.grid_y, Q[t_peak, :], color="C0")
+            ax_b.set_title(f"Spatial profile at t = {solver.t[t_peak]:.3f}")
+        else:
+            ax_b.plot(solver.grid_y, np.ones_like(solver.grid_y), color="C0")
+            ax_b.set_ylim(-0.1, 1.5)
+            ax_b.set_title("Spatial profile (uniform)")
+        ax_b.set_xlabel("y")
+        ax_b.set_ylabel("q_left(y) at t_peak")
+        ax_b.grid(True)
+
+        pcm = ax_c.pcolormesh(
+            solver.t,
+            solver.grid_y,
+            Q.T,
+            cmap="coolwarm",
+            vmin=-q_abs,
+            vmax=q_abs,
+            shading="auto",
+        )
+        ax_c.axvline(solver.t_on, color="0.2", linestyle=":", alpha=0.8)
+        ax_c.axvline(solver.t_off, color="0.2", linestyle=":", alpha=0.8)
+        ax_c.set_xlabel("Time")
+        ax_c.set_ylabel("y")
+        ax_c.set_title("q_left(y, t)")
+        fig.colorbar(pcm, ax=ax_c, label=r"$q_{left}$", shrink=0.9)
 
         snap_indices = np.linspace(1, Nt - 1, min(5, Nt - 1), dtype=int)
         cmap_snap = plt.cm.viridis
         for i, t_idx in enumerate(snap_indices):
             dT = T_hist[t_idx, 1:, j_mid] - T_hist[t_idx, :-1, j_mid]
             q_face = -solver.G_x[:, j_mid] * dT
-            ax_b.plot(
+            ax_d.plot(
                 solver.face_positions_x,
                 q_face,
                 color=cmap_snap(i / max(len(snap_indices) - 1, 1)),
                 label=f"t={solver.t[t_idx]:.3f}",
             )
 
-        _add_interface_lines(ax_b, interface_meta["positions"])
-        ax_b.set_xlabel("Face position (x)")
-        ax_b.set_ylabel("Heat flux q")
-        ax_b.set_title(f"Numerical x-Flux at y = {solver.grid_y[j_mid]:.2f}")
-        ax_b.legend(loc="best")
-        ax_b.grid(True)
+        _add_interface_lines(ax_d, interface_meta["positions"])
+        ax_d.set_xlabel("Face position (x)")
+        ax_d.set_ylabel("Heat flux q")
+        ax_d.set_title(f"Numerical x-Flux at y = {solver.grid_y[j_mid]:.2f}")
+        ax_d.legend(loc="best")
+        ax_d.grid(True)
 
         _save_figure(fig, save_path, "physics", "heat_flux_profile")
 
@@ -1534,78 +1621,123 @@ def plot_flux_profiles(
     t_final: float = 1.0,
     save_path: str | Path | None = None,
 ):
-    """Plot the applied boundary flux and 2D x-flux maps from a demo 2D solver."""
+    """Tile the new q_L(y, t) representation across patch / gaussian / triangle.
+
+    Row 0 (full width): shared temporal forcing a(t).
+    Rows 1-3: per family — s(y) | q_left(y, t) heatmap | q_x at t_peak.
+    """
     layers = [
         Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
         Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
-    solver = FVSolver2D(
-        a=0.0,
-        b=1.0,
-        c=0.0,
-        d=1.0,
-        Nx=60,
-        Ny=60,
-        lam_target=0.8,
-        layers=layers,
-        interface_R=[0.5],
-        t_final=t_final,
-        flux_f=10.5,
-        flux_A=175.0,
-        t_on=t_on,
-        t_off=t_off,
-        phase=0.0,
-        dt=0.005,
-    )
-    _, _, _, T_hist = solver.solve(store_trajectory=True)
-    snap_indices = np.linspace(1, len(solver.t) - 1, 4, dtype=int)
-    q_maps = []
-    for t_idx in snap_indices:
-        dT = T_hist[t_idx, 1:, :] - T_hist[t_idx, :-1, :]
-        q_maps.append(-solver.G_x * dT)
-    q_maps = np.asarray(q_maps)
-    q_abs = max(float(np.max(np.abs(q_maps))), 1e-8)
-    interface_meta = _resolve_interface_metadata(solver=solver)
+    families = [
+        ("patch",    dict(y_c=0.50, w=0.30)),
+        ("gaussian", dict(y_c=0.50, sigma_y=0.08)),
+        ("triangle", dict(y_c=0.50, ell=0.20)),
+    ]
+    Nx, Ny = 60, 60
+    a_x, b_x, c_y, d_y = 0.0, 1.0, 0.0, 1.0
+    flux_A, flux_f, phase = 175.0, 10.5, 0.0
+    y_grid = np.linspace(c_y, d_y, Ny)
+
+    runs = []
+    for name, sp in families:
+        q_fn, s_vec = build_qL(
+            "sin",
+            dict(A=flux_A, f=flux_f, t_on=t_on, t_off=t_off, phase=phase),
+            name,
+            sp,
+            y_grid,
+        )
+        solver = FVSolver2D(
+            a=a_x, b=b_x, c=c_y, d=d_y,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.8,
+            layers=layers,
+            interface_R=[0.5],
+            t_final=t_final,
+            flux_f=flux_f,
+            flux_A=flux_A,
+            t_on=t_on,
+            t_off=t_off,
+            phase=phase,
+            dt=0.005,
+            q_left_fn=q_fn,
+        )
+        _, _, _, T_hist = solver.solve(store_trajectory=True)
+        Q = _evaluate_q_left_field(solver)
+        t_peak = int(np.argmax(np.max(np.abs(Q), axis=1)))
+        dT = T_hist[t_peak, 1:, :] - T_hist[t_peak, :-1, :]
+        q_x = -solver.G_x * dT
+        runs.append({
+            "name": name, "sp": sp, "solver": solver, "T_hist": T_hist,
+            "Q": Q, "s_vec": s_vec, "q_x": q_x, "t_peak": t_peak,
+        })
+
+    # Reconstruct a(t) from one run: q(y, t) = a(t) * s(y) → a(t) = q(y_peak, t)/s(y_peak).
+    run0 = runs[0]
+    j0 = int(np.argmax(np.abs(run0["s_vec"])))
+    s0 = float(run0["s_vec"][j0])
+    a_t_shared = run0["Q"][:, j0] / s0 if abs(s0) > 1e-12 else run0["Q"][:, j0]
+
+    q_x_global = max(float(np.max([np.max(np.abs(r["q_x"])) for r in runs])), 1e-8)
+    interface_meta = _resolve_interface_metadata(solver=runs[0]["solver"])
 
     with plt.rc_context(PLOT_STYLE):
-        fig = plt.figure(figsize=(16, 9), constrained_layout=True)
-        gs = fig.add_gridspec(2, 3, width_ratios=[1.05, 1.0, 1.0])
-        ax_flux = fig.add_subplot(gs[:, 0])
-        axes_maps = [
-            fig.add_subplot(gs[0, 1]),
-            fig.add_subplot(gs[0, 2]),
-            fig.add_subplot(gs[1, 1]),
-            fig.add_subplot(gs[1, 2]),
-        ]
+        fig = plt.figure(figsize=(16, 13), constrained_layout=True)
+        gs = fig.add_gridspec(4, 3, height_ratios=[0.7, 1.0, 1.0, 1.0])
 
-        q_left_vals = np.array([solver.q_left(ti) for ti in solver.t])
-        ax_flux.plot(solver.t, q_left_vals, color="C3")
-        ax_flux.axvline(solver.t_on, color="C2", linestyle=":", alpha=0.8, label=f"t_on={solver.t_on}")
-        ax_flux.axvline(solver.t_off, color="C1", linestyle=":", alpha=0.8, label=f"t_off={solver.t_off}")
-        ax_flux.set_xlabel("Time")
-        ax_flux.set_ylabel(r"Applied flux $q_{left}(t)$")
-        ax_flux.set_title("Applied Boundary Flux")
-        ax_flux.legend(loc="upper right")
-        ax_flux.grid(True)
+        ax_at = fig.add_subplot(gs[0, :])
+        solver0 = runs[0]["solver"]
+        ax_at.plot(solver0.t, a_t_shared, color="C3")
+        ax_at.axvline(t_on, color="C2", linestyle=":", alpha=0.8, label=f"t_on={t_on}")
+        ax_at.axvline(t_off, color="C1", linestyle=":", alpha=0.8, label=f"t_off={t_off}")
+        ax_at.set_xlabel("Time")
+        ax_at.set_ylabel(r"$a(t)$")
+        ax_at.set_title("Temporal forcing (shared across families)")
+        ax_at.legend(loc="upper right")
+        ax_at.grid(True)
 
-        pcm = None
-        for ax, t_idx, q_map in zip(axes_maps, snap_indices, q_maps):
-            pcm = ax.pcolormesh(
-                solver.face_positions_x,
-                solver.grid_y,
-                q_map.T,
-                cmap="coolwarm",
-                vmin=-q_abs,
-                vmax=q_abs,
-                shading="nearest",
+        qx_axes = []
+        pcm_x = None
+        for row, run in enumerate(runs, start=1):
+            solver = run["solver"]
+            ax_s = fig.add_subplot(gs[row, 0])
+            ax_q = fig.add_subplot(gs[row, 1])
+            ax_qx = fig.add_subplot(gs[row, 2])
+
+            ax_s.plot(solver.grid_y, run["s_vec"], color="C0")
+            sp_str = ", ".join(f"{k}={v:.2f}" for k, v in run["sp"].items())
+            ax_s.set_xlabel("y")
+            ax_s.set_ylabel(r"$s(y)$")
+            ax_s.set_title(f"{run['name']}: {sp_str}")
+            ax_s.set_ylim(-0.1, 1.15)
+            ax_s.grid(True)
+
+            q_abs_row = max(float(np.max(np.abs(run["Q"]))), 1e-12)
+            pcm_q = ax_q.pcolormesh(
+                solver.t, solver.grid_y, run["Q"].T,
+                cmap="coolwarm", vmin=-q_abs_row, vmax=q_abs_row, shading="auto",
             )
-            _add_interface_lines(ax, interface_meta["positions"])
-            ax.set_xlabel("x-face position")
-            ax.set_ylabel("y")
-            ax.set_title(f"$q_x$ at t={solver.t[t_idx]:.3f}")
+            ax_q.axvline(t_on, color="0.2", linestyle=":", alpha=0.6)
+            ax_q.axvline(t_off, color="0.2", linestyle=":", alpha=0.6)
+            ax_q.set_xlabel("Time")
+            ax_q.set_ylabel("y")
+            ax_q.set_title(rf"$q_{{left}}(y,t)$ — {run['name']}")
+            fig.colorbar(pcm_q, ax=ax_q, shrink=0.9)
 
-        fig.colorbar(pcm, ax=axes_maps, label=r"$q_x$", shrink=0.9)
-        fig.suptitle("2D x-Flux Diagnostic")
+            pcm_x = ax_qx.pcolormesh(
+                solver.face_positions_x, solver.grid_y, run["q_x"].T,
+                cmap="coolwarm", vmin=-q_x_global, vmax=q_x_global, shading="nearest",
+            )
+            _add_interface_lines(ax_qx, interface_meta["positions"])
+            ax_qx.set_xlabel("x-face position")
+            ax_qx.set_ylabel("y")
+            ax_qx.set_title(rf"$q_x$ at t={solver.t[run['t_peak']]:.3f}")
+            qx_axes.append(ax_qx)
+
+        fig.colorbar(pcm_x, ax=qx_axes, label=r"$q_x$", shrink=0.85)
+        fig.suptitle("Boundary Flux Demo — Spatial Family Tiling")
         _save_figure(fig, save_path, "data", "flux_profiles", layout="constrained")
 
 
@@ -1650,7 +1782,10 @@ def plot_snapshot_pair_samples(
                 lead_time = dataset._lead_times[pair_idx]
                 source = trajectories[sim_id, s]
                 target = trajectories[sim_id, j]
-                amp, freq, _T0, R_c = sim_params[sim_id]
+                params = sim_params[sim_id]
+                amp = float(params["amp"])
+                freq = float(params["freq"])
+                R_c = float(params["R_c"])
                 vmin = float(min(np.min(source), np.min(target)))
                 vmax = float(max(np.max(source), np.max(target)))
                 ax_source = row_axes[2 * col]
