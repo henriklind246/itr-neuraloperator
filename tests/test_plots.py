@@ -9,7 +9,7 @@ import torch
 matplotlib.use("Agg")
 
 from data.dataset import split_sim_ids
-from visual import plots
+from visual import _common, dataset_plots, physics_plots
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def plot_config():
 class TestLoadPlotData:
     def test_loads_saved_arrays(self, tmp_npy_data):
         traj_path, x_path, y_path, t_path = tmp_npy_data
-        trajectories, x_grid, y_grid, t_grid = plots._load_plot_data(
+        trajectories, x_grid, y_grid, t_grid = dataset_plots._load_plot_data(
             traj_path, x_path, y_path, t_path
         )
         assert trajectories.shape == (20, 51, 11, 11)
@@ -53,7 +53,7 @@ class TestLoadPlotData:
         np.save(y_path, y_grid)
         np.save(t_path, t_grid)
         with pytest.raises(ValueError, match="x_grid length"):
-            plots._load_plot_data(traj_path, x_path, y_path, t_path)
+            dataset_plots._load_plot_data(traj_path, x_path, y_path, t_path)
 
 
 class TestPlotRegistry:
@@ -67,7 +67,7 @@ class TestPlotRegistry:
             "dataset_summary",
             "interface_jump_summary",
         ]:
-            assert plots.PLOT_REGISTRY[name] == "data"
+            assert _common.PLOT_REGISTRY[name] == "data"
 
     def test_retired_plot_names_removed(self):
         for name in [
@@ -76,16 +76,16 @@ class TestPlotRegistry:
             "boundary_temperature",
             "parameter_response",
         ]:
-            assert name not in plots.PLOT_REGISTRY
+            assert name not in _common.PLOT_REGISTRY
 
     def test_should_run_uses_new_registry(self):
-        assert plots._should_run("prediction_vs_truth", ["data"], None) is True
-        assert plots._should_run("prediction_vs_truth", ["training"], None) is False
+        assert _common._should_run("prediction_vs_truth", ["data"], None) is True
+        assert _common._should_run("prediction_vs_truth", ["training"], None) is False
 
 
 class TestSnapshotPairSamples:
     def test_signature_has_no_legacy_window_params(self):
-        signature = inspect.signature(plots.plot_snapshot_pair_samples)
+        signature = inspect.signature(dataset_plots.plot_snapshot_pair_samples)
         assert "k" not in signature.parameters
         assert "H" not in signature.parameters
 
@@ -98,7 +98,7 @@ class TestSnapshotPairSamples:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "snapshot_pair_samples.png"
-        plots.plot_snapshot_pair_samples(
+        dataset_plots.plot_snapshot_pair_samples(
             trajectories,
             x_grid,
             y_grid,
@@ -113,41 +113,41 @@ class TestSnapshotPairSamples:
 
 class TestPlotHelpers:
     def test_future_target_indices_are_unique_and_increasing(self):
-        target_indices = plots._future_target_indices(start_idx=2, n_requested=5, n_total=9)
+        target_indices = dataset_plots._future_target_indices(start_idx=2, n_requested=5, n_total=9)
         assert np.array_equal(target_indices, np.unique(target_indices))
         assert np.all(np.diff(target_indices) > 0)
         assert target_indices[0] > 2
 
     def test_future_target_indices_cap_to_available_horizon(self):
-        target_indices = plots._future_target_indices(start_idx=7, n_requested=10, n_total=10)
+        target_indices = dataset_plots._future_target_indices(start_idx=7, n_requested=10, n_total=10)
         assert np.array_equal(target_indices, np.array([8, 9]))
 
     def test_future_target_indices_short_horizon_has_no_duplicates(self):
-        target_indices = plots._future_target_indices(start_idx=46, n_requested=10, n_total=51)
+        target_indices = dataset_plots._future_target_indices(start_idx=46, n_requested=10, n_total=51)
         assert np.array_equal(target_indices, np.array([47, 48, 49, 50]))
 
     def test_future_target_indices_without_future_targets_raises(self):
         with pytest.raises(ValueError, match="future target"):
-            plots._future_target_indices(start_idx=4, n_requested=3, n_total=5)
+            dataset_plots._future_target_indices(start_idx=4, n_requested=3, n_total=5)
 
     def test_resolve_interface_metadata_uses_solver_positions(self, plot_config):
         class DummySolver:
             interface_positions = [0.25, 0.75]
 
-        meta = plots._resolve_interface_metadata(config=plot_config, solver=DummySolver())
+        meta = _common._resolve_interface_metadata(config=plot_config, solver=DummySolver())
         assert meta["positions"] == [0.25, 0.75]
         assert meta["interface_x"] == pytest.approx(0.5)
         assert meta["interface_half_width"] == pytest.approx(0.05)
 
     def test_resolve_interface_metadata_uses_config_when_solver_missing(self, plot_config):
-        meta = plots._resolve_interface_metadata(config=plot_config)
+        meta = _common._resolve_interface_metadata(config=plot_config)
         assert meta["positions"] == [0.5]
         assert meta["interface_x"] == pytest.approx(0.5)
         assert meta["interface_half_width"] == pytest.approx(0.05)
 
     def test_resolve_interface_metadata_falls_back_when_missing(self):
         """Missing config+solver should yield defaults (no raise) so older checkpoints still plot."""
-        meta = plots._resolve_interface_metadata(config=None, solver=None)
+        meta = _common._resolve_interface_metadata(config=None, solver=None)
         assert meta["interface_x"] == pytest.approx(0.5)
         assert meta["interface_half_width"] == pytest.approx(0.05)
         assert meta["positions"] == [0.5]
@@ -156,7 +156,7 @@ class TestPlotHelpers:
 class TestLeadTimeCoverage:
     def test_counts_match_all_pairs(self, synthetic_trajectories, synthetic_sim_params, plot_config):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        coverage = plots._lead_time_coverage_counts(
+        coverage = dataset_plots._lead_time_coverage_counts(
             trajectories,
             x_grid,
             y_grid,
@@ -183,7 +183,7 @@ class TestLeadTimeCoverage:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "lead_time_coverage.png"
-        plots.plot_lead_time_coverage(
+        dataset_plots.plot_lead_time_coverage(
             trajectories,
             x_grid,
             y_grid,
@@ -203,7 +203,7 @@ class TestDataFieldPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "trajectory_heatmap.png"
-        plots.plot_trajectory_heatmap(
+        dataset_plots.plot_trajectory_heatmap(
             trajectories,
             sim_id=0,
             x_grid=x_grid,
@@ -220,7 +220,7 @@ class TestDataFieldPlots:
     ):
         trajectories, x_grid, y_grid, _t_grid = synthetic_trajectories
         out_path = tmp_path / "initial_conditions.png"
-        plots.plot_initial_conditions(
+        dataset_plots.plot_initial_conditions(
             trajectories,
             x_grid=x_grid,
             y_grid=y_grid,
@@ -231,7 +231,7 @@ class TestDataFieldPlots:
 
     def test_flux_profiles_smoke(self, tmp_path):
         out_path = tmp_path / "flux_profiles.png"
-        plots.plot_flux_profiles(t_final=0.2, save_path=out_path)
+        dataset_plots.plot_flux_profiles(t_final=0.2, save_path=out_path)
         assert out_path.exists()
 
 
@@ -246,7 +246,7 @@ class TestModelDiagnosticPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "prediction_vs_truth.png"
-        plots.plot_prediction_vs_truth(
+        dataset_plots.plot_prediction_vs_truth(
             small_fno2d,
             trajectories,
             x_grid,
@@ -271,7 +271,7 @@ class TestModelDiagnosticPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "prediction_vs_truth_short.png"
-        plots.plot_prediction_vs_truth(
+        dataset_plots.plot_prediction_vs_truth(
             small_fno2d,
             trajectories,
             x_grid,
@@ -296,7 +296,7 @@ class TestModelDiagnosticPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "interface_error.png"
-        plots.plot_interface_error(
+        dataset_plots.plot_interface_error(
             small_fno2d,
             trajectories,
             x_grid,
@@ -320,9 +320,9 @@ class TestModelDiagnosticPlots:
         plot_config,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        datasets = plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
+        datasets = dataset_plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
         out_path = tmp_path / "lead_time_error.png"
-        plots.plot_lead_time_error(
+        dataset_plots.plot_lead_time_error(
             small_fno2d,
             datasets["test"],
             x_grid,
@@ -342,9 +342,9 @@ class TestModelDiagnosticPlots:
         plot_config,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        datasets = plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
+        datasets = dataset_plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
         out_path = tmp_path / "parameter_error_slices.png"
-        plots.plot_parameter_error_slices(
+        dataset_plots.plot_parameter_error_slices(
             small_fno2d,
             datasets["test"],
             x_grid,
@@ -364,7 +364,7 @@ class TestModelDiagnosticPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         out_path = tmp_path / "dataset_summary.png"
-        plots.plot_dataset_summary(
+        dataset_plots.plot_dataset_summary(
             trajectories,
             x_grid,
             y_grid,
@@ -410,7 +410,7 @@ class TestModelDiagnosticPlots:
         assert len(val_ids) == 0
 
         out_path = tmp_path / "dataset_summary_empty_split.png"
-        plots.plot_dataset_summary(
+        dataset_plots.plot_dataset_summary(
             trajectories,
             x_grid,
             y_grid,
@@ -430,9 +430,9 @@ class TestModelDiagnosticPlots:
         plot_config,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        datasets = plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
+        datasets = dataset_plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config)
         out_path = tmp_path / "interface_jump_summary.png"
-        plots.plot_interface_jump_summary(
+        dataset_plots.plot_interface_jump_summary(
             small_fno2d,
             datasets["test"],
             x_grid,
@@ -444,7 +444,7 @@ class TestModelDiagnosticPlots:
         assert out_path.exists()
 
     def test_load_checkpoint_model_loads_2d_checkpoint(self, small_fno2d_checkpoint):
-        model, conf = plots._load_checkpoint_model(small_fno2d_checkpoint)
+        model, conf = dataset_plots._load_checkpoint_model(small_fno2d_checkpoint)
         assert conf["model"]["parameters"]["modes1"] == 2
         assert conf["model"]["parameters"]["modes2"] == 2
         assert getattr(model, "_mu_global") == 0.0
@@ -470,7 +470,7 @@ class TestModelDiagnosticPlots:
             ckpt_path,
         )
         with pytest.raises(ValueError, match="missing modes1/modes2"):
-            plots._load_checkpoint_model(ckpt_path)
+            dataset_plots._load_checkpoint_model(ckpt_path)
 
     def test_checkpoint_loaded_model_prediction_smoke(
         self,
@@ -481,9 +481,9 @@ class TestModelDiagnosticPlots:
         plot_config,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        model, _ = plots._load_checkpoint_model(small_fno2d_checkpoint)
+        model, _ = dataset_plots._load_checkpoint_model(small_fno2d_checkpoint)
         out_path = tmp_path / "prediction_vs_truth_from_ckpt.png"
-        plots.plot_prediction_vs_truth(
+        dataset_plots.plot_prediction_vs_truth(
             model,
             trajectories,
             x_grid,
@@ -501,8 +501,8 @@ class TestModelDiagnosticPlots:
 
 class TestPhysicsPlots:
     def test_multilayer_evolution_smoke(self, tmp_path):
-        solver = plots.create_demo_multilayer_solver()
+        solver = physics_plots.create_demo_multilayer_solver()
         _, _, _, T_hist = solver.solve(store_trajectory=True)
         out_path = tmp_path / "multilayer_evolution.png"
-        plots.plot_multilayer_evolution(solver, T_hist, save_path=out_path)
+        physics_plots.plot_multilayer_evolution(solver, T_hist, save_path=out_path)
         assert out_path.exists()
