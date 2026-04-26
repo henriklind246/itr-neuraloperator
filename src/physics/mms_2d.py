@@ -158,6 +158,83 @@ def run_mms_2d(N: int, dt=None) -> tuple[float, float, float, float]:
 
 
 # ==============================================================
+# 2b. y-dependent left-flux MMS (verifies vector q_left path)
+# ==============================================================
+
+def run_mms_2d_yflux(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    Manufactured solution with separable y-dependent left Neumann flux.
+
+    T*(x, y, t) = 300 + A sin(wt) (b-x)^4 cos(pi (y-c)/(d-c))
+
+    Boundary conditions:
+      Left:       q*(y,t) = -k dT*/dx|_{x=a}
+                          = 4 k A sin(wt) (b-a)^3 cos(pi (y-c)/(d-c))
+                          = a*(t) * s*(y)   (separable)
+      Right:      T*(b,y,t) = 300            (factor (b-x)^4 vanishes)
+      Top/bottom: dT*/dy = 0 at y=c, y=d     (sin(0) = sin(pi) = 0)
+
+    This case exists specifically to verify the vector-valued q_left path —
+    the only existing MMS cases use scalar q*(t).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    L = b - a
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.0
+    A = 10.0
+    kappa = np.pi / Ly
+
+    def cos_y(Y):
+        return np.cos(kappa * (Y - c))
+
+    def T_star(X, Y, t):
+        return 300.0 + A * np.sin(omega * t + phase) * (b - X) ** 4 * cos_y(Y)
+
+    def q_star(t):
+        # Vector-valued: shape (Ny,)
+        return 4.0 * k * A * L ** 3 * np.sin(omega * t + phase) * cos_y(np.linspace(c, d, N))
+
+    def s_star(X, Y, t):
+        g = np.sin(omega * t + phase)
+        gp = omega * np.cos(omega * t + phase)
+        cy = cos_y(Y)
+        # dT/dt
+        s_t = rho * cp * A * gp * (b - X) ** 4 * cy
+        # k d²T/dx²
+        s_xx = k * 12.0 * A * g * (b - X) ** 2 * cy
+        # k d²T/dy² = -k A g (b-x)^4 kappa^2 cos_y
+        s_yy = -k * A * g * (b - X) ** 4 * kappa ** 2 * cy
+        return s_t - s_xx - s_yy
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_star,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ==============================================================
 # 3. Interface MMS (piecewise 2D with R_c)
 # ==============================================================
 
@@ -352,6 +429,23 @@ def time_order_test_2d_interface(dt_list: list) -> float:
     return float(np.mean(_pairwise_orders(dt_list, results)))
 
 
+def space_order_test_2d_yflux(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d_yflux(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_yflux(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_yflux(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
 def space_order_test_2d_off_center_interface(N_list: list, x_I: float = 0.4734) -> float:
     """Spatial convergence test with interface not on a cell-face midpoint."""
     results, hs = [], []
@@ -390,6 +484,14 @@ if __name__ == '__main__':
     p = space_order_test_2d([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
     p = time_order_test_2d([0.02, 0.01, 0.005])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== y-dependent Left-Flux MMS (vector q_left) ===")
+    h, dt, me, l2 = run_mms_2d_yflux(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_yflux([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_yflux([0.02, 0.01, 0.005])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Interface MMS ===")
