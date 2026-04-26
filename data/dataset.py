@@ -4,12 +4,31 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
+from src.physics.boundary_forcing import (
+    SPATIAL_FAMILIES,
+    PATCH_W_RANGE,
+    GAUSS_SIGMA_RANGE,
+    TRIANGLE_ELL_RANGE,
+)
+
 # --------- NORMALIZATION CONSTANTS ---------
 
 RC_RANGE = (0.05, 1.0)
 AMP_RANGE = (50.0, 300.0)
 FREQ_RANGE = (1.0, 20.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
+
+# Conditioning-vector layout (13 dims):
+#   [0:5]  base physics: t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm
+#   [5:9]  one-hot spatial family: uniform, patch, gaussian, triangle
+#   [9:13] spatial params: y_c_norm, w_norm, sigma_y_norm, ell_norm (zero-padded)
+SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
+COND_DIM = 13
+
+# log-uniform sigma_y is min-max normalized in log-space so coverage matches
+# the sampler's log-uniform distribution.
+_LOG_SIGMA_LO = float(np.log(GAUSS_SIGMA_RANGE[0]))
+_LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
 
 # --------- SNAPSHOT PAIR DATASET ---------
 
@@ -30,7 +49,9 @@ class SnapshotPairDataset(Dataset):
 
     Returns 4-tuple: (spatial, cond, Y, T_stats)
         spatial : (Nx, Ny, 3)  — [T̃_source, x_norm, y_norm]
-        cond      : (5,)     — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
+        cond      : (13,)    — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm,
+                                onehot_uniform, onehot_patch, onehot_gauss, onehot_triangle,
+                                y_c_norm, w_norm, sigma_y_norm, ell_norm]
         Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
         T_stats   : (2,)     — [μ_global, σ_global] for denormalization
     """
@@ -115,10 +136,13 @@ class SnapshotPairDataset(Dataset):
     def __getitem__(self, idx):
         sim_id, s, j = self._pairs[idx]
 
-        # Unpack sim params: (amp, freq, T0, R_c)
-        amp, freq, _T0, R_c = self.sim_params[sim_id]
-        amp = np.float32(amp)
-        freq = np.float32(freq)
+        # Unpack sim params (dict schema)
+        params = self.sim_params[sim_id]
+        amp = np.float32(params["amp"])
+        freq = np.float32(params["freq"])
+        R_c = np.float32(params["R_c"])
+        spatial_family = params["spatial_family"]
+        spatial_params = params["spatial_params"]
 
         # Source and target snapshots
         T_source = self.trajectories[sim_id, s, :, :]  # (Nx, Ny)
@@ -135,14 +159,34 @@ class SnapshotPairDataset(Dataset):
         # Spatial input: (Nx, Ny, 3) — [T̃_source, x_norm, y_norm]
         spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm], axis=-1).astype(np.float32)
 
-        # Conditioning vector: (5,) — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm]
+        # Conditioning vector (13,)
         t_bar = self.t_grid[j] - self.t_grid[s]
         t_bar_norm = t_bar / self.t_grid[-1]
         t_s_norm = self.t_grid[s] / self.t_grid[-1]
         A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
         f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
         R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-        cond = np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm], dtype=np.float32)
+
+        # One-hot spatial family + zero-padded normalized parameters.
+        onehot = np.zeros(len(SPATIAL_FAMILY_ORDER), dtype=np.float32)
+        onehot[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
+
+        y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
+        if spatial_family == "patch":
+            y_c_norm = float(spatial_params["y_c"])
+            w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
+        elif spatial_family == "gaussian":
+            y_c_norm = float(spatial_params["y_c"])
+            sigma_y_norm = (np.log(spatial_params["sigma_y"]) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
+        elif spatial_family == "triangle":
+            y_c_norm = float(spatial_params["y_c"])
+            ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
+
+        cond = np.concatenate([
+            np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm], dtype=np.float32),
+            onehot,
+            np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32),
+        ]).astype(np.float32)
 
         # Target: (Nx, Ny, 1)
         Y = T_target_norm[:, :, None].astype(np.float32)
@@ -329,6 +373,6 @@ if __name__ == '__main__':
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
     print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 3)
-    print(f"cond: {cond.shape}")            # (B, 5)
+    print(f"cond: {cond.shape}")            # (B, 13)
     print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
