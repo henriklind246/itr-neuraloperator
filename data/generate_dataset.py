@@ -165,6 +165,10 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
     np.save("x_grid.npy", x_grid)
     np.save("y_grid.npy", y_grid)
     np.save("t_grid.npy", t_grid)
+    # Saved t_grid spacing != solver dt when save_stride > 1; persist solver dt
+    # so the dataset can normalize tau / dt_n cond slots against the same bounds
+    # used during sampling.
+    np.save("dt.npy", np.float64(dt))
     np.save("trajectories.npy", trajectories)
     np.save("sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
     print("Saved:", x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape)
