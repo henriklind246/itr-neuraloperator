@@ -5,11 +5,12 @@ from data.generate_dataset import (
     generate_lhs_samples,
     random_ic,
 )
+from src.physics.boundary_forcing import TEMPORAL_FAMILIES
 
 
-AMP_RANGE = (50.0, 300.0)
-FREQ_RANGE = (1.0, 20.0)
 RC_RANGE = (0.05, 1.0)
+DT = 0.005
+T_FINAL = 0.3
 
 
 def _mesh(a: float, b: float, c: float, d: float, Nx: int, Ny: int):
@@ -53,8 +54,6 @@ class TestRandomIC:
         assert np.issubdtype(result.dtype, np.floating)
 
     def test_different_domains(self):
-        # Same grid but different declared Lx changes the trig arguments -> different output.
-        # (Match the 1D-era test: grid spans [0, 2] while a=0 is fixed and b toggles between 1 and 2.)
         X, Y = _mesh(0.0, 2.0, 0.0, 2.0, 11, 13)
         r1 = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, np.random.default_rng(0))
         r2 = random_ic(0.0, 2.0, 0.0, 2.0, X, Y, np.random.default_rng(0))
@@ -65,21 +64,18 @@ class TestRandomIC:
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 25, 17)
         rng = np.random.default_rng(0)
         result = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng)
-        # std along y-axis (axis=1) at each x-row: at least one row must vary
         assert float(np.std(result, axis=1).max()) > 1e-6
 
 
 class TestGenerateLHSSamples:
     def test_shape_and_dtype(self):
         samples = generate_lhs_samples(num_sims=64, seed=0)
-        assert samples.shape == (64, 3)
+        assert samples.shape == (64, 1)
         assert samples.dtype == np.float32
 
     def test_columns_within_bounds(self):
         samples = generate_lhs_samples(num_sims=128, seed=0)
-        amps, freqs, rcs = samples[:, 0], samples[:, 1], samples[:, 2]
-        assert np.all(amps >= AMP_RANGE[0]) and np.all(amps <= AMP_RANGE[1])
-        assert np.all(freqs >= FREQ_RANGE[0]) and np.all(freqs <= FREQ_RANGE[1])
+        rcs = samples[:, 0]
         assert np.all(rcs >= RC_RANGE[0]) and np.all(rcs <= RC_RANGE[1])
 
     def test_deterministic_same_seed(self):
@@ -92,22 +88,6 @@ class TestGenerateLHSSamples:
         s2 = generate_lhs_samples(num_sims=32, seed=1)
         assert not np.array_equal(s1, s2)
 
-    def test_frequency_is_log_uniform(self):
-        """Frequency is sampled log-uniformly: log(f) should be approximately
-        uniform on [log(lo), log(hi)], i.e. geometric mean ≈ sqrt(lo*hi)."""
-        samples = generate_lhs_samples(num_sims=4000, seed=0)
-        freqs = samples[:, 1]
-        log_mean = np.mean(np.log(freqs))
-        expected = 0.5 * (np.log(FREQ_RANGE[0]) + np.log(FREQ_RANGE[1]))
-        assert abs(log_mean - expected) < 0.05
-
-    def test_amplitude_is_uniform_not_log(self):
-        """Amplitude is uniformly scaled: arithmetic mean ≈ (lo + hi) / 2."""
-        samples = generate_lhs_samples(num_sims=4000, seed=0)
-        amps = samples[:, 0]
-        expected = 0.5 * (AMP_RANGE[0] + AMP_RANGE[1])
-        assert abs(np.mean(amps) - expected) < 5.0
-
 
 class TestBuildSimParams:
     def test_length_and_dict_structure(self):
@@ -115,28 +95,48 @@ class TestBuildSimParams:
         rng = np.random.default_rng(0)
         rng_profile = np.random.default_rng(1)
         params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=8,
-                                  rng=rng, rng_profile=rng_profile, lhs_seed=0)
+                                  rng=rng, rng_profile=rng_profile,
+                                  dt=DT, t_final=T_FINAL, lhs_seed=0)
         assert len(params) == 8
-        required_keys = {"amp", "freq", "R_c", "T0", "temporal_family",
+        required_keys = {"R_c", "T0", "temporal_family",
                          "temporal_params", "spatial_family", "spatial_params"}
         for entry in params:
             assert isinstance(entry, dict)
             assert required_keys.issubset(entry.keys())
-            assert AMP_RANGE[0] <= float(entry["amp"]) <= AMP_RANGE[1]
-            assert FREQ_RANGE[0] <= float(entry["freq"]) <= FREQ_RANGE[1]
             assert RC_RANGE[0] <= float(entry["R_c"]) <= RC_RANGE[1]
             assert isinstance(entry["T0"], np.ndarray)
-            assert entry["temporal_family"] == "sin"
+            assert entry["temporal_family"] in TEMPORAL_FAMILIES
             assert entry["spatial_family"] in {"uniform", "patch", "gaussian", "triangle"}
 
+    def test_temporal_params_match_family_schema(self):
+        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 9, 7)
+        rng = np.random.default_rng(0)
+        rng_profile = np.random.default_rng(1)
+        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=64,
+                                  rng=rng, rng_profile=rng_profile,
+                                  dt=DT, t_final=T_FINAL, lhs_seed=0)
+        for entry in params:
+            tp = entry["temporal_params"]
+            fam = entry["temporal_family"]
+            if fam == "sin":
+                assert {"A", "f", "t_on", "t_off", "phase", "tukey_alpha"} <= tp.keys()
+            elif fam == "exp":
+                assert {"A", "t0", "tau"} <= tp.keys()
+            elif fam == "pulse_train":
+                assert {"Np", "A_list", "t_list", "dt_list"} <= tp.keys()
+                assert len(tp["A_list"]) == tp["Np"]
+            elif fam == "exp_train":
+                assert {"Np", "A_list", "t_list", "tau_list"} <= tp.keys()
+                assert len(tp["A_list"]) == tp["Np"]
+
     def test_T0_is_2d_with_grid_shape(self):
-        """Regression guard: catches any silent revert to a 1D IC."""
         Nx, Ny = 13, 9
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, Nx, Ny)
         rng = np.random.default_rng(0)
         rng_profile = np.random.default_rng(1)
         params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4,
-                                  rng=rng, rng_profile=rng_profile, lhs_seed=0)
+                                  rng=rng, rng_profile=rng_profile,
+                                  dt=DT, t_final=T_FINAL, lhs_seed=0)
         for entry in params:
             T0 = entry["T0"]
             assert T0.shape == (Nx, Ny)
@@ -146,17 +146,19 @@ class TestBuildSimParams:
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 11, 11)
         p1 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=5,
                               rng=np.random.default_rng(123),
-                              rng_profile=np.random.default_rng(7), lhs_seed=0)
+                              rng_profile=np.random.default_rng(7),
+                              dt=DT, t_final=T_FINAL, lhs_seed=0)
         p2 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=5,
                               rng=np.random.default_rng(123),
-                              rng_profile=np.random.default_rng(7), lhs_seed=0)
+                              rng_profile=np.random.default_rng(7),
+                              dt=DT, t_final=T_FINAL, lhs_seed=0)
         for e1, e2 in zip(p1, p2):
-            assert float(e1["amp"]) == float(e2["amp"])
-            assert float(e1["freq"]) == float(e2["freq"])
             assert float(e1["R_c"]) == float(e2["R_c"])
             np.testing.assert_array_equal(e1["T0"], e2["T0"])
             assert e1["spatial_family"] == e2["spatial_family"]
             assert e1["spatial_params"] == e2["spatial_params"]
+            assert e1["temporal_family"] == e2["temporal_family"]
+            assert e1["temporal_params"] == e2["temporal_params"]
 
     def test_T0_varies_across_sims(self):
         """Each sim should get its own random IC."""
@@ -164,7 +166,8 @@ class TestBuildSimParams:
         rng = np.random.default_rng(0)
         rng_profile = np.random.default_rng(1)
         params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4,
-                                  rng=rng, rng_profile=rng_profile, lhs_seed=0)
+                                  rng=rng, rng_profile=rng_profile,
+                                  dt=DT, t_final=T_FINAL, lhs_seed=0)
         T0_stack = np.stack([p["T0"] for p in params])
         for i in range(len(params)):
             for j in range(i + 1, len(params)):

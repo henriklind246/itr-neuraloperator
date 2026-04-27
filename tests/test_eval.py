@@ -15,11 +15,11 @@ def eval_setup():
     """Tiny model + 4-tuple loader for eval tests."""
     Nx = 11
     Ny = 11
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=3, out_channels=1, n_layers=2, cond_dim=13)
+    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=3, out_channels=1, n_layers=2, cond_dim=28)
     model.eval()
 
     x_spatial = torch.randn(4, Nx, Ny, 3)
-    cond = torch.rand(4, 13)
+    cond = torch.rand(4, 28)
     Y = torch.randn(4, Nx, Ny, 1)
     T_stats = torch.stack([
         torch.randn(4),           # mu_s

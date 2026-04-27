@@ -48,37 +48,40 @@ def synthetic_trajectories():
 
 @pytest.fixture
 def synthetic_sim_params(synthetic_trajectories):
-    """Synthetic sim_params matching synthetic_trajectories (20 sims, dict schema)."""
+    """Synthetic sim_params matching synthetic_trajectories (20 sims, dict schema).
+
+    Uses the real per-family samplers so the temporal_params dict shape always
+    matches what TEMPORAL_BUILDERS / encode_temporal_params expect.
+    """
     from src.physics.boundary_forcing import (
         SPATIAL_SAMPLERS,
+        TEMPORAL_SAMPLERS,
         sample_spatial_family,
         sample_temporal_family,
     )
 
-    trajectories, x_grid, y_grid, _ = synthetic_trajectories
+    trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
     num_sims = trajectories.shape[0]
     Nx = x_grid.shape[0]
     Ny = y_grid.shape[0]
+    dt = float(t_grid[1] - t_grid[0])
+    t_final = float(t_grid[-1])
     rng = np.random.default_rng(42)
     params = []
     for _ in range(num_sims):
-        amp = float(rng.uniform(50.0, 300.0))
-        freq = float(rng.uniform(1.0, 20.0))
         R_c = float(rng.uniform(0.05, 1.0))
         T0 = rng.standard_normal((Nx, Ny)).astype(np.float32)
         temporal_family = sample_temporal_family(rng)
+        temporal_params = TEMPORAL_SAMPLERS[temporal_family](
+            rng, dt=dt, t_final=t_final, t_on=0.0, t_off=0.2,
+        )
         spatial_family = sample_spatial_family(rng)
         spatial_params = SPATIAL_SAMPLERS[spatial_family](rng)
         params.append({
-            "amp": amp,
-            "freq": freq,
             "R_c": R_c,
             "T0": T0,
             "temporal_family": temporal_family,
-            "temporal_params": {
-                "A": amp, "f": freq,
-                "t_on": 0.0, "t_off": 0.2, "phase": 0.0, "tukey_alpha": 0.5,
-            },
+            "temporal_params": temporal_params,
             "spatial_family": spatial_family,
             "spatial_params": spatial_params,
         })
@@ -118,7 +121,7 @@ def small_fno2d():
         in_channels=3,
         out_channels=1,
         n_layers=2,
-        cond_dim=13,
+        cond_dim=28,
     )
 
 
@@ -138,7 +141,7 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
                         "in_channels": 3,
                         "out_channels": 1,
                         "n_layers": 2,
-                        "cond_dim": 13,
+                        "cond_dim": 28,
                         "cond_hidden": 256,
                         "dropout": 0.0,
                         "spectral_dropout": 0.0,
