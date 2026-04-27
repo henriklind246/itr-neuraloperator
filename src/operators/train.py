@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.optim import Adam, AdamW
 
-from data.dataset import compute_global_stats, create_dataloaders, load_sim_data, split_sim_ids
+from data.dataset import COND_DIM, compute_global_stats, create_dataloaders, load_sim_data, split_sim_ids
 from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
@@ -423,7 +423,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         in_channels=model_cfg.get("in_channels", 3),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", 5),
+        cond_dim=model_cfg.get("cond_dim", COND_DIM),
         cond_hidden=model_cfg.get("cond_hidden", 256),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),

@@ -1,5 +1,5 @@
 import torch
-from data.dataset import compute_global_stats, load_sim_data, split_sim_ids, create_dataloaders, T_EPS
+from data.dataset import COND_DIM, compute_global_stats, load_sim_data, split_sim_ids, create_dataloaders, T_EPS
 from src.operators.fno2d import FNO2d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
@@ -119,7 +119,7 @@ def eval_all_seeds(run_root: str):
             in_channels=model_cfg.get("in_channels", 3),
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
-            cond_dim=model_cfg.get("cond_dim", 5),
+            cond_dim=model_cfg.get("cond_dim", COND_DIM),
             cond_hidden=model_cfg.get("cond_hidden", 256),
         )
         fno.load_state_dict(ckpt['model_state'])
