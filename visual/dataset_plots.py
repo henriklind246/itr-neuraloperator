@@ -12,22 +12,37 @@ import numpy as np
 from matplotlib.colors import TwoSlopeNorm
 
 from data.dataset import (
-    AMP_RANGE,
-    FREQ_RANGE,
+    COND_DIM,
     RC_RANGE,
-    SPATIAL_FAMILY_ORDER,
     T_EPS,
     SnapshotPairDataset,
+    build_cond_vector,
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
 )
-from src.physics.boundary_forcing import (
-    PATCH_W_RANGE,
-    GAUSS_SIGMA_RANGE,
-    TRIANGLE_ELL_RANGE,
-    build_qL,
-)
+from src.physics.boundary_forcing import build_qL
+
+
+def _sin_amp_freq(params: dict) -> tuple[float, float]:
+    """Pull (amp, freq) from a sim's temporal params; NaN if not the sin family."""
+    if params.get("temporal_family") == "sin":
+        tp = params["temporal_params"]
+        return float(tp["A"]), float(tp["f"])
+    return float("nan"), float("nan")
+
+
+def _forcing_label(params: dict) -> str:
+    """Short human-readable label for a sim's temporal forcing."""
+    fam = params.get("temporal_family", "?")
+    tp = params.get("temporal_params", {})
+    if fam == "sin":
+        return f"sin A={tp['A']:.0f} f={tp['f']:.2f}"
+    if fam == "exp":
+        return f"exp A={tp['A']:.0f} t0={tp['t0']:.2f} tau={tp['tau']:.3f}"
+    if fam in ("pulse_train", "exp_train"):
+        return f"{fam} Np={tp['Np']}"
+    return fam
 from src.operators.train import load_config
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.operators.fno2d import FNO2d
@@ -196,47 +211,44 @@ def _compute_binned_quantiles(
     )
 
 
-def _build_spatial_cond_block(spatial_family: str, spatial_params: dict) -> list[float]:
-    """Mirror SnapshotPairDataset's spatial cond layout: 4-onehot + (y_c, w, sigma_y, ell)_norm."""
-    onehot = [0.0] * len(SPATIAL_FAMILY_ORDER)
-    onehot[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
-    y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
-    if spatial_family == "patch":
-        y_c_norm = float(spatial_params["y_c"])
-        w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
-    elif spatial_family == "gaussian":
-        y_c_norm = float(spatial_params["y_c"])
-        log_lo = float(np.log(GAUSS_SIGMA_RANGE[0]))
-        log_hi = float(np.log(GAUSS_SIGMA_RANGE[1]))
-        sigma_y_norm = (np.log(spatial_params["sigma_y"]) - log_lo) / (log_hi - log_lo)
-    elif spatial_family == "triangle":
-        y_c_norm = float(spatial_params["y_c"])
-        ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
-    return [*onehot, y_c_norm, w_norm, sigma_y_norm, ell_norm]
-
-
 def _parameter_arrays(sim_params: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return amplitude, frequency, and contact resistance arrays."""
-    amplitudes = np.array([float(p["amp"]) for p in sim_params], dtype=np.float32)
-    frequencies = np.array([float(p["freq"]) for p in sim_params], dtype=np.float32)
+    """Return amplitude, frequency, and contact resistance arrays.
+
+    Amplitude / frequency are sin-specific; non-sin sims contribute NaN.
+    """
+    pairs = [_sin_amp_freq(p) for p in sim_params]
+    amplitudes = np.array([a for a, _ in pairs], dtype=np.float32)
+    frequencies = np.array([f for _, f in pairs], dtype=np.float32)
     contact_resistance = np.array([float(p["R_c"]) for p in sim_params], dtype=np.float32)
     return amplitudes, frequencies, contact_resistance
 
 
 def _select_representative_sim_id(sim_params: np.ndarray) -> int:
-    """Choose a deterministic representative simulation near the median condition point."""
+    """Choose a deterministic representative simulation near the median condition point.
+
+    Restricted to sin-family sims because the median is computed over (A, f, R_c).
+    Falls back to the first sim if no sin sims exist.
+    """
+    sin_idx = np.array(
+        [i for i, p in enumerate(sim_params) if p.get("temporal_family") == "sin"],
+        dtype=np.int64,
+    )
+    if sin_idx.size == 0:
+        return 0
     amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
+    A = amplitudes[sin_idx]
+    F = frequencies[sin_idx]
+    R = contact_resistance[sin_idx]
     stacked = np.column_stack(
         [
-            (amplitudes - amplitudes.min()) / max(amplitudes.max() - amplitudes.min(), 1e-12),
-            (np.log10(frequencies) - np.log10(frequencies).min())
-            / max(np.log10(frequencies).max() - np.log10(frequencies).min(), 1e-12),
-            (contact_resistance - contact_resistance.min())
-            / max(contact_resistance.max() - contact_resistance.min(), 1e-12),
+            (A - A.min()) / max(A.max() - A.min(), 1e-12),
+            (np.log10(F) - np.log10(F).min())
+            / max(np.log10(F).max() - np.log10(F).min(), 1e-12),
+            (R - R.min()) / max(R.max() - R.min(), 1e-12),
         ]
     )
     target = np.median(stacked, axis=0)
-    return int(np.argmin(np.sum((stacked - target) ** 2, axis=1)))
+    return int(sin_idx[int(np.argmin(np.sum((stacked - target) ** 2, axis=1)))])
 
 
 def _spatial_localness(p: dict) -> float:
@@ -335,7 +347,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         in_channels=model_cfg.get("in_channels", 3),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", 5),
+        cond_dim=model_cfg.get("cond_dim", COND_DIM),
         cond_hidden=model_cfg.get("cond_hidden", 256),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
@@ -441,26 +453,32 @@ def _prepare_prediction_case(
     Y_norm = np.broadcast_to(y_norm[None, :], T_source.shape).astype(np.float32)
 
     params = sim_params[sim_id]
-    amp = float(params["amp"])
-    freq = float(params["freq"])
+    amp, freq = _sin_amp_freq(params)
     R_c = float(params["R_c"])
     spatial_family = params["spatial_family"]
     spatial_params = params["spatial_params"]
+    temporal_family = params["temporal_family"]
+    temporal_params = params["temporal_params"]
 
     x_spatial_single = np.stack([T_source_norm, X_norm, Y_norm], axis=-1)
     x_spatial_batch = np.repeat(x_spatial_single[None, :, :, :], len(target_indices), axis=0)
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
-    cond_extras = _build_spatial_cond_block(spatial_family, spatial_params)
-    cond_batch = np.column_stack([
-        t_bars / t_grid[-1],
-        np.full(len(target_indices), t_s_norm),
-        np.full(len(target_indices), (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])),
-        np.full(len(target_indices), (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])),
-        np.full(len(target_indices), (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])),
-        *(np.full(len(target_indices), v) for v in cond_extras),
-    ]).astype(np.float32)
+    dt_grid = float(t_grid[1] - t_grid[0])
+    t_final_grid = float(t_grid[-1])
+    cond_rows = [
+        build_cond_vector(
+            t_bar_norm=float(t_bars[k]) / t_final_grid,
+            t_s_norm=float(t_s_norm),
+            R_c=R_c,
+            spatial_family=spatial_family, spatial_params=spatial_params,
+            temporal_family=temporal_family, temporal_params=temporal_params,
+            dt=dt_grid, t_final=t_final_grid,
+        )
+        for k in range(len(target_indices))
+    ]
+    cond_batch = np.stack(cond_rows, axis=0).astype(np.float32)
 
     device = next(model.parameters()).device
     with torch.no_grad():
@@ -577,8 +595,8 @@ def _compute_pair_error_records(
         "global_rel_l2": global_rel.numpy(),
         "iface_rel_l2": iface_rel.numpy(),
         "jump_rel_l2": jump_rel.numpy(),
-        "amplitude": np.array([float(p["amp"]) for p in params], dtype=np.float32),
-        "frequency": np.array([float(p["freq"]) for p in params], dtype=np.float32),
+        "amplitude": np.array([_sin_amp_freq(p)[0] for p in params], dtype=np.float32),
+        "frequency": np.array([_sin_amp_freq(p)[1] for p in params], dtype=np.float32),
         "R_c": np.array([float(p["R_c"]) for p in params], dtype=np.float32),
         "true_jump_rms": true_jump_rms.numpy(),
         "pred_jump_rms": pred_jump_rms.numpy(),
@@ -825,6 +843,71 @@ def plot_trajectory_heatmap(
         fig.colorbar(pcm, ax=axes_flat.tolist(), label="Temperature", shrink=0.9)
         fig.suptitle(f"Temperature Snapshots — Simulation {sim_id}{family_str}")
         _save_figure(fig, save_path, "data", "trajectory_heatmap", layout="constrained")
+
+
+def plot_trajectory_deviation_heatmap(
+    trajectories: np.ndarray,
+    sim_id: int,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray | None = None,
+    t_window: tuple[float, float] | None = None,
+    T_right: float = 300.0,
+    save_path: str | Path | None = None,
+):
+    """Plot the *deviation* T(x, y, t) - T_right for one simulation.
+
+    Subtracting the right Dirichlet exposes the flux-induced 2D pattern, which
+    is otherwise crushed by the dominant uniform background. Uses a diverging
+    colormap so heating (>0) and cooling (<0) regions are visually distinct.
+    """
+    Nt = trajectories.shape[1]
+    if t_window is not None:
+        snap_main = _snap_indices_in_window(t_grid, t_window[0], t_window[1], 5)
+        post = np.array([Nt - 1], dtype=int)
+        snap_indices = np.unique(np.concatenate([snap_main, post]))
+    else:
+        snap_indices = np.linspace(0, Nt - 1, 6, dtype=int)
+    snapshots = trajectories[sim_id, snap_indices].astype(np.float32) - float(T_right)
+    interface_meta = _resolve_interface_metadata()
+
+    # Symmetric range so 0 (no deviation) sits at the colormap midpoint.
+    vmax = float(np.max(np.abs(snapshots)))
+    vmax = max(vmax, 1e-6)
+    vmin = -vmax
+
+    family_str = ""
+    if sim_params is not None:
+        family_str = f" — {_format_spatial_family(sim_params[sim_id])}"
+
+    with plt.rc_context(PLOT_STYLE):
+        nrows = 2
+        ncols = int(np.ceil(len(snap_indices) / nrows))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 4.4 * nrows),
+                                 constrained_layout=True, squeeze=False)
+        axes_flat = axes.ravel()
+        pcm = None
+        for ax, t_idx, field in zip(axes_flat, snap_indices, snapshots):
+            pcm = _plot_field_2d(
+                ax,
+                x_grid,
+                y_grid,
+                field,
+                cmap="RdBu_r",
+                vmin=vmin,
+                vmax=vmax,
+                interface_positions=interface_meta["positions"],
+            )
+            ax.set_title(f"t = {t_grid[t_idx]:.3f}")
+        for ax in axes_flat[len(snap_indices):]:
+            ax.set_axis_off()
+
+        fig.colorbar(pcm, ax=axes_flat.tolist(),
+                     label=f"T - T_right  (T_right = {T_right:.0f} K)", shrink=0.9)
+        fig.suptitle(f"Deviation from Right Dirichlet — Simulation {sim_id}{family_str}")
+        _save_figure(fig, save_path, "data", "trajectory_deviation_heatmap",
+                     layout="constrained")
 
 
 def plot_y_perturbation(
@@ -1207,9 +1290,8 @@ def plot_snapshot_pair_samples(
                 source = trajectories[sim_id, s]
                 target = trajectories[sim_id, j]
                 params = sim_params[sim_id]
-                amp = float(params["amp"])
-                freq = float(params["freq"])
                 R_c = float(params["R_c"])
+                forcing_label = _forcing_label(params)
                 vmin = float(min(np.min(source), np.min(target)))
                 vmax = float(max(np.max(source), np.max(target)))
                 ax_source = row_axes[2 * col]
@@ -1234,7 +1316,7 @@ def plot_snapshot_pair_samples(
                     interface_positions=interface_meta["positions"],
                 )
 
-                text = f"Δt={lead_time:.3f}\nA={float(amp):.0f}\nf={float(freq):.2f}\nR_c={float(R_c):.2f}"
+                text = f"Δt={lead_time:.3f}\n{forcing_label}\nR_c={float(R_c):.2f}"
                 ax_target.text(
                     0.03,
                     0.97,

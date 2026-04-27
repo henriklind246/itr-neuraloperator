@@ -25,6 +25,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "seed_comparison":           "training",
     # group: data
     "trajectory_heatmap":        "data",
+    "trajectory_deviation_heatmap": "data",
     "y_perturbation":            "data",
     "spatial_family_breakdown":  "data",
     "initial_conditions":        "data",

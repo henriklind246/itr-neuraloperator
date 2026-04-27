@@ -160,6 +160,7 @@ def main():
 
         grid_data_plots = {
             "trajectory_heatmap",
+            "trajectory_deviation_heatmap",
             "y_perturbation",
             "spatial_family_breakdown",
             "initial_conditions",
@@ -231,6 +232,17 @@ def main():
                     sim_params=sim_params,
                     t_window=(0.0, 0.20) if sim_params is not None else None,
                     save_path=data_dir / "trajectory_heatmap.png",
+                )
+
+            if _should_run("trajectory_deviation_heatmap", groups, individual):
+                print("--- trajectory_deviation_heatmap ---")
+                dataset_plots.plot_trajectory_deviation_heatmap(
+                    trajectories,
+                    sim_id=highlight_sid,
+                    x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
+                    sim_params=sim_params,
+                    t_window=(0.0, 0.20) if sim_params is not None else None,
+                    save_path=data_dir / "trajectory_deviation_heatmap.png",
                 )
 
             if _should_run("initial_conditions", groups, individual):
