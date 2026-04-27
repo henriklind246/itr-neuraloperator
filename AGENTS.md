@@ -101,6 +101,12 @@ temporal-conditioning vector, predict T(x, y, t) for any future time.
     uniformly.
 - **Time grid**: `t_final = 0.3`, `dt = 0.005`, `save_stride = 2` →
   `Nt_saved = 31`. Flux-active window for `sin` is `[t_on, t_off] = [0, 0.2]`.
+- **`dt.npy` is mandatory**: the solver `dt` is saved alongside `t_grid.npy`
+  because `t_grid[1] - t_grid[0] = solver_dt × save_stride` is the snapshot
+  cadence, not the solver dt. The cond-vec encoder uses solver dt to
+  normalize `tau` / `dt_n` against the same bounds the samplers used.
+  `data.dataset.load_solver_dt(t_grid_path)` reads it; `train.py` and
+  `eval.py` pass it through `create_dataloaders(dt=...)`.
 - **Per-sim metadata schema** (saved to `sim_params.npy`):
   ```
   {R_c, T0, temporal_family, temporal_params, spatial_family, spatial_params}
