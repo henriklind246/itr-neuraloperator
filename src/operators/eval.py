@@ -122,11 +122,13 @@ def eval_all_seeds(run_root: str):
         ).to(device)
 
         model_cfg = config['model']['parameters']
+        if model_cfg.get("in_channels", 4) != 4:
+            raise ValueError("Checkpoint uses the old 3-channel spatial input; train a fresh 4-channel s_y model.")
         fno = FNO2d(
             modes1=model_cfg["modes1"],
             modes2=model_cfg["modes2"],
             width=model_cfg["width"],
-            in_channels=model_cfg.get("in_channels", 3),
+            in_channels=model_cfg.get("in_channels", 4),
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
             cond_dim=model_cfg.get("cond_dim", COND_DIM),

@@ -6,11 +6,11 @@ import torch.nn.functional as F
 # -------- Time-conditioned 2d FNO --------
 #
 # Operator-learning task:
-# G(T(x, y, t_s), x, y, t_bar, t_s, A, f, R_c) -> T(x, y, t_j)
+# G(T(x, y, t_s), x, y, s_y, cond) -> T(x, y, t_j)
 #
 # where t_bar = t_j - t_s is the lead time, t_s is the absolute source time, and
 # T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
-# The conditioning vector (t_bar, t_s, A, f, R_c) is injected via Conditional Instance Normalization (CIN)
+# The 28D conditioning vector is injected via Conditional Instance Normalization (CIN).
 
 
 # --------- SpectralConv2d ---------
@@ -151,8 +151,8 @@ class FNO2d(nn.Module):
     Forward signature:
         model(spatial, cond) → y_pred
 
-    spatial : (B, Nx, Ny, C_spatial)   — T̃(x, y, t_s), x_norm, and y_norm
-    cond      : (B, C_cond)         — (t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm)
+    spatial : (B, Nx, Ny, C_spatial)   — T̃(x, y, t_s), x_norm, y_norm, and s_y
+    cond      : (B, C_cond)         — 28D forcing/contact conditioning vector
     y_pred    : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
     """
 
@@ -161,10 +161,10 @@ class FNO2d(nn.Module):
         modes1: int,
         modes2: int,
         width: int,
-        in_channels: int = 3, # source temp. field, x_norm, y_norm
+        in_channels: int = 4, # source temp. field, x_norm, y_norm, s_y
         out_channels: int = 1,
         n_layers: int = 4,
-        cond_dim: int = 5,
+        cond_dim: int = 28,
         cond_hidden: int = 256,
         dropout: float = 0.0,
         spectral_dropout: float = 0.0

@@ -429,7 +429,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", 3),
+        in_channels=model_cfg.get("in_channels", 4),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", COND_DIM),
