@@ -162,9 +162,17 @@ def _compute_binned_quantiles(
     y: np.ndarray,
     n_bins: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Bin x and return centers, median, q25, q75, counts for non-empty bins."""
+    """Bin x and return centers, median, q25, q75, counts for non-empty bins.
+
+    Drops (x, y) pairs where either is NaN — needed because mixed-family
+    datasets have NaN amplitude/frequency for non-sin sims.
+    """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
 
     if x.size == 0:
         empty = np.array([])
@@ -366,8 +374,13 @@ def _build_split_datasets(
     t_grid: np.ndarray,
     sim_params: np.ndarray,
     config: dict,
+    dt: float | None = None,
 ) -> dict[str, SnapshotPairDataset]:
-    """Build train/val/test snapshot-pair datasets that mirror training-time sampling."""
+    """Build train/val/test snapshot-pair datasets that mirror training-time sampling.
+
+    `dt` is the solver dt (saved alongside trajectories). Required for cond-vec
+    consistency when save_stride > 1; falls back to t_grid spacing if None.
+    """
     num_sims = trajectories.shape[0]
     data_cfg = config.get("data", {})
     training_cfg = config.get("training", {})
@@ -392,6 +405,7 @@ def _build_split_datasets(
             mu_global=mu_global,
             sigma_global=sigma_global,
             n_snapshots=n_snapshots,
+            dt=dt,
         ),
         "val": SnapshotPairDataset(
             trajectories=trajectories,
@@ -403,6 +417,7 @@ def _build_split_datasets(
             mu_global=mu_global,
             sigma_global=sigma_global,
             n_snapshots=n_snapshots,
+            dt=dt,
         ),
         "test": SnapshotPairDataset(
             trajectories=trajectories,
@@ -414,6 +429,7 @@ def _build_split_datasets(
             mu_global=mu_global,
             sigma_global=sigma_global,
             n_snapshots=test_snapshots,
+            dt=dt,
         ),
     }
 
@@ -429,6 +445,7 @@ def _prepare_prediction_case(
     s: int,
     target_indices: np.ndarray,
     config: dict | None = None,
+    dt: float | None = None,
 ) -> dict[str, np.ndarray | float]:
     """Prepare truth/prediction arrays for one source snapshot and multiple target times."""
     import torch
@@ -465,7 +482,9 @@ def _prepare_prediction_case(
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
-    dt_grid = float(t_grid[1] - t_grid[0])
+    # dt is the solver dt (saved alongside trajectories); fall back to t_grid
+    # spacing if not provided. Mismatch corrupts tau / dt_n cond slots.
+    dt_grid = float(dt) if dt is not None else float(t_grid[1] - t_grid[0])
     t_final_grid = float(t_grid[-1])
     cond_rows = [
         build_cond_vector(
@@ -674,6 +693,7 @@ def plot_prediction_vs_truth(
     n_steps: int = 40,
     config: dict | None = None,
     save_path: str | Path | None = None,
+    dt: float | None = None,
 ):
     """Plot full 2D truth, prediction, residual, and jump profile diagnostics."""
     config = _resolve_plot_config(config)
@@ -694,6 +714,7 @@ def plot_prediction_vs_truth(
         s,
         target_indices,
         config=config,
+        dt=dt,
     )
     t_targets = case["t_targets"]
     Y_pred = case["Y_pred"]
@@ -1083,12 +1104,23 @@ def plot_lhs_scatter(
     sim_params: np.ndarray,
     save_path: str | Path | None = None,
 ):
-    """Coverage summary for sampled conditioning parameters."""
+    """Coverage summary for sampled conditioning parameters.
+
+    Amplitude / frequency are NaN for non-sin sims; nan-aware ops keep the sin
+    marginals visible while ignoring NaN entries (matplotlib drops them too).
+    """
     amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
+
+    def _normalize(values: np.ndarray, log: bool = False) -> np.ndarray:
+        v = np.log10(values) if log else values
+        lo = np.nanmin(v)
+        hi = np.nanmax(v)
+        return (v - lo) / max(hi - lo, 1e-12)
+
     normalized_marginals = [
-        ("A", (amplitudes - amplitudes.min()) / max(amplitudes.max() - amplitudes.min(), 1e-12), "C0"),
-        ("log10(f)", (np.log10(frequencies) - np.log10(frequencies).min()) / max(np.ptp(np.log10(frequencies)), 1e-12), "C3"),
-        ("R_c", (contact_resistance - contact_resistance.min()) / max(contact_resistance.max() - contact_resistance.min(), 1e-12), "C2"),
+        ("A",        _normalize(amplitudes),                "C0"),
+        ("log10(f)", _normalize(frequencies, log=True),     "C3"),
+        ("R_c",      _normalize(contact_resistance),        "C2"),
     ]
 
     with plt.rc_context(PLOT_STYLE):
@@ -1347,6 +1379,7 @@ def plot_interface_error(
     seed: int = 42,
     config: dict | None = None,
     save_path: str | Path | None = None,
+    dt: float | None = None,
 ):
     """Diagnose interface-jump prediction accuracy over y and target time."""
     config = _resolve_plot_config(config)
@@ -1372,6 +1405,7 @@ def plot_interface_error(
             s,
             target_indices,
             config=config,
+            dt=dt,
         )
         cases.append(case)
 

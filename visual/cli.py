@@ -181,10 +181,13 @@ def main():
         plot_config = None
         split_datasets = None
 
+        solver_dt = None
         if needs_grid_data:
             if args.data and args.x_grid and args.y_grid and args.t_grid:
                 print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.y_grid}, {args.t_grid} ...")
                 trajectories, x_grid, y_grid, t_grid = dataset_plots._load_plot_data(args.data, args.x_grid, args.y_grid, args.t_grid)
+                from data.dataset import load_solver_dt
+                solver_dt = load_solver_dt(args.t_grid)
             else:
                 for name in grid_data_plots:
                     if _should_run(name, groups, individual):
@@ -212,7 +215,10 @@ def main():
 
         if trajectories is not None and sim_params is not None:
             plot_config = dataset_plots._resolve_plot_config(checkpoint_conf)
-            split_datasets = dataset_plots._build_split_datasets(trajectories, x_grid, y_grid, t_grid, sim_params, plot_config)
+            split_datasets = dataset_plots._build_split_datasets(
+                trajectories, x_grid, y_grid, t_grid, sim_params, plot_config,
+                dt=solver_dt,
+            )
 
         if sim_params is not None and _should_run("lhs_scatter", groups, individual):
             print("--- lhs_scatter ---")
@@ -325,6 +331,7 @@ def main():
                             n_steps=n_steps,
                             config=plot_config,
                             save_path=data_dir / "prediction_vs_truth.png",
+                            dt=solver_dt,
                         )
 
                     if _should_run("interface_error", groups, individual):
@@ -338,6 +345,7 @@ def main():
                             sim_params,
                             test_dataset.sim_ids,
                             config=plot_config,
+                            dt=solver_dt,
                             save_path=data_dir / "interface_error.png",
                         )
 
