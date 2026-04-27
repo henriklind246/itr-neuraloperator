@@ -21,7 +21,7 @@ from data.dataset import (
     load_sim_data,
     split_sim_ids,
 )
-from src.physics.boundary_forcing import build_qL
+from src.physics.boundary_forcing import SPATIAL_BUILDERS, build_qL
 
 
 def _sin_amp_freq(params: dict) -> tuple[float, float]:
@@ -347,12 +347,14 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
     model_cfg = conf.get("model", {}).get("parameters", {})
     if "modes1" not in model_cfg or "modes2" not in model_cfg:
         raise ValueError("Checkpoint is not a 2D FNO checkpoint: missing modes1/modes2")
+    if model_cfg.get("in_channels", 4) != 4:
+        raise ValueError("Checkpoint uses the old 3-channel spatial input; train a fresh 4-channel s_y model.")
 
     model = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg.get("width", 64),
-        in_channels=model_cfg.get("in_channels", 3),
+        in_channels=model_cfg.get("in_channels", 4),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", COND_DIM),
@@ -477,7 +479,9 @@ def _prepare_prediction_case(
     temporal_family = params["temporal_family"]
     temporal_params = params["temporal_params"]
 
-    x_spatial_single = np.stack([T_source_norm, X_norm, Y_norm], axis=-1)
+    s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
+    S_y = np.broadcast_to(np.asarray(s_vec, dtype=np.float32)[None, :], T_source.shape)
+    x_spatial_single = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1)
     x_spatial_batch = np.repeat(x_spatial_single[None, :, :, :], len(target_indices), axis=0)
 
     t_bars = t_grid[target_indices] - t_grid[s]

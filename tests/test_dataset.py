@@ -11,6 +11,7 @@ from data.dataset import (
     create_dataloaders,
 )
 from src.physics.boundary_forcing import (
+    SPATIAL_BUILDERS,
     TEMPORAL_FAMILY_ORDER,
     NP_MAX,
     PULSE_SLOTS,
@@ -213,7 +214,7 @@ class TestSnapshotPairDataset:
     def test_getitem_shapes(self, dataset_subsampled):
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx, Ny = 11, 11
-        assert x_spatial.shape == (Nx, Ny, 3)
+        assert x_spatial.shape == (Nx, Ny, 4)
         assert cond.shape == (COND_DIM,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
@@ -248,6 +249,27 @@ class TestSnapshotPairDataset:
         y_channel = x_spatial[:, :, 2]
         assert y_channel[:, 0].abs().max().item() < 1e-6
         assert (y_channel[:, -1] - 1.0).abs().max().item() < 1e-6
+
+    def test_sy_channel_matches_spatial_builder(self, dataset_subsampled):
+        x_spatial, _, _, _ = dataset_subsampled[0]
+        sim_id, _, _ = dataset_subsampled._pairs[0]
+        params = dataset_subsampled.sim_params[sim_id]
+        expected_vec = SPATIAL_BUILDERS[params["spatial_family"]](
+            dataset_subsampled.y_grid, **params["spatial_params"]
+        )
+        expected = torch.from_numpy(
+            np.broadcast_to(
+                np.asarray(expected_vec, dtype=np.float32)[None, :],
+                (dataset_subsampled.Nx, dataset_subsampled.Ny),
+            ).copy()
+        )
+        assert torch.allclose(x_spatial[:, :, 3], expected)
+
+    def test_sy_channel_constant_along_x(self, dataset_subsampled):
+        x_spatial, _, _, _ = dataset_subsampled[0]
+        sy_channel = x_spatial[:, :, 3]
+        assert torch.allclose(sy_channel[0, :], sy_channel[-1, :])
+        assert torch.allclose(sy_channel.std(dim=0), torch.zeros(sy_channel.shape[1]), atol=1e-6)
 
     def test_t_bar_positive(self, dataset_subsampled):
         """Lead time t_bar should always be > 0 (target after source)."""
@@ -373,7 +395,7 @@ class TestCreateDataloaders:
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 11   # Ny
-        assert x_spatial.shape[3] == 3    # T_source + x_norm + y_norm
+        assert x_spatial.shape[3] == 4    # T_source + x_norm + y_norm + s_y
         assert cond.shape[1] == COND_DIM
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_global, sigma_global
@@ -440,6 +462,8 @@ class TestCreateDataloaders:
         assert torch.equal(x1[:, :, 1], x2[:, :, 1])
         # y_norm channel should be identical too
         assert torch.equal(x1[:, :, 2], x2[:, :, 2])
+        # s_y channel should be identical too
+        assert torch.equal(x1[:, :, 3], x2[:, :, 3])
 
 
 # ===================== Solver -> Dataset integration =====================
@@ -524,7 +548,7 @@ class TestSolverDatasetIntegration:
         assert len(ds) == num_sims * (5 * 4 // 2)
 
         spatial, cond, Y, T_stats = ds[0]
-        assert spatial.shape == (Nx, Ny, 3)
+        assert spatial.shape == (Nx, Ny, 4)
         assert cond.shape == (COND_DIM,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
@@ -586,6 +610,28 @@ class TestCondVectorLayout:
         )
 
     # ---- spatial onehot + spatial-param slot tests ----
+
+    @pytest.mark.parametrize(
+        ("spatial_family", "spatial_params"),
+        [
+            ("uniform", {}),
+            ("patch", {"y_c": 0.5, "w": 0.4}),
+            ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
+            ("triangle", {"y_c": 0.5, "ell": 0.2}),
+        ],
+    )
+    def test_spatial_profile_channel_matches_family(self, synthetic_trajectories,
+                                                    spatial_family, spatial_params):
+        ds = self._make_dataset(spatial_family, spatial_params, "sin", synthetic_trajectories)
+        spatial, _, _, _ = ds[0]
+        expected_vec = SPATIAL_BUILDERS[spatial_family](ds.y_grid, **spatial_params)
+        expected = torch.from_numpy(
+            np.broadcast_to(
+                np.asarray(expected_vec, dtype=np.float32)[None, :],
+                (ds.Nx, ds.Ny),
+            ).copy()
+        )
+        assert torch.allclose(spatial[:, :, 3], expected)
 
     def test_uniform_onehot_and_zero_spatial_params(self, synthetic_trajectories):
         ds = self._make_dataset("uniform", {}, "sin", synthetic_trajectories)
