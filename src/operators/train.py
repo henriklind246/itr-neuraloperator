@@ -7,7 +7,14 @@ import numpy as np
 import torch
 from torch.optim import Adam, AdamW
 
-from data.dataset import COND_DIM, compute_global_stats, create_dataloaders, load_sim_data, split_sim_ids
+from data.dataset import (
+    COND_DIM,
+    compute_global_stats,
+    create_dataloaders,
+    load_sim_data,
+    load_solver_dt,
+    split_sim_ids,
+)
 from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
@@ -396,6 +403,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         t_grid_path=config["data"]["t_grid_path"],
     )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
+    solver_dt = load_solver_dt(config["data"]["t_grid_path"])
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
     mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
@@ -410,6 +418,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         n_snapshots=config["training"].get("n_snapshots", 15),
         n_snapshots_test=config["training"].get("n_snapshots_test", None),
         noise_std=config["training"].get("noise_std", 0.0),
+        dt=solver_dt,
     )
 
     device = resolve_device(config["training"].get("device", "auto"))

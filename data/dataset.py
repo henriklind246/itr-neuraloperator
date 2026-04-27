@@ -260,6 +260,20 @@ def load_sim_data(
     return trajectories, x_grid, y_grid, t_grid
 
 
+def load_solver_dt(t_grid_path: str | Path) -> float | None:
+    """Return the solver dt saved alongside the trajectories, or None if absent.
+
+    Looks for `dt.npy` in the same directory as `t_grid_path`. Needed because
+    `t_grid[1] - t_grid[0]` is the saved snapshot cadence (= solver dt × save_stride),
+    not the solver dt that the boundary-forcing samplers used to set tau / dt_n
+    bounds. Mismatched dt produces cond-vec slots outside [0, 1].
+    """
+    dt_path = Path(t_grid_path).parent / "dt.npy"
+    if not dt_path.exists():
+        return None
+    return float(np.load(dt_path))
+
+
 # ------- SLICE ALL SIMS INTO TRAIN/VAL/TEST SPLITS -------
 
 def split_sim_ids(

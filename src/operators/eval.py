@@ -1,5 +1,13 @@
 import torch
-from data.dataset import COND_DIM, compute_global_stats, load_sim_data, split_sim_ids, create_dataloaders, T_EPS
+from data.dataset import (
+    COND_DIM,
+    T_EPS,
+    compute_global_stats,
+    create_dataloaders,
+    load_sim_data,
+    load_solver_dt,
+    split_sim_ids,
+)
 from src.operators.fno2d import FNO2d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
@@ -22,6 +30,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         t_grid_path=config["data"]["t_grid_path"],
     )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
+    solver_dt = load_solver_dt(config["data"]["t_grid_path"])
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
@@ -37,7 +46,8 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         mu_global=mu_global,
         sigma_global=sigma_global,
         n_snapshots=10,
-        n_snapshots_test=40
+        n_snapshots_test=40,
+        dt=solver_dt,
     )
 
     return testing_set, x_grid, y_grid
