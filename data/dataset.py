@@ -9,26 +9,67 @@ from src.physics.boundary_forcing import (
     PATCH_W_RANGE,
     GAUSS_SIGMA_RANGE,
     TRIANGLE_ELL_RANGE,
+    TEMPORAL_FAMILIES,
+    TEMPORAL_FAMILY_ORDER,
+    PULSE_SLOTS,
+    encode_temporal_params,
 )
 
-# --------- NORMALIZATION CONSTANTS ---------
-
 RC_RANGE = (0.05, 1.0)
-AMP_RANGE = (50.0, 300.0)
-FREQ_RANGE = (1.0, 20.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
 
-# Conditioning-vector layout (13 dims):
-#   [0:5]  base physics: t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm
-#   [5:9]  one-hot spatial family: uniform, patch, gaussian, triangle
-#   [9:13] spatial params: y_c_norm, w_norm, sigma_y_norm, ell_norm (zero-padded)
+# Conditioning-vector layout (28 dims):
+#   [0:3]    base:           t_bar_norm, t_s_norm, R_c_norm
+#   [3:7]    spatial onehot: uniform, patch, gaussian, triangle
+#   [7:11]   spatial params: y_c_norm, w_norm, sigma_y_norm, ell_norm
+#   [11:15]  temporal onehot: sin, exp, pulse_train, exp_train
+#   [15:28]  temporal params (1 + PULSE_SLOTS*3 = 13 dims), family-meaning
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
-COND_DIM = 13
+
+_BASE_DIM            = 3
+_SPATIAL_ONEHOT_DIM  = len(SPATIAL_FAMILY_ORDER)
+_SPATIAL_PARAM_DIM   = 4
+_TEMPORAL_ONEHOT_DIM = len(TEMPORAL_FAMILY_ORDER)
+_TEMPORAL_PARAM_DIM  = 1 + PULSE_SLOTS * 3
+COND_DIM = (_BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
+            + _TEMPORAL_ONEHOT_DIM + _TEMPORAL_PARAM_DIM)
 
 # log-uniform sigma_y is min-max normalized in log-space so coverage matches
 # the sampler's log-uniform distribution.
 _LOG_SIGMA_LO = float(np.log(GAUSS_SIGMA_RANGE[0]))
 _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
+
+
+def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
+                      spatial_family: str, spatial_params: dict,
+                      temporal_family: str, temporal_params: dict,
+                      dt: float, t_final: float) -> np.ndarray:
+    """Assemble the 28-dim conditioning vector. Used by both the dataset and
+    the inference plotting paths so they cannot drift apart."""
+    R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
+    base = np.array([t_bar_norm, t_s_norm, R_c_norm], dtype=np.float32)
+
+    spatial_oh = np.zeros(_SPATIAL_ONEHOT_DIM, dtype=np.float32)
+    spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
+    y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
+    if spatial_family == "patch":
+        y_c_norm = float(spatial_params["y_c"])
+        w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
+    elif spatial_family == "gaussian":
+        y_c_norm = float(spatial_params["y_c"])
+        sigma_y_norm = (np.log(spatial_params["sigma_y"]) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
+    elif spatial_family == "triangle":
+        y_c_norm = float(spatial_params["y_c"])
+        ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
+    spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
+
+    temporal_oh = np.zeros(_TEMPORAL_ONEHOT_DIM, dtype=np.float32)
+    temporal_oh[TEMPORAL_FAMILY_ORDER.index(temporal_family)] = 1.0
+    temporal_p = encode_temporal_params(
+        temporal_family, temporal_params, dt, t_final
+    ).astype(np.float32)
+
+    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh, temporal_p]).astype(np.float32)
 
 # --------- SNAPSHOT PAIR DATASET ---------
 
@@ -49,9 +90,7 @@ class SnapshotPairDataset(Dataset):
 
     Returns 4-tuple: (spatial, cond, Y, T_stats)
         spatial : (Nx, Ny, 3)  — [T̃_source, x_norm, y_norm]
-        cond      : (13,)    — [t̄_norm, t_s_norm, A_norm, f_norm, R_c_norm,
-                                onehot_uniform, onehot_patch, onehot_gauss, onehot_triangle,
-                                y_c_norm, w_norm, sigma_y_norm, ell_norm]
+        cond      : (28,)    — see COND_DIM layout above
         Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
         T_stats   : (2,)     — [μ_global, σ_global] for denormalization
     """
@@ -68,6 +107,8 @@ class SnapshotPairDataset(Dataset):
         sigma_global: float,
         n_snapshots: int | None = None,
         noise_std: float = 0.0,
+        dt: float | None = None,
+        t_final: float | None = None,
     ):
         self.trajectories = trajectories  # (num_sims, Nt, Nx, Ny)
         self.sim_params = sim_params
@@ -80,6 +121,12 @@ class SnapshotPairDataset(Dataset):
         self.noise_std = noise_std
 
         self.num_sims, self.Nt, self.Nx, self.Ny = trajectories.shape
+
+        # dt and t_final are needed by encode_temporal_params for log-space
+        # normalization of tau / dt_n. Defaults derived from t_grid match the
+        # generation pipeline whenever the saved t_grid is uniform.
+        self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
+        self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
 
         # Normalized spatial coordinates (fixed for all samples)
         self.x_norm = (
@@ -136,57 +183,32 @@ class SnapshotPairDataset(Dataset):
     def __getitem__(self, idx):
         sim_id, s, j = self._pairs[idx]
 
-        # Unpack sim params (dict schema)
         params = self.sim_params[sim_id]
-        amp = np.float32(params["amp"])
-        freq = np.float32(params["freq"])
         R_c = np.float32(params["R_c"])
         spatial_family = params["spatial_family"]
         spatial_params = params["spatial_params"]
+        temporal_family = params["temporal_family"]
+        temporal_params = params["temporal_params"]
 
-        # Source and target snapshots
         T_source = self.trajectories[sim_id, s, :, :]  # (Nx, Ny)
         T_target = self.trajectories[sim_id, j, :, :]  # (Nx, Ny)
 
-        # Global temperature normalization (training-set statistics)
         T_source_norm = (T_source - self.mu_global) / (self.sigma_global + T_EPS)
         T_target_norm = (T_target - self.mu_global) / (self.sigma_global + T_EPS)
 
-        # Input noise augmentation (training only, controlled by noise_std)
         if self.noise_std > 0:
             T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
 
-        # Spatial input: (Nx, Ny, 3) — [T̃_source, x_norm, y_norm]
         spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm], axis=-1).astype(np.float32)
 
-        # Conditioning vector (13,)
-        t_bar = self.t_grid[j] - self.t_grid[s]
-        t_bar_norm = t_bar / self.t_grid[-1]
+        t_bar_norm = (self.t_grid[j] - self.t_grid[s]) / self.t_grid[-1]
         t_s_norm = self.t_grid[s] / self.t_grid[-1]
-        A_norm = (amp - AMP_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0])
-        f_norm = (freq - FREQ_RANGE[0]) / (FREQ_RANGE[1] - FREQ_RANGE[0])
-        R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-
-        # One-hot spatial family + zero-padded normalized parameters.
-        onehot = np.zeros(len(SPATIAL_FAMILY_ORDER), dtype=np.float32)
-        onehot[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
-
-        y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
-        if spatial_family == "patch":
-            y_c_norm = float(spatial_params["y_c"])
-            w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
-        elif spatial_family == "gaussian":
-            y_c_norm = float(spatial_params["y_c"])
-            sigma_y_norm = (np.log(spatial_params["sigma_y"]) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
-        elif spatial_family == "triangle":
-            y_c_norm = float(spatial_params["y_c"])
-            ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
-
-        cond = np.concatenate([
-            np.array([t_bar_norm, t_s_norm, A_norm, f_norm, R_c_norm], dtype=np.float32),
-            onehot,
-            np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32),
-        ]).astype(np.float32)
+        cond = build_cond_vector(
+            t_bar_norm=float(t_bar_norm), t_s_norm=float(t_s_norm), R_c=float(R_c),
+            spatial_family=spatial_family, spatial_params=spatial_params,
+            temporal_family=temporal_family, temporal_params=temporal_params,
+            dt=self.dt, t_final=self.t_final,
+        )
 
         # Target: (Nx, Ny, 1)
         Y = T_target_norm[:, :, None].astype(np.float32)
@@ -296,6 +318,8 @@ def create_dataloaders(
     n_snapshots_test: int | None = None,
     noise_std: float = 0.0,
     num_workers: int | None = None,
+    dt: float | None = None,
+    t_final: float | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
 
     n_test = n_snapshots_test if n_snapshots_test is not None else n_snapshots
@@ -311,6 +335,8 @@ def create_dataloaders(
         sigma_global=sigma_global,
         n_snapshots=n_snapshots,
         noise_std=noise_std,
+        dt=dt,
+        t_final=t_final,
     )
 
     val_dataset = SnapshotPairDataset(
@@ -323,6 +349,8 @@ def create_dataloaders(
         mu_global=mu_global,
         sigma_global=sigma_global,
         n_snapshots=n_snapshots,
+        dt=dt,
+        t_final=t_final,
     )
 
     test_dataset = SnapshotPairDataset(
@@ -335,6 +363,8 @@ def create_dataloaders(
         mu_global=mu_global,
         sigma_global=sigma_global,
         n_snapshots=n_test,
+        dt=dt,
+        t_final=t_final,
     )
 
     pin = torch.cuda.is_available()
@@ -373,6 +403,6 @@ if __name__ == '__main__':
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
     print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 3)
-    print(f"cond: {cond.shape}")            # (B, 13)
+    print(f"cond: {cond.shape}")            # (B, 28)
     print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
