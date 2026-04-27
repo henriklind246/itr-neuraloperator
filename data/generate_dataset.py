@@ -4,6 +4,7 @@ from src.physics.boundary_forcing import (
     SPATIAL_FAMILIES,
     TEMPORAL_FAMILIES,
     SPATIAL_SAMPLERS,
+    TEMPORAL_SAMPLERS,
     sample_spatial_family,
     sample_temporal_family,
     build_qL,
@@ -34,74 +35,54 @@ def random_ic(a: float, b: float, c: float, d: float,
 
 
 def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
-
-    # -------- DEFINE PARAM. RANGES ------
-    param_ranges = {
-        "amplitude": (50.0, 300.0),
-        "frequency": (1.0, 20.0),
-        "R_c":       (0.05, 1.0),
-    }
-
-    # Parameters sampled log-uniformly instead of uniformly.
-    # Frequency: penetration depth delta ~ 1/sqrt(f), so log-uniform gives
-    # more uniform coverage of the physics space (deep vs shallow penetration).
-    log_uniform_params = {"frequency"}
-
-    # create list of parameter names to help calculate sample dim. and lower & upper bounds
+    # R_c is the only material parameter sampled here; forcing-family params
+    # are drawn per-sim by the boundary-forcing samplers (see TEMPORAL_SAMPLERS).
+    param_ranges = {"R_c": (0.05, 1.0)}
     param_names = list(param_ranges.keys())
     sample_dim = len(param_names)
     lower_bounds = np.array([param_ranges[name][0] for name in param_names], dtype=np.float32)
     upper_bounds = np.array([param_ranges[name][1] for name in param_names], dtype=np.float32)
 
-    # ------- GENERATE LHS SAMPLES -------
     sampler = qmc.LatinHypercube(d=sample_dim, seed=seed)
     samples_unit = sampler.random(n=num_sims)
-
-    # uniform scaling for all parameters first
     samples_scaled = qmc.scale(samples_unit, lower_bounds, upper_bounds).astype(np.float32)
-
-    # override log-uniform parameters: x = lo * (hi/lo)^u, u in [0, 1]
-    for idx, name in enumerate(param_names):
-        if name in log_uniform_params:
-            lo, hi = lower_bounds[idx], upper_bounds[idx]
-            samples_scaled[:, idx] = lo * (hi / lo) ** samples_unit[:, idx]
-
     return samples_scaled
 
 
 def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: np.ndarray,
-                     num_sims: int, rng, rng_profile, lhs_seed: int = 0,
+                     num_sims: int, rng, rng_profile,
+                     dt: float, t_final: float, lhs_seed: int = 0,
                      t_on: float = 0.0, t_off: float = 0.2, phase: float = 0.0,
-                     tukey_alpha: float = 0.5) -> list:
+                     tukey_alpha: float = 0.5,
+                     T_right: float = 300.0) -> list:
 
     samples_scaled = generate_lhs_samples(num_sims=num_sims, seed=lhs_seed)
+    R_c_values = samples_scaled[:, 0]
 
-    amplitudes  = samples_scaled[:, 0]
-    frequencies = samples_scaled[:, 1]
-    R_c_values  = samples_scaled[:, 2]
+    temporal_window = dict(t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha)
 
+    # building full list of simulation parameters
     sim_params = []
     for i in range(num_sims):
-        amp = float(amplitudes[i])
-        freq = float(frequencies[i])
         R_c = float(R_c_values[i])
-        T0 = random_ic(a, b, c, d, X, Y, rng)
+        # Offset IC by T_right so it's consistent with the right Dirichlet —
+        # otherwise the (~1 K IC) → (300 K BC) discontinuity drives a 1D x-transient
+        # that dominates the dynamics and washes out the y-pattern from s(y).
+        T0 = (random_ic(a, b, c, d, X, Y, rng) + T_right).astype(np.float32)
 
-        # Sample temporal family (currently only "sin", but kept for future-proofing)
+        # choose temporal forcing family randomly per simulation
         temporal_family = sample_temporal_family(rng_profile)
-        temporal_params = {
-            "A": amp, "f": freq,
-            "t_on": t_on, "t_off": t_off,
-            "phase": phase, "tukey_alpha": tukey_alpha,
-        }
 
-        # Sample spatial family + its parameters
+        # randomly sample the temporal forcing functions parameters
+        temporal_params = TEMPORAL_SAMPLERS[temporal_family](rng_profile, dt=dt, t_final=t_final, **temporal_window)
+
+        # randomly choose a spatial profile function
         spatial_family = sample_spatial_family(rng_profile)
+
+        # randomly sample the spatial profile functions parameters
         spatial_params = SPATIAL_SAMPLERS[spatial_family](rng_profile)
 
         sim_params.append({
-            "amp": amp,
-            "freq": freq,
             "R_c": R_c,
             "T0": T0,
             "temporal_family": temporal_family,
@@ -143,12 +124,14 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
 
     sim_params = build_sim_params(
         a=a, b=b, c=c, d=d, X=X, Y=Y,
-        num_sims=num_sims, rng=rng, rng_profile=rng_profile, lhs_seed=0,
+        num_sims=num_sims, rng=rng, rng_profile=rng_profile,
+        dt=dt, t_final=t_final, lhs_seed=0,
         t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
     )
 
     trajectories = np.zeros((num_sims, Nt_saved, Nx, Ny), dtype=np.float32)
 
+    # generate all simulations with varying parameters from simulation parameters
     for i, params in enumerate(sim_params):
         q_left_fn, _ = build_qL(
             temporal_family=params["temporal_family"],
@@ -162,7 +145,7 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
             a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
             lam_target=0.8, layers=layers,
             t_final=t_final,
-            flux_f=params["freq"], flux_A=params["amp"],
+            flux_f=0.0, flux_A=0.0,
             t_on=t_on, t_off=t_off, phase=phase,
             dt=dt, tukey_alpha=tukey_alpha,
             interface_R=[params["R_c"]],
