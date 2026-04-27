@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.physics.boundary_forcing import (
     SPATIAL_FAMILIES,
+    SPATIAL_BUILDERS,
     PATCH_W_RANGE,
     GAUSS_SIGMA_RANGE,
     TRIANGLE_ELL_RANGE,
@@ -89,7 +90,7 @@ class SnapshotPairDataset(Dataset):
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
     Returns 4-tuple: (spatial, cond, Y, T_stats)
-        spatial : (Nx, Ny, 3)  — [T̃_source, x_norm, y_norm]
+        spatial : (Nx, Ny, 4)  — [T̃_source, x_norm, y_norm, s_y]
         cond      : (28,)    — see COND_DIM layout above
         Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
         T_stats   : (2,)     — [μ_global, σ_global] for denormalization
@@ -140,6 +141,7 @@ class SnapshotPairDataset(Dataset):
         # Broadcast to (Nx, Ny) so they can be stacked with T_source at sample time
         self.X_norm = np.broadcast_to(self.x_norm[:, None], (self.Nx, self.Ny)).astype(np.float32)
         self.Y_norm = np.broadcast_to(self.y_norm[None, :], (self.Nx, self.Ny)).astype(np.float32)
+        self.s_y_profiles = self._build_spatial_profiles()
 
         # Determine which time indices to use
         if n_snapshots is not None and n_snapshots < self.Nt:
@@ -166,6 +168,16 @@ class SnapshotPairDataset(Dataset):
         pairs.sort(key=lambda p: p[3])
         self._pairs = [(p[0], p[1], p[2]) for p in pairs]
         self._lead_times = np.array([p[3] for p in pairs], dtype=np.float32)
+
+    def _build_spatial_profiles(self) -> dict[int, np.ndarray]:
+        profiles = {}
+        for sim_id in self.sim_ids:
+            params = self.sim_params[int(sim_id)]
+            s_vec = SPATIAL_BUILDERS[params["spatial_family"]](
+                self.y_grid, **params["spatial_params"]
+            )
+            profiles[int(sim_id)] = np.asarray(s_vec, dtype=np.float32)
+        return profiles
 
     def set_curriculum_fraction(self, frac: float):
         """Expose only pairs with lead time <= frac * max_lead_time.
@@ -199,7 +211,8 @@ class SnapshotPairDataset(Dataset):
         if self.noise_std > 0:
             T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
 
-        spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm], axis=-1).astype(np.float32)
+        S_y = np.broadcast_to(self.s_y_profiles[sim_id][None, :], (self.Nx, self.Ny))
+        spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1).astype(np.float32)
 
         t_bar_norm = (self.t_grid[j] - self.t_grid[s]) / self.t_grid[-1]
         t_s_norm = self.t_grid[s] / self.t_grid[-1]
@@ -416,7 +429,7 @@ if __name__ == '__main__':
 
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
-    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 3)
+    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 4)
     print(f"cond: {cond.shape}")            # (B, 28)
     print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
