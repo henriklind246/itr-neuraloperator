@@ -65,10 +65,10 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     sim_params = []
     for i in range(num_sims):
         R_c = float(R_c_values[i])
-        # Offset IC by T_right so it's consistent with the right Dirichlet —
-        # otherwise the (~1 K IC) → (300 K BC) discontinuity drives a 1D x-transient
-        # that dominates the dynamics and washes out the y-pattern from s(y).
+        # Offset IC by T_right and pin the Dirichlet edge to avoid a spurious
+        # initial boundary discontinuity that can dominate the early transient.
         T0 = (random_ic(a, b, c, d, X, Y, rng) + T_right).astype(np.float32)
+        T0[-1, :] = np.float32(T_right)
 
         # choose temporal forcing family randomly per simulation
         temporal_family = sample_temporal_family(rng_profile)

@@ -142,6 +142,19 @@ class TestBuildSimParams:
             assert T0.shape == (Nx, Ny)
             assert np.issubdtype(T0.dtype, np.floating)
 
+    def test_T0_right_boundary_matches_dirichlet(self):
+        Nx, Ny = 13, 9
+        T_right = 312.5
+        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, Nx, Ny)
+        rng = np.random.default_rng(0)
+        rng_profile = np.random.default_rng(1)
+        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=4,
+                                  rng=rng, rng_profile=rng_profile,
+                                  dt=DT, t_final=T_FINAL, lhs_seed=0,
+                                  T_right=T_right)
+        for entry in params:
+            np.testing.assert_allclose(entry["T0"][-1, :], T_right)
+
     def test_deterministic_same_rng_and_lhs_seed(self):
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 11, 11)
         p1 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=5,
