@@ -715,7 +715,7 @@ if __name__ == '__main__':
         flux_A=50.0,
         t_on=0.0,
         t_off=0.2,
-        t_final=0.5,
+        t_final=0.3,
         phase=0.0
     )
 
