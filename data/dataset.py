@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import torch
@@ -13,7 +14,10 @@ from src.physics.boundary_forcing import (
     TEMPORAL_FAMILIES,
     TEMPORAL_FAMILY_ORDER,
     PULSE_SLOTS,
+    FORCING_BINS,
+    SIN_AMP_RANGE,
     encode_temporal_params,
+    integrate_temporal_bins,
 )
 
 RC_RANGE = (0.05, 1.0)
@@ -90,7 +94,8 @@ class SnapshotPairDataset(Dataset):
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
     Returns 4-tuple: (spatial, cond, Y, T_stats)
-        spatial : (Nx, Ny, 4)  — [T̃_source, x_norm, y_norm, s_y]
+        spatial : (Nx, Ny, 8)  — [T̃_source, x_norm, y_norm, s_y,
+                                   Q_y_bin_0, ..., Q_y_bin_3]
         cond      : (28,)    — see COND_DIM layout above
         Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
         T_stats   : (2,)     — [μ_global, σ_global] for denormalization
@@ -128,6 +133,7 @@ class SnapshotPairDataset(Dataset):
         # generation pipeline whenever the saved t_grid is uniform.
         self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
         self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
+        self.q_ref = np.float32(SIN_AMP_RANGE[1] * self.t_final / FORCING_BINS)
 
         # Normalized spatial coordinates (fixed for all samples)
         self.x_norm = (
@@ -211,11 +217,22 @@ class SnapshotPairDataset(Dataset):
         if self.noise_std > 0:
             T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
 
-        S_y = np.broadcast_to(self.s_y_profiles[sim_id][None, :], (self.Nx, self.Ny))
-        spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1).astype(np.float32)
-
         t_bar_norm = (self.t_grid[j] - self.t_grid[s]) / self.t_grid[-1]
         t_s_norm = self.t_grid[s] / self.t_grid[-1]
+        bins = integrate_temporal_bins(
+            temporal_family,
+            temporal_params,
+            float(self.t_grid[s]),
+            float(self.t_grid[j]),
+            K=FORCING_BINS,
+        ).astype(np.float32)
+
+        s_y = self.s_y_profiles[sim_id]
+        S_y = np.broadcast_to(s_y[None, :], (self.Nx, self.Ny))
+        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / self.q_ref).astype(np.float32)
+        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (self.Nx, self.Ny, FORCING_BINS))
+        spatial_base = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1)
+        spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
         cond = build_cond_vector(
             t_bar_norm=float(t_bar_norm), t_s_norm=float(t_s_norm), R_c=float(R_c),
             spatial_family=spatial_family, spatial_params=spatial_params,
@@ -235,6 +252,41 @@ class SnapshotPairDataset(Dataset):
             torch.from_numpy(Y),
             torch.from_numpy(T_stats),
         )
+
+
+def _dataset_with_pairs(dataset: SnapshotPairDataset, pairs: list[tuple[int, int, int]]) -> SnapshotPairDataset:
+    out = copy.copy(dataset)
+    out._pairs = list(pairs)
+    out._lead_times = np.array(
+        [float(out.t_grid[j] - out.t_grid[s]) for _, s, j in out._pairs],
+        dtype=np.float32,
+    )
+    out._active_len = len(out._pairs)
+    return out
+
+
+def split_pairs_within_sims(
+    dataset: SnapshotPairDataset,
+    val_pair_frac: float = 0.1,
+    seed: int = 0,
+) -> tuple[Dataset, Dataset]:
+    rng = np.random.default_rng(seed)
+    val_indices = set()
+    for sim_id in dataset.sim_ids:
+        sim_pair_indices = [i for i, pair in enumerate(dataset._pairs) if pair[0] == int(sim_id)]
+        n_val = int(round(len(sim_pair_indices) * val_pair_frac))
+        if val_pair_frac > 0.0 and len(sim_pair_indices) > 0:
+            n_val = max(1, n_val)
+        if n_val > 0:
+            chosen = rng.choice(sim_pair_indices, size=n_val, replace=False)
+            val_indices.update(int(i) for i in chosen)
+
+    train_pairs = [pair for i, pair in enumerate(dataset._pairs) if i not in val_indices]
+    val_pairs = [pair for i, pair in enumerate(dataset._pairs) if i in val_indices]
+    train_dataset = _dataset_with_pairs(dataset, train_pairs)
+    val_dataset = _dataset_with_pairs(dataset, val_pairs)
+    val_dataset.noise_std = 0.0
+    return train_dataset, val_dataset
 
 
 # --------- LOAD RAW SIM. DATA --------
@@ -429,7 +481,7 @@ if __name__ == '__main__':
 
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
-    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 4)
+    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 8)
     print(f"cond: {cond.shape}")            # (B, 28)
     print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)
