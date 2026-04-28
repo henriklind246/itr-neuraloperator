@@ -6,7 +6,7 @@ import torch.nn.functional as F
 # -------- Time-conditioned 2d FNO --------
 #
 # Operator-learning task:
-# G(T(x, y, t_s), x, y, s_y, cond) -> T(x, y, t_j)
+# G(T(x, y, t_s), x, y, s_y, Q_y_bins, cond) -> T(x, y, t_j)
 #
 # where t_bar = t_j - t_s is the lead time, t_s is the absolute source time, and
 # T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
@@ -151,7 +151,7 @@ class FNO2d(nn.Module):
     Forward signature:
         model(spatial, cond) → y_pred
 
-    spatial : (B, Nx, Ny, C_spatial)   — T̃(x, y, t_s), x_norm, y_norm, and s_y
+    spatial : (B, Nx, Ny, C_spatial)   — T̃(x, y, t_s), x_norm, y_norm, s_y, and Q_y bins
     cond      : (B, C_cond)         — 28D forcing/contact conditioning vector
     y_pred    : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
     """
@@ -161,7 +161,7 @@ class FNO2d(nn.Module):
         modes1: int,
         modes2: int,
         width: int,
-        in_channels: int = 4, # source temp. field, x_norm, y_norm, s_y
+        in_channels: int = 8,
         out_channels: int = 1,
         n_layers: int = 4,
         cond_dim: int = 28,
