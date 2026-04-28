@@ -40,6 +40,7 @@ DT_PULSE_FRAC_HI = 0.2
 NP_CHOICES = (1, 2, 3, 4)
 NP_MAX = 4
 PULSE_SLOTS = 4
+FORCING_BINS = 4
 
 # -------- SPATIAL PROFILE FUNCTIONS -----
 
@@ -106,6 +107,80 @@ TEMPORAL_BUILDERS = {
     "pulse_train": temporal_pulse_train,
     "exp_train":   temporal_exp_train,
 }
+
+
+def integrate_temporal(
+    temporal_family: str,
+    temporal_params: dict,
+    t_lo: float,
+    t_hi: float,
+) -> float:
+    """Integrate the nonnegative injected temporal forcing over [t_lo, t_hi]."""
+    if t_hi <= t_lo:
+        return 0.0
+
+    if temporal_family == "sin":
+        q = temporal_sin(**temporal_params)
+        t = np.linspace(t_lo, t_hi, 65)
+        values = np.array([q(float(tn)) for tn in t], dtype=float)
+        return float(np.trapezoid(np.maximum(values, 0.0), t))
+
+    if temporal_family == "exp":
+        A = float(temporal_params["A"])
+        t0 = float(temporal_params["t0"])
+        tau = float(temporal_params["tau"])
+        if t_hi <= t0:
+            return 0.0
+        a = max(float(t_lo), t0)
+        b = float(t_hi)
+        return float(A * tau * (np.exp(-(a - t0) / tau) - np.exp(-(b - t0) / tau)))
+
+    if temporal_family == "pulse_train":
+        total = 0.0
+        for A, t_n, dt_n in zip(
+            temporal_params["A_list"],
+            temporal_params["t_list"],
+            temporal_params["dt_list"],
+        ):
+            lo = max(float(t_lo), float(t_n))
+            hi = min(float(t_hi), float(t_n) + float(dt_n))
+            total += float(A) * max(0.0, hi - lo)
+        return float(total)
+
+    if temporal_family == "exp_train":
+        total = 0.0
+        for A, t_n, tau_n in zip(
+            temporal_params["A_list"],
+            temporal_params["t_list"],
+            temporal_params["tau_list"],
+        ):
+            t0 = float(t_n)
+            if t_hi <= t0:
+                continue
+            a = max(float(t_lo), t0)
+            b = float(t_hi)
+            tau = float(tau_n)
+            total += float(A) * tau * (np.exp(-(a - t0) / tau) - np.exp(-(b - t0) / tau))
+        return float(total)
+
+    raise ValueError(f"Unknown temporal family: {temporal_family}")
+
+
+def integrate_temporal_bins(
+    temporal_family: str,
+    temporal_params: dict,
+    t_s: float,
+    t_j: float,
+    K: int = FORCING_BINS,
+) -> np.ndarray:
+    edges = np.linspace(float(t_s), float(t_j), int(K) + 1)
+    return np.array(
+        [
+            integrate_temporal(temporal_family, temporal_params, edges[k], edges[k + 1])
+            for k in range(int(K))
+        ],
+        dtype=float,
+    )
 
 # --------- SAMPLER FUNCTIONS ----------
 
