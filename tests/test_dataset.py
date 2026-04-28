@@ -7,6 +7,7 @@ from data.dataset import (
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
+    split_pairs_within_sims,
     SnapshotPairDataset,
     create_dataloaders,
 )
@@ -24,6 +25,9 @@ from src.physics.boundary_forcing import (
     PULSE_AMP_RANGE,
     SIN_AMP_RANGE,
     SIN_FREQ_RANGE,
+    FORCING_BINS,
+    integrate_temporal,
+    integrate_temporal_bins,
 )
 
 # Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
@@ -214,7 +218,7 @@ class TestSnapshotPairDataset:
     def test_getitem_shapes(self, dataset_subsampled):
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx, Ny = 11, 11
-        assert x_spatial.shape == (Nx, Ny, 4)
+        assert x_spatial.shape == (Nx, Ny, 8)
         assert cond.shape == (COND_DIM,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
@@ -270,6 +274,34 @@ class TestSnapshotPairDataset:
         sy_channel = x_spatial[:, :, 3]
         assert torch.allclose(sy_channel[0, :], sy_channel[-1, :])
         assert torch.allclose(sy_channel.std(dim=0), torch.zeros(sy_channel.shape[1]), atol=1e-6)
+
+    def test_forcing_bin_channels_are_nonnegative(self, dataset_subsampled):
+        x_spatial, _, _, _ = dataset_subsampled[0]
+        assert torch.all(x_spatial[:, :, 4:8] >= -1e-6)
+
+    def test_forcing_bin_channels_match_temporal_integrals(self, dataset_subsampled):
+        x_spatial, _, _, _ = dataset_subsampled[0]
+        sim_id, s, j = dataset_subsampled._pairs[0]
+        params = dataset_subsampled.sim_params[sim_id]
+        bins = integrate_temporal_bins(
+            params["temporal_family"],
+            params["temporal_params"],
+            float(dataset_subsampled.t_grid[s]),
+            float(dataset_subsampled.t_grid[j]),
+            K=FORCING_BINS,
+        )
+        total = integrate_temporal(
+            params["temporal_family"],
+            params["temporal_params"],
+            float(dataset_subsampled.t_grid[s]),
+            float(dataset_subsampled.t_grid[j]),
+        )
+        expected_y = dataset_subsampled.s_y_profiles[sim_id] * total / dataset_subsampled.q_ref
+        expected = torch.from_numpy(
+            np.broadcast_to(expected_y[None, :], (dataset_subsampled.Nx, dataset_subsampled.Ny)).copy()
+        )
+        assert np.sum(bins) == pytest.approx(total, abs=1e-8)
+        assert torch.allclose(x_spatial[:, :, 4:8].sum(dim=-1), expected, atol=1e-5)
 
     def test_t_bar_positive(self, dataset_subsampled):
         """Lead time t_bar should always be > 0 (target after source)."""
@@ -365,6 +397,18 @@ class TestSnapshotPairDataset:
         )
         assert len(ds_test) > len(ds_train)
 
+    def test_split_pairs_within_sims_is_disjoint_and_complete(self, dataset_subsampled):
+        train_pairs, val_pairs = split_pairs_within_sims(dataset_subsampled, val_pair_frac=0.2, seed=123)
+
+        original = set(dataset_subsampled._pairs)
+        train_set = set(train_pairs._pairs)
+        val_set = set(val_pairs._pairs)
+        assert train_set.isdisjoint(val_set)
+        assert train_set | val_set == original
+        assert len(val_pairs) > 0
+        assert train_pairs.trajectories is dataset_subsampled.trajectories
+        assert val_pairs.trajectories is dataset_subsampled.trajectories
+
 
 # ===================== create_dataloaders =====================
 
@@ -395,7 +439,7 @@ class TestCreateDataloaders:
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 11   # Ny
-        assert x_spatial.shape[3] == 4    # T_source + x_norm + y_norm + s_y
+        assert x_spatial.shape[3] == 8    # T_source + x_norm + y_norm + s_y + Q_y bins
         assert cond.shape[1] == COND_DIM
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_global, sigma_global
@@ -548,7 +592,7 @@ class TestSolverDatasetIntegration:
         assert len(ds) == num_sims * (5 * 4 // 2)
 
         spatial, cond, Y, T_stats = ds[0]
-        assert spatial.shape == (Nx, Ny, 4)
+        assert spatial.shape == (Nx, Ny, 8)
         assert cond.shape == (COND_DIM,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)

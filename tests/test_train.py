@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from data.dataset import SnapshotPairDataset
 from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 
@@ -87,7 +88,7 @@ class TestLoadConfig:
 
 def _make_4tuple_loader(Nx=11, Ny=11, n_samples=4, batch_size=2):
     """Create a DataLoader yielding (x_spatial, cond, Y, T_stats) 4-tuples."""
-    x_spatial = torch.randn(n_samples, Nx, Ny, 4)
+    x_spatial = torch.randn(n_samples, Nx, Ny, 8)
     cond = torch.rand(n_samples, 28)
     Y = torch.randn(n_samples, Nx, Ny, 1)
     T_stats = torch.randn(n_samples, 2)
@@ -99,7 +100,7 @@ def tiny_training_setup():
     """Tiny model + synthetic 4-tuple dataloader for fast training tests."""
     Nx = 11
     Ny = 11
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=4, out_channels=1, n_layers=2, cond_dim=28)
+    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=8, out_channels=1, n_layers=2, cond_dim=28)
     loader = _make_4tuple_loader(Nx=Nx, Ny=Ny)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -201,6 +202,51 @@ class TestValidate:
         for n, p in model.named_parameters():
             assert torch.equal(params_before[n], p)
 
+    def test_writes_per_pair_validation_csv(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        dataset = SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            sim_ids=np.array([0]),
+            sim_params=synthetic_sim_params,
+            mu_global=0.0,
+            sigma_global=1.0,
+            n_snapshots=3,
+        )
+        loader = DataLoader(dataset, batch_size=2, shuffle=False)
+        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=8, out_channels=1, n_layers=2, cond_dim=28)
+        iface_mask = build_interface_mask(x_grid, y_grid)
+        csv_path = tmp_path / "val_pairs.csv"
+
+        validate(
+            model,
+            loader,
+            torch.device("cpu"),
+            iface_mask=iface_mask,
+            dataset=dataset,
+            pair_csv_path=csv_path,
+            epoch=7,
+        )
+
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        assert len(rows) == len(dataset)
+        assert set(rows[0]) == {
+            "epoch",
+            "sim_id",
+            "temporal_family",
+            "spatial_family",
+            "t_s",
+            "t_bar",
+            "R_c",
+            "rel_l2",
+            "iface_rel_l2",
+        }
+        assert {int(row["epoch"]) for row in rows} == {7}
+
 
 # ===================== RIGNO scheduler =====================
 
@@ -288,7 +334,7 @@ class TestRIGNOThreePhaseSchedule:
                 },
             }
         }
-        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=4, out_channels=1, n_layers=2, cond_dim=28)
+        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=8, out_channels=1, n_layers=2, cond_dim=28)
         optimizer = build_optimizer(config, model.parameters())
 
         scheduler = build_scheduler(config, optimizer)
@@ -315,7 +361,7 @@ class TestRIGNOThreePhaseSchedule:
                 },
             }
         }
-        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=4, out_channels=1, n_layers=2, cond_dim=28)
+        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=8, out_channels=1, n_layers=2, cond_dim=28)
         optimizer = build_optimizer(config, model.parameters())
 
         with pytest.raises(ValueError, match="scheduler.peak_lr must match training.learning_rate"):
@@ -397,7 +443,7 @@ class TestRunOneSeedResume:
                     "modes1": 2,
                     "modes2": 2,
                     "width": 8,
-                    "in_channels": 4,
+                    "in_channels": 8,
                     "out_channels": 1,
                     "n_layers": 2,
                     "cond_dim": 28,
@@ -666,7 +712,7 @@ class TestRunConfigSeeds:
                     "modes1": 2,
                     "modes2": 2,
                     "width": 8,
-                    "in_channels": 4,
+                    "in_channels": 8,
                     "out_channels": 1,
                     "n_layers": 2,
                     "cond_dim": 28,

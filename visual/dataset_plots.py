@@ -21,7 +21,13 @@ from data.dataset import (
     load_sim_data,
     split_sim_ids,
 )
-from src.physics.boundary_forcing import SPATIAL_BUILDERS, build_qL
+from src.physics.boundary_forcing import (
+    FORCING_BINS,
+    SIN_AMP_RANGE,
+    SPATIAL_BUILDERS,
+    build_qL,
+    integrate_temporal_bins,
+)
 
 
 def _sin_amp_freq(params: dict) -> tuple[float, float]:
@@ -347,14 +353,14 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
     model_cfg = conf.get("model", {}).get("parameters", {})
     if "modes1" not in model_cfg or "modes2" not in model_cfg:
         raise ValueError("Checkpoint is not a 2D FNO checkpoint: missing modes1/modes2")
-    if model_cfg.get("in_channels", 4) != 4:
-        raise ValueError("Checkpoint uses the old 3-channel spatial input; train a fresh 4-channel s_y model.")
+    if model_cfg.get("in_channels", 8) != 8:
+        raise ValueError("Checkpoint uses an incompatible spatial input; train a fresh 8-channel forcing-bin model.")
 
     model = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg.get("width", 64),
-        in_channels=model_cfg.get("in_channels", 4),
+        in_channels=model_cfg.get("in_channels", 8),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", COND_DIM),
@@ -479,10 +485,9 @@ def _prepare_prediction_case(
     temporal_family = params["temporal_family"]
     temporal_params = params["temporal_params"]
 
-    s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
+    s_vec = np.asarray(SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params), dtype=np.float32)
     S_y = np.broadcast_to(np.asarray(s_vec, dtype=np.float32)[None, :], T_source.shape)
-    x_spatial_single = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1)
-    x_spatial_batch = np.repeat(x_spatial_single[None, :, :, :], len(target_indices), axis=0)
+    x_spatial_base = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1)
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
@@ -490,6 +495,20 @@ def _prepare_prediction_case(
     # spacing if not provided. Mismatch corrupts tau / dt_n cond slots.
     dt_grid = float(dt) if dt is not None else float(t_grid[1] - t_grid[0])
     t_final_grid = float(t_grid[-1])
+    q_ref = np.float32(SIN_AMP_RANGE[1] * t_final_grid / FORCING_BINS)
+    x_spatial_batch = []
+    for target_idx in target_indices:
+        bins = integrate_temporal_bins(
+            temporal_family,
+            temporal_params,
+            float(t_grid[s]),
+            float(t_grid[target_idx]),
+            K=FORCING_BINS,
+        ).astype(np.float32)
+        Q_y_bins = (s_vec[None, :, None] * bins[None, None, :] / q_ref).astype(np.float32)
+        Q_y_bins_2d = np.broadcast_to(Q_y_bins, T_source.shape + (FORCING_BINS,))
+        x_spatial_batch.append(np.concatenate([x_spatial_base, Q_y_bins_2d], axis=-1))
+    x_spatial_batch = np.stack(x_spatial_batch, axis=0).astype(np.float32)
     cond_rows = [
         build_cond_vector(
             t_bar_norm=float(t_bars[k]) / t_final_grid,
