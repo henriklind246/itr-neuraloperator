@@ -9,6 +9,8 @@ from torch.optim import Adam, AdamW
 
 from data.dataset import (
     COND_DIM,
+    T_EPS,
+    SnapshotPairDataset,
     compute_global_stats,
     create_dataloaders,
     load_sim_data,
@@ -20,6 +22,19 @@ from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, com
 from src.operators.utils import resolve_device
 
 from omegaconf import OmegaConf
+
+
+VAL_PAIR_FIELDNAMES = [
+    "epoch",
+    "sim_id",
+    "temporal_family",
+    "spatial_family",
+    "t_s",
+    "t_bar",
+    "R_c",
+    "rel_l2",
+    "iface_rel_l2",
+]
 
 
 def load_config(config_path: str | None = None) -> dict:
@@ -357,30 +372,113 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=
     return training_loss, train_rel_l2, train_iface_rel_l2
 
 
-def validate(model, val_loader, device, *, iface_mask=None) -> tuple[float, float]:
+def _per_pair_rel_l2_percent(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    rms = torch.mean((y_pred - y_true) ** 2, dim=(1, 2, 3)).sqrt()
+    denom = y_true.flatten(1).norm(dim=1).clamp_min(1e-12)
+    return rms / denom * 100.0
+
+
+def _write_val_pair_rows(
+    writer: csv.DictWriter,
+    epoch: int,
+    dataset: SnapshotPairDataset,
+    pairs: list[tuple[int, int, int]],
+    rel_l2: torch.Tensor,
+    iface_rel_l2: torch.Tensor,
+) -> None:
+    rows = []
+    for row_idx, (sim_id, s, j) in enumerate(pairs):
+        params = dataset.sim_params[int(sim_id)]
+        rows.append(
+            {
+                "epoch": int(epoch),
+                "sim_id": int(sim_id),
+                "temporal_family": params["temporal_family"],
+                "spatial_family": params["spatial_family"],
+                "t_s": float(dataset.t_grid[s]),
+                "t_bar": float(dataset.t_grid[j] - dataset.t_grid[s]),
+                "R_c": float(params["R_c"]),
+                "rel_l2": float(rel_l2[row_idx].item()),
+                "iface_rel_l2": float(iface_rel_l2[row_idx].item()),
+            }
+        )
+    writer.writerows(rows)
+
+
+def validate(
+    model,
+    val_loader,
+    device,
+    *,
+    iface_mask=None,
+    dataset: SnapshotPairDataset | None = None,
+    pair_csv_path: str | Path | None = None,
+    epoch: int | None = None,
+) -> tuple[float, float]:
     """Return (val_rel_l2, val_iface_rel_l2) after validation."""
     with torch.no_grad():
         model.eval()
         val_loss = 0.0
         val_iface = 0.0
+        pair_cursor = 0
+        write_pairs = dataset is not None and pair_csv_path is not None and epoch is not None
+        pair_file = None
+        pair_writer = None
+        if write_pairs:
+            pair_path = Path(pair_csv_path)
+            pair_path.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not pair_path.exists() or pair_path.stat().st_size == 0
+            pair_file = pair_path.open("a", newline="")
+            pair_writer = csv.DictWriter(pair_file, fieldnames=VAL_PAIR_FIELDNAMES)
+            if write_header:
+                pair_writer.writeheader()
 
-        for x_spatial, cond, y_batch, _T_stats in val_loader:
-            x_spatial = x_spatial.to(device)
-            cond = cond.to(device)
-            y_batch = y_batch.to(device)
+        try:
+            for x_spatial, cond, y_batch, T_stats in val_loader:
+                x_spatial = x_spatial.to(device)
+                cond = cond.to(device)
+                y_batch = y_batch.to(device)
 
-            y_pred = model(x_spatial, cond)
-            val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
-            val_loss += val_rel_l2.item()
-            if iface_mask is not None:
-                val_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+                y_pred = model(x_spatial, cond)
+                val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
+                val_loss += val_rel_l2.item()
+                if iface_mask is not None:
+                    val_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+
+                if write_pairs and pair_writer is not None and dataset is not None:
+                    T_stats = T_stats.to(device)
+                    mu_s = T_stats[:, 0]
+                    sigma_s = T_stats[:, 1]
+                    y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
+                    y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
+                    rel_l2 = _per_pair_rel_l2_percent(y_pred_phys, y_true_phys).cpu()
+                    if iface_mask is not None:
+                        pred_iface = y_pred_phys[:, iface_mask, :]
+                        true_iface = y_true_phys[:, iface_mask, :]
+                        iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface[:, :, None, :], true_iface[:, :, None, :]).cpu()
+                    else:
+                        iface_rel_l2 = torch.zeros_like(rel_l2)
+                    batch_size = x_spatial.shape[0]
+                    pairs = dataset._pairs[pair_cursor:pair_cursor + batch_size]
+                    _write_val_pair_rows(pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2)
+                    pair_cursor += batch_size
+        finally:
+            if pair_file is not None:
+                pair_file.close()
 
         val_loss /= len(val_loader)
         val_iface /= len(val_loader)
         return val_loss, val_iface
 
 
-def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, float | int | str]:
+def run_one_seed(
+    config: dict,
+    seed: int,
+    run_dir: str | Path,
+    *,
+    train_loader_override=None,
+    val_loader_override=None,
+) -> dict[str, float | int | str]:
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
 
@@ -396,30 +494,41 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     set_seed(seed)
 
-    trajectories, x_grid, y_grid, t_grid = load_sim_data(
-        sim_traj_path=config["data"]["trajectories.npy"],
-        x_grid_path=config["data"]["x_grid_path"],
-        y_grid_path=config["data"]["y_grid_path"],
-        t_grid_path=config["data"]["t_grid_path"],
-    )
-    sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
-    solver_dt = load_solver_dt(config["data"]["t_grid_path"])
+    if (train_loader_override is None) != (val_loader_override is None):
+        raise ValueError("train_loader_override and val_loader_override must be provided together.")
 
-    train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
-    mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+    if train_loader_override is None:
+        trajectories, x_grid, y_grid, t_grid = load_sim_data(
+            sim_traj_path=config["data"]["trajectories.npy"],
+            x_grid_path=config["data"]["x_grid_path"],
+            y_grid_path=config["data"]["y_grid_path"],
+            t_grid_path=config["data"]["t_grid_path"],
+        )
+        sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
+        solver_dt = load_solver_dt(config["data"]["t_grid_path"])
 
-    training_set, validation_set, _ = create_dataloaders(
-        trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
-        train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
-        batch_size=config["training"]["batch_size"],
-        sim_params=sim_params,
-        mu_global=mu_global,
-        sigma_global=sigma_global,
-        n_snapshots=config["training"].get("n_snapshots", 15),
-        n_snapshots_test=config["training"].get("n_snapshots_test", None),
-        noise_std=config["training"].get("noise_std", 0.0),
-        dt=solver_dt,
-    )
+        train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
+        mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+
+        training_set, validation_set, _ = create_dataloaders(
+            trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
+            train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
+            batch_size=config["training"]["batch_size"],
+            sim_params=sim_params,
+            mu_global=mu_global,
+            sigma_global=sigma_global,
+            n_snapshots=config["training"].get("n_snapshots", 15),
+            n_snapshots_test=config["training"].get("n_snapshots_test", None),
+            noise_std=config["training"].get("noise_std", 0.0),
+            dt=solver_dt,
+        )
+    else:
+        training_set = train_loader_override
+        validation_set = val_loader_override
+        x_grid = np.asarray(training_set.dataset.x_grid)
+        y_grid = np.asarray(training_set.dataset.y_grid)
+        mu_global = float(training_set.dataset.mu_global)
+        sigma_global = float(training_set.dataset.sigma_global)
 
     device = resolve_device(config["training"].get("device", "auto"))
     print(f"Training on: {device}")
@@ -429,7 +538,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", 4),
+        in_channels=model_cfg.get("in_channels", 8),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", COND_DIM),
@@ -483,6 +592,7 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
 
     # --- CSV: truncate to start_epoch when resuming, overwrite when fresh ---
     csv_path = run_path / "train_metrics.csv"
+    val_pairs_path = run_path / "val_pairs.csv"
     fieldnames = ["epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2", "val_rel_l2", "val_iface_rel_l2", "lr", "is_best"]
 
     if resuming and csv_path.exists():
@@ -498,6 +608,17 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         csv_file = csv_path.open("w", newline="")
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
+
+    if resuming and val_pairs_path.exists():
+        with val_pairs_path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
+        with val_pairs_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=VAL_PAIR_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(kept_rows)
+    elif not resuming and val_pairs_path.exists():
+        val_pairs_path.unlink()
 
     grad_clip = config["training"].get("grad_clip", None)
     warmup_epochs = config["training"].get("curriculum_warmup", 0)
@@ -523,7 +644,15 @@ def run_one_seed(config: dict, seed: int, run_dir: str | Path) -> dict[str, floa
         should_stop = False
 
         if (epoch % validate_every) == 0:
-            val_loss, val_iface_rel_l2 = validate(model=fno, val_loader=validation_set, device=device, iface_mask=iface_mask)
+            val_loss, val_iface_rel_l2 = validate(
+                model=fno,
+                val_loader=validation_set,
+                device=device,
+                iface_mask=iface_mask,
+                dataset=validation_set.dataset,
+                pair_csv_path=val_pairs_path,
+                epoch=epoch,
+            )
             print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
 
             if val_loss < best_val_loss:
