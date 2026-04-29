@@ -240,15 +240,27 @@ def run_mms_2d_yflux(N: int, dt=None) -> tuple[float, float, float, float]:
 
 def run_mms_2d_interface(N: int, dt=None, x_I: float = 0.5) -> tuple[float, float, float, float]:
     """
-    2D MMS with two-layer interface and thermal resistance.
+    2D MMS with two-layer interface, thermal resistance, and y-dependent
+    left flux — exercises the production physics path end-to-end.
 
-    Base 1D solution (from mms_1d.py):
-      T_L,1D(x,t) = 300 + A_L sin(wt)[(x_I-x)^4 + D_L(x_I-x)] + C_L sin(wt)
-      T_R,1D(x,t) = 300 + A_R sin(wt)(b-x)^4
+    Manufactured solution carries a single shared y-mode cos(kappa*(y-c)):
+      T_L*(x,y,t) = 300 + cos(kappa*(y-c)) * V_L(x,t)
+      T_R*(x,y,t) = 300 + cos(kappa*(y-c)) * V_R(x,t)
+    with
+      V_L(x,t) = A_L g[(x_I-x)^4 + D_L(x_I-x)] + C_L g + B_L g (x-a)^2(x_I-x)^2
+      V_R(x,t) = A_R g (b-x)^4                        + B_R g (x-x_I)^2(b-x)^2
+      g = sin(omega t),  kappa = pi / (d - c)
 
-    2D correction (vanishes at interface with zero x-derivative):
-      T_L*(x,y,t) = T_L,1D + B_L sin(wt)(x-a)^2(x_I-x)^2 cos(kappa(y-c))
-      T_R*(x,y,t) = T_R,1D + B_R sin(wt)(x-x_I)^2(b-x)^2  cos(kappa(y-c))
+    The shared cos(kappa*(y-c)) factors out of every interface condition, so the
+    A_R / C_L relations (flux continuity, jump T_L - T_R = R_c q_I) are
+    unchanged from the y-independent case.
+
+    Boundary conditions:
+      Left:       q*(y,t) = -k1 dT_L*/dx|_{x=a}
+                          = k1 A_L cos(kappa*(y-c)) g [4(x_I-a)^3 + D_L]
+                            (B_L correction has phi_L'(a)=0, contributes nothing)
+      Right:      T_R*(b,y,t) = 300                (V_R(b,t) = 0)
+      Top/bottom: dT*/dy = 0 at y=c,d              (cos -> sin derivative = 0)
 
     The default x_I = 0.5 places the interface at a cell-face midpoint
     (requires even N). Any other x_I is an off-center interface; choose N so x_I doesn't land on a node.
@@ -273,68 +285,68 @@ def run_mms_2d_interface(N: int, dt=None, x_I: float = 0.5) -> tuple[float, floa
     B_R = 10.0   # y-correction amplitude, right
     kappa = np.pi / (d - c)
 
+    def cos_y_arr(Y):
+        return np.cos(kappa * (Y - c))
+
     # --- manufactured solution ---
     def T_star(X, Y, t):
         T = np.full_like(X, 300.0)
         g = np.sin(omega * t)
-        cos_y = np.cos(kappa * (Y - c))
-        left = X < x_I
-
-        # 1D base
-        T[left] += (A_L * g * ((x_I - X[left]) ** 4 + D_L * (x_I - X[left]))
-                     + C_L * g)
-        T[~left] += A_R * g * (b - X[~left]) ** 4
-
-        # 2D corrections
-        phi_L = (X[left] - a) ** 2 * (x_I - X[left]) ** 2
-        phi_R = (X[~left] - x_I) ** 2 * (b - X[~left]) ** 2
-        T[left] += B_L * g * phi_L * cos_y[left]
-        T[~left] += B_R * g * phi_R * cos_y[~left]
-        return T
-
-    # --- left boundary flux: q = -k1 dT_L*/dx|_{x=a} ---
-    # Correction phi_L(a) = 0 and phi_L'(a) = 0, so same as 1D
-    def q_left(t):
-        return k1 * A_L * np.sin(omega * t) * (4.0 * (x_I - a) ** 3 + D_L)
-
-    # --- source ---
-    def source(X, Y, t):
-        s = np.empty_like(X)
-        g = np.sin(omega * t)
-        gp = omega * np.cos(omega * t)
-        cos_y = np.cos(kappa * (Y - c))
+        cy = cos_y_arr(Y)
         left = X < x_I
         xl = X[left]
         xr = X[~left]
 
-        # 1D source
-        s_L_1d = (rho1 * cp1 * gp * (A_L * ((x_I - xl) ** 4 + D_L * (x_I - xl)) + C_L)
-                   - k1 * A_L * g * 12.0 * (x_I - xl) ** 2)
-        s_R_1d = (rho2 * cp2 * A_R * gp * (b - xr) ** 4
-                   - k2 * A_R * g * 12.0 * (b - xr) ** 2)
+        V_L = (A_L * g * ((x_I - xl) ** 4 + D_L * (x_I - xl))
+               + C_L * g
+               + B_L * g * (xl - a) ** 2 * (x_I - xl) ** 2)
+        V_R = (A_R * g * (b - xr) ** 4
+               + B_R * g * (xr - x_I) ** 2 * (b - xr) ** 2)
 
-        # Left correction source
+        T[left] += cy[left] * V_L
+        T[~left] += cy[~left] * V_R
+        return T
+
+    # --- left boundary flux: q = -k1 dT_L*/dx|_{x=a}, vector-valued (Ny,) ---
+    y_vec = np.linspace(c, d, N)
+    cos_y_left = np.cos(kappa * (y_vec - c))
+
+    def q_left(t):
+        return k1 * A_L * np.sin(omega * t) * (4.0 * (x_I - a) ** 3 + D_L) * cos_y_left
+
+    # --- source: ρcp ∂V/∂t - k ∂²V/∂x² + k κ² V, all multiplied by cos(κ(y-c)) ---
+    def source(X, Y, t):
+        s = np.empty_like(X)
+        g = np.sin(omega * t)
+        gp = omega * np.cos(omega * t)
+        cy = cos_y_arr(Y)
+        left = X < x_I
+        xl = X[left]
+        xr = X[~left]
+
+        # Left side: V_L and its t-derivative and xx-derivative
         phi_L = (xl - a) ** 2 * (x_I - xl) ** 2
         phi_L_xx = (2.0 * (x_I - xl) ** 2 + 2.0 * (xl - a) ** 2
                     - 8.0 * (xl - a) * (x_I - xl))
-        cos_yL = cos_y[left]
+        V_L = (A_L * g * ((x_I - xl) ** 4 + D_L * (x_I - xl))
+               + C_L * g
+               + B_L * g * phi_L)
+        Vt_L = (A_L * gp * ((x_I - xl) ** 4 + D_L * (x_I - xl))
+                + C_L * gp
+                + B_L * gp * phi_L)
+        Vxx_L = A_L * g * 12.0 * (x_I - xl) ** 2 + B_L * g * phi_L_xx
 
-        s_corr_L = (rho1 * cp1 * B_L * gp * phi_L * cos_yL
-                     - k1 * B_L * g * phi_L_xx * cos_yL
-                     - k1 * B_L * g * phi_L * (-kappa ** 2) * cos_yL)
+        s[left] = cy[left] * (rho1 * cp1 * Vt_L - k1 * Vxx_L + k1 * kappa ** 2 * V_L)
 
-        # Right correction source
+        # Right side
         phi_R = (xr - x_I) ** 2 * (b - xr) ** 2
         phi_R_xx = (2.0 * (b - xr) ** 2 + 2.0 * (xr - x_I) ** 2
                     - 8.0 * (xr - x_I) * (b - xr))
-        cos_yR = cos_y[~left]
+        V_R = A_R * g * (b - xr) ** 4 + B_R * g * phi_R
+        Vt_R = A_R * gp * (b - xr) ** 4 + B_R * gp * phi_R
+        Vxx_R = A_R * g * 12.0 * (b - xr) ** 2 + B_R * g * phi_R_xx
 
-        s_corr_R = (rho2 * cp2 * B_R * gp * phi_R * cos_yR
-                     - k2 * B_R * g * phi_R_xx * cos_yR
-                     - k2 * B_R * g * phi_R * (-kappa ** 2) * cos_yR)
-
-        s[left] = s_L_1d + s_corr_L
-        s[~left] = s_R_1d + s_corr_R
+        s[~left] = cy[~left] * (rho2 * cp2 * Vt_R - k2 * Vxx_R + k2 * kappa ** 2 * V_R)
         return s
 
     # --- solver ---
