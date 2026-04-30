@@ -1,25 +1,49 @@
 import argparse
+import ast
+import copy
 import csv
 from pathlib import Path
 import sys
-
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.dataset import (
-    SnapshotPairDataset,
-    compute_global_stats,
-    load_sim_data,
-    load_solver_dt,
-    split_pairs_within_sims,
-    split_sim_ids,
-)
-from src.operators.train import load_config, run_one_seed
+
+def _parse_override_value(raw: str) -> object:
+    lowered = raw.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+
+    try:
+        return ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return raw
+
+
+def _apply_override(config: dict, key_path: str, value: object) -> None:
+    parts = key_path.split(".")
+    current = config
+
+    for idx, part in enumerate(parts[:-1]):
+        if not isinstance(current, dict) or part not in current:
+            prefix = ".".join(parts[: idx + 1])
+            raise KeyError(f"Unknown config path: {prefix}")
+        current = current[part]
+
+    leaf = parts[-1]
+    if not isinstance(current, dict) or leaf not in current:
+        raise KeyError(f"Unknown config path: {key_path}")
+    current[leaf] = value
+
+
+def _resolve_run_dir(config: dict) -> Path:
+    runs_root = Path(str(config["paths"]["runs_root"]))
+    experiment_name = str(config["experiment"]["name"])
+    config_id = str(config["config_id"])
+    return runs_root / experiment_name / f"config{config_id}"
 
 
 def _latest_validation_value(metrics_path: Path) -> float | None:
@@ -32,7 +56,20 @@ def _latest_validation_value(metrics_path: Path) -> float | None:
     return float(rows[-1]["val_rel_l2"])
 
 
-def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int) -> tuple[DataLoader, DataLoader]:
+def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int):
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader
+
+    from data.dataset import (
+        SnapshotPairDataset,
+        compute_global_stats,
+        load_sim_data,
+        load_solver_dt,
+        split_pairs_within_sims,
+        split_sim_ids,
+    )
+
     trajectories, x_grid, y_grid, t_grid = load_sim_data(
         sim_traj_path=config["data"]["trajectories.npy"],
         x_grid_path=config["data"]["x_grid_path"],
@@ -69,7 +106,7 @@ def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int)
     return train_loader, val_loader
 
 
-def main() -> None:
+def main(load_config_fn=None, build_loaders_fn=None, run_one_seed_fn=None) -> None:
     parser = argparse.ArgumentParser(description="Train with same-simulation held-out snapshot pairs as validation.")
     parser.add_argument("--config", default=None, help="Optional config path. Defaults to conf/config.yaml.")
     parser.add_argument("--seed", type=int, default=None, help="Model initialization seed. Defaults to the first configured seed.")
@@ -77,15 +114,42 @@ def main() -> None:
     parser.add_argument("--val-pair-frac", type=float, default=0.1, help="Fraction of pairs per training sim held out for validation.")
     parser.add_argument("--split-seed", type=int, default=0, help="RNG seed for the within-simulation pair split.")
     parser.add_argument("--cross-sim-metrics", default=None, help="Optional prior cross-sim train_metrics.csv path.")
+    parser.add_argument("overrides", nargs="*", help="Config overrides in dotted key=value form.")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    seed = int(args.seed if args.seed is not None else config["training"]["seeds"][0])
-    base_run_dir = Path(config["training"]["run"]["run_dir"])
-    run_dir = Path(args.run_dir) if args.run_dir else base_run_dir / "same_sim_holdout" / f"seed{seed}"
+    if load_config_fn is None or run_one_seed_fn is None:
+        from src.operators.train import load_config as _load_config, run_one_seed as _run_one_seed
+        load_config_fn = load_config_fn or _load_config
+        run_one_seed_fn = run_one_seed_fn or _run_one_seed
+    build_loaders_fn = build_loaders_fn or _build_same_sim_loaders
 
-    train_loader, val_loader = _build_same_sim_loaders(config, args.val_pair_frac, args.split_seed)
-    result = run_one_seed(
+    config = copy.deepcopy(load_config_fn(args.config))
+    applied_overrides = []
+    for raw_override in args.overrides:
+        if "=" not in raw_override:
+            raise ValueError(f"Invalid override '{raw_override}'. Expected key=value.")
+        key_path, raw_value = raw_override.split("=", 1)
+        value = _parse_override_value(raw_value)
+        _apply_override(config, key_path, value)
+        applied_overrides.append((key_path, value))
+
+    base_run_dir = _resolve_run_dir(config)
+    config.setdefault("training", {})
+    config["training"].setdefault("run", {})
+    config["training"]["run"]["run_dir"] = str(base_run_dir)
+    seed = int(args.seed if args.seed is not None else config["training"]["seeds"][0])
+    run_dir = Path(args.run_dir) if args.run_dir else base_run_dir / f"seed{seed}"
+
+    print(f"Using same-sim experiment namespace: {config['experiment']['name']}")
+    print(f"Config ID: {config['config_id']}")
+    print(f"Run directory: {run_dir}")
+    if applied_overrides:
+        print("Applied overrides:")
+        for key, value in applied_overrides:
+            print(f"  {key}={value!r}")
+
+    train_loader, val_loader = build_loaders_fn(config, args.val_pair_frac, args.split_seed)
+    result = run_one_seed_fn(
         config,
         seed=seed,
         run_dir=run_dir,

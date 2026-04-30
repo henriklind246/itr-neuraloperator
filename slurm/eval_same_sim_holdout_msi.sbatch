@@ -22,10 +22,10 @@ export RUNS_ROOT="$LOCAL_RUNS"
 PERSISTENT_RUNS="$HOME/fno_runs"
 mkdir -p "$LOCAL_RUNS" "$PERSISTENT_RUNS"
 
-SAME_SIM_SEED="${SAME_SIM_SEED:-42}"
+SAME_SIM_SEED="${SAME_SIM_SEED:-}"
 SAME_SIM_VAL_PAIR_FRAC="${SAME_SIM_VAL_PAIR_FRAC:-0.1}"
 SAME_SIM_SPLIT_SEED="${SAME_SIM_SPLIT_SEED:-0}"
-SAME_SIM_RUN_DIR="${SAME_SIM_RUN_DIR:-$LOCAL_RUNS/same_sim_holdout/seed${SAME_SIM_SEED}}"
+SAME_SIM_RUN_DIR="${SAME_SIM_RUN_DIR:-}"
 CROSS_SIM_METRICS="${CROSS_SIM_METRICS:-}"
 
 module load miniforge
@@ -36,10 +36,10 @@ echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
 echo "DATA_DIR=$DATA_DIR"
 echo "RUNS_ROOT=$RUNS_ROOT"
-echo "SAME_SIM_SEED=$SAME_SIM_SEED"
+echo "SAME_SIM_SEED=${SAME_SIM_SEED:-<first configured training seed>}"
 echo "SAME_SIM_VAL_PAIR_FRAC=$SAME_SIM_VAL_PAIR_FRAC"
 echo "SAME_SIM_SPLIT_SEED=$SAME_SIM_SPLIT_SEED"
-echo "SAME_SIM_RUN_DIR=$SAME_SIM_RUN_DIR"
+echo "SAME_SIM_RUN_DIR=${SAME_SIM_RUN_DIR:-<resolved from experiment.name/config_id>}"
 echo "CROSS_SIM_METRICS=$CROSS_SIM_METRICS"
 nvidia-smi
 
@@ -47,11 +47,17 @@ cd "$PROJECT_DIR"
 
 cmd=(
   python scripts/eval_same_sim_holdout.py
-  --seed "$SAME_SIM_SEED"
-  --run-dir "$SAME_SIM_RUN_DIR"
   --val-pair-frac "$SAME_SIM_VAL_PAIR_FRAC"
   --split-seed "$SAME_SIM_SPLIT_SEED"
 )
+
+if [[ -n "$SAME_SIM_SEED" ]]; then
+  cmd+=(--seed "$SAME_SIM_SEED")
+fi
+
+if [[ -n "$SAME_SIM_RUN_DIR" ]]; then
+  cmd+=(--run-dir "$SAME_SIM_RUN_DIR")
+fi
 
 if [[ -n "$CROSS_SIM_METRICS" ]]; then
   cmd+=(--cross-sim-metrics "$CROSS_SIM_METRICS")
