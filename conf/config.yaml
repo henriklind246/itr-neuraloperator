@@ -31,8 +31,8 @@ model:
 
 training:
   device: "auto"
-  batch_size: 512
-  n_snapshots: 20
+  batch_size: 1024
+  n_snapshots: 14
   n_snapshots_test: 40
   curriculum_warmup: 35
   epochs: 1500
@@ -78,7 +78,7 @@ data:
   y_shape: "B, Nx, Ny, 1"
   cond_shape: "B, 28"
   t_stats_shape: "B, 2"
-  num_sims: 4000
+  num_sims: 8000
 
 hydra:
   mode: MULTIRUN

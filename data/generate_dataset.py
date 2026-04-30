@@ -174,4 +174,4 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
     print("Saved:", x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape)
 
 if __name__ == '__main__':
-    generate_sim_data(num_sims=4000)
+    generate_sim_data(num_sims=8000)
