@@ -1,6 +1,13 @@
 import csv
+import json
 import math
+import os
 import random
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -107,6 +114,134 @@ def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) ->
             f"but current config uses optimizer={curr_optimizer}, scheduler={curr_scheduler}. "
             "Start from a fresh run directory or remove fno2d_latest.pt."
         )
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.rstrip("\n")
+
+
+def _capture_git_provenance(run_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    head = _git(repo_root, "rev-parse", "HEAD") or "unknown"
+    short = _git(repo_root, "rev-parse", "--short", "HEAD") or "unknown"
+    status = _git(repo_root, "status", "--short")
+    (run_path / "git_commit.txt").write_text(f"{head}\n{short}\n")
+    (run_path / "git_status.txt").write_text(status + ("\n" if status else ""))
+
+
+def _capture_job_context(run_path: Path) -> None:
+    slurm_keys = ("SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_NODELIST", "SLURMD_NODENAME")
+    slurm_env = {k: os.environ[k] for k in slurm_keys if k in os.environ}
+    lines = []
+    if slurm_env:
+        for k, v in slurm_env.items():
+            lines.append(f"{k}={v}")
+    else:
+        lines.append("slurm=local")
+    lines.append(f"hostname={socket.gethostname()}")
+    lines.append(f"argv={' '.join(sys.argv)}")
+    lines.append(f"start_utc={datetime.now(timezone.utc).isoformat()}")
+    (run_path / "slurm_job.txt").write_text("\n".join(lines) + "\n")
+
+
+def _dump_resolved_config(run_path: Path, config: dict) -> None:
+    OmegaConf.save(OmegaConf.create(config), run_path / "config_used.yaml")
+
+
+def _summarize_metrics_csv(csv_path: Path) -> dict:
+    with csv_path.open("r", newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    def _f(row, key):
+        v = row.get(key, "")
+        return float(v) if v not in ("", None) else None
+
+    def _row(row):
+        return {
+            "epoch": int(row["epoch"]),
+            "train_rel_l2": _f(row, "train_rel_l2"),
+            "train_iface_rel_l2": _f(row, "train_iface_rel_l2"),
+            "val_rel_l2": _f(row, "val_rel_l2"),
+            "val_iface_rel_l2": _f(row, "val_iface_rel_l2"),
+            "lr": _f(row, "lr"),
+        }
+
+    best_rows = [r for r in rows if r.get("is_best") == "1"]
+    best_row = _row(best_rows[-1]) if best_rows else _row(rows[-1])
+    final_row = _row(rows[-1])
+    return {
+        "best_row": best_row,
+        "final_row": final_row,
+        "total_epochs": len(rows),
+    }
+
+
+def _write_final_metrics(
+    run_path: Path,
+    *,
+    seed: int,
+    config: dict,
+    wall_time_s: float,
+    status: str,
+) -> None:
+    csv_path = run_path / "train_metrics.csv"
+    if not csv_path.exists():
+        return
+    summary = _summarize_metrics_csv(csv_path)
+    best = summary["best_row"]
+    final = summary["final_row"]
+
+    git_short = "unknown"
+    commit_file = run_path / "git_commit.txt"
+    if commit_file.exists():
+        lines = commit_file.read_text().strip().splitlines()
+        if len(lines) >= 2:
+            git_short = lines[1]
+
+    model_cfg = config.get("model", {}).get("parameters", {})
+    training_cfg = config.get("training", {})
+    payload = {
+        "status": status,
+        "seed": int(seed),
+        "experiment_name": str(config.get("experiment", {}).get("name", "")),
+        "config_id": config.get("config_id"),
+        "best": {
+            "epoch": best["epoch"],
+            "val_rel_l2": best["val_rel_l2"],
+            "val_iface_rel_l2": best["val_iface_rel_l2"],
+            "train_rel_l2": best["train_rel_l2"],
+            "train_iface_rel_l2": best["train_iface_rel_l2"],
+        },
+        "final": {
+            "epoch": final["epoch"],
+            "train_rel_l2": final["train_rel_l2"],
+            "train_iface_rel_l2": final["train_iface_rel_l2"],
+            "lr": final["lr"],
+        },
+        "epochs_trained": summary["total_epochs"],
+        "epochs_configured": int(training_cfg.get("epochs", 0)),
+        "early_stopped": status == "early_stopped",
+        "wall_time_seconds": round(float(wall_time_s), 2),
+        "wall_time_minutes": round(float(wall_time_s) / 60.0, 2),
+        "git_commit_short": git_short,
+        "model_params": {
+            "modes1": model_cfg.get("modes1"),
+            "modes2": model_cfg.get("modes2"),
+            "width": model_cfg.get("width"),
+            "n_layers": model_cfg.get("n_layers"),
+        },
+        "training_params": {
+            "batch_size": training_cfg.get("batch_size"),
+            "learning_rate": training_cfg.get("learning_rate"),
+            "n_snapshots": training_cfg.get("n_snapshots"),
+        },
+    }
+    (run_path / "final_metrics.json").write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def build_optimizer(config: dict, params) -> torch.optim.Optimizer:
@@ -482,10 +617,18 @@ def run_one_seed(
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
 
+    _t_start = time.time()
+    _capture_git_provenance(run_path)
+    _capture_job_context(run_path)
+    _dump_resolved_config(run_path, config)
+
     # --- Skip completed runs ---
     if _is_training_complete(run_path):
         result = _load_completed_result(run_path, seed)
         print(f"Seed {seed}: training already complete (best_val={result['best_val']:.4f}%), skipping.")
+        _write_final_metrics(
+            run_path, seed=seed, config=config, wall_time_s=0.0, status="already_complete"
+        )
         return result
 
     # --- Check for interrupted run ---
@@ -720,6 +863,15 @@ def run_one_seed(
     # Clean completion: remove sentinel
     if latest_path.exists():
         latest_path.unlink()
+
+    status = "early_stopped" if should_stop else "completed"
+    _write_final_metrics(
+        run_path,
+        seed=seed,
+        config=config,
+        wall_time_s=time.time() - _t_start,
+        status=status,
+    )
 
     return {"seed": seed, "best_val": float(best_val_loss), "best_path": str(best_path)}
 
