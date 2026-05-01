@@ -90,15 +90,19 @@ class SpectralConv2d(nn.Module):
 # --------- Conditional Instance Normalization ---------
 
 class ConditionalInstanceNorm2d(nn.Module):
-    """InstanceNorm2d + external affine (γ, β) from conditioning MLP."""
+    """Instance normalization + external affine (γ, β) from conditioning MLP."""
 
-    def __init__(self, num_features: int):
+    def __init__(self, num_features: int, eps: float = 1e-5):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
+        self.num_features = num_features
+        self.eps = eps
 
-    def forward(self, x, gamma, beta):
+    def forward(self, x, gamma, beta, valid_shape: tuple[int, int] | None = None):
         # x: (B, C, Nx, Ny),  gamma/beta: (B, C)
-        out = self.norm(x)
+        valid = x if valid_shape is None else x[..., :valid_shape[0], :valid_shape[1]]
+        mean = valid.mean(dim=(-2, -1), keepdim=True)
+        var = valid.var(dim=(-2, -1), unbiased=False, keepdim=True)
+        out = (x - mean) * torch.rsqrt(var + self.eps)
         return gamma[:, :, None, None] * out + beta[:, :, None, None]
 
 
@@ -229,7 +233,7 @@ class FNO2d(nn.Module):
             x1 = self.spectral_layers[l](x)
             x2 = self.conv_layers[l](x)
             x = x1 + x2
-            x = self.cin_layers[l](x, gamma, beta)
+            x = self.cin_layers[l](x, gamma, beta, valid_shape=(Nx0, Ny0))
             x = self.drop(self.activation(x))
 
         # Unpad + Project
