@@ -12,6 +12,7 @@ from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 
 from src.operators.train import (
+    _per_pair_rel_l2_percent,
     load_config,
     set_seed,
     train_one_epoch,
@@ -26,6 +27,18 @@ from src.operators.train import (
     run_one_seed,
     run_config_seeds,
 )
+
+
+class ZeroModel(torch.nn.Module):
+    def forward(self, spatial, cond):
+        return torch.zeros(
+            spatial.shape[0],
+            spatial.shape[1],
+            spatial.shape[2],
+            1,
+            dtype=spatial.dtype,
+            device=spatial.device,
+        )
 
 
 # ===================== set_seed =====================
@@ -174,6 +187,14 @@ class TestTrainOneEpoch:
 # ===================== validate =====================
 
 class TestValidate:
+    def test_per_pair_rel_l2_uses_rms_over_rms(self):
+        y_true = torch.arange(1.0, 7.0).view(1, 2, 3, 1)
+        y_pred = torch.zeros_like(y_true)
+
+        rel_l2 = _per_pair_rel_l2_percent(y_pred, y_true)
+
+        assert rel_l2.item() == pytest.approx(100.0)
+
     def test_returns_tuple(self, tiny_training_setup):
         model, loader, _, _, device, iface_mask = tiny_training_setup
         result = validate(model, loader, device, iface_mask=iface_mask)
@@ -246,6 +267,41 @@ class TestValidate:
             "iface_rel_l2",
         }
         assert {int(row["epoch"]) for row in rows} == {7}
+
+    def test_per_pair_csv_metrics_use_normalized_tensors(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        dataset = SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            sim_ids=np.array([0]),
+            sim_params=synthetic_sim_params,
+            mu_global=10.0,
+            sigma_global=2.0,
+            n_snapshots=3,
+        )
+        loader = DataLoader(dataset, batch_size=2, shuffle=False)
+        iface_mask = build_interface_mask(x_grid, y_grid)
+        csv_path = tmp_path / "val_pairs.csv"
+
+        validate(
+            ZeroModel(),
+            loader,
+            torch.device("cpu"),
+            iface_mask=iface_mask,
+            dataset=dataset,
+            pair_csv_path=csv_path,
+            epoch=7,
+        )
+
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        assert len(rows) == len(dataset)
+        for row in rows:
+            assert float(row["rel_l2"]) == pytest.approx(100.0)
+            assert float(row["iface_rel_l2"]) == pytest.approx(100.0)
 
 
 # ===================== RIGNO scheduler =====================

@@ -16,7 +16,6 @@ from torch.optim import Adam, AdamW
 
 from data.dataset import (
     COND_DIM,
-    T_EPS,
     SnapshotPairDataset,
     compute_global_stats,
     create_dataloaders,
@@ -508,9 +507,9 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=
 
 
 def _per_pair_rel_l2_percent(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-    rms = torch.mean((y_pred - y_true) ** 2, dim=(1, 2, 3)).sqrt()
-    denom = y_true.flatten(1).norm(dim=1).clamp_min(1e-12)
-    return rms / denom * 100.0
+    numerator = torch.mean((y_pred - y_true) ** 2, dim=(1, 2, 3))
+    denominator = torch.mean(y_true ** 2, dim=(1, 2, 3)).clamp_min(1e-12)
+    return torch.sqrt(numerator / denominator) * 100.0
 
 
 def _write_val_pair_rows(
@@ -569,7 +568,7 @@ def validate(
                 pair_writer.writeheader()
 
         try:
-            for x_spatial, cond, y_batch, T_stats in val_loader:
+            for x_spatial, cond, y_batch, _T_stats in val_loader:
                 x_spatial = x_spatial.to(device)
                 cond = cond.to(device)
                 y_batch = y_batch.to(device)
@@ -581,15 +580,10 @@ def validate(
                     val_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
 
                 if write_pairs and pair_writer is not None and dataset is not None:
-                    T_stats = T_stats.to(device)
-                    mu_s = T_stats[:, 0]
-                    sigma_s = T_stats[:, 1]
-                    y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
-                    y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
-                    rel_l2 = _per_pair_rel_l2_percent(y_pred_phys, y_true_phys).cpu()
+                    rel_l2 = _per_pair_rel_l2_percent(y_pred, y_batch).cpu()
                     if iface_mask is not None:
-                        pred_iface = y_pred_phys[:, iface_mask, :]
-                        true_iface = y_true_phys[:, iface_mask, :]
+                        pred_iface = y_pred[:, iface_mask, :]
+                        true_iface = y_batch[:, iface_mask, :]
                         iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface[:, :, None, :], true_iface[:, :, None, :]).cpu()
                     else:
                         iface_rel_l2 = torch.zeros_like(rel_l2)
