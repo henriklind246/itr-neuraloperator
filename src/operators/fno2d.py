@@ -100,10 +100,11 @@ class ConditionalInstanceNorm2d(nn.Module):
     def forward(self, x, gamma, beta, valid_shape: tuple[int, int] | None = None):
         # x: (B, C, Nx, Ny),  gamma/beta: (B, C)
         valid = x if valid_shape is None else x[..., :valid_shape[0], :valid_shape[1]]
-        mean = valid.mean(dim=(-2, -1), keepdim=True)
-        var = valid.var(dim=(-2, -1), unbiased=False, keepdim=True)
-        out = (x - mean) * torch.rsqrt(var + self.eps)
-        return gamma[:, :, None, None] * out + beta[:, :, None, None]
+        var, mean = torch.var_mean(valid, dim=(-2, -1), unbiased=False, keepdim=True)
+        inv_std = torch.rsqrt(var + self.eps)
+        scale = gamma[:, :, None, None] * inv_std
+        bias = beta[:, :, None, None] - mean * scale
+        return torch.addcmul(bias, x, scale)
 
 
 # --------- Conditioning MLP ---------

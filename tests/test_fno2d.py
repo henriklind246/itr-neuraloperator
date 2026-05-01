@@ -4,6 +4,27 @@ from src.operators.fno2d import ConditionalInstanceNorm2d, FNO2d
 
 
 class TestConditionalInstanceNorm2d:
+    def test_matches_unfused_formula_and_gradients(self):
+        torch.manual_seed(0)
+        cin = ConditionalInstanceNorm2d(num_features=8)
+        x = torch.randn(2, 8, 12, 12, requires_grad=True)
+        gamma = torch.randn(2, 8, requires_grad=True)
+        beta = torch.randn(2, 8, requires_grad=True)
+
+        y_new = cin(x, gamma, beta, valid_shape=(10, 10))
+
+        valid = x[..., :10, :10]
+        var, mean = torch.var_mean(valid, dim=(-2, -1), unbiased=False, keepdim=True)
+        y_old = (x - mean) * torch.rsqrt(var + cin.eps)
+        y_old = gamma[:, :, None, None] * y_old + beta[:, :, None, None]
+
+        assert torch.allclose(y_new, y_old, atol=1e-6)
+
+        grads_new = torch.autograd.grad(y_new.sum(), (x, gamma, beta), retain_graph=True)
+        grads_old = torch.autograd.grad(y_old.sum(), (x, gamma, beta), retain_graph=True)
+        for grad_new, grad_old in zip(grads_new, grads_old):
+            assert torch.allclose(grad_new, grad_old, atol=1e-5)
+
     def test_physical_region_has_instance_norm_statistics(self):
         torch.manual_seed(0)
         cin = ConditionalInstanceNorm2d(num_features=3)
