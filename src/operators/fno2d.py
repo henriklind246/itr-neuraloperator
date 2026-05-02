@@ -92,19 +92,14 @@ class SpectralConv2d(nn.Module):
 class ConditionalInstanceNorm2d(nn.Module):
     """Instance normalization + external affine (γ, β) from conditioning MLP."""
 
-    def __init__(self, num_features: int, eps: float = 1e-5):
+    def __init__(self, num_features: int):
         super().__init__()
-        self.num_features = num_features
-        self.eps = eps
+        self.norm = nn.InstanceNorm2d(num_features, affine=False)
 
     def forward(self, x, gamma, beta, valid_shape: tuple[int, int] | None = None):
         # x: (B, C, Nx, Ny),  gamma/beta: (B, C)
-        valid = x if valid_shape is None else x[..., :valid_shape[0], :valid_shape[1]]
-        var, mean = torch.var_mean(valid, dim=(-2, -1), unbiased=False, keepdim=True)
-        inv_std = torch.rsqrt(var + self.eps)
-        scale = gamma[:, :, None, None] * inv_std
-        bias = beta[:, :, None, None] - mean * scale
-        return torch.addcmul(bias, x, scale)
+        out = self.norm(x)
+        return gamma[:, :, None, None] * out + beta[:, :, None, None]
 
 
 # --------- Conditioning MLP ---------
