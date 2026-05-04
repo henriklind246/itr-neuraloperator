@@ -2,10 +2,11 @@ import numpy as np
 
 from data.generate_dataset import (
     build_sim_params,
+    generate_sim_data,
     generate_lhs_samples,
-    random_ic,
 )
 from src.physics.boundary_forcing import TEMPORAL_FAMILIES
+from src.physics.init_conditions import IC_FAMILIES
 
 
 RC_RANGE = (0.05, 1.0)
@@ -18,53 +19,6 @@ def _mesh(a: float, b: float, c: float, d: float, Nx: int, Ny: int):
     y = np.linspace(c, d, Ny)
     X, Y = np.meshgrid(x, y, indexing="ij")
     return X, Y
-
-
-class TestRandomIC:
-    def test_shape(self):
-        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 25, 17)
-        rng = np.random.default_rng(0)
-        result = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng)
-        assert result.shape == (25, 17)
-
-    def test_deterministic_same_seed(self):
-        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 11, 13)
-        rng1 = np.random.default_rng(42)
-        rng2 = np.random.default_rng(42)
-        r1 = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng1)
-        r2 = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng2)
-        np.testing.assert_array_equal(r1, r2)
-
-    def test_varies_with_different_seed(self):
-        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 11, 13)
-        r1 = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, np.random.default_rng(0))
-        r2 = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, np.random.default_rng(1))
-        assert not np.array_equal(r1, r2)
-
-    def test_values_finite(self):
-        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 25, 17)
-        rng = np.random.default_rng(0)
-        result = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng)
-        assert np.all(np.isfinite(result))
-
-    def test_dtype_float(self):
-        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 11, 13)
-        rng = np.random.default_rng(0)
-        result = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng)
-        assert np.issubdtype(result.dtype, np.floating)
-
-    def test_different_domains(self):
-        X, Y = _mesh(0.0, 2.0, 0.0, 2.0, 11, 13)
-        r1 = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, np.random.default_rng(0))
-        r2 = random_ic(0.0, 2.0, 0.0, 2.0, X, Y, np.random.default_rng(0))
-        assert not np.array_equal(r1, r2)
-
-    def test_nontrivial_y_variation(self):
-        """IC must actually vary along the y axis (otherwise 2D becomes 1D)."""
-        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 25, 17)
-        rng = np.random.default_rng(0)
-        result = random_ic(0.0, 1.0, 0.0, 1.0, X, Y, rng)
-        assert float(np.std(result, axis=1).max()) > 1e-6
 
 
 class TestGenerateLHSSamples:
@@ -99,7 +53,8 @@ class TestBuildSimParams:
                                   dt=DT, t_final=T_FINAL, lhs_seed=0)
         assert len(params) == 8
         required_keys = {"R_c", "T0", "temporal_family",
-                         "temporal_params", "spatial_family", "spatial_params"}
+                         "temporal_params", "spatial_family", "spatial_params",
+                         "ic_family", "ic_params"}
         for entry in params:
             assert isinstance(entry, dict)
             assert required_keys.issubset(entry.keys())
@@ -107,6 +62,8 @@ class TestBuildSimParams:
             assert isinstance(entry["T0"], np.ndarray)
             assert entry["temporal_family"] in TEMPORAL_FAMILIES
             assert entry["spatial_family"] in {"uniform", "patch", "gaussian", "triangle"}
+            assert entry["ic_family"] in IC_FAMILIES
+            assert isinstance(entry["ic_params"], dict)
 
     def test_temporal_params_match_family_schema(self):
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 9, 7)
@@ -140,7 +97,8 @@ class TestBuildSimParams:
         for entry in params:
             T0 = entry["T0"]
             assert T0.shape == (Nx, Ny)
-            assert np.issubdtype(T0.dtype, np.floating)
+            assert T0.dtype == np.float32
+            assert np.isfinite(T0).all()
 
     def test_T0_right_boundary_matches_dirichlet(self):
         Nx, Ny = 13, 9
@@ -172,9 +130,10 @@ class TestBuildSimParams:
             assert e1["spatial_params"] == e2["spatial_params"]
             assert e1["temporal_family"] == e2["temporal_family"]
             assert e1["temporal_params"] == e2["temporal_params"]
+            assert e1["ic_family"] == e2["ic_family"]
+            assert e1["ic_params"] == e2["ic_params"]
 
     def test_T0_varies_across_sims(self):
-        """Each sim should get its own random IC."""
         X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 15, 15)
         rng = np.random.default_rng(0)
         rng_profile = np.random.default_rng(1)
@@ -185,3 +144,93 @@ class TestBuildSimParams:
         for i in range(len(params)):
             for j in range(i + 1, len(params)):
                 assert not np.array_equal(T0_stack[i], T0_stack[j])
+
+    def test_ic_family_distribution_uses_rng_not_rng_profile(self):
+        """Changing rng_profile alone must not change IC family/params draws."""
+        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 9, 7)
+        # same rng (data RNG), different rng_profile
+        p1 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=6,
+                              rng=np.random.default_rng(42),
+                              rng_profile=np.random.default_rng(1),
+                              dt=DT, t_final=T_FINAL, lhs_seed=0)
+        p2 = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y, num_sims=6,
+                              rng=np.random.default_rng(42),
+                              rng_profile=np.random.default_rng(2),
+                              dt=DT, t_final=T_FINAL, lhs_seed=0)
+        for e1, e2 in zip(p1, p2):
+            assert e1["ic_family"] == e2["ic_family"]
+            assert e1["ic_params"] == e2["ic_params"]
+            np.testing.assert_array_equal(e1["T0"], e2["T0"])
+
+    def test_every_ic_family_is_accepted_by_build_sim_params(self, monkeypatch):
+        X, Y = _mesh(0.0, 1.0, 0.0, 1.0, 17, 13)
+        families = list(IC_FAMILIES.keys())
+        family_iter = iter(families)
+        monkeypatch.setattr(
+            "data.generate_dataset.sample_ic_family",
+            lambda rng: next(family_iter),
+        )
+
+        params = build_sim_params(0.0, 1.0, 0.0, 1.0, X, Y,
+                                  num_sims=len(families),
+                                  rng=np.random.default_rng(11),
+                                  rng_profile=np.random.default_rng(12),
+                                  dt=DT, t_final=T_FINAL, lhs_seed=0)
+
+        assert [p["ic_family"] for p in params] == families
+        for entry in params:
+            assert entry["T0"].shape == (17, 13)
+            assert entry["T0"].dtype == np.float32
+            assert np.isfinite(entry["T0"]).all()
+            np.testing.assert_allclose(entry["T0"][-1, :], 300.0)
+
+
+class TestGenerateSimData:
+    def test_generate_sim_data_smoke_writes_outputs_to_data_dir_with_ic_metadata(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        cwd = tmp_path / "cwd"
+        data_dir = tmp_path / "data"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setattr("data.generate_dataset.DATA_DIR", data_dir)
+
+        generate_sim_data(num_sims=2, save_stride=2)
+
+        out = capsys.readouterr().out
+        assert "Building simulation parameters." in out
+        assert "Finished simulation 0" in out
+        assert "Finished simulation 1" in out
+        assert "Saved to:" in out
+
+        expected_files = [
+            "x_grid.npy",
+            "y_grid.npy",
+            "t_grid.npy",
+            "dt.npy",
+            "trajectories.npy",
+            "sim_params.npy",
+        ]
+        for name in expected_files:
+            assert (data_dir / name).exists()
+            assert not (cwd / name).exists()
+
+        trajectories = np.load(data_dir / "trajectories.npy")
+        x_grid = np.load(data_dir / "x_grid.npy")
+        y_grid = np.load(data_dir / "y_grid.npy")
+        t_grid = np.load(data_dir / "t_grid.npy")
+        dt = np.load(data_dir / "dt.npy")
+        sim_params = np.load(data_dir / "sim_params.npy", allow_pickle=True)
+
+        assert trajectories.shape == (2, 31, 100, 100)
+        assert trajectories.dtype == np.float32
+        assert x_grid.shape == (100,)
+        assert y_grid.shape == (100,)
+        assert t_grid.shape == (31,)
+        assert float(dt) == DT
+        assert sim_params.shape == (2,)
+        for entry in sim_params:
+            assert entry["ic_family"] in IC_FAMILIES
+            assert isinstance(entry["ic_params"], dict)
+            assert entry["T0"].shape == (100, 100)
+            np.testing.assert_allclose(entry["T0"][-1, :], 300.0)

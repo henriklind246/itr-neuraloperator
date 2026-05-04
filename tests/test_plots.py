@@ -502,7 +502,8 @@ class TestModelDiagnosticPlots:
 class TestPhysicsPlots:
     def test_multilayer_evolution_smoke(self, tmp_path):
         solver = physics_plots.create_demo_multilayer_solver()
-        _, _, _, T_hist = solver.solve(store_trajectory=True)
+        T0 = np.full((solver.Nx, solver.Ny), solver.T_right(0.0))
+        _, _, _, T_hist = solver.solve(T0=T0, store_trajectory=True)
         out_path = tmp_path / "multilayer_evolution.png"
         physics_plots.plot_multilayer_evolution(solver, T_hist, save_path=out_path)
         assert out_path.exists()

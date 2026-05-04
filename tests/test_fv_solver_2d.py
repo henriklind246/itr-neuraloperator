@@ -574,14 +574,16 @@ class TestSolveOutput:
 
     def test_final_only_shapes(self):
         sim = make_single_layer_2d(Nx=11, Ny=11)
-        t, gx, gy, T_final = sim.solve(store_trajectory=False)
+        T0 = np.full((11, 11), sim.T_right(0.0))
+        t, gx, gy, T_final = sim.solve(T0=T0, store_trajectory=False)
         assert T_final.shape == (11, 11)
         assert gx.shape == (11,)
         assert gy.shape == (11,)
 
     def test_trajectory_shapes(self):
         sim = make_single_layer_2d(Nx=11, Ny=11)
-        t, gx, gy, T_hist = sim.solve(store_trajectory=True)
+        T0 = np.full((11, 11), sim.T_right(0.0))
+        t, gx, gy, T_hist = sim.solve(T0=T0, store_trajectory=True)
         Nt = len(sim.t)
         assert T_hist.shape == (Nt, 11, 11)
 
@@ -600,7 +602,8 @@ class TestSolveOutput:
 
     def test_temperatures_finite(self):
         sim = make_single_layer_2d(Nx=11, Ny=11, flux_A=50.0)
-        _, _, _, T_hist = sim.solve(store_trajectory=True)
+        T0 = np.full((11, 11), sim.T_right(0.0))
+        _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
         assert np.all(np.isfinite(T_hist))
 
 
