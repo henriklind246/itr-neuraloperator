@@ -24,17 +24,6 @@ from src.physics.fv_solver_1d import (
 Layer2D = Layer1D
 
 
-def ic(X: np.ndarray, Y: np.ndarray, a: float, b: float, c: float, d: float) -> np.ndarray:
-    # returns a 2d array with shape (Nx, Ny)
-    Lx = b - a
-    Ly = d - c
-    Xn = X - a
-    Yn = Y - c
-    fx = np.cos((np.pi * Xn) / (2 * Lx)) + 0.1 * np.sin((np.pi * Xn) / Lx)
-    fy = np.cos((np.pi * Yn) / (2 * Ly)) + 0.1 * np.sin((np.pi * Yn) / Ly)
-    return fx * fy
-
-
 class FVSolver2D:
     """
     2D Conservative Multilayer FV Solver (Crank-Nicolson)
@@ -650,7 +639,7 @@ class FVSolver2D:
 
     def solve(
         self,
-        T0: np.ndarray | None = None,
+        T0: np.ndarray,
         store_trajectory: bool = False,
     ) -> tuple:
         """
@@ -666,15 +655,11 @@ class FVSolver2D:
         Nt = len(self.t)
         Nx, Ny = self.Nx, self.Ny
 
-        if T0 is None:
-            T = ic(self.X, self.Y, self.a, self.b, self.c, self.d).astype(float)
-            T += self.T_right(0.0)
-        else:
-            T = np.asarray(T0, dtype=float)
-            if T.shape != (Nx, Ny):
-                raise ValueError(
-                    f"T0 shape must be ({Nx}, {Ny}), got {T.shape}"
-                )
+        T = np.asarray(T0, dtype=float)
+        if T.shape != (Nx, Ny):
+            raise ValueError(
+                f"T0 shape must be ({Nx}, {Ny}), got {T.shape}"
+            )
 
         if store_trajectory:
             T_hist = np.zeros((Nt, Nx, Ny), dtype=float)
@@ -719,7 +704,8 @@ if __name__ == '__main__':
         phase=0.0
     )
 
-    t, x, y, T_final = sim.solve(store_trajectory=False)
+    T0_demo = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=float)
+    t, x, y, T_final = sim.solve(T0=T0_demo, store_trajectory=False)
 
     print(f"t shape: {t.shape}")
     print(f"x shape: {x.shape}")
