@@ -52,6 +52,15 @@ def _forcing_label(params: dict) -> str:
 from src.operators.train import load_config
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.operators.fno2d import FNO2d
+from src.physics.init_conditions import (
+    GRF_ELL_RANGE,
+    HOT_AMP_RANGE,
+    HOT_SIGMA_RANGE,
+    SINU_AMP_RANGE,
+    SINU_KMAX,
+    UNIFORM_OFFSET_RANGE,
+    build_ic,
+)
 
 from visual._common import (
     PLOT_STYLE,
@@ -1123,6 +1132,163 @@ def plot_initial_conditions(
         _save_figure(fig, save_path, "data", "initial_conditions", layout="constrained")
 
 
+# ============================================================
+# IC FAMILY PROGRESSION PLOTS
+# ============================================================
+# One figure per IC family with three panels showing the IC field at
+# low / median / high values of one driving parameter. List-valued params
+# (sinusoid wavenumbers, hot-spot positions) are drawn once with a fixed
+# seed so the panels differ only along the swept axis.
+
+_IC_PROG_NX = 100
+_IC_PROG_NY = 100
+_IC_PROG_T_RIGHT = 300.0
+_IC_PROG_FIXED_SEED = 0
+
+
+def _ic_progression_grid() -> tuple[np.ndarray, np.ndarray]:
+    x = np.linspace(0.0, 1.0, _IC_PROG_NX)
+    y = np.linspace(0.0, 1.0, _IC_PROG_NY)
+    return np.meshgrid(x, y, indexing="ij")
+
+
+def _render_ic_progression(
+    family: str,
+    panels: list[tuple[str, dict]],
+    name: str,
+    suptitle: str,
+    save_path: str | Path | None,
+) -> None:
+    """Render a 1x3 progression of IC fields for one family.
+
+    panels: list of (panel_title, ic_params_kwargs).
+    """
+    X, Y = _ic_progression_grid()
+    interface_meta = _resolve_interface_metadata()
+
+    fields = [
+        build_ic(family, params, X, Y, T_right=_IC_PROG_T_RIGHT, b=1.0)
+        for _, params in panels
+    ]
+    deviations = [field.astype(np.float64) - _IC_PROG_T_RIGHT for field in fields]
+    abs_max = max(float(np.max(np.abs(d))) for d in deviations)
+    abs_max = max(abs_max, 1e-12)
+    vmin = _IC_PROG_T_RIGHT - abs_max
+    vmax = _IC_PROG_T_RIGHT + abs_max
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(
+            1, 3, figsize=(13, 4.4), constrained_layout=True, squeeze=False,
+        )
+        pcm = None
+        for ax, (title, _), field in zip(axes[0], panels, fields):
+            pcm = _plot_field_2d(
+                ax, X[:, 0], Y[0, :], field,
+                cmap="coolwarm", vmin=vmin, vmax=vmax,
+                interface_positions=interface_meta["positions"],
+            )
+            ax.set_title(title)
+        for ax in axes[0, 1:]:
+            ax.set_ylabel("")
+        fig.colorbar(pcm, ax=axes.ravel().tolist(), label="Temperature", shrink=0.85)
+        fig.suptitle(suptitle)
+        _save_figure(fig, save_path, "data", name, layout="constrained")
+
+
+def plot_ic_uniform_progression(save_path: str | Path | None = None) -> None:
+    """Uniform IC across low / mean / high T0_offset."""
+    lo, hi = UNIFORM_OFFSET_RANGE
+    panels = [
+        (f"T0_offset = {lo:+.1f}", {"T0_offset": float(lo)}),
+        (f"T0_offset = {0.5 * (lo + hi):+.1f}", {"T0_offset": 0.5 * (lo + hi)}),
+        (f"T0_offset = {hi:+.1f}", {"T0_offset": float(hi)}),
+    ]
+    _render_ic_progression(
+        "uniform_2d", panels,
+        name="ic_uniform_progression",
+        suptitle="Uniform IC progression — T0_offset sweep",
+        save_path=save_path,
+    )
+
+
+def plot_ic_random_sinusoid_progression(save_path: str | Path | None = None) -> None:
+    """Random-sinusoid IC at low / mean / high amplitude (fixed wavenumbers/phases)."""
+    rng = np.random.default_rng(_IC_PROG_FIXED_SEED)
+    N = 4
+    nx_list = [int(v) for v in rng.integers(1, SINU_KMAX + 1, size=N)]
+    ny_list = [int(v) for v in rng.integers(1, SINU_KMAX + 1, size=N)]
+    phi_list = [float(v) for v in rng.uniform(0.0, 2.0 * np.pi, size=N)]
+
+    lo, hi = SINU_AMP_RANGE
+    amplitudes = [float(lo), 0.5 * (lo + hi), float(hi)]
+
+    def make_params(scale: float) -> dict:
+        return {
+            "A_list": [scale] * N,
+            "nx_list": nx_list,
+            "ny_list": ny_list,
+            "phi_list": phi_list,
+        }
+
+    panels = [(f"A = {amp:.1f}", make_params(amp)) for amp in amplitudes]
+    _render_ic_progression(
+        "random_sinusoid_2d", panels,
+        name="ic_random_sinusoid_progression",
+        suptitle=f"Random-sinusoid IC progression — amplitude sweep (N={N})",
+        save_path=save_path,
+    )
+
+
+def plot_ic_grf_progression(save_path: str | Path | None = None) -> None:
+    """GRF IC at low / log-mean / high correlation length (fixed sigma, wn_seed)."""
+    lo, hi = GRF_ELL_RANGE
+    sigma_fixed = 10.0
+    wn_seed = _IC_PROG_FIXED_SEED
+    ells = [float(lo), float(np.sqrt(lo * hi)), float(hi)]
+
+    panels = [
+        (f"ell = {ell:.3f}", {"ell": ell, "sigma": sigma_fixed, "wn_seed": wn_seed})
+        for ell in ells
+    ]
+    _render_ic_progression(
+        "grf_2d", panels,
+        name="ic_grf_progression",
+        suptitle=f"GRF IC progression — correlation length sweep (sigma={sigma_fixed:.1f})",
+        save_path=save_path,
+    )
+
+
+def plot_ic_hot_spot_progression(save_path: str | Path | None = None) -> None:
+    """Hot-spot IC at low / log-mean / high sigma (fixed bump centers and amplitudes)."""
+    rng = np.random.default_rng(_IC_PROG_FIXED_SEED)
+    N = 3
+    amp_lo, amp_hi = HOT_AMP_RANGE
+    A_list = [float(v) for v in rng.uniform(amp_lo, amp_hi, size=N)]
+    s_lo, s_hi = HOT_SIGMA_RANGE
+    sigmas = [float(s_lo), float(np.sqrt(s_lo * s_hi)), float(s_hi)]
+
+    margin_max = 2.0 * s_hi  # keep centers in-bounds for the widest sigma panel
+    margin = min(margin_max, 0.45)
+    mu_x_list = [float(v) for v in rng.uniform(margin, 1.0 - margin, size=N)]
+    mu_y_list = [float(v) for v in rng.uniform(margin, 1.0 - margin, size=N)]
+
+    def make_params(sigma: float) -> dict:
+        return {
+            "A_list": A_list,
+            "mu_x_list": mu_x_list,
+            "mu_y_list": mu_y_list,
+            "sigma_list": [sigma] * N,
+        }
+
+    panels = [(f"sigma = {s:.3f}", make_params(s)) for s in sigmas]
+    _render_ic_progression(
+        "hot_spot_2d", panels,
+        name="ic_hot_spot_progression",
+        suptitle=f"Hot-spot IC progression — sigma sweep (N={N})",
+        save_path=save_path,
+    )
+
+
 def plot_lhs_scatter(
     sim_params: np.ndarray,
     save_path: str | Path | None = None,
@@ -1226,7 +1392,8 @@ def plot_flux_profiles(
             dt=0.005,
             q_left_fn=q_fn,
         )
-        _, _, _, T_hist = solver.solve(store_trajectory=True)
+        T0_demo = np.full((solver.Nx, solver.Ny), solver.T_right(0.0), dtype=float)
+        _, _, _, T_hist = solver.solve(T0=T0_demo, store_trajectory=True)
         Q = _evaluate_q_left_field(solver)
         t_peak = int(np.argmax(np.max(np.abs(Q), axis=1)))
         dT = T_hist[t_peak, 1:, :] - T_hist[t_peak, :-1, :]

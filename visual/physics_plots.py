@@ -52,7 +52,8 @@ def plot_final_temperature(
     save_path: Optional[Path] = None,
 ):
     """2D temperature field at final time as a pcolormesh heatmap."""
-    _, _, _, T_final = solver.solve(store_trajectory=False)
+    T0 = np.full((solver.Nx, solver.Ny), solver.T_right(0.0), dtype=float)
+    _, _, _, T_final = solver.solve(T0=T0, store_trajectory=False)
     interface_meta = _resolve_interface_metadata(solver=solver)
 
     with plt.rc_context(PLOT_STYLE):

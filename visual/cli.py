@@ -78,7 +78,8 @@ def main():
     if need_physics:
         print("=== PHYSICS GROUP ===")
         solver = physics_plots.create_demo_multilayer_solver()
-        t_sol, gx_sol, gy_sol, T_hist = solver.solve(store_trajectory=True)
+        T0_demo = np.full((solver.Nx, solver.Ny), solver.T_right(0.0), dtype=float)
+        t_sol, gx_sol, gy_sol, T_hist = solver.solve(T0=T0_demo, store_trajectory=True)
 
         physics_dir = out_dir / "physics"
 
@@ -153,6 +154,18 @@ def main():
         if _should_run("flux_profiles", groups, individual):
             print("--- flux_profiles ---")
             dataset_plots.plot_flux_profiles(save_path=data_dir / "flux_profiles.png")
+
+        # IC family progression plots — pure synthetic, no data files needed
+        ic_progression_plots = [
+            ("ic_uniform_progression",         dataset_plots.plot_ic_uniform_progression),
+            ("ic_random_sinusoid_progression", dataset_plots.plot_ic_random_sinusoid_progression),
+            ("ic_grf_progression",             dataset_plots.plot_ic_grf_progression),
+            ("ic_hot_spot_progression",        dataset_plots.plot_ic_hot_spot_progression),
+        ]
+        for name, fn in ic_progression_plots:
+            if _should_run(name, groups, individual):
+                print(f"--- {name} ---")
+                fn(save_path=data_dir / f"{name}.png")
 
         sim_params = None
         if args.params:
