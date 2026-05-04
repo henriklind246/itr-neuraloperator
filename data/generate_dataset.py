@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.boundary_forcing import (
@@ -9,29 +11,14 @@ from src.physics.boundary_forcing import (
     sample_temporal_family,
     build_qL,
 )
-from scipy.stats import qmc
+from src.physics.init_conditions import (
+    IC_SAMPLERS,
+    sample_ic_family,
+    build_ic,
+)
 
 
-def random_ic(a: float, b: float, c: float, d: float,
-              X: np.ndarray, Y: np.ndarray, rng) -> np.ndarray:
-    Lx = b - a
-    Ly = d - c
-
-    # x-direction random combination
-    cx0 = rng.uniform(0.5, 1.5)
-    cx1 = rng.uniform(-0.3, 0.3)
-    cx2 = rng.uniform(-0.3, 0.3)
-    Xn = X - a
-    Yn = Y - c
-    fx = (cx0 * np.cos((np.pi * Xn) / (2.0 * Lx)) + cx1 * np.sin((np.pi * Xn) / Lx) + cx2 * np.cos((2.0 * np.pi * Xn) / Lx))
-
-    # y-direction random combination
-    cy0 = rng.uniform(0.5, 1.5)
-    cy1 = rng.uniform(-0.3, 0.3)
-    cy2 = rng.uniform(-0.3, 0.3)
-    fy = (cy0 * np.cos((np.pi * Yn) / (2.0 * Ly)) + cy1 * np.sin((np.pi * Yn) / Ly) + cy2 * np.cos((2.0 * np.pi * Yn) / Ly))
-
-    return (fx * fy).astype(np.float32)
+DATA_DIR = Path(__file__).resolve().parent
 
 
 def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
@@ -43,9 +30,15 @@ def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
     lower_bounds = np.array([param_ranges[name][0] for name in param_names], dtype=np.float32)
     upper_bounds = np.array([param_ranges[name][1] for name in param_names], dtype=np.float32)
 
-    sampler = qmc.LatinHypercube(d=sample_dim, seed=seed)
-    samples_unit = sampler.random(n=num_sims)
-    samples_scaled = qmc.scale(samples_unit, lower_bounds, upper_bounds).astype(np.float32)
+    rng = np.random.default_rng(seed)
+    edges = np.linspace(0.0, 1.0, num_sims + 1, dtype=np.float64)
+    widths = edges[1:] - edges[:-1]
+    samples_unit = edges[:-1, None] + widths[:, None] * rng.random((num_sims, sample_dim))
+    for j in range(sample_dim):
+        rng.shuffle(samples_unit[:, j])
+
+    samples_scaled = lower_bounds + samples_unit * (upper_bounds - lower_bounds)
+    samples_scaled = samples_scaled.astype(np.float32)
     return samples_scaled
 
 
@@ -65,26 +58,25 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     sim_params = []
     for i in range(num_sims):
         R_c = float(R_c_values[i])
-        # Offset IC by T_right and pin the Dirichlet edge to avoid a spurious
-        # initial boundary discontinuity that can dominate the early transient.
-        T0 = (random_ic(a, b, c, d, X, Y, rng) + T_right).astype(np.float32)
-        T0[-1, :] = np.float32(T_right)
 
-        # choose temporal forcing family randomly per simulation
+        # IC family + params per sim. The smoothstep taper inside build_ic
+        # drives the deviation to zero at the right Dirichlet edge so the
+        # exact pin in the last column does not introduce a discontinuity.
+        ic_family = sample_ic_family(rng)
+        ic_params = IC_SAMPLERS[ic_family](rng, Nx=X.shape[0], Ny=X.shape[1])
+        T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b)
+
         temporal_family = sample_temporal_family(rng_profile)
-
-        # randomly sample the temporal forcing functions parameters
         temporal_params = TEMPORAL_SAMPLERS[temporal_family](rng_profile, dt=dt, t_final=t_final, **temporal_window)
 
-        # randomly choose a spatial profile function
         spatial_family = sample_spatial_family(rng_profile)
-
-        # randomly sample the spatial profile functions parameters
         spatial_params = SPATIAL_SAMPLERS[spatial_family](rng_profile)
 
         sim_params.append({
             "R_c": R_c,
             "T0": T0,
+            "ic_family": ic_family,
+            "ic_params": ic_params,
             "temporal_family": temporal_family,
             "temporal_params": temporal_params,
             "spatial_family": spatial_family,
@@ -120,7 +112,7 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
         Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
 
-    print("Building simulation parameters.")
+    print("Building simulation parameters.", flush=True)
 
     sim_params = build_sim_params(
         a=a, b=b, c=c, d=d, X=X, Y=Y,
@@ -156,22 +148,25 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
 
         trajectories[i] = T_hist[::save_stride].astype(np.float32)
 
-        print(f"Finished simulation {i}")
+        print(f"Finished simulation {i}", flush=True)
 
     x_grid = x.astype(np.float32)
     y_grid = y.astype(np.float32)
     t_grid = t[::save_stride].astype(np.float32)
 
-    np.save("x_grid.npy", x_grid)
-    np.save("y_grid.npy", y_grid)
-    np.save("t_grid.npy", t_grid)
+    save_dir = DATA_DIR
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    np.save(save_dir / "x_grid.npy", x_grid)
+    np.save(save_dir / "y_grid.npy", y_grid)
+    np.save(save_dir / "t_grid.npy", t_grid)
     # Saved t_grid spacing != solver dt when save_stride > 1; persist solver dt
     # so the dataset can normalize tau / dt_n cond slots against the same bounds
     # used during sampling.
-    np.save("dt.npy", np.float64(dt))
-    np.save("trajectories.npy", trajectories)
-    np.save("sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
-    print("Saved:", x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape)
+    np.save(save_dir / "dt.npy", np.float64(dt))
+    np.save(save_dir / "trajectories.npy", trajectories)
+    np.save(save_dir / "sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
+    print("Saved to:", save_dir, x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape, flush=True)
 
 if __name__ == '__main__':
     generate_sim_data(num_sims=8000)
