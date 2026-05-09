@@ -94,8 +94,8 @@ class SnapshotPairDataset(Dataset):
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
     Returns 4-tuple: (spatial, cond, Y, T_stats)
-        spatial : (Nx, Ny, 8)  — [T̃_source, x_norm, y_norm, s_y,
-                                   Q_y_bin_0, ..., Q_y_bin_3]
+        spatial : (Nx, Ny, 4 + FORCING_BINS)  — [T̃_source, x_norm, y_norm, s_y,
+                                   Q_y_bin_0, ..., Q_y_bin_{FORCING_BINS-1}]
         cond      : (28,)    — see COND_DIM layout above
         Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
         T_stats   : (2,)     — [μ_global, σ_global] for denormalization
@@ -481,7 +481,7 @@ if __name__ == '__main__':
 
     # Verify shapes
     x_spatial, cond, yb, t_stats = next(iter(train_loader))
-    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 8)
+    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 4 + FORCING_BINS)
     print(f"cond: {cond.shape}")            # (B, 28)
     print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")      # (B, 2)

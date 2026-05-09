@@ -20,7 +20,7 @@ model:
     modes1: 16
     modes2: 16
     width: 64
-    in_channels: 8
+    in_channels: 12
     out_channels: 1
     n_layers: 4
     cond_dim: 28
@@ -32,10 +32,10 @@ model:
 training:
   device: "auto"
   batch_size: 1024
-  n_snapshots: 14
+  n_snapshots: 20
   n_snapshots_test: 40
   curriculum_warmup: 35
-  epochs: 1500
+  epochs: 101
   learning_rate: 0.002
   weight_decay: 1.0e-5
   noise_std: 0.0
@@ -74,7 +74,7 @@ data:
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "B, Nx, Ny, 8"
+  x_shape: "B, Nx, Ny, 12"
   y_shape: "B, Nx, Ny, 1"
   cond_shape: "B, 28"
   t_stats_shape: "B, 2"

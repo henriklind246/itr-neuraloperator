@@ -26,6 +26,7 @@ from data.dataset import (
 from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
+from src.physics.boundary_forcing import FORCING_BINS
 
 from omegaconf import OmegaConf
 
@@ -671,11 +672,12 @@ def run_one_seed(
     print(f"Training on: {device}")
 
     model_cfg = config["model"]["parameters"]
+    expected_in_channels = 4 + FORCING_BINS
     fno = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", 8),
+        in_channels=model_cfg.get("in_channels", expected_in_channels),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", COND_DIM),

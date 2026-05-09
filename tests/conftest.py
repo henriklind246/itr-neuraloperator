@@ -3,8 +3,11 @@ import pytest
 import torch
 
 from src.physics.fv_solver_1d import FVSolver1D, Layer1D
+from src.physics.boundary_forcing import FORCING_BINS
 from src.operators.fno1d import FNO1d
 from src.operators.fno2d import FNO2d
+
+SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
 
 
 # ---------- solver fixtures ----------
@@ -118,7 +121,7 @@ def small_fno2d():
         modes1=2,
         modes2=2,
         width=8,
-        in_channels=8,
+        in_channels=SPATIAL_IN_CHANNELS,
         out_channels=1,
         n_layers=2,
         cond_dim=28,
@@ -138,7 +141,7 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
                         "modes1": 2,
                         "modes2": 2,
                         "width": 8,
-                        "in_channels": 8,
+                        "in_channels": SPATIAL_IN_CHANNELS,
                         "out_channels": 1,
                         "n_layers": 2,
                         "cond_dim": 28,

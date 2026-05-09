@@ -362,14 +362,17 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
     model_cfg = conf.get("model", {}).get("parameters", {})
     if "modes1" not in model_cfg or "modes2" not in model_cfg:
         raise ValueError("Checkpoint is not a 2D FNO checkpoint: missing modes1/modes2")
-    if model_cfg.get("in_channels", 8) != 8:
-        raise ValueError("Checkpoint uses an incompatible spatial input; train a fresh 8-channel forcing-bin model.")
+    expected_in_channels = 4 + FORCING_BINS
+    if model_cfg.get("in_channels", expected_in_channels) != expected_in_channels:
+        raise ValueError(
+            f"Checkpoint uses an incompatible spatial input; train a fresh {expected_in_channels}-channel forcing-bin model."
+        )
 
     model = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg.get("width", 64),
-        in_channels=model_cfg.get("in_channels", 8),
+        in_channels=model_cfg.get("in_channels", expected_in_channels),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_dim=model_cfg.get("cond_dim", COND_DIM),
