@@ -33,6 +33,7 @@ from src.physics.boundary_forcing import (
 # Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
+SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
 
 
 # ===================== load_sim_data =====================
@@ -218,7 +219,7 @@ class TestSnapshotPairDataset:
     def test_getitem_shapes(self, dataset_subsampled):
         x_spatial, cond, Y, T_stats = dataset_subsampled[0]
         Nx, Ny = 11, 11
-        assert x_spatial.shape == (Nx, Ny, 8)
+        assert x_spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
         assert cond.shape == (COND_DIM,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
@@ -277,7 +278,7 @@ class TestSnapshotPairDataset:
 
     def test_forcing_bin_channels_are_nonnegative(self, dataset_subsampled):
         x_spatial, _, _, _ = dataset_subsampled[0]
-        assert torch.all(x_spatial[:, :, 4:8] >= -1e-6)
+        assert torch.all(x_spatial[:, :, 4:4 + FORCING_BINS] >= -1e-6)
 
     def test_forcing_bin_channels_match_temporal_integrals(self, dataset_subsampled):
         x_spatial, _, _, _ = dataset_subsampled[0]
@@ -301,7 +302,7 @@ class TestSnapshotPairDataset:
             np.broadcast_to(expected_y[None, :], (dataset_subsampled.Nx, dataset_subsampled.Ny)).copy()
         )
         assert np.sum(bins) == pytest.approx(total, abs=1e-8)
-        assert torch.allclose(x_spatial[:, :, 4:8].sum(dim=-1), expected, atol=1e-5)
+        assert torch.allclose(x_spatial[:, :, 4:4 + FORCING_BINS].sum(dim=-1), expected, atol=1e-5)
 
     def test_t_bar_positive(self, dataset_subsampled):
         """Lead time t_bar should always be > 0 (target after source)."""
@@ -439,7 +440,7 @@ class TestCreateDataloaders:
         assert x_spatial.shape[0] <= 4
         assert x_spatial.shape[1] == 11   # Nx
         assert x_spatial.shape[2] == 11   # Ny
-        assert x_spatial.shape[3] == 8    # T_source + x_norm + y_norm + s_y + Q_y bins
+        assert x_spatial.shape[3] == SPATIAL_IN_CHANNELS    # T_source + x_norm + y_norm + s_y + Q_y bins
         assert cond.shape[1] == COND_DIM
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2     # mu_global, sigma_global
@@ -592,7 +593,7 @@ class TestSolverDatasetIntegration:
         assert len(ds) == num_sims * (5 * 4 // 2)
 
         spatial, cond, Y, T_stats = ds[0]
-        assert spatial.shape == (Nx, Ny, 8)
+        assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
         assert cond.shape == (COND_DIM,)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)

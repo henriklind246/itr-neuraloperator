@@ -1,6 +1,9 @@
 import torch
 
 from src.operators.fno2d import ConditionalInstanceNorm2d, FNO2d
+from src.physics.boundary_forcing import FORCING_BINS
+
+SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
 
 
 class TestConditionalInstanceNorm2d:
@@ -51,8 +54,8 @@ class TestConditionalInstanceNorm2d:
 
 class TestFNO2d:
     def test_forward_returns_channels_last_output(self):
-        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=8, out_channels=1, n_layers=2, cond_dim=28)
-        spatial = torch.randn(2, 11, 11, 8)
+        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
+        spatial = torch.randn(2, 11, 11, SPATIAL_IN_CHANNELS)
         cond = torch.randn(2, 28)
 
         out = model(spatial, cond)

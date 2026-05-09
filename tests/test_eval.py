@@ -6,6 +6,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.eval import evaluate, mean_std, print_seed_report
 from src.operators.fno2d import FNO2d
+from src.physics.boundary_forcing import FORCING_BINS
+
+SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
 
 
 # ===================== evaluate =====================
@@ -15,10 +18,10 @@ def eval_setup():
     """Tiny model + 4-tuple loader for eval tests."""
     Nx = 11
     Ny = 11
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=8, out_channels=1, n_layers=2, cond_dim=28)
+    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
     model.eval()
 
-    x_spatial = torch.randn(4, Nx, Ny, 8)
+    x_spatial = torch.randn(4, Nx, Ny, SPATIAL_IN_CHANNELS)
     cond = torch.rand(4, 28)
     Y = torch.randn(4, Nx, Ny, 1)
     T_stats = torch.stack([

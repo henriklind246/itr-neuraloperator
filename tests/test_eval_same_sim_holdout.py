@@ -2,6 +2,9 @@ import subprocess
 from pathlib import Path
 
 from scripts import eval_same_sim_holdout
+from src.physics.boundary_forcing import FORCING_BINS
+
+SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
 
 
 def _base_config(tmp_path):
@@ -21,7 +24,7 @@ def _base_config(tmp_path):
                 "modes1": 2,
                 "modes2": 2,
                 "width": 8,
-                "in_channels": 8,
+                "in_channels": SPATIAL_IN_CHANNELS,
                 "out_channels": 1,
                 "n_layers": 2,
                 "cond_dim": 28,
