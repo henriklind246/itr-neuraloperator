@@ -20,9 +20,9 @@ spatial(x, y) = [
   T_tilde(x, y, t_s),      # globally normalized source temperature
   x_norm, y_norm,          # normalized coordinates
   s(y),                    # spatial forcing profile, broadcast over x
-  Q_y_bin_0(y), ...,       # FORCING_BINS=4 future-forcing integrals over
-  Q_y_bin_3(y),            # equal sub-intervals of [t_s, t_j], broadcast over x
-]                          # 8 channels total
+  Q_y_bin_0(y), ...,       # FORCING_BINS=16 future-forcing integrals over
+  Q_y_bin_15(y),           # equal sub-intervals of [t_s, t_j], broadcast over x
+]                          # 20 channels total
 
 cond = [
   t_bar_norm, t_s_norm, R_c_norm,                # base
@@ -52,8 +52,8 @@ Current high-level state:
 | Temporal forcing families | `sin`, `exp`, `pulse_train`, `exp_train` |
 | Spatial forcing families | `uniform`, `patch`, `gaussian`, `triangle` |
 | Dataset target | 8000 simulations in current config/main generation path |
-| Model input | 8 spatial channels plus 28D conditioning vector |
-| Current empirical issue | Cross-simulation validation remains much higher than train |
+| Model input | 20 spatial channels plus 28D conditioning vector |
+| Current empirical issue | Cross-simulation validation remains much higher than train, especially for pulse-like forcing and long leads |
 
 ---
 
@@ -158,14 +158,14 @@ factorization.
 
 ### Future-Forcing Bin Channels
 
-The dataset computes `FORCING_BINS = 4` temporal integrals over equal
+The dataset computes `FORCING_BINS = 16` temporal integrals over equal
 sub-intervals of `[t_s, t_j]`:
 
 ```text
 Q_bin_k(y) = s(y) * integral_bin_k a(t) dt
 ```
 
-These four fields are normalized by:
+These sixteen fields are normalized by:
 
 ```text
 Q_REF = SIN_AMP_RANGE[1] * t_final / FORCING_BINS
@@ -238,8 +238,9 @@ Current generation settings:
 | Current generated target | 8000 simulations |
 | Split | 70/15/15 by simulation ID |
 
-`generate_sim_data` defaults to 2000 sims when called directly, but the current
-`__main__` path and `conf/config.yaml` target 8000 simulations.
+`generate_sim_data` defaults to 2000 sims when imported and called without
+arguments, but the current `__main__` path and `conf/config.yaml` target 8000
+simulations.
 
 ### Sampling
 
@@ -259,6 +260,8 @@ The saved `sim_params.npy` schema is:
 {
   "R_c": float,
   "T0": np.ndarray shape (Nx, Ny),
+  "ic_family": str,
+  "ic_params": dict,
   "temporal_family": str,
   "temporal_params": dict,
   "spatial_family": str,
@@ -268,14 +271,19 @@ The saved `sim_params.npy` schema is:
 
 ### Initial Conditions
 
-Each simulation uses a smooth, separable, y-varying initial condition:
+Initial conditions are sampled from the registry in
+`src/physics/init_conditions.py`:
 
-```text
-T0(x, y) = random smooth fx(x) * random smooth fy(y) + 300
-```
+| Family | Description |
+|--------|-------------|
+| `uniform_2d` | Uniform offset around the right Dirichlet temperature |
+| `random_sinusoid_2d` | Sum of low-frequency sinusoidal modes |
+| `grf_2d` | Gaussian random field with sampled length scale and amplitude |
+| `hot_spot_2d` | Sum of Gaussian hot/cold spots |
 
-The right Dirichlet edge is pinned to 300 K in the initial condition to avoid a
-spurious initial discontinuity at `x = 1`.
+All IC families are added to `T_right = 300 K`, tapered smoothly near the right
+edge, and pinned exactly at `x = 1` so the initial field is consistent with the
+Dirichlet boundary.
 
 ### Output Files
 
@@ -305,12 +313,13 @@ Current config:
 
 | Setting | Value |
 |---------|-------|
-| Training snapshots per sim | `n_snapshots = 14` |
-| Test snapshots per sim | `n_snapshots_test = 40` |
-| Pairs per training sim | `C(14, 2) = 91` |
+| Training snapshots per sim | `n_snapshots = 20` |
+| Test snapshots per sim | `n_snapshots_test = 40`, effectively all 31 saved snapshots in the current dataset |
+| Pairs per training sim | `C(20, 2) = 190` |
 | 8000-sim split | 5600 train, 1200 val, 1200 test |
-| Training pairs at full curriculum | 509,600 |
-| Validation pairs per validation pass | 109,200 |
+| Training pairs at full curriculum | 1,064,000 |
+| Validation pairs per validation pass | 228,000 |
+| Test pairs per test pass | 558,000 |
 
 ### Per-Sample Output
 
@@ -318,7 +327,7 @@ Each dataset item returns:
 
 | Tensor | Shape | Description |
 |--------|-------|-------------|
-| `spatial` | `(Nx, Ny, 8)` | Spatial channels |
+| `spatial` | `(Nx, Ny, 20)` | Spatial channels |
 | `cond` | `(28,)` | Conditioning vector |
 | `Y` | `(Nx, Ny, 1)` | Target normalized temperature |
 | `T_stats` | `(2,)` | `[mu_global, sigma_global]` |
@@ -334,9 +343,21 @@ Spatial channel layout:
 5: Q_y_bin_1
 6: Q_y_bin_2
 7: Q_y_bin_3
+8: Q_y_bin_4
+9: Q_y_bin_5
+10: Q_y_bin_6
+11: Q_y_bin_7
+12: Q_y_bin_8
+13: Q_y_bin_9
+14: Q_y_bin_10
+15: Q_y_bin_11
+16: Q_y_bin_12
+17: Q_y_bin_13
+18: Q_y_bin_14
+19: Q_y_bin_15
 ```
 
-`s_y` and the four `Q_y_bin_k` channels are y-only profiles broadcast across x
+`s_y` and the sixteen `Q_y_bin_k` channels are y-only profiles broadcast across x
 so the model sees the spatial forcing footprint and the per-bin heat-injection
 totals as full 2D fields.
 
@@ -408,7 +429,7 @@ model(spatial, cond) -> y_pred
 with:
 
 ```text
-spatial: (B, Nx, Ny, 8)
+spatial: (B, Nx, Ny, 20)
 cond:    (B, 28)
 y_pred:  (B, Nx, Ny, 1)
 ```
@@ -421,7 +442,7 @@ Default config:
 | `modes2` | 16 |
 | `width` | 64 |
 | `n_layers` | 4 |
-| `in_channels` | 8 |
+| `in_channels` | 20 |
 | `cond_dim` | 28 |
 | `cond_hidden` | 256 |
 | `dropout` | 0.0 |
@@ -431,7 +452,7 @@ Default config:
 
 | Stage | Operation |
 |-------|-----------|
-| Lift | `Linear(8, width)` on channels-last spatial input |
+| Lift | `Linear(20, width)` on channels-last spatial input |
 | Permute | Convert to `(B, width, Nx, Ny)` |
 | Pad | Zero-pad x and y by 8 on the high side |
 | Fourier blocks | `SpectralConv2d + 1x1 Conv2d + CIN + GELU + dropout` |
@@ -569,6 +590,8 @@ Current training defaults:
 | Peak LR | `0.002` |
 | Weight decay | `1e-5` |
 | Batch size | `1024` |
+| Epochs | `101` |
+| Training snapshots | `20` |
 | Gradient clipping | `1.0` |
 | Validate every | 10 epochs |
 | Patience | 20 validation checks |
@@ -618,7 +641,7 @@ Evaluation:
 5. Reports physical-space `test_rel_l2` and `test_iface_rel_l2`.
 6. Writes `seed_report.json`.
 
-The eval code expects the current 8-channel model input. Old 4-channel
+The eval code expects the current 20-channel model input. Old 12-channel
 checkpoints are intentionally incompatible.
 
 ---
@@ -674,13 +697,13 @@ uniformly distributed:
 
 Current likely next interventions:
 
-1. Rerun clean `InstanceNorm2d` baseline for any experiment that used the
-   padding-aware CIN variant.
+1. Run and analyze the 20-channel / 16-bin / 20-snapshot experiment cleanly.
 2. Add lead-time-balanced sampling or weighting.
 3. Add hard-regime sampling/weighting for `pulse_train` and `exp_train`.
-4. Consider increasing `FORCING_BINS` from 4 to 8 for sharper pulse timing.
-5. If generating more data, prefer targeted hard-regime simulations over
+4. If generating more data, prefer targeted hard-regime simulations over
    uniform brute-force expansion.
+5. Consider single-node multi-GPU training if experiment turnaround remains
+   dominated by 12-20 hour single-GPU runs.
 
 ---
 

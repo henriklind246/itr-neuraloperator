@@ -161,7 +161,7 @@ class FNO2d(nn.Module):
         modes1: int,
         modes2: int,
         width: int,
-        in_channels: int = 12,
+        in_channels: int = 20,
         out_channels: int = 1,
         n_layers: int = 4,
         cond_dim: int = 28,
