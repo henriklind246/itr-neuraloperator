@@ -47,7 +47,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         mu_global=mu_global,
         sigma_global=sigma_global,
         n_snapshots=10,
-        n_snapshots_test=40,
+        n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
         dt=solver_dt,
     )
 
@@ -216,18 +216,3 @@ def save_report(run_root: str, results: list[dict], summary: dict) -> None:
     with out_path.open("w") as f:
         json.dump(out, f, indent=2)
     print(f"Saved report -> {out_path}")
-
-if __name__ == '__main__':
-    project_root = Path(__file__).resolve().parents[2]
-    run_root = str(project_root / "runs" / "experiment0" / "config0")
-    # get results from evaluating model with a conf on all seeds
-    results = eval_all_seeds(run_root)
-
-    for r in results:
-        print(f"seed={r['seed']} best epoch: {r['best_epoch']} best validation loss: {r['best_val']} test_rel_l2: {r['test_rel_l2']} test_iface_rel_l2: {r['test_iface_rel_l2']}.")
-
-    # print summary evaluation of seeds
-    summary = print_seed_report(results)
-
-    # save to disk
-    save_report(run_root=run_root, results=results, summary=summary)
