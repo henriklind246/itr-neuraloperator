@@ -33,21 +33,23 @@ def eval_setup():
     return model, loader, device
 
 
+EXPECTED_METRIC_KEYS = {"rel_l2_norm", "rel_l2_phys", "iface_rel_l2_norm", "iface_rel_l2_phys"}
+
+
 class TestEvaluate:
-    def test_returns_tuple(self, eval_setup):
+    def test_returns_dict(self, eval_setup):
         model, loader, device = eval_setup
         result = evaluate(model, loader, device)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-        test_rel_l2, test_iface_rel_l2 = result
-        assert isinstance(test_rel_l2, float)
-        assert isinstance(test_iface_rel_l2, float)
+        assert isinstance(result, dict)
+        assert set(result.keys()) == EXPECTED_METRIC_KEYS
+        for v in result.values():
+            assert isinstance(v, float)
 
     def test_nonnegative(self, eval_setup):
         model, loader, device = eval_setup
-        test_rel_l2, test_iface_rel_l2 = evaluate(model, loader, device)
-        assert test_rel_l2 >= 0
-        assert test_iface_rel_l2 >= 0
+        result = evaluate(model, loader, device)
+        for k in ("rel_l2_norm", "rel_l2_phys"):
+            assert result[k] >= 0
 
     def test_with_iface_mask(self, eval_setup):
         model, loader, device = eval_setup
@@ -55,9 +57,17 @@ class TestEvaluate:
         Ny = 11
         iface_mask = torch.zeros(Nx, Ny, dtype=torch.bool)
         iface_mask[4:7, :] = True  # mark 3 columns as interface
-        test_rel_l2, test_iface_rel_l2 = evaluate(model, loader, device, iface_mask=iface_mask)
-        assert isinstance(test_iface_rel_l2, float)
-        assert test_iface_rel_l2 >= 0
+        result = evaluate(model, loader, device, iface_mask=iface_mask)
+        assert isinstance(result["iface_rel_l2_norm"], float)
+        assert isinstance(result["iface_rel_l2_phys"], float)
+        assert result["iface_rel_l2_norm"] >= 0
+        assert result["iface_rel_l2_phys"] >= 0
+
+    def test_iface_zero_without_mask(self, eval_setup):
+        model, loader, device = eval_setup
+        result = evaluate(model, loader, device)
+        assert result["iface_rel_l2_norm"] == 0.0
+        assert result["iface_rel_l2_phys"] == 0.0
 
     def test_model_stays_eval(self, eval_setup):
         model, loader, device = eval_setup
@@ -94,23 +104,40 @@ class TestMeanStd:
 
 # ===================== print_seed_report =====================
 
+def _seed_result(seed, best_val, norm, phys, iface_norm, iface_phys):
+    return {
+        "seed": seed,
+        "best_epoch": 10,
+        "best_val": best_val,
+        "test_rel_l2_norm": norm,
+        "test_rel_l2": phys,
+        "test_iface_rel_l2_norm": iface_norm,
+        "test_iface_rel_l2": iface_phys,
+        "ckpt": "x",
+    }
+
+
 class TestPrintSeedReport:
     def test_returns_dict(self):
         results = [
-            {"seed": 0, "best_epoch": 10, "best_val": 0.5, "test_rel_l2": 0.6, "test_iface_rel_l2": 0.8, "ckpt": "x"},
-            {"seed": 1, "best_epoch": 20, "best_val": 0.4, "test_rel_l2": 0.5, "test_iface_rel_l2": 0.7, "ckpt": "y"},
+            _seed_result(0, 0.5, 2.6, 0.06, 2.8, 0.08),
+            _seed_result(1, 0.4, 2.5, 0.05, 2.7, 0.07),
         ]
         summary = print_seed_report(results)
         assert isinstance(summary, dict)
-        assert "num_seeds" in summary
-        assert "best_val_loss_mean" in summary
-        assert "test_rel_l2_mean" in summary
-        assert "test_iface_rel_l2_mean" in summary
-        assert "test_iface_rel_l2_std" in summary
+        for key in (
+            "num_seeds",
+            "best_val_loss_mean",
+            "test_rel_l2_norm_mean",
+            "test_rel_l2_norm_std",
+            "test_rel_l2_mean",
+            "test_iface_rel_l2_norm_mean",
+            "test_iface_rel_l2_mean",
+            "test_iface_rel_l2_std",
+        ):
+            assert key in summary
 
     def test_correct_num_seeds(self):
-        results = [
-            {"seed": 0, "best_epoch": 10, "best_val": 0.5, "test_rel_l2": 0.6, "test_iface_rel_l2": 0.8, "ckpt": "x"},
-        ]
+        results = [_seed_result(0, 0.5, 2.6, 0.06, 2.8, 0.08)]
         summary = print_seed_report(results)
         assert summary["num_seeds"] == 1

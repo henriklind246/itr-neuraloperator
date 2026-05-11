@@ -39,10 +39,12 @@ def main() -> int:
 
     for r in results:
         print(
-            f"seed={r['seed']} best epoch: {r['best_epoch']} "
-            f"best validation loss: {r['best_val']} "
-            f"test_rel_l2: {r['test_rel_l2']} "
-            f"test_iface_rel_l2: {r['test_iface_rel_l2']}."
+            f"seed={r['seed']} best_epoch={r['best_epoch']} "
+            f"best_val={r['best_val']:.6f} "
+            f"test_rel_l2_norm={r['test_rel_l2_norm']:.6f} "
+            f"test_rel_l2_phys={r['test_rel_l2']:.6f} "
+            f"test_iface_rel_l2_norm={r['test_iface_rel_l2_norm']:.6f} "
+            f"test_iface_rel_l2_phys={r['test_iface_rel_l2']:.6f}"
         )
 
     summary = print_seed_report(results)

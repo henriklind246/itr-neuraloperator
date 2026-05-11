@@ -17,7 +17,14 @@ import math
 import json
 from datetime import datetime
 
-"""File loads checkpoint, runs test metrics test_rel_l2 and test_iface_rel_l2, outputs seed_report.json"""
+"""File loads checkpoint, runs test metrics in normalized AND physical space, outputs seed_report.json.
+
+Per-seed result keys:
+    test_rel_l2_norm        normalized-space relative L2 (%) — comparable to val_rel_l2
+    test_rel_l2             physical-space (Kelvin) relative L2 (%)
+    test_iface_rel_l2_norm  normalized-space interface-weighted relative L2 (%)
+    test_iface_rel_l2       physical-space interface-weighted relative L2 (%)
+"""
 
 # -------- LOAD TEST SET ---------
 
@@ -56,15 +63,23 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
 # -------- EVAL MODEL ON TEST SET  ---------
 
 def evaluate(model, test_loader, device, iface_mask=None):
-    """Return (test_rel_l2, test_iface_rel_l2) after evaluation on test set.
+    """Return a dict of test metrics in both normalized and physical space.
 
-    Metrics are computed in physical (denormalized) space using T_stats
-    from the dataset.
+    Keys:
+        rel_l2_norm:        relative L2 (%) on normalized outputs — directly
+                            comparable to train/val_rel_l2 in train_metrics.csv.
+        rel_l2_phys:        relative L2 (%) after denormalizing to Kelvin —
+                            small because the ~300 K baseline inflates the
+                            denominator. Useful for "% of absolute T" intuition.
+        iface_rel_l2_norm:  interface-weighted relative L2 (%) on normalized outputs.
+        iface_rel_l2_phys:  interface-weighted relative L2 (%) in Kelvin.
     """
     with torch.no_grad():
         model.eval()
-        test_loss = 0.0
-        test_iface = 0.0
+        rel_l2_norm = 0.0
+        rel_l2_phys = 0.0
+        iface_rel_l2_norm = 0.0
+        iface_rel_l2_phys = 0.0
 
         for x_spatial, cond, y_batch, T_stats in test_loader:
             x_spatial = x_spatial.to(device)
@@ -74,23 +89,34 @@ def evaluate(model, test_loader, device, iface_mask=None):
 
             y_pred = model(x_spatial, cond)
 
-            # Denormalize to physical space
-            mu_s = T_stats[:, 0]    # (B,)
-            sigma_s = T_stats[:, 1]  # (B,)
+            # Normalized-space metric (same convention as train/val_rel_l2)
+            batch_rel_l2_norm = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
+            rel_l2_norm += batch_rel_l2_norm.item()
+
+            # Physical-space metric (denormalized to Kelvin)
+            mu_s = T_stats[:, 0]
+            sigma_s = T_stats[:, 1]
             y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
             y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
+            batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
+            rel_l2_phys += batch_rel_l2_phys.item()
 
-            test_rel_l2 = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
-
-            test_loss += test_rel_l2.item()
             if iface_mask is not None:
-                test_iface += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
+                iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+                iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
 
-        # average test loss across all batches
-        test_loss /= len(test_loader)
-        test_iface /= len(test_loader)
+        n_batches = len(test_loader)
+        rel_l2_norm /= n_batches
+        rel_l2_phys /= n_batches
+        iface_rel_l2_norm /= n_batches
+        iface_rel_l2_phys /= n_batches
 
-    return test_loss, test_iface
+    return {
+        "rel_l2_norm": rel_l2_norm,
+        "rel_l2_phys": rel_l2_phys,
+        "iface_rel_l2_norm": iface_rel_l2_norm,
+        "iface_rel_l2_phys": iface_rel_l2_phys,
+    }
 
 
 # --------- EVAL ALL SEEDS IN RUNS ---------
@@ -141,21 +167,23 @@ def eval_all_seeds(run_root: str):
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
-        test_rel_l2, test_iface_rel_l2 = evaluate(model=fno, test_loader=test_loader, device=device, iface_mask=iface_mask)
+        metrics = evaluate(model=fno, test_loader=test_loader, device=device, iface_mask=iface_mask)
 
         results.append(
             {
                 "seed": ckpt.get("seed", seed_dir.name),
                 "best_epoch": ckpt["epoch"],
                 "best_val": float(ckpt["best_val"]),
-                "test_rel_l2": float(test_rel_l2),
-                "test_iface_rel_l2": float(test_iface_rel_l2),
-                "ckpt": str(ckpt_path)
+                "test_rel_l2_norm": float(metrics["rel_l2_norm"]),
+                "test_rel_l2": float(metrics["rel_l2_phys"]),
+                "test_iface_rel_l2_norm": float(metrics["iface_rel_l2_norm"]),
+                "test_iface_rel_l2": float(metrics["iface_rel_l2_phys"]),
+                "ckpt": str(ckpt_path),
             }
         )
 
-    # sort by test performance (done by sort() which goes from smallest -> largest)
-    results.sort(key=lambda r: r['test_rel_l2'])
+    # sort by normalized test performance (apples-to-apples with val_rel_l2)
+    results.sort(key=lambda r: r["test_rel_l2_norm"])
     return results
 
 
@@ -174,33 +202,45 @@ def mean_std(values: list[float]) -> tuple[float, float]:
     return mu, math.sqrt(var)
 
 def print_seed_report(results: list[dict]) -> dict:
-    best_vals = [r['best_val'] for r in results]
-    test_rel_l2 = [r['test_rel_l2'] for r in results]
-    test_iface = [r['test_iface_rel_l2'] for r in results]
+    best_vals = [r["best_val"] for r in results]
+    test_rel_l2_norm = [r["test_rel_l2_norm"] for r in results]
+    test_rel_l2 = [r["test_rel_l2"] for r in results]
+    test_iface_norm = [r["test_iface_rel_l2_norm"] for r in results]
+    test_iface = [r["test_iface_rel_l2"] for r in results]
 
-    # compute the mean and std for validation, test, and interface test
     val_mu, val_std = mean_std(best_vals)
+    norm_mu, norm_std = mean_std(test_rel_l2_norm)
     test_mu, test_std = mean_std(test_rel_l2)
+    iface_norm_mu, iface_norm_std = mean_std(test_iface_norm)
     iface_mu, iface_std = mean_std(test_iface)
 
-    # print seed report
     print("\n===== Seed Report =====")
     print(f"Number of seeds: {len(results)}")
-    print(f"best_val_loss mean & standard dist. ({val_mu}, {val_std})")
-    print(f"test_rel_l2 mean & standard dist. ({test_mu}, {test_std})")
-    print(f"test_iface_rel_l2 mean & standard dist. ({iface_mu}, {iface_std})")
+    print(f"best_val_loss            mean, std: ({val_mu}, {val_std})")
+    print(f"test_rel_l2_norm         mean, std: ({norm_mu}, {norm_std})   <- comparable to val_rel_l2")
+    print(f"test_rel_l2 (physical)   mean, std: ({test_mu}, {test_std})")
+    print(f"test_iface_rel_l2_norm   mean, std: ({iface_norm_mu}, {iface_norm_std})")
+    print(f"test_iface_rel_l2 (phys) mean, std: ({iface_mu}, {iface_std})")
 
-    # also print best seed by lowest test error
-    best = min(results, key=lambda r: r['test_rel_l2'])
-    print(f"Best by lowest test error: seed={best['seed']} test_rel_l2={best['test_rel_l2']} test_iface_rel_l2={best['test_iface_rel_l2']}")
+    best = min(results, key=lambda r: r["test_rel_l2_norm"])
+    print(
+        f"Best by lowest normalized test error: seed={best['seed']} "
+        f"test_rel_l2_norm={best['test_rel_l2_norm']} "
+        f"test_rel_l2={best['test_rel_l2']} "
+        f"test_iface_rel_l2_norm={best['test_iface_rel_l2_norm']} "
+        f"test_iface_rel_l2={best['test_iface_rel_l2']}"
+    )
 
-    # return dict
     return {
         "num_seeds": len(results),
         "best_val_loss_mean": val_mu,
         "best_val_loss_std": val_std,
+        "test_rel_l2_norm_mean": norm_mu,
+        "test_rel_l2_norm_std": norm_std,
         "test_rel_l2_mean": test_mu,
         "test_rel_l2_std": test_std,
+        "test_iface_rel_l2_norm_mean": iface_norm_mu,
+        "test_iface_rel_l2_norm_std": iface_norm_std,
         "test_iface_rel_l2_mean": iface_mu,
         "test_iface_rel_l2_std": iface_std,
     }
