@@ -26,8 +26,8 @@ model:
     cond_dim: 28
     cond_hidden: 256
     activation: "GELU"
-    dropout: 0.02
-    spectral_dropout: 0.01
+    dropout: 0.0
+    spectral_dropout: 0.0
 
 training:
   device: "auto"
