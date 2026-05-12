@@ -26,8 +26,8 @@ model:
     cond_dim: 28
     cond_hidden: 256
     activation: "GELU"
-    dropout: 0.0
-    spectral_dropout: 0.0
+    dropout: 0.02
+    spectral_dropout: 0.01
 
 training:
   device: "auto"
@@ -37,7 +37,7 @@ training:
   curriculum_warmup: 35
   epochs: 101
   learning_rate: 0.002
-  weight_decay: 1.0e-5
+  weight_decay: 3.0e-5
   noise_std: 0.0
   grad_clip: 1.0
   scheduler:
