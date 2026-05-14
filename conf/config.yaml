@@ -78,7 +78,7 @@ data:
   y_shape: "B, Nx, Ny, 1"
   cond_shape: "B, 28"
   t_stats_shape: "B, 2"
-  num_sims: 8000
+  num_sims: 10000
 
 hydra:
   mode: MULTIRUN
