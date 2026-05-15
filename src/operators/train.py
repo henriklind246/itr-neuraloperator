@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam, AdamW
 
 from data.dataset import (
@@ -23,8 +25,9 @@ from data.dataset import (
     load_solver_dt,
     split_sim_ids,
 )
+from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
-from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
+from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 from src.operators.utils import resolve_device
 from src.physics.boundary_forcing import FORCING_BINS
 
@@ -242,6 +245,20 @@ def _write_final_metrics(
         },
     }
     (run_path / "final_metrics.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def resolve_num_workers(config: dict, world_size: int) -> int:
+    """Decide DataLoader worker count. Config takes precedence; otherwise
+    derive from `SLURM_CPUS_PER_TASK` divided by `world_size`. Default: 0."""
+    cfg_workers = config.get("training", {}).get("num_workers", None)
+    if cfg_workers is not None:
+        return int(cfg_workers)
+
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus is not None:
+        return max(0, int(slurm_cpus) // max(1, world_size))
+
+    return 0
 
 
 def build_optimizer(config: dict, params) -> torch.optim.Optimizer:
@@ -474,11 +491,31 @@ def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
     raise ValueError(f"Unsupported scheduler type: {sched_type}")
 
 
-def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=None, grad_clip=None) -> tuple[float, float, float]:
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    loss_fn,
+    device,
+    iface_mask=None,
+    grad_clip=None,
+    dist_info: DistInfo | None = None,
+) -> tuple[float, float, float]:
+    """Train one epoch. Under DDP, reduces sums (loss, MSE, ||y||^2, iface MSE,
+    ||y_iface||^2, sample counts) across ranks and computes true global metrics
+    from those sums — not an average of per-rank ratios."""
+    if dist_info is None:
+        dist_info = get_dist_info()
+
     model.train()
-    training_loss = 0.0
-    train_rel_l2 = 0.0
-    train_iface_rel_l2 = 0.0
+
+    loss_sum = 0.0
+    mse_sum = 0.0
+    target_sq_sum = 0.0
+    iface_mse_sum = 0.0
+    iface_target_sq_sum = 0.0
+    n_samples = 0
+    n_iface_voxels = 0  # number of (sample, iface_voxel) entries summed
 
     # _T_stats is not used since error metrics are computed in z-score temp. source space
     for x_spatial, cond, y_batch, _T_stats in train_loader:
@@ -493,17 +530,43 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device, iface_mask=
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
-        training_loss += loss.item()
 
         with torch.no_grad():
-            batch_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
-            train_rel_l2 += batch_rel_l2.item()
-            if iface_mask is not None:
-                train_iface_rel_l2 += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+            b = x_spatial.shape[0]
+            loss_sum += loss.item() * b
+            n_samples += b
 
-    training_loss /= len(train_loader)
-    train_rel_l2 /= len(train_loader)
-    train_iface_rel_l2 /= len(train_loader)
+            mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
+            target_sq_sum += torch.sum(y_batch ** 2).item()
+
+            if iface_mask is not None:
+                pred_iface = y_pred[:, iface_mask, :]
+                true_iface = y_batch[:, iface_mask, :]
+                iface_mse_sum += torch.sum((pred_iface - true_iface) ** 2).item()
+                iface_target_sq_sum += torch.sum(true_iface ** 2).item()
+                n_iface_voxels += pred_iface.numel()
+
+    if dist_info.is_distributed:
+        t = torch.tensor(
+            [loss_sum, mse_sum, target_sq_sum, iface_mse_sum, iface_target_sq_sum,
+             float(n_samples), float(n_iface_voxels)],
+            device=device, dtype=torch.float64,
+        )
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        loss_sum = t[0].item()
+        mse_sum = t[1].item()
+        target_sq_sum = t[2].item()
+        iface_mse_sum = t[3].item()
+        iface_target_sq_sum = t[4].item()
+        n_samples = int(t[5].item())
+        n_iface_voxels = int(t[6].item())
+
+    training_loss = loss_sum / max(n_samples, 1)
+    train_rel_l2 = math.sqrt(mse_sum / max(target_sq_sum, 1e-12)) * 100.0
+    if iface_mask is not None and n_iface_voxels > 0:
+        train_iface_rel_l2 = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
+    else:
+        train_iface_rel_l2 = 0.0
     return training_loss, train_rel_l2, train_iface_rel_l2
 
 
@@ -550,11 +613,23 @@ def validate(
     pair_csv_path: str | Path | None = None,
     epoch: int | None = None,
 ) -> tuple[float, float]:
-    """Return (val_rel_l2, val_iface_rel_l2) after validation."""
+    """Return (val_rel_l2, val_iface_rel_l2) after validation.
+
+    Pass the **unwrapped** model (not the DDP wrapper) — see Fix 1: a rank-0-only
+    DDP forward would deadlock other ranks waiting on a collective.
+    Validation is intended to run on rank 0 only; the caller broadcasts results.
+
+    Metric semantics: global ratio sqrt(sum MSE / sum target_sq), consistent
+    with `train_one_epoch`.
+    """
     with torch.no_grad():
         model.eval()
-        val_loss = 0.0
-        val_iface = 0.0
+
+        mse_sum = 0.0
+        target_sq_sum = 0.0
+        iface_mse_sum = 0.0
+        iface_target_sq_sum = 0.0
+
         pair_cursor = 0
         write_pairs = dataset is not None and pair_csv_path is not None and epoch is not None
         pair_file = None
@@ -575,17 +650,21 @@ def validate(
                 y_batch = y_batch.to(device)
 
                 y_pred = model(x_spatial, cond)
-                val_rel_l2 = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
-                val_loss += val_rel_l2.item()
+                mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
+                target_sq_sum += torch.sum(y_batch ** 2).item()
+
                 if iface_mask is not None:
-                    val_iface += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+                    pred_iface = y_pred[:, iface_mask, :]
+                    true_iface = y_batch[:, iface_mask, :]
+                    iface_mse_sum += torch.sum((pred_iface - true_iface) ** 2).item()
+                    iface_target_sq_sum += torch.sum(true_iface ** 2).item()
 
                 if write_pairs and pair_writer is not None and dataset is not None:
                     rel_l2 = _per_pair_rel_l2_percent(y_pred, y_batch).cpu()
                     if iface_mask is not None:
-                        pred_iface = y_pred[:, iface_mask, :]
-                        true_iface = y_batch[:, iface_mask, :]
-                        iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface[:, :, None, :], true_iface[:, :, None, :]).cpu()
+                        pred_iface_b = y_pred[:, iface_mask, :]
+                        true_iface_b = y_batch[:, iface_mask, :]
+                        iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface_b[:, :, None, :], true_iface_b[:, :, None, :]).cpu()
                     else:
                         iface_rel_l2 = torch.zeros_like(rel_l2)
                     batch_size = x_spatial.shape[0]
@@ -596,8 +675,11 @@ def validate(
             if pair_file is not None:
                 pair_file.close()
 
-        val_loss /= len(val_loader)
-        val_iface /= len(val_loader)
+        val_loss = math.sqrt(mse_sum / max(target_sq_sum, 1e-12)) * 100.0
+        if iface_mask is not None:
+            val_iface = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
+        else:
+            val_iface = 0.0
         return val_loss, val_iface
 
 
@@ -609,21 +691,28 @@ def run_one_seed(
     train_loader_override=None,
     val_loader_override=None,
 ) -> dict[str, float | int | str]:
+    dist_info = get_dist_info()
+    is_main = dist_info.rank == 0
+
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
 
     _t_start = time.time()
-    _capture_git_provenance(run_path)
-    _capture_job_context(run_path)
-    _dump_resolved_config(run_path, config)
+    if is_main:
+        _capture_git_provenance(run_path)
+        _capture_job_context(run_path)
+        _dump_resolved_config(run_path, config)
+    if dist_info.is_distributed:
+        dist.barrier()
 
     # --- Skip completed runs ---
     if _is_training_complete(run_path):
         result = _load_completed_result(run_path, seed)
-        print(f"Seed {seed}: training already complete (best_val={result['best_val']:.4f}%), skipping.")
-        _write_final_metrics(
-            run_path, seed=seed, config=config, wall_time_s=0.0, status="already_complete"
-        )
+        if is_main:
+            print(f"Seed {seed}: training already complete (best_val={result['best_val']:.4f}%), skipping.")
+            _write_final_metrics(
+                run_path, seed=seed, config=config, wall_time_s=0.0, status="already_complete"
+            )
         return result
 
     # --- Check for interrupted run ---
@@ -648,6 +737,7 @@ def run_one_seed(
         train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
         mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
+        num_workers = resolve_num_workers(config, dist_info.world_size)
         training_set, validation_set, _ = create_dataloaders(
             trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
             train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
@@ -658,7 +748,11 @@ def run_one_seed(
             n_snapshots=config["training"].get("n_snapshots", 15),
             n_snapshots_test=config["training"].get("n_snapshots_test", None),
             noise_std=config["training"].get("noise_std", 0.0),
+            num_workers=num_workers,
             dt=solver_dt,
+            world_size=dist_info.world_size,
+            rank=dist_info.rank,
+            sampler_seed=seed,
         )
     else:
         training_set = train_loader_override
@@ -668,8 +762,12 @@ def run_one_seed(
         mu_global = float(training_set.dataset.mu_global)
         sigma_global = float(training_set.dataset.sigma_global)
 
-    device = resolve_device(config["training"].get("device", "auto"))
-    print(f"Training on: {device}")
+    device = resolve_device(
+        config["training"].get("device", "auto"),
+        local_rank=dist_info.local_rank if dist_info.is_distributed else None,
+    )
+    if is_main:
+        print(f"Training on: {device} (world_size={dist_info.world_size})")
 
     model_cfg = config["model"]["parameters"]
     expected_in_channels = 4 + FORCING_BINS
@@ -692,7 +790,7 @@ def run_one_seed(
     bad_epochs = 0
 
     if resuming:
-        ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+        ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
         _validate_resume_compatibility(ckpt["conf"], config)
         fno.load_state_dict(ckpt["model_state"])
         best_val_loss = ckpt["best_val"]
@@ -701,13 +799,28 @@ def run_one_seed(
 
     fno.to(device)
 
+    # Wrap with DDP after .to(device) and after loading checkpoint weights.
+    # `fno_unwrapped` is the original module — use it for state_dict() and for
+    # rank-0-only validation forward (Fix 1).
+    if dist_info.is_distributed:
+        fno = DistributedDataParallel(
+            fno,
+            device_ids=[dist_info.local_rank] if torch.cuda.is_available() else None,
+            output_device=dist_info.local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=False,
+        )
+        fno_unwrapped = fno.module
+    else:
+        fno_unwrapped = fno
+
     optimizer = build_optimizer(config, fno.parameters())
     scheduler = build_scheduler(config, optimizer)
 
     if resuming:
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
-        print(f"Resuming seed {seed} from epoch {start_epoch} (best_val={best_val_loss:.4f}%, bad_epochs={bad_epochs})")
+        if is_main:
+            print(f"Resuming seed {seed} from epoch {start_epoch} (best_val={best_val_loss:.4f}%, bad_epochs={bad_epochs})")
 
     loss_cfg = config["training"].get("loss", {})
     loss_fn = SpatiallyWeightedMSE(
@@ -729,145 +842,186 @@ def run_one_seed(
 
     best_path = run_path / "fno2d_best.pt"
 
-    # --- CSV: truncate to start_epoch when resuming, overwrite when fresh ---
+    # --- CSV setup (rank 0 only) ---
     csv_path = run_path / "train_metrics.csv"
     val_pairs_path = run_path / "val_pairs.csv"
     fieldnames = ["epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2", "val_rel_l2", "val_iface_rel_l2", "lr", "is_best"]
+    csv_file = None
+    csv_writer = None
 
-    if resuming and csv_path.exists():
-        # Keep only rows with epoch < start_epoch (discard stale rows beyond checkpoint)
-        with csv_path.open("r", newline="") as f:
-            reader = csv.DictReader(f)
-            kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
-        csv_file = csv_path.open("w", newline="")
-        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        csv_writer.writeheader()
-        csv_writer.writerows(kept_rows)
-    else:
-        csv_file = csv_path.open("w", newline="")
-        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        csv_writer.writeheader()
+    if is_main:
+        if resuming and csv_path.exists():
+            with csv_path.open("r", newline="") as f:
+                reader = csv.DictReader(f)
+                kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
+            csv_file = csv_path.open("w", newline="")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_writer.writerows(kept_rows)
+        else:
+            csv_file = csv_path.open("w", newline="")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            csv_writer.writeheader()
 
-    if resuming and val_pairs_path.exists():
-        with val_pairs_path.open("r", newline="") as f:
-            reader = csv.DictReader(f)
-            kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
-        with val_pairs_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=VAL_PAIR_FIELDNAMES)
-            writer.writeheader()
-            writer.writerows(kept_rows)
-    elif not resuming and val_pairs_path.exists():
-        val_pairs_path.unlink()
+        if resuming and val_pairs_path.exists():
+            with val_pairs_path.open("r", newline="") as f:
+                reader = csv.DictReader(f)
+                kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
+            with val_pairs_path.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=VAL_PAIR_FIELDNAMES)
+                writer.writeheader()
+                writer.writerows(kept_rows)
+        elif not resuming and val_pairs_path.exists():
+            val_pairs_path.unlink()
 
     grad_clip = config["training"].get("grad_clip", None)
     warmup_epochs = config["training"].get("curriculum_warmup", 0)
 
+    should_stop = False
+
     for epoch in range(start_epoch, epochs):
-        # Lead-time curriculum: progressively expose longer lead times
+        # Lead-time curriculum: progressively expose longer lead times.
+        # Deterministic given `frac` -> identical _active_len on every rank.
         if warmup_epochs > 0:
             frac = min(1.0, (epoch + 1) / warmup_epochs)
             training_set.dataset.set_curriculum_fraction(frac)
+
+        # DistributedSampler shuffle ordering: curriculum first, then set_epoch.
+        if dist_info.is_distributed and hasattr(training_set.sampler, "set_epoch"):
+            training_set.sampler.set_epoch(epoch)
 
         lr = optimizer.param_groups[0]["lr"]
         train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
-            grad_clip=grad_clip,
+            grad_clip=grad_clip, dist_info=dist_info,
         )
         scheduler.step()
 
-        print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%")
+        if is_main:
+            print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%")
+
         is_best = 0
         val_loss = None
         val_iface_rel_l2 = None
-        should_stop = False
 
         if (epoch % validate_every) == 0:
-            val_loss, val_iface_rel_l2 = validate(
-                model=fno,
-                val_loader=validation_set,
-                device=device,
-                iface_mask=iface_mask,
-                dataset=validation_set.dataset,
-                pair_csv_path=val_pairs_path,
-                epoch=epoch,
-            )
-            print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                bad_epochs = 0
-                is_best = 1
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "conf": config,
-                        "seed": seed,
-                        "model_state": fno.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "scheduler_state": scheduler.state_dict(),
-                        "best_val": best_val_loss,
-                        "bad_epochs": bad_epochs,
-                        "mu_global": mu_global,
-                        "sigma_global": sigma_global,
-                    },
-                    best_path,
+            # Validation runs on rank 0 only, using the UNWRAPPED model (Fix 1).
+            # All ranks then receive (val_loss, val_iface, is_best, bad_epochs,
+            # best_val_loss, should_stop) via broadcast (Fix 2).
+            if is_main:
+                val_loss, val_iface_rel_l2 = validate(
+                    model=fno_unwrapped,
+                    val_loader=validation_set,
+                    device=device,
+                    iface_mask=iface_mask,
+                    dataset=validation_set.dataset,
+                    pair_csv_path=val_pairs_path,
+                    epoch=epoch,
                 )
-                print(f"Saved new best: {best_val_loss} -> {best_path}")
-            else:
-                bad_epochs += 1
-                if bad_epochs >= patience:
-                    print(f"Early stopping: no improvement for {patience} evaluations.")
-                    should_stop = True
+                print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
 
-        # Save latest checkpoint (sentinel) every epoch for resume
-        torch.save(
-            {
-                "epoch": epoch,
-                "conf": config,
-                "seed": seed,
-                "model_state": fno.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
-                "best_val": best_val_loss,
-                "bad_epochs": bad_epochs,
-                "mu_global": mu_global,
-                "sigma_global": sigma_global,
-            },
-            latest_path,
-        )
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    bad_epochs = 0
+                    is_best = 1
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "conf": config,
+                            "seed": seed,
+                            "model_state": fno_unwrapped.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "scheduler_state": scheduler.state_dict(),
+                            "best_val": best_val_loss,
+                            "bad_epochs": bad_epochs,
+                            "mu_global": mu_global,
+                            "sigma_global": sigma_global,
+                        },
+                        best_path,
+                    )
+                    print(f"Saved new best: {best_val_loss} -> {best_path}")
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        print(f"Early stopping: no improvement for {patience} evaluations.")
+                        should_stop = True
 
-        csv_writer.writerow(
-            {
-                "epoch": epoch,
-                "train_loss": float(train_loss),
-                "train_rel_l2": float(train_rel_l2),
-                "train_iface_rel_l2": float(train_iface_rel_l2),
-                "val_rel_l2": "" if val_loss is None else float(val_loss),
-                "val_iface_rel_l2": "" if val_iface_rel_l2 is None else float(val_iface_rel_l2),
-                "lr": float(lr),
-                "is_best": int(is_best),
-            }
-        )
-        csv_file.flush()
+            # Broadcast control-flow state so every rank stays in lockstep (Fix 2).
+            if dist_info.is_distributed:
+                state = {
+                    "val_loss": val_loss,
+                    "val_iface_rel_l2": val_iface_rel_l2,
+                    "best_val_loss": best_val_loss,
+                    "bad_epochs": bad_epochs,
+                    "is_best": is_best,
+                    "should_stop": should_stop,
+                }
+                obj_list = [state if is_main else None]
+                dist.broadcast_object_list(obj_list, src=0)
+                state = obj_list[0]
+                val_loss = state["val_loss"]
+                val_iface_rel_l2 = state["val_iface_rel_l2"]
+                best_val_loss = state["best_val_loss"]
+                bad_epochs = state["bad_epochs"]
+                is_best = state["is_best"]
+                should_stop = state["should_stop"]
+
+        # Save latest checkpoint (rank 0 only) for resume.
+        if is_main:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "conf": config,
+                    "seed": seed,
+                    "model_state": fno_unwrapped.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "best_val": best_val_loss,
+                    "bad_epochs": bad_epochs,
+                    "mu_global": mu_global,
+                    "sigma_global": sigma_global,
+                },
+                latest_path,
+            )
+
+            csv_writer.writerow(
+                {
+                    "epoch": epoch,
+                    "train_loss": float(train_loss),
+                    "train_rel_l2": float(train_rel_l2),
+                    "train_iface_rel_l2": float(train_iface_rel_l2),
+                    "val_rel_l2": "" if val_loss is None else float(val_loss),
+                    "val_iface_rel_l2": "" if val_iface_rel_l2 is None else float(val_iface_rel_l2),
+                    "lr": float(lr),
+                    "is_best": int(is_best),
+                }
+            )
+            csv_file.flush()
+
+        if dist_info.is_distributed:
+            dist.barrier()
 
         if should_stop:
             break
 
-    csv_file.close()
+    if is_main:
+        if csv_file is not None:
+            csv_file.close()
+        if latest_path.exists():
+            latest_path.unlink()
 
-    # Clean completion: remove sentinel
-    if latest_path.exists():
-        latest_path.unlink()
+        status = "early_stopped" if should_stop else "completed"
+        _write_final_metrics(
+            run_path,
+            seed=seed,
+            config=config,
+            wall_time_s=time.time() - _t_start,
+            status=status,
+        )
 
-    status = "early_stopped" if should_stop else "completed"
-    _write_final_metrics(
-        run_path,
-        seed=seed,
-        config=config,
-        wall_time_s=time.time() - _t_start,
-        status=status,
-    )
+    if dist_info.is_distributed:
+        dist.barrier()
 
     return {"seed": seed, "best_val": float(best_val_loss), "best_path": str(best_path)}
 
