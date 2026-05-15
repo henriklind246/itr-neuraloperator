@@ -62,6 +62,9 @@ training:
   patience: 20
   checkpoint_metric: "val_rel_l2"
   seeds: [42]
+  # DataLoader workers per rank. `null` derives from SLURM_CPUS_PER_TASK /
+  # world_size at runtime; set an int to override.
+  num_workers: null
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
 
