@@ -399,7 +399,29 @@ def create_dataloaders(
     num_workers: int | None = None,
     dt: float | None = None,
     t_final: float | None = None,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
+    world_size: int = 1,
+    rank: int = 0,
+    sampler_seed: int = 0,
+) -> tuple[DataLoader, DataLoader | None, DataLoader]:
+    """Build train/val/test loaders.
+
+    When `world_size > 1`:
+    - `batch_size` is divided across ranks: per-GPU batch = `batch_size // world_size`.
+      The total effective batch matches single-GPU baseline.
+    - Train uses `CurriculumDistributedSampler` (curriculum-safe).
+    - Val loader is built **only on rank 0** (returned as `None` on other ranks).
+      Validation runs single-process and the result is broadcast.
+    - Test loader is unchanged (eval is single-GPU and decoupled from training).
+    """
+    if world_size > 1:
+        if batch_size % world_size != 0:
+            raise ValueError(
+                f"batch_size={batch_size} not divisible by world_size={world_size}. "
+                f"Choose a batch_size that splits evenly across GPUs."
+            )
+        per_gpu_bs = batch_size // world_size
+    else:
+        per_gpu_bs = batch_size
 
     n_test = n_snapshots_test if n_snapshots_test is not None else n_snapshots
 
@@ -448,10 +470,66 @@ def create_dataloaders(
 
     pin = torch.cuda.is_available()
     workers = num_workers if num_workers is not None else (4 if pin else 0)
+    persistent = workers > 0
 
-    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, pin_memory=pin, num_workers=workers)
-    val_loader = DataLoader(val_dataset, batch_size, shuffle=False, pin_memory=pin, num_workers=workers)
-    test_loader = DataLoader(test_dataset, batch_size, shuffle=False, pin_memory=pin, num_workers=workers)
+    if world_size > 1:
+        from data.distributed_sampler import CurriculumDistributedSampler
+
+        train_sampler = CurriculumDistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=sampler_seed,
+            drop_last=False,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=per_gpu_bs,
+            sampler=train_sampler,
+            shuffle=False,
+            pin_memory=pin,
+            num_workers=workers,
+            persistent_workers=persistent,
+        )
+
+        if rank == 0:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=per_gpu_bs,
+                shuffle=False,
+                pin_memory=pin,
+                num_workers=workers,
+                persistent_workers=persistent,
+            )
+        else:
+            val_loader = None
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=per_gpu_bs,
+            shuffle=True,
+            pin_memory=pin,
+            num_workers=workers,
+            persistent_workers=persistent,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=per_gpu_bs,
+            shuffle=False,
+            pin_memory=pin,
+            num_workers=workers,
+            persistent_workers=persistent,
+        )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=per_gpu_bs,
+        shuffle=False,
+        pin_memory=pin,
+        num_workers=workers,
+        persistent_workers=persistent,
+    )
 
     return train_loader, val_loader, test_loader
 
