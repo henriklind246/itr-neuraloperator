@@ -6,11 +6,13 @@ import torch.nn.functional as F
 # -------- Time-conditioned 2d FNO --------
 #
 # Operator-learning task:
-# G(T(x, y, t_s), x, y, s_y, Q_y_bins, cond) -> T(x, y, t_j)
+# G(T(x, y, t_s), x, y, s_y, cond_static, forcing_seq) -> T(x, y, t_j)
 #
 # where t_bar = t_j - t_s is the lead time, t_s is the absolute source time, and
 # T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
-# The 28D conditioning vector is injected via Conditional Instance Normalization (CIN).
+# cond_static (11D: t_bar, t_s, R_c, spatial onehot + params) is concatenated with a
+# learned temporal-forcing embedding h_a = TemporalForcingEncoder(forcing_seq), and the
+# 75D concatenation drives Conditional Instance Normalization (CIN).
 
 
 # --------- SpectralConv2d ---------
@@ -143,17 +145,48 @@ class ConditioningMLP(nn.Module):
         return out.view(-1, self.n_layers, 2, self.width)  # (B, L, 2, W)
 
 
+# --------- Temporal Forcing Encoder ---------
+
+class TemporalForcingEncoder(nn.Module):
+    """forcing_seq: (B, M, token_dim) -> h_a: (B, embed_dim).
+
+    Conv1d-based, mean + max pooling over the M temporal samples. Max pooling
+    preserves localized pulse activations that mean alone would smear across
+    the sample grid.
+    """
+
+    def __init__(self, token_dim: int = 5, hidden: int = 128, embed_dim: int = 64):
+        super().__init__()
+        self.lift = nn.Linear(token_dim, hidden)
+        self.conv1 = nn.Conv1d(hidden, hidden, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=5, padding=2)
+        self.proj = nn.Linear(2 * hidden, embed_dim)
+        self.act = nn.GELU()
+
+    def forward(self, z):
+        # z: (B, M, token_dim)
+        h = self.act(self.lift(z))             # (B, M, hidden)
+        h = h.transpose(1, 2)                  # (B, hidden, M)
+        h = self.act(self.conv1(h))
+        h = self.act(self.conv2(h))
+        h_mean = h.mean(dim=-1)                # (B, hidden)
+        h_max = h.amax(dim=-1)                 # (B, hidden)
+        h = torch.cat([h_mean, h_max], dim=-1) # (B, 2*hidden)
+        return self.act(self.proj(h))          # (B, embed_dim)
+
+
 # --------- FNO2d ---------
 
 class FNO2d(nn.Module):
     """Time-conditioned 2D Fourier Neural Operator.
 
     Forward signature:
-        model(spatial, cond) → y_pred
+        model(spatial, cond_static, forcing_seq) → y_pred
 
-    spatial : (B, Nx, Ny, C_spatial)   — T̃(x, y, t_s), x_norm, y_norm, s_y, and Q_y bins
-    cond      : (B, C_cond)         — 28D forcing/contact conditioning vector
-    y_pred    : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
+    spatial      : (B, Nx, Ny, 4)        — T̃(x, y, t_s), x_norm, y_norm, s_y
+    cond_static  : (B, 11)               — t_bar_norm, t_s_norm, R_c_norm, spatial onehot+params
+    forcing_seq  : (B, M, token_dim)     — 5-D tokens sampled from a(t) over [t_s, t_j]
+    y_pred       : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
     """
 
     def __init__(
@@ -161,13 +194,16 @@ class FNO2d(nn.Module):
         modes1: int,
         modes2: int,
         width: int,
-        in_channels: int = 20,
+        in_channels: int = 4,
         out_channels: int = 1,
         n_layers: int = 4,
-        cond_dim: int = 28,
+        cond_static_dim: int = 11,
         cond_hidden: int = 256,
+        temporal_token_dim: int = 5,
+        temporal_hidden: int = 128,
+        forcing_embed_dim: int = 64,
         dropout: float = 0.0,
-        spectral_dropout: float = 0.0
+        spectral_dropout: float = 0.0,
     ):
         super().__init__()
         self.modes1 = modes1
@@ -176,6 +212,10 @@ class FNO2d(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.n_layers = n_layers
+        self.cond_static_dim = cond_static_dim
+        self.temporal_token_dim = temporal_token_dim
+        self.temporal_hidden = temporal_hidden
+        self.forcing_embed_dim = forcing_embed_dim
         self.padding = 8  # pad spatial dim for non-periodic signals
 
         # Lift: (B, Nx, Ny, in_channels) → (B, Nx, Ny, width)
@@ -194,8 +234,18 @@ class FNO2d(nn.Module):
             ConditionalInstanceNorm2d(width) for _ in range(n_layers)
         ])
 
-        # Conditioning MLP
-        self.cond_mlp = ConditioningMLP(cond_dim, cond_hidden, n_layers, width)
+        # Temporal forcing encoder + Conditioning MLP
+        self.temporal_encoder = TemporalForcingEncoder(
+            token_dim=temporal_token_dim,
+            hidden=temporal_hidden,
+            embed_dim=forcing_embed_dim,
+        )
+        self.cond_mlp = ConditioningMLP(
+            cond_dim=cond_static_dim + forcing_embed_dim,
+            hidden_dim=cond_hidden,
+            n_layers=n_layers,
+            width=width,
+        )
 
         # Project: (B, Nx, Ny, width) → (B, Nx, Ny, out_channels)
         self.linear_q = nn.Linear(width, 128)
@@ -204,14 +254,17 @@ class FNO2d(nn.Module):
         self.activation = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, spatial, cond):
+    def forward(self, spatial, cond_static, forcing_seq):
         """
-        spatial : (B, Nx, Ny, in_channels)
-        cond      : (B, cond_dim)
-        returns   : (B, Nx, Ny, out_channels)
+        spatial      : (B, Nx, Ny, in_channels)
+        cond_static  : (B, cond_static_dim)
+        forcing_seq  : (B, M, temporal_token_dim)
+        returns      : (B, Nx, Ny, out_channels)
         """
-        # Conditioning: compute all (γ_l, β_l) upfront
-        cin_params = self.cond_mlp(cond)  # (B, n_layers, 2, width)
+        # Temporal branch + concat with static conditioning
+        h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
+        cond_full = torch.cat([cond_static, h_a], dim=-1)     # (B, cond_static_dim + forcing_embed_dim)
+        cin_params = self.cond_mlp(cond_full)                 # (B, n_layers, 2, width)
 
         # Lift
         x = self.linear_p(spatial)      # (B, Nx, Ny, width)
