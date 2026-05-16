@@ -15,17 +15,21 @@ tuning:
   objective: best_val_mean
 
 model:
-  type: "2D FNO time-conditioned"
+  type: "2D FNO time-conditioned (temporal branch)"
   parameters:
     modes1: 16
     modes2: 16
     width: 64
-    in_channels: 20
+    in_channels: 4
     out_channels: 1
     n_layers: 4
-    cond_dim: 28
+    cond_static_dim: 11
     cond_hidden: 256
-    activation: "GELU"
+    temporal_token_dim: 5
+    temporal_samples: 64
+    temporal_hidden: 128
+    forcing_embed_dim: 64
+    activation: "GELU"            # doc-only; FNO2d hardcodes GELU
     dropout: 0.0
     spectral_dropout: 0.0
 
@@ -77,9 +81,10 @@ data:
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "B, Nx, Ny, 20"
+  x_shape: "B, Nx, Ny, 4"
   y_shape: "B, Nx, Ny, 1"
-  cond_shape: "B, 28"
+  cond_static_shape: "B, 11"
+  forcing_seq_shape: "B, 64, 5"
   t_stats_shape: "B, 2"
   num_sims: 10000
 
