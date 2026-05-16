@@ -1,6 +1,7 @@
 import torch
 from data.dataset import (
-    COND_DIM,
+    COND_STATIC_DIM,
+    TEMPORAL_SAMPLES,
     T_EPS,
     compute_global_stats,
     create_dataloaders,
@@ -11,7 +12,6 @@ from data.dataset import (
 from src.operators.fno2d import FNO2d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
-from src.physics.boundary_forcing import FORCING_BINS
 from pathlib import Path
 import math
 import json
@@ -56,6 +56,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         n_snapshots=10,
         n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
         dt=solver_dt,
+        temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
     )
 
     return testing_set, x_grid, y_grid
@@ -81,13 +82,14 @@ def evaluate(model, test_loader, device, iface_mask=None):
         iface_rel_l2_norm = 0.0
         iface_rel_l2_phys = 0.0
 
-        for x_spatial, cond, y_batch, T_stats in test_loader:
+        for x_spatial, cond_static, forcing_seq, y_batch, T_stats in test_loader:
             x_spatial = x_spatial.to(device)
-            cond = cond.to(device)
+            cond_static = cond_static.to(device)
+            forcing_seq = forcing_seq.to(device)
             y_batch = y_batch.to(device)
             T_stats = T_stats.to(device)
 
-            y_pred = model(x_spatial, cond)
+            y_pred = model(x_spatial, cond_static, forcing_seq)
 
             # Normalized-space metric (same convention as train/val_rel_l2)
             batch_rel_l2_norm = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
@@ -149,20 +151,18 @@ def eval_all_seeds(run_root: str):
         ).to(device)
 
         model_cfg = config['model']['parameters']
-        expected_in_channels = 4 + FORCING_BINS
-        if model_cfg.get("in_channels", expected_in_channels) != expected_in_channels:
-            raise ValueError(
-                f"Checkpoint uses an incompatible spatial input; train a fresh {expected_in_channels}-channel forcing-bin model."
-            )
         fno = FNO2d(
             modes1=model_cfg["modes1"],
             modes2=model_cfg["modes2"],
             width=model_cfg["width"],
-            in_channels=model_cfg.get("in_channels", expected_in_channels),
+            in_channels=model_cfg.get("in_channels", 4),
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
-            cond_dim=model_cfg.get("cond_dim", COND_DIM),
+            cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
             cond_hidden=model_cfg.get("cond_hidden", 256),
+            temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+            temporal_hidden=model_cfg.get("temporal_hidden", 128),
+            forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)

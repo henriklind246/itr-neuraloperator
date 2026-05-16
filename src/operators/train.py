@@ -17,7 +17,8 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam, AdamW
 
 from data.dataset import (
-    COND_DIM,
+    COND_STATIC_DIM,
+    TEMPORAL_SAMPLES,
     SnapshotPairDataset,
     compute_global_stats,
     create_dataloaders,
@@ -29,7 +30,6 @@ from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 from src.operators.utils import resolve_device
-from src.physics.boundary_forcing import FORCING_BINS
 
 from omegaconf import OmegaConf
 
@@ -518,13 +518,14 @@ def train_one_epoch(
     n_iface_voxels = 0  # number of (sample, iface_voxel) entries summed
 
     # _T_stats is not used since error metrics are computed in z-score temp. source space
-    for x_spatial, cond, y_batch, _T_stats in train_loader:
+    for x_spatial, cond_static, forcing_seq, y_batch, _T_stats in train_loader:
         x_spatial = x_spatial.to(device)
-        cond = cond.to(device)
+        cond_static = cond_static.to(device)
+        forcing_seq = forcing_seq.to(device)
         y_batch = y_batch.to(device)
 
         optimizer.zero_grad()
-        y_pred = model(x_spatial, cond)
+        y_pred = model(x_spatial, cond_static, forcing_seq)
         loss = loss_fn(y_pred, y_batch)
         loss.backward()
         if grad_clip is not None:
@@ -644,12 +645,13 @@ def validate(
                 pair_writer.writeheader()
 
         try:
-            for x_spatial, cond, y_batch, _T_stats in val_loader:
+            for x_spatial, cond_static, forcing_seq, y_batch, _T_stats in val_loader:
                 x_spatial = x_spatial.to(device)
-                cond = cond.to(device)
+                cond_static = cond_static.to(device)
+                forcing_seq = forcing_seq.to(device)
                 y_batch = y_batch.to(device)
 
-                y_pred = model(x_spatial, cond)
+                y_pred = model(x_spatial, cond_static, forcing_seq)
                 mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
                 target_sq_sum += torch.sum(y_batch ** 2).item()
 
@@ -750,6 +752,7 @@ def run_one_seed(
             noise_std=config["training"].get("noise_std", 0.0),
             num_workers=num_workers,
             dt=solver_dt,
+            temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
             world_size=dist_info.world_size,
             rank=dist_info.rank,
             sampler_seed=seed,
@@ -770,16 +773,18 @@ def run_one_seed(
         print(f"Training on: {device} (world_size={dist_info.world_size})")
 
     model_cfg = config["model"]["parameters"]
-    expected_in_channels = 4 + FORCING_BINS
     fno = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", expected_in_channels),
+        in_channels=model_cfg.get("in_channels", 4),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", COND_DIM),
+        cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
         cond_hidden=model_cfg.get("cond_hidden", 256),
+        temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+        temporal_hidden=model_cfg.get("temporal_hidden", 128),
+        forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
     )
