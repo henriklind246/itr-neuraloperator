@@ -12,8 +12,8 @@
 #SBATCH --mail-user=lind1775@umn.edu
 
 # ──── Paths ────
-PROJECT_DIR="$HOME/repos/itr-neuraloperator"
-export DATA_DIR="$PROJECT_DIR/data"
+PROJECT_DIR="${PROJECT_DIR:-$HOME/repos/itr-neuraloperator}"
+export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"
 export PROJECT_ROOT="$PROJECT_DIR"
 
 # Use node-local scratch for Optuna SQLite DB (avoids NFS locking),

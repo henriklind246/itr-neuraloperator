@@ -13,8 +13,8 @@
 set -euo pipefail
 
 # ──── Paths ────
-PROJECT_DIR="$HOME/repos/itr-neuraloperator"
-export DATA_DIR="$PROJECT_DIR/data"
+PROJECT_DIR="${PROJECT_DIR:-$HOME/repos/itr-neuraloperator}"
+export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"
 export PROJECT_ROOT="$PROJECT_DIR"
 
 # ──── Environment ────

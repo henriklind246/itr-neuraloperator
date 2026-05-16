@@ -9,9 +9,23 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=lind1775@umn.edu
 
+set -euo pipefail
+
 # ──── Paths ────
-PROJECT_DIR="$HOME/repos/itr-neuraloperator"
+PROJECT_DIR="${PROJECT_DIR:-$HOME/repos/itr-neuraloperator}"
 export PROJECT_ROOT="$PROJECT_DIR"
+DATA_OUT_DIR="${DATA_OUT_DIR:-$PROJECT_DIR/data}"
+NUM_SIMS="${NUM_SIMS:-8000}"
+
+if [[ $# -gt 0 && "$1" != -* ]]; then
+    DATA_OUT_DIR="$1"
+    shift
+fi
+
+if [[ $# -gt 0 && "$1" != -* ]]; then
+    NUM_SIMS="$1"
+    shift
+fi
 
 # ──── Environment ────
 module load miniforge
@@ -24,11 +38,17 @@ export PYTHONUNBUFFERED=1
 # ──── Logging ────
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
+echo "DATA_OUT_DIR=$DATA_OUT_DIR"
+echo "NUM_SIMS=$NUM_SIMS"
+echo "Extra generator args: $*"
 
 # ──── Run ────
-# Run from data/ so the relative np.save() calls land inside $PROJECT_DIR/data/
-cd "$PROJECT_DIR/data"
-python "$PROJECT_DIR/data/generate_dataset.py"
+cd "$PROJECT_DIR"
+mkdir -p "$DATA_OUT_DIR"
+python "$PROJECT_DIR/data/generate_dataset.py" \
+    --num-sims "$NUM_SIMS" \
+    --save-dir "$DATA_OUT_DIR" \
+    "$@"
 
 echo "Job $SLURM_JOB_ID finished at $(date)"
-ls -lh "$PROJECT_DIR/data"/*.npy
+ls -lh "$DATA_OUT_DIR"/*.npy

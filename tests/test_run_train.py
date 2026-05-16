@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import subprocess
 
 import pytest
 import yaml
@@ -24,6 +25,7 @@ from scripts.run_train import (
 from scripts.run_train_fixed import (
     _parse_override_value,
     _apply_override,
+    _sync_data_paths_from_data_dir,
     _validate_fixed_run_config,
     _resolve_run_dir,
     main as fixed_main,
@@ -429,6 +431,71 @@ class TestRunTrainFixedHelpers:
         cfg15 = {**base, "config_id": 15}
 
         assert _resolve_run_dir(cfg10) != _resolve_run_dir(cfg15)
+
+    def test_sync_data_paths_from_data_dir_updates_standard_files(self, tmp_path):
+        data_dir = tmp_path / "custom_data"
+        config = {
+            "paths": {"data_dir": str(data_dir)},
+            "data": {
+                "t_grid_path": "old/t_grid.npy",
+                "x_grid_path": "old/x_grid.npy",
+                "y_grid_path": "old/y_grid.npy",
+                "trajectories.npy": "old/trajectories.npy",
+                "sim_params_path": "old/sim_params.npy",
+            },
+        }
+
+        _sync_data_paths_from_data_dir(config, {"paths.data_dir"})
+
+        assert config["data"]["t_grid_path"] == str(data_dir / "t_grid.npy")
+        assert config["data"]["x_grid_path"] == str(data_dir / "x_grid.npy")
+        assert config["data"]["y_grid_path"] == str(data_dir / "y_grid.npy")
+        assert config["data"]["trajectories.npy"] == str(data_dir / "trajectories.npy")
+        assert config["data"]["sim_params_path"] == str(data_dir / "sim_params.npy")
+
+    def test_sync_data_paths_preserves_explicit_file_override(self, tmp_path):
+        data_dir = tmp_path / "custom_data"
+        explicit_t_grid = tmp_path / "elsewhere" / "t_grid.npy"
+        config = {
+            "paths": {"data_dir": str(data_dir)},
+            "data": {
+                "t_grid_path": str(explicit_t_grid),
+                "x_grid_path": "old/x_grid.npy",
+                "y_grid_path": "old/y_grid.npy",
+                "trajectories.npy": "old/trajectories.npy",
+                "sim_params_path": "old/sim_params.npy",
+            },
+        }
+
+        _sync_data_paths_from_data_dir(config, {"paths.data_dir", "data.t_grid_path"})
+
+        assert config["data"]["t_grid_path"] == str(explicit_t_grid)
+        assert config["data"]["x_grid_path"] == str(data_dir / "x_grid.npy")
+
+    def test_msi_slurm_scripts_accept_data_dir_env_override(self):
+        root = Path(__file__).resolve().parents[1]
+        scripts = [
+            root / "slurm" / "train_fno_msi.sbatch",
+            root / "slurm" / "train_fno_msi_fixed.sbatch",
+            root / "slurm" / "train_fno_msi_fixed_ddp.sbatch",
+            root / "slurm" / "eval_fno_msi.sbatch",
+        ]
+
+        for script in scripts:
+            subprocess.run(["bash", "-n", str(script)], check=True)
+            text = script.read_text(encoding="utf-8")
+            assert 'export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"' in text
+
+    def test_generate_data_slurm_accepts_output_overrides(self):
+        script = Path(__file__).resolve().parents[1] / "slurm" / "generate_data_msi.sbatch"
+
+        subprocess.run(["bash", "-n", str(script)], check=True)
+        text = script.read_text(encoding="utf-8")
+
+        assert 'DATA_OUT_DIR="${DATA_OUT_DIR:-$PROJECT_DIR/data}"' in text
+        assert 'NUM_SIMS="${NUM_SIMS:-8000}"' in text
+        assert '--save-dir "$DATA_OUT_DIR"' in text
+        assert '"$@"' in text
 
 
 class TestRunTrainFixedMain:

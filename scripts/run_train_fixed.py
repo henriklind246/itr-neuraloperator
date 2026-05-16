@@ -9,6 +9,14 @@ from src.operators.distributed import cleanup_distributed, init_distributed, is_
 from src.operators.train import load_config, run_config_seeds
 from src.operators.utils import resolve_device
 
+DATA_FILE_NAMES = {
+    "t_grid_path": "t_grid.npy",
+    "x_grid_path": "x_grid.npy",
+    "y_grid_path": "y_grid.npy",
+    "trajectories.npy": "trajectories.npy",
+    "sim_params_path": "sim_params.npy",
+}
+
 
 def _parse_override_value(raw: str) -> object:
     lowered = raw.lower()
@@ -37,6 +45,16 @@ def _apply_override(config: dict, key_path: str, value: object) -> None:
     if not isinstance(current, dict) or leaf not in current:
         raise KeyError(f"Unknown config path: {key_path}")
     current[leaf] = value
+
+
+def _sync_data_paths_from_data_dir(config: dict, overridden_keys: set[str]) -> None:
+    if "paths.data_dir" not in overridden_keys:
+        return
+
+    data_dir = Path(str(config["paths"]["data_dir"]))
+    for key, file_name in DATA_FILE_NAMES.items():
+        if f"data.{key}" not in overridden_keys:
+            config["data"][key] = str(data_dir / file_name)
 
 
 def _validate_fixed_run_config(config: dict) -> None:
@@ -88,6 +106,8 @@ def main() -> int:
             value = _parse_override_value(raw_value)
             _apply_override(config, key_path, value)
             applied_overrides.append((key_path, value))
+
+        _sync_data_paths_from_data_dir(config, {key for key, _ in applied_overrides})
 
         run_dir = _resolve_run_dir(config)
         config.setdefault("training", {})

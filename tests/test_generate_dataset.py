@@ -4,6 +4,7 @@ from data.generate_dataset import (
     build_sim_params,
     generate_sim_data,
     generate_lhs_samples,
+    main as generate_main,
 )
 from src.physics.boundary_forcing import TEMPORAL_FAMILIES
 from src.physics.init_conditions import IC_FAMILIES
@@ -186,6 +187,22 @@ class TestBuildSimParams:
 
 
 class TestGenerateSimData:
+    def test_main_passes_cli_overrides_to_generator(self, tmp_path):
+        calls = {}
+
+        def fake_generate(**kwargs):
+            calls.update(kwargs)
+
+        save_dir = tmp_path / "custom_data"
+        exit_code = generate_main(
+            ["--num-sims", "17", "--save-dir", str(save_dir)],
+            generate_fn=fake_generate,
+        )
+
+        assert exit_code == 0
+        assert calls["num_sims"] == 17
+        assert calls["save_dir"] == save_dir
+
     def test_generate_sim_data_smoke_writes_outputs_to_data_dir_with_ic_metadata(
         self, tmp_path, monkeypatch, capsys,
     ):

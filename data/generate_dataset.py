@@ -1,4 +1,10 @@
+import argparse
 from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
@@ -86,7 +92,11 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     return sim_params
 
 
-def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
+def generate_sim_data(
+    num_sims: int = 2000,
+    save_stride: int = 2,
+    save_dir: Path | str | None = None,
+) -> None:
     rng = np.random.default_rng(0)
     rng_profile = np.random.default_rng(1)
 
@@ -154,19 +164,34 @@ def generate_sim_data(num_sims: int = 2000, save_stride: int = 2) -> None:
     y_grid = y.astype(np.float32)
     t_grid = t[::save_stride].astype(np.float32)
 
-    save_dir = DATA_DIR
-    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = Path(save_dir) if save_dir is not None else DATA_DIR
+    save_path.mkdir(parents=True, exist_ok=True)
 
-    np.save(save_dir / "x_grid.npy", x_grid)
-    np.save(save_dir / "y_grid.npy", y_grid)
-    np.save(save_dir / "t_grid.npy", t_grid)
+    np.save(save_path / "x_grid.npy", x_grid)
+    np.save(save_path / "y_grid.npy", y_grid)
+    np.save(save_path / "t_grid.npy", t_grid)
     # Saved t_grid spacing != solver dt when save_stride > 1; persist solver dt
     # so the dataset can normalize tau / dt_n cond slots against the same bounds
     # used during sampling.
-    np.save(save_dir / "dt.npy", np.float64(dt))
-    np.save(save_dir / "trajectories.npy", trajectories)
-    np.save(save_dir / "sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
-    print("Saved to:", save_dir, x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape, flush=True)
+    np.save(save_path / "dt.npy", np.float64(dt))
+    np.save(save_path / "trajectories.npy", trajectories)
+    np.save(save_path / "sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
+    print("Saved to:", save_path, x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape, flush=True)
+
+def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
+    parser = argparse.ArgumentParser(description="Generate FNO training data.")
+    parser.add_argument("--num-sims", type=int, default=8000, help="Number of simulations to generate.")
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        help="Directory for generated .npy files. Defaults to this script's data directory.",
+    )
+    args = parser.parse_args(argv)
+
+    generate_fn(num_sims=args.num_sims, save_dir=args.save_dir)
+    return 0
+
 
 if __name__ == '__main__':
-    generate_sim_data(num_sims=8000)
+    raise SystemExit(main())

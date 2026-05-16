@@ -11,7 +11,7 @@ TEMPORAL_SAMPLES = 64
 
 def _base_config(tmp_path):
     return {
-        "paths": {"runs_root": str(tmp_path / "runs")},
+        "paths": {"runs_root": str(tmp_path / "runs"), "data_dir": "unused"},
         "experiment": {"name": "placeholder"},
         "config_id": 99,
         "data": {
@@ -123,6 +123,35 @@ def test_same_sim_main_seed_flag_overrides_config_seed(tmp_path, monkeypatch):
     assert run_dir == tmp_path / "runs" / "2d_fno_same_sim" / "config3" / "seed7"
 
 
+def test_same_sim_paths_data_dir_override_updates_dataset_paths(tmp_path, monkeypatch):
+    calls = {}
+    data_dir = tmp_path / "custom_data"
+
+    def fake_run_one_seed(config, seed, run_dir, *, train_loader_override, val_loader_override):
+        calls["config"] = config
+        return {"best_val": 0.0, "best_path": str(Path(run_dir) / "fno2d_best.pt"), "seed": seed}
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "eval_same_sim_holdout.py",
+            "experiment.name=2d_fno_same_sim",
+            "config_id=0",
+            f"paths.data_dir={data_dir}",
+        ],
+    )
+
+    eval_same_sim_holdout.main(
+        load_config_fn=lambda _path=None: _base_config(tmp_path),
+        build_loaders_fn=lambda config, val_pair_frac, split_seed: ("train", "val"),
+        run_one_seed_fn=fake_run_one_seed,
+    )
+
+    assert calls["config"]["data"]["t_grid_path"] == str(data_dir / "t_grid.npy")
+    assert calls["config"]["data"]["trajectories.npy"] == str(data_dir / "trajectories.npy")
+    assert calls["config"]["data"]["sim_params_path"] == str(data_dir / "sim_params.npy")
+
+
 def test_same_sim_slurm_script_has_valid_syntax_and_forwards_overrides():
     script = Path(__file__).resolve().parents[1] / "slurm" / "eval_same_sim_holdout_msi.sbatch"
 
@@ -133,3 +162,4 @@ def test_same_sim_slurm_script_has_valid_syntax_and_forwards_overrides():
     assert 'cmd+=("$@")' in text
     assert 'cmd+=(--seed "$SAME_SIM_SEED")' in text
     assert 'SAME_SIM_SEED="${SAME_SIM_SEED:-}"' in text
+    assert 'export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"' in text
