@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from data.dataset import SnapshotPairDataset
 from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
-from src.physics.boundary_forcing import FORCING_BINS
 
 from src.operators.train import (
     _per_pair_rel_l2_percent,
@@ -29,11 +28,14 @@ from src.operators.train import (
     run_config_seeds,
 )
 
-SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
+SPATIAL_IN_CHANNELS = 4
+COND_STATIC_DIM = 11
+TEMPORAL_TOKEN_DIM = 5
+TEMPORAL_SAMPLES = 64
 
 
 class ZeroModel(torch.nn.Module):
-    def forward(self, spatial, cond):
+    def forward(self, spatial, cond_static, forcing_seq):
         return torch.zeros(
             spatial.shape[0],
             spatial.shape[1],
@@ -102,22 +104,37 @@ class TestLoadConfig:
 
 # ===================== helpers for training tests =====================
 
-def _make_4tuple_loader(Nx=11, Ny=11, n_samples=4, batch_size=2):
-    """Create a DataLoader yielding (x_spatial, cond, Y, T_stats) 4-tuples."""
+def _make_5tuple_loader(Nx=11, Ny=11, n_samples=4, batch_size=2):
+    """Create a DataLoader yielding (x_spatial, cond_static, forcing_seq, Y, T_stats) 5-tuples."""
     x_spatial = torch.randn(n_samples, Nx, Ny, SPATIAL_IN_CHANNELS)
-    cond = torch.rand(n_samples, 28)
+    cond_static = torch.rand(n_samples, COND_STATIC_DIM)
+    forcing_seq = torch.randn(n_samples, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
     Y = torch.randn(n_samples, Nx, Ny, 1)
     T_stats = torch.randn(n_samples, 2)
-    return DataLoader(TensorDataset(x_spatial, cond, Y, T_stats), batch_size=batch_size)
+    return DataLoader(
+        TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
+        batch_size=batch_size,
+    )
+
+
+def _make_tiny_fno():
+    return FNO2d(
+        modes1=2, modes2=2, width=8,
+        in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+    )
 
 
 @pytest.fixture
 def tiny_training_setup():
-    """Tiny model + synthetic 4-tuple dataloader for fast training tests."""
+    """Tiny model + synthetic 5-tuple dataloader for fast training tests."""
     Nx = 11
     Ny = 11
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
-    loader = _make_4tuple_loader(Nx=Nx, Ny=Ny)
+    model = _make_tiny_fno()
+    loader = _make_5tuple_loader(Nx=Nx, Ny=Ny)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     x_grid_np = np.linspace(0.0, 1.0, Nx).astype(np.float32)
@@ -240,7 +257,7 @@ class TestValidate:
             n_snapshots=3,
         )
         loader = DataLoader(dataset, batch_size=2, shuffle=False)
-        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
+        model = _make_tiny_fno()
         iface_mask = build_interface_mask(x_grid, y_grid)
         csv_path = tmp_path / "val_pairs.csv"
 
@@ -393,7 +410,7 @@ class TestRIGNOThreePhaseSchedule:
                 },
             }
         }
-        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
+        model = _make_tiny_fno()
         optimizer = build_optimizer(config, model.parameters())
 
         scheduler = build_scheduler(config, optimizer)
@@ -420,7 +437,7 @@ class TestRIGNOThreePhaseSchedule:
                 },
             }
         }
-        model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
+        model = _make_tiny_fno()
         optimizer = build_optimizer(config, model.parameters())
 
         with pytest.raises(ValueError, match="scheduler.peak_lr must match training.learning_rate"):
@@ -505,8 +522,12 @@ class TestRunOneSeedResume:
                     "in_channels": SPATIAL_IN_CHANNELS,
                     "out_channels": 1,
                     "n_layers": 2,
-                    "cond_dim": 28,
+                    "cond_static_dim": COND_STATIC_DIM,
                     "cond_hidden": 32,
+                    "temporal_token_dim": TEMPORAL_TOKEN_DIM,
+                    "temporal_samples": TEMPORAL_SAMPLES,
+                    "temporal_hidden": 16,
+                    "forcing_embed_dim": 16,
                 }
             },
             "training": {
@@ -774,8 +795,12 @@ class TestRunConfigSeeds:
                     "in_channels": SPATIAL_IN_CHANNELS,
                     "out_channels": 1,
                     "n_layers": 2,
-                    "cond_dim": 28,
+                    "cond_static_dim": COND_STATIC_DIM,
                     "cond_hidden": 32,
+                    "temporal_token_dim": TEMPORAL_TOKEN_DIM,
+                    "temporal_samples": TEMPORAL_SAMPLES,
+                    "temporal_hidden": 16,
+                    "forcing_embed_dim": 16,
                 }
             },
             "training": {

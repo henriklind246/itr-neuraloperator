@@ -12,21 +12,22 @@ import numpy as np
 from matplotlib.colors import TwoSlopeNorm
 
 from data.dataset import (
-    COND_DIM,
+    A_AMP_REF,
+    COND_STATIC_DIM,
     RC_RANGE,
+    TEMPORAL_SAMPLES,
     T_EPS,
     SnapshotPairDataset,
     build_cond_vector,
+    build_forcing_seq,
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
 )
 from src.physics.boundary_forcing import (
-    FORCING_BINS,
-    SIN_AMP_RANGE,
     SPATIAL_BUILDERS,
+    TEMPORAL_BUILDERS,
     build_qL,
-    integrate_temporal_bins,
 )
 
 
@@ -362,21 +363,19 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
     model_cfg = conf.get("model", {}).get("parameters", {})
     if "modes1" not in model_cfg or "modes2" not in model_cfg:
         raise ValueError("Checkpoint is not a 2D FNO checkpoint: missing modes1/modes2")
-    expected_in_channels = 4 + FORCING_BINS
-    if model_cfg.get("in_channels", expected_in_channels) != expected_in_channels:
-        raise ValueError(
-            f"Checkpoint uses an incompatible spatial input; train a fresh {expected_in_channels}-channel forcing-bin model."
-        )
 
     model = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg.get("width", 64),
-        in_channels=model_cfg.get("in_channels", expected_in_channels),
+        in_channels=model_cfg.get("in_channels", 4),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_dim=model_cfg.get("cond_dim", COND_DIM),
+        cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
         cond_hidden=model_cfg.get("cond_hidden", 256),
+        temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+        temporal_hidden=model_cfg.get("temporal_hidden", 128),
+        forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
     )
@@ -499,46 +498,47 @@ def _prepare_prediction_case(
 
     s_vec = np.asarray(SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params), dtype=np.float32)
     S_y = np.broadcast_to(np.asarray(s_vec, dtype=np.float32)[None, :], T_source.shape)
-    x_spatial_base = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1)
+    spatial_one = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1).astype(np.float32)
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
-    # dt is the solver dt (saved alongside trajectories); fall back to t_grid
-    # spacing if not provided. Mismatch corrupts tau / dt_n cond slots.
-    dt_grid = float(dt) if dt is not None else float(t_grid[1] - t_grid[0])
     t_final_grid = float(t_grid[-1])
-    q_ref = np.float32(SIN_AMP_RANGE[1] * t_final_grid / FORCING_BINS)
-    x_spatial_batch = []
+    A_cum_ref = float(A_AMP_REF * t_final_grid)
+
+    q = TEMPORAL_BUILDERS[temporal_family](**temporal_params)
+
+    x_spatial_batch = np.broadcast_to(spatial_one[None, ...], (len(target_indices),) + spatial_one.shape).astype(np.float32)
+    cond_rows = []
+    forcing_rows = []
     for target_idx in target_indices:
-        bins = integrate_temporal_bins(
-            temporal_family,
-            temporal_params,
-            float(t_grid[s]),
-            float(t_grid[target_idx]),
-            K=FORCING_BINS,
-        ).astype(np.float32)
-        Q_y_bins = (s_vec[None, :, None] * bins[None, None, :] / q_ref).astype(np.float32)
-        Q_y_bins_2d = np.broadcast_to(Q_y_bins, T_source.shape + (FORCING_BINS,))
-        x_spatial_batch.append(np.concatenate([x_spatial_base, Q_y_bins_2d], axis=-1))
-    x_spatial_batch = np.stack(x_spatial_batch, axis=0).astype(np.float32)
-    cond_rows = [
-        build_cond_vector(
-            t_bar_norm=float(t_bars[k]) / t_final_grid,
-            t_s_norm=float(t_s_norm),
-            R_c=R_c,
-            spatial_family=spatial_family, spatial_params=spatial_params,
-            temporal_family=temporal_family, temporal_params=temporal_params,
-            dt=dt_grid, t_final=t_final_grid,
+        cond_rows.append(
+            build_cond_vector(
+                t_bar_norm=float(t_grid[target_idx] - t_grid[s]) / t_final_grid,
+                t_s_norm=float(t_s_norm),
+                R_c=R_c,
+                spatial_family=spatial_family, spatial_params=spatial_params,
+            )
         )
-        for k in range(len(target_indices))
-    ]
+        forcing_rows.append(
+            build_forcing_seq(
+                q,
+                t_s=float(t_grid[s]),
+                t_j=float(t_grid[target_idx]),
+                t_final=t_final_grid,
+                M=TEMPORAL_SAMPLES,
+                A_amp_ref=A_AMP_REF,
+                A_cum_ref=A_cum_ref,
+            )
+        )
     cond_batch = np.stack(cond_rows, axis=0).astype(np.float32)
+    forcing_batch = np.stack(forcing_rows, axis=0).astype(np.float32)
 
     device = next(model.parameters()).device
     with torch.no_grad():
         x_tensor = torch.from_numpy(x_spatial_batch).to(device)
         c_tensor = torch.from_numpy(cond_batch).to(device)
-        Y_pred_norm = model(x_tensor, c_tensor).cpu().numpy()[..., 0]
+        f_tensor = torch.from_numpy(forcing_batch).to(device)
+        Y_pred_norm = model(x_tensor, c_tensor, f_tensor).cpu().numpy()[..., 0]
 
     Y_pred = (Y_pred_norm * (sigma_global + T_EPS) + mu_global).astype(np.float32)
     Y_true = trajectories[sim_id, target_indices].astype(np.float32)
@@ -582,17 +582,20 @@ def _compute_pair_error_records(
 
     x_batch = []
     cond_batch = []
+    forcing_batch = []
     y_batch = []
     stats_batch = []
     for idx in sample_indices:
-        x_spatial, cond, Y, T_stats = dataset[idx]
+        x_spatial, cond_static, forcing_seq, Y, T_stats = dataset[idx]
         x_batch.append(x_spatial)
-        cond_batch.append(cond)
+        cond_batch.append(cond_static)
+        forcing_batch.append(forcing_seq)
         y_batch.append(Y)
         stats_batch.append(T_stats)
 
     x_tensor = torch.stack(x_batch, dim=0)
     cond_tensor = torch.stack(cond_batch, dim=0)
+    forcing_tensor = torch.stack(forcing_batch, dim=0)
     y_tensor = torch.stack(y_batch, dim=0)
     stats_tensor = torch.stack(stats_batch, dim=0)
 
@@ -611,6 +614,7 @@ def _compute_pair_error_records(
             pred = model(
                 x_tensor[start:stop].to(device),
                 cond_tensor[start:stop].to(device),
+                forcing_tensor[start:stop].to(device),
             ).cpu()
         preds.append(pred)
     y_pred = torch.cat(preds, dim=0)

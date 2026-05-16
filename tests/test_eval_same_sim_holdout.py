@@ -2,9 +2,11 @@ import subprocess
 from pathlib import Path
 
 from scripts import eval_same_sim_holdout
-from src.physics.boundary_forcing import FORCING_BINS
 
-SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
+SPATIAL_IN_CHANNELS = 4
+COND_STATIC_DIM = 11
+TEMPORAL_TOKEN_DIM = 5
+TEMPORAL_SAMPLES = 64
 
 
 def _base_config(tmp_path):
@@ -27,8 +29,12 @@ def _base_config(tmp_path):
                 "in_channels": SPATIAL_IN_CHANNELS,
                 "out_channels": 1,
                 "n_layers": 2,
-                "cond_dim": 28,
+                "cond_static_dim": COND_STATIC_DIM,
                 "cond_hidden": 32,
+                "temporal_token_dim": TEMPORAL_TOKEN_DIM,
+                "temporal_samples": TEMPORAL_SAMPLES,
+                "temporal_hidden": 16,
+                "forcing_embed_dim": 16,
             }
         },
         "training": {

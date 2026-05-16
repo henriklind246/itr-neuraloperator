@@ -6,29 +6,42 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.operators.eval import evaluate, mean_std, print_seed_report
 from src.operators.fno2d import FNO2d
-from src.physics.boundary_forcing import FORCING_BINS
 
-SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
+SPATIAL_IN_CHANNELS = 4
+COND_STATIC_DIM = 11
+TEMPORAL_TOKEN_DIM = 5
+TEMPORAL_SAMPLES = 64
 
 
 # ===================== evaluate =====================
 
 @pytest.fixture
 def eval_setup():
-    """Tiny model + 4-tuple loader for eval tests."""
+    """Tiny model + 5-tuple loader for eval tests."""
     Nx = 11
     Ny = 11
-    model = FNO2d(modes1=2, modes2=2, width=8, in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2, cond_dim=28)
+    model = FNO2d(
+        modes1=2, modes2=2, width=8,
+        in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+    )
     model.eval()
 
     x_spatial = torch.randn(4, Nx, Ny, SPATIAL_IN_CHANNELS)
-    cond = torch.rand(4, 28)
+    cond_static = torch.rand(4, COND_STATIC_DIM)
+    forcing_seq = torch.randn(4, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
     Y = torch.randn(4, Nx, Ny, 1)
     T_stats = torch.stack([
-        torch.randn(4),           # mu_s
+        torch.randn(4),             # mu_s
         torch.abs(torch.randn(4)),  # sigma_s (positive)
     ], dim=-1)  # (4, 2)
-    loader = DataLoader(TensorDataset(x_spatial, cond, Y, T_stats), batch_size=2)
+    loader = DataLoader(
+        TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
+        batch_size=2,
+    )
     device = torch.device("cpu")
     return model, loader, device
 

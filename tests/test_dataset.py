@@ -3,37 +3,27 @@ import pytest
 import torch
 
 from data.dataset import (
-    COND_DIM,
+    COND_STATIC_DIM,
+    TEMPORAL_SAMPLES,
+    TEMPORAL_TOKEN_DIM,
+    A_AMP_REF,
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
     split_pairs_within_sims,
     SnapshotPairDataset,
     create_dataloaders,
+    build_forcing_seq,
 )
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
-    TEMPORAL_FAMILY_ORDER,
-    NP_MAX,
-    PULSE_SLOTS,
-    DT_PULSE_FRAC_LO,
-    DT_PULSE_FRAC_HI,
-    TAU_FRAC_LO,
-    TAU_EXP_FRAC_HI,
-    TAU_TRAIN_FRAC_HI,
-    EXP_T0_FRAC,
-    PULSE_AMP_RANGE,
-    SIN_AMP_RANGE,
-    SIN_FREQ_RANGE,
-    FORCING_BINS,
-    integrate_temporal,
-    integrate_temporal_bins,
+    TEMPORAL_BUILDERS,
 )
 
 # Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
-SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
+SPATIAL_IN_CHANNELS = 4
 
 
 # ===================== load_sim_data =====================
@@ -165,7 +155,6 @@ class TestSplitSimIds:
 
     def test_small_dataset(self):
         train, val, test = split_sim_ids(3, 0.7, 0.15, seed=0)
-        # int(3*0.7)=2, int(3*0.15)=0, rest=1
         assert len(train) == 2
         assert len(val) == 0
         assert len(test) == 1
@@ -205,58 +194,54 @@ class TestSnapshotPairDataset:
         )
 
     def test_len_subsampled(self, dataset_subsampled):
-        # 5 sims * C(6,2) = 5 * 15 = 75
         assert len(dataset_subsampled) == 5 * 15
 
     def test_len_full(self, dataset_full):
-        # 5 sims * C(51,2) = 5 * 1275 = 6375
         assert len(dataset_full) == 5 * 1275
 
-    def test_getitem_returns_4tuple(self, dataset_subsampled):
+    def test_getitem_returns_5tuple(self, dataset_subsampled):
         result = dataset_subsampled[0]
-        assert len(result) == 4
+        assert len(result) == 5
 
     def test_getitem_shapes(self, dataset_subsampled):
-        x_spatial, cond, Y, T_stats = dataset_subsampled[0]
+        spatial, cond_static, forcing_seq, Y, T_stats = dataset_subsampled[0]
         Nx, Ny = 11, 11
-        assert x_spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
-        assert cond.shape == (COND_DIM,)
+        assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
+        assert cond_static.shape == (COND_STATIC_DIM,)
+        assert forcing_seq.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
 
     def test_getitem_dtypes(self, dataset_subsampled):
-        x_spatial, cond, Y, T_stats = dataset_subsampled[0]
-        assert x_spatial.dtype == torch.float32
-        assert cond.dtype == torch.float32
+        spatial, cond_static, forcing_seq, Y, T_stats = dataset_subsampled[0]
+        assert spatial.dtype == torch.float32
+        assert cond_static.dtype == torch.float32
+        assert forcing_seq.dtype == torch.float32
         assert Y.dtype == torch.float32
         assert T_stats.dtype == torch.float32
 
     def test_x_coord_normalized(self, dataset_subsampled):
-        x_spatial, _, _, _ = dataset_subsampled[0]
-        x_channel = x_spatial[:, :, 1]  # second channel is x_norm
+        spatial, _, _, _, _ = dataset_subsampled[0]
+        x_channel = spatial[:, :, 1]
         assert x_channel.min() >= -1e-6
         assert x_channel.max() <= 1.0 + 1e-6
 
     def test_ynorm_channel_varies_along_y(self, dataset_subsampled):
-        """y_norm channel should be constant along x and monotone along y."""
-        x_spatial, _, _, _ = dataset_subsampled[0]
-        y_channel = x_spatial[:, :, 2]  # third channel is y_norm
-        # Constant along x (axis=0)
+        spatial, _, _, _, _ = dataset_subsampled[0]
+        y_channel = spatial[:, :, 2]
         assert torch.allclose(y_channel[0, :], y_channel[-1, :])
         assert torch.allclose(y_channel.std(dim=0), torch.zeros(y_channel.shape[1]), atol=1e-6)
-        # Monotone along y
         diffs = y_channel[0, 1:] - y_channel[0, :-1]
         assert torch.all(diffs > 0)
 
     def test_ynorm_channel_unit_range(self, dataset_subsampled):
-        """y_norm endpoints should be 0 and 1."""
-        x_spatial, _, _, _ = dataset_subsampled[0]
-        y_channel = x_spatial[:, :, 2]
+        spatial, _, _, _, _ = dataset_subsampled[0]
+        y_channel = spatial[:, :, 2]
         assert y_channel[:, 0].abs().max().item() < 1e-6
         assert (y_channel[:, -1] - 1.0).abs().max().item() < 1e-6
 
     def test_sy_channel_matches_spatial_builder(self, dataset_subsampled):
-        x_spatial, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = dataset_subsampled[0]
         sim_id, _, _ = dataset_subsampled._pairs[0]
         params = dataset_subsampled.sim_params[sim_id]
         expected_vec = SPATIAL_BUILDERS[params["spatial_family"]](
@@ -268,120 +253,151 @@ class TestSnapshotPairDataset:
                 (dataset_subsampled.Nx, dataset_subsampled.Ny),
             ).copy()
         )
-        assert torch.allclose(x_spatial[:, :, 3], expected)
+        assert torch.allclose(spatial[:, :, 3], expected)
 
     def test_sy_channel_constant_along_x(self, dataset_subsampled):
-        x_spatial, _, _, _ = dataset_subsampled[0]
-        sy_channel = x_spatial[:, :, 3]
+        spatial, _, _, _, _ = dataset_subsampled[0]
+        sy_channel = spatial[:, :, 3]
         assert torch.allclose(sy_channel[0, :], sy_channel[-1, :])
         assert torch.allclose(sy_channel.std(dim=0), torch.zeros(sy_channel.shape[1]), atol=1e-6)
 
-    def test_forcing_bin_channels_are_nonnegative(self, dataset_subsampled):
-        x_spatial, _, _, _ = dataset_subsampled[0]
-        assert torch.all(x_spatial[:, :, 4:4 + FORCING_BINS] >= -1e-6)
+    def test_forcing_seq_r_endpoints(self, dataset_subsampled):
+        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        # r_m = m / (M-1), so first is 0 and last is 1
+        assert forcing_seq[0, 0].item() == pytest.approx(0.0, abs=1e-6)
+        assert forcing_seq[-1, 0].item() == pytest.approx(1.0, abs=1e-6)
 
-    def test_forcing_bin_channels_match_temporal_integrals(self, dataset_subsampled):
-        x_spatial, _, _, _ = dataset_subsampled[0]
+    def test_forcing_seq_dt_to_target_endpoints(self, dataset_subsampled):
+        _, _, forcing_seq, _, _ = dataset_subsampled[0]
         sim_id, s, j = dataset_subsampled._pairs[0]
-        params = dataset_subsampled.sim_params[sim_id]
-        bins = integrate_temporal_bins(
-            params["temporal_family"],
-            params["temporal_params"],
-            float(dataset_subsampled.t_grid[s]),
-            float(dataset_subsampled.t_grid[j]),
-            K=FORCING_BINS,
+        t_bar = float(dataset_subsampled.t_grid[j] - dataset_subsampled.t_grid[s])
+        t_final = float(dataset_subsampled.t_final)
+        # tok3 = (1 - r) * t_bar / t_final; at r=0 it's t_bar/t_final, at r=1 it's 0
+        assert forcing_seq[0, 3].item() == pytest.approx(t_bar / t_final, abs=1e-5)
+        assert forcing_seq[-1, 3].item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_forcing_seq_t_m_endpoints(self, dataset_subsampled):
+        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        sim_id, s, j = dataset_subsampled._pairs[0]
+        t_s = float(dataset_subsampled.t_grid[s])
+        t_j = float(dataset_subsampled.t_grid[j])
+        t_final = float(dataset_subsampled.t_final)
+        # tok4 = t_m / t_final
+        assert forcing_seq[0, 4].item() == pytest.approx(t_s / t_final, abs=1e-5)
+        assert forcing_seq[-1, 4].item() == pytest.approx(t_j / t_final, abs=1e-5)
+
+    def test_forcing_seq_cumulative_matches_trapezoid(self, dataset_subsampled):
+        """tok2 should be the signed trapezoidal cumulative of tok1 * A_AMP_REF, divided by A_cum_ref."""
+        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        A_cum_ref = float(dataset_subsampled.A_cum_ref)
+        sim_id, s, j = dataset_subsampled._pairs[0]
+        t_s = float(dataset_subsampled.t_grid[s])
+        t_j = float(dataset_subsampled.t_grid[j])
+        M = TEMPORAL_SAMPLES
+        r = np.linspace(0.0, 1.0, M, dtype=np.float32)
+        t_samples = t_s + r * (t_j - t_s)
+        a_m = (forcing_seq[:, 1].numpy() * A_AMP_REF).astype(np.float32)
+        A_cum = np.empty_like(a_m)
+        A_cum[0] = 0.0
+        A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
+        expected_tok2 = A_cum / A_cum_ref
+        np.testing.assert_allclose(forcing_seq[:, 2].numpy(), expected_tok2, atol=1e-5)
+
+    def test_forcing_seq_starts_at_zero_cumulative(self, dataset_subsampled):
+        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        assert forcing_seq[0, 2].item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_forcing_seq_pulse_train_monotone(self, synthetic_trajectories):
+        """For a fixed nonnegative pulse_train, cumulative tok2 must be monotone nondecreasing."""
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        t_final = float(t_grid[-1])
+        sim_params = np.array([{
+            "R_c": 0.5,
+            "T0": np.zeros((trajectories.shape[2], trajectories.shape[3]), dtype=np.float32),
+            "temporal_family": "pulse_train",
+            "temporal_params": {
+                "Np": 2,
+                "A_list":  [100.0, 200.0],
+                "t_list":  [0.05, 0.20],
+                "dt_list": [0.05, 0.10],
+            },
+            "spatial_family": "uniform",
+            "spatial_params": {},
+        }], dtype=object)
+        ds = SnapshotPairDataset(
+            trajectories=trajectories[:1], t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
+            sim_ids=np.array([0]), sim_params=sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
+            n_snapshots=6, t_final=t_final,
         )
-        total = integrate_temporal(
-            params["temporal_family"],
-            params["temporal_params"],
-            float(dataset_subsampled.t_grid[s]),
-            float(dataset_subsampled.t_grid[j]),
-        )
-        expected_y = dataset_subsampled.s_y_profiles[sim_id] * total / dataset_subsampled.q_ref
-        expected = torch.from_numpy(
-            np.broadcast_to(expected_y[None, :], (dataset_subsampled.Nx, dataset_subsampled.Ny)).copy()
-        )
-        assert np.sum(bins) == pytest.approx(total, abs=1e-8)
-        assert torch.allclose(x_spatial[:, :, 4:4 + FORCING_BINS].sum(dim=-1), expected, atol=1e-5)
+        _, _, forcing_seq, _, _ = ds[0]
+        diffs = np.diff(forcing_seq[:, 2].numpy())
+        assert np.all(diffs >= -1e-6)
 
     def test_t_bar_positive(self, dataset_subsampled):
-        """Lead time t_bar should always be > 0 (target after source)."""
         for i in range(min(10, len(dataset_subsampled))):
-            _, cond, _, _ = dataset_subsampled[i]
-            t_bar_norm = cond[0].item()
+            _, cond_static, _, _, _ = dataset_subsampled[i]
+            t_bar_norm = cond_static[0].item()
             assert t_bar_norm > 0
 
-    def test_conditioning_in_unit_range(self, dataset_subsampled):
-        """All conditioning values (min-max normalized + one-hot) should be in [0, 1]."""
+    def test_cond_static_in_unit_range(self, dataset_subsampled):
         for i in range(min(10, len(dataset_subsampled))):
-            _, cond, _, _ = dataset_subsampled[i]
-            assert torch.all(cond >= -1e-6)
-            assert torch.all(cond <= 1.0 + 1e-6)
+            _, cond_static, _, _, _ = dataset_subsampled[i]
+            assert torch.all(cond_static >= -1e-6)
+            assert torch.all(cond_static <= 1.0 + 1e-6)
 
     def test_temperature_normalization(self, dataset_subsampled):
-        """Source temperature should be globally normalized (finite values)."""
-        x_spatial, _, _, _ = dataset_subsampled[0]
-        T_norm = x_spatial[:, :, 0]  # first channel is T_source_norm
+        spatial, _, _, _, _ = dataset_subsampled[0]
+        T_norm = spatial[:, :, 0]
         assert torch.all(torch.isfinite(T_norm))
 
     def test_T_stats_returns_global_stats(self, synthetic_trajectories, synthetic_sim_params):
-        """T_stats should return (mu_global, sigma_global), constant across samples."""
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        sim_ids = np.arange(1)  # single sim for easier verification
+        sim_ids = np.arange(1)
         ds = SnapshotPairDataset(
             trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
             sim_ids=sim_ids, sim_params=synthetic_sim_params,
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
-        _, _, _, T_stats_0 = ds[0]
-        _, _, _, T_stats_1 = ds[1]
-        # T_stats should be constant (global stats, not per-sample)
+        _, _, _, _, T_stats_0 = ds[0]
+        _, _, _, _, T_stats_1 = ds[1]
         assert torch.equal(T_stats_0, T_stats_1)
         assert T_stats_0[0].item() == pytest.approx(_SYNTH_MU)
         assert T_stats_0[1].item() == pytest.approx(_SYNTH_SIGMA)
 
     def test_n_snapshots_uniform_spacing(self, dataset_subsampled):
-        """Subsampled t_indices should be uniformly spaced."""
         t_indices = dataset_subsampled.t_indices
         diffs = np.diff(t_indices)
-        # Uniform spacing means all diffs should be equal (or differ by at most 1 due to rounding)
         assert np.max(diffs) - np.min(diffs) <= 1
 
     def test_all_pairs_exhaustive(self, dataset_subsampled):
-        """Pair count should match C(n_snapshots, 2) * num_sims."""
         n_snap = len(dataset_subsampled.t_indices)
         expected = 5 * (n_snap * (n_snap - 1) // 2)
         assert len(dataset_subsampled) == expected
 
     def test_all_lead_times_positive(self, dataset_subsampled):
-        """Every pair should have t_j > t_s (positive lead time)."""
         assert np.all(dataset_subsampled._lead_times > 0)
 
     def test_pairs_sorted_by_lead_time(self, dataset_subsampled):
-        """_lead_times array should be non-decreasing."""
         lead_times = dataset_subsampled._lead_times
         assert np.all(lead_times[1:] >= lead_times[:-1])
 
     def test_curriculum_fraction_reduces_len(self, dataset_subsampled):
-        """set_curriculum_fraction(0.5) should expose fewer pairs than full."""
         full_len = len(dataset_subsampled)
         dataset_subsampled.set_curriculum_fraction(0.5)
         reduced_len = len(dataset_subsampled)
         assert reduced_len < full_len
         assert reduced_len >= 1
-        # Restore
         dataset_subsampled.set_curriculum_fraction(1.0)
 
     def test_curriculum_fraction_one_exposes_all(self, dataset_subsampled):
-        """set_curriculum_fraction(1.0) should restore full length."""
         full_len = len(dataset_subsampled._pairs)
         dataset_subsampled.set_curriculum_fraction(0.3)
         dataset_subsampled.set_curriculum_fraction(1.0)
         assert len(dataset_subsampled) == full_len
 
     def test_n_snapshots_test_finer_than_train(self, synthetic_trajectories, synthetic_sim_params):
-        """Test dataset with more snapshots should have more pairs per sim."""
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(1)
         ds_train = SnapshotPairDataset(
@@ -410,6 +426,42 @@ class TestSnapshotPairDataset:
         assert train_pairs.trajectories is dataset_subsampled.trajectories
         assert val_pairs.trajectories is dataset_subsampled.trajectories
 
+    def test_split_pairs_resets_q_callable_cache(self, dataset_subsampled):
+        """Train and val copies must not share the _q_callables dict (mutable, worker-local)."""
+        train_pairs, val_pairs = split_pairs_within_sims(dataset_subsampled, val_pair_frac=0.2, seed=123)
+        assert train_pairs._q_callables is not val_pairs._q_callables
+        assert train_pairs._q_callables is not dataset_subsampled._q_callables
+
+
+# ===================== build_forcing_seq helper =====================
+
+class TestBuildForcingSeq:
+    def test_shape_and_dtype(self):
+        q = lambda t: np.zeros_like(np.atleast_1d(t), dtype=np.float64)
+        z = build_forcing_seq(q, t_s=0.0, t_j=0.5, t_final=1.0)
+        assert z.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        assert z.dtype == np.float32
+
+    def test_constant_a_gives_linear_cumulative(self):
+        A = 100.0
+        q = lambda t: np.full_like(np.atleast_1d(t).astype(np.float64), A, dtype=np.float64)
+        t_s, t_j, t_final = 0.0, 0.5, 1.0
+        z = build_forcing_seq(q, t_s=t_s, t_j=t_j, t_final=t_final)
+        # Final cumulative should equal A * (t_j - t_s) / A_cum_ref
+        A_cum_ref = A_AMP_REF * t_final
+        expected_final = A * (t_j - t_s) / A_cum_ref
+        assert z[-1, 2] == pytest.approx(expected_final, abs=1e-5)
+        # cumulative starts at zero
+        assert z[0, 2] == pytest.approx(0.0, abs=1e-6)
+
+    def test_scalar_callable_broadcasts(self):
+        """A callable returning a python float must be broadcast to (M,)."""
+        q = lambda t: 42.0
+        z = build_forcing_seq(q, t_s=0.0, t_j=0.1, t_final=1.0)
+        assert z.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        # tok1 = a_m / A_AMP_REF should equal 42 / 300 everywhere
+        assert np.allclose(z[:, 1], 42.0 / A_AMP_REF)
+
 
 # ===================== create_dataloaders =====================
 
@@ -436,14 +488,30 @@ class TestCreateDataloaders:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
-        x_spatial, cond, Y, T_stats = next(iter(train_loader))
-        assert x_spatial.shape[0] <= 4
-        assert x_spatial.shape[1] == 11   # Nx
-        assert x_spatial.shape[2] == 11   # Ny
-        assert x_spatial.shape[3] == SPATIAL_IN_CHANNELS    # T_source + x_norm + y_norm + s_y + Q_y bins
-        assert cond.shape[1] == COND_DIM
+        spatial, cond_static, forcing_seq, Y, T_stats = next(iter(train_loader))
+        assert spatial.shape[0] <= 4
+        assert spatial.shape[1] == 11
+        assert spatial.shape[2] == 11
+        assert spatial.shape[3] == SPATIAL_IN_CHANNELS
+        assert cond_static.shape[1] == COND_STATIC_DIM
+        assert forcing_seq.shape[1] == TEMPORAL_SAMPLES
+        assert forcing_seq.shape[2] == TEMPORAL_TOKEN_DIM
         assert Y.shape[-1] == 1
-        assert T_stats.shape[-1] == 2     # mu_global, sigma_global
+        assert T_stats.shape[-1] == 2
+
+    def test_temporal_samples_override(self, synthetic_trajectories, synthetic_sim_params):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
+        train_loader, _, _ = create_dataloaders(
+            trajectories, x_grid, y_grid, t_grid,
+            train_ids, val_ids, test_ids,
+            batch_size=4, sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
+            n_snapshots=6,
+            temporal_samples=32,
+        )
+        _, _, forcing_seq, _, _ = next(iter(train_loader))
+        assert forcing_seq.shape[1] == 32
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
@@ -462,7 +530,6 @@ class TestCreateDataloaders:
         assert val_sims.isdisjoint(test_sims)
 
     def test_n_snapshots_test_passed_through(self, synthetic_trajectories, synthetic_sim_params):
-        """n_snapshots_test should give the test set a finer grid."""
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         _, _, test_loader = create_dataloaders(
@@ -471,12 +538,10 @@ class TestCreateDataloaders:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, n_snapshots_test=10,
         )
-        # Test dataset should use n_snapshots_test=10 -> C(10,2)=45 pairs per sim
         n_test_sims = len(test_ids)
         assert len(test_loader.dataset) == n_test_sims * 45
 
     def test_noise_std_only_on_train(self, synthetic_trajectories, synthetic_sim_params):
-        """noise_std should only be applied to training set, not val/test."""
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, val_loader, test_loader = create_dataloaders(
@@ -490,7 +555,6 @@ class TestCreateDataloaders:
         assert test_loader.dataset.noise_std == 0.0
 
     def test_noise_augmentation_changes_source(self, synthetic_trajectories, synthetic_sim_params):
-        """With noise_std > 0, two reads of the same sample should differ."""
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)
         ds = SnapshotPairDataset(
@@ -499,15 +563,11 @@ class TestCreateDataloaders:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, noise_std=0.5,
         )
-        x1, _, _, _ = ds[0]
-        x2, _, _, _ = ds[0]
-        # Source temperature channel should differ due to noise
+        x1, _, _, _, _ = ds[0]
+        x2, _, _, _, _ = ds[0]
         assert not torch.equal(x1[:, :, 0], x2[:, :, 0])
-        # x_norm channel should be identical (no noise on spatial coords)
         assert torch.equal(x1[:, :, 1], x2[:, :, 1])
-        # y_norm channel should be identical too
         assert torch.equal(x1[:, :, 2], x2[:, :, 2])
-        # s_y channel should be identical too
         assert torch.equal(x1[:, :, 3], x2[:, :, 3])
 
 
@@ -522,7 +582,6 @@ class TestSolverDatasetIntegration:
         from src.physics.boundary_forcing import build_qL
 
         a, b, c, d = 0.0, 1.0, 0.0, 1.0
-        # Nx=Ny=12 puts face 5|6 exactly at x=0.5 (interface between layers).
         Nx = Ny = 12
         dt = 0.01
         t_final = 0.1
@@ -568,10 +627,9 @@ class TestSolverDatasetIntegration:
                 "spatial_params": spatial_params,
             })
 
-        trajectories = np.stack(T_hist_list, axis=0)  # (num_sims, Nt, Nx, Ny)
+        trajectories = np.stack(T_hist_list, axis=0)
         sim_params = np.array(sim_params_rows, dtype=object)
 
-        # Shape contract: solver output matches the 4D trajectory the dataset expects
         Nt = len(t_grid)
         assert trajectories.shape == (num_sims, Nt, Nx, Ny)
         assert x_grid.shape == (Nx,)
@@ -592,58 +650,37 @@ class TestSolverDatasetIntegration:
         )
         assert len(ds) == num_sims * (5 * 4 // 2)
 
-        spatial, cond, Y, T_stats = ds[0]
+        spatial, cond_static, forcing_seq, Y, T_stats = ds[0]
         assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
-        assert cond.shape == (COND_DIM,)
+        assert cond_static.shape == (COND_STATIC_DIM,)
+        assert forcing_seq.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
         assert torch.all(torch.isfinite(spatial))
+        assert torch.all(torch.isfinite(forcing_seq))
         assert torch.all(torch.isfinite(Y))
 
 
-# ===================== Conditioning vector layout (28 dims) =====================
+# ===================== Static conditioning vector layout (11 dims) =====================
 
-# Slot offsets must match data/dataset.py.
-_OFF_SPATIAL_OH  = 3
-_OFF_SPATIAL_P   = 7
-_OFF_TEMPORAL_OH = 11
-_OFF_TEMPORAL_P  = 15
+# Slot offsets must match data/dataset.py build_cond_vector.
+_OFF_SPATIAL_OH = 3
+_OFF_SPATIAL_P  = 7
 
 
-def _default_temporal(family: str, dt: float, t_final: float) -> dict:
-    """Return a canonical temporal_params dict for the given family."""
-    if family == "sin":
-        return {"A": 175.0, "f": float(np.sqrt(SIN_FREQ_RANGE[0] * SIN_FREQ_RANGE[1])),
-                "t_on": 0.0, "t_off": 0.2, "phase": 0.0, "tukey_alpha": 0.5}
-    if family == "exp":
-        return {"A": 175.0, "t0": 0.5 * EXP_T0_FRAC * t_final,
-                "tau": float(np.sqrt(TAU_FRAC_LO * dt * TAU_EXP_FRAC_HI * t_final))}
-    if family == "pulse_train":
-        return {"Np": 2,
-                "A_list":  [100.0, 200.0],
-                "t_list":  [0.05, 0.20],
-                "dt_list": [DT_PULSE_FRAC_LO * dt, DT_PULSE_FRAC_HI * t_final]}
-    if family == "exp_train":
-        return {"Np": 3,
-                "A_list":   [100.0, 150.0, 200.0],
-                "t_list":   [0.0, 0.05, 0.10],
-                "tau_list": [TAU_FRAC_LO * dt] * 3}
-    raise ValueError(family)
-
-
-class TestCondVectorLayout:
-    """Verifies the 28-dim conditioning vector layout."""
+class TestCondStaticLayout:
+    """Verifies the 11-dim static conditioning vector layout (spatial only;
+    temporal is now consumed by the forcing branch, not by cond_static)."""
 
     def _make_dataset(self, spatial_family, spatial_params,
-                      temporal_family, synthetic_trajectories):
+                      temporal_family, temporal_params,
+                      synthetic_trajectories):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        dt = float(t_grid[1] - t_grid[0])
-        t_final = float(t_grid[-1])
         sim_params = np.array([{
             "R_c": 0.5,
             "T0": np.zeros((trajectories.shape[2], trajectories.shape[3]), dtype=np.float32),
             "temporal_family": temporal_family,
-            "temporal_params": _default_temporal(temporal_family, dt, t_final),
+            "temporal_params": temporal_params,
             "spatial_family": spatial_family,
             "spatial_params": spatial_params,
         }], dtype=object)
@@ -654,7 +691,9 @@ class TestCondVectorLayout:
             n_snapshots=4,
         )
 
-    # ---- spatial onehot + spatial-param slot tests ----
+    _DEFAULT_TEMPORAL = dict(
+        A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5,
+    )
 
     @pytest.mark.parametrize(
         ("spatial_family", "spatial_params"),
@@ -667,8 +706,9 @@ class TestCondVectorLayout:
     )
     def test_spatial_profile_channel_matches_family(self, synthetic_trajectories,
                                                     spatial_family, spatial_params):
-        ds = self._make_dataset(spatial_family, spatial_params, "sin", synthetic_trajectories)
-        spatial, _, _, _ = ds[0]
+        ds = self._make_dataset(spatial_family, spatial_params, "sin", self._DEFAULT_TEMPORAL,
+                                synthetic_trajectories)
+        spatial, _, _, _, _ = ds[0]
         expected_vec = SPATIAL_BUILDERS[spatial_family](ds.y_grid, **spatial_params)
         expected = torch.from_numpy(
             np.broadcast_to(
@@ -679,119 +719,47 @@ class TestCondVectorLayout:
         assert torch.allclose(spatial[:, :, 3], expected)
 
     def test_uniform_onehot_and_zero_spatial_params(self, synthetic_trajectories):
-        ds = self._make_dataset("uniform", {}, "sin", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        assert cond.shape == (COND_DIM,)
-        assert cond[_OFF_SPATIAL_OH + 0].item() == 1.0
-        assert torch.all(cond[_OFF_SPATIAL_OH + 1:_OFF_SPATIAL_OH + 4] == 0.0)
-        assert torch.all(cond[_OFF_SPATIAL_P:_OFF_SPATIAL_P + 4] == 0.0)
+        ds = self._make_dataset("uniform", {}, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
+        _, cond_static, _, _, _ = ds[0]
+        assert cond_static.shape == (COND_STATIC_DIM,)
+        assert cond_static[_OFF_SPATIAL_OH + 0].item() == 1.0
+        assert torch.all(cond_static[_OFF_SPATIAL_OH + 1:_OFF_SPATIAL_OH + 4] == 0.0)
+        assert torch.all(cond_static[_OFF_SPATIAL_P:_OFF_SPATIAL_P + 4] == 0.0)
 
     def test_patch_onehot_and_only_yc_w_populated(self, synthetic_trajectories):
-        ds = self._make_dataset("patch", {"y_c": 0.4, "w": 0.3}, "sin", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        assert cond[_OFF_SPATIAL_OH + 1].item() == 1.0
-        assert cond[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.4)
-        assert cond[_OFF_SPATIAL_P + 1].item() > 0.0
-        assert cond[_OFF_SPATIAL_P + 2].item() == 0.0
-        assert cond[_OFF_SPATIAL_P + 3].item() == 0.0
+        ds = self._make_dataset("patch", {"y_c": 0.4, "w": 0.3}, "sin", self._DEFAULT_TEMPORAL,
+                                synthetic_trajectories)
+        _, cond_static, _, _, _ = ds[0]
+        assert cond_static[_OFF_SPATIAL_OH + 1].item() == 1.0
+        assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.4)
+        assert cond_static[_OFF_SPATIAL_P + 1].item() > 0.0
+        assert cond_static[_OFF_SPATIAL_P + 2].item() == 0.0
+        assert cond_static[_OFF_SPATIAL_P + 3].item() == 0.0
 
     def test_gaussian_onehot_and_only_yc_sigma_populated(self, synthetic_trajectories):
-        ds = self._make_dataset("gaussian", {"y_c": 0.6, "sigma_y": 0.1}, "sin", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        assert cond[_OFF_SPATIAL_OH + 2].item() == 1.0
-        assert cond[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.6)
-        assert cond[_OFF_SPATIAL_P + 1].item() == 0.0
-        assert cond[_OFF_SPATIAL_P + 2].item() > 0.0
-        assert cond[_OFF_SPATIAL_P + 3].item() == 0.0
+        ds = self._make_dataset("gaussian", {"y_c": 0.6, "sigma_y": 0.1}, "sin", self._DEFAULT_TEMPORAL,
+                                synthetic_trajectories)
+        _, cond_static, _, _, _ = ds[0]
+        assert cond_static[_OFF_SPATIAL_OH + 2].item() == 1.0
+        assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.6)
+        assert cond_static[_OFF_SPATIAL_P + 1].item() == 0.0
+        assert cond_static[_OFF_SPATIAL_P + 2].item() > 0.0
+        assert cond_static[_OFF_SPATIAL_P + 3].item() == 0.0
 
     def test_triangle_onehot_and_only_yc_ell_populated(self, synthetic_trajectories):
-        ds = self._make_dataset("triangle", {"y_c": 0.5, "ell": 0.2}, "sin", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        assert cond[_OFF_SPATIAL_OH + 3].item() == 1.0
-        assert cond[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.5)
-        assert cond[_OFF_SPATIAL_P + 1].item() == 0.0
-        assert cond[_OFF_SPATIAL_P + 2].item() == 0.0
-        assert cond[_OFF_SPATIAL_P + 3].item() > 0.0
-
-    # ---- temporal onehot + temporal-param slot tests ----
-
-    def test_sin_temporal_block(self, synthetic_trajectories):
-        ds = self._make_dataset("uniform", {}, "sin", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        idx = TEMPORAL_FAMILY_ORDER.index("sin")
-        assert cond[_OFF_TEMPORAL_OH + idx].item() == 1.0
-        assert cond[_OFF_TEMPORAL_OH:_OFF_TEMPORAL_OH + 4].sum().item() == pytest.approx(1.0)
-        # Np_norm slot is 0 for sin
-        assert cond[_OFF_TEMPORAL_P + 0].item() == 0.0
-        # slot 0: A_norm=0.5, f_norm_log=0.5; the rest of the temporal block is zero
-        assert cond[_OFF_TEMPORAL_P + 1].item() == pytest.approx(0.5, abs=1e-5)
-        assert cond[_OFF_TEMPORAL_P + 2].item() == pytest.approx(0.5, abs=1e-5)
-        assert cond[_OFF_TEMPORAL_P + 3].item() == 0.0
-        assert torch.all(cond[_OFF_TEMPORAL_P + 4:] == 0.0)
-
-    def test_exp_temporal_block(self, synthetic_trajectories):
-        ds = self._make_dataset("uniform", {}, "exp", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        idx = TEMPORAL_FAMILY_ORDER.index("exp")
-        assert cond[_OFF_TEMPORAL_OH + idx].item() == 1.0
-        assert cond[_OFF_TEMPORAL_P + 0].item() == 0.0
-        # slot 0: t0_norm > 0, tau_norm_log mid-range, A_norm = 0.5
-        assert cond[_OFF_TEMPORAL_P + 1].item() > 0.0
-        assert cond[_OFF_TEMPORAL_P + 2].item() == pytest.approx(0.5, abs=1e-5)
-        assert cond[_OFF_TEMPORAL_P + 3].item() == pytest.approx(0.5, abs=1e-5)
-        # rest of temporal block zero
-        assert torch.all(cond[_OFF_TEMPORAL_P + 4:] == 0.0)
-
-    def test_pulse_train_temporal_block(self, synthetic_trajectories):
-        ds = self._make_dataset("uniform", {}, "pulse_train", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        idx = TEMPORAL_FAMILY_ORDER.index("pulse_train")
-        assert cond[_OFF_TEMPORAL_OH + idx].item() == 1.0
-        # Np = 2 → Np_norm = 1/3
-        assert cond[_OFF_TEMPORAL_P + 0].item() == pytest.approx(1.0 / 3.0, abs=1e-6)
-        # slots 0 and 1 populated, slots 2 and 3 zero
-        assert cond[_OFF_TEMPORAL_P + 1 + 0].item() > 0.0  # t_n0 > 0
-        assert cond[_OFF_TEMPORAL_P + 1 + 3].item() > 0.0  # t_n1 > 0
-        # slots 2 and 3 (positions [_OFF_TEMPORAL_P + 7 : _OFF_TEMPORAL_P + 13]) all zero
-        assert torch.all(cond[_OFF_TEMPORAL_P + 1 + 6:_OFF_TEMPORAL_P + 1 + 12] == 0.0)
-
-    def test_exp_train_temporal_block(self, synthetic_trajectories):
-        ds = self._make_dataset("uniform", {}, "exp_train", synthetic_trajectories)
-        _, cond, _, _ = ds[0]
-        idx = TEMPORAL_FAMILY_ORDER.index("exp_train")
-        assert cond[_OFF_TEMPORAL_OH + idx].item() == 1.0
-        # Np = 3 → Np_norm = 2/3
-        assert cond[_OFF_TEMPORAL_P + 0].item() == pytest.approx(2.0 / 3.0, abs=1e-6)
-        # slot 3 (last pulse slot) is unused for Np=3
-        assert torch.all(cond[_OFF_TEMPORAL_P + 1 + 9:_OFF_TEMPORAL_P + 1 + 12] == 0.0)
-
-    # ---- end-to-end invariants ----
-
-    def test_cond_in_unit_range_across_families(self, synthetic_trajectories):
-        """Across all spatial × temporal family combinations, every cond entry lands in [0, 1]."""
-        spatial_cases = [
-            ("uniform", {}),
-            ("patch", {"y_c": 0.5, "w": 0.4}),
-            ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
-            ("triangle", {"y_c": 0.5, "ell": 0.2}),
-        ]
-        for sf, sp in spatial_cases:
-            for tf in TEMPORAL_FAMILY_ORDER:
-                ds = self._make_dataset(sf, sp, tf, synthetic_trajectories)
-                _, cond, _, _ = ds[0]
-                assert torch.all(cond >= -1e-6), f"{sf}/{tf}: negative entry"
-                assert torch.all(cond <= 1.0 + 1e-6), f"{sf}/{tf}: entry > 1"
+        ds = self._make_dataset("triangle", {"y_c": 0.5, "ell": 0.2}, "sin", self._DEFAULT_TEMPORAL,
+                                synthetic_trajectories)
+        _, cond_static, _, _, _ = ds[0]
+        assert cond_static[_OFF_SPATIAL_OH + 3].item() == 1.0
+        assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.5)
+        assert cond_static[_OFF_SPATIAL_P + 1].item() == 0.0
+        assert cond_static[_OFF_SPATIAL_P + 2].item() == 0.0
+        assert cond_static[_OFF_SPATIAL_P + 3].item() > 0.0
 
     def test_spatial_onehot_sums_to_one(self, synthetic_trajectories):
         for sf, sp in [("uniform", {}), ("patch", {"y_c": 0.5, "w": 0.2}),
                        ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
                        ("triangle", {"y_c": 0.5, "ell": 0.1})]:
-            ds = self._make_dataset(sf, sp, "sin", synthetic_trajectories)
-            _, cond, _, _ = ds[0]
-            assert cond[_OFF_SPATIAL_OH:_OFF_SPATIAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
-
-    def test_temporal_onehot_sums_to_one(self, synthetic_trajectories):
-        for tf in TEMPORAL_FAMILY_ORDER:
-            ds = self._make_dataset("uniform", {}, tf, synthetic_trajectories)
-            _, cond, _, _ = ds[0]
-            assert cond[_OFF_TEMPORAL_OH:_OFF_TEMPORAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
+            ds = self._make_dataset(sf, sp, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
+            _, cond_static, _, _, _ = ds[0]
+            assert cond_static[_OFF_SPATIAL_OH:_OFF_SPATIAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)

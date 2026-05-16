@@ -3,11 +3,13 @@ import pytest
 import torch
 
 from src.physics.fv_solver_1d import FVSolver1D, Layer1D
-from src.physics.boundary_forcing import FORCING_BINS
 from src.operators.fno1d import FNO1d
 from src.operators.fno2d import FNO2d
 
-SPATIAL_IN_CHANNELS = 4 + FORCING_BINS
+SPATIAL_IN_CHANNELS = 4
+COND_STATIC_DIM = 11
+TEMPORAL_TOKEN_DIM = 5
+TEMPORAL_SAMPLES = 64
 
 
 # ---------- solver fixtures ----------
@@ -124,7 +126,10 @@ def small_fno2d():
         in_channels=SPATIAL_IN_CHANNELS,
         out_channels=1,
         n_layers=2,
-        cond_dim=28,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
     )
 
 
@@ -144,8 +149,12 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
                         "in_channels": SPATIAL_IN_CHANNELS,
                         "out_channels": 1,
                         "n_layers": 2,
-                        "cond_dim": 28,
+                        "cond_static_dim": COND_STATIC_DIM,
                         "cond_hidden": 256,
+                        "temporal_token_dim": TEMPORAL_TOKEN_DIM,
+                        "temporal_samples": TEMPORAL_SAMPLES,
+                        "temporal_hidden": 16,
+                        "forcing_embed_dim": 16,
                         "dropout": 0.0,
                         "spectral_dropout": 0.0,
                     }
