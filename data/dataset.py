@@ -1,4 +1,5 @@
 import copy
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -11,33 +12,31 @@ from src.physics.boundary_forcing import (
     PATCH_W_RANGE,
     GAUSS_SIGMA_RANGE,
     TRIANGLE_ELL_RANGE,
-    TEMPORAL_FAMILIES,
-    TEMPORAL_FAMILY_ORDER,
-    PULSE_SLOTS,
-    FORCING_BINS,
-    SIN_AMP_RANGE,
-    encode_temporal_params,
-    integrate_temporal_bins,
+    TEMPORAL_BUILDERS,
 )
 
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
 
-# Conditioning-vector layout (28 dims):
+# Static conditioning layout (11 dims):
 #   [0:3]    base:           t_bar_norm, t_s_norm, R_c_norm
 #   [3:7]    spatial onehot: uniform, patch, gaussian, triangle
 #   [7:11]   spatial params: y_c_norm, w_norm, sigma_y_norm, ell_norm
-#   [11:15]  temporal onehot: sin, exp, pulse_train, exp_train
-#   [15:28]  temporal params (1 + PULSE_SLOTS*3 = 13 dims), family-meaning
+#
+# Temporal forcing is no longer encoded via family one-hot/parameter labels.
+# Instead, forcing_seq (M, 5) tokens sample a(t) over [t_s, t_j] and are
+# consumed by a learned encoder inside the model.
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
 
 _BASE_DIM            = 3
 _SPATIAL_ONEHOT_DIM  = len(SPATIAL_FAMILY_ORDER)
 _SPATIAL_PARAM_DIM   = 4
-_TEMPORAL_ONEHOT_DIM = len(TEMPORAL_FAMILY_ORDER)
-_TEMPORAL_PARAM_DIM  = 1 + PULSE_SLOTS * 3
-COND_DIM = (_BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
-            + _TEMPORAL_ONEHOT_DIM + _TEMPORAL_PARAM_DIM)
+COND_STATIC_DIM = _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM  # 11
+
+# Defaults for the temporal forcing branch.
+TEMPORAL_SAMPLES   = 64
+TEMPORAL_TOKEN_DIM = 5
+A_AMP_REF          = 300.0    # matches SIN_AMP_RANGE[1] from boundary_forcing
 
 # log-uniform sigma_y is min-max normalized in log-space so coverage matches
 # the sampler's log-uniform distribution.
@@ -46,11 +45,13 @@ _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
 
 
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      spatial_family: str, spatial_params: dict,
-                      temporal_family: str, temporal_params: dict,
-                      dt: float, t_final: float) -> np.ndarray:
-    """Assemble the 28-dim conditioning vector. Used by both the dataset and
-    the inference plotting paths so they cannot drift apart."""
+                      spatial_family: str, spatial_params: dict) -> np.ndarray:
+    """Assemble the 11-dim static conditioning vector. Used by both the
+    dataset and the inference plotting paths so they cannot drift apart.
+
+    `R_c` is the raw contact resistance (not pre-normalized) — normalization
+    happens here once.
+    """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     base = np.array([t_bar_norm, t_s_norm, R_c_norm], dtype=np.float32)
 
@@ -68,13 +69,58 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
         ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
     spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
 
-    temporal_oh = np.zeros(_TEMPORAL_ONEHOT_DIM, dtype=np.float32)
-    temporal_oh[TEMPORAL_FAMILY_ORDER.index(temporal_family)] = 1.0
-    temporal_p = encode_temporal_params(
-        temporal_family, temporal_params, dt, t_final
-    ).astype(np.float32)
+    return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
 
-    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh, temporal_p]).astype(np.float32)
+
+def build_forcing_seq(
+    q,
+    t_s: float,
+    t_j: float,
+    t_final: float,
+    M: int = TEMPORAL_SAMPLES,
+    A_amp_ref: float = A_AMP_REF,
+    A_cum_ref: float | None = None,
+) -> np.ndarray:
+    """Sample a(t) on M points over [t_s, t_j] and build the (M, 5) token array.
+
+    Tokens:
+        [0] r_m = m / (M-1)
+        [1] a_m / A_amp_ref
+        [2] A_m / A_cum_ref            (signed trapezoidal cumulative)
+        [3] (t_j - t_m) / t_final      (time to target)
+        [4] t_m / t_final              (absolute normalized time)
+
+    `q` is a callable returning a(t). We attempt vectorized evaluation and
+    fall back to scalar iteration if the callable does not broadcast.
+    """
+    if A_cum_ref is None:
+        A_cum_ref = float(A_amp_ref) * float(t_final)
+
+    t_bar = float(t_j) - float(t_s)
+    r = np.linspace(0.0, 1.0, int(M), dtype=np.float32)              # (M,)
+    t_samples = (float(t_s) + r * t_bar).astype(np.float32)          # (M,)
+
+    try:
+        a_m = np.asarray(q(t_samples), dtype=np.float32)
+    except Exception:
+        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
+    if a_m.shape == ():
+        a_m = np.full_like(t_samples, float(a_m), dtype=np.float32)
+    elif a_m.shape != t_samples.shape:
+        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
+
+    # Signed cumulative trapezoid over the M sample grid. NO clamping — solver
+    # uses signed flux, so the encoder must see the same signed values.
+    A_cum = np.empty_like(a_m)
+    A_cum[0] = 0.0
+    A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
+
+    tok0 = r
+    tok1 = a_m / np.float32(A_amp_ref)
+    tok2 = A_cum / np.float32(A_cum_ref)
+    tok3 = ((1.0 - r) * t_bar / float(t_final)).astype(np.float32)
+    tok4 = (t_samples / float(t_final)).astype(np.float32)
+    return np.stack([tok0, tok1, tok2, tok3, tok4], axis=-1).astype(np.float32)
 
 # --------- SNAPSHOT PAIR DATASET ---------
 
@@ -93,12 +139,12 @@ class SnapshotPairDataset(Dataset):
     from the full trajectory and enumerates all possible pairs per
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
-    Returns 4-tuple: (spatial, cond, Y, T_stats)
-        spatial : (Nx, Ny, 4 + FORCING_BINS)  — [T̃_source, x_norm, y_norm, s_y,
-                                   Q_y_bin_0, ..., Q_y_bin_{FORCING_BINS-1}]
-        cond      : (28,)    — see COND_DIM layout above
-        Y         : (Nx, Ny, 1)  — T̃_target (globally normalized)
-        T_stats   : (2,)     — [μ_global, σ_global] for denormalization
+    Returns 5-tuple: (spatial, cond_static, forcing_seq, Y, T_stats)
+        spatial      : (Nx, Ny, 4)        — [T̃_source, x_norm, y_norm, s_y]
+        cond_static  : (11,)              — see COND_STATIC_DIM layout above
+        forcing_seq  : (M, 5)             — token-encoded a(t) over [t_s, t_j]
+        Y            : (Nx, Ny, 1)        — T̃_target (globally normalized)
+        T_stats      : (2,)               — [μ_global, σ_global] for denormalization
     """
 
     def __init__(
@@ -115,6 +161,7 @@ class SnapshotPairDataset(Dataset):
         noise_std: float = 0.0,
         dt: float | None = None,
         t_final: float | None = None,
+        temporal_samples: int = TEMPORAL_SAMPLES,
     ):
         self.trajectories = trajectories  # (num_sims, Nt, Nx, Ny)
         self.sim_params = sim_params
@@ -128,12 +175,20 @@ class SnapshotPairDataset(Dataset):
 
         self.num_sims, self.Nt, self.Nx, self.Ny = trajectories.shape
 
-        # dt and t_final are needed by encode_temporal_params for log-space
-        # normalization of tau / dt_n. Defaults derived from t_grid match the
-        # generation pipeline whenever the saved t_grid is uniform.
+        # Defaults derived from t_grid match the generation pipeline whenever
+        # the saved t_grid is uniform. `dt` is retained for downstream callers
+        # that still want the solver step size; the forcing branch itself
+        # consumes a(t) directly through TEMPORAL_BUILDERS, not via dt/tau.
         self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
         self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
-        self.q_ref = np.float32(SIN_AMP_RANGE[1] * self.t_final / FORCING_BINS)
+
+        # Temporal forcing branch state. The callables are lazy because some
+        # of them (e.g. windowed_sin_flux closures) are not picklable, which
+        # breaks across spawn-style / multi-worker DataLoaders.
+        self.temporal_samples = int(temporal_samples)
+        self.A_cum_ref = float(A_AMP_REF * self.t_final)
+        self._r = np.linspace(0.0, 1.0, self.temporal_samples, dtype=np.float32)
+        self._q_callables: dict[int, Callable] = {}
 
         # Normalized spatial coordinates (fixed for all samples)
         self.x_norm = (
@@ -200,16 +255,15 @@ class SnapshotPairDataset(Dataset):
 
     def __getitem__(self, idx):
         sim_id, s, j = self._pairs[idx]
+        sid = int(sim_id)
 
-        params = self.sim_params[sim_id]
-        R_c = np.float32(params["R_c"])
+        params = self.sim_params[sid]
+        R_c = float(params["R_c"])
         spatial_family = params["spatial_family"]
         spatial_params = params["spatial_params"]
-        temporal_family = params["temporal_family"]
-        temporal_params = params["temporal_params"]
 
-        T_source = self.trajectories[sim_id, s, :, :]  # (Nx, Ny)
-        T_target = self.trajectories[sim_id, j, :, :]  # (Nx, Ny)
+        T_source = self.trajectories[sid, s, :, :]  # (Nx, Ny)
+        T_target = self.trajectories[sid, j, :, :]  # (Nx, Ny)
 
         T_source_norm = (T_source - self.mu_global) / (self.sigma_global + T_EPS)
         T_target_norm = (T_target - self.mu_global) / (self.sigma_global + T_EPS)
@@ -217,27 +271,40 @@ class SnapshotPairDataset(Dataset):
         if self.noise_std > 0:
             T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
 
-        t_bar_norm = (self.t_grid[j] - self.t_grid[s]) / self.t_grid[-1]
-        t_s_norm = self.t_grid[s] / self.t_grid[-1]
-        bins = integrate_temporal_bins(
-            temporal_family,
-            temporal_params,
-            float(self.t_grid[s]),
-            float(self.t_grid[j]),
-            K=FORCING_BINS,
-        ).astype(np.float32)
+        t_s_val = float(self.t_grid[s])
+        t_j_val = float(self.t_grid[j])
+        t_bar = t_j_val - t_s_val
+        t_bar_norm = t_bar / self.t_final
+        t_s_norm = t_s_val / self.t_final
 
-        s_y = self.s_y_profiles[sim_id]
+        # Spatial: 4 channels only (T̃_source, x_norm, y_norm, s_y).
+        s_y = self.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (self.Nx, self.Ny))
-        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / self.q_ref).astype(np.float32)
-        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (self.Nx, self.Ny, FORCING_BINS))
-        spatial_base = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1)
-        spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
-        cond = build_cond_vector(
-            t_bar_norm=float(t_bar_norm), t_s_norm=float(t_s_norm), R_c=float(R_c),
-            spatial_family=spatial_family, spatial_params=spatial_params,
-            temporal_family=temporal_family, temporal_params=temporal_params,
-            dt=self.dt, t_final=self.t_final,
+        spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1).astype(np.float32)
+
+        # Lazy worker-local cache of a(t) callables.
+        if sid not in self._q_callables:
+            self._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
+                **params["temporal_params"]
+            )
+        q = self._q_callables[sid]
+
+        forcing_seq = build_forcing_seq(
+            q,
+            t_s=t_s_val,
+            t_j=t_j_val,
+            t_final=self.t_final,
+            M=self.temporal_samples,
+            A_amp_ref=A_AMP_REF,
+            A_cum_ref=self.A_cum_ref,
+        )
+
+        cond_static = build_cond_vector(
+            t_bar_norm=t_bar_norm,
+            t_s_norm=t_s_norm,
+            R_c=R_c,
+            spatial_family=spatial_family,
+            spatial_params=spatial_params,
         )
 
         # Target: (Nx, Ny, 1)
@@ -248,7 +315,8 @@ class SnapshotPairDataset(Dataset):
 
         return (
             torch.from_numpy(spatial),
-            torch.from_numpy(cond),
+            torch.from_numpy(cond_static),
+            torch.from_numpy(forcing_seq),
             torch.from_numpy(Y),
             torch.from_numpy(T_stats),
         )
@@ -262,6 +330,8 @@ def _dataset_with_pairs(dataset: SnapshotPairDataset, pairs: list[tuple[int, int
         dtype=np.float32,
     )
     out._active_len = len(out._pairs)
+    # Fresh worker-local cache on the copy so train/val don't share a mutable dict.
+    out._q_callables = {}
     return out
 
 
@@ -399,6 +469,7 @@ def create_dataloaders(
     num_workers: int | None = None,
     dt: float | None = None,
     t_final: float | None = None,
+    temporal_samples: int = TEMPORAL_SAMPLES,
     world_size: int = 1,
     rank: int = 0,
     sampler_seed: int = 0,
@@ -438,6 +509,7 @@ def create_dataloaders(
         noise_std=noise_std,
         dt=dt,
         t_final=t_final,
+        temporal_samples=temporal_samples,
     )
 
     val_dataset = SnapshotPairDataset(
@@ -452,6 +524,7 @@ def create_dataloaders(
         n_snapshots=n_snapshots,
         dt=dt,
         t_final=t_final,
+        temporal_samples=temporal_samples,
     )
 
     test_dataset = SnapshotPairDataset(
@@ -466,6 +539,7 @@ def create_dataloaders(
         n_snapshots=n_test,
         dt=dt,
         t_final=t_final,
+        temporal_samples=temporal_samples,
     )
 
     pin = torch.cuda.is_available()
@@ -558,8 +632,9 @@ if __name__ == '__main__':
     )
 
     # Verify shapes
-    x_spatial, cond, yb, t_stats = next(iter(train_loader))
-    print(f"spatial: {x_spatial.shape}")  # (B, Nx, Ny, 4 + FORCING_BINS)
-    print(f"cond: {cond.shape}")            # (B, 28)
-    print(f"Y: {yb.shape}")                 # (B, Nx, Ny, 1)
-    print(f"T_stats: {t_stats.shape}")      # (B, 2)
+    x_spatial, cond_static, forcing_seq, yb, t_stats = next(iter(train_loader))
+    print(f"spatial: {x_spatial.shape}")        # (B, Nx, Ny, 4)
+    print(f"cond_static: {cond_static.shape}")  # (B, 11)
+    print(f"forcing_seq: {forcing_seq.shape}")  # (B, M, 5)
+    print(f"Y: {yb.shape}")                     # (B, Nx, Ny, 1)
+    print(f"T_stats: {t_stats.shape}")          # (B, 2)
