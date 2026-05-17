@@ -76,6 +76,7 @@ class TestFNO2d:
             temporal_token_dim=TEMPORAL_TOKEN_DIM,
             temporal_hidden=16,
             forcing_embed_dim=16,
+            forcing_spatial_dim=4,
         )
         spatial = torch.randn(2, 11, 11, SPATIAL_IN_CHANNELS)
         cond_static = torch.randn(2, COND_STATIC_DIM)
@@ -85,8 +86,13 @@ class TestFNO2d:
 
         assert out.shape == (2, 11, 11, 1)
 
-    def test_identity_init_at_step_zero(self):
-        """CIN identity init: γ=1, β=0 → cond_mlp output should be all-ones for γ and all-zeros for β."""
+    def test_near_identity_init_at_step_zero(self):
+        """Soft identity init: head weights small-random (std=1e-3), bias at γ=1, β=0.
+
+        Per-element deviation can occasionally exceed 0.05; the mean-deviation is the
+        stable property that confirms the model starts near an unconditioned FNO while
+        still allowing gradient flow through the conditioning path.
+        """
         torch.manual_seed(0)
         model = FNO2d(
             modes1=2,
@@ -99,6 +105,7 @@ class TestFNO2d:
             temporal_token_dim=TEMPORAL_TOKEN_DIM,
             temporal_hidden=16,
             forcing_embed_dim=16,
+            forcing_spatial_dim=4,
         )
         cond_static = torch.randn(4, COND_STATIC_DIM)
         forcing_seq = torch.randn(4, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
@@ -107,5 +114,5 @@ class TestFNO2d:
         cin_params = model.cond_mlp(cond_full)
         gamma = cin_params[:, :, 0, :]
         beta = cin_params[:, :, 1, :]
-        assert torch.allclose(gamma, torch.ones_like(gamma))
-        assert torch.allclose(beta, torch.zeros_like(beta))
+        assert (gamma - 1.0).abs().mean() < 0.01
+        assert beta.abs().mean() < 0.01
