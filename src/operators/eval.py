@@ -163,6 +163,7 @@ def eval_all_seeds(run_root: str):
             temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
             temporal_hidden=model_cfg.get("temporal_hidden", 128),
             forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
+            forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)

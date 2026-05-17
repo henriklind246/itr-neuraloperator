@@ -10,9 +10,10 @@ import torch.nn.functional as F
 #
 # where t_bar = t_j - t_s is the lead time, t_s is the absolute source time, and
 # T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
-# cond_static (11D: t_bar, t_s, R_c, spatial onehot + params) is concatenated with a
-# learned temporal-forcing embedding h_a = TemporalForcingEncoder(forcing_seq), and the
-# 75D concatenation drives Conditional Instance Normalization (CIN).
+# h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways:
+#   1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s_y(y) * z_{a,k} is concatenated
+#      to spatial input as K extra channels (direct spatial pathway).
+#   2. Global: [cond_static (11D), h_a (64D)] drives Conditional Instance Normalization.
 
 
 # --------- SpectralConv2d ---------
@@ -109,9 +110,9 @@ class ConditionalInstanceNorm2d(nn.Module):
 class ConditioningMLP(nn.Module):
     """Maps per-sample conditioning vector → per-layer CIN parameters (γ, β).
 
-    Identity init: last linear layer has weight=0 and bias=[1…1, 0…0]
-    so that at initialization γ=1, β=0 (plain InstanceNorm, model starts
-    as unconditioned FNO).
+    Soft identity init: head weights are small random (std=1e-3) and bias=[1…1, 0…0]
+    so γ≈1, β≈0 at start (model starts *near* an unconditioned FNO) while gradients
+    still flow through the conditioning MLP and temporal encoder from step 0.
     """
 
     def __init__(self, cond_dim: int, hidden_dim: int, n_layers: int, width: int):
@@ -128,10 +129,10 @@ class ConditioningMLP(nn.Module):
         )
         self.head = nn.Linear(hidden_dim, n_layers * 2 * width)
 
-        # Identity init for head: γ=1, β=0 at start
+        # Soft identity init: small random weights + bias at γ=1, β=0.
         # Bias layout must match reshape(n_layers, 2, width):
         #   [γ_0(width), β_0(width), γ_1(width), β_1(width), ...]
-        nn.init.zeros_(self.head.weight)
+        nn.init.normal_(self.head.weight, mean=0.0, std=1e-3)
         with torch.no_grad():
             bias_3d = torch.zeros(n_layers, 2, width)
             bias_3d[:, 0, :] = 1.0  # γ = 1 for all layers
@@ -187,6 +188,10 @@ class FNO2d(nn.Module):
     cond_static  : (B, 11)               — t_bar_norm, t_s_norm, R_c_norm, spatial onehot+params
     forcing_seq  : (B, M, token_dim)     — 5-D tokens sampled from a(t) over [t_s, t_j]
     y_pred       : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
+
+    Internally, h_a = TemporalForcingEncoder(forcing_seq) is projected to z_a ∈ R^K and
+    s_y * z_a is concatenated as K extra spatial channels before the lift, so linear_p
+    receives (in_channels + K) channels.
     """
 
     def __init__(
@@ -202,6 +207,7 @@ class FNO2d(nn.Module):
         temporal_token_dim: int = 5,
         temporal_hidden: int = 128,
         forcing_embed_dim: int = 64,
+        forcing_spatial_dim: int = 16,
         dropout: float = 0.0,
         spectral_dropout: float = 0.0,
     ):
@@ -216,10 +222,17 @@ class FNO2d(nn.Module):
         self.temporal_token_dim = temporal_token_dim
         self.temporal_hidden = temporal_hidden
         self.forcing_embed_dim = forcing_embed_dim
+        self.forcing_spatial_dim = forcing_spatial_dim
         self.padding = 8  # pad spatial dim for non-periodic signals
 
-        # Lift: (B, Nx, Ny, in_channels) → (B, Nx, Ny, width)
-        self.linear_p = nn.Linear(in_channels, width)
+        # Lift: (B, Nx, Ny, in_channels + K) → (B, Nx, Ny, width)
+        # The +K accounts for spatial-forcing channels built inside forward as s_y * z_a.
+        self.linear_p = nn.Linear(in_channels + forcing_spatial_dim, width)
+
+        # Project temporal embedding h_a to K spatial-forcing weights; multiplied by s_y(y)
+        # to form K extra spatial channels (restores the direct spatial pathway lost when
+        # the hand-crafted Q_y_bins were removed).
+        self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
 
         # ------- FOURIER LAYERS -------------
         self.spectral_layers = nn.ModuleList([
@@ -261,13 +274,25 @@ class FNO2d(nn.Module):
         forcing_seq  : (B, M, temporal_token_dim)
         returns      : (B, Nx, Ny, out_channels)
         """
-        # Temporal branch + concat with static conditioning
+        # Temporal branch
         h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
+
+        # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}.
+        # Dataset convention: spatial = [T_source_norm, x_norm, y_norm, s_y]; s_y is channel 3.
+        assert spatial.size(-1) == self.in_channels
+        z_a = self.forcing_to_spatial(h_a)                    # (B, K)
+        s_y = spatial[..., 3:4]                               # (B, Nx, Ny, 1)
+        Nx, Ny = spatial.size(1), spatial.size(2)
+        z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1) # (B, Nx, Ny, K)
+        forcing_field = s_y * z_grid                          # (B, Nx, Ny, K)
+        spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
+
+        # Conditioning MLP (h_a is also routed through CIN)
         cond_full = torch.cat([cond_static, h_a], dim=-1)     # (B, cond_static_dim + forcing_embed_dim)
         cin_params = self.cond_mlp(cond_full)                 # (B, n_layers, 2, width)
 
         # Lift
-        x = self.linear_p(spatial)      # (B, Nx, Ny, width)
+        x = self.linear_p(spatial_aug)      # (B, Nx, Ny, width)
         x = x.permute(0, 3, 1, 2)            # (B, width, Nx, Ny)
 
         Nx0 = x.size(-2)
