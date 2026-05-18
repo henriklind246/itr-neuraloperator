@@ -23,7 +23,7 @@ from src.physics.boundary_forcing import (
 # Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
-SPATIAL_IN_CHANNELS = 4
+SPATIAL_IN_CHANNELS = 20
 
 
 # ===================== load_sim_data =====================
@@ -664,8 +664,9 @@ class TestSolverDatasetIntegration:
 # ===================== Static conditioning vector layout (11 dims) =====================
 
 # Slot offsets must match data/dataset.py build_cond_vector.
-_OFF_SPATIAL_OH = 3
-_OFF_SPATIAL_P  = 7
+_OFF_SPATIAL_OH  = 3
+_OFF_SPATIAL_P   = 7
+_OFF_TEMPORAL_OH = 11
 
 
 class TestCondStaticLayout:
@@ -763,3 +764,33 @@ class TestCondStaticLayout:
             ds = self._make_dataset(sf, sp, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
             _, cond_static, _, _, _ = ds[0]
             assert cond_static[_OFF_SPATIAL_OH:_OFF_SPATIAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
+
+    @pytest.mark.parametrize(
+        ("temporal_family", "temporal_params", "expected_slot"),
+        [
+            ("sin", dict(A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5), 0),
+            ("exp", dict(A=200.0, t0=0.0, tau=0.05), 1),
+            ("pulse_train", dict(A_list=[150.0, 200.0], t_list=[0.0, 0.1], dt_list=[0.02, 0.02]), 2),
+            ("exp_train", dict(A_list=[150.0, 200.0], t_list=[0.0, 0.1], tau_list=[0.05, 0.05]), 3),
+        ],
+    )
+    def test_temporal_onehot_matches_family(self, synthetic_trajectories,
+                                            temporal_family, temporal_params, expected_slot):
+        ds = self._make_dataset("uniform", {}, temporal_family, temporal_params,
+                                synthetic_trajectories)
+        _, cond_static, _, _, _ = ds[0]
+        assert cond_static.shape == (COND_STATIC_DIM,)
+        for slot in range(4):
+            expected = 1.0 if slot == expected_slot else 0.0
+            assert cond_static[_OFF_TEMPORAL_OH + slot].item() == expected
+
+    def test_temporal_onehot_sums_to_one(self, synthetic_trajectories):
+        for tf, tp in [
+            ("sin", dict(A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)),
+            ("exp", dict(A=200.0, t0=0.0, tau=0.05)),
+            ("pulse_train", dict(A_list=[150.0], t_list=[0.0], dt_list=[0.02])),
+            ("exp_train", dict(A_list=[150.0], t_list=[0.0], tau_list=[0.05])),
+        ]:
+            ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
+            _, cond_static, _, _, _ = ds[0]
+            assert cond_static[_OFF_TEMPORAL_OH:_OFF_TEMPORAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)

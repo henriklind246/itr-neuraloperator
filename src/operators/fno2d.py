@@ -6,14 +6,16 @@ import torch.nn.functional as F
 # -------- Time-conditioned 2d FNO --------
 #
 # Operator-learning task:
-# G(T(x, y, t_s), x, y, s_y, cond_static, forcing_seq) -> T(x, y, t_j)
+# G(T(x, y, t_s), x, y, s_y, Q_y_bins, cond_static, forcing_seq) -> T(x, y, t_j)
 #
 # where t_bar = t_j - t_s is the lead time, t_s is the absolute source time, and
 # T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
-# h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways:
+# spatial input carries 4 base channels + 16 fixed temporal-forcing integral bins
+# (Q_y_bins(x, y, k) = s_y(y) * ∫a(t)dt over the k-th subinterval of [t_s, t_j], /q_ref).
+# h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways in addition to the bins:
 #   1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s_y(y) * z_{a,k} is concatenated
-#      to spatial input as K extra channels (direct spatial pathway).
-#   2. Global: [cond_static (11D), h_a (64D)] drives Conditional Instance Normalization.
+#      to spatial input as K extra channels (learned spatial pathway).
+#   2. Global: [cond_static (15D), h_a (64D)] drives Conditional Instance Normalization.
 
 
 # --------- SpectralConv2d ---------
@@ -184,14 +186,14 @@ class FNO2d(nn.Module):
     Forward signature:
         model(spatial, cond_static, forcing_seq) → y_pred
 
-    spatial      : (B, Nx, Ny, 4)        — T̃(x, y, t_s), x_norm, y_norm, s_y
-    cond_static  : (B, 11)               — t_bar_norm, t_s_norm, R_c_norm, spatial onehot+params
+    spatial      : (B, Nx, Ny, 20)       — T̃(x, y, t_s), x_norm, y_norm, s_y, Q_y_bin_0..Q_y_bin_15
+    cond_static  : (B, 15)               — t_bar_norm, t_s_norm, R_c_norm, spatial onehot+params, temporal onehot
     forcing_seq  : (B, M, token_dim)     — 5-D tokens sampled from a(t) over [t_s, t_j]
     y_pred       : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
 
     Internally, h_a = TemporalForcingEncoder(forcing_seq) is projected to z_a ∈ R^K and
     s_y * z_a is concatenated as K extra spatial channels before the lift, so linear_p
-    receives (in_channels + K) channels.
+    receives (in_channels + K) channels (e.g. 20 + 16 = 36 with the default config).
     """
 
     def __init__(
@@ -199,10 +201,10 @@ class FNO2d(nn.Module):
         modes1: int,
         modes2: int,
         width: int,
-        in_channels: int = 4,
+        in_channels: int = 20,
         out_channels: int = 1,
         n_layers: int = 4,
-        cond_static_dim: int = 11,
+        cond_static_dim: int = 15,
         cond_hidden: int = 256,
         temporal_token_dim: int = 5,
         temporal_hidden: int = 128,
@@ -278,7 +280,7 @@ class FNO2d(nn.Module):
         h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
 
         # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}.
-        # Dataset convention: spatial = [T_source_norm, x_norm, y_norm, s_y]; s_y is channel 3.
+        # Dataset convention: spatial = [T_source_norm, x_norm, y_norm, s_y, Q_y_bin_0..15]; s_y is channel 3.
         assert spatial.size(-1) == self.in_channels
         z_a = self.forcing_to_spatial(h_a)                    # (B, K)
         s_y = spatial[..., 3:4]                               # (B, Nx, Ny, 1)

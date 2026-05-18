@@ -2,8 +2,8 @@ import torch
 
 from src.operators.fno2d import ConditionalInstanceNorm2d, FNO2d, TemporalForcingEncoder
 
-SPATIAL_IN_CHANNELS = 4
-COND_STATIC_DIM = 11
+SPATIAL_IN_CHANNELS = 20
+COND_STATIC_DIM = 15
 TEMPORAL_TOKEN_DIM = 5
 TEMPORAL_SAMPLES = 64
 

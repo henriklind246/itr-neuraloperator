@@ -13,25 +13,31 @@ from src.physics.boundary_forcing import (
     GAUSS_SIGMA_RANGE,
     TRIANGLE_ELL_RANGE,
     TEMPORAL_BUILDERS,
+    TEMPORAL_FAMILY_ORDER,
+    integrate_temporal_bins,
+    FORCING_BINS,
+    SIN_AMP_RANGE,
 )
 
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
 
-# Static conditioning layout (11 dims):
-#   [0:3]    base:           t_bar_norm, t_s_norm, R_c_norm
-#   [3:7]    spatial onehot: uniform, patch, gaussian, triangle
-#   [7:11]   spatial params: y_c_norm, w_norm, sigma_y_norm, ell_norm
+# Static conditioning layout (15 dims):
+#   [0:3]    base:            t_bar_norm, t_s_norm, R_c_norm
+#   [3:7]    spatial onehot:  uniform, patch, gaussian, triangle
+#   [7:11]   spatial params:  y_c_norm, w_norm, sigma_y_norm, ell_norm
+#   [11:15]  temporal onehot: sin, exp, pulse_train, exp_train
 #
-# Temporal forcing is no longer encoded via family one-hot/parameter labels.
-# Instead, forcing_seq (M, 5) tokens sample a(t) over [t_s, t_j] and are
-# consumed by a learned encoder inside the model.
+# The temporal one-hot gives the conditioning MLP a clean family label; the
+# (M, 5) forcing_seq tokens and the precomputed Q_y_bins spatial channels
+# carry the within-family shape information.
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
 
-_BASE_DIM            = 3
-_SPATIAL_ONEHOT_DIM  = len(SPATIAL_FAMILY_ORDER)
-_SPATIAL_PARAM_DIM   = 4
-COND_STATIC_DIM = _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM  # 11
+_BASE_DIM             = 3
+_SPATIAL_ONEHOT_DIM   = len(SPATIAL_FAMILY_ORDER)
+_SPATIAL_PARAM_DIM    = 4
+_TEMPORAL_ONEHOT_DIM  = len(TEMPORAL_FAMILY_ORDER)
+COND_STATIC_DIM = _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM + _TEMPORAL_ONEHOT_DIM  # 15
 
 # Defaults for the temporal forcing branch.
 TEMPORAL_SAMPLES   = 64
@@ -45,8 +51,9 @@ _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
 
 
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      spatial_family: str, spatial_params: dict) -> np.ndarray:
-    """Assemble the 11-dim static conditioning vector. Used by both the
+                      spatial_family: str, spatial_params: dict,
+                      temporal_family: str) -> np.ndarray:
+    """Assemble the 15-dim static conditioning vector. Used by both the
     dataset and the inference plotting paths so they cannot drift apart.
 
     `R_c` is the raw contact resistance (not pre-normalized) — normalization
@@ -69,7 +76,10 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
         ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
     spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
 
-    return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
+    temporal_oh = np.zeros(_TEMPORAL_ONEHOT_DIM, dtype=np.float32)
+    temporal_oh[TEMPORAL_FAMILY_ORDER.index(temporal_family)] = 1.0
+
+    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh]).astype(np.float32)
 
 
 def build_forcing_seq(
@@ -140,8 +150,8 @@ class SnapshotPairDataset(Dataset):
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
     Returns 5-tuple: (spatial, cond_static, forcing_seq, Y, T_stats)
-        spatial      : (Nx, Ny, 4)        — [T̃_source, x_norm, y_norm, s_y]
-        cond_static  : (11,)              — see COND_STATIC_DIM layout above
+        spatial      : (Nx, Ny, 20)       — [T̃_source, x_norm, y_norm, s_y, Q_y_bin_0, ..., Q_y_bin_15]
+        cond_static  : (15,)              — see COND_STATIC_DIM layout above
         forcing_seq  : (M, 5)             — token-encoded a(t) over [t_s, t_j]
         Y            : (Nx, Ny, 1)        — T̃_target (globally normalized)
         T_stats      : (2,)               — [μ_global, σ_global] for denormalization
@@ -187,6 +197,7 @@ class SnapshotPairDataset(Dataset):
         # breaks across spawn-style / multi-worker DataLoaders.
         self.temporal_samples = int(temporal_samples)
         self.A_cum_ref = float(A_AMP_REF * self.t_final)
+        self.q_ref = np.float32(SIN_AMP_RANGE[1] * self.t_final / FORCING_BINS)
         self._r = np.linspace(0.0, 1.0, self.temporal_samples, dtype=np.float32)
         self._q_callables: dict[int, Callable] = {}
 
@@ -277,10 +288,23 @@ class SnapshotPairDataset(Dataset):
         t_bar_norm = t_bar / self.t_final
         t_s_norm = t_s_val / self.t_final
 
-        # Spatial: 4 channels only (T̃_source, x_norm, y_norm, s_y).
+        # Spatial: 4 base channels + 16 temporal forcing integral bins.
+        # Bins integrate a(t) over equal subintervals of [t_s, t_j], weighted by
+        # s_y(y) and normalized by q_ref. Layout:
+        #   [T̃_source, x_norm, y_norm, s_y, Q_y_bin_0, ..., Q_y_bin_15].
         s_y = self.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (self.Nx, self.Ny))
-        spatial = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1).astype(np.float32)
+        bins = integrate_temporal_bins(
+            params["temporal_family"],
+            params["temporal_params"],
+            t_s_val,
+            t_j_val,
+            K=FORCING_BINS,
+        ).astype(np.float32)
+        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / self.q_ref).astype(np.float32)
+        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (self.Nx, self.Ny, FORCING_BINS))
+        spatial_base = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1).astype(np.float32)
+        spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
 
         # Lazy worker-local cache of a(t) callables.
         if sid not in self._q_callables:
@@ -305,6 +329,7 @@ class SnapshotPairDataset(Dataset):
             R_c=R_c,
             spatial_family=spatial_family,
             spatial_params=spatial_params,
+            temporal_family=params["temporal_family"],
         )
 
         # Target: (Nx, Ny, 1)
@@ -633,8 +658,8 @@ if __name__ == '__main__':
 
     # Verify shapes
     x_spatial, cond_static, forcing_seq, yb, t_stats = next(iter(train_loader))
-    print(f"spatial: {x_spatial.shape}")        # (B, Nx, Ny, 4)
-    print(f"cond_static: {cond_static.shape}")  # (B, 11)
+    print(f"spatial: {x_spatial.shape}")        # (B, Nx, Ny, 20)
+    print(f"cond_static: {cond_static.shape}")  # (B, 15)
     print(f"forcing_seq: {forcing_seq.shape}")  # (B, M, 5)
     print(f"Y: {yb.shape}")                     # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")          # (B, 2)

@@ -3,8 +3,8 @@ from pathlib import Path
 
 from scripts import eval_same_sim_holdout
 
-SPATIAL_IN_CHANNELS = 4
-COND_STATIC_DIM = 11
+SPATIAL_IN_CHANNELS = 20
+COND_STATIC_DIM = 15
 TEMPORAL_TOKEN_DIM = 5
 TEMPORAL_SAMPLES = 64
 

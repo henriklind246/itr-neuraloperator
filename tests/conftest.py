@@ -6,8 +6,8 @@ from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 from src.operators.fno1d import FNO1d
 from src.operators.fno2d import FNO2d
 
-SPATIAL_IN_CHANNELS = 4
-COND_STATIC_DIM = 11
+SPATIAL_IN_CHANNELS = 20
+COND_STATIC_DIM = 15
 TEMPORAL_TOKEN_DIM = 5
 TEMPORAL_SAMPLES = 64
 

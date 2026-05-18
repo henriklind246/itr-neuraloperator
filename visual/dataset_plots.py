@@ -27,7 +27,10 @@ from data.dataset import (
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
     TEMPORAL_BUILDERS,
+    FORCING_BINS,
+    SIN_AMP_RANGE,
     build_qL,
+    integrate_temporal_bins,
 )
 
 
@@ -368,7 +371,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg.get("width", 64),
-        in_channels=model_cfg.get("in_channels", 4),
+        in_channels=model_cfg.get("in_channels", 20),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
@@ -499,25 +502,36 @@ def _prepare_prediction_case(
 
     s_vec = np.asarray(SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params), dtype=np.float32)
     S_y = np.broadcast_to(np.asarray(s_vec, dtype=np.float32)[None, :], T_source.shape)
-    spatial_one = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1).astype(np.float32)
+    spatial_base = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1).astype(np.float32)
 
     t_bars = t_grid[target_indices] - t_grid[s]
     t_s_norm = t_grid[s] / t_grid[-1]
     t_final_grid = float(t_grid[-1])
     A_cum_ref = float(A_AMP_REF * t_final_grid)
+    q_ref = np.float32(SIN_AMP_RANGE[1] * t_final_grid / FORCING_BINS)
 
     q = TEMPORAL_BUILDERS[temporal_family](**temporal_params)
 
-    x_spatial_batch = np.broadcast_to(spatial_one[None, ...], (len(target_indices),) + spatial_one.shape).astype(np.float32)
+    Nx, Ny = T_source.shape
+    spatial_rows = []
     cond_rows = []
     forcing_rows = []
     for target_idx in target_indices:
+        bins = integrate_temporal_bins(
+            temporal_family, temporal_params,
+            float(t_grid[s]), float(t_grid[target_idx]),
+            K=FORCING_BINS,
+        ).astype(np.float32)
+        Q_y_bins = (s_vec[None, :, None] * bins[None, None, :] / q_ref).astype(np.float32)
+        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (Nx, Ny, FORCING_BINS))
+        spatial_rows.append(np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32))
         cond_rows.append(
             build_cond_vector(
                 t_bar_norm=float(t_grid[target_idx] - t_grid[s]) / t_final_grid,
                 t_s_norm=float(t_s_norm),
                 R_c=R_c,
                 spatial_family=spatial_family, spatial_params=spatial_params,
+                temporal_family=temporal_family,
             )
         )
         forcing_rows.append(
@@ -531,6 +545,7 @@ def _prepare_prediction_case(
                 A_cum_ref=A_cum_ref,
             )
         )
+    x_spatial_batch = np.stack(spatial_rows, axis=0).astype(np.float32)
     cond_batch = np.stack(cond_rows, axis=0).astype(np.float32)
     forcing_batch = np.stack(forcing_rows, axis=0).astype(np.float32)
 

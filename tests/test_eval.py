@@ -7,8 +7,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.operators.eval import evaluate, mean_std, print_seed_report
 from src.operators.fno2d import FNO2d
 
-SPATIAL_IN_CHANNELS = 4
-COND_STATIC_DIM = 11
+SPATIAL_IN_CHANNELS = 20
+COND_STATIC_DIM = 15
 TEMPORAL_TOKEN_DIM = 5
 TEMPORAL_SAMPLES = 64
 

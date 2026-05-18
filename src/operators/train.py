@@ -1145,7 +1145,7 @@ def run_one_seed(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", 4),
+        in_channels=model_cfg.get("in_channels", 20),
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
         cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
