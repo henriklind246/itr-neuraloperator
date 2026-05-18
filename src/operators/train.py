@@ -491,6 +491,337 @@ def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
     raise ValueError(f"Unsupported scheduler type: {sched_type}")
 
 
+# ----------------------------------------------------------------------------
+# Diagnostic logging for the learned temporal-forcing path
+# ----------------------------------------------------------------------------
+
+DIAGNOSTICS_FIELDNAMES = [
+    "epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2",
+    "val_rel_l2", "val_iface_rel_l2",
+    "h_a_mean", "h_a_std", "h_a_min", "h_a_max", "h_a_l2_mean", "h_a_batch_var",
+    "z_a_mean", "z_a_std", "z_a_min", "z_a_max", "z_a_l2_mean", "z_a_batch_var",
+    "forcing_field_mean", "forcing_field_std",
+    "forcing_field_min", "forcing_field_max", "forcing_field_l2_mean",
+    "forcing_over_spatial_std", "forcing_over_spatial_norm",
+    "T_source_mean", "T_source_std",
+    "x_norm_mean", "x_norm_std",
+    "y_norm_mean", "y_norm_std",
+    "s_y_mean", "s_y_std",
+    "linear_p_base_w_norm", "linear_p_forcing_w_norm", "linear_p_forcing_over_base",
+    "effective_base_signal", "effective_forcing_signal", "effective_forcing_over_base",
+    "grad_temporal_encoder", "grad_forcing_to_spatial",
+    "grad_cond_mlp", "grad_linear_p", "grad_spectral",
+    "grad_temporal_over_linear_p", "grad_forcing_to_spatial_over_linear_p",
+    "grad_temporal_over_spectral",
+    "sens_val_rel_l2", "sens_amp_shuf_rel_l2", "sens_zero_amp_rel_l2",
+    "sens_amp_shuf_over_normal", "sens_zero_amp_over_normal",
+    "sens_val_iface_rel_l2", "sens_amp_shuf_iface_rel_l2", "sens_zero_amp_iface_rel_l2",
+    "sens_amp_shuf_iface_over_normal", "sens_zero_amp_iface_over_normal",
+    "pred_amp_shuf_mae", "pred_zero_amp_mae",
+    "pred_amp_shuf_rel_norm_diff", "pred_zero_amp_rel_norm_diff",
+    "forcing_seq_amp_shuf_rel_diff", "forcing_seq_amp_std", "forcing_seq_cum_std",
+]
+
+
+class _ForcingActivationProbe:
+    """Context manager: captures h_a (TemporalForcingEncoder output), z_a
+    (forcing_to_spatial output), and spatial_aug (input to linear_p, from which
+    base + forcing_field are split) via forward hooks on the unwrapped FNO2d.
+
+    The model is not modified. Captures are detached. Hooks are removed on exit.
+    """
+
+    def __init__(self, model_unwrapped):
+        self.model = model_unwrapped
+        self.handles: list = []
+        self.h_a = None
+        self.z_a = None
+        self.spatial_aug = None
+
+    def __enter__(self):
+        def cap_h_a(_module, _inputs, output):
+            self.h_a = output.detach()
+
+        def cap_z_a(_module, _inputs, output):
+            self.z_a = output.detach()
+
+        def cap_spatial_aug(_module, inputs):
+            self.spatial_aug = inputs[0].detach()
+
+        self.handles.append(self.model.temporal_encoder.register_forward_hook(cap_h_a))
+        self.handles.append(self.model.forcing_to_spatial.register_forward_hook(cap_z_a))
+        self.handles.append(self.model.linear_p.register_forward_pre_hook(cap_spatial_aug))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+
+def _tensor_stats(t: torch.Tensor, prefix: str, sample_dim: int = 0) -> dict[str, float]:
+    flat = t.float()
+    stats = {
+        f"{prefix}_mean": float(flat.mean().item()),
+        f"{prefix}_std": float(flat.std(unbiased=False).item()),
+        f"{prefix}_min": float(flat.min().item()),
+        f"{prefix}_max": float(flat.max().item()),
+    }
+    moved = flat.movedim(sample_dim, 0)
+    per_sample = moved.reshape(moved.size(0), -1).norm(dim=-1)
+    stats[f"{prefix}_l2_per_sample_mean"] = float(per_sample.mean().item())
+    return stats
+
+
+def _batch_variation(t: torch.Tensor, sample_dim: int = 0) -> float:
+    """Std across the batch dim, then mean over remaining feature dims."""
+    f = t.float()
+    return float(f.std(dim=sample_dim, unbiased=False).mean().item())
+
+
+def _linear_p_weight_norms(model_unwrapped) -> dict[str, float]:
+    """Split linear_p.weight columns into base (first in_channels) vs forcing
+    (last forcing_spatial_dim) and report Frobenius norms.
+    """
+    W = model_unwrapped.linear_p.weight.detach()
+    n_base = model_unwrapped.in_channels
+    base_norm = float(W[:, :n_base].norm().item())
+    forcing_norm = float(W[:, n_base:].norm().item())
+    eps = 1e-12
+    return {
+        "linear_p_base_w_norm": base_norm,
+        "linear_p_forcing_w_norm": forcing_norm,
+        "linear_p_forcing_over_base": forcing_norm / max(base_norm, eps),
+    }
+
+
+# First-match-wins ordering; more-specific prefixes first.
+_GRAD_GROUPS = (
+    ("temporal_encoder", "temporal_encoder."),
+    ("forcing_to_spatial", "forcing_to_spatial."),
+    ("cond_mlp", "cond_mlp."),
+    ("linear_p", "linear_p."),
+    ("spectral", "spectral_layers."),
+)
+
+
+def _grad_norms(model_unwrapped) -> dict[str, float]:
+    """Group gradient norms by submodule prefix. Call after loss.backward() and
+    before optimizer.zero_grad(). Under DDP, gradients are already all-reduced
+    by the backward pass, so rank-0 sees the global view.
+
+    Spectral-conv weights are complex; `.norm()` returns the modulus-based
+    Frobenius norm for both real and complex tensors.
+    """
+    sq = {name: 0.0 for name, _ in _GRAD_GROUPS}
+    for pname, p in model_unwrapped.named_parameters():
+        if p.grad is None:
+            continue
+        for name, prefix in _GRAD_GROUPS:
+            if pname.startswith(prefix):
+                sq[name] += float(p.grad.detach().norm().item() ** 2)
+                break
+    out = {f"grad_{name}": math.sqrt(v) for name, v in sq.items()}
+    eps = 1e-12
+    out["grad_temporal_over_linear_p"] = out["grad_temporal_encoder"] / max(out["grad_linear_p"], eps)
+    out["grad_forcing_to_spatial_over_linear_p"] = out["grad_forcing_to_spatial"] / max(out["grad_linear_p"], eps)
+    out["grad_temporal_over_spectral"] = out["grad_temporal_encoder"] / max(out["grad_spectral"], eps)
+    return out
+
+
+def _accumulate_activation_stats(
+    accum: dict[str, float],
+    probe: _ForcingActivationProbe,
+    in_channels: int,
+) -> None:
+    h_a = probe.h_a                 # (B, embed_dim)
+    z_a = probe.z_a                 # (B, K)
+    spatial_aug = probe.spatial_aug # (B, Nx, Ny, in_channels + K)
+    base = spatial_aug[..., :in_channels]
+    forcing_field = spatial_aug[..., in_channels:]
+
+    batch: dict[str, float] = {}
+    batch.update(_tensor_stats(h_a, "h_a"))
+    batch["h_a_batch_var"] = _batch_variation(h_a)
+    batch.update(_tensor_stats(z_a, "z_a"))
+    batch["z_a_batch_var"] = _batch_variation(z_a)
+    batch.update(_tensor_stats(forcing_field, "forcing_field"))
+
+    eps = 1e-12
+    base_std = float(base.float().std(unbiased=False).item())
+    base_per_sample_norm = float(
+        base.float().reshape(base.size(0), -1).norm(dim=-1).mean().item()
+    )
+    forcing_std = batch["forcing_field_std"]
+    forcing_per_sample_norm = batch["forcing_field_l2_per_sample_mean"]
+    batch["forcing_over_spatial_std"] = forcing_std / max(base_std, eps)
+    batch["forcing_over_spatial_norm"] = forcing_per_sample_norm / max(base_per_sample_norm, eps)
+
+    # Per-channel base spatial stats. Channel order: see fno2d.py:281–284
+    # spatial = [T_source_norm, x_norm, y_norm, s_y].
+    for i, name in enumerate(("T_source", "x_norm", "y_norm", "s_y")):
+        ch = base[..., i].float()
+        batch[f"{name}_mean"] = float(ch.mean().item())
+        batch[f"{name}_std"] = float(ch.std(unbiased=False).item())
+
+    # Stash raw activation stds for effective-signal computation later.
+    batch["_base_activation_std"] = base_std
+    batch["_forcing_activation_std"] = forcing_std
+
+    for k, v in batch.items():
+        accum[k] = accum.get(k, 0.0) + float(v)
+
+
+def _finalize_activation_accum(
+    accum: dict[str, float],
+    n_batches: int,
+    weight_stats: dict[str, float],
+) -> dict[str, float]:
+    if n_batches == 0:
+        return {}
+    out = {k: v / n_batches for k, v in accum.items()}
+    base_std = out.pop("_base_activation_std", 0.0)
+    forcing_std = out.pop("_forcing_activation_std", 0.0)
+    eps = 1e-12
+    out["effective_base_signal"] = weight_stats["linear_p_base_w_norm"] * base_std
+    out["effective_forcing_signal"] = weight_stats["linear_p_forcing_w_norm"] * forcing_std
+    out["effective_forcing_over_base"] = (
+        out["effective_forcing_signal"] / max(out["effective_base_signal"], eps)
+    )
+    # Rename per-sample-L2 fields to the shorter CSV-schema name.
+    for prefix in ("h_a", "z_a", "forcing_field"):
+        key = f"{prefix}_l2_per_sample_mean"
+        if key in out:
+            out[f"{prefix}_l2_mean"] = out.pop(key)
+    return out
+
+
+def forcing_sensitivity_diagnostics(
+    model_unwrapped,
+    val_loader,
+    device,
+    *,
+    iface_mask,
+    n_batches: int,
+    seed: int,
+) -> dict[str, float]:
+    """Rank-0-only: does the model react to perturbations of the forcing
+    sequence?
+
+    forcing_seq token layout (data/dataset.py:build_forcing_seq):
+        [0] r_m                       — kept intact (time coordinate)
+        [1] a_m / A_amp_ref           — perturbed (amplitude)
+        [2] A_cum / A_cum_ref         — perturbed (cumulative amplitude)
+        [3] (t_j - t_m) / t_final     — kept intact (time coordinate)
+        [4] t_m / t_final             — kept intact (time coordinate)
+    Time-coordinate columns are kept so the perturbed input still matches
+    cond_static.
+    """
+    if n_batches <= 0:
+        return {}
+
+    model_unwrapped.eval()
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    mse_n = mse_s = mse_z = 0.0
+    tgt_sq = 0.0
+    imse_n = imse_s = imse_z = 0.0
+    itgt_sq = 0.0
+    shuf_mae = zero_mae = 0.0
+    shuf_rel = zero_rel = 0.0
+    amp_shuf_diff = amp_std = cum_std = 0.0
+    n_done = 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            if n_done >= n_batches:
+                break
+            x_spatial, cond_static, forcing_seq, y_batch, _ = batch
+            x_spatial = x_spatial.to(device)
+            cond_static = cond_static.to(device)
+            forcing_seq = forcing_seq.to(device)
+            y_batch = y_batch.to(device)
+
+            B = forcing_seq.size(0)
+            perm = torch.randperm(B, generator=gen).to(forcing_seq.device)
+
+            forcing_amp_shuf = forcing_seq.clone()
+            forcing_amp_shuf[..., 1:3] = forcing_seq[perm][..., 1:3]
+
+            forcing_zero_amp = forcing_seq.clone()
+            forcing_zero_amp[..., 1:3] = 0.0
+
+            y_n = model_unwrapped(x_spatial, cond_static, forcing_seq)
+            y_s = model_unwrapped(x_spatial, cond_static, forcing_amp_shuf)
+            y_z = model_unwrapped(x_spatial, cond_static, forcing_zero_amp)
+
+            mse_n += torch.sum((y_n - y_batch) ** 2).item()
+            mse_s += torch.sum((y_s - y_batch) ** 2).item()
+            mse_z += torch.sum((y_z - y_batch) ** 2).item()
+            tgt_sq += torch.sum(y_batch ** 2).item()
+
+            if iface_mask is not None:
+                pred_n_i = y_n[:, iface_mask, :]
+                pred_s_i = y_s[:, iface_mask, :]
+                pred_z_i = y_z[:, iface_mask, :]
+                true_i = y_batch[:, iface_mask, :]
+                imse_n += torch.sum((pred_n_i - true_i) ** 2).item()
+                imse_s += torch.sum((pred_s_i - true_i) ** 2).item()
+                imse_z += torch.sum((pred_z_i - true_i) ** 2).item()
+                itgt_sq += torch.sum(true_i ** 2).item()
+
+            eps = 1e-12
+            n_norm = y_n.norm().item() + eps
+            shuf_mae += (y_s - y_n).abs().mean().item()
+            zero_mae += (y_z - y_n).abs().mean().item()
+            shuf_rel += (y_s - y_n).norm().item() / n_norm
+            zero_rel += (y_z - y_n).norm().item() / n_norm
+
+            amp_orig = forcing_seq[..., 1:3].float()
+            amp_shuf = forcing_amp_shuf[..., 1:3].float()
+            amp_shuf_diff += (amp_orig - amp_shuf).norm().item() / (amp_orig.norm().item() + eps)
+            amp_std += float(forcing_seq[..., 1].float().std(unbiased=False).item())
+            cum_std += float(forcing_seq[..., 2].float().std(unbiased=False).item())
+
+            n_done += 1
+
+    if n_done == 0:
+        return {}
+
+    eps = 1e-12
+
+    def rel_l2(num, den):
+        return math.sqrt(num / max(den, eps)) * 100.0
+
+    out: dict[str, float] = {}
+    out["sens_val_rel_l2"] = rel_l2(mse_n, tgt_sq)
+    out["sens_amp_shuf_rel_l2"] = rel_l2(mse_s, tgt_sq)
+    out["sens_zero_amp_rel_l2"] = rel_l2(mse_z, tgt_sq)
+    out["sens_amp_shuf_over_normal"] = out["sens_amp_shuf_rel_l2"] / max(out["sens_val_rel_l2"], eps)
+    out["sens_zero_amp_over_normal"] = out["sens_zero_amp_rel_l2"] / max(out["sens_val_rel_l2"], eps)
+
+    if iface_mask is not None and itgt_sq > 0:
+        out["sens_val_iface_rel_l2"] = rel_l2(imse_n, itgt_sq)
+        out["sens_amp_shuf_iface_rel_l2"] = rel_l2(imse_s, itgt_sq)
+        out["sens_zero_amp_iface_rel_l2"] = rel_l2(imse_z, itgt_sq)
+        out["sens_amp_shuf_iface_over_normal"] = (
+            out["sens_amp_shuf_iface_rel_l2"] / max(out["sens_val_iface_rel_l2"], eps)
+        )
+        out["sens_zero_amp_iface_over_normal"] = (
+            out["sens_zero_amp_iface_rel_l2"] / max(out["sens_val_iface_rel_l2"], eps)
+        )
+
+    out["pred_amp_shuf_mae"] = shuf_mae / n_done
+    out["pred_zero_amp_mae"] = zero_mae / n_done
+    out["pred_amp_shuf_rel_norm_diff"] = shuf_rel / n_done
+    out["pred_zero_amp_rel_norm_diff"] = zero_rel / n_done
+    out["forcing_seq_amp_shuf_rel_diff"] = amp_shuf_diff / n_done
+    out["forcing_seq_amp_std"] = amp_std / n_done
+    out["forcing_seq_cum_std"] = cum_std / n_done
+
+    return out
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -500,6 +831,11 @@ def train_one_epoch(
     iface_mask=None,
     grad_clip=None,
     dist_info: DistInfo | None = None,
+    *,
+    record_diagnostics: bool = False,
+    model_unwrapped=None,
+    diag_out: dict | None = None,
+    activation_batches: int = 0,
 ) -> tuple[float, float, float]:
     """Train one epoch. Under DDP, reduces sums (loss, MSE, ||y||^2, iface MSE,
     ||y_iface||^2, sample counts) across ranks and computes true global metrics
@@ -517,35 +853,67 @@ def train_one_epoch(
     n_samples = 0
     n_iface_voxels = 0  # number of (sample, iface_voxel) entries summed
 
-    # _T_stats is not used since error metrics are computed in z-score temp. source space
-    for x_spatial, cond_static, forcing_seq, y_batch, _T_stats in train_loader:
-        x_spatial = x_spatial.to(device)
-        cond_static = cond_static.to(device)
-        forcing_seq = forcing_seq.to(device)
-        y_batch = y_batch.to(device)
+    do_diag = (
+        record_diagnostics
+        and dist_info.rank == 0
+        and diag_out is not None
+        and model_unwrapped is not None
+        and activation_batches > 0
+    )
+    diag_acc: dict[str, float] = {}
+    grad_acc: dict[str, float] = {}
+    diag_done = 0
+    probe = _ForcingActivationProbe(model_unwrapped) if do_diag else None
+    if probe is not None:
+        probe.__enter__()
 
-        optimizer.zero_grad()
-        y_pred = model(x_spatial, cond_static, forcing_seq)
-        loss = loss_fn(y_pred, y_batch)
-        loss.backward()
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
+    try:
+        # _T_stats is not used since error metrics are computed in z-score temp. source space
+        for x_spatial, cond_static, forcing_seq, y_batch, _T_stats in train_loader:
+            x_spatial = x_spatial.to(device)
+            cond_static = cond_static.to(device)
+            forcing_seq = forcing_seq.to(device)
+            y_batch = y_batch.to(device)
 
-        with torch.no_grad():
-            b = x_spatial.shape[0]
-            loss_sum += loss.item() * b
-            n_samples += b
+            optimizer.zero_grad()
+            y_pred = model(x_spatial, cond_static, forcing_seq)
+            loss = loss_fn(y_pred, y_batch)
+            loss.backward()
 
-            mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
-            target_sq_sum += torch.sum(y_batch ** 2).item()
+            if do_diag and diag_done < activation_batches:
+                _accumulate_activation_stats(diag_acc, probe, model_unwrapped.in_channels)
+                grad_stats = _grad_norms(model_unwrapped)
+                for k, v in grad_stats.items():
+                    grad_acc[k] = grad_acc.get(k, 0.0) + v
+                diag_done += 1
 
-            if iface_mask is not None:
-                pred_iface = y_pred[:, iface_mask, :]
-                true_iface = y_batch[:, iface_mask, :]
-                iface_mse_sum += torch.sum((pred_iface - true_iface) ** 2).item()
-                iface_target_sq_sum += torch.sum(true_iface ** 2).item()
-                n_iface_voxels += pred_iface.numel()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+
+            with torch.no_grad():
+                b = x_spatial.shape[0]
+                loss_sum += loss.item() * b
+                n_samples += b
+
+                mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
+                target_sq_sum += torch.sum(y_batch ** 2).item()
+
+                if iface_mask is not None:
+                    pred_iface = y_pred[:, iface_mask, :]
+                    true_iface = y_batch[:, iface_mask, :]
+                    iface_mse_sum += torch.sum((pred_iface - true_iface) ** 2).item()
+                    iface_target_sq_sum += torch.sum(true_iface ** 2).item()
+                    n_iface_voxels += pred_iface.numel()
+    finally:
+        if probe is not None:
+            probe.__exit__(None, None, None)
+
+    if do_diag and diag_done > 0:
+        weight_stats = _linear_p_weight_norms(model_unwrapped)
+        diag_out.update(weight_stats)
+        diag_out.update(_finalize_activation_accum(diag_acc, diag_done, weight_stats))
+        diag_out.update({k: v / diag_done for k, v in grad_acc.items()})
 
     if dist_info.is_distributed:
         t = torch.tensor(
@@ -880,6 +1248,31 @@ def run_one_seed(
         elif not resuming and val_pairs_path.exists():
             val_pairs_path.unlink()
 
+    # --- Diagnostics CSV (rank 0 only) ---
+    diag_cfg = config["training"].get("diagnostics", {"enabled": False})
+    diag_enabled = bool(diag_cfg.get("enabled", False))
+    diag_every = int(diag_cfg.get("every", 10))
+    diag_run_first = bool(diag_cfg.get("run_first_epoch", True))
+    diag_act_batches = int(diag_cfg.get("activation_batches", 2))
+    diag_sens_batches = int(diag_cfg.get("sensitivity_batches", 2))
+
+    diag_csv_path = run_path / "diagnostics.csv"
+    diag_csv_file = None
+    diag_csv_writer = None
+    if is_main and diag_enabled:
+        if resuming and diag_csv_path.exists():
+            with diag_csv_path.open("r", newline="") as f:
+                reader = csv.DictReader(f)
+                kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
+            diag_csv_file = diag_csv_path.open("w", newline="")
+            diag_csv_writer = csv.DictWriter(diag_csv_file, fieldnames=DIAGNOSTICS_FIELDNAMES)
+            diag_csv_writer.writeheader()
+            diag_csv_writer.writerows(kept_rows)
+        else:
+            diag_csv_file = diag_csv_path.open("w", newline="")
+            diag_csv_writer = csv.DictWriter(diag_csv_file, fieldnames=DIAGNOSTICS_FIELDNAMES)
+            diag_csv_writer.writeheader()
+
     grad_clip = config["training"].get("grad_clip", None)
     warmup_epochs = config["training"].get("curriculum_warmup", 0)
 
@@ -897,10 +1290,20 @@ def run_one_seed(
             training_set.sampler.set_epoch(epoch)
 
         lr = optimizer.param_groups[0]["lr"]
+
+        diagnostic_epoch = diag_enabled and (
+            (epoch == 0 and diag_run_first) or (epoch % diag_every == 0)
+        )
+        diag_out: dict[str, float] | None = {} if diagnostic_epoch else None
+
         train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
             grad_clip=grad_clip, dist_info=dist_info,
+            record_diagnostics=diagnostic_epoch,
+            model_unwrapped=fno_unwrapped,
+            diag_out=diag_out,
+            activation_batches=diag_act_batches,
         )
         scheduler.step()
 
@@ -926,6 +1329,18 @@ def run_one_seed(
                     epoch=epoch,
                 )
                 print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
+
+                if diagnostic_epoch and diag_out is not None:
+                    diag_out.update(
+                        forcing_sensitivity_diagnostics(
+                            model_unwrapped=fno_unwrapped,
+                            val_loader=validation_set,
+                            device=device,
+                            iface_mask=iface_mask,
+                            n_batches=diag_sens_batches,
+                            seed=epoch,
+                        )
+                    )
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -1005,6 +1420,22 @@ def run_one_seed(
             )
             csv_file.flush()
 
+            if diag_csv_writer is not None and diag_out is not None:
+                row = {k: "" for k in DIAGNOSTICS_FIELDNAMES}
+                row["epoch"] = int(epoch)
+                row["train_loss"] = float(train_loss)
+                row["train_rel_l2"] = float(train_rel_l2)
+                row["train_iface_rel_l2"] = float(train_iface_rel_l2)
+                if val_loss is not None:
+                    row["val_rel_l2"] = float(val_loss)
+                if val_iface_rel_l2 is not None:
+                    row["val_iface_rel_l2"] = float(val_iface_rel_l2)
+                for k, v in diag_out.items():
+                    if k in row:
+                        row[k] = float(v)
+                diag_csv_writer.writerow(row)
+                diag_csv_file.flush()
+
         if dist_info.is_distributed:
             dist.barrier()
 
@@ -1014,6 +1445,8 @@ def run_one_seed(
     if is_main:
         if csv_file is not None:
             csv_file.close()
+        if diag_csv_file is not None:
+            diag_csv_file.close()
         if latest_path.exists():
             latest_path.unlink()
 
