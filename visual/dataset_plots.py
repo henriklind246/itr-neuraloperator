@@ -20,9 +20,11 @@ from data.dataset import (
     SnapshotPairDataset,
     build_cond_vector,
     build_forcing_seq,
+    build_forcing_summary,
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
+    _sample_a,
 )
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
@@ -525,6 +527,13 @@ def _prepare_prediction_case(
         Q_y_bins = (s_vec[None, :, None] * bins[None, None, :] / q_ref).astype(np.float32)
         Q_y_bins_2d = np.broadcast_to(Q_y_bins, (Nx, Ny, FORCING_BINS))
         spatial_rows.append(np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32))
+
+        t_s_val = float(t_grid[s])
+        t_j_val = float(t_grid[target_idx])
+        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, TEMPORAL_SAMPLES)
+        forcing_summary = build_forcing_summary(
+            a_m, t_samples, t_s_val, t_j_val, t_final_grid, A_AMP_REF,
+        )
         cond_rows.append(
             build_cond_vector(
                 t_bar_norm=float(t_grid[target_idx] - t_grid[s]) / t_final_grid,
@@ -532,13 +541,14 @@ def _prepare_prediction_case(
                 R_c=R_c,
                 spatial_family=spatial_family, spatial_params=spatial_params,
                 temporal_family=temporal_family,
+                forcing_summary=forcing_summary,
             )
         )
         forcing_rows.append(
             build_forcing_seq(
                 q,
-                t_s=float(t_grid[s]),
-                t_j=float(t_grid[target_idx]),
+                t_s=t_s_val,
+                t_j=t_j_val,
                 t_final=t_final_grid,
                 M=TEMPORAL_SAMPLES,
                 A_amp_ref=A_AMP_REF,

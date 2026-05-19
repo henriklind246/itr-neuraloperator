@@ -23,7 +23,7 @@ model:
     in_channels: 20
     out_channels: 1
     n_layers: 4
-    cond_static_dim: 15
+    cond_static_dim: 23
     cond_hidden: 256
     temporal_token_dim: 5
     temporal_samples: 64
@@ -90,7 +90,7 @@ data:
   test_split: 0.15
   x_shape: "B, Nx, Ny, 20"
   y_shape: "B, Nx, Ny, 1"
-  cond_static_shape: "B, 15"
+  cond_static_shape: "B, 23"
   forcing_seq_shape: "B, 64, 5"
   t_stats_shape: "B, 2"
   num_sims: 10000

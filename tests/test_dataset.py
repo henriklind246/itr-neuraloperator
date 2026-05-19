@@ -14,6 +14,7 @@ from data.dataset import (
     SnapshotPairDataset,
     create_dataloaders,
     build_forcing_seq,
+    build_forcing_summary,
 )
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
@@ -661,17 +662,18 @@ class TestSolverDatasetIntegration:
         assert torch.all(torch.isfinite(Y))
 
 
-# ===================== Static conditioning vector layout (11 dims) =====================
+# ===================== Static conditioning vector layout (23 dims) =====================
 
 # Slot offsets must match data/dataset.py build_cond_vector.
-_OFF_SPATIAL_OH  = 3
-_OFF_SPATIAL_P   = 7
-_OFF_TEMPORAL_OH = 11
+_OFF_SPATIAL_OH       = 3
+_OFF_SPATIAL_P        = 7
+_OFF_TEMPORAL_OH      = 11
+_OFF_FORCING_SUMMARY  = 15
 
 
 class TestCondStaticLayout:
-    """Verifies the 11-dim static conditioning vector layout (spatial only;
-    temporal is now consumed by the forcing branch, not by cond_static)."""
+    """Verifies the 23-dim static conditioning vector layout: base + spatial
+    one-hot + spatial params + temporal one-hot + 8-dim forcing summary."""
 
     def _make_dataset(self, spatial_family, spatial_params,
                       temporal_family, temporal_params,
@@ -794,3 +796,89 @@ class TestCondStaticLayout:
             ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
             _, cond_static, _, _, _ = ds[0]
             assert cond_static[_OFF_TEMPORAL_OH:_OFF_TEMPORAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
+
+    def test_forcing_summary_slot_populated_and_finite(self, synthetic_trajectories):
+        """[15:23] block must be filled (not all-zero for a non-trivial forcing)
+        and finite for every temporal family."""
+        for tf, tp in [
+            ("sin", dict(A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)),
+            ("exp", dict(A=200.0, t0=0.0, tau=0.05)),
+            ("pulse_train", dict(A_list=[150.0], t_list=[0.0], dt_list=[0.02])),
+            ("exp_train", dict(A_list=[150.0], t_list=[0.0], tau_list=[0.05])),
+        ]:
+            ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
+            _, cond_static, _, _, _ = ds[0]
+            block = cond_static[_OFF_FORCING_SUMMARY:_OFF_FORCING_SUMMARY + 8]
+            assert block.shape == (8,)
+            assert torch.all(torch.isfinite(block))
+            # S2 (abs impulse) and S6 (RMS) and S7 (peak) are nonneg by construction
+            assert block[1].item() >= 0.0
+            assert block[5].item() >= 0.0
+            assert block[6].item() >= 0.0
+            # For these positive-amplitude families, peak |a|/A_ref is > 0
+            assert block[6].item() > 0.0
+
+
+# ===================== build_forcing_summary helper =====================
+
+
+class TestBuildForcingSummary:
+    """Closed-form checks for constant a(t) and zero forcing."""
+
+    def _grid(self, t_s, t_j, M=TEMPORAL_SAMPLES):
+        return np.linspace(t_s, t_j, M, dtype=np.float64)
+
+    def test_shape_and_dtype(self):
+        t_vals = self._grid(0.0, 0.5)
+        a_vals = np.zeros_like(t_vals)
+        s = build_forcing_summary(a_vals, t_vals, t_s=0.0, t_j=0.5, t_final=1.0)
+        assert s.shape == (8,)
+        assert s.dtype == np.float32
+
+    def test_zero_forcing_all_zero(self):
+        t_vals = self._grid(0.0, 0.7)
+        a_vals = np.zeros_like(t_vals)
+        s = build_forcing_summary(a_vals, t_vals, t_s=0.0, t_j=0.7, t_final=1.0)
+        assert np.allclose(s, 0.0, atol=1e-7)
+
+    def test_constant_positive(self):
+        A = 60.0
+        t_s, t_j, t_final = 0.1, 0.6, 1.0
+        t_vals = self._grid(t_s, t_j)
+        a_vals = np.full_like(t_vals, A)
+        s = build_forcing_summary(a_vals, t_vals, t_s=t_s, t_j=t_j, t_final=t_final)
+        mass = A * (t_j - t_s) / (A_AMP_REF * t_final)
+        # S1, S2, S3, S4
+        assert s[0] == pytest.approx(mass,  rel=1e-5)
+        assert s[1] == pytest.approx(mass,  rel=1e-5)
+        assert s[2] == pytest.approx(mass,  rel=1e-5)
+        assert s[3] == pytest.approx(0.0,   abs=1e-7)
+        # S5, S6, S7, S8
+        assert s[4] == pytest.approx(A / A_AMP_REF, rel=1e-5)
+        assert s[5] == pytest.approx(A / A_AMP_REF, rel=1e-5)
+        assert s[6] == pytest.approx(A / A_AMP_REF, rel=1e-5)
+        assert s[7] == pytest.approx(A / A_AMP_REF, rel=1e-5)
+
+    def test_constant_negative(self):
+        A = 80.0
+        t_s, t_j, t_final = 0.0, 0.4, 1.0
+        t_vals = self._grid(t_s, t_j)
+        a_vals = np.full_like(t_vals, -A)
+        s = build_forcing_summary(a_vals, t_vals, t_s=t_s, t_j=t_j, t_final=t_final)
+        mass = A * (t_j - t_s) / (A_AMP_REF * t_final)
+        # S1 = -mass, S2 = mass, S3 = 0, S4 = mass
+        assert s[0] == pytest.approx(-mass, rel=1e-5)
+        assert s[1] == pytest.approx( mass, rel=1e-5)
+        assert s[2] == pytest.approx(0.0,   abs=1e-7)
+        assert s[3] == pytest.approx( mass, rel=1e-5)
+        # S5 = -A/A_ref, S6 = A/A_ref, S7 = A/A_ref, S8 = -A/A_ref
+        assert s[4] == pytest.approx(-A / A_AMP_REF, rel=1e-5)
+        assert s[5] == pytest.approx( A / A_AMP_REF, rel=1e-5)
+        assert s[6] == pytest.approx( A / A_AMP_REF, rel=1e-5)
+        assert s[7] == pytest.approx(-A / A_AMP_REF, rel=1e-5)
+
+    def test_zero_interval_does_not_divide_by_zero(self):
+        t_vals = np.array([0.3, 0.3], dtype=np.float64)
+        a_vals = np.array([10.0, 10.0], dtype=np.float64)
+        s = build_forcing_summary(a_vals, t_vals, t_s=0.3, t_j=0.3, t_final=1.0)
+        assert np.all(np.isfinite(s))

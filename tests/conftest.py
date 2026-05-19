@@ -7,7 +7,7 @@ from src.operators.fno1d import FNO1d
 from src.operators.fno2d import FNO2d
 
 SPATIAL_IN_CHANNELS = 20
-COND_STATIC_DIM = 15
+COND_STATIC_DIM = 23
 TEMPORAL_TOKEN_DIM = 5
 TEMPORAL_SAMPLES = 64
 
