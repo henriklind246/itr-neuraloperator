@@ -811,12 +811,14 @@ class TestCondStaticLayout:
             block = cond_static[_OFF_FORCING_SUMMARY:_OFF_FORCING_SUMMARY + 8]
             assert block.shape == (8,)
             assert torch.all(torch.isfinite(block))
-            # S2 (abs impulse) and S6 (RMS) and S7 (peak) are nonneg by construction
+            # S2 (abs impulse), S6 (RMS), S7 (peak) are nonneg by construction.
+            # Cannot assert strict positivity: for narrow pulse_train forcings,
+            # the smallest-lead-time pair can lie entirely outside the pulse
+            # support, in which case a(t) = 0 over [t_s, t_j] and all eight
+            # summaries are exactly zero. That is correct behavior.
             assert block[1].item() >= 0.0
             assert block[5].item() >= 0.0
             assert block[6].item() >= 0.0
-            # For these positive-amplitude families, peak |a|/A_ref is > 0
-            assert block[6].item() > 0.0
 
 
 # ===================== build_forcing_summary helper =====================

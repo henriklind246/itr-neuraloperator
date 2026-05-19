@@ -22,22 +22,27 @@ from src.physics.boundary_forcing import (
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
 
-# Static conditioning layout (15 dims):
-#   [0:3]    base:            t_bar_norm, t_s_norm, R_c_norm
-#   [3:7]    spatial onehot:  uniform, patch, gaussian, triangle
-#   [7:11]   spatial params:  y_c_norm, w_norm, sigma_y_norm, ell_norm
-#   [11:15]  temporal onehot: sin, exp, pulse_train, exp_train
+# Static conditioning layout (23 dims):
+#   [0:3]    base:             t_bar_norm, t_s_norm, R_c_norm
+#   [3:7]    spatial onehot:   uniform, patch, gaussian, triangle
+#   [7:11]   spatial params:   y_c_norm, w_norm, sigma_y_norm, ell_norm
+#   [11:15]  temporal onehot:  sin, exp, pulse_train, exp_train
+#   [15:23]  forcing summary:  S1..S8 (signed/abs/pos/neg impulse, mean, RMS, peak, final)
 #
-# The temporal one-hot gives the conditioning MLP a clean family label; the
-# (M, 5) forcing_seq tokens and the precomputed Q_y_bins spatial channels
-# carry the within-family shape information.
+# The forcing summary block gives the conditioning MLP global, interval-level
+# scalar descriptors of a(t) over [t_s, t_j] — complementary to the spatial
+# Q_y_bins channels and the learned TemporalForcingEncoder embedding.
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
 
 _BASE_DIM             = 3
 _SPATIAL_ONEHOT_DIM   = len(SPATIAL_FAMILY_ORDER)
 _SPATIAL_PARAM_DIM    = 4
 _TEMPORAL_ONEHOT_DIM  = len(TEMPORAL_FAMILY_ORDER)
-COND_STATIC_DIM = _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM + _TEMPORAL_ONEHOT_DIM  # 15
+_FORCING_SUMMARY_DIM  = 8
+COND_STATIC_DIM = (
+    _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
+    + _TEMPORAL_ONEHOT_DIM + _FORCING_SUMMARY_DIM
+)  # 23
 
 # Defaults for the temporal forcing branch.
 TEMPORAL_SAMPLES   = 64
@@ -52,12 +57,16 @@ _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
 
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
                       spatial_family: str, spatial_params: dict,
-                      temporal_family: str) -> np.ndarray:
-    """Assemble the 15-dim static conditioning vector. Used by both the
+                      temporal_family: str,
+                      forcing_summary: np.ndarray) -> np.ndarray:
+    """Assemble the 23-dim static conditioning vector. Used by both the
     dataset and the inference plotting paths so they cannot drift apart.
 
     `R_c` is the raw contact resistance (not pre-normalized) — normalization
-    happens here once.
+    happens here once. `forcing_summary` is the (_FORCING_SUMMARY_DIM,) vector
+    built by `build_forcing_summary` from the same a(t) samples that feed
+    `forcing_seq`; required (no default) so callers cannot silently ship a
+    zero-padded conditioning vector.
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     base = np.array([t_bar_norm, t_s_norm, R_c_norm], dtype=np.float32)
@@ -79,7 +88,62 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
     temporal_oh = np.zeros(_TEMPORAL_ONEHOT_DIM, dtype=np.float32)
     temporal_oh[TEMPORAL_FAMILY_ORDER.index(temporal_family)] = 1.0
 
-    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh]).astype(np.float32)
+    fs = np.asarray(forcing_summary, dtype=np.float32).reshape(-1)
+    if fs.shape[0] != _FORCING_SUMMARY_DIM:
+        raise ValueError(
+            f"forcing_summary must have shape ({_FORCING_SUMMARY_DIM},), got {fs.shape}"
+        )
+
+    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh, fs]).astype(np.float32)
+
+
+def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate a(t) at M uniform samples spanning [t_s, t_j] (both endpoints).
+
+    Returns (t_samples, a_m), both float32 arrays of shape (M,). Endpoint
+    inclusion matters: the final sample is a(t_j), which the forcing-summary
+    `S8` reads as the most recent forcing value.
+    """
+    t_bar = float(t_j) - float(t_s)
+    r = np.linspace(0.0, 1.0, int(M), dtype=np.float32)
+    t_samples = (float(t_s) + r * t_bar).astype(np.float32)
+
+    try:
+        a_m = np.asarray(q(t_samples), dtype=np.float32)
+    except Exception:
+        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
+    if a_m.shape == ():
+        a_m = np.full_like(t_samples, float(a_m), dtype=np.float32)
+    elif a_m.shape != t_samples.shape:
+        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
+    return t_samples, a_m
+
+
+def _forcing_seq_from_samples(
+    t_samples: np.ndarray,
+    a_m: np.ndarray,
+    t_s: float,
+    t_j: float,
+    t_final: float,
+    A_amp_ref: float,
+    A_cum_ref: float,
+) -> np.ndarray:
+    t_bar = float(t_j) - float(t_s)
+    M = t_samples.shape[0]
+    r = np.linspace(0.0, 1.0, M, dtype=np.float32)
+
+    # Signed cumulative trapezoid over the M sample grid. NO clamping — solver
+    # uses signed flux, so the encoder must see the same signed values.
+    A_cum = np.empty_like(a_m)
+    A_cum[0] = 0.0
+    A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
+
+    tok0 = r
+    tok1 = a_m / np.float32(A_amp_ref)
+    tok2 = A_cum / np.float32(A_cum_ref)
+    tok3 = ((1.0 - r) * t_bar / float(t_final)).astype(np.float32)
+    tok4 = (t_samples / float(t_final)).astype(np.float32)
+    return np.stack([tok0, tok1, tok2, tok3, tok4], axis=-1).astype(np.float32)
 
 
 def build_forcing_seq(
@@ -106,31 +170,57 @@ def build_forcing_seq(
     if A_cum_ref is None:
         A_cum_ref = float(A_amp_ref) * float(t_final)
 
-    t_bar = float(t_j) - float(t_s)
-    r = np.linspace(0.0, 1.0, int(M), dtype=np.float32)              # (M,)
-    t_samples = (float(t_s) + r * t_bar).astype(np.float32)          # (M,)
+    t_samples, a_m = _sample_a(q, t_s, t_j, int(M))
+    return _forcing_seq_from_samples(t_samples, a_m, t_s, t_j, t_final, A_amp_ref, A_cum_ref)
 
-    try:
-        a_m = np.asarray(q(t_samples), dtype=np.float32)
-    except Exception:
-        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
-    if a_m.shape == ():
-        a_m = np.full_like(t_samples, float(a_m), dtype=np.float32)
-    elif a_m.shape != t_samples.shape:
-        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
 
-    # Signed cumulative trapezoid over the M sample grid. NO clamping — solver
-    # uses signed flux, so the encoder must see the same signed values.
-    A_cum = np.empty_like(a_m)
-    A_cum[0] = 0.0
-    A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
+def build_forcing_summary(
+    a_vals: np.ndarray,
+    t_vals: np.ndarray,
+    t_s: float,
+    t_j: float,
+    t_final: float,
+    A_amp_ref: float = A_AMP_REF,
+) -> np.ndarray:
+    """Global interval-level descriptors of a(t) over [t_s, t_j].
 
-    tok0 = r
-    tok1 = a_m / np.float32(A_amp_ref)
-    tok2 = A_cum / np.float32(A_cum_ref)
-    tok3 = ((1.0 - r) * t_bar / float(t_final)).astype(np.float32)
-    tok4 = (t_samples / float(t_final)).astype(np.float32)
-    return np.stack([tok0, tok1, tok2, tok3, tok4], axis=-1).astype(np.float32)
+    Returns float32 shape (_FORCING_SUMMARY_DIM,):
+        S1 = ∫a(t)dt / (A_ref * t_final)           signed impulse
+        S2 = ∫|a(t)|dt / (A_ref * t_final)         absolute impulse
+        S3 = ∫max(a,0)dt / (A_ref * t_final)       positive impulse
+        S4 = ∫max(-a,0)dt / (A_ref * t_final)      negative impulse magnitude
+        S5 = mean(a) / A_ref                       mean forcing
+        S6 = sqrt(<a^2>) / A_ref                   RMS forcing
+        S7 = max|a| / A_ref                         peak abs forcing
+        S8 = a(t_j) / A_ref                         final forcing value
+
+    `t_vals` must include both endpoints (t_s, t_j) so that `S8 = a_vals[-1]`
+    is genuinely a(t_j). Caller is expected to share t_vals/a_vals with
+    `build_forcing_seq` via `_sample_a` to guarantee both descriptors see the
+    same underlying samples.
+    """
+    A_ref = float(A_amp_ref)
+    dt_interval = max(float(t_j) - float(t_s), 1e-8)
+    denom_impulse = A_ref * float(t_final)
+
+    # np.trapezoid added in numpy 2.0; fall back to deprecated np.trapz otherwise.
+    trapz = getattr(np, "trapezoid", np.trapz)
+    I_signed = float(trapz(a_vals, t_vals))
+    I_abs    = float(trapz(np.abs(a_vals), t_vals))
+    I_pos    = float(trapz(np.clip(a_vals, 0.0, None), t_vals))
+    I_neg    = float(trapz(np.clip(-a_vals, 0.0, None), t_vals))
+    I_sq     = float(trapz(a_vals ** 2, t_vals))
+
+    S1 = I_signed / denom_impulse
+    S2 = I_abs    / denom_impulse
+    S3 = I_pos    / denom_impulse
+    S4 = I_neg    / denom_impulse
+    S5 = (I_signed / dt_interval) / A_ref
+    S6 = np.sqrt(max(I_sq / dt_interval, 0.0)) / A_ref
+    S7 = float(np.max(np.abs(a_vals))) / A_ref
+    S8 = float(a_vals[-1]) / A_ref
+
+    return np.array([S1, S2, S3, S4, S5, S6, S7, S8], dtype=np.float32)
 
 # --------- SNAPSHOT PAIR DATASET ---------
 
@@ -151,7 +241,7 @@ class SnapshotPairDataset(Dataset):
 
     Returns 5-tuple: (spatial, cond_static, forcing_seq, Y, T_stats)
         spatial      : (Nx, Ny, 20)       — [T̃_source, x_norm, y_norm, s_y, Q_y_bin_0, ..., Q_y_bin_15]
-        cond_static  : (15,)              — see COND_STATIC_DIM layout above
+        cond_static  : (23,)              — see COND_STATIC_DIM layout above
         forcing_seq  : (M, 5)             — token-encoded a(t) over [t_s, t_j]
         Y            : (Nx, Ny, 1)        — T̃_target (globally normalized)
         T_stats      : (2,)               — [μ_global, σ_global] for denormalization
@@ -313,14 +403,14 @@ class SnapshotPairDataset(Dataset):
             )
         q = self._q_callables[sid]
 
-        forcing_seq = build_forcing_seq(
-            q,
-            t_s=t_s_val,
-            t_j=t_j_val,
-            t_final=self.t_final,
-            M=self.temporal_samples,
-            A_amp_ref=A_AMP_REF,
-            A_cum_ref=self.A_cum_ref,
+        # Single a(t) sampling shared by forcing_seq and forcing_summary so the
+        # two conditioning pathways cannot drift apart.
+        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, self.temporal_samples)
+        forcing_seq = _forcing_seq_from_samples(
+            t_samples, a_m, t_s_val, t_j_val, self.t_final, A_AMP_REF, self.A_cum_ref,
+        )
+        forcing_summary = build_forcing_summary(
+            a_m, t_samples, t_s_val, t_j_val, self.t_final, A_AMP_REF,
         )
 
         cond_static = build_cond_vector(
@@ -330,6 +420,7 @@ class SnapshotPairDataset(Dataset):
             spatial_family=spatial_family,
             spatial_params=spatial_params,
             temporal_family=params["temporal_family"],
+            forcing_summary=forcing_summary,
         )
 
         # Target: (Nx, Ny, 1)
@@ -659,7 +750,7 @@ if __name__ == '__main__':
     # Verify shapes
     x_spatial, cond_static, forcing_seq, yb, t_stats = next(iter(train_loader))
     print(f"spatial: {x_spatial.shape}")        # (B, Nx, Ny, 20)
-    print(f"cond_static: {cond_static.shape}")  # (B, 15)
+    print(f"cond_static: {cond_static.shape}")  # (B, 23)
     print(f"forcing_seq: {forcing_seq.shape}")  # (B, M, 5)
     print(f"Y: {yb.shape}")                     # (B, Nx, Ny, 1)
     print(f"T_stats: {t_stats.shape}")          # (B, 2)
