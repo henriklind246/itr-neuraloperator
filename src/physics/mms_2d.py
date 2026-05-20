@@ -235,6 +235,109 @@ def run_mms_2d_yflux(N: int, dt=None) -> tuple[float, float, float, float]:
 
 
 # ==============================================================
+# 2c. smooth-in-time left-flux MMS with exact step-integral forcing
+# ==============================================================
+
+def run_mms_2d_smooth_forcing_integral(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    Manufactured solution for the exact-integral left-forcing path.
+
+    T*(x, y, t) = 300 + A sin(omega t + phase) (b-x)^4 cos(pi (y-c)/(d-c))
+
+    The matching source is f = rho*cp*T_t - div(k grad T). The left flux uses
+    the solver's positive-inward convention:
+
+      q_L(y,t) = -k dT*/dx|_{x=a}
+               = 4 k A sin(omega t + phase) (b-a)^3 cos(pi (y-c)/(d-c)).
+
+    This case is intentionally smooth in time. Production exp/exp_train
+    activation and pulse_train discontinuities belong in refined-reference
+    tests, not strict second-order MMS.
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    L = b - a
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.37
+    A = 10.0
+    kappa = np.pi / Ly
+    y_vec = np.linspace(c, d, N)
+    cos_y_left = np.cos(kappa * (y_vec - c))
+
+    def cos_y(Y):
+        return np.cos(kappa * (Y - c))
+
+    def g(t):
+        return np.sin(omega * t + phase)
+
+    def g_t(t):
+        return omega * np.cos(omega * t + phase)
+
+    def T_star(X, Y, t):
+        return 300.0 + A * g(t) * (b - X) ** 4 * cos_y(Y)
+
+    def q_left(t):
+        return 4.0 * k * A * L ** 3 * g(t) * cos_y_left
+
+    def q_left_integral(t_lo, t_hi):
+        g_int = (np.cos(omega * t_lo + phase) - np.cos(omega * t_hi + phase)) / omega
+        return 4.0 * k * A * L ** 3 * g_int * cos_y_left
+
+    def source(X, Y, t):
+        P = (b - X) ** 4
+        cy = cos_y(Y)
+        T_t = A * g_t(t) * P * cy
+        T_xx = 12.0 * A * g(t) * (b - X) ** 2 * cy
+        T_yy = -A * g(t) * P * kappa ** 2 * cy
+        return rho * cp * T_t - k * (T_xx + T_yy)
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=source,
+        q_left_fn=q_left,
+        q_left_integral_fn=q_left_integral,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+def smooth_forcing_left_flux_sign_sample() -> tuple[float, float, float]:
+    """Return (q_L, -k*T_x, +k*T_x) for the smooth forcing MMS at x=a."""
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    k = 1.0
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.37
+    A = 10.0
+    t = 0.043
+    y = 0.25
+    kappa = np.pi / (d - c)
+    g = np.sin(omega * t + phase)
+    cos_y = np.cos(kappa * (y - c))
+    T_x_left = -4.0 * A * g * (b - a) ** 3 * cos_y
+    q_left = 4.0 * k * A * (b - a) ** 3 * g * cos_y
+    return float(q_left), float(-k * T_x_left), float(k * T_x_left)
+
+
+# ==============================================================
 # 3. Interface MMS (piecewise 2D with R_c)
 # ==============================================================
 
@@ -454,6 +557,14 @@ def time_order_test_2d_yflux(dt_list: list) -> float:
     results = []
     for dt_val in dt_list:
         _, _, _, l2 = run_mms_2d_yflux(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def time_order_test_2d_smooth_forcing_integral(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_smooth_forcing_integral(N=201, dt=dt_val)
         results.append(l2)
     return float(np.mean(_pairwise_orders(dt_list, results)))
 

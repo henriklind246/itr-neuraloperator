@@ -806,6 +806,151 @@ class TestIntegralLeftFlux:
         np.testing.assert_allclose(T_hist_i[-1], T_hist_e[-1], atol=1e-4, rtol=1e-3)
 
 
+class TestLeftFluxSignConvention:
+    """Positive q_left is inward heat flux at the left boundary."""
+
+    def test_positive_left_flux_heats_and_negative_left_flux_cools(self):
+        Nx = Ny = 9
+        T0 = np.full((Nx, Ny), 300.0)
+
+        common = dict(
+            Nx=Nx, Ny=Ny,
+            t_final=0.01,
+            dt=0.01,
+            flux_A=0.0,
+            q_left_integral_fn=None,
+        )
+        sim_pos = make_single_layer_2d(q_left_fn=lambda t: 100.0, **common)
+        sim_neg = make_single_layer_2d(q_left_fn=lambda t: -100.0, **common)
+
+        T_pos = sim_pos.cn_step(T0.copy(), 0.0)
+        T_neg = sim_neg.cn_step(T0.copy(), 0.0)
+
+        assert T_pos[0, :].mean() > 300.0
+        assert T_neg[0, :].mean() < 300.0
+        assert T_pos[0, :].mean() > T_neg[0, :].mean()
+
+
+class TestNonsmoothForcingReference:
+    """Production nonsmooth forcings converge toward smaller-dt integral-path references."""
+
+    @staticmethod
+    def _solve_family(temporal_family, temporal_params, dt):
+        from src.physics.boundary_forcing import build_qL, build_qL_integral
+
+        Nx = Ny = 9
+        t_final = 0.08
+        y_grid = np.linspace(0.0, 1.0, Ny)
+        q_left, _ = build_qL(temporal_family, temporal_params, "uniform", {}, y_grid)
+        q_int, _ = build_qL_integral(temporal_family, temporal_params, "uniform", {}, y_grid)
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=t_final,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=t_final, phase=0.0,
+            dt=dt,
+            q_left_fn=q_left,
+            q_left_integral_fn=q_int,
+        )
+        T0 = np.full((Nx, Ny), 300.0)
+        _, _, _, T_final = sim.solve(T0=T0, store_trajectory=False)
+        return T_final
+
+    @pytest.mark.parametrize(
+        ("temporal_family", "temporal_params"),
+        [
+            ("exp", {"A": 160.0, "t0": 0.013, "tau": 0.012}),
+            (
+                "exp_train",
+                {"Np": 2, "A_list": [130.0, 80.0], "t_list": [0.011, 0.037], "tau_list": [0.009, 0.017]},
+            ),
+            (
+                "pulse_train",
+                {"Np": 2, "A_list": [150.0, 90.0], "t_list": [0.013, 0.041], "dt_list": [0.014, 0.017]},
+            ),
+        ],
+    )
+    def test_integral_path_converges_toward_refined_reference(self, temporal_family, temporal_params):
+        dts = [0.01, 0.005, 0.0025]
+        reference = self._solve_family(temporal_family, temporal_params, dt=0.000625)
+
+        errors = [
+            float(np.sqrt(np.mean((self._solve_family(temporal_family, temporal_params, dt) - reference) ** 2)))
+            for dt in dts
+        ]
+
+        assert errors[1] < errors[0], errors
+        assert errors[2] < errors[1], errors
+        assert errors[2] < 0.5 * errors[0], errors
+
+
+class TestSpatialTemporalCoupling:
+    """The left-boundary temperature response follows production s_y profiles."""
+
+    @staticmethod
+    def _one_step_response(spatial_family, spatial_params):
+        from src.physics.boundary_forcing import build_qL, build_qL_integral
+
+        Nx = Ny = 41
+        y_grid = np.linspace(0.0, 1.0, Ny)
+        temporal_params = {
+            "Np": 1,
+            "A_list": [300.0],
+            "t_list": [0.0013],
+            "dt_list": [0.0127],
+        }
+        q_left, s_vec = build_qL(
+            "pulse_train", temporal_params, spatial_family, spatial_params, y_grid
+        )
+        q_int, _ = build_qL_integral(
+            "pulse_train", temporal_params, spatial_family, spatial_params, y_grid
+        )
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.005,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.005, phase=0.0,
+            dt=0.005,
+            q_left_fn=q_left,
+            q_left_integral_fn=q_int,
+        )
+        T0 = np.full((Nx, Ny), 300.0)
+        T1 = sim.cn_step(T0.copy(), 0.0)
+        return y_grid, s_vec, T1[0, :] - 300.0
+
+    def test_uniform_profile_heats_left_boundary_uniformly(self):
+        _, _, response = self._one_step_response("uniform", {})
+        np.testing.assert_allclose(response, response.mean(), rtol=0.0, atol=1e-12)
+
+    def test_patch_profile_heats_inside_band_more_than_outside(self):
+        y, _, response = self._one_step_response("patch", {"y_c": 0.5, "w": 0.3})
+        inside = (y >= 0.35) & (y <= 0.65)
+        outside = ~inside
+        assert response[inside].mean() > response[outside].mean() + 1e-3
+
+    @pytest.mark.parametrize(
+        ("spatial_family", "spatial_params", "expected_peak_y"),
+        [
+            ("gaussian", {"y_c": 0.35, "sigma_y": 0.10}, 0.35),
+            ("triangle", {"y_c": 0.65, "ell": 0.25}, 0.65),
+        ],
+    )
+    def test_smooth_localized_profiles_peak_and_correlate_with_response(
+        self, spatial_family, spatial_params, expected_peak_y
+    ):
+        y, s_vec, response = self._one_step_response(spatial_family, spatial_params)
+        assert abs(float(y[np.argmax(response)]) - expected_peak_y) <= y[1] - y[0]
+
+        corr = np.corrcoef(s_vec, response)[0, 1]
+        assert corr > 0.98
+
+
 # ==================== TEST 9: MMS VERIFICATION ====================
 
 from src.physics.mms_2d import (

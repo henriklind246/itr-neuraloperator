@@ -2,10 +2,13 @@ import pytest
 
 from src.physics.mms_2d import (
     run_mms_2d_interface,
+    run_mms_2d_smooth_forcing_integral,
     run_mms_2d_yflux,
+    smooth_forcing_left_flux_sign_sample,
     space_order_test_2d_off_center_interface,
     space_order_test_2d_yflux,
     time_order_test_2d_off_center_interface,
+    time_order_test_2d_smooth_forcing_integral,
     time_order_test_2d_yflux,
 )
 
@@ -48,3 +51,23 @@ class TestYFluxMMS:
     def test_temporal_convergence_is_second_order(self):
         order = time_order_test_2d_yflux([0.02, 0.01, 0.005])
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
+
+
+class TestSmoothForcingIntegralMMS:
+    """Strict MMS for smooth-in-time left forcing through q_left_integral_fn."""
+
+    def test_runs_at_default_grid(self):
+        h, dt, max_err, l2_err = run_mms_2d_smooth_forcing_integral(N=101, dt=0.0001)
+        assert h > 0 and dt > 0
+        assert max_err > 0 and l2_err > 0
+        assert max_err < 1e-2
+        assert l2_err < 5e-3
+
+    def test_temporal_convergence_is_second_order(self):
+        order = time_order_test_2d_smooth_forcing_integral([0.02, 0.01, 0.005])
+        assert order >= 1.85, f"expected >= 1.85, got {order:.3f}"
+
+    def test_left_flux_sign_convention_matches_mms_derivative(self):
+        q_left, minus_k_Tx, plus_k_Tx = smooth_forcing_left_flux_sign_sample()
+        assert q_left == pytest.approx(minus_k_Tx, rel=0.0, abs=1e-12)
+        assert q_left == pytest.approx(-plus_k_Tx, rel=0.0, abs=1e-12)

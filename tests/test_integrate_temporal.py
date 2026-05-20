@@ -146,3 +146,100 @@ def test_build_qL_integral_matches_high_res_trapezoid_on_smooth_sin():
     expected = _trapz(q_fine, t_fine, axis=0)
     got = q_int_fn(t_lo, t_hi)
     np.testing.assert_allclose(got, expected, atol=1e-3, rtol=1e-3)
+
+
+def _independent_exp_integral(A, t0, tau, t_lo, t_hi):
+    if t_hi <= t0:
+        return 0.0
+    lo = max(float(t_lo), float(t0))
+    hi = float(t_hi)
+    return float(A) * float(tau) * (
+        np.exp(-(lo - float(t0)) / float(tau))
+        - np.exp(-(hi - float(t0)) / float(tau))
+    )
+
+
+def _independent_pulse_integral(A_list, t_list, dt_list, t_lo, t_hi):
+    total = 0.0
+    for A, t0, width in zip(A_list, t_list, dt_list):
+        lo = max(float(t_lo), float(t0))
+        hi = min(float(t_hi), float(t0) + float(width))
+        if hi > lo:
+            total += float(A) * (hi - lo)
+    return float(total)
+
+
+def _independent_temporal_integral(family, params, t_lo, t_hi):
+    if family == "exp":
+        return _independent_exp_integral(
+            params["A"], params["t0"], params["tau"], t_lo, t_hi
+        )
+    if family == "pulse_train":
+        return _independent_pulse_integral(
+            params["A_list"], params["t_list"], params["dt_list"], t_lo, t_hi
+        )
+    if family == "exp_train":
+        return sum(
+            _independent_exp_integral(A, t0, tau, t_lo, t_hi)
+            for A, t0, tau in zip(params["A_list"], params["t_list"], params["tau_list"])
+        )
+    raise ValueError(f"no closed-form independent integral for {family}")
+
+
+@pytest.mark.parametrize(
+    ("spatial_family", "spatial_params"),
+    [
+        ("uniform", {}),
+        ("patch", {"y_c": 0.5, "w": 0.4}),
+        ("gaussian", {"y_c": 0.35, "sigma_y": 0.12}),
+        ("triangle", {"y_c": 0.65, "ell": 0.25}),
+    ],
+)
+@pytest.mark.parametrize(
+    ("temporal_family", "temporal_params", "intervals"),
+    [
+        (
+            "sin",
+            {"A": 120.0, "f": 3.0, "t_on": 0.0, "t_off": 0.6, "phase": 0.2, "tukey_alpha": 0.25},
+            [(0.0, 0.05), (0.04, 0.17), (0.21, 0.44), (0.0, 0.6)],
+        ),
+        (
+            "exp",
+            {"A": 130.0, "t0": 0.13, "tau": 0.07},
+            [(0.0, 0.08), (0.08, 0.18), (0.18, 0.41), (0.0, 0.6)],
+        ),
+        (
+            "pulse_train",
+            {"Np": 2, "A_list": [90.0, -40.0], "t_list": [0.11, 0.33], "dt_list": [0.07, 0.09]},
+            [(0.0, 0.08), (0.08, 0.14), (0.14, 0.36), (0.32, 0.45), (0.0, 0.6)],
+        ),
+        (
+            "exp_train",
+            {"Np": 2, "A_list": [75.0, 115.0], "t_list": [0.09, 0.31], "tau_list": [0.05, 0.11]},
+            [(0.0, 0.08), (0.08, 0.14), (0.14, 0.36), (0.32, 0.5), (0.0, 0.6)],
+        ),
+    ],
+)
+def test_build_qL_integral_production_profiles_match_independent_expected(
+    temporal_family, temporal_params, intervals, spatial_family, spatial_params
+):
+    y_grid = np.linspace(0.0, 1.0, 17)
+    q_left, s_vec = build_qL(
+        temporal_family, temporal_params, spatial_family, spatial_params, y_grid
+    )
+    q_int_fn, _ = build_qL_integral(
+        temporal_family, temporal_params, spatial_family, spatial_params, y_grid
+    )
+
+    for t_lo, t_hi in intervals:
+        got = q_int_fn(t_lo, t_hi)
+        if temporal_family == "sin":
+            t_fine = np.linspace(t_lo, t_hi, 8193)
+            q_fine = np.array([q_left(float(tk)) for tk in t_fine])
+            expected = np.trapezoid(q_fine, t_fine, axis=0)
+            np.testing.assert_allclose(got, expected, atol=2e-4, rtol=2e-4)
+        else:
+            scalar = _independent_temporal_integral(
+                temporal_family, temporal_params, t_lo, t_hi
+            )
+            np.testing.assert_allclose(got, scalar * s_vec, atol=1e-12, rtol=1e-12)
