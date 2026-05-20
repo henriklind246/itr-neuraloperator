@@ -54,6 +54,7 @@ class FVSolver2D:
         dt=None,
         source=None,
         q_left_fn=None,
+        q_left_integral_fn=None,
         T_right_fn=None,
         interface_R: list[float] | None = None,
         tol: float = 1e-12,
@@ -138,6 +139,12 @@ class FVSolver2D:
                     f"({self.Ny},); got shape {q_arr.shape}"
                 )
             self._q_left_is_vector = True
+
+        # Optional exact time-integral of q_L over a CN step. When provided, both
+        # cn_step and cn_step_loop use 2 * q_int / (rho_cp * h) on the left half-cell
+        # instead of the endpoint trapezoid of q_left — required for pulse forcing
+        # whose support lies strictly inside a step.
+        self.q_left_integral = q_left_integral_fn
 
         self.T_right = T_right_fn if T_right_fn is not None else (lambda t: 300.0)
 
@@ -508,6 +515,15 @@ class FVSolver2D:
         dt = self.dt
         rhs = np.zeros((Nx, Ny), dtype=float)
 
+        # Hoist left-flux evaluations out of the i/j loop bodies — they only depend
+        # on the step endpoints (or interval), not on (i, j).
+        if self.q_left_integral is not None:
+            q_int = self.q_left_integral(tn, tn + dt)
+            q_int_is_vector = np.asarray(q_int).ndim > 0
+        else:
+            qn_step = self.q_left(tn)
+            qnp1_step = self.q_left(tn + dt)
+
         for j in range(Ny):
             for i in range(Nx):
                 # --- Dirichlet nodes (right edge) ---
@@ -540,16 +556,18 @@ class FVSolver2D:
 
                 # --- Left Neumann BC flux contribution (i=0) ---
                 if i == 0:
-                    qn = self.q_left(tn)
-                    qnp1 = self.q_left(tn + dt)
-                    if self._q_left_is_vector:
-                        qn_j = qn[j]
-                        qnp1_j = qnp1[j]
-                    else:
-                        qn_j = qn
-                        qnp1_j = qnp1
                     rho_cp = self.rho_nodes[0, j] * self.cp_nodes[0, j]
-                    rhs[i, j] += dt * (qn_j + qnp1_j) / (rho_cp * h)
+                    if self.q_left_integral is not None:
+                        q_int_j = q_int[j] if q_int_is_vector else q_int
+                        rhs[i, j] += 2.0 * q_int_j / (rho_cp * h)
+                    else:
+                        if self._q_left_is_vector:
+                            qn_j = qn_step[j]
+                            qnp1_j = qnp1_step[j]
+                        else:
+                            qn_j = qn_step
+                            qnp1_j = qnp1_step
+                        rhs[i, j] += dt * (qn_j + qnp1_j) / (rho_cp * h)
 
         # --- Source term (CN time-averaged, V cancels for all cell types) ---
         if self.source is not None:
@@ -611,10 +629,14 @@ class FVSolver2D:
         rhs[act, 0:Ny - 1] += self.r_n[act, 0:Ny - 1] * Tn[act, 1:Ny]
 
         # --- Left Neumann BC flux (i=0 row) ---
-        qn = self.q_left(tn)
-        qnp1 = self.q_left(tn + dt)
         rho_cp_left = self.rho_nodes[0, :] * self.cp_nodes[0, :]
-        rhs[0, :] += dt * (qn + qnp1) / (rho_cp_left * h)
+        if self.q_left_integral is not None:
+            q_int = self.q_left_integral(tn, tn + dt)
+            rhs[0, :] += 2.0 * q_int / (rho_cp_left * h)
+        else:
+            qn = self.q_left(tn)
+            qnp1 = self.q_left(tn + dt)
+            rhs[0, :] += dt * (qn + qnp1) / (rho_cp_left * h)
 
         # --- Dirichlet column (i=Nx-1) ---
         rhs[Nx - 1, :] = self.T_right(tn + dt)

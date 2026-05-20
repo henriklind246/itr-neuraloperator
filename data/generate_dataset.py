@@ -16,6 +16,7 @@ from src.physics.boundary_forcing import (
     sample_spatial_family,
     sample_temporal_family,
     build_qL,
+    build_qL_integral,
 )
 from src.physics.init_conditions import (
     IC_SAMPLERS,
@@ -142,6 +143,13 @@ def generate_sim_data(
             spatial_params=params["spatial_params"],
             y_grid=y_grid,
         )
+        q_left_integral_fn, _ = build_qL_integral(
+            temporal_family=params["temporal_family"],
+            temporal_params=params["temporal_params"],
+            spatial_family=params["spatial_family"],
+            spatial_params=params["spatial_params"],
+            y_grid=y_grid,
+        )
 
         sim = FVSolver2D(
             a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
@@ -152,6 +160,7 @@ def generate_sim_data(
             dt=dt, tukey_alpha=tukey_alpha,
             interface_R=[params["R_c"]],
             q_left_fn=q_left_fn,
+            q_left_integral_fn=q_left_integral_fn,
         )
 
         t, x, y, T_hist = sim.solve(T0=params["T0"], store_trajectory=True)

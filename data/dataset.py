@@ -14,7 +14,7 @@ from src.physics.boundary_forcing import (
     TRIANGLE_ELL_RANGE,
     TEMPORAL_BUILDERS,
     TEMPORAL_FAMILY_ORDER,
-    integrate_temporal_bins,
+    integrate_temporal_bins_signed,
     FORCING_BINS,
     SIN_AMP_RANGE,
 )
@@ -379,12 +379,13 @@ class SnapshotPairDataset(Dataset):
         t_s_norm = t_s_val / self.t_final
 
         # Spatial: 4 base channels + 16 temporal forcing integral bins.
-        # Bins integrate a(t) over equal subintervals of [t_s, t_j], weighted by
-        # s_y(y) and normalized by q_ref. Layout:
+        # Bins are the signed integral of a(t) over equal subintervals of [t_s, t_j]
+        # (matches the solver's signed left-flux semantics), weighted by s_y(y) and
+        # normalized by q_ref. Layout:
         #   [T̃_source, x_norm, y_norm, s_y, Q_y_bin_0, ..., Q_y_bin_15].
         s_y = self.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (self.Nx, self.Ny))
-        bins = integrate_temporal_bins(
+        bins = integrate_temporal_bins_signed(
             params["temporal_family"],
             params["temporal_params"],
             t_s_val,
