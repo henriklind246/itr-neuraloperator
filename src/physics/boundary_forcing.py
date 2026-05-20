@@ -183,7 +183,10 @@ def integrate_temporal_bins(
     )
 
 
-_trapz = getattr(np, "trapezoid", np.trapz)
+if hasattr(np, "trapezoid"):
+    _trapz = np.trapezoid
+else:
+    _trapz = np.trapz
 
 
 def integrate_temporal_signed(

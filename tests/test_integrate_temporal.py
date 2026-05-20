@@ -142,7 +142,7 @@ def test_build_qL_integral_matches_high_res_trapezoid_on_smooth_sin():
     t_lo, t_hi = 0.1, 0.4
     t_fine = np.linspace(t_lo, t_hi, 2049)
     q_fine = np.array([q_left(float(tk)) for tk in t_fine])
-    _trapz = getattr(np, "trapezoid", np.trapz)
+    _trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     expected = _trapz(q_fine, t_fine, axis=0)
     got = q_int_fn(t_lo, t_hi)
     np.testing.assert_allclose(got, expected, atol=1e-3, rtol=1e-3)

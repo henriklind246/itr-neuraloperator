@@ -203,8 +203,10 @@ def build_forcing_summary(
     dt_interval = max(float(t_j) - float(t_s), 1e-8)
     denom_impulse = A_ref * float(t_final)
 
-    # np.trapezoid added in numpy 2.0; fall back to deprecated np.trapz otherwise.
-    trapz = getattr(np, "trapezoid", np.trapz)
+    if hasattr(np, "trapezoid"):
+        trapz = np.trapezoid
+    else:
+        trapz = np.trapz
     I_signed = float(trapz(a_vals, t_vals))
     I_abs    = float(trapz(np.abs(a_vals), t_vals))
     I_pos    = float(trapz(np.clip(a_vals, 0.0, None), t_vals))
