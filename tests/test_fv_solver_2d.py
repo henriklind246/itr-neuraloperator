@@ -683,6 +683,128 @@ class TestLoopVsVectorized:
         T_vec = sim.cn_step(Tn, 0.05)
         np.testing.assert_allclose(T_vec, T_loop, atol=1e-12)
 
+    def test_with_q_left_integral_fn(self):
+        """Loop vs vectorized must agree to 1e-12 when q_left_integral_fn is used."""
+        from src.physics.boundary_forcing import build_qL, build_qL_integral
+
+        Nx = Ny = 13
+        y_grid = np.linspace(0.0, 1.0, Ny)
+        temporal_params = {"Np": 2, "A_list": [120.0, -80.0],
+                           "t_list": [0.005, 0.04], "dt_list": [0.01, 0.015]}
+        spatial_params = {"y_c": 0.5, "sigma_y": 0.15}
+
+        q_left, _ = build_qL("pulse_train", temporal_params,
+                             "gaussian", spatial_params, y_grid)
+        q_int, _ = build_qL_integral("pulse_train", temporal_params,
+                                     "gaussian", spatial_params, y_grid)
+
+        sim = FVSolver2D(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            dt=0.001,
+            q_left_fn=q_left,
+            q_left_integral_fn=q_int,
+        )
+        rng = np.random.default_rng(7)
+        Tn = rng.standard_normal((Nx, Ny)) + 300.0
+
+        T_loop = sim.cn_step_loop(Tn, 0.02)
+        T_vec = sim.cn_step(Tn, 0.02)
+        np.testing.assert_allclose(T_vec, T_loop, atol=1e-12)
+
+
+# ==================== TEST 8b: INTEGRAL LEFT-FLUX FORCING =========
+
+class TestIntegralLeftFlux:
+    """Verify that q_left_integral_fn captures sub-step pulses that endpoint sampling misses."""
+
+    def _make_solvers(self, dt, pulse_t, pulse_dt, A):
+        """Build two identical solvers; one with endpoint sampling, one with integral fn."""
+        from src.physics.boundary_forcing import build_qL, build_qL_integral
+
+        Nx = Ny = 9
+        y_grid = np.linspace(0.0, 1.0, Ny)
+        temporal_params = {"Np": 1, "A_list": [A], "t_list": [pulse_t], "dt_list": [pulse_dt]}
+        spatial_params = {}
+
+        q_left, _ = build_qL("pulse_train", temporal_params,
+                             "uniform", spatial_params, y_grid)
+        q_int, _ = build_qL_integral("pulse_train", temporal_params,
+                                     "uniform", spatial_params, y_grid)
+
+        common = dict(
+            a=0.0, b=1.0, c=0.0, d=1.0, Nx=Nx, Ny=Ny,
+            lam_target=0.5, layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=10.0 * dt,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=10.0 * dt, phase=0.0,
+            dt=dt,
+        )
+        sim_endpoint = FVSolver2D(q_left_fn=q_left, **common)
+        sim_integral = FVSolver2D(q_left_fn=q_left, q_left_integral_fn=q_int, **common)
+        return sim_endpoint, sim_integral
+
+    def test_pulse_inside_step_endpoint_misses_integral_captures(self):
+        """Pulse strictly inside (tn, tn+dt) with q_left(tn)=q_left(tn+dt)=0 must
+        produce zero injected energy under endpoint sampling and strictly positive
+        injection under the integral path."""
+        dt = 0.01
+        # Pulse centered at tn=0 + dt/2, width 0.2*dt — fully inside (0, dt).
+        pulse_t = 0.4 * dt
+        pulse_dt = 0.2 * dt
+        A = 500.0
+        sim_endpoint, sim_integral = self._make_solvers(dt, pulse_t, pulse_dt, A)
+
+        # Sanity: q_left at both endpoints is zero.
+        assert sim_endpoint.q_left(0.0)[0] == pytest.approx(0.0)
+        assert sim_endpoint.q_left(dt)[0] == pytest.approx(0.0)
+
+        T0 = np.full((sim_endpoint.Nx, sim_endpoint.Ny), 300.0)
+        T_end_endpoint = sim_endpoint.cn_step(T0.copy(), 0.0)
+        T_end_integral = sim_integral.cn_step(T0.copy(), 0.0)
+
+        # Endpoint: no flux contribution and no source → field stays exactly T0.
+        np.testing.assert_allclose(T_end_endpoint, T0, atol=1e-12)
+        # Integral path: row 0 (and everywhere via diffusion) must rise above T0.
+        assert T_end_integral[0, :].min() > 300.0
+        assert T_end_integral.max() > T_end_endpoint.max()
+
+    def test_smooth_sin_integral_agrees_with_endpoint(self):
+        """On slowly varying sin (f·dt ≪ 1), integral and endpoint paths should
+        agree to a loose tolerance after several steps — regression sanity check."""
+        from src.physics.boundary_forcing import build_qL, build_qL_integral
+
+        Nx = Ny = 11
+        y_grid = np.linspace(0.0, 1.0, Ny)
+        temporal_params = {"A": 50.0, "f": 1.0, "t_on": 0.0, "t_off": 1.0,
+                           "phase": 0.0, "tukey_alpha": 0.2}
+        spatial_params = {}
+
+        q_left, _ = build_qL("sin", temporal_params, "uniform", spatial_params, y_grid)
+        q_int, _ = build_qL_integral("sin", temporal_params, "uniform", spatial_params, y_grid)
+
+        common = dict(
+            a=0.0, b=1.0, c=0.0, d=1.0, Nx=Nx, Ny=Ny,
+            lam_target=0.5, layers=[Layer2D(0.0, 1.0, 1.0, 1.0, 1.0)],
+            t_final=0.2, flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.2, phase=0.0,
+            dt=0.001,  # f * dt = 1e-3, very smooth at this resolution
+        )
+        sim_endpoint = FVSolver2D(q_left_fn=q_left, **common)
+        sim_integral = FVSolver2D(q_left_fn=q_left, q_left_integral_fn=q_int, **common)
+
+        T0 = np.full((Nx, Ny), 300.0)
+        _, _, _, T_hist_e = sim_endpoint.solve(T0=T0.copy(), store_trajectory=True)
+        _, _, _, T_hist_i = sim_integral.solve(T0=T0.copy(), store_trajectory=True)
+
+        # Loose tolerance: both paths are O(dt^2) for smooth forcing but not identical.
+        np.testing.assert_allclose(T_hist_i[-1], T_hist_e[-1], atol=1e-4, rtol=1e-3)
+
 
 # ==================== TEST 9: MMS VERIFICATION ====================
 

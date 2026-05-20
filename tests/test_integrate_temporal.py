@@ -5,6 +5,10 @@ from src.physics.boundary_forcing import (
     FORCING_BINS,
     integrate_temporal,
     integrate_temporal_bins,
+    integrate_temporal_signed,
+    integrate_temporal_bins_signed,
+    build_qL,
+    build_qL_integral,
 )
 
 
@@ -82,3 +86,63 @@ def test_pulse_train_bins_discriminate_early_and_late_pulses():
     assert early_bins[0] == pytest.approx(late_bins[-1], abs=1e-6)
     assert early_bins[-1] == pytest.approx(late_bins[0], abs=1e-6)
     assert not np.allclose(early_bins, late_bins)
+
+
+def test_integrate_signed_sin_zero_over_full_period():
+    # Pure sine (no Tukey ramp) integrated over one full period must be ~0
+    # with the signed helper, but strictly positive with the clipped helper.
+    params = {"A": 1.0, "f": 1.0, "t_on": 0.0, "t_off": 1.0, "phase": 0.0, "tukey_alpha": 0.0}
+    assert integrate_temporal_signed("sin", params, 0.0, 1.0) == pytest.approx(0.0, abs=1e-3)
+    # Clipped helper retains only the positive half-wave: A/(pi*f) for one period.
+    assert integrate_temporal("sin", params, 0.0, 1.0) == pytest.approx(1.0 / np.pi, abs=1e-2)
+
+
+def test_integrate_signed_pulse_train_negative_amplitude():
+    # Negative-amplitude pulse: signed integral is negative; clipped helper
+    # (current integrate_temporal) treats pulse_train identically and is also
+    # signed for that family, so both agree here.
+    params = {"Np": 1, "A_list": [-4.0], "t_list": [0.1], "dt_list": [0.3]}
+    assert integrate_temporal_signed("pulse_train", params, 0.0, 1.0) == pytest.approx(-4.0 * 0.3, abs=1e-12)
+
+
+def test_signed_bins_sum_matches_total_signed_integral():
+    params = {"A": 1.0, "f": 1.0, "t_on": 0.0, "t_off": 1.0, "phase": 0.0, "tukey_alpha": 0.0}
+    bins = integrate_temporal_bins_signed("sin", params, 0.0, 1.0, K=FORCING_BINS)
+    total = integrate_temporal_signed("sin", params, 0.0, 1.0)
+    assert bins.shape == (FORCING_BINS,)
+    assert float(bins.sum()) == pytest.approx(total, abs=1e-3)
+    # Signed bins must contain at least one negative value for a full period of sin.
+    assert (bins < 0).any()
+
+
+def test_build_qL_integral_separable_pulse_train():
+    y_grid = np.linspace(0.0, 1.0, 9)
+    temporal_params = {"Np": 1, "A_list": [5.0], "t_list": [0.1], "dt_list": [0.4]}
+    spatial_params = {"y_c": 0.5, "w": 0.3}
+
+    q_int_fn, s_vec = build_qL_integral(
+        "pulse_train", temporal_params, "patch", spatial_params, y_grid
+    )
+    t_lo, t_hi = 0.0, 0.6
+    scalar_int = integrate_temporal_signed("pulse_train", temporal_params, t_lo, t_hi)
+    expected = scalar_int * s_vec
+    np.testing.assert_allclose(q_int_fn(t_lo, t_hi), expected, atol=1e-12)
+
+
+def test_build_qL_integral_matches_high_res_trapezoid_on_smooth_sin():
+    # On smooth sin the signed integral should agree with a high-resolution
+    # trapezoid of q_left(t) — sanity check for the analytic/quadrature path.
+    y_grid = np.linspace(0.0, 1.0, 5)
+    temporal_params = {"A": 100.0, "f": 2.0, "t_on": 0.0, "t_off": 1.0, "phase": 0.0, "tukey_alpha": 0.2}
+    spatial_params = {"y_c": 0.5, "w": 0.6}
+
+    q_left, _ = build_qL("sin", temporal_params, "patch", spatial_params, y_grid)
+    q_int_fn, _ = build_qL_integral("sin", temporal_params, "patch", spatial_params, y_grid)
+
+    t_lo, t_hi = 0.1, 0.4
+    t_fine = np.linspace(t_lo, t_hi, 2049)
+    q_fine = np.array([q_left(float(tk)) for tk in t_fine])
+    _trapz = getattr(np, "trapezoid", np.trapz)
+    expected = _trapz(q_fine, t_fine, axis=0)
+    got = q_int_fn(t_lo, t_hi)
+    np.testing.assert_allclose(got, expected, atol=1e-3, rtol=1e-3)
