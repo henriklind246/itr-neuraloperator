@@ -182,6 +182,83 @@ def integrate_temporal_bins(
         dtype=float,
     )
 
+
+_trapz = getattr(np, "trapezoid", np.trapz)
+
+
+def integrate_temporal_signed(
+    temporal_family: str,
+    temporal_params: dict,
+    t_lo: float,
+    t_hi: float,
+) -> float:
+    """Signed integral of a(t) over [t_lo, t_hi] — no clipping of negative parts."""
+    if t_hi <= t_lo:
+        return 0.0
+
+    if temporal_family == "sin":
+        q = temporal_sin(**temporal_params)
+        t = np.linspace(t_lo, t_hi, 65)
+        values = np.array([q(float(tn)) for tn in t], dtype=float)
+        return float(_trapz(values, t))
+
+    if temporal_family == "exp":
+        A = float(temporal_params["A"])
+        t0 = float(temporal_params["t0"])
+        tau = float(temporal_params["tau"])
+        if t_hi <= t0:
+            return 0.0
+        a = max(float(t_lo), t0)
+        b = float(t_hi)
+        return float(A * tau * (np.exp(-(a - t0) / tau) - np.exp(-(b - t0) / tau)))
+
+    if temporal_family == "pulse_train":
+        total = 0.0
+        for A, t_n, dt_n in zip(
+            temporal_params["A_list"],
+            temporal_params["t_list"],
+            temporal_params["dt_list"],
+        ):
+            lo = max(float(t_lo), float(t_n))
+            hi = min(float(t_hi), float(t_n) + float(dt_n))
+            total += float(A) * max(0.0, hi - lo)
+        return float(total)
+
+    if temporal_family == "exp_train":
+        total = 0.0
+        for A, t_n, tau_n in zip(
+            temporal_params["A_list"],
+            temporal_params["t_list"],
+            temporal_params["tau_list"],
+        ):
+            t0 = float(t_n)
+            if t_hi <= t0:
+                continue
+            a = max(float(t_lo), t0)
+            b = float(t_hi)
+            tau = float(tau_n)
+            total += float(A) * tau * (np.exp(-(a - t0) / tau) - np.exp(-(b - t0) / tau))
+        return float(total)
+
+    raise ValueError(f"Unknown temporal family: {temporal_family}")
+
+
+def integrate_temporal_bins_signed(
+    temporal_family: str,
+    temporal_params: dict,
+    t_s: float,
+    t_j: float,
+    K: int = FORCING_BINS,
+) -> np.ndarray:
+    edges = np.linspace(float(t_s), float(t_j), int(K) + 1)
+    return np.array(
+        [
+            integrate_temporal_signed(temporal_family, temporal_params, edges[k], edges[k + 1])
+            for k in range(int(K))
+        ],
+        dtype=float,
+    )
+
 # --------- SAMPLER FUNCTIONS ----------
 
 def sample_uniform_params(rng: np.random.Generator) -> dict:
@@ -315,6 +392,25 @@ def build_qL(temporal_family: str, temporal_params: dict,
         return a_fn(t) * s_vec
 
     return q_left, s_vec
+
+
+def build_qL_integral(temporal_family: str, temporal_params: dict,
+                      spatial_family: str, spatial_params: dict,
+                      y_grid: np.ndarray):
+    """
+    Build a callable q_left_integral(t_lo, t_hi) -> (Ny,) returning the exact signed
+    time-integral of q_L(y, t) over [t_lo, t_hi]. Uses the separable structure
+    q_L(y, t) = a(t) * s(y), so the integral is integrate_temporal_signed(...) * s_vec.
+    """
+    s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
+    s_vec = np.asarray(s_vec, dtype=float)
+
+    def q_left_integral(t_lo, t_hi):
+        return integrate_temporal_signed(
+            temporal_family, temporal_params, t_lo, t_hi
+        ) * s_vec
+
+    return q_left_integral, s_vec
 
 # --------- PARAMETER ENCODING ----------
 
