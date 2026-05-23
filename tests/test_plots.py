@@ -9,7 +9,7 @@ import torch
 matplotlib.use("Agg")
 
 from data.dataset import split_sim_ids
-from visual import _common, dataset_plots, physics_plots
+from visual import _common, dataset_plots, forcing_plots, physics_plots
 
 
 @pytest.fixture
@@ -75,12 +75,30 @@ class TestPlotRegistry:
             "trajectory_comparison_grid",
             "boundary_temperature",
             "parameter_response",
+            "flux_profiles",
+            "lhs_scatter",
+            "y_perturbation",
+            "sweep_hyperparams",
         ]:
             assert name not in _common.PLOT_REGISTRY
 
     def test_should_run_uses_new_registry(self):
         assert _common._should_run("prediction_vs_truth", ["data"], None) is True
         assert _common._should_run("prediction_vs_truth", ["training"], None) is False
+
+    def test_forcing_plot_names_registered(self):
+        for name in [
+            "forcing_temporal_families",
+            "forcing_spatial_profiles",
+            "forcing_separable_assembly",
+            "forcing_bin_encoding",
+            "forcing_seq_tokens",
+            "forcing_summary_scalars",
+            "forcing_param_distributions_design",
+            "forcing_param_distributions_empirical",
+        ]:
+            assert _common.PLOT_REGISTRY[name] == "forcing"
+        assert "forcing" in _common.GROUPS
 
 
 class TestSnapshotPairSamples:
@@ -229,9 +247,95 @@ class TestDataFieldPlots:
         )
         assert out_path.exists()
 
-    def test_flux_profiles_smoke(self, tmp_path):
-        out_path = tmp_path / "flux_profiles.png"
-        dataset_plots.plot_flux_profiles(t_final=0.2, save_path=out_path)
+class TestForcingPlots:
+    def test_temporal_families_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_temporal_families.png"
+        forcing_plots.plot_forcing_temporal_families(n_curves=3, save_path=out_path)
+        assert out_path.exists()
+
+    def test_spatial_profiles_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_spatial_profiles.png"
+        forcing_plots.plot_forcing_spatial_profiles(n_curves=3, save_path=out_path)
+        assert out_path.exists()
+
+    def test_separable_assembly_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_separable_assembly.png"
+        forcing_plots.plot_forcing_separable_assembly(save_path=out_path)
+        assert out_path.exists()
+
+    def test_bin_encoding_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_bin_encoding.png"
+        forcing_plots.plot_forcing_bin_encoding(save_path=out_path)
+        assert out_path.exists()
+
+    def test_seq_tokens_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_seq_tokens.png"
+        forcing_plots.plot_forcing_seq_tokens(save_path=out_path)
+        assert out_path.exists()
+
+    def test_summary_scalars_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_summary_scalars.png"
+        forcing_plots.plot_forcing_summary_scalars(n_samples=40, save_path=out_path)
+        assert out_path.exists()
+
+    def test_param_distributions_design_smoke(self, tmp_path):
+        out_path = tmp_path / "forcing_param_distributions_design.png"
+        forcing_plots.plot_forcing_param_distributions_design(
+            n_samples=40,
+            save_path=out_path,
+            spatial_save_path=tmp_path / "forcing_param_distributions_design_spatial.png",
+        )
+        assert out_path.exists()
+
+    def test_param_distributions_empirical_smoke(self, tmp_path):
+        sim_params = np.array(
+            [
+                {
+                    "temporal_family": "sin",
+                    "temporal_params": {
+                        "A": 200.0, "f": 5.0, "t_on": 0.0, "t_off": 0.2,
+                        "phase": 0.0, "tukey_alpha": 0.5,
+                    },
+                    "spatial_family": "uniform",
+                    "spatial_params": {},
+                },
+                {
+                    "temporal_family": "exp",
+                    "temporal_params": {"A": 150.0, "t0": 0.05, "tau": 0.03},
+                    "spatial_family": "gaussian",
+                    "spatial_params": {"y_c": 0.5, "sigma_y": 0.08},
+                },
+                {
+                    "temporal_family": "pulse_train",
+                    "temporal_params": {
+                        "Np": 2,
+                        "A_list": [100.0, 80.0],
+                        "t_list": [0.05, 0.12],
+                        "dt_list": [0.01, 0.015],
+                    },
+                    "spatial_family": "patch",
+                    "spatial_params": {"y_c": 0.4, "w": 0.2},
+                },
+                {
+                    "temporal_family": "exp_train",
+                    "temporal_params": {
+                        "Np": 2,
+                        "A_list": [120.0, 90.0],
+                        "t_list": [0.04, 0.10],
+                        "tau_list": [0.01, 0.02],
+                    },
+                    "spatial_family": "triangle",
+                    "spatial_params": {"y_c": 0.5, "ell": 0.25},
+                },
+            ],
+            dtype=object,
+        )
+        out_path = tmp_path / "forcing_param_distributions_empirical.png"
+        forcing_plots.plot_forcing_param_distributions_empirical(
+            sim_params,
+            save_path=out_path,
+            spatial_save_path=tmp_path / "forcing_param_distributions_empirical_spatial.png",
+        )
         assert out_path.exists()
 
 

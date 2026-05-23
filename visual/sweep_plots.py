@@ -1,4 +1,4 @@
-"""Hyperparameter sweep visualization: ranking, convergence overlays, and sensitivity scatter."""
+"""Hyperparameter sweep visualization: ranking and convergence overlays."""
 
 from pathlib import Path
 
@@ -196,82 +196,3 @@ def plot_sweep_convergence(
         _save_figure(fig, save_path if save_path is not None else experiment_dir / "sweep_convergence.png", "sweep", "sweep_convergence")
 
 
-def plot_sweep_hyperparams(
-    experiment_dir: str | Path,
-    save_path: str | Path | None = None,
-):
-    """2x3 grid of scatter plots showing each hyperparameter vs performance."""
-    experiment_dir = Path(experiment_dir)
-    records = _load_sweep_data(experiment_dir)
-
-    if len(records) < 2:
-        print("Need at least 2 configs for hyperparameter plots — skipping.")
-        return
-
-    n = len(records)
-    objectives = np.array([r["objective"] for r in records])
-
-    # rank-based coloring: best=green, worst=red
-    ranks = np.argsort(np.argsort(objectives))  # 0=best, n-1=worst
-    norm = plt.Normalize(vmin=0, vmax=n - 1)
-    cmap = plt.cm.RdYlGn_r  # green (low rank) -> red (high rank)
-    colors = [cmap(norm(rank)) for rank in ranks]
-
-    # hyperparameter panels.
-    # NOTE (stale): "modes" was the 1D-only key; 2D sweeps emit modes1/modes2.
-    # _load_sweep_data still falls back modes -> modes1, so this column shows
-    # only x-mode count for 2D runs (modes2 is silently ignored). Capacity
-    # panel below uses the same single value × width. Re-work to plot modes1
-    # and modes2 separately — capacity = modes1 * modes2 * width — when
-    # touching this function next.
-    hp_specs = [
-        ("learning_rate", "Learning Rate", True),   # (key, label, log_x)
-        ("weight_decay",  "Weight Decay",  True),
-        ("batch_size",    "Batch Size",    False),
-        ("modes",         "Modes",         False),
-        ("width",         "Width",         False),
-    ]
-
-    with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(2, 3, figsize=(14, 8))
-        axes = axes.flatten()
-
-        for idx, (key, label, log_x) in enumerate(hp_specs):
-            ax = axes[idx]
-            vals = [r[key] for r in records]
-
-            if all(v is None for v in vals):
-                ax.set_visible(False)
-                continue
-
-            vals = np.array([v if v is not None else np.nan for v in vals], dtype=float)
-            ax.scatter(vals, objectives, c=colors, s=80, edgecolors="k", linewidths=0.5, zorder=3)
-            ax.scatter(vals[0], objectives[0], s=200, facecolors="none", edgecolors="#4CAF50", linewidths=2.0, zorder=4)
-
-            if log_x:
-                ax.set_xscale("log")
-            if objectives.max() / max(objectives.min(), 1e-12) > 10:
-                ax.set_yscale("log")
-
-            ax.set_xlabel(label)
-            ax.set_ylabel("Val Rel. L2 (%)")
-            ax.grid(True)
-
-        ax = axes[5]
-        modes_vals = np.array([r["modes"] if r["modes"] is not None else np.nan for r in records], dtype=float)
-        width_vals = np.array([r["width"] if r["width"] is not None else np.nan for r in records], dtype=float)
-        capacity = modes_vals * width_vals
-
-        if not np.all(np.isnan(capacity)):
-            ax.scatter(capacity, objectives, c=colors, s=80, edgecolors="k", linewidths=0.5, zorder=3)
-            ax.scatter(capacity[0], objectives[0], s=200, facecolors="none", edgecolors="#4CAF50", linewidths=2.0, zorder=4)
-            if objectives.max() / max(objectives.min(), 1e-12) > 10:
-                ax.set_yscale("log")
-            ax.set_xlabel("Modes × Width")
-            ax.set_ylabel("Val Rel. L2 (%)")
-            ax.grid(True)
-        else:
-            ax.set_visible(False)
-
-        fig.suptitle("Hyperparameter Sensitivity")
-        _save_figure(fig, save_path if save_path is not None else experiment_dir / "sweep_hyperparams.png", "sweep", "sweep_hyperparams")

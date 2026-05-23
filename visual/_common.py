@@ -26,15 +26,12 @@ PLOT_REGISTRY: dict[str, str] = {
     # group: data
     "trajectory_heatmap":        "data",
     "trajectory_deviation_heatmap": "data",
-    "y_perturbation":            "data",
     "spatial_family_breakdown":  "data",
     "initial_conditions":        "data",
     "ic_uniform_progression":         "data",
     "ic_random_sinusoid_progression": "data",
     "ic_grf_progression":             "data",
     "ic_hot_spot_progression":        "data",
-    "lhs_scatter":               "data",
-    "flux_profiles":             "data",
     "snapshot_pair_samples":     "data",
     "prediction_vs_truth":       "data",
     "interface_error":           "data",
@@ -43,13 +40,21 @@ PLOT_REGISTRY: dict[str, str] = {
     "parameter_error_slices":    "data",
     "dataset_summary":           "data",
     "interface_jump_summary":    "data",
+    # group: forcing
+    "forcing_temporal_families":            "forcing",
+    "forcing_spatial_profiles":             "forcing",
+    "forcing_separable_assembly":           "forcing",
+    "forcing_bin_encoding":                 "forcing",
+    "forcing_seq_tokens":                   "forcing",
+    "forcing_summary_scalars":              "forcing",
+    "forcing_param_distributions_design":   "forcing",
+    "forcing_param_distributions_empirical": "forcing",
     # group: sweep
     "sweep_ranking":             "sweep",
     "sweep_convergence":         "sweep",
-    "sweep_hyperparams":         "sweep",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "sweep"}
+GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep"}
 
 PLOT_STYLE = {
     "font.size": 10,

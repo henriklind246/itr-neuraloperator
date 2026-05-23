@@ -11,7 +11,14 @@ from pathlib import Path
 import numpy as np
 
 from visual._common import _plots_for_group, _print_skip, _should_run
-from visual import dataset_plots, mms_plots, physics_plots, sweep_plots, training_plots
+from visual import (
+    dataset_plots,
+    forcing_plots,
+    mms_plots,
+    physics_plots,
+    sweep_plots,
+    training_plots,
+)
 
 
 def main():
@@ -59,7 +66,7 @@ def main():
                         help="Path to model checkpoint (for interface_error plot)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
-                        choices=["all", "physics", "mms", "training", "data", "sweep"],
+                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep"],
                         help="Which plot group(s) to generate (default: all)")
     parser.add_argument("--plots", type=str, nargs="+", default=None,
                         help="Individual plot names to generate (overrides --group)")
@@ -150,11 +157,6 @@ def main():
         checkpoint_conf = None
         model = None
 
-        # flux_profiles needs no data files
-        if _should_run("flux_profiles", groups, individual):
-            print("--- flux_profiles ---")
-            dataset_plots.plot_flux_profiles(save_path=data_dir / "flux_profiles.png")
-
         # IC family progression plots — pure synthetic, no data files needed
         ic_progression_plots = [
             ("ic_uniform_progression",         dataset_plots.plot_ic_uniform_progression),
@@ -174,7 +176,6 @@ def main():
         grid_data_plots = {
             "trajectory_heatmap",
             "trajectory_deviation_heatmap",
-            "y_perturbation",
             "spatial_family_breakdown",
             "initial_conditions",
             "snapshot_pair_samples",
@@ -233,10 +234,6 @@ def main():
                 dt=solver_dt,
             )
 
-        if sim_params is not None and _should_run("lhs_scatter", groups, individual):
-            print("--- lhs_scatter ---")
-            dataset_plots.plot_lhs_scatter(sim_params, save_path=data_dir / "lhs_scatter.png")
-
         if trajectories is not None:
             highlight_sid = (
                 dataset_plots._select_localized_sim_id(sim_params) if sim_params is not None else 0
@@ -271,16 +268,6 @@ def main():
 
             # plots requiring sim_params
             if sim_params is not None:
-                if _should_run("y_perturbation", groups, individual):
-                    print("--- y_perturbation ---")
-                    dataset_plots.plot_y_perturbation(
-                        trajectories,
-                        sim_id=highlight_sid,
-                        x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
-                        sim_params=sim_params,
-                        save_path=data_dir / "y_perturbation.png",
-                    )
-
                 if _should_run("spatial_family_breakdown", groups, individual):
                     print("--- spatial_family_breakdown ---")
                     dataset_plots.plot_spatial_family_breakdown(
@@ -396,7 +383,6 @@ def main():
                         )
             else:
                 for name in {
-                    "lhs_scatter",
                     "snapshot_pair_samples",
                     "lead_time_coverage",
                     "dataset_summary",
@@ -413,6 +399,71 @@ def main():
                 for name in grid_data_plots:
                     if _should_run(name, groups, individual):
                         _print_skip(name, "trajectory grids are unavailable")
+
+    # ---- FORCING GROUP ----
+    forcing_plot_names = _plots_for_group("forcing")
+    need_forcing = any(_should_run(p, groups, individual) for p in forcing_plot_names)
+
+    if need_forcing:
+        print("=== FORCING GROUP ===")
+        forcing_dir = out_dir / "forcing"
+
+        if _should_run("forcing_temporal_families", groups, individual):
+            print("--- forcing_temporal_families ---")
+            forcing_plots.plot_forcing_temporal_families(
+                save_path=forcing_dir / "forcing_temporal_families.png",
+            )
+
+        if _should_run("forcing_spatial_profiles", groups, individual):
+            print("--- forcing_spatial_profiles ---")
+            forcing_plots.plot_forcing_spatial_profiles(
+                save_path=forcing_dir / "forcing_spatial_profiles.png",
+            )
+
+        if _should_run("forcing_separable_assembly", groups, individual):
+            print("--- forcing_separable_assembly ---")
+            forcing_plots.plot_forcing_separable_assembly(
+                save_path=forcing_dir / "forcing_separable_assembly.png",
+            )
+
+        if _should_run("forcing_bin_encoding", groups, individual):
+            print("--- forcing_bin_encoding ---")
+            forcing_plots.plot_forcing_bin_encoding(
+                save_path=forcing_dir / "forcing_bin_encoding.png",
+            )
+
+        if _should_run("forcing_seq_tokens", groups, individual):
+            print("--- forcing_seq_tokens ---")
+            forcing_plots.plot_forcing_seq_tokens(
+                save_path=forcing_dir / "forcing_seq_tokens.png",
+            )
+
+        if _should_run("forcing_summary_scalars", groups, individual):
+            print("--- forcing_summary_scalars ---")
+            forcing_plots.plot_forcing_summary_scalars(
+                save_path=forcing_dir / "forcing_summary_scalars.png",
+            )
+
+        if _should_run("forcing_param_distributions_design", groups, individual):
+            print("--- forcing_param_distributions_design ---")
+            forcing_plots.plot_forcing_param_distributions_design(
+                save_path=forcing_dir / "forcing_param_distributions_design.png",
+            )
+
+        if _should_run("forcing_param_distributions_empirical", groups, individual):
+            if args.params:
+                sim_params_for_forcing = (
+                    sim_params
+                    if "sim_params" in locals() and sim_params is not None
+                    else np.load(args.params, allow_pickle=True)
+                )
+                print("--- forcing_param_distributions_empirical ---")
+                forcing_plots.plot_forcing_param_distributions_empirical(
+                    sim_params_for_forcing,
+                    save_path=forcing_dir / "forcing_param_distributions_empirical.png",
+                )
+            else:
+                _print_skip("forcing_param_distributions_empirical", "need --params")
 
     # ---- SWEEP GROUP ----
     sweep_plot_names = _plots_for_group("sweep")
@@ -440,10 +491,6 @@ def main():
                     )
                 else:
                     _print_skip("sweep_convergence", "need --runs")
-
-            if _should_run("sweep_hyperparams", groups, individual):
-                print("--- sweep_hyperparams ---")
-                sweep_plots.plot_sweep_hyperparams(experiment_dir, save_path=sweep_dir / "sweep_hyperparams.png")
         else:
             for name in sweep_plot_names:
                 if _should_run(name, groups, individual):

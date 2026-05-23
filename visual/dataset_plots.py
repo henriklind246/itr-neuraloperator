@@ -31,7 +31,6 @@ from src.physics.boundary_forcing import (
     TEMPORAL_BUILDERS,
     FORCING_BINS,
     SIN_AMP_RANGE,
-    build_qL,
     integrate_temporal_bins,
 )
 
@@ -56,7 +55,6 @@ def _forcing_label(params: dict) -> str:
         return f"{fam} Np={tp['Np']}"
     return fam
 from src.operators.train import load_config
-from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.operators.fno2d import FNO2d
 from src.physics.init_conditions import (
     GRF_ELL_RANGE,
@@ -71,7 +69,6 @@ from src.physics.init_conditions import (
 from visual._common import (
     PLOT_STYLE,
     _add_interface_lines,
-    _evaluate_q_left_field,
     _resolve_interface_metadata,
     _save_figure,
 )
@@ -996,61 +993,6 @@ def plot_trajectory_deviation_heatmap(
                      layout="constrained")
 
 
-def plot_y_perturbation(
-    trajectories: np.ndarray,
-    sim_id: int,
-    x_grid: np.ndarray,
-    y_grid: np.ndarray,
-    t_grid: np.ndarray,
-    sim_params: np.ndarray | None = None,
-    t_window: tuple[float, float] = (0.0, 0.25),
-    save_path: str | Path | None = None,
-):
-    """Plot the y-perturbation T(x, y, t) - <T>_y(x, t) for one simulation.
-
-    Subtracting the y-mean exposes the y-structure imprinted by the spatial
-    flux profile, regardless of the absolute temperature scale.
-    """
-    Nt = trajectories.shape[1]
-    snap_main = _snap_indices_in_window(t_grid, t_window[0], t_window[1], 5)
-    post = np.array([Nt - 1], dtype=int)
-    snap_indices = np.unique(np.concatenate([snap_main, post]))
-
-    fields = trajectories[sim_id, snap_indices].astype(np.float32)  # (S, Nx, Ny)
-    perturbations = fields - fields.mean(axis=2, keepdims=True)
-    abs_max = max(float(np.max(np.abs(perturbations))), 1e-12)
-    interface_meta = _resolve_interface_metadata()
-
-    family_str = ""
-    if sim_params is not None:
-        family_str = f" — {_format_spatial_family(sim_params[sim_id])}"
-
-    with plt.rc_context(PLOT_STYLE):
-        nrows = 2
-        ncols = int(np.ceil(len(snap_indices) / nrows))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 4.4 * nrows), constrained_layout=True, squeeze=False)
-        axes_flat = axes.ravel()
-        pcm = None
-        for ax, t_idx, field in zip(axes_flat, snap_indices, perturbations):
-            pcm = _plot_field_2d(
-                ax,
-                x_grid,
-                y_grid,
-                field,
-                cmap="coolwarm",
-                vmin=-abs_max,
-                vmax=abs_max,
-                interface_positions=interface_meta["positions"],
-            )
-            ax.set_title(f"t = {t_grid[t_idx]:.3f}")
-        for ax in axes_flat[len(snap_indices):]:
-            ax.set_axis_off()
-
-        fig.colorbar(pcm, ax=axes_flat.tolist(), label=r"$T - \langle T \rangle_y$", shrink=0.9)
-        fig.suptitle(f"y-Perturbation — Simulation {sim_id}{family_str}")
-        _save_figure(fig, save_path, "data", "y_perturbation", layout="constrained")
-
-
 def plot_spatial_family_breakdown(
     trajectories: np.ndarray,
     sim_params: np.ndarray,
@@ -1069,16 +1011,31 @@ def plot_spatial_family_breakdown(
     Each row uses its own symmetric colorbar.
     """
     families = ["uniform", "patch", "gaussian", "triangle"]
+    snap_indices = _snap_indices_in_window(t_grid, t_window[0], t_window[1], n_snaps)
+
+    # Floor on y-perturbation magnitude; below this the autoscaled colormap
+    # would saturate float64 round-off from the per-column mean subtraction.
+    signal_floor = 1e-3
+
     selected_ids = []
     for fam in families:
-        sid = _select_localized_sim_id(sim_params, family=fam)
-        if sim_params[sid]["spatial_family"] == fam:
-            selected_ids.append((fam, sid))
+        candidates = [
+            i for i, p in enumerate(sim_params) if p["spatial_family"] == fam
+        ]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda i: _spatial_localness(sim_params[i]))
+        chosen = candidates[0]
+        for sid in candidates:
+            window_fields = trajectories[sid, snap_indices].astype(np.float32)
+            window_pert = window_fields - window_fields.mean(axis=2, keepdims=True)
+            if float(np.max(np.abs(window_pert))) >= signal_floor:
+                chosen = sid
+                break
+        selected_ids.append((fam, chosen))
 
     if not selected_ids:
         raise ValueError("No simulations available for any spatial family.")
-
-    snap_indices = _snap_indices_in_window(t_grid, t_window[0], t_window[1], n_snaps)
     interface_meta = _resolve_interface_metadata()
     nrows = len(selected_ids)
     ncols = len(snap_indices)
@@ -1320,187 +1277,6 @@ def plot_ic_hot_spot_progression(save_path: str | Path | None = None) -> None:
         suptitle=f"Hot-spot IC progression — sigma sweep (N={N})",
         save_path=save_path,
     )
-
-
-def plot_lhs_scatter(
-    sim_params: np.ndarray,
-    save_path: str | Path | None = None,
-):
-    """Coverage summary for sampled conditioning parameters.
-
-    Amplitude / frequency are NaN for non-sin sims; nan-aware ops keep the sin
-    marginals visible while ignoring NaN entries (matplotlib drops them too).
-    """
-    amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
-
-    def _normalize(values: np.ndarray, log: bool = False) -> np.ndarray:
-        v = np.log10(values) if log else values
-        lo = np.nanmin(v)
-        hi = np.nanmax(v)
-        return (v - lo) / max(hi - lo, 1e-12)
-
-    normalized_marginals = [
-        ("A",        _normalize(amplitudes),                "C0"),
-        ("log10(f)", _normalize(frequencies, log=True),     "C3"),
-        ("R_c",      _normalize(contact_resistance),        "C2"),
-    ]
-
-    with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
-        scatter_specs = [
-            (axes[0, 0], amplitudes, frequencies, "Flux Amplitude (A)", "Flux Frequency (f)"),
-            (axes[0, 1], amplitudes, contact_resistance, "Flux Amplitude (A)", "Contact Resistance (R_c)"),
-            (axes[1, 0], frequencies, contact_resistance, "Flux Frequency (f)", "Contact Resistance (R_c)"),
-        ]
-        for ax, x_vals, y_vals, x_label, y_label in scatter_specs:
-            ax.scatter(x_vals, y_vals, s=16, alpha=0.45, color="C0", edgecolors="none")
-            ax.set_xlabel(x_label)
-            ax.set_ylabel(y_label)
-            ax.grid(True)
-            if "Frequency" in x_label:
-                ax.set_xscale("log")
-            if "Frequency" in y_label:
-                ax.set_yscale("log")
-
-        hist_ax = axes[1, 1]
-        bins = np.linspace(0.0, 1.0, 12)
-        for label, values, color in normalized_marginals:
-            hist_ax.hist(values, bins=bins, histtype="step", linewidth=1.8, label=label, color=color)
-        hist_ax.set_xlabel("Normalized parameter value")
-        hist_ax.set_ylabel("Count")
-        hist_ax.set_title("Marginal Coverage")
-        hist_ax.legend(loc="upper center")
-        hist_ax.grid(True)
-
-        fig.suptitle(f"Conditioning Parameter Coverage — {len(amplitudes)} simulations")
-        _save_figure(fig, save_path, "data", "lhs_scatter", layout="constrained")
-
-
-def plot_flux_profiles(
-    t_on: float = 0.0,
-    t_off: float = 0.2,
-    t_final: float = 1.0,
-    save_path: str | Path | None = None,
-):
-    """Tile the new q_L(y, t) representation across patch / gaussian / triangle.
-
-    Row 0 (full width): shared temporal forcing a(t).
-    Rows 1-3: per family — s(y) | q_left(y, t) heatmap | q_x at t_peak.
-    """
-    layers = [
-        Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
-        Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
-    ]
-    families = [
-        ("patch",    dict(y_c=0.50, w=0.30)),
-        ("gaussian", dict(y_c=0.50, sigma_y=0.08)),
-        ("triangle", dict(y_c=0.50, ell=0.20)),
-    ]
-    Nx, Ny = 60, 60
-    a_x, b_x, c_y, d_y = 0.0, 1.0, 0.0, 1.0
-    flux_A, flux_f, phase = 175.0, 10.5, 0.0
-    y_grid = np.linspace(c_y, d_y, Ny)
-
-    runs = []
-    for name, sp in families:
-        q_fn, s_vec = build_qL(
-            "sin",
-            dict(A=flux_A, f=flux_f, t_on=t_on, t_off=t_off, phase=phase),
-            name,
-            sp,
-            y_grid,
-        )
-        solver = FVSolver2D(
-            a=a_x, b=b_x, c=c_y, d=d_y,
-            Nx=Nx, Ny=Ny,
-            lam_target=0.8,
-            layers=layers,
-            interface_R=[0.5],
-            t_final=t_final,
-            flux_f=flux_f,
-            flux_A=flux_A,
-            t_on=t_on,
-            t_off=t_off,
-            phase=phase,
-            dt=0.005,
-            q_left_fn=q_fn,
-        )
-        T0_demo = np.full((solver.Nx, solver.Ny), solver.T_right(0.0), dtype=float)
-        _, _, _, T_hist = solver.solve(T0=T0_demo, store_trajectory=True)
-        Q = _evaluate_q_left_field(solver)
-        t_peak = int(np.argmax(np.max(np.abs(Q), axis=1)))
-        dT = T_hist[t_peak, 1:, :] - T_hist[t_peak, :-1, :]
-        q_x = -solver.G_x * dT
-        runs.append({
-            "name": name, "sp": sp, "solver": solver, "T_hist": T_hist,
-            "Q": Q, "s_vec": s_vec, "q_x": q_x, "t_peak": t_peak,
-        })
-
-    # Reconstruct a(t) from one run: q(y, t) = a(t) * s(y) → a(t) = q(y_peak, t)/s(y_peak).
-    run0 = runs[0]
-    j0 = int(np.argmax(np.abs(run0["s_vec"])))
-    s0 = float(run0["s_vec"][j0])
-    a_t_shared = run0["Q"][:, j0] / s0 if abs(s0) > 1e-12 else run0["Q"][:, j0]
-
-    q_x_global = max(float(np.max([np.max(np.abs(r["q_x"])) for r in runs])), 1e-8)
-    interface_meta = _resolve_interface_metadata(solver=runs[0]["solver"])
-
-    with plt.rc_context(PLOT_STYLE):
-        fig = plt.figure(figsize=(16, 13), constrained_layout=True)
-        gs = fig.add_gridspec(4, 3, height_ratios=[0.7, 1.0, 1.0, 1.0])
-
-        ax_at = fig.add_subplot(gs[0, :])
-        solver0 = runs[0]["solver"]
-        ax_at.plot(solver0.t, a_t_shared, color="C3")
-        ax_at.axvline(t_on, color="C2", linestyle=":", alpha=0.8, label=f"t_on={t_on}")
-        ax_at.axvline(t_off, color="C1", linestyle=":", alpha=0.8, label=f"t_off={t_off}")
-        ax_at.set_xlabel("Time")
-        ax_at.set_ylabel(r"$a(t)$")
-        ax_at.set_title("Temporal forcing (shared across families)")
-        ax_at.legend(loc="upper right")
-        ax_at.grid(True)
-
-        qx_axes = []
-        pcm_x = None
-        for row, run in enumerate(runs, start=1):
-            solver = run["solver"]
-            ax_s = fig.add_subplot(gs[row, 0])
-            ax_q = fig.add_subplot(gs[row, 1])
-            ax_qx = fig.add_subplot(gs[row, 2])
-
-            ax_s.plot(solver.grid_y, run["s_vec"], color="C0")
-            sp_str = ", ".join(f"{k}={v:.2f}" for k, v in run["sp"].items())
-            ax_s.set_xlabel("y")
-            ax_s.set_ylabel(r"$s(y)$")
-            ax_s.set_title(f"{run['name']}: {sp_str}")
-            ax_s.set_ylim(-0.1, 1.15)
-            ax_s.grid(True)
-
-            q_abs_row = max(float(np.max(np.abs(run["Q"]))), 1e-12)
-            pcm_q = ax_q.pcolormesh(
-                solver.t, solver.grid_y, run["Q"].T,
-                cmap="coolwarm", vmin=-q_abs_row, vmax=q_abs_row, shading="auto",
-            )
-            ax_q.axvline(t_on, color="0.2", linestyle=":", alpha=0.6)
-            ax_q.axvline(t_off, color="0.2", linestyle=":", alpha=0.6)
-            ax_q.set_xlabel("Time")
-            ax_q.set_ylabel("y")
-            ax_q.set_title(rf"$q_{{left}}(y,t)$ — {run['name']}")
-            fig.colorbar(pcm_q, ax=ax_q, shrink=0.9)
-
-            pcm_x = ax_qx.pcolormesh(
-                solver.face_positions_x, solver.grid_y, run["q_x"].T,
-                cmap="coolwarm", vmin=-q_x_global, vmax=q_x_global, shading="nearest",
-            )
-            _add_interface_lines(ax_qx, interface_meta["positions"])
-            ax_qx.set_xlabel("x-face position")
-            ax_qx.set_ylabel("y")
-            ax_qx.set_title(rf"$q_x$ at t={solver.t[run['t_peak']]:.3f}")
-            qx_axes.append(ax_qx)
-
-        fig.colorbar(pcm_x, ax=qx_axes, label=r"$q_x$", shrink=0.85)
-        fig.suptitle("Boundary Flux Demo — Spatial Family Tiling")
-        _save_figure(fig, save_path, "data", "flux_profiles", layout="constrained")
 
 
 def plot_snapshot_pair_samples(
