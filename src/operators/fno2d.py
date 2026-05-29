@@ -36,11 +36,18 @@ class SpectralConv2d(nn.Module):
         self.spectral_dropout = spectral_dropout
 
         self.scale = 1.0 / (in_channels * out_channels)
+        # Stored as real (..., 2) rather than cfloat: torch.distributed cannot
+        # all-reduce complex tensors (gloo errors outright; NCCL goes through a
+        # view-as-real path that is not numerically equivalent to the
+        # single-process complex gradient). Keeping the leaf parameters real
+        # makes DDP reduce them through its standard, correct path. forward()
+        # recovers the complex weight via view_as_complex (a zero-copy view), so
+        # the math — and the single-process result — is unchanged.
         self.weights1 = nn.Parameter(
-            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
+            torch.view_as_real(self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
         )
         self.weights2 = nn.Parameter(
-            self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat)
+            torch.view_as_real(self.scale * torch.rand(in_channels, out_channels, modes1, modes2, dtype=torch.cfloat))
         )
 
     def compl_mul2d(self, inp, weights):
@@ -67,14 +74,18 @@ class SpectralConv2d(nn.Module):
                 f"modes1={self.modes1} too large for Nx_freq={Nx_freq}: "
                 f"positive and negative x-mode slices overlap (need 2*modes1 <= Nx_freq)."
             )
+        # Real (..., 2) leaf params -> complex view for the mode-wise product.
+        weights1 = torch.view_as_complex(self.weights1)
+        weights2 = torch.view_as_complex(self.weights2)
+
         out_ft = torch.zeros(x.size(0), self.out_channels, Nx_freq, Ny_freq, dtype=torch.cfloat, device=x.device)
         # positive modes
-        out_ft[:, :, :mx, :my] = self.compl_mul2d(x_ft[:, :, :mx, :my], self.weights1[:, :, :mx, :my])
+        out_ft[:, :, :mx, :my] = self.compl_mul2d(x_ft[:, :, :mx, :my], weights1[:, :, :mx, :my])
         # negative modes
         # for rfft2, the last dimension is one-sided but the x dim. is still positive and negative
         # mx and my are still used for weights2 simply because the slice is still shape (B, C_in, mx, my) so its just
         # illustrating the size of the weight2 learnable tensor
-        out_ft[:, :, -mx:, :my] = self.compl_mul2d(x_ft[:, :, -mx:, :my], self.weights2[:, :, :mx, :my])
+        out_ft[:, :, -mx:, :my] = self.compl_mul2d(x_ft[:, :, -mx:, :my], weights2[:, :, :mx, :my])
 
         # Spectral dropout: randomly zero modes during training.
         # Matches fno1d.SpectralConv1d: no inverse-scaling by 1/(1-p), so
