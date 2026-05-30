@@ -24,6 +24,7 @@ from data.dataset import (
     create_dataloaders,
     load_sim_data,
     load_solver_dt,
+    problem_from_config,
     split_sim_ids,
 )
 from src.operators.distributed import DistInfo, get_dist_info
@@ -62,6 +63,25 @@ def load_config(config_path: str | None = None) -> dict:
     cfg = OmegaConf.load(path)
     paths_cfg = OmegaConf.load(project_root / "conf" / "paths" / "default.yaml")
     cfg = OmegaConf.merge({"paths": paths_cfg}, cfg)
+
+    # Compose the active benchmark group. Hydra entrypoints do this via the
+    # `defaults` list; load_config (fixed-run path) bypasses Hydra, so merge the
+    # group manually. Name comes from $BENCHMARK, else the `defaults` list,
+    # else "forcing". The group file is `# @package _global_`, so its keys are
+    # top-level and provide the (benchmark-specific) representational dims.
+    benchmark_name = os.environ.get("BENCHMARK")
+    if benchmark_name is None:
+        benchmark_name = "forcing"
+        for entry in cfg.get("defaults", []) or []:
+            if not isinstance(entry, str):
+                d = OmegaConf.to_container(entry)
+                if isinstance(d, dict) and "benchmark" in d:
+                    benchmark_name = d["benchmark"]
+                    break
+    benchmark_path = project_root / "conf" / "benchmark" / f"{benchmark_name}.yaml"
+    if not benchmark_path.exists():
+        raise FileNotFoundError(f"Benchmark config not found: {benchmark_path}")
+    cfg = OmegaConf.merge(cfg, OmegaConf.load(benchmark_path))
 
     # Remove Hydra-only sections that can't resolve outside Hydra
     for key in ("hydra", "defaults"):
@@ -736,11 +756,10 @@ def forcing_sensitivity_diagnostics(
         for batch in val_loader:
             if n_done >= n_batches:
                 break
-            x_spatial, cond_static, forcing_seq, y_batch, _ = batch
-            x_spatial = x_spatial.to(device)
-            cond_static = cond_static.to(device)
-            forcing_seq = forcing_seq.to(device)
-            y_batch = y_batch.to(device)
+            x_spatial = batch["spatial"].to(device)
+            cond_static = batch["cond_static"].to(device)
+            forcing_seq = batch["forcing_seq"].to(device)
+            y_batch = batch["Y"].to(device)
 
             B = forcing_seq.size(0)
             perm = torch.randperm(B, generator=gen).to(forcing_seq.device)
@@ -859,6 +878,7 @@ def train_one_epoch(
         and diag_out is not None
         and model_unwrapped is not None
         and activation_batches > 0
+        and getattr(model_unwrapped, "use_temporal_encoder", True)
     )
     diag_acc: dict[str, float] = {}
     grad_acc: dict[str, float] = {}
@@ -868,12 +888,12 @@ def train_one_epoch(
         probe.__enter__()
 
     try:
-        # _T_stats is not used since error metrics are computed in z-score temp. source space
-        for x_spatial, cond_static, forcing_seq, y_batch, _T_stats in train_loader:
-            x_spatial = x_spatial.to(device)
-            cond_static = cond_static.to(device)
-            forcing_seq = forcing_seq.to(device)
-            y_batch = y_batch.to(device)
+        # T_stats is not used since error metrics are computed in z-score temp. source space
+        for batch in train_loader:
+            x_spatial = batch["spatial"].to(device)
+            cond_static = batch["cond_static"].to(device)
+            forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
+            y_batch = batch["Y"].to(device)
 
             optimizer.zero_grad()
             y_pred = model(x_spatial, cond_static, forcing_seq)
@@ -1013,11 +1033,11 @@ def validate(
                 pair_writer.writeheader()
 
         try:
-            for x_spatial, cond_static, forcing_seq, y_batch, _T_stats in val_loader:
-                x_spatial = x_spatial.to(device)
-                cond_static = cond_static.to(device)
-                forcing_seq = forcing_seq.to(device)
-                y_batch = y_batch.to(device)
+            for batch in val_loader:
+                x_spatial = batch["spatial"].to(device)
+                cond_static = batch["cond_static"].to(device)
+                forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
+                y_batch = batch["Y"].to(device)
 
                 y_pred = model(x_spatial, cond_static, forcing_seq)
                 mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
@@ -1124,6 +1144,7 @@ def run_one_seed(
             world_size=dist_info.world_size,
             rank=dist_info.rank,
             sampler_seed=seed,
+            problem=problem_from_config(config),
         )
     else:
         training_set = train_loader_override
@@ -1156,6 +1177,7 @@ def run_one_seed(
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
+        use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
     )
 
     # --- Resume state ---
@@ -1330,7 +1352,11 @@ def run_one_seed(
                 )
                 print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
 
-                if diagnostic_epoch and diag_out is not None:
+                if (
+                    diagnostic_epoch
+                    and diag_out is not None
+                    and fno_unwrapped.use_temporal_encoder
+                ):
                     diag_out.update(
                         forcing_sensitivity_diagnostics(
                             model_unwrapped=fno_unwrapped,

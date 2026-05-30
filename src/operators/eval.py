@@ -7,6 +7,7 @@ from data.dataset import (
     create_dataloaders,
     load_sim_data,
     load_solver_dt,
+    problem_from_config,
     split_sim_ids,
 )
 from src.operators.fno2d import FNO2d
@@ -57,6 +58,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
         dt=solver_dt,
         temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
+        problem=problem_from_config(config),
     )
 
     return testing_set, x_grid, y_grid
@@ -82,12 +84,12 @@ def evaluate(model, test_loader, device, iface_mask=None):
         iface_rel_l2_norm = 0.0
         iface_rel_l2_phys = 0.0
 
-        for x_spatial, cond_static, forcing_seq, y_batch, T_stats in test_loader:
-            x_spatial = x_spatial.to(device)
-            cond_static = cond_static.to(device)
-            forcing_seq = forcing_seq.to(device)
-            y_batch = y_batch.to(device)
-            T_stats = T_stats.to(device)
+        for batch in test_loader:
+            x_spatial = batch["spatial"].to(device)
+            cond_static = batch["cond_static"].to(device)
+            forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
+            y_batch = batch["Y"].to(device)
+            T_stats = batch["T_stats"].to(device)
 
             y_pred = model(x_spatial, cond_static, forcing_seq)
 
@@ -164,6 +166,7 @@ def eval_all_seeds(run_root: str):
             temporal_hidden=model_cfg.get("temporal_hidden", 128),
             forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
             forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
+            use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
         )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)

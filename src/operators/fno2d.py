@@ -223,6 +223,7 @@ class FNO2d(nn.Module):
         forcing_spatial_dim: int = 16,
         dropout: float = 0.0,
         spectral_dropout: float = 0.0,
+        use_temporal_encoder: bool = True,
     ):
         super().__init__()
         self.modes1 = modes1
@@ -236,16 +237,20 @@ class FNO2d(nn.Module):
         self.temporal_hidden = temporal_hidden
         self.forcing_embed_dim = forcing_embed_dim
         self.forcing_spatial_dim = forcing_spatial_dim
+        self.use_temporal_encoder = use_temporal_encoder
         self.padding = 8  # pad spatial dim for non-periodic signals
 
+        # Spatial-forcing channels (s_y * z_a) are only injected when the temporal
+        # branch is active; with the encoder off the lift sees in_channels alone.
+        lift_extra = forcing_spatial_dim if use_temporal_encoder else 0
         # Lift: (B, Nx, Ny, in_channels + K) → (B, Nx, Ny, width)
-        # The +K accounts for spatial-forcing channels built inside forward as s_y * z_a.
-        self.linear_p = nn.Linear(in_channels + forcing_spatial_dim, width)
+        self.linear_p = nn.Linear(in_channels + lift_extra, width)
 
         # Project temporal embedding h_a to K spatial-forcing weights; multiplied by s_y(y)
         # to form K extra spatial channels (restores the direct spatial pathway lost when
         # the hand-crafted Q_y_bins were removed).
-        self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
+        if use_temporal_encoder:
+            self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
 
         # ------- FOURIER LAYERS -------------
         self.spectral_layers = nn.ModuleList([
@@ -260,14 +265,20 @@ class FNO2d(nn.Module):
             ConditionalInstanceNorm2d(width) for _ in range(n_layers)
         ])
 
-        # Temporal forcing encoder + Conditioning MLP
-        self.temporal_encoder = TemporalForcingEncoder(
-            token_dim=temporal_token_dim,
-            hidden=temporal_hidden,
-            embed_dim=forcing_embed_dim,
-        )
+        # Temporal forcing encoder + Conditioning MLP. With the encoder off, the
+        # CIN is driven by cond_static alone (e.g. the source benchmark, which has
+        # no forcing_seq).
+        if use_temporal_encoder:
+            self.temporal_encoder = TemporalForcingEncoder(
+                token_dim=temporal_token_dim,
+                hidden=temporal_hidden,
+                embed_dim=forcing_embed_dim,
+            )
+            cond_dim = cond_static_dim + forcing_embed_dim
+        else:
+            cond_dim = cond_static_dim
         self.cond_mlp = ConditioningMLP(
-            cond_dim=cond_static_dim + forcing_embed_dim,
+            cond_dim=cond_dim,
             hidden_dim=cond_hidden,
             n_layers=n_layers,
             width=width,
@@ -280,28 +291,35 @@ class FNO2d(nn.Module):
         self.activation = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, spatial, cond_static, forcing_seq):
+    def forward(self, spatial, cond_static, forcing_seq=None):
         """
         spatial      : (B, Nx, Ny, in_channels)
         cond_static  : (B, cond_static_dim)
-        forcing_seq  : (B, M, temporal_token_dim)
+        forcing_seq  : (B, M, temporal_token_dim) or None when the temporal
+                       encoder is disabled
         returns      : (B, Nx, Ny, out_channels)
         """
-        # Temporal branch
-        h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
-
-        # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}.
-        # Dataset convention: spatial = [T_source_norm, x_norm, y_norm, s_y, Q_y_bin_0..15]; s_y is channel 3.
         assert spatial.size(-1) == self.in_channels
-        z_a = self.forcing_to_spatial(h_a)                    # (B, K)
-        s_y = spatial[..., 3:4]                               # (B, Nx, Ny, 1)
-        Nx, Ny = spatial.size(1), spatial.size(2)
-        z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1) # (B, Nx, Ny, K)
-        forcing_field = s_y * z_grid                          # (B, Nx, Ny, K)
-        spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
 
-        # Conditioning MLP (h_a is also routed through CIN)
-        cond_full = torch.cat([cond_static, h_a], dim=-1)     # (B, cond_static_dim + forcing_embed_dim)
+        if self.use_temporal_encoder:
+            # Temporal branch
+            h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
+
+            # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}.
+            # Dataset convention: spatial = [T_source_norm, x_norm, y_norm, s_y, Q_y_bin_0..15]; s_y is channel 3.
+            z_a = self.forcing_to_spatial(h_a)                    # (B, K)
+            s_y = spatial[..., 3:4]                               # (B, Nx, Ny, 1)
+            Nx, Ny = spatial.size(1), spatial.size(2)
+            z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1) # (B, Nx, Ny, K)
+            forcing_field = s_y * z_grid                          # (B, Nx, Ny, K)
+            spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
+
+            # Conditioning MLP (h_a is also routed through CIN)
+            cond_full = torch.cat([cond_static, h_a], dim=-1)     # (B, cond_static_dim + forcing_embed_dim)
+        else:
+            spatial_aug = spatial
+            cond_full = cond_static
+
         cin_params = self.cond_mlp(cond_full)                 # (B, n_layers, 2, width)
 
         # Lift
