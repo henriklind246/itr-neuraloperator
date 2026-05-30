@@ -609,12 +609,12 @@ def _compute_pair_error_records(
     y_batch = []
     stats_batch = []
     for idx in sample_indices:
-        x_spatial, cond_static, forcing_seq, Y, T_stats = dataset[idx]
-        x_batch.append(x_spatial)
-        cond_batch.append(cond_static)
-        forcing_batch.append(forcing_seq)
-        y_batch.append(Y)
-        stats_batch.append(T_stats)
+        item = dataset[idx]
+        x_batch.append(item["spatial"])
+        cond_batch.append(item["cond_static"])
+        forcing_batch.append(item["forcing_seq"])
+        y_batch.append(item["Y"])
+        stats_batch.append(item["T_stats"])
 
     x_tensor = torch.stack(x_batch, dim=0)
     cond_tensor = torch.stack(cond_batch, dim=0)

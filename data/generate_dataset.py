@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 import sys
 
@@ -23,6 +24,7 @@ from src.physics.init_conditions import (
     sample_ic_family,
     build_ic,
 )
+from problems.registry import get_problem
 
 
 DATA_DIR = Path(__file__).resolve().parent
@@ -97,7 +99,11 @@ def generate_sim_data(
     num_sims: int = 2000,
     save_stride: int = 2,
     save_dir: Path | str | None = None,
+    benchmark: str | None = None,
 ) -> None:
+    benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
+    spec = get_problem(benchmark)
+
     rng = np.random.default_rng(0)
     rng_profile = np.random.default_rng(1)
 
@@ -123,45 +129,31 @@ def generate_sim_data(
         Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
     ]
 
+    grids = {"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid}
+    time_cfg = dict(
+        num_sims=num_sims, dt=dt, t_final=t_final, lhs_seed=0,
+        t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
+        T_right=300.0, b=b,
+    )
+    base_kwargs = dict(
+        a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
+        lam_target=0.8, layers=layers, t_final=t_final,
+        flux_f=0.0, flux_A=0.0, t_on=t_on, t_off=t_off, phase=phase,
+        dt=dt, tukey_alpha=tukey_alpha, y_grid=y_grid, X=X, Y=Y,
+    )
+
+    print(f"Benchmark: {benchmark}", flush=True)
     print("Building simulation parameters.", flush=True)
 
-    sim_params = build_sim_params(
-        a=a, b=b, c=c, d=d, X=X, Y=Y,
-        num_sims=num_sims, rng=rng, rng_profile=rng_profile,
-        dt=dt, t_final=t_final, lhs_seed=0,
-        t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
+    sim_params = spec.sample_sim_params(
+        rng=rng, rng_profile=rng_profile, grids=grids, time_cfg=time_cfg,
     )
 
     trajectories = np.zeros((num_sims, Nt_saved, Nx, Ny), dtype=np.float32)
 
     # generate all simulations with varying parameters from simulation parameters
     for i, params in enumerate(sim_params):
-        q_left_fn, _ = build_qL(
-            temporal_family=params["temporal_family"],
-            temporal_params=params["temporal_params"],
-            spatial_family=params["spatial_family"],
-            spatial_params=params["spatial_params"],
-            y_grid=y_grid,
-        )
-        q_left_integral_fn, _ = build_qL_integral(
-            temporal_family=params["temporal_family"],
-            temporal_params=params["temporal_params"],
-            spatial_family=params["spatial_family"],
-            spatial_params=params["spatial_params"],
-            y_grid=y_grid,
-        )
-
-        sim = FVSolver2D(
-            a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
-            lam_target=0.8, layers=layers,
-            t_final=t_final,
-            flux_f=0.0, flux_A=0.0,
-            t_on=t_on, t_off=t_off, phase=phase,
-            dt=dt, tukey_alpha=tukey_alpha,
-            interface_R=[params["R_c"]],
-            q_left_fn=q_left_fn,
-            q_left_integral_fn=q_left_integral_fn,
-        )
+        sim = spec.configure_solver(params, base_kwargs)
 
         t, x, y, T_hist = sim.solve(T0=params["T0"], store_trajectory=True)
 
@@ -196,9 +188,15 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         default=None,
         help="Directory for generated .npy files. Defaults to this script's data directory.",
     )
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default=os.environ.get("BENCHMARK", "forcing"),
+        help="Benchmark adapter to generate data for (forcing|interfaces|source).",
+    )
     args = parser.parse_args(argv)
 
-    generate_fn(num_sims=args.num_sims, save_dir=args.save_dir)
+    generate_fn(num_sims=args.num_sims, save_dir=args.save_dir, benchmark=args.benchmark)
     return 0
 
 
