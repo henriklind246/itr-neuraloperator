@@ -980,8 +980,8 @@ def _write_val_pair_rows(
             {
                 "epoch": int(epoch),
                 "sim_id": int(sim_id),
-                "temporal_family": params["temporal_family"],
-                "spatial_family": params["spatial_family"],
+                "temporal_family": params.get("temporal_family", ""),
+                "spatial_family": params.get("spatial_family", ""),
                 "t_s": float(dataset.t_grid[s]),
                 "t_bar": float(dataset.t_grid[j] - dataset.t_grid[s]),
                 "R_c": float(params["R_c"]),
