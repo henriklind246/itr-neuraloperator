@@ -1,6 +1,7 @@
 defaults:
   - paths: default
   - search_space: medium
+  - benchmark: forcing
   - override hydra/sweeper: optuna_local
   - _self_
 
@@ -17,15 +18,14 @@ tuning:
 model:
   type: "2D FNO time-conditioned (temporal branch)"
   parameters:
+    # Representational dims (in_channels, cond_static_dim, temporal_token_dim,
+    # use_temporal_encoder) are owned by the active `benchmark` config group.
     modes1: 16
     modes2: 16
     width: 64
-    in_channels: 20
     out_channels: 1
     n_layers: 4
-    cond_static_dim: 23
     cond_hidden: 256
-    temporal_token_dim: 5
     temporal_samples: 64
     temporal_hidden: 128
     forcing_embed_dim: 64
@@ -59,10 +59,8 @@ training:
     step_size: 50
     gamma: 0.5
   optimizer: "AdamW"
-  loss:
-    interface_x: 0.5
-    interface_half_width: 0.05
-    interface_weight: 10.0
+  # training.loss.{interface_x, interface_half_width, interface_weight} are
+  # owned by the active `benchmark` config group (per-benchmark loss region).
   validate_every: 10
   patience: 20
   checkpoint_metric: "val_rel_l2"
@@ -88,11 +86,9 @@ data:
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  x_shape: "B, Nx, Ny, 20"
+  # x_shape / cond_static_shape / forcing_seq_shape / t_stats_shape are owned by
+  # the active `benchmark` config group (per-benchmark representation).
   y_shape: "B, Nx, Ny, 1"
-  cond_static_shape: "B, 23"
-  forcing_seq_shape: "B, 64, 5"
-  t_stats_shape: "B, 2"
   num_sims: 10000
 
 hydra:
