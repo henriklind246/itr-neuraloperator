@@ -12,12 +12,20 @@ COND_STATIC_DIM = 23
 TEMPORAL_TOKEN_DIM = 5
 TEMPORAL_SAMPLES = 64
 
+_ITEM_KEYS = ("spatial", "cond_static", "forcing_seq", "Y", "T_stats")
+
+
+def _dict_collate(batch):
+    """Map TensorDataset tuples -> dict batches matching the dataset item schema."""
+    stacked = [torch.stack([sample[i] for sample in batch]) for i in range(len(_ITEM_KEYS))]
+    return dict(zip(_ITEM_KEYS, stacked))
+
 
 # ===================== evaluate =====================
 
 @pytest.fixture
 def eval_setup():
-    """Tiny model + 5-tuple loader for eval tests."""
+    """Tiny model + dict-batch loader for eval tests."""
     Nx = 11
     Ny = 11
     model = FNO2d(
@@ -41,6 +49,7 @@ def eval_setup():
     loader = DataLoader(
         TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
         batch_size=2,
+        collate_fn=_dict_collate,
     )
     device = torch.device("cpu")
     return model, loader, device

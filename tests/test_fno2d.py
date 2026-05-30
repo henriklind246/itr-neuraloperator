@@ -86,6 +86,45 @@ class TestFNO2d:
 
         assert out.shape == (2, 11, 11, 1)
 
+    def test_cond_mlp_input_width_encoder_on(self):
+        """With the temporal encoder on, the CIN MLP consumes
+        cond_static_dim + forcing_embed_dim."""
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+            cond_static_dim=COND_STATIC_DIM,
+            temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+        )
+        first_linear = model.cond_mlp.net[0]
+        assert first_linear.in_features == COND_STATIC_DIM + 16
+        # lift sees in_channels + forcing_spatial_dim
+        assert model.linear_p.in_features == SPATIAL_IN_CHANNELS + 4
+        assert hasattr(model, "temporal_encoder")
+        assert hasattr(model, "forcing_to_spatial")
+
+    def test_forward_encoder_off_no_forcing_seq(self):
+        """Encoder-off path (source benchmark): forward works with
+        forcing_seq=None, lift sees in_channels alone, CIN consumes
+        cond_static alone."""
+        in_ch = 20
+        cond_dim = 8
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=in_ch, out_channels=1, n_layers=2,
+            cond_static_dim=cond_dim,
+            use_temporal_encoder=False,
+        )
+        assert not hasattr(model, "temporal_encoder")
+        assert not hasattr(model, "forcing_to_spatial")
+        assert model.linear_p.in_features == in_ch
+        assert model.cond_mlp.net[0].in_features == cond_dim
+
+        spatial = torch.randn(2, 11, 11, in_ch)
+        cond_static = torch.randn(2, cond_dim)
+        out = model(spatial, cond_static)
+        assert out.shape == (2, 11, 11, 1)
+
     def test_near_identity_init_at_step_zero(self):
         """Soft identity init: head weights small-random (std=1e-3), bias at γ=1, β=0.
 

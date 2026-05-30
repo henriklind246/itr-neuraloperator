@@ -13,6 +13,7 @@ from data.dataset import (
     split_pairs_within_sims,
     SnapshotPairDataset,
     create_dataloaders,
+    collate_fn,
     build_forcing_seq,
     build_forcing_summary,
 )
@@ -25,6 +26,18 @@ from src.physics.boundary_forcing import (
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
 SPATIAL_IN_CHANNELS = 20
+
+
+def _unpack(item):
+    """Adapt a dict dataset item / batched dict to the legacy 5-tuple order.
+
+    `SnapshotPairDataset.__getitem__` and the `collate_fn`-backed DataLoader both
+    return dicts now; the forcing benchmark always carries `forcing_seq`.
+    """
+    return (
+        item["spatial"], item["cond_static"], item["forcing_seq"],
+        item["Y"], item["T_stats"],
+    )
 
 
 # ===================== load_sim_data =====================
@@ -200,12 +213,15 @@ class TestSnapshotPairDataset:
     def test_len_full(self, dataset_full):
         assert len(dataset_full) == 5 * 1275
 
-    def test_getitem_returns_5tuple(self, dataset_subsampled):
+    def test_getitem_returns_dict(self, dataset_subsampled):
         result = dataset_subsampled[0]
-        assert len(result) == 5
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {
+            "spatial", "cond_static", "forcing_seq", "Y", "T_stats",
+        }
 
     def test_getitem_shapes(self, dataset_subsampled):
-        spatial, cond_static, forcing_seq, Y, T_stats = dataset_subsampled[0]
+        spatial, cond_static, forcing_seq, Y, T_stats = _unpack(dataset_subsampled[0])
         Nx, Ny = 11, 11
         assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
         assert cond_static.shape == (COND_STATIC_DIM,)
@@ -214,7 +230,7 @@ class TestSnapshotPairDataset:
         assert T_stats.shape == (2,)
 
     def test_getitem_dtypes(self, dataset_subsampled):
-        spatial, cond_static, forcing_seq, Y, T_stats = dataset_subsampled[0]
+        spatial, cond_static, forcing_seq, Y, T_stats = _unpack(dataset_subsampled[0])
         assert spatial.dtype == torch.float32
         assert cond_static.dtype == torch.float32
         assert forcing_seq.dtype == torch.float32
@@ -222,13 +238,13 @@ class TestSnapshotPairDataset:
         assert T_stats.dtype == torch.float32
 
     def test_x_coord_normalized(self, dataset_subsampled):
-        spatial, _, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = _unpack(dataset_subsampled[0])
         x_channel = spatial[:, :, 1]
         assert x_channel.min() >= -1e-6
         assert x_channel.max() <= 1.0 + 1e-6
 
     def test_ynorm_channel_varies_along_y(self, dataset_subsampled):
-        spatial, _, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = _unpack(dataset_subsampled[0])
         y_channel = spatial[:, :, 2]
         assert torch.allclose(y_channel[0, :], y_channel[-1, :])
         assert torch.allclose(y_channel.std(dim=0), torch.zeros(y_channel.shape[1]), atol=1e-6)
@@ -236,13 +252,13 @@ class TestSnapshotPairDataset:
         assert torch.all(diffs > 0)
 
     def test_ynorm_channel_unit_range(self, dataset_subsampled):
-        spatial, _, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = _unpack(dataset_subsampled[0])
         y_channel = spatial[:, :, 2]
         assert y_channel[:, 0].abs().max().item() < 1e-6
         assert (y_channel[:, -1] - 1.0).abs().max().item() < 1e-6
 
     def test_sy_channel_matches_spatial_builder(self, dataset_subsampled):
-        spatial, _, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = _unpack(dataset_subsampled[0])
         sim_id, _, _ = dataset_subsampled._pairs[0]
         params = dataset_subsampled.sim_params[sim_id]
         expected_vec = SPATIAL_BUILDERS[params["spatial_family"]](
@@ -257,19 +273,19 @@ class TestSnapshotPairDataset:
         assert torch.allclose(spatial[:, :, 3], expected)
 
     def test_sy_channel_constant_along_x(self, dataset_subsampled):
-        spatial, _, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = _unpack(dataset_subsampled[0])
         sy_channel = spatial[:, :, 3]
         assert torch.allclose(sy_channel[0, :], sy_channel[-1, :])
         assert torch.allclose(sy_channel.std(dim=0), torch.zeros(sy_channel.shape[1]), atol=1e-6)
 
     def test_forcing_seq_r_endpoints(self, dataset_subsampled):
-        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
         # r_m = m / (M-1), so first is 0 and last is 1
         assert forcing_seq[0, 0].item() == pytest.approx(0.0, abs=1e-6)
         assert forcing_seq[-1, 0].item() == pytest.approx(1.0, abs=1e-6)
 
     def test_forcing_seq_dt_to_target_endpoints(self, dataset_subsampled):
-        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
         sim_id, s, j = dataset_subsampled._pairs[0]
         t_bar = float(dataset_subsampled.t_grid[j] - dataset_subsampled.t_grid[s])
         t_final = float(dataset_subsampled.t_final)
@@ -278,7 +294,7 @@ class TestSnapshotPairDataset:
         assert forcing_seq[-1, 3].item() == pytest.approx(0.0, abs=1e-6)
 
     def test_forcing_seq_t_m_endpoints(self, dataset_subsampled):
-        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
         sim_id, s, j = dataset_subsampled._pairs[0]
         t_s = float(dataset_subsampled.t_grid[s])
         t_j = float(dataset_subsampled.t_grid[j])
@@ -289,7 +305,7 @@ class TestSnapshotPairDataset:
 
     def test_forcing_seq_cumulative_matches_trapezoid(self, dataset_subsampled):
         """tok2 should be the signed trapezoidal cumulative of tok1 * A_AMP_REF, divided by A_cum_ref."""
-        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
         A_cum_ref = float(dataset_subsampled.A_cum_ref)
         sim_id, s, j = dataset_subsampled._pairs[0]
         t_s = float(dataset_subsampled.t_grid[s])
@@ -305,7 +321,7 @@ class TestSnapshotPairDataset:
         np.testing.assert_allclose(forcing_seq[:, 2].numpy(), expected_tok2, atol=1e-5)
 
     def test_forcing_seq_starts_at_zero_cumulative(self, dataset_subsampled):
-        _, _, forcing_seq, _, _ = dataset_subsampled[0]
+        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
         assert forcing_seq[0, 2].item() == pytest.approx(0.0, abs=1e-6)
 
     def test_forcing_seq_pulse_train_monotone(self, synthetic_trajectories):
@@ -331,24 +347,24 @@ class TestSnapshotPairDataset:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, t_final=t_final,
         )
-        _, _, forcing_seq, _, _ = ds[0]
+        _, _, forcing_seq, _, _ = _unpack(ds[0])
         diffs = np.diff(forcing_seq[:, 2].numpy())
         assert np.all(diffs >= -1e-6)
 
     def test_t_bar_positive(self, dataset_subsampled):
         for i in range(min(10, len(dataset_subsampled))):
-            _, cond_static, _, _, _ = dataset_subsampled[i]
+            _, cond_static, _, _, _ = _unpack(dataset_subsampled[i])
             t_bar_norm = cond_static[0].item()
             assert t_bar_norm > 0
 
     def test_cond_static_in_unit_range(self, dataset_subsampled):
         for i in range(min(10, len(dataset_subsampled))):
-            _, cond_static, _, _, _ = dataset_subsampled[i]
+            _, cond_static, _, _, _ = _unpack(dataset_subsampled[i])
             assert torch.all(cond_static >= -1e-6)
             assert torch.all(cond_static <= 1.0 + 1e-6)
 
     def test_temperature_normalization(self, dataset_subsampled):
-        spatial, _, _, _, _ = dataset_subsampled[0]
+        spatial, _, _, _, _ = _unpack(dataset_subsampled[0])
         T_norm = spatial[:, :, 0]
         assert torch.all(torch.isfinite(T_norm))
 
@@ -361,8 +377,8 @@ class TestSnapshotPairDataset:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
-        _, _, _, _, T_stats_0 = ds[0]
-        _, _, _, _, T_stats_1 = ds[1]
+        _, _, _, _, T_stats_0 = _unpack(ds[0])
+        _, _, _, _, T_stats_1 = _unpack(ds[1])
         assert torch.equal(T_stats_0, T_stats_1)
         assert T_stats_0[0].item() == pytest.approx(_SYNTH_MU)
         assert T_stats_0[1].item() == pytest.approx(_SYNTH_SIGMA)
@@ -489,7 +505,7 @@ class TestCreateDataloaders:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6,
         )
-        spatial, cond_static, forcing_seq, Y, T_stats = next(iter(train_loader))
+        spatial, cond_static, forcing_seq, Y, T_stats = _unpack(next(iter(train_loader)))
         assert spatial.shape[0] <= 4
         assert spatial.shape[1] == 11
         assert spatial.shape[2] == 11
@@ -511,7 +527,7 @@ class TestCreateDataloaders:
             n_snapshots=6,
             temporal_samples=32,
         )
-        _, _, forcing_seq, _, _ = next(iter(train_loader))
+        _, _, forcing_seq, _, _ = _unpack(next(iter(train_loader)))
         assert forcing_seq.shape[1] == 32
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
@@ -564,8 +580,8 @@ class TestCreateDataloaders:
             mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
             n_snapshots=6, noise_std=0.5,
         )
-        x1, _, _, _, _ = ds[0]
-        x2, _, _, _, _ = ds[0]
+        x1, _, _, _, _ = _unpack(ds[0])
+        x2, _, _, _, _ = _unpack(ds[0])
         assert not torch.equal(x1[:, :, 0], x2[:, :, 0])
         assert torch.equal(x1[:, :, 1], x2[:, :, 1])
         assert torch.equal(x1[:, :, 2], x2[:, :, 2])
@@ -651,7 +667,7 @@ class TestSolverDatasetIntegration:
         )
         assert len(ds) == num_sims * (5 * 4 // 2)
 
-        spatial, cond_static, forcing_seq, Y, T_stats = ds[0]
+        spatial, cond_static, forcing_seq, Y, T_stats = _unpack(ds[0])
         assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
         assert cond_static.shape == (COND_STATIC_DIM,)
         assert forcing_seq.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
@@ -711,7 +727,7 @@ class TestCondStaticLayout:
                                                     spatial_family, spatial_params):
         ds = self._make_dataset(spatial_family, spatial_params, "sin", self._DEFAULT_TEMPORAL,
                                 synthetic_trajectories)
-        spatial, _, _, _, _ = ds[0]
+        spatial, _, _, _, _ = _unpack(ds[0])
         expected_vec = SPATIAL_BUILDERS[spatial_family](ds.y_grid, **spatial_params)
         expected = torch.from_numpy(
             np.broadcast_to(
@@ -723,7 +739,7 @@ class TestCondStaticLayout:
 
     def test_uniform_onehot_and_zero_spatial_params(self, synthetic_trajectories):
         ds = self._make_dataset("uniform", {}, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
-        _, cond_static, _, _, _ = ds[0]
+        _, cond_static, _, _, _ = _unpack(ds[0])
         assert cond_static.shape == (COND_STATIC_DIM,)
         assert cond_static[_OFF_SPATIAL_OH + 0].item() == 1.0
         assert torch.all(cond_static[_OFF_SPATIAL_OH + 1:_OFF_SPATIAL_OH + 4] == 0.0)
@@ -732,7 +748,7 @@ class TestCondStaticLayout:
     def test_patch_onehot_and_only_yc_w_populated(self, synthetic_trajectories):
         ds = self._make_dataset("patch", {"y_c": 0.4, "w": 0.3}, "sin", self._DEFAULT_TEMPORAL,
                                 synthetic_trajectories)
-        _, cond_static, _, _, _ = ds[0]
+        _, cond_static, _, _, _ = _unpack(ds[0])
         assert cond_static[_OFF_SPATIAL_OH + 1].item() == 1.0
         assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.4)
         assert cond_static[_OFF_SPATIAL_P + 1].item() > 0.0
@@ -742,7 +758,7 @@ class TestCondStaticLayout:
     def test_gaussian_onehot_and_only_yc_sigma_populated(self, synthetic_trajectories):
         ds = self._make_dataset("gaussian", {"y_c": 0.6, "sigma_y": 0.1}, "sin", self._DEFAULT_TEMPORAL,
                                 synthetic_trajectories)
-        _, cond_static, _, _, _ = ds[0]
+        _, cond_static, _, _, _ = _unpack(ds[0])
         assert cond_static[_OFF_SPATIAL_OH + 2].item() == 1.0
         assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.6)
         assert cond_static[_OFF_SPATIAL_P + 1].item() == 0.0
@@ -752,7 +768,7 @@ class TestCondStaticLayout:
     def test_triangle_onehot_and_only_yc_ell_populated(self, synthetic_trajectories):
         ds = self._make_dataset("triangle", {"y_c": 0.5, "ell": 0.2}, "sin", self._DEFAULT_TEMPORAL,
                                 synthetic_trajectories)
-        _, cond_static, _, _, _ = ds[0]
+        _, cond_static, _, _, _ = _unpack(ds[0])
         assert cond_static[_OFF_SPATIAL_OH + 3].item() == 1.0
         assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.5)
         assert cond_static[_OFF_SPATIAL_P + 1].item() == 0.0
@@ -764,7 +780,7 @@ class TestCondStaticLayout:
                        ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
                        ("triangle", {"y_c": 0.5, "ell": 0.1})]:
             ds = self._make_dataset(sf, sp, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
-            _, cond_static, _, _, _ = ds[0]
+            _, cond_static, _, _, _ = _unpack(ds[0])
             assert cond_static[_OFF_SPATIAL_OH:_OFF_SPATIAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
 
     @pytest.mark.parametrize(
@@ -780,7 +796,7 @@ class TestCondStaticLayout:
                                             temporal_family, temporal_params, expected_slot):
         ds = self._make_dataset("uniform", {}, temporal_family, temporal_params,
                                 synthetic_trajectories)
-        _, cond_static, _, _, _ = ds[0]
+        _, cond_static, _, _, _ = _unpack(ds[0])
         assert cond_static.shape == (COND_STATIC_DIM,)
         for slot in range(4):
             expected = 1.0 if slot == expected_slot else 0.0
@@ -794,7 +810,7 @@ class TestCondStaticLayout:
             ("exp_train", dict(A_list=[150.0], t_list=[0.0], tau_list=[0.05])),
         ]:
             ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
-            _, cond_static, _, _, _ = ds[0]
+            _, cond_static, _, _, _ = _unpack(ds[0])
             assert cond_static[_OFF_TEMPORAL_OH:_OFF_TEMPORAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
 
     def test_forcing_summary_slot_populated_and_finite(self, synthetic_trajectories):
@@ -807,7 +823,7 @@ class TestCondStaticLayout:
             ("exp_train", dict(A_list=[150.0], t_list=[0.0], tau_list=[0.05])),
         ]:
             ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
-            _, cond_static, _, _, _ = ds[0]
+            _, cond_static, _, _, _ = _unpack(ds[0])
             block = cond_static[_OFF_FORCING_SUMMARY:_OFF_FORCING_SUMMARY + 8]
             assert block.shape == (8,)
             assert torch.all(torch.isfinite(block))
@@ -884,3 +900,41 @@ class TestBuildForcingSummary:
         a_vals = np.array([10.0, 10.0], dtype=np.float64)
         s = build_forcing_summary(a_vals, t_vals, t_s=0.3, t_j=0.3, t_final=1.0)
         assert np.all(np.isfinite(s))
+
+
+# ===================== collate_fn =====================
+
+
+class TestCollateFn:
+    """The dict collate stacks present keys and tolerates benchmarks that omit
+    optional keys (e.g. source has no `forcing_seq`)."""
+
+    def test_stacks_all_keys_with_forcing_seq(self, synthetic_trajectories,
+                                              synthetic_sim_params):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        ds = SnapshotPairDataset(
+            trajectories=trajectories, t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
+            sim_ids=np.arange(5), sim_params=synthetic_sim_params,
+            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
+            n_snapshots=6,
+        )
+        batch = [ds[i] for i in range(4)]
+        out = collate_fn(batch)
+        assert set(out.keys()) == {
+            "spatial", "cond_static", "forcing_seq", "Y", "T_stats",
+        }
+        assert out["spatial"].shape[0] == 4
+        assert out["forcing_seq"].shape[0] == 4
+        assert out["T_stats"].shape == (4, 2)
+
+    def test_omitted_optional_key_not_required(self):
+        batch = [
+            {"spatial": torch.zeros(3, 3, 6), "cond_static": torch.zeros(4),
+             "Y": torch.zeros(3, 3, 1), "T_stats": torch.zeros(3)},
+            {"spatial": torch.ones(3, 3, 6), "cond_static": torch.ones(4),
+             "Y": torch.ones(3, 3, 1), "T_stats": torch.ones(3)},
+        ]
+        out = collate_fn(batch)
+        assert "forcing_seq" not in out
+        assert out["spatial"].shape == (2, 3, 3, 6)
+        assert out["T_stats"].shape == (2, 3)
