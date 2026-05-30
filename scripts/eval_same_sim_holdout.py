@@ -84,6 +84,7 @@ def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int)
         compute_global_stats,
         load_sim_data,
         load_solver_dt,
+        problem_from_config,
         split_pairs_within_sims,
         split_sim_ids,
     )
@@ -111,6 +112,7 @@ def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int)
         n_snapshots=config["training"].get("n_snapshots", 15),
         noise_std=config["training"].get("noise_std", 0.0),
         dt=solver_dt,
+        problem=problem_from_config(config),
     )
     train_pairs, val_pairs = split_pairs_within_sims(train_dataset, val_pair_frac=val_pair_frac, seed=split_seed)
 

@@ -17,6 +17,11 @@ export PROJECT_ROOT="$PROJECT_DIR"
 DATA_OUT_DIR="${DATA_OUT_DIR:-$PROJECT_DIR/data}"
 NUM_SIMS="${NUM_SIMS:-8000}"
 
+# Active benchmark adapter (forcing|interfaces|source). Selects sampling +
+# physics + item representation. generate_dataset.py reads $BENCHMARK as the
+# default for --benchmark, so exporting it here is sufficient.
+export BENCHMARK="${BENCHMARK:-forcing}"
+
 if [[ $# -gt 0 && "$1" != -* ]]; then
     DATA_OUT_DIR="$1"
     shift
@@ -40,6 +45,7 @@ echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
 echo "DATA_OUT_DIR=$DATA_OUT_DIR"
 echo "NUM_SIMS=$NUM_SIMS"
+echo "BENCHMARK=$BENCHMARK"
 echo "Extra generator args: $*"
 
 # ──── Run ────
@@ -48,6 +54,7 @@ mkdir -p "$DATA_OUT_DIR"
 python "$PROJECT_DIR/data/generate_dataset.py" \
     --num-sims "$NUM_SIMS" \
     --save-dir "$DATA_OUT_DIR" \
+    --benchmark "$BENCHMARK" \
     "$@"
 
 echo "Job $SLURM_JOB_ID finished at $(date)"

@@ -24,6 +24,12 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/repos/itr-neuraloperator}"
 export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"
 export PROJECT_ROOT="$PROJECT_DIR"
 
+# Active benchmark adapter (forcing|interfaces|source). load_config reads
+# $BENCHMARK to pick conf/benchmark/<name>.yaml, which sets BOTH the model dims
+# and the dataset adapter. Must match the benchmark used to generate $DATA_DIR.
+# torchrun propagates this env var to every rank.
+export BENCHMARK="${BENCHMARK:-forcing}"
+
 # Use node-local scratch for run outputs, then copy results back to $HOME/fno_runs.
 LOCAL_RUNS="/tmp/fno_runs_${SLURM_JOB_ID}"
 export RUNS_ROOT="$LOCAL_RUNS"
@@ -57,6 +63,7 @@ echo "PROJECT_ROOT=$PROJECT_ROOT"
 echo "DATA_DIR=$DATA_DIR"
 echo "RUNS_ROOT=$RUNS_ROOT"
 echo "NPROC_PER_NODE=$NPROC_PER_NODE"
+echo "BENCHMARK=$BENCHMARK"
 nvidia-smi
 
 # ──── Run ────

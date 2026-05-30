@@ -17,6 +17,11 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/repos/itr-neuraloperator}"
 export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"
 export PROJECT_ROOT="$PROJECT_DIR"
 
+# Same-sim holdout re-runs training via load_config, so it needs $BENCHMARK to
+# select the representation (same rule as the training scripts). Must match the
+# benchmark used to generate $DATA_DIR.
+export BENCHMARK="${BENCHMARK:-forcing}"
+
 LOCAL_RUNS="/tmp/fno_runs_${SLURM_JOB_ID}"
 export RUNS_ROOT="$LOCAL_RUNS"
 PERSISTENT_RUNS="$HOME/fno_runs"
@@ -36,6 +41,7 @@ echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
 echo "DATA_DIR=$DATA_DIR"
 echo "RUNS_ROOT=$RUNS_ROOT"
+echo "BENCHMARK=$BENCHMARK"
 echo "SAME_SIM_SEED=${SAME_SIM_SEED:-<first configured training seed>}"
 echo "SAME_SIM_VAL_PAIR_FRAC=$SAME_SIM_VAL_PAIR_FRAC"
 echo "SAME_SIM_SPLIT_SEED=$SAME_SIM_SPLIT_SEED"
