@@ -1,0 +1,27 @@
+# @package _global_
+# Forcing benchmark: separable boundary flux q_L(y, t) = a(t) * s(y).
+# 20 spatial channels, 23 static cond dims, (64, 5) forcing_seq, temporal
+# encoder on, interface fixed at x = 0.5. This file owns the representational
+# dims so `benchmark=forcing` is the single source of truth for them.
+
+benchmark:
+  name: forcing
+
+model:
+  parameters:
+    in_channels: 20
+    cond_static_dim: 23
+    temporal_token_dim: 5
+    use_temporal_encoder: true
+
+data:
+  x_shape: "B, Nx, Ny, 20"
+  cond_static_shape: "B, 23"
+  forcing_seq_shape: "B, 64, 5"
+  t_stats_shape: "B, 2"
+
+training:
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.05
+    interface_weight: 10.0

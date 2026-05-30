@@ -1,0 +1,27 @@
+# @package _global_
+# Source benchmark: internal volumetric chip-heating patch, interface fixed at
+# x = 0.5. 20 spatial channels [T_tilde, x, y, S_h, Q_0..15], 8 static cond
+# dims, NO forcing_seq, temporal encoder off, 3-dim T_stats (slot 2 = fixed
+# interface_x). This file owns the representational dims so `benchmark=source`
+# is the single source of truth for them.
+
+benchmark:
+  name: source
+
+model:
+  parameters:
+    in_channels: 20
+    cond_static_dim: 8
+    temporal_token_dim: 5
+    use_temporal_encoder: false
+
+data:
+  x_shape: "B, Nx, Ny, 20"
+  cond_static_shape: "B, 8"
+  t_stats_shape: "B, 3"
+
+training:
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.03
+    interface_weight: 15.0
