@@ -1,0 +1,109 @@
+import numpy as np
+from typing import Callable
+
+"""Internal volumetric heat-generation patch source.
+
+Used by the variable-location chip-heating experiment. A single rectangular
+patch centered at (x_h, y_h) of size (w, h) is heated by a smooth sin^2 pulse
+between t=0 and t=t_off:
+
+    Q(x, y, t) = a(t) * S_h(x, y)
+    a(t)       = A * sin^2(pi * t / t_off)   for 0 <= t <= t_off, else 0
+    S_h(x, y)  = indicator of the rectangular patch.
+
+PATCH_A_RANGE is the (A_MIN, A_MAX) tuple consumed by downstream LHS sampling
+and normalization, so there is a single source of truth. The range is chosen
+so that peak temperature rises land inside the 5-150 K window used by
+`scripts/calibrate_patch_amplitude.py`: a 4-point sweep at (A=300, A=3000)
+across both interface regimes gave ~1 K and ~10 K peak rises, so linear
+extrapolation places A_min at ~1500 (5 K floor) and A_max at ~15000
+(~50 K rise, well below the 150 K ceiling).
+"""
+
+PATCH_W = 0.1
+PATCH_H = 0.1
+PATCH_X_RANGE = (0.05, 0.95)
+PATCH_Y_RANGE = (0.05, 0.95)
+PATCH_A_RANGE: tuple[float, float] = (1500.0, 15000.0)
+
+
+def make_patch_indicator(
+    X: np.ndarray,
+    Y: np.ndarray,
+    x_h: float,
+    y_h: float,
+    w: float,
+    h: float,
+) -> np.ndarray:
+    """Return a float32 (Nx, Ny) indicator of the rectangular patch.
+
+    Boundary convention is `<=` on both sides, matching the patch builder in
+    `boundary_forcing.spatial_patch`. Cells with centers on the edge of the
+    patch are included.
+    """
+    half_w = 0.5 * w
+    half_h = 0.5 * h
+    mask = (
+        (X >= x_h - half_w) & (X <= x_h + half_w)
+        & (Y >= y_h - half_h) & (Y <= y_h + half_h)
+    )
+    return mask.astype(np.float32)
+
+
+def make_sin2_pulse(A: float, t_off: float) -> Callable[[float], float]:
+    """Return a(t) = A * sin^2(pi * t / t_off), clamped to zero outside [0, t_off]."""
+    if t_off <= 0:
+        raise ValueError(f"t_off must be positive, got {t_off}.")
+
+    def a(t: float) -> float:
+        if t < 0.0 or t > t_off:
+            return 0.0
+        return float(A) * np.sin(np.pi * t / t_off) ** 2
+
+    return a
+
+
+def integrate_sin2_pulse(A: float, t_off: float, t0: float, t1: float) -> float:
+    """Exact integral of a(t) = A * sin^2(pi t / t_off) over [t0, t1].
+
+    Uses the closed form
+        int sin^2(c t) dt = t/2 - sin(2 c t) / (4 c).
+    Integration is clipped to [0, t_off] so the value outside the pulse
+    window contributes nothing.
+    """
+    a = max(t0, 0.0)
+    b = min(t1, t_off)
+    if b <= a:
+        return 0.0
+    c = np.pi / t_off
+    primitive = lambda u: 0.5 * u - np.sin(2.0 * c * u) / (4.0 * c)
+    return float(A) * (primitive(b) - primitive(a))
+
+
+def build_patch_source(
+    X: np.ndarray,
+    Y: np.ndarray,
+    x_h: float,
+    y_h: float,
+    w: float,
+    h: float,
+    A: float,
+    t_off: float,
+) -> Callable[[np.ndarray, np.ndarray, float], np.ndarray]:
+    """Construct the solver-facing source(X, Y, t) = a(t) * S_h(X, Y).
+
+    The returned callable matches FVSolver2D's expected source signature.
+    The indicator is pre-built against the full (X, Y) grid; the solver passes
+    sub-arrays (active y-rows) so we re-evaluate the indicator on the supplied
+    coords rather than slicing a buffered mask.
+    """
+    pulse = make_sin2_pulse(A, t_off)
+
+    def source(Xq: np.ndarray, Yq: np.ndarray, t: float) -> np.ndarray:
+        amp = pulse(t)
+        if amp == 0.0:
+            return np.zeros_like(Xq, dtype=np.float64)
+        mask = make_patch_indicator(Xq, Yq, x_h, y_h, w, h)
+        return amp * mask.astype(np.float64)
+
+    return source
