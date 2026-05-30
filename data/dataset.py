@@ -18,6 +18,15 @@ from src.physics.boundary_forcing import (
     FORCING_BINS,
     SIN_AMP_RANGE,
 )
+from problems.base import ProblemSpec
+from problems.registry import get_problem
+
+
+def problem_from_config(config: dict) -> ProblemSpec:
+    """Resolve the active ProblemSpec from a loaded config's benchmark section."""
+    name = str((config.get("benchmark") or {}).get("name", "forcing"))
+    return get_problem(name)
+
 
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
@@ -264,7 +273,9 @@ class SnapshotPairDataset(Dataset):
         dt: float | None = None,
         t_final: float | None = None,
         temporal_samples: int = TEMPORAL_SAMPLES,
+        problem: ProblemSpec | None = None,
     ):
+        self.problem = problem if problem is not None else get_problem("forcing")
         self.trajectories = trajectories  # (num_sims, Nt, Nx, Ny)
         self.sim_params = sim_params
         self.t_grid = t_grid.astype(np.float32)
@@ -284,14 +295,10 @@ class SnapshotPairDataset(Dataset):
         self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
         self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
 
-        # Temporal forcing branch state. The callables are lazy because some
-        # of them (e.g. windowed_sin_flux closures) are not picklable, which
-        # breaks across spawn-style / multi-worker DataLoaders.
+        # Number of a(t) samples the temporal branch consumes. Benchmark-
+        # specific caches (lazy callables, spatial profiles, normalization
+        # references) are populated by `self.problem.setup_dataset(self)` below.
         self.temporal_samples = int(temporal_samples)
-        self.A_cum_ref = float(A_AMP_REF * self.t_final)
-        self.q_ref = np.float32(SIN_AMP_RANGE[1] * self.t_final / FORCING_BINS)
-        self._r = np.linspace(0.0, 1.0, self.temporal_samples, dtype=np.float32)
-        self._q_callables: dict[int, Callable] = {}
 
         # Normalized spatial coordinates (fixed for all samples)
         self.x_norm = (
@@ -305,7 +312,8 @@ class SnapshotPairDataset(Dataset):
         # Broadcast to (Nx, Ny) so they can be stacked with T_source at sample time
         self.X_norm = np.broadcast_to(self.x_norm[:, None], (self.Nx, self.Ny)).astype(np.float32)
         self.Y_norm = np.broadcast_to(self.y_norm[None, :], (self.Nx, self.Ny)).astype(np.float32)
-        self.s_y_profiles = self._build_spatial_profiles()
+
+        self.problem.setup_dataset(self)
 
         # Determine which time indices to use
         if n_snapshots is not None and n_snapshots < self.Nt:
@@ -333,16 +341,6 @@ class SnapshotPairDataset(Dataset):
         self._pairs = [(p[0], p[1], p[2]) for p in pairs]
         self._lead_times = np.array([p[3] for p in pairs], dtype=np.float32)
 
-    def _build_spatial_profiles(self) -> dict[int, np.ndarray]:
-        profiles = {}
-        for sim_id in self.sim_ids:
-            params = self.sim_params[int(sim_id)]
-            s_vec = SPATIAL_BUILDERS[params["spatial_family"]](
-                self.y_grid, **params["spatial_params"]
-            )
-            profiles[int(sim_id)] = np.asarray(s_vec, dtype=np.float32)
-        return profiles
-
     def set_curriculum_fraction(self, frac: float):
         """Expose only pairs with lead time <= frac * max_lead_time.
         frac=1.0 means all pairs (no curriculum restriction)."""
@@ -358,87 +356,20 @@ class SnapshotPairDataset(Dataset):
 
     def __getitem__(self, idx):
         sim_id, s, j = self._pairs[idx]
-        sid = int(sim_id)
+        item = self.problem.build_item(self, int(sim_id), int(s), int(j))
+        return {k: torch.from_numpy(v) for k, v in item.items()}
 
-        params = self.sim_params[sid]
-        R_c = float(params["R_c"])
-        spatial_family = params["spatial_family"]
-        spatial_params = params["spatial_params"]
 
-        T_source = self.trajectories[sid, s, :, :]  # (Nx, Ny)
-        T_target = self.trajectories[sid, j, :, :]  # (Nx, Ny)
+def collate_fn(batch: list[dict]) -> dict:
+    """Stack a list of per-item dicts into a batched dict.
 
-        T_source_norm = (T_source - self.mu_global) / (self.sigma_global + T_EPS)
-        T_target_norm = (T_target - self.mu_global) / (self.sigma_global + T_EPS)
-
-        if self.noise_std > 0:
-            T_source_norm = T_source_norm + np.random.randn(*T_source_norm.shape).astype(np.float32) * self.noise_std
-
-        t_s_val = float(self.t_grid[s])
-        t_j_val = float(self.t_grid[j])
-        t_bar = t_j_val - t_s_val
-        t_bar_norm = t_bar / self.t_final
-        t_s_norm = t_s_val / self.t_final
-
-        # Spatial: 4 base channels + 16 temporal forcing integral bins.
-        # Bins are the signed integral of a(t) over equal subintervals of [t_s, t_j]
-        # (matches the solver's signed left-flux semantics), weighted by s_y(y) and
-        # normalized by q_ref. Layout:
-        #   [T̃_source, x_norm, y_norm, s_y, Q_y_bin_0, ..., Q_y_bin_15].
-        s_y = self.s_y_profiles[sid]
-        S_y = np.broadcast_to(s_y[None, :], (self.Nx, self.Ny))
-        bins = integrate_temporal_bins_signed(
-            params["temporal_family"],
-            params["temporal_params"],
-            t_s_val,
-            t_j_val,
-            K=FORCING_BINS,
-        ).astype(np.float32)
-        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / self.q_ref).astype(np.float32)
-        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (self.Nx, self.Ny, FORCING_BINS))
-        spatial_base = np.stack([T_source_norm, self.X_norm, self.Y_norm, S_y], axis=-1).astype(np.float32)
-        spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
-
-        # Lazy worker-local cache of a(t) callables.
-        if sid not in self._q_callables:
-            self._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
-                **params["temporal_params"]
-            )
-        q = self._q_callables[sid]
-
-        # Single a(t) sampling shared by forcing_seq and forcing_summary so the
-        # two conditioning pathways cannot drift apart.
-        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, self.temporal_samples)
-        forcing_seq = _forcing_seq_from_samples(
-            t_samples, a_m, t_s_val, t_j_val, self.t_final, A_AMP_REF, self.A_cum_ref,
-        )
-        forcing_summary = build_forcing_summary(
-            a_m, t_samples, t_s_val, t_j_val, self.t_final, A_AMP_REF,
-        )
-
-        cond_static = build_cond_vector(
-            t_bar_norm=t_bar_norm,
-            t_s_norm=t_s_norm,
-            R_c=R_c,
-            spatial_family=spatial_family,
-            spatial_params=spatial_params,
-            temporal_family=params["temporal_family"],
-            forcing_summary=forcing_summary,
-        )
-
-        # Target: (Nx, Ny, 1)
-        Y = T_target_norm[:, :, None].astype(np.float32)
-
-        # Stats for denormalization at eval time: (2,) — global, constant across samples
-        T_stats = np.array([self.mu_global, self.sigma_global], dtype=np.float32)
-
-        return (
-            torch.from_numpy(spatial),
-            torch.from_numpy(cond_static),
-            torch.from_numpy(forcing_seq),
-            torch.from_numpy(Y),
-            torch.from_numpy(T_stats),
-        )
+    Each benchmark's items share the same keys (optional `forcing_seq` is
+    present for every item of a benchmark that declares `has_forcing_seq`, and
+    absent for every item otherwise), so stacking the first item's keys is
+    sufficient.
+    """
+    keys = batch[0].keys()
+    return {k: torch.stack([item[k] for item in batch]) for k in keys}
 
 
 def _dataset_with_pairs(dataset: SnapshotPairDataset, pairs: list[tuple[int, int, int]]) -> SnapshotPairDataset:
@@ -449,8 +380,10 @@ def _dataset_with_pairs(dataset: SnapshotPairDataset, pairs: list[tuple[int, int
         dtype=np.float32,
     )
     out._active_len = len(out._pairs)
-    # Fresh worker-local cache on the copy so train/val don't share a mutable dict.
-    out._q_callables = {}
+    # Fresh worker-local cache on the copy so train/val don't share a mutable dict
+    # (only benchmarks with a lazy a(t) callable cache populate this).
+    if hasattr(out, "_q_callables"):
+        out._q_callables = {}
     return out
 
 
@@ -592,6 +525,7 @@ def create_dataloaders(
     world_size: int = 1,
     rank: int = 0,
     sampler_seed: int = 0,
+    problem: ProblemSpec | None = None,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader]:
     """Build train/val/test loaders.
 
@@ -615,6 +549,9 @@ def create_dataloaders(
 
     n_test = n_snapshots_test if n_snapshots_test is not None else n_snapshots
 
+    if problem is None:
+        problem = get_problem("forcing")
+
     train_dataset = SnapshotPairDataset(
         trajectories=trajectories,
         x_grid=x_grid,
@@ -629,6 +566,7 @@ def create_dataloaders(
         dt=dt,
         t_final=t_final,
         temporal_samples=temporal_samples,
+        problem=problem,
     )
 
     val_dataset = SnapshotPairDataset(
@@ -644,6 +582,7 @@ def create_dataloaders(
         dt=dt,
         t_final=t_final,
         temporal_samples=temporal_samples,
+        problem=problem,
     )
 
     test_dataset = SnapshotPairDataset(
@@ -659,6 +598,7 @@ def create_dataloaders(
         dt=dt,
         t_final=t_final,
         temporal_samples=temporal_samples,
+        problem=problem,
     )
 
     pin = torch.cuda.is_available()
@@ -684,6 +624,7 @@ def create_dataloaders(
             pin_memory=pin,
             num_workers=workers,
             persistent_workers=persistent,
+            collate_fn=collate_fn,
         )
 
         if rank == 0:
@@ -694,6 +635,7 @@ def create_dataloaders(
                 pin_memory=pin,
                 num_workers=workers,
                 persistent_workers=persistent,
+                collate_fn=collate_fn,
             )
         else:
             val_loader = None
@@ -705,6 +647,7 @@ def create_dataloaders(
             pin_memory=pin,
             num_workers=workers,
             persistent_workers=persistent,
+            collate_fn=collate_fn,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -713,6 +656,7 @@ def create_dataloaders(
             pin_memory=pin,
             num_workers=workers,
             persistent_workers=persistent,
+            collate_fn=collate_fn,
         )
 
     test_loader = DataLoader(
@@ -722,6 +666,7 @@ def create_dataloaders(
         pin_memory=pin,
         num_workers=workers,
         persistent_workers=persistent,
+        collate_fn=collate_fn,
     )
 
     return train_loader, val_loader, test_loader
@@ -751,9 +696,9 @@ if __name__ == '__main__':
     )
 
     # Verify shapes
-    x_spatial, cond_static, forcing_seq, yb, t_stats = next(iter(train_loader))
-    print(f"spatial: {x_spatial.shape}")        # (B, Nx, Ny, 20)
-    print(f"cond_static: {cond_static.shape}")  # (B, 23)
-    print(f"forcing_seq: {forcing_seq.shape}")  # (B, M, 5)
-    print(f"Y: {yb.shape}")                     # (B, Nx, Ny, 1)
-    print(f"T_stats: {t_stats.shape}")          # (B, 2)
+    batch = next(iter(train_loader))
+    print(f"spatial: {batch['spatial'].shape}")          # (B, Nx, Ny, 20)
+    print(f"cond_static: {batch['cond_static'].shape}")  # (B, 23)
+    print(f"forcing_seq: {batch['forcing_seq'].shape}")  # (B, M, 5)
+    print(f"Y: {batch['Y'].shape}")                      # (B, Nx, Ny, 1)
+    print(f"T_stats: {batch['T_stats'].shape}")          # (B, 2)
