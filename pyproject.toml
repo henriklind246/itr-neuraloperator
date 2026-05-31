@@ -15,7 +15,7 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*", "data*"]
+include = ["src*", "data*", "problems*"]
 
 [tool.pytest.ini_options]
 markers = [
