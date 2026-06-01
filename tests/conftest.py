@@ -94,6 +94,51 @@ def synthetic_sim_params(synthetic_trajectories):
 
 
 @pytest.fixture
+def synthetic_source_sim_params(synthetic_trajectories):
+    """Synthetic sim_params matching the source benchmark schema (20 sims).
+
+    Mirrors problems/source.py: rectangular patch params, fixed interface at
+    x = 0.5, no temporal/spatial forcing keys, plus a T0 IC field for plotting.
+    """
+    from problems.source import INTERFACE_X, _classify_regime
+    from src.physics.internal_source import (
+        PATCH_A_RANGE,
+        PATCH_H,
+        PATCH_W,
+        PATCH_X_RANGE,
+        PATCH_Y_RANGE,
+    )
+
+    trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+    num_sims = trajectories.shape[0]
+    Nx = x_grid.shape[0]
+    Ny = y_grid.shape[0]
+    t_final = float(t_grid[-1])
+    t_off = 0.75 * t_final
+    A_min, A_max = PATCH_A_RANGE
+    rng = np.random.default_rng(7)
+    params = []
+    for _ in range(num_sims):
+        x_h = float(rng.uniform(*PATCH_X_RANGE))
+        y_h = float(rng.uniform(*PATCH_Y_RANGE))
+        A = float(np.exp(rng.uniform(np.log(A_min), np.log(A_max))))
+        params.append({
+            "R_c": float(rng.uniform(0.05, 1.0)),
+            "interface_x": INTERFACE_X,
+            "x_h": x_h,
+            "y_h": y_h,
+            "w_h": PATCH_W,
+            "h_h": PATCH_H,
+            "A": A,
+            "t_off": t_off,
+            "regime": _classify_regime(x_h, INTERFACE_X, PATCH_W),
+            "T0": rng.standard_normal((Nx, Ny)).astype(np.float32),
+            "ic_family": "uniform_2d",
+        })
+    return np.array(params, dtype=object)
+
+
+@pytest.fixture
 def tmp_npy_data(tmp_path, synthetic_trajectories):
     """Save synthetic data as .npy files and return paths."""
     trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
@@ -159,6 +204,53 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
                         "spectral_dropout": 0.0,
                     }
                 }
+            },
+            "mu_global": 0.0,
+            "sigma_global": 1.0,
+        },
+        ckpt_path,
+    )
+    return ckpt_path
+
+
+@pytest.fixture
+def small_source_fno2d():
+    """Tiny source-benchmark FNO2d (temporal encoder off, 8 static dims)."""
+    return FNO2d(
+        modes1=2,
+        modes2=2,
+        width=8,
+        in_channels=SPATIAL_IN_CHANNELS,
+        out_channels=1,
+        n_layers=2,
+        cond_static_dim=8,
+        use_temporal_encoder=False,
+    )
+
+
+@pytest.fixture
+def small_source_fno2d_checkpoint(tmp_path, small_source_fno2d):
+    """Save a minimal source-benchmark checkpoint for plot-loader smoke tests."""
+    ckpt_path = tmp_path / "small_source_fno2d.pt"
+    torch.save(
+        {
+            "model_state": small_source_fno2d.state_dict(),
+            "conf": {
+                "benchmark": {"name": "source"},
+                "model": {
+                    "parameters": {
+                        "modes1": 2,
+                        "modes2": 2,
+                        "width": 8,
+                        "in_channels": SPATIAL_IN_CHANNELS,
+                        "out_channels": 1,
+                        "n_layers": 2,
+                        "cond_static_dim": 8,
+                        "use_temporal_encoder": False,
+                        "dropout": 0.0,
+                        "spectral_dropout": 0.0,
+                    }
+                },
             },
             "mu_global": 0.0,
             "sigma_global": 1.0,

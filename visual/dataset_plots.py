@@ -10,6 +10,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Rectangle
 
 from data.dataset import (
     A_AMP_REF,
@@ -23,6 +24,7 @@ from data.dataset import (
     build_forcing_summary,
     compute_global_stats,
     load_sim_data,
+    problem_from_config,
     split_sim_ids,
     _sample_a,
 )
@@ -31,8 +33,26 @@ from src.physics.boundary_forcing import (
     TEMPORAL_BUILDERS,
     FORCING_BINS,
     SIN_AMP_RANGE,
+    SIN_FREQ_RANGE,
+    build_qL,
     integrate_temporal_bins,
 )
+from problems.source import (
+    INTERFACE_X,
+    SOURCE_BINS,
+    SPATIAL_IN_CHANNELS as SOURCE_SPATIAL_IN_CHANNELS,
+)
+from problems.interfaces import INTERFACE_X_RANGE
+from src.physics.internal_source import (
+    PATCH_A_RANGE,
+    PATCH_H,
+    PATCH_W,
+    build_patch_source,
+    integrate_sin2_pulse,
+    make_patch_indicator,
+    make_sin2_pulse,
+)
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 
 def _sin_amp_freq(params: dict) -> tuple[float, float]:
@@ -41,6 +61,37 @@ def _sin_amp_freq(params: dict) -> tuple[float, float]:
         tp = params["temporal_params"]
         return float(tp["A"]), float(tp["f"])
     return float("nan"), float("nan")
+
+
+def _safe_param_float(params: dict, key: str) -> float:
+    """Read a top-level scalar sim param as float; NaN if missing/non-numeric.
+
+    Lets benchmark-agnostic record builders collect keys that exist only for
+    some benchmarks (e.g. source ``A``/``x_h`` vs forcing ``temporal_params``).
+    """
+    try:
+        return float(params.get(key))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _model_predict_item(model, item):
+    """Run a single dataset item through the model, honoring its forcing branch.
+
+    Adds a batch dim, forwards ``forcing_seq`` only when the model uses its
+    temporal encoder and the item carries one (source items have no forcing).
+    """
+    import torch
+
+    spatial = item["spatial"].unsqueeze(0)
+    cond = item["cond_static"].unsqueeze(0)
+    fseq = item.get("forcing_seq")
+    if fseq is not None:
+        fseq = fseq.unsqueeze(0)
+    with torch.no_grad():
+        if getattr(model, "use_temporal_encoder", True) and fseq is not None:
+            return model(spatial, cond, fseq)
+        return model(spatial, cond)
 
 
 def _forcing_label(params: dict) -> str:
@@ -69,6 +120,7 @@ from src.physics.init_conditions import (
 from visual._common import (
     PLOT_STYLE,
     _add_interface_lines,
+    _evaluate_q_left_field,
     _resolve_interface_metadata,
     _save_figure,
 )
@@ -381,6 +433,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
+        use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
     )
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -416,6 +469,7 @@ def _build_split_datasets(
     n_snapshots_test = training_cfg.get("n_snapshots_test", None)
     test_snapshots = n_snapshots_test if n_snapshots_test is not None else n_snapshots
     mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+    problem = problem_from_config(config)
     return {
         "train": SnapshotPairDataset(
             trajectories=trajectories,
@@ -428,6 +482,7 @@ def _build_split_datasets(
             sigma_global=sigma_global,
             n_snapshots=n_snapshots,
             dt=dt,
+            problem=problem,
         ),
         "val": SnapshotPairDataset(
             trajectories=trajectories,
@@ -440,6 +495,7 @@ def _build_split_datasets(
             sigma_global=sigma_global,
             n_snapshots=n_snapshots,
             dt=dt,
+            problem=problem,
         ),
         "test": SnapshotPairDataset(
             trajectories=trajectories,
@@ -452,6 +508,7 @@ def _build_split_datasets(
             sigma_global=sigma_global,
             n_snapshots=test_snapshots,
             dt=dt,
+            problem=problem,
         ),
     }
 
@@ -472,7 +529,11 @@ def _prepare_prediction_case(
     """Prepare truth/prediction arrays for one source snapshot and multiple target times."""
     import torch
 
-    interface_meta = _resolve_interface_metadata(config=_resolve_plot_config(config))
+    config = _resolve_plot_config(config)
+    problem = problem_from_config(config)
+    interface_meta = _resolve_interface_metadata(
+        config=config, sim_params=sim_params, sim_id=sim_id,
+    )
     t_targets = t_grid[target_indices]
 
     # Use global normalization stats from model (attached during checkpoint loading)
@@ -483,6 +544,80 @@ def _prepare_prediction_case(
         from data.dataset import split_sim_ids as _split
         train_ids, _, _ = _split(trajectories.shape[0], 0.7, 0.15, seed=0)
         mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+
+    if problem.name != "forcing":
+        plot_dataset = SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            sim_ids=np.array([sim_id], dtype=np.int64),
+            sim_params=sim_params,
+            mu_global=float(mu_global),
+            sigma_global=float(sigma_global),
+            n_snapshots=None,
+            noise_std=0.0,
+            dt=dt,
+            temporal_samples=config.get("model", {}).get("parameters", {}).get(
+                "temporal_samples", TEMPORAL_SAMPLES,
+            ),
+            problem=problem,
+        )
+        items = [
+            problem.build_item(plot_dataset, int(sim_id), int(s), int(target_idx))
+            for target_idx in target_indices
+        ]
+        spatial = torch.from_numpy(np.stack([item["spatial"] for item in items], axis=0))
+        cond_static = torch.from_numpy(np.stack([item["cond_static"] for item in items], axis=0))
+        forcing_seq = None
+        if all("forcing_seq" in item for item in items):
+            forcing_seq = torch.from_numpy(np.stack([item["forcing_seq"] for item in items], axis=0))
+
+        device = next(model.parameters()).device
+        use_temporal = bool(getattr(model, "use_temporal_encoder", True))
+        with torch.no_grad():
+            if use_temporal and forcing_seq is not None:
+                Y_pred_norm = model(
+                    spatial.to(device),
+                    cond_static.to(device),
+                    forcing_seq.to(device),
+                ).cpu().numpy()[..., 0]
+            else:
+                Y_pred_norm = model(
+                    spatial.to(device),
+                    cond_static.to(device),
+                ).cpu().numpy()[..., 0]
+
+        Y_pred_rows = []
+        Y_true_rows = []
+        for row, item in enumerate(items):
+            stats = np.asarray(item["T_stats"], dtype=np.float32)
+            mu_s = float(stats[0])
+            sigma_s = float(stats[1])
+            Y_pred_rows.append((Y_pred_norm[row] * (sigma_s + T_EPS) + mu_s).astype(np.float32))
+            Y_true_rows.append((item["Y"][..., 0] * (sigma_s + T_EPS) + mu_s).astype(np.float32))
+            if stats.shape[0] > 2:
+                interface_meta = {
+                    **interface_meta,
+                    "interface_x": float(stats[2]),
+                    "positions": [float(stats[2])],
+                }
+
+        params = sim_params[int(sim_id)]
+        amp, freq = _sin_amp_freq(params)
+        return {
+            "interface_x": interface_meta["interface_x"],
+            "interface_positions": interface_meta["positions"],
+            "interface_half_width": interface_meta["interface_half_width"],
+            "t_targets": t_targets,
+            "t_bars": t_grid[target_indices] - t_grid[s],
+            "source_time": float(t_grid[s]),
+            "Y_pred": np.stack(Y_pred_rows, axis=0),
+            "Y_true": np.stack(Y_true_rows, axis=0),
+            "amp": amp,
+            "freq": freq,
+            "R_c": float(params["R_c"]),
+        }
 
     T_source = trajectories[sim_id, s].astype(np.float32)
     T_source_norm = (T_source - mu_global) / (sigma_global + T_EPS)
@@ -608,37 +743,45 @@ def _compute_pair_error_records(
     forcing_batch = []
     y_batch = []
     stats_batch = []
+    has_forcing = True
     for idx in sample_indices:
         item = dataset[idx]
         x_batch.append(item["spatial"])
         cond_batch.append(item["cond_static"])
-        forcing_batch.append(item["forcing_seq"])
+        fseq = item.get("forcing_seq")
+        if fseq is None:
+            has_forcing = False
+        else:
+            forcing_batch.append(fseq)
         y_batch.append(item["Y"])
         stats_batch.append(item["T_stats"])
 
     x_tensor = torch.stack(x_batch, dim=0)
     cond_tensor = torch.stack(cond_batch, dim=0)
-    forcing_tensor = torch.stack(forcing_batch, dim=0)
+    forcing_tensor = torch.stack(forcing_batch, dim=0) if has_forcing else None
     y_tensor = torch.stack(y_batch, dim=0)
     stats_tensor = torch.stack(stats_batch, dim=0)
 
     interface_meta = _resolve_interface_metadata(config=_resolve_plot_config(config))
-    interface_metric_mask = torch.from_numpy(
-        _build_interface_mask_2d(x_grid, y_grid, interface_meta["interface_x"], interface_meta["interface_half_width"])
-    )
-    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_meta["interface_x"])
     device = next(model.parameters()).device
+    use_temporal = bool(getattr(model, "use_temporal_encoder", True))
     model.eval()
 
     preds = []
     for start in range(0, sample_size, batch_size):
         stop = min(start + batch_size, sample_size)
         with torch.no_grad():
-            pred = model(
-                x_tensor[start:stop].to(device),
-                cond_tensor[start:stop].to(device),
-                forcing_tensor[start:stop].to(device),
-            ).cpu()
+            if use_temporal and forcing_tensor is not None:
+                pred = model(
+                    x_tensor[start:stop].to(device),
+                    cond_tensor[start:stop].to(device),
+                    forcing_tensor[start:stop].to(device),
+                ).cpu()
+            else:
+                pred = model(
+                    x_tensor[start:stop].to(device),
+                    cond_tensor[start:stop].to(device),
+                ).cpu()
         preds.append(pred)
     y_pred = torch.cat(preds, dim=0)
 
@@ -653,18 +796,65 @@ def _compute_pair_error_records(
     ).sqrt() * 100.0
     y_pred_phys_field = y_pred_phys[..., 0]
     y_true_phys_field = y_true_phys[..., 0]
-    iface_rel = (
-        torch.mean((y_pred_phys_field[:, interface_metric_mask] - y_true_phys_field[:, interface_metric_mask]) ** 2, dim=1)
-        / torch.clamp(torch.mean(y_true_phys_field[:, interface_metric_mask] ** 2, dim=1), min=1e-12)
-    ).sqrt() * 100.0
-    pred_jump = y_pred_phys_field[:, right_node, :] - y_pred_phys_field[:, left_node, :]
-    true_jump = y_true_phys_field[:, right_node, :] - y_true_phys_field[:, left_node, :]
-    jump_rel = (
-        torch.mean((pred_jump - true_jump) ** 2, dim=1)
-        / torch.clamp(torch.mean(true_jump ** 2, dim=1), min=1e-12)
-    ).sqrt() * 100.0
-    true_jump_rms = torch.sqrt(torch.mean(true_jump ** 2, dim=1))
-    pred_jump_rms = torch.sqrt(torch.mean(pred_jump ** 2, dim=1))
+    if stats_tensor.shape[1] > 2:
+        interface_x_values = stats_tensor[:, 2].numpy().astype(np.float32)
+        iface_rel_rows = []
+        jump_rel_rows = []
+        true_jump_rms_rows = []
+        pred_jump_rms_rows = []
+        for row, interface_x in enumerate(interface_x_values):
+            interface_metric_mask = torch.from_numpy(
+                _build_interface_mask_2d(
+                    x_grid, y_grid, float(interface_x),
+                    interface_meta["interface_half_width"],
+                )
+            )
+            left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, float(interface_x))
+            pred_iface = y_pred_phys_field[row, interface_metric_mask]
+            true_iface = y_true_phys_field[row, interface_metric_mask]
+            iface_rel_rows.append(
+                (
+                    torch.mean((pred_iface - true_iface) ** 2)
+                    / torch.clamp(torch.mean(true_iface ** 2), min=1e-12)
+                ).sqrt() * 100.0
+            )
+            pred_jump_row = y_pred_phys_field[row, right_node, :] - y_pred_phys_field[row, left_node, :]
+            true_jump_row = y_true_phys_field[row, right_node, :] - y_true_phys_field[row, left_node, :]
+            jump_rel_rows.append(
+                (
+                    torch.mean((pred_jump_row - true_jump_row) ** 2)
+                    / torch.clamp(torch.mean(true_jump_row ** 2), min=1e-12)
+                ).sqrt() * 100.0
+            )
+            true_jump_rms_rows.append(torch.sqrt(torch.mean(true_jump_row ** 2)))
+            pred_jump_rms_rows.append(torch.sqrt(torch.mean(pred_jump_row ** 2)))
+
+        iface_rel = torch.stack(iface_rel_rows)
+        jump_rel = torch.stack(jump_rel_rows)
+        true_jump_rms = torch.stack(true_jump_rms_rows)
+        pred_jump_rms = torch.stack(pred_jump_rms_rows)
+    else:
+        interface_x_values = np.full(sample_size, float(interface_meta["interface_x"]), dtype=np.float32)
+        interface_metric_mask = torch.from_numpy(
+            _build_interface_mask_2d(
+                x_grid, y_grid,
+                interface_meta["interface_x"],
+                interface_meta["interface_half_width"],
+            )
+        )
+        left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_meta["interface_x"])
+        iface_rel = (
+            torch.mean((y_pred_phys_field[:, interface_metric_mask] - y_true_phys_field[:, interface_metric_mask]) ** 2, dim=1)
+            / torch.clamp(torch.mean(y_true_phys_field[:, interface_metric_mask] ** 2, dim=1), min=1e-12)
+        ).sqrt() * 100.0
+        pred_jump = y_pred_phys_field[:, right_node, :] - y_pred_phys_field[:, left_node, :]
+        true_jump = y_true_phys_field[:, right_node, :] - y_true_phys_field[:, left_node, :]
+        jump_rel = (
+            torch.mean((pred_jump - true_jump) ** 2, dim=1)
+            / torch.clamp(torch.mean(true_jump ** 2, dim=1), min=1e-12)
+        ).sqrt() * 100.0
+        true_jump_rms = torch.sqrt(torch.mean(true_jump ** 2, dim=1))
+        pred_jump_rms = torch.sqrt(torch.mean(pred_jump ** 2, dim=1))
 
     sim_ids = np.array([dataset._pairs[idx][0] for idx in sample_indices], dtype=np.int64)
     params = dataset.sim_params[sim_ids]
@@ -679,6 +869,12 @@ def _compute_pair_error_records(
         "amplitude": np.array([_sin_amp_freq(p)[0] for p in params], dtype=np.float32),
         "frequency": np.array([_sin_amp_freq(p)[1] for p in params], dtype=np.float32),
         "R_c": np.array([float(p["R_c"]) for p in params], dtype=np.float32),
+        # source-benchmark fields (NaN/empty for forcing/interface sims)
+        "A": np.array([_safe_param_float(p, "A") for p in params], dtype=np.float32),
+        "x_h": np.array([_safe_param_float(p, "x_h") for p in params], dtype=np.float32),
+        "y_h": np.array([_safe_param_float(p, "y_h") for p in params], dtype=np.float32),
+        "interface_x": interface_x_values,
+        "regime": np.array([str(p.get("regime", "")) for p in params], dtype=object),
         "true_jump_rms": true_jump_rms.numpy(),
         "pred_jump_rms": pred_jump_rms.numpy(),
         "source_index": source_indices,
@@ -806,6 +1002,7 @@ def plot_prediction_vs_truth(
             global_rel = _relative_l2_percent(pred_field, true_field)
             iface_rel = _relative_l2_percent(pred_field[interface_metric_mask], true_field[interface_metric_mask])
             jump_rel = _relative_l2_percent(pred_jump_row, true_jump_row)
+            jump_rmse = float(np.sqrt(np.mean((pred_jump_row - true_jump_row) ** 2)))
 
             ax_truth, ax_pred, ax_resid, ax_jump = axes[row]
             pcm_truth = _plot_field_2d(
@@ -855,8 +1052,17 @@ def plot_prediction_vs_truth(
             ax_jump.plot(y_grid, pred_jump_row, color="C3", linestyle="--", label="Prediction")
             ax_jump.axhline(0.0, color="0.45", linestyle=":", linewidth=1.0)
             ax_jump.set_xlabel("y")
-            ax_jump.set_ylabel("ΔT")
-            ax_jump.set_title("Interface Jump Profile")
+            ax_jump.set_ylabel("Node-to-node ΔT")
+            ax_jump.set_title(f"Interface Jump Profile — jump rel. err. {jump_rel:.2f}%")
+            ax_jump.text(
+                0.03,
+                0.04,
+                f"Field rel. L2: {global_rel:.2f}%\nJump RMSE: {jump_rmse:.3f} K",
+                transform=ax_jump.transAxes,
+                va="bottom",
+                ha="left",
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+            )
             ax_jump.grid(True)
             if row == 0:
                 ax_jump.legend(loc="best")
@@ -1383,9 +1589,6 @@ def plot_interface_error(
     """Diagnose interface-jump prediction accuracy over y and target time."""
     config = _resolve_plot_config(config)
     interface_meta = _resolve_interface_metadata(config=config)
-    interface_x = interface_meta["interface_x"]
-    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_x)
-    interface_metric_mask = _build_interface_mask_2d(x_grid, y_grid, interface_x, interface_meta["interface_half_width"])
 
     rng = np.random.default_rng(seed)
     chosen_sims = rng.choice(sim_ids, size=min(n_samples, len(sim_ids)), replace=False)
@@ -1413,6 +1616,7 @@ def plot_interface_error(
     for case in cases:
         Y_true = case["Y_true"]
         Y_pred = case["Y_pred"]
+        left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, case["interface_x"])
         true_jump = _interface_jump_map(Y_true, left_node, right_node)
         pred_jump = _interface_jump_map(Y_pred, left_node, right_node)
         resid_jump = pred_jump - true_jump
@@ -1429,6 +1633,12 @@ def plot_interface_error(
             t_targets = case["t_targets"]
             Y_true = case["Y_true"]
             Y_pred = case["Y_pred"]
+            left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, case["interface_x"])
+            interface_metric_mask = _build_interface_mask_2d(
+                x_grid, y_grid,
+                case["interface_x"],
+                case["interface_half_width"],
+            )
             true_jump = _interface_jump_map(Y_true, left_node, right_node)
             pred_jump = _interface_jump_map(Y_pred, left_node, right_node)
             residual_jump = pred_jump - true_jump
@@ -1448,10 +1658,10 @@ def plot_interface_error(
             )
             ax_left.set_xlabel("Time")
             ax_left.set_ylabel("y")
-            ax_left.set_title("True Jump Map")
+            ax_left.set_title(f"True Jump Map — x={case['interface_x']:.3f}")
             ax_mid.set_xlabel("Time")
             ax_mid.set_ylabel("y")
-            ax_mid.set_title("Predicted Jump Map")
+            ax_mid.set_title(f"Predicted Jump Map — x={case['interface_x']:.3f}")
             ax_right.set_xlabel("Time")
             ax_right.set_ylabel("y")
             ax_right.set_title("Jump Residual Map")
@@ -1469,7 +1679,7 @@ def plot_interface_error(
             fig.colorbar(pcm_true, ax=[ax_left, ax_mid], label="ΔT", shrink=0.82)
             fig.colorbar(pcm_resid, ax=ax_right, label="Pred - Truth", shrink=0.82)
 
-        fig.suptitle(f"Interface Diagnostic — x = {interface_x:.3f}")
+        fig.suptitle("Interface Diagnostic")
         _save_figure(fig, save_path, "data", "interface_error", layout="constrained")
 
 
@@ -1817,3 +2027,1761 @@ def plot_interface_jump_summary(
 
         fig.suptitle("Interface Jump Summary")
         _save_figure(fig, save_path, "data", "interface_jump_summary", layout="constrained")
+
+
+# ============================================================
+# SOURCE BENCHMARK — helpers (ported from experiment/source-itr)
+# ============================================================
+
+def _patch_param_arrays(sim_params: np.ndarray) -> dict[str, np.ndarray]:
+    """Pull per-sim patch parameters into arrays."""
+    return {
+        "R_c": np.array([float(p["R_c"]) for p in sim_params], dtype=np.float32),
+        "A": np.array([float(p["A"]) for p in sim_params], dtype=np.float32),
+        "x_h": np.array([float(p["x_h"]) for p in sim_params], dtype=np.float32),
+        "y_h": np.array([float(p["y_h"]) for p in sim_params], dtype=np.float32),
+        "regime": np.array([str(p.get("regime", "")) for p in sim_params], dtype=object),
+    }
+
+
+def _select_representative_source_sim_id(sim_params: np.ndarray) -> int:
+    """Choose a deterministic representative source sim near the median patch params."""
+    arrs = _patch_param_arrays(sim_params)
+    A = arrs["A"]
+    if len(A) == 0:
+        return 0
+    Rc = arrs["R_c"]
+    xh = arrs["x_h"]
+    yh = arrs["y_h"]
+
+    def _norm(v: np.ndarray) -> np.ndarray:
+        v_min, v_max = float(v.min()), float(v.max())
+        return (v - v_min) / max(v_max - v_min, 1e-12)
+
+    stacked = np.column_stack([_norm(A), _norm(Rc), _norm(xh), _norm(yh)])
+    target = np.median(stacked, axis=0)
+    return int(np.argmin(np.sum((stacked - target) ** 2, axis=1)))
+
+
+def _format_patch_label(p: dict) -> str:
+    """Compact label describing a sim's patch parameters."""
+    return (
+        f"x_h={float(p['x_h']):.2f}, y_h={float(p['y_h']):.2f}, "
+        f"A={float(p['A']):.0f}"
+    )
+
+
+def _build_source_bin_channels(
+    X_grid: np.ndarray,
+    Y_grid: np.ndarray,
+    x_h: float,
+    y_h: float,
+    w_h: float,
+    h_h: float,
+    A: float,
+    t_off: float,
+    t_s: float,
+    t_j: float,
+    t_final: float,
+    source_bins: int = SOURCE_BINS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (S_h, Q_bins) matching the dataset's source-bin encoding.
+
+    S_h     : (Nx, Ny) indicator
+    Q_bins  : (Nx, Ny, source_bins) future-source bins divided by Q_REF.
+    """
+    A_max = float(PATCH_A_RANGE[1])
+    q_ref = float(A_max * float(t_final) / float(source_bins))
+    S_h = make_patch_indicator(X_grid, Y_grid, x_h, y_h, w_h, h_h)
+    Nx, Ny = X_grid.shape
+    Q = np.zeros((Nx, Ny, source_bins), dtype=np.float32)
+    if t_j > t_s:
+        edges = np.linspace(t_s, t_j, source_bins + 1, dtype=np.float64)
+        for k in range(source_bins):
+            integral = integrate_sin2_pulse(A, t_off, float(edges[k]), float(edges[k + 1]))
+            Q[..., k] = S_h * np.float32(integral / q_ref)
+    return S_h.astype(np.float32), Q
+
+
+_REGIME_COLORS = {"left": "C0", "near": "C2", "right": "C3"}
+
+
+def _regime_for_sim(p: dict, interface_x: float = INTERFACE_X) -> str:
+    """Classify a sim's patch as left/near/right relative to the interface."""
+    regime = p.get("regime", None)
+    if regime in _REGIME_COLORS:
+        return str(regime)
+    x_h = float(p["x_h"])
+    w_h = float(p["w_h"])
+    if x_h + 0.5 * w_h < interface_x:
+        return "left"
+    if x_h - 0.5 * w_h > interface_x:
+        return "right"
+    return "near"
+
+
+def _representative_sim_per_regime(
+    sim_params: np.ndarray,
+    interface_x: float = INTERFACE_X,
+) -> dict[str, int]:
+    """Pick one sim_id per regime, falling back gracefully."""
+    selections: dict[str, int] = {}
+    for r in ("left", "near", "right"):
+        for i, p in enumerate(sim_params):
+            if _regime_for_sim(p, interface_x) == r:
+                selections[r] = i
+                break
+    return selections
+
+
+def _extract_breakdown_payload(breakdown_path: str | Path) -> dict:
+    """Load breakdown.json and return the per-seed[0] payload (or top-level dict)."""
+    import json
+
+    with open(breakdown_path, "r") as f:
+        data = json.load(f)
+    if "per_seed" in data:
+        if not data["per_seed"]:
+            raise ValueError(f"breakdown.json has empty per_seed: {breakdown_path}")
+        return data["per_seed"][0]
+    return data
+
+
+def _grid_error_heatmap(
+    ax, x: np.ndarray, y: np.ndarray, z: np.ndarray,
+    n_bins: int, xlabel: str, ylabel: str,
+    x_log: bool = False, vmin: float | None = None, vmax: float | None = None,
+):
+    """Plot mean(z) over quantile bins of (x, y) and return the QuadMesh."""
+    if x_log:
+        x_safe = np.log10(np.clip(x, 1e-12, None))
+    else:
+        x_safe = x
+    x_edges = np.quantile(x_safe, np.linspace(0, 1, n_bins + 1))
+    y_edges = np.quantile(y, np.linspace(0, 1, n_bins + 1))
+    x_edges = np.unique(x_edges)
+    y_edges = np.unique(y_edges)
+    if len(x_edges) < 2 or len(y_edges) < 2:
+        ax.text(0.5, 0.5, "(degenerate)", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        return None
+    bx = np.clip(np.digitize(x_safe, x_edges[1:-1]), 0, len(x_edges) - 2)
+    by = np.clip(np.digitize(y, y_edges[1:-1]), 0, len(y_edges) - 2)
+    grid = np.full((len(x_edges) - 1, len(y_edges) - 1), np.nan)
+    for i in range(len(x_edges) - 1):
+        for j in range(len(y_edges) - 1):
+            mask = (bx == i) & (by == j)
+            if np.any(mask):
+                grid[i, j] = float(np.mean(z[mask]))
+    pcm = ax.pcolormesh(x_edges, y_edges, grid.T, cmap="viridis",
+                       shading="flat", vmin=vmin, vmax=vmax)
+    if x_log:
+        ax.set_xlabel(xlabel + " (log10)")
+    else:
+        ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    return pcm
+
+
+def _bilinear_resample(
+    field: np.ndarray, x_grid: np.ndarray, y_grid: np.ndarray,
+    xs: np.ndarray, ys: np.ndarray,
+) -> np.ndarray:
+    """Bilinear resample ``field`` of shape (Nx, Ny) at sample points (xs, ys).
+
+    xs, ys arrays of the same shape. Returns the resampled field with that
+    shape. Points outside the convex hull return NaN.
+    """
+    Nx = len(x_grid)
+    Ny = len(y_grid)
+    x_lo = float(x_grid[0])
+    x_hi = float(x_grid[-1])
+    y_lo = float(y_grid[0])
+    y_hi = float(y_grid[-1])
+    valid = (xs >= x_lo) & (xs <= x_hi) & (ys >= y_lo) & (ys <= y_hi)
+    fx = (xs - x_lo) / max(x_hi - x_lo, 1e-12) * (Nx - 1)
+    fy = (ys - y_lo) / max(y_hi - y_lo, 1e-12) * (Ny - 1)
+    i0 = np.clip(np.floor(fx).astype(int), 0, Nx - 2)
+    j0 = np.clip(np.floor(fy).astype(int), 0, Ny - 2)
+    i1 = i0 + 1
+    j1 = j0 + 1
+    wx = fx - i0
+    wy = fy - j0
+    f00 = field[i0, j0]
+    f01 = field[i0, j1]
+    f10 = field[i1, j0]
+    f11 = field[i1, j1]
+    out = (
+        (1 - wx) * (1 - wy) * f00
+        + (1 - wx) * wy * f01
+        + wx * (1 - wy) * f10
+        + wx * wy * f11
+    )
+    out = np.where(valid, out, np.nan)
+    return out
+
+
+# ============================================================
+# SOURCE BENCHMARK — plots (ported from experiment/source-itr)
+# ============================================================
+
+def plot_source_error_vs_params(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    max_samples: int = 256,
+    seed: int = 42,
+    config: dict | None = None,
+    save_path: str | Path | None = None,
+):
+    """Scatter rel-L2 against patch and contact parameters plus a regime box plot.
+
+    Panels (2x3):
+      (0,0) rel-L2 vs R_c
+      (0,1) rel-L2 vs A (log x)
+      (0,2) rel-L2 vs x_h
+      (1,0) rel-L2 vs y_h
+      (1,1) rel-L2 vs |x_h - 0.5|
+      (1,2) box plot by regime {left, near, right}
+    """
+    records = _compute_pair_error_records(
+        model=model, dataset=dataset,
+        x_grid=x_grid, y_grid=y_grid,
+        config=config, max_samples=max_samples, seed=seed,
+    )
+    rel = records["global_rel_l2"]
+    dist = np.abs(records["x_h"] - float(INTERFACE_X))
+    regimes = records["regime"]
+
+    specs = [
+        ("R_c", records["R_c"], False, "Contact resistance R_c"),
+        ("A", records["A"], True, "Patch amplitude A"),
+        ("x_h", records["x_h"], False, "Patch x-center x_h"),
+        ("y_h", records["y_h"], False, "Patch y-center y_h"),
+        ("|x_h - 0.5|", dist, False, "Distance to interface |x_h - 0.5|"),
+    ]
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+        flat = axes.ravel()
+        for ax, (key, xv, log_x, label) in zip(flat[:5], specs):
+            ax.scatter(xv, rel, s=18, alpha=0.45, color="C0", edgecolors="none")
+            if log_x:
+                ax.set_xscale("log")
+            ax.set_xlabel(label)
+            ax.set_ylabel("Global rel. L2 (%)")
+            ax.grid(True)
+
+        ax_box = flat[5]
+        regime_order = ["left", "near", "right"]
+        data = [rel[regimes == r] for r in regime_order]
+        positions = list(range(1, len(regime_order) + 1))
+        for pos, label, samples in zip(positions, regime_order, data):
+            if len(samples) > 0:
+                ax_box.boxplot(
+                    [samples], positions=[pos], widths=0.6,
+                    patch_artist=True,
+                    boxprops={"facecolor": "C2", "alpha": 0.4},
+                )
+            else:
+                ax_box.text(pos, 0.5, "(empty)", ha="center", va="center",
+                            transform=ax_box.get_xaxis_transform(),
+                            fontsize=8, color="0.5")
+        ax_box.set_xticks(positions)
+        ax_box.set_xticklabels(regime_order)
+        ax_box.set_ylabel("Global rel. L2 (%)")
+        ax_box.set_title("By regime")
+        ax_box.grid(True, axis="y")
+
+        fig.suptitle("Held-Out Error Across Patch/Contact Parameters")
+        _save_figure(fig, save_path, "source", "source_error_vs_params", layout="constrained")
+
+
+def plot_source_interface_zone_error(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    config: dict,
+    max_samples: int = 256,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Lightweight interface-zone diagnostic.
+
+    (a) Scatter of pred-vs-truth jump magnitude |T(0.5+) - T(0.5-)| (RMS over y).
+    (b) Scatter of rel-L2 inside the band |x - 0.5| < 0.05 vs R_c.
+    The jump is computed from the two cell centers adjacent to x=0.5, matching
+    the FV face convention.
+    """
+    config = _resolve_plot_config(config)
+    records = _compute_pair_error_records(
+        model=model, dataset=dataset,
+        x_grid=x_grid, y_grid=y_grid,
+        config=config, max_samples=max_samples, seed=seed,
+    )
+
+    true_jump = records["true_jump_rms"]
+    pred_jump = records["pred_jump_rms"]
+    rc = records["R_c"]
+    iface_rel = records["iface_rel_l2"]
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
+
+        ax = axes[0]
+        if len(true_jump) > 0:
+            lo = float(min(true_jump.min(), pred_jump.min()))
+            hi = float(max(true_jump.max(), pred_jump.max()))
+        else:
+            lo, hi = 0.0, 1.0
+        ax.scatter(true_jump, pred_jump, s=18, alpha=0.45, color="C2", edgecolors="none")
+        ax.plot([lo, hi], [lo, hi], color="black", linestyle="--", linewidth=1.0, label="Identity")
+        ax.set_xlabel(r"True $|T(0.5^+) - T(0.5^-)|$ RMS")
+        ax.set_ylabel(r"Predicted $|T(0.5^+) - T(0.5^-)|$ RMS")
+        ax.set_title("Jump magnitude — pred vs truth")
+        ax.legend(loc="upper left")
+        ax.grid(True)
+
+        ax = axes[1]
+        ax.scatter(rc, iface_rel, s=18, alpha=0.45, color="C3", edgecolors="none")
+        ax.set_xlabel(r"Contact resistance $R_c$")
+        ax.set_ylabel("Interface band rel. L2 (%)")
+        ax.set_title(r"Band $|x - 0.5| < 0.05$ error vs $R_c$")
+        ax.grid(True)
+
+        fig.suptitle("Interface Zone Diagnostic")
+        _save_figure(fig, save_path, "source", "source_interface_zone_error", layout="constrained")
+
+
+def plot_source_dataset_summary(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict,
+    representative_sim_id: int | None = None,
+    save_path: str | Path | None = None,
+):
+    """Report-style overview of the source-itr dataset."""
+    config = _resolve_plot_config(config)
+    arrs = _patch_param_arrays(sim_params)
+    sim_id = _select_representative_source_sim_id(sim_params) if representative_sim_id is None else int(representative_sim_id)
+    coverage = _lead_time_coverage_counts(trajectories, x_grid, y_grid, t_grid, sim_params, config)
+    interface_meta = _resolve_interface_metadata(config=config)
+    ic_std = np.std(trajectories[:, 0], axis=0)
+    max_lead = max(
+        float(coverage["train"].max()) if len(coverage["train"]) > 0 else 0.0,
+        float(coverage["val"].max()) if len(coverage["val"]) > 0 else 0.0,
+        float(coverage["test"].max()) if len(coverage["test"]) > 0 else 0.0,
+        float(t_grid[-1] - t_grid[0]),
+    )
+    hist_bins = np.linspace(0.0, max_lead, 16)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+        temp_fields = np.stack([trajectories[sim_id, 0], trajectories[sim_id, -1]])
+        temp_vmin = float(np.min(temp_fields))
+        temp_vmax = float(np.max(temp_fields))
+        std_vmax = float(np.max(ic_std))
+
+        pcm = _plot_field_2d(
+            axes[0, 0], x_grid, y_grid, trajectories[sim_id, 0],
+            vmin=temp_vmin, vmax=temp_vmax,
+            interface_positions=interface_meta["positions"],
+        )
+        axes[0, 0].set_title(f"Representative IC — Sim {sim_id}")
+
+        _plot_field_2d(
+            axes[0, 1], x_grid, y_grid, trajectories[sim_id, -1],
+            vmin=temp_vmin, vmax=temp_vmax,
+            interface_positions=interface_meta["positions"],
+        )
+        axes[0, 1].set_title(f"Representative Final Field — t={t_grid[-1]:.3f}")
+
+        pcm_std = _plot_field_2d(
+            axes[0, 2], x_grid, y_grid, ic_std,
+            cmap="viridis", vmin=0.0, vmax=std_vmax,
+            interface_positions=interface_meta["positions"],
+        )
+        axes[0, 2].set_title("Initial-Condition Std. Dev.")
+
+        scatter = axes[1, 0].scatter(arrs["x_h"], arrs["y_h"], c=arrs["A"],
+                                     cmap="viridis", s=18, alpha=0.7, edgecolors="none")
+        axes[1, 0].axvline(INTERFACE_X, color="0.35", linestyle=":", linewidth=1.0)
+        axes[1, 0].set_title("Patch x_h vs y_h (color = A)")
+        axes[1, 0].set_xlabel("x_h")
+        axes[1, 0].set_ylabel("y_h")
+        axes[1, 0].grid(True)
+
+        for label, values, color in [("Train", coverage["train"], "C0"), ("Val", coverage["val"], "C2"), ("Test", coverage["test"], "C3")]:
+            axes[1, 1].hist(values, bins=hist_bins, histtype="step", linewidth=1.8, label=label, color=color)
+        axes[1, 1].set_title("Lead-Time Coverage by Split")
+        axes[1, 1].set_xlabel("Lead time Δt")
+        axes[1, 1].set_ylabel("Pair count")
+        axes[1, 1].legend(loc="upper right")
+        axes[1, 1].grid(True)
+
+        axes[1, 2].hist(arrs["R_c"], bins=20, color="C2", edgecolor="white")
+        for x_lim in RC_RANGE:
+            axes[1, 2].axvline(x_lim, color="0.4", linestyle=":", linewidth=1.0)
+        axes[1, 2].set_xlabel(r"$R_c$")
+        axes[1, 2].set_ylabel("Count")
+        axes[1, 2].set_title(r"Contact resistance $R_c$")
+        axes[1, 2].grid(True)
+
+        fig.colorbar(pcm, ax=axes[0, :2].tolist(), label="Temperature", shrink=0.92)
+        fig.colorbar(pcm_std, ax=axes[0, 2], label="Std. Dev.", shrink=0.92)
+        fig.colorbar(scatter, ax=axes[1, 0], label="A", shrink=0.92)
+
+        fig.suptitle("Dataset Summary — source-itr")
+        _save_figure(fig, save_path, "source", "source_dataset_summary", layout="constrained")
+
+
+def plot_patch_param_scatter(
+    sim_params: np.ndarray,
+    split_assignments: dict[str, np.ndarray] | None = None,
+    save_path: str | Path | None = None,
+):
+    """2x3 overview of patch parameter sampling and regime distribution."""
+    arrs = _patch_param_arrays(sim_params)
+    x_h = arrs["x_h"]
+    y_h = arrs["y_h"]
+    R_c = arrs["R_c"]
+    A = arrs["A"]
+    regimes = np.array([_regime_for_sim(p) for p in sim_params], dtype=object)
+
+    if split_assignments is None:
+        num_sims = len(sim_params)
+        train_ids, val_ids, test_ids = split_sim_ids(num_sims, 0.7, 0.15, seed=0)
+        split_assignments = {"train": train_ids, "val": val_ids, "test": test_ids}
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+        ax = axes[0, 0]
+        for label, color in _REGIME_COLORS.items():
+            mask = regimes == label
+            if not np.any(mask):
+                continue
+            ax.scatter(
+                x_h[mask], y_h[mask], c=color, s=18, alpha=0.75,
+                edgecolors="none", label=label,
+            )
+        ax.axvline(INTERFACE_X, color="0.35", linestyle=":", linewidth=1.2)
+        ax.axvspan(
+            INTERFACE_X - 0.5 * PATCH_W, INTERFACE_X + 0.5 * PATCH_W,
+            color="0.7", alpha=0.2,
+        )
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_aspect("equal")
+        ax.set_xlabel("x_h")
+        ax.set_ylabel("y_h")
+        ax.set_title("Patch Position by Regime")
+        ax.legend(loc="upper right")
+        ax.grid(True)
+
+        axes[0, 1].hist(R_c, bins=20, color="C2", edgecolor="white")
+        axes[0, 1].set_xlabel(r"$R_c$")
+        axes[0, 1].set_ylabel("Count")
+        axes[0, 1].set_title("Contact Resistance")
+        axes[0, 1].grid(True)
+
+        axes[0, 2].hist(A, bins=np.logspace(np.log10(A.min()), np.log10(A.max()), 20),
+                       color="C1", edgecolor="white")
+        axes[0, 2].set_xscale("log")
+        axes[0, 2].set_xlabel("A")
+        axes[0, 2].set_ylabel("Count")
+        axes[0, 2].set_title("Patch Amplitude")
+        axes[0, 2].grid(True, which="both")
+
+        axes[1, 0].hist(x_h, bins=20, color="C0", edgecolor="white")
+        axes[1, 0].axvline(INTERFACE_X, color="0.35", linestyle=":")
+        axes[1, 0].set_xlabel("x_h")
+        axes[1, 0].set_ylabel("Count")
+        axes[1, 0].set_title("Patch x")
+        axes[1, 0].grid(True)
+
+        axes[1, 1].hist(y_h, bins=20, color="C3", edgecolor="white")
+        axes[1, 1].set_xlabel("y_h")
+        axes[1, 1].set_ylabel("Count")
+        axes[1, 1].set_title("Patch y")
+        axes[1, 1].grid(True)
+
+        ax = axes[1, 2]
+        split_labels = list(split_assignments.keys())
+        regime_labels = ["left", "near", "right"]
+        counts = np.zeros((len(regime_labels), len(split_labels)), dtype=int)
+        for j, split in enumerate(split_labels):
+            ids = np.asarray(split_assignments[split], dtype=int)
+            if len(ids) == 0:
+                continue
+            split_regimes = regimes[ids]
+            for i, r in enumerate(regime_labels):
+                counts[i, j] = int(np.sum(split_regimes == r))
+        bottom = np.zeros(len(split_labels), dtype=int)
+        for i, r in enumerate(regime_labels):
+            ax.bar(split_labels, counts[i], bottom=bottom,
+                  color=_REGIME_COLORS[r], label=r, edgecolor="white")
+            bottom = bottom + counts[i]
+        ax.set_ylabel("Sim count")
+        ax.set_title("Regime Counts by Split")
+        ax.legend(loc="upper right")
+        ax.grid(True, axis="y")
+
+        fig.suptitle("Patch Parameter Distributions")
+        _save_figure(fig, save_path, "source", "patch_param_scatter", layout="constrained")
+
+
+def plot_source_temporal_profile(
+    sim_params: np.ndarray,
+    t_grid: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """1x2 overview of the patch's temporal amplitude."""
+    arrs = _patch_param_arrays(sim_params)
+    A = arrs["A"]
+    if len(A) == 0:
+        raise ValueError("sim_params is empty; cannot plot temporal profile.")
+    t_off = float(sim_params[0]["t_off"])
+    t_final = float(t_grid[-1])
+    rep_idx = _select_representative_source_sim_id(sim_params)
+    rep_A = float(sim_params[rep_idx]["A"])
+    rep_t_off = float(sim_params[rep_idx]["t_off"])
+
+    quantiles = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    A_samples = np.quantile(A, quantiles)
+
+    t_dense = np.linspace(0.0, t_final, 400)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+
+        ax = axes[0]
+        for q, A_val in zip(quantiles, A_samples):
+            pulse = make_sin2_pulse(float(A_val), t_off)
+            ax.plot(t_dense, [pulse(t) for t in t_dense],
+                   label=f"A={A_val:.0f} (q={q:.2f})")
+        ax.axvline(t_off, color="0.35", linestyle=":", label=r"$t_{off}$")
+        ax.axvline(t_final, color="0.55", linestyle="--", label=r"$t_{final}$")
+        ax.set_xlabel("t")
+        ax.set_ylabel("a(t)")
+        ax.set_title("Patch Amplitude Pulse")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True)
+
+        ax = axes[1]
+        edges = np.linspace(0.0, t_final, SOURCE_BINS + 1)
+        integrals = np.array([
+            integrate_sin2_pulse(rep_A, rep_t_off, float(edges[k]), float(edges[k + 1]))
+            for k in range(SOURCE_BINS)
+        ])
+        ax.step(edges[:-1], integrals, where="post", color="C0", linewidth=1.8)
+        ax.axvline(rep_t_off, color="0.35", linestyle=":", label=r"$t_{off}$")
+        ax.axvline(t_final, color="0.55", linestyle="--", label=r"$t_{final}$")
+        ax.set_xlabel("t bin start")
+        ax.set_ylabel(r"$\int_{\tau_k}^{\tau_{k+1}} a(t)\,dt$")
+        ax.set_title(f"Bin Integrals — sim {rep_idx}, A={rep_A:.0f}")
+        ax.legend(loc="upper right")
+        ax.grid(True)
+
+        _save_figure(fig, save_path, "source", "source_temporal_profile", layout="constrained")
+
+
+def plot_regime_error_breakdown(
+    breakdown_path: str | Path,
+    save_path: str | Path | None = None,
+):
+    """1x3 grouped bar chart of mean rel-L2 (physical) by regime / R_c / A bins."""
+    payload = _extract_breakdown_payload(breakdown_path)
+
+    def _bars_from_section(section: dict) -> tuple[list[str], list[float], list[float], list[int]]:
+        labels, means, stds, counts = [], [], [], []
+        for k, entry in section.items():
+            if not isinstance(entry, dict):
+                continue
+            count = int(entry.get("count", 0))
+            if count == 0:
+                continue
+            labels.append(str(k))
+            means.append(float(entry.get("rel_l2_phys_mean", 0.0)))
+            stds.append(float(entry.get("rel_l2_phys_std", 0.0)))
+            counts.append(count)
+        return labels, means, stds, counts
+
+    sections = [
+        ("by_regime", "By Regime"),
+        ("by_R_c", r"By $R_c$ quartile"),
+        ("by_A", "By A quartile"),
+    ]
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True)
+        for ax, (key, title) in zip(axes, sections):
+            section = payload.get(key, {})
+            labels, means, stds, counts = _bars_from_section(section)
+            if not labels:
+                ax.text(0.5, 0.5, "(no data)", ha="center", va="center",
+                       transform=ax.transAxes)
+                ax.set_title(title)
+                continue
+            x = np.arange(len(labels))
+            bars = ax.bar(x, means, yerr=stds, color="C0", edgecolor="white",
+                          capsize=4, alpha=0.85)
+            for rect, c in zip(bars, counts):
+                ax.text(rect.get_x() + rect.get_width() / 2.0,
+                       rect.get_height(),
+                       f"n={c}",
+                       ha="center", va="bottom", fontsize=7)
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=0)
+            ax.set_ylabel("Relative L2 (%, physical)")
+            ax.set_title(title)
+            ax.grid(True, axis="y")
+
+        fig.suptitle("Regime / Parameter Error Breakdown")
+        _save_figure(fig, save_path, "source", "regime_error_breakdown", layout="constrained")
+
+
+def plot_patch_error_slices(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    config: dict | None = None,
+    sim_params: np.ndarray | None = None,
+    max_samples: int = 512,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """2x2 heatmaps of mean rel-L2 over quantile bins of patch params x t_bar."""
+    records = _compute_pair_error_records(
+        model, dataset, x_grid, y_grid,
+        config=config, max_samples=max_samples, seed=seed,
+    )
+    rel = records["global_rel_l2"]
+    t_bar = records["lead_time"]
+
+    vmax = float(np.nanpercentile(rel, 95))
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 11), constrained_layout=True)
+
+        pcm = _grid_error_heatmap(
+            axes[0, 0], records["R_c"], t_bar, rel, n_bins=6,
+            xlabel=r"$R_c$", ylabel=r"$\Delta t$", vmax=vmax,
+        )
+        axes[0, 0].set_title(r"Error vs $R_c$, $\Delta t$")
+
+        _grid_error_heatmap(
+            axes[0, 1], records["A"], t_bar, rel, n_bins=6,
+            xlabel="A", ylabel=r"$\Delta t$", x_log=True, vmax=vmax,
+        )
+        axes[0, 1].set_title(r"Error vs A, $\Delta t$")
+
+        _grid_error_heatmap(
+            axes[1, 0], np.abs(records["x_h"] - INTERFACE_X), t_bar, rel, n_bins=6,
+            xlabel=r"$|x_h - 0.5|$", ylabel=r"$\Delta t$", vmax=vmax,
+        )
+        axes[1, 0].set_title(r"Error vs interface offset, $\Delta t$")
+
+        _grid_error_heatmap(
+            axes[1, 1], records["y_h"], t_bar, rel, n_bins=6,
+            xlabel=r"$y_h$", ylabel=r"$\Delta t$", vmax=vmax,
+        )
+        axes[1, 1].set_title(r"Error vs $y_h$, $\Delta t$")
+
+        if pcm is not None:
+            fig.colorbar(pcm, ax=axes.ravel().tolist(),
+                        label="Mean rel L2 (%, physical)", shrink=0.85)
+        fig.suptitle("Patch-Parameter Error Slices")
+        _save_figure(fig, save_path, "source", "patch_error_slices", layout="constrained")
+
+
+def plot_patch_region_error_map(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict | None = None,
+    window: float = 0.3,
+    max_samples: int = 128,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Mean per-pixel MAE recentered to each pair's patch center (x_h, y_h)."""
+    import torch
+
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty; cannot compute patch-region error map.")
+
+    rng = np.random.default_rng(seed)
+    sample_size = min(max_samples, len(dataset))
+    sample_indices = np.arange(len(dataset))
+    if sample_size < len(dataset):
+        sample_indices = np.sort(rng.choice(sample_indices, size=sample_size, replace=False))
+
+    x_batch, c_batch, y_batch, stats_batch = [], [], [], []
+    forcing_batch = []
+    has_forcing = True
+    for idx in sample_indices:
+        item = dataset[idx]
+        x_batch.append(item["spatial"])
+        c_batch.append(item["cond_static"])
+        fseq = item.get("forcing_seq")
+        if fseq is None:
+            has_forcing = False
+        else:
+            forcing_batch.append(fseq)
+        y_batch.append(item["Y"])
+        stats_batch.append(item["T_stats"])
+    x_tensor = torch.stack(x_batch, dim=0)
+    c_tensor = torch.stack(c_batch, dim=0)
+    forcing_tensor = torch.stack(forcing_batch, dim=0) if has_forcing else None
+    y_tensor = torch.stack(y_batch, dim=0)
+    stats_tensor = torch.stack(stats_batch, dim=0)
+
+    device = next(model.parameters()).device
+    use_temporal = bool(getattr(model, "use_temporal_encoder", True))
+    model.eval()
+    preds = []
+    batch_size = 32
+    for start in range(0, sample_size, batch_size):
+        stop = min(start + batch_size, sample_size)
+        with torch.no_grad():
+            if use_temporal and forcing_tensor is not None:
+                p = model(x_tensor[start:stop].to(device),
+                         c_tensor[start:stop].to(device),
+                         forcing_tensor[start:stop].to(device)).cpu()
+            else:
+                p = model(x_tensor[start:stop].to(device),
+                         c_tensor[start:stop].to(device)).cpu()
+        preds.append(p)
+    y_pred = torch.cat(preds, dim=0)
+    mu_s = stats_tensor[:, 0][:, None, None, None]
+    sigma_s = stats_tensor[:, 1][:, None, None, None]
+    y_pred_phys = (y_pred * (sigma_s + T_EPS) + mu_s).numpy()[..., 0]
+    y_true_phys = (y_tensor * (sigma_s + T_EPS) + mu_s).numpy()[..., 0]
+    abs_err = np.abs(y_pred_phys - y_true_phys)
+
+    sim_ids = np.array([dataset._pairs[i][0] for i in sample_indices], dtype=np.int64)
+
+    local_n = 64
+    grid_local = np.linspace(-0.5 * window, 0.5 * window, local_n)
+    Xl, Yl = np.meshgrid(grid_local, grid_local, indexing="ij")
+
+    accum = np.zeros((local_n, local_n), dtype=np.float64)
+    weight = np.zeros((local_n, local_n), dtype=np.float64)
+    used = 0
+    for k, sid in enumerate(sim_ids):
+        params = sim_params[int(sid)]
+        x_h = float(params["x_h"])
+        y_h = float(params["y_h"])
+        if (x_h - 0.5 * window < x_grid[0] or x_h + 0.5 * window > x_grid[-1]
+            or y_h - 0.5 * window < y_grid[0] or y_h + 0.5 * window > y_grid[-1]):
+            continue
+        sampled = _bilinear_resample(abs_err[k], x_grid, y_grid, Xl + x_h, Yl + y_h)
+        valid = ~np.isnan(sampled)
+        accum[valid] += sampled[valid]
+        weight[valid] += 1.0
+        used += 1
+    mean_err = np.where(weight > 0, accum / np.maximum(weight, 1.0), np.nan)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
+        pcm = ax.pcolormesh(grid_local, grid_local, mean_err.T, cmap="magma",
+                           shading="auto")
+        fig.colorbar(pcm, ax=ax, label="Mean |pred - truth|")
+        rect = Rectangle((-0.5 * PATCH_W, -0.5 * PATCH_H), PATCH_W, PATCH_H,
+                        fill=False, edgecolor="cyan", linewidth=1.6)
+        ax.add_patch(rect)
+        ax.axhline(0.0, color="white", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.axvline(0.0, color="white", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax.set_xlabel(r"$x - x_h$")
+        ax.set_ylabel(r"$y - y_h$")
+        ax.set_aspect("equal")
+        ax.set_title(
+            f"Mean Absolute Error Centered on Patch ({used} pairs; interface fixed at x=0.5)"
+        )
+        _save_figure(fig, save_path, "source", "patch_region_error_map", layout="constrained")
+
+
+def plot_source_field_snapshots(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    sim_id: int | None = None,
+    save_path: str | Path | None = None,
+):
+    """2x3 grid of Q(x,y,t) at representative times for one sim."""
+    if sim_id is None:
+        sim_id = _select_representative_source_sim_id(sim_params)
+    params = sim_params[int(sim_id)]
+    x_h = float(params["x_h"])
+    y_h = float(params["y_h"])
+    w_h = float(params["w_h"])
+    h_h = float(params["h_h"])
+    A = float(params["A"])
+    t_off = float(params["t_off"])
+    t_final = float(t_grid[-1])
+
+    X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
+    source = build_patch_source(X, Y, x_h, y_h, w_h, h_h, A, t_off)
+
+    times = np.array([
+        0.25 * t_off,
+        0.5 * t_off,
+        t_off,
+        0.5 * (t_off + t_final),
+        max(t_final - 1e-6, t_off + 1e-6),
+        min(0.1 * t_off, t_off * 0.05 + 1e-6),
+    ])
+    times.sort()
+
+    fields = np.stack([source(X, Y, float(t)) for t in times], axis=0)
+    vmin = float(np.min(fields))
+    vmax = float(np.max(fields))
+    interface_meta = _resolve_interface_metadata(sim_params=sim_params, sim_id=int(sim_id))
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+        pcm = None
+        for ax, t_val, fld in zip(axes.ravel(), times, fields):
+            pcm = _plot_field_2d(
+                ax, x_grid, y_grid, fld,
+                vmin=vmin, vmax=vmax,
+                interface_positions=interface_meta["positions"],
+            )
+            rect = Rectangle(
+                (x_h - 0.5 * w_h, y_h - 0.5 * h_h), w_h, h_h,
+                fill=False, edgecolor="cyan", linewidth=1.2,
+            )
+            ax.add_patch(rect)
+            ax.plot([x_h], [y_h], marker="x", color="cyan", markersize=8)
+            ax.set_title(f"t = {t_val:.3f}")
+
+        fig.colorbar(pcm, ax=axes.ravel().tolist(), label="Q(x, y, t)", shrink=0.92)
+        fig.suptitle(f"Source Field Snapshots — sim {sim_id} ({_format_patch_label(params)})")
+        _save_figure(fig, save_path, "source", "source_field_snapshots", layout="constrained")
+
+
+def plot_source_input_channels(
+    sim_params: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_id: int | None = None,
+    save_path: str | Path | None = None,
+):
+    """Render the SOURCE_BINS Q channels from a built dataset sample."""
+    if sim_id is None:
+        sim_id = _select_representative_source_sim_id(sim_params)
+    params = sim_params[int(sim_id)]
+    x_h = float(params["x_h"])
+    y_h = float(params["y_h"])
+    w_h = float(params["w_h"])
+    h_h = float(params["h_h"])
+    A = float(params["A"])
+    t_off = float(params["t_off"])
+    t_final = float(t_grid[-1])
+
+    X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
+    _, Q_bins = _build_source_bin_channels(
+        X, Y, x_h, y_h, w_h, h_h, A, t_off,
+        t_s=0.0, t_j=t_final, t_final=t_final,
+    )
+    n_panels = Q_bins.shape[-1]
+    nrows, ncols = _shared_thumbnail_grid(n_panels)
+
+    vmax = float(np.max(Q_bins))
+    interface_meta = _resolve_interface_metadata(sim_params=sim_params, sim_id=int(sim_id))
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows),
+                                constrained_layout=True)
+        axes_arr = np.atleast_2d(axes).ravel()
+        pcm = None
+        for k in range(n_panels):
+            ax = axes_arr[k]
+            pcm = _plot_field_2d(
+                ax, x_grid, y_grid, Q_bins[..., k],
+                cmap="magma", vmin=0.0, vmax=vmax,
+                interface_positions=interface_meta["positions"],
+            )
+            rect = Rectangle(
+                (x_h - 0.5 * w_h, y_h - 0.5 * h_h), w_h, h_h,
+                fill=False, edgecolor="cyan", linewidth=1.0,
+            )
+            ax.add_patch(rect)
+            ax.set_title(f"Q_{k}")
+        for k in range(n_panels, len(axes_arr)):
+            axes_arr[k].axis("off")
+
+        fig.colorbar(pcm, ax=list(axes_arr[:n_panels]),
+                    label="Q_k (normalized)", shrink=0.92)
+        fig.suptitle(
+            f"Source Channels Q_0..Q_{n_panels - 1} "
+            f"(SOURCE_BINS={SOURCE_BINS}, SPATIAL_IN_CHANNELS={SOURCE_SPATIAL_IN_CHANNELS} detected)"
+        )
+        _save_figure(fig, save_path, "source", "source_input_channels", layout="constrained")
+
+
+def plot_patch_overlay_trajectory(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    sim_ids: dict[str, int] | None = None,
+    save_path: str | Path | None = None,
+):
+    """One row per regime, 4 snapshots each, with patch rectangle overlay."""
+    if sim_ids is None:
+        sim_ids = _representative_sim_per_regime(sim_params)
+    if not sim_ids:
+        sim_ids = {"sim": _select_representative_source_sim_id(sim_params)}
+
+    snap_idx = np.linspace(0, len(t_grid) - 1, 4, dtype=int)
+    interface_meta = _resolve_interface_metadata()
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(len(sim_ids), len(snap_idx),
+                                figsize=(4.0 * len(snap_idx), 3.6 * len(sim_ids)),
+                                constrained_layout=True,
+                                squeeze=False)
+        for row, (label, sid) in enumerate(sim_ids.items()):
+            params = sim_params[int(sid)]
+            x_h = float(params["x_h"])
+            y_h = float(params["y_h"])
+            w_h = float(params["w_h"])
+            h_h = float(params["h_h"])
+            traj = trajectories[int(sid)]
+            row_fields = traj[snap_idx]
+            vmin = float(np.min(row_fields))
+            vmax = float(np.max(row_fields))
+            for col, t_idx in enumerate(snap_idx):
+                ax = axes[row, col]
+                pcm = _plot_field_2d(
+                    ax, x_grid, y_grid, traj[t_idx],
+                    vmin=vmin, vmax=vmax,
+                    interface_positions=interface_meta["positions"],
+                )
+                rect = Rectangle(
+                    (x_h - 0.5 * w_h, y_h - 0.5 * h_h), w_h, h_h,
+                    fill=False, edgecolor="cyan", linewidth=1.2,
+                )
+                ax.add_patch(rect)
+                ax.plot([x_h], [y_h], marker="x", color="cyan", markersize=8)
+                ax.set_title(
+                    f"{label} (sim {sid}) — t={t_grid[t_idx]:.3f}"
+                )
+                if col == len(snap_idx) - 1:
+                    fig.colorbar(pcm, ax=ax, shrink=0.8, label="T")
+
+        fig.suptitle("Patch Overlay Trajectory by Regime")
+        _save_figure(fig, save_path, "source", "patch_overlay_trajectory", layout="constrained")
+
+
+def plot_energy_budget(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    sim_id: int | None = None,
+    save_path: str | Path | None = None,
+):
+    """Compare injected, stored, and outgoing energy for one representative sim.
+
+    Assumes rho = cp = 1 (from CLAUDE.md) and right-wall material k=1
+    matching the source-itr experiment. Right-wall Dirichlet uses one-sided
+    cell-center to ghost difference, consistent with the FV solver stencil.
+    """
+    if sim_id is None:
+        sim_id = _select_representative_source_sim_id(sim_params)
+    params = sim_params[int(sim_id)]
+    x_h = float(params["x_h"])
+    y_h = float(params["y_h"])
+    w_h = float(params["w_h"])
+    h_h = float(params["h_h"])
+    A = float(params["A"])
+    t_off = float(params["t_off"])
+
+    Nx = len(x_grid)
+    Ny = len(y_grid)
+    dx = float(x_grid[1] - x_grid[0])
+    dy = float(y_grid[1] - y_grid[0])
+
+    cell_dx = np.full(Nx, dx)
+    cell_dx[0] = dx / 2.0
+    cell_dx[-1] = dx / 2.0
+    cell_dy = np.full(Ny, dy)
+    cell_dy[0] = dy / 2.0
+    cell_dy[-1] = dy / 2.0
+    cell_area = cell_dx[:, None] * cell_dy[None, :]
+
+    X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
+    indicator = make_patch_indicator(X, Y, x_h, y_h, w_h, h_h)
+    pulse = make_sin2_pulse(A, t_off)
+    a_t = np.array([pulse(float(t)) for t in t_grid], dtype=np.float64)
+    Q_per_cell_t = a_t[:, None, None] * indicator[None, ...]
+    integrand_t = np.sum(Q_per_cell_t * cell_area[None, ...], axis=(1, 2))
+    dt = np.diff(t_grid)
+    E_in = np.concatenate([[0.0], np.cumsum(0.5 * (integrand_t[1:] + integrand_t[:-1]) * dt)])
+
+    traj = trajectories[int(sim_id)].astype(np.float64)
+    T0_field = traj[0]
+    delta = traj - T0_field[None, ...]
+    E_stored = np.sum(delta * cell_area[None, ...], axis=(1, 2))
+
+    T_right_target = 300.0
+    k_right = 1.0
+    T_ghost = 2.0 * T_right_target - traj[:, -1, :]
+    flux_t = -k_right * (T_ghost - traj[:, -1, :]) / (dx / 2.0)
+    out_per_t = np.sum(flux_t * cell_dy[None, :], axis=1)
+    E_out_right = np.concatenate([[0.0], np.cumsum(0.5 * (out_per_t[1:] + out_per_t[:-1]) * dt)])
+
+    residual = E_in - E_stored - E_out_right
+
+    arrs = _patch_param_arrays(sim_params)
+    max_dev = np.array([
+        float(np.max(np.mean(trajectories[i] - trajectories[i, 0], axis=(1, 2))))
+        for i in range(len(sim_params))
+    ])
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
+
+        ax = axes[0]
+        ax.plot(t_grid, E_in, color="C0", label=r"$E_{in}$")
+        ax.plot(t_grid, E_stored, color="C2", label=r"$\Delta E_{stored}$")
+        ax.plot(t_grid, E_out_right, color="C3", label=r"$E_{out}^{right}$")
+        ax.set_xlabel("t")
+        ax.set_ylabel("Energy")
+        ax.legend(loc="upper left")
+        ax.grid(True)
+        ax.set_title(f"Energy Budget — sim {sim_id} ({_format_patch_label(params)})")
+        ax2 = ax.twinx()
+        ax2.plot(t_grid, residual, color="0.4", linestyle="--",
+                 label=r"residual $E_{in} - \Delta E_{stored} - E_{out}$")
+        ax2.set_ylabel("Residual")
+        ax2.legend(loc="lower right")
+
+        ax = axes[1]
+        ax.scatter(arrs["A"], max_dev, c="C1", alpha=0.7, edgecolors="none", s=18)
+        ax.set_xscale("log")
+        ax.set_xlabel("A")
+        ax.set_ylabel(r"$\max_t \langle T - T_0 \rangle_\Omega$")
+        ax.set_title("Response Scaling vs A")
+        ax.grid(True, which="both")
+
+        fig.suptitle("Energy Budget and Response Scaling")
+        _save_figure(fig, save_path, "source", "energy_budget", layout="constrained")
+
+
+# ============================================================
+# INTERFACES BENCHMARK — helpers
+# ============================================================
+
+_IC_FAMILY_ORDER = ("uniform_2d", "random_sinusoid_2d", "grf_2d", "hot_spot_2d")
+
+
+def _interface_x_array(sim_params: np.ndarray) -> np.ndarray:
+    """Return per-sim interface_x array."""
+    return np.array([float(p["interface_x"]) for p in sim_params], dtype=np.float64)
+
+
+def _pick_interface_quartile_sims(sim_params: np.ndarray) -> list[tuple[str, int]]:
+    """Pick one sim per interface_x quartile (Q1, Q2, Q3, Q4).
+
+    Returns a list of (label, sim_id). Order is from low to high interface_x.
+    Matches the existing breakdown style (no controlling for other params).
+    """
+    interface_x = _interface_x_array(sim_params)
+    n = len(interface_x)
+    if n == 0:
+        return []
+    order = np.argsort(interface_x)
+    picks: list[tuple[str, int]] = []
+    for q in range(4):
+        lo = q * n // 4
+        hi = (q + 1) * n // 4 if q < 3 else n
+        if hi <= lo:
+            continue
+        mid = lo + (hi - lo) // 2
+        sid = int(order[mid])
+        picks.append((f"Q{q + 1}", sid))
+    return picks
+
+
+def _pick_first_per_ic_family(sim_params: np.ndarray) -> list[tuple[str, int]]:
+    """Pick the first sim for each IC family present in sim_params."""
+    seen: dict[str, int] = {}
+    for i, p in enumerate(sim_params):
+        fam = p.get("ic_family")
+        if fam in _IC_FAMILY_ORDER and fam not in seen:
+            seen[fam] = i
+    return [(fam, seen[fam]) for fam in _IC_FAMILY_ORDER if fam in seen]
+
+
+# ============================================================
+# INTERFACES BENCHMARK — plots
+# ============================================================
+
+def plot_interface_y_perturbation(
+    trajectories: np.ndarray,
+    sim_id: int,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray | None = None,
+    t_window: tuple[float, float] = (0.0, 0.25),
+    save_path: str | Path | None = None,
+):
+    """Plot the y-perturbation T(x, y, t) - <T>_y(x, t) for one simulation.
+
+    Subtracting the y-mean exposes the y-structure imprinted by the spatial
+    flux profile, regardless of the absolute temperature scale.
+    """
+    Nt = trajectories.shape[1]
+    snap_main = _snap_indices_in_window(t_grid, t_window[0], t_window[1], 5)
+    post = np.array([Nt - 1], dtype=int)
+    snap_indices = np.unique(np.concatenate([snap_main, post]))
+
+    fields = trajectories[sim_id, snap_indices].astype(np.float32)  # (S, Nx, Ny)
+    perturbations = fields - fields.mean(axis=2, keepdims=True)
+    abs_max = max(float(np.max(np.abs(perturbations))), 1e-12)
+    interface_meta = _resolve_interface_metadata(sim_params=sim_params, sim_id=sim_id)
+
+    family_str = ""
+    if sim_params is not None:
+        family_str = f" — {_format_spatial_family(sim_params[sim_id])}"
+
+    with plt.rc_context(PLOT_STYLE):
+        nrows = 2
+        ncols = int(np.ceil(len(snap_indices) / nrows))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 4.4 * nrows), constrained_layout=True, squeeze=False)
+        axes_flat = axes.ravel()
+        pcm = None
+        for ax, t_idx, field in zip(axes_flat, snap_indices, perturbations):
+            pcm = _plot_field_2d(
+                ax,
+                x_grid,
+                y_grid,
+                field,
+                cmap="coolwarm",
+                vmin=-abs_max,
+                vmax=abs_max,
+                interface_positions=interface_meta["positions"],
+            )
+            ax.set_title(f"t = {t_grid[t_idx]:.3f}")
+        for ax in axes_flat[len(snap_indices):]:
+            ax.set_axis_off()
+
+        fig.colorbar(pcm, ax=axes_flat.tolist(), label=r"$T - \langle T \rangle_y$", shrink=0.9)
+        fig.suptitle(f"y-Perturbation — Simulation {sim_id}{family_str}")
+        _save_figure(fig, save_path, "interfaces", "interface_y_perturbation", layout="constrained")
+
+
+def plot_interface_lhs_scatter(
+    sim_params: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """Coverage summary for sampled conditioning parameters.
+
+    Amplitude / frequency are NaN for non-sin sims; nan-aware ops keep the sin
+    marginals visible while ignoring NaN entries (matplotlib drops them too).
+    """
+    amplitudes, frequencies, contact_resistance = _parameter_arrays(sim_params)
+
+    def _normalize(values: np.ndarray, log: bool = False) -> np.ndarray:
+        v = np.log10(values) if log else values
+        lo = np.nanmin(v)
+        hi = np.nanmax(v)
+        return (v - lo) / max(hi - lo, 1e-12)
+
+    normalized_marginals = [
+        ("A",        _normalize(amplitudes),                "C0"),
+        ("log10(f)", _normalize(frequencies, log=True),     "C3"),
+        ("R_c",      _normalize(contact_resistance),        "C2"),
+    ]
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+        scatter_specs = [
+            (axes[0, 0], amplitudes, frequencies, "Flux Amplitude (A)", "Flux Frequency (f)"),
+            (axes[0, 1], amplitudes, contact_resistance, "Flux Amplitude (A)", "Contact Resistance (R_c)"),
+            (axes[1, 0], frequencies, contact_resistance, "Flux Frequency (f)", "Contact Resistance (R_c)"),
+        ]
+        for ax, x_vals, y_vals, x_label, y_label in scatter_specs:
+            ax.scatter(x_vals, y_vals, s=16, alpha=0.45, color="C0", edgecolors="none")
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y_label)
+            ax.grid(True)
+            if "Frequency" in x_label:
+                ax.set_xscale("log")
+            if "Frequency" in y_label:
+                ax.set_yscale("log")
+
+        hist_ax = axes[1, 1]
+        bins = np.linspace(0.0, 1.0, 12)
+        for label, values, color in normalized_marginals:
+            hist_ax.hist(values, bins=bins, histtype="step", linewidth=1.8, label=label, color=color)
+        hist_ax.set_xlabel("Normalized parameter value")
+        hist_ax.set_ylabel("Count")
+        hist_ax.set_title("Marginal Coverage")
+        hist_ax.legend(loc="upper center")
+        hist_ax.grid(True)
+
+        fig.suptitle(f"Conditioning Parameter Coverage — {len(amplitudes)} simulations")
+        _save_figure(fig, save_path, "interfaces", "interface_lhs_scatter", layout="constrained")
+
+
+def plot_interface_flux_profiles(
+    t_on: float = 0.0,
+    t_off: float = 0.2,
+    t_final: float = 1.0,
+    save_path: str | Path | None = None,
+):
+    """Tile the new q_L(y, t) representation across patch / gaussian / triangle.
+
+    Row 0 (full width): shared temporal forcing a(t).
+    Rows 1-3: per family — s(y) | q_left(y, t) heatmap | q_x at t_peak.
+    """
+    layers = [
+        Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
+        Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+    ]
+    families = [
+        ("patch",    dict(y_c=0.50, w=0.30)),
+        ("gaussian", dict(y_c=0.50, sigma_y=0.08)),
+        ("triangle", dict(y_c=0.50, ell=0.20)),
+    ]
+    Nx, Ny = 60, 60
+    a_x, b_x, c_y, d_y = 0.0, 1.0, 0.0, 1.0
+    flux_A, flux_f, phase = 175.0, 10.5, 0.0
+    y_grid = np.linspace(c_y, d_y, Ny)
+
+    runs = []
+    for name, sp in families:
+        q_fn, s_vec = build_qL(
+            "sin",
+            dict(A=flux_A, f=flux_f, t_on=t_on, t_off=t_off, phase=phase),
+            name,
+            sp,
+            y_grid,
+        )
+        solver = FVSolver2D(
+            a=a_x, b=b_x, c=c_y, d=d_y,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.8,
+            layers=layers,
+            interface_R=[0.5],
+            t_final=t_final,
+            flux_f=flux_f,
+            flux_A=flux_A,
+            t_on=t_on,
+            t_off=t_off,
+            phase=phase,
+            dt=0.005,
+            q_left_fn=q_fn,
+        )
+        T0_demo = np.full((solver.Nx, solver.Ny), solver.T_right(0.0), dtype=float)
+        _, _, _, T_hist = solver.solve(T0=T0_demo, store_trajectory=True)
+        Q = _evaluate_q_left_field(solver)
+        t_peak = int(np.argmax(np.max(np.abs(Q), axis=1)))
+        dT = T_hist[t_peak, 1:, :] - T_hist[t_peak, :-1, :]
+        q_x = -solver.G_x * dT
+        runs.append({
+            "name": name, "sp": sp, "solver": solver, "T_hist": T_hist,
+            "Q": Q, "s_vec": s_vec, "q_x": q_x, "t_peak": t_peak,
+        })
+
+    run0 = runs[0]
+    j0 = int(np.argmax(np.abs(run0["s_vec"])))
+    s0 = float(run0["s_vec"][j0])
+    a_t_shared = run0["Q"][:, j0] / s0 if abs(s0) > 1e-12 else run0["Q"][:, j0]
+
+    q_x_global = max(float(np.max([np.max(np.abs(r["q_x"])) for r in runs])), 1e-8)
+    interface_meta = _resolve_interface_metadata(solver=runs[0]["solver"])
+
+    with plt.rc_context(PLOT_STYLE):
+        fig = plt.figure(figsize=(16, 13), constrained_layout=True)
+        gs = fig.add_gridspec(4, 3, height_ratios=[0.7, 1.0, 1.0, 1.0])
+
+        ax_at = fig.add_subplot(gs[0, :])
+        solver0 = runs[0]["solver"]
+        ax_at.plot(solver0.t, a_t_shared, color="C3")
+        ax_at.axvline(t_on, color="C2", linestyle=":", alpha=0.8, label=f"t_on={t_on}")
+        ax_at.axvline(t_off, color="C1", linestyle=":", alpha=0.8, label=f"t_off={t_off}")
+        ax_at.set_xlabel("Time")
+        ax_at.set_ylabel(r"$a(t)$")
+        ax_at.set_title("Temporal forcing (shared across families)")
+        ax_at.legend(loc="upper right")
+        ax_at.grid(True)
+
+        qx_axes = []
+        pcm_x = None
+        for row, run in enumerate(runs, start=1):
+            solver = run["solver"]
+            ax_s = fig.add_subplot(gs[row, 0])
+            ax_q = fig.add_subplot(gs[row, 1])
+            ax_qx = fig.add_subplot(gs[row, 2])
+
+            ax_s.plot(solver.grid_y, run["s_vec"], color="C0")
+            sp_str = ", ".join(f"{k}={v:.2f}" for k, v in run["sp"].items())
+            ax_s.set_xlabel("y")
+            ax_s.set_ylabel(r"$s(y)$")
+            ax_s.set_title(f"{run['name']}: {sp_str}")
+            ax_s.set_ylim(-0.1, 1.15)
+            ax_s.grid(True)
+
+            q_abs_row = max(float(np.max(np.abs(run["Q"]))), 1e-12)
+            pcm_q = ax_q.pcolormesh(
+                solver.t, solver.grid_y, run["Q"].T,
+                cmap="coolwarm", vmin=-q_abs_row, vmax=q_abs_row, shading="auto",
+            )
+            ax_q.axvline(t_on, color="0.2", linestyle=":", alpha=0.6)
+            ax_q.axvline(t_off, color="0.2", linestyle=":", alpha=0.6)
+            ax_q.set_xlabel("Time")
+            ax_q.set_ylabel("y")
+            ax_q.set_title(rf"$q_{{left}}(y,t)$ — {run['name']}")
+            fig.colorbar(pcm_q, ax=ax_q, shrink=0.9)
+
+            pcm_x = ax_qx.pcolormesh(
+                solver.face_positions_x, solver.grid_y, run["q_x"].T,
+                cmap="coolwarm", vmin=-q_x_global, vmax=q_x_global, shading="nearest",
+            )
+            _add_interface_lines(ax_qx, interface_meta["positions"])
+            ax_qx.set_xlabel("x-face position")
+            ax_qx.set_ylabel("y")
+            ax_qx.set_title(rf"$q_x$ at t={solver.t[run['t_peak']]:.3f}")
+            qx_axes.append(ax_qx)
+
+        fig.colorbar(pcm_x, ax=qx_axes, label=r"$q_x$", shrink=0.85)
+        fig.suptitle("Boundary Flux Demo — Spatial Family Tiling")
+        _save_figure(fig, save_path, "interfaces", "interface_flux_profiles", layout="constrained")
+
+
+def plot_vary_interface_lhs_scatter(
+    sim_params: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """Coverage summary for the vary-interfaces sampling space.
+
+    The LHS sampler covers (R_c, interface_x) jointly; sin amplitude and
+    frequency are drawn independently per sim. This plot surfaces all four
+    axes so coverage gaps are obvious at a glance.
+    """
+    amplitudes, frequencies, R_c = _parameter_arrays(sim_params)
+    interface_x = _interface_x_array(sim_params)
+    n_sims = len(interface_x)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+
+        ax = axes[0, 0]
+        ax.scatter(interface_x, R_c, s=18, alpha=0.55, color="C0", edgecolors="none")
+        ax.set_xlabel(r"Interface location $x_I$")
+        ax.set_ylabel(r"Contact resistance $R_c$")
+        ax.set_title(r"LHS coverage: $x_I$ vs $R_c$")
+        ax.grid(True)
+        ax.set_xlim(INTERFACE_X_RANGE)
+        ax.set_ylim(RC_RANGE)
+
+        ax = axes[0, 1]
+        ax.scatter(amplitudes, frequencies, s=18, alpha=0.55, color="C3", edgecolors="none")
+        ax.set_xlabel(r"Sin amplitude $A$")
+        ax.set_ylabel(r"Sin frequency $f$")
+        ax.set_title(r"Per-sim sin sampler: $A$ vs $f$")
+        ax.set_yscale("log")
+        ax.grid(True)
+
+        ax = axes[0, 2]
+        ax.scatter(interface_x, amplitudes, s=18, alpha=0.55, color="C2", edgecolors="none")
+        ax.set_xlabel(r"Interface location $x_I$")
+        ax.set_ylabel(r"Sin amplitude $A$")
+        ax.set_title(r"$x_I$ vs $A$ (independence check)")
+        ax.grid(True)
+        ax.set_xlim(INTERFACE_X_RANGE)
+
+        ax = axes[1, 0]
+        ax.hist(interface_x, bins=20, color="C0", edgecolor="white")
+        for x_lim in INTERFACE_X_RANGE:
+            ax.axvline(x_lim, color="0.4", linestyle=":", linewidth=1.0)
+        ax.set_xlabel(r"$x_I$")
+        ax.set_ylabel("Count")
+        ax.set_title(r"$x_I$ marginal")
+        ax.grid(True)
+
+        ax = axes[1, 1]
+        ax.hist(R_c, bins=20, color="C2", edgecolor="white")
+        for x_lim in RC_RANGE:
+            ax.axvline(x_lim, color="0.4", linestyle=":", linewidth=1.0)
+        ax.set_xlabel(r"$R_c$")
+        ax.set_ylabel("Count")
+        ax.set_title(r"$R_c$ marginal")
+        ax.grid(True)
+
+        ax = axes[1, 2]
+        amp_norm = (amplitudes - SIN_AMP_RANGE[0]) / max(SIN_AMP_RANGE[1] - SIN_AMP_RANGE[0], 1e-12)
+        log_lo, log_hi = np.log(SIN_FREQ_RANGE[0]), np.log(SIN_FREQ_RANGE[1])
+        freq_norm = (np.log(frequencies) - log_lo) / max(log_hi - log_lo, 1e-12)
+        bins = np.linspace(0.0, 1.0, 16)
+        ax.hist(amp_norm, bins=bins, histtype="step", linewidth=1.8, label="A (linear)", color="C3")
+        ax.hist(freq_norm, bins=bins, histtype="step", linewidth=1.8, label="f (log)", color="C1")
+        ax.set_xlabel("Normalized value")
+        ax.set_ylabel("Count")
+        ax.set_title("Sin A / f marginals")
+        ax.legend(loc="upper center")
+        ax.grid(True)
+
+        fig.suptitle(f"Vary-Interfaces LHS Coverage — {n_sims} simulations", fontsize=13)
+        _save_figure(fig, save_path, "interfaces", "vary_interface_lhs_scatter", layout="constrained")
+
+
+def plot_interface_x_breakdown(
+    trajectories: np.ndarray,
+    sim_params: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    t_window: tuple[float, float] = (0.0, 0.20),
+    n_snaps: int = 4,
+    save_path: str | Path | None = None,
+):
+    """Tile field snapshots across interface_x quartiles.
+
+    Rows: one representative sim per interface_x quartile (Q1..Q4).
+    Cols: ``n_snaps`` snapshots in the flux-active window.
+    Each row uses its own colorbar and overlays its sim's interface_x.
+    """
+    picks = _pick_interface_quartile_sims(sim_params)
+    if not picks:
+        raise ValueError("No sims available for interface_x breakdown.")
+
+    snap_indices = _snap_indices_in_window(t_grid, t_window[0], t_window[1], n_snaps)
+    nrows = len(picks)
+    ncols = len(snap_indices)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(3.8 * ncols + 1.5, 3.6 * nrows),
+            constrained_layout=True, squeeze=False,
+        )
+        for r, (qlabel, sid) in enumerate(picks):
+            fields = trajectories[sid, snap_indices].astype(np.float32)
+            vmin = float(np.min(fields))
+            vmax = float(np.max(fields))
+            iface = _resolve_interface_metadata(sim_params=sim_params, sim_id=sid)
+            row_pcm = None
+            for c, (t_idx, field) in enumerate(zip(snap_indices, fields)):
+                ax = axes[r, c]
+                row_pcm = _plot_field_2d(
+                    ax, x_grid, y_grid, field,
+                    cmap="inferno", vmin=vmin, vmax=vmax,
+                    interface_positions=iface["positions"],
+                )
+                if r == 0:
+                    ax.set_title(f"t = {t_grid[t_idx]:.3f}")
+                if c != 0:
+                    ax.set_ylabel("")
+            row_label = (
+                f"{qlabel}\nsim {sid}\n"
+                f"$x_I$={iface['interface_x']:.3f}\n"
+                f"$R_c$={float(sim_params[sid]['R_c']):.2f}"
+            )
+            axes[r, 0].annotate(
+                row_label,
+                xy=(-0.32, 0.5), xycoords="axes fraction",
+                ha="right", va="center", fontsize=10,
+            )
+            fig.colorbar(row_pcm, ax=axes[r, :].tolist(), label="Temperature", shrink=0.85)
+
+        fig.suptitle(r"Interface-Location Breakdown — fields per $x_I$ quartile", fontsize=14)
+        _save_figure(fig, save_path, "interfaces", "interface_x_breakdown", layout="constrained")
+
+
+def plot_sin_forcing_profiles(
+    t_on: float = 0.0,
+    t_off: float = 0.2,
+    t_final: float = 0.3,
+    dt: float = 0.005,
+    save_path: str | Path | None = None,
+):
+    """Visualize the windowed-sinusoid forcing space (sin-only experiment).
+
+    Mirrors ``plot_interface_flux_profiles`` but focused on the sin family
+    alone. Shows a(t) at four (A, f) corners, the uniform spatial profile, and
+    the q_L(y,t) heatmap at the high-A/high-f corner. No external data — uses
+    ``build_qL`` directly like the legacy flux profile plot.
+    """
+    Ny = 60
+    y_grid = np.linspace(0.0, 1.0, Ny)
+    t = np.arange(0.0, t_final + 1e-12, dt)
+
+    A_lo, A_hi = SIN_AMP_RANGE
+    f_lo, f_hi = SIN_FREQ_RANGE
+    corners = [
+        ("low-A / low-f",   A_lo, f_lo, "C0"),
+        ("low-A / high-f",  A_lo, f_hi, "C1"),
+        ("high-A / low-f",  A_hi, f_lo, "C2"),
+        ("high-A / high-f", A_hi, f_hi, "C3"),
+    ]
+
+    a_t_per_corner: list[tuple[str, np.ndarray, str]] = []
+    q_high_high = None
+    s_vec_uniform = None
+    for label, A, f, color in corners:
+        q_fn, s_vec = build_qL(
+            "sin",
+            dict(A=A, f=f, t_on=t_on, t_off=t_off, phase=0.0, tukey_alpha=0.5),
+            "uniform", {}, y_grid,
+        )
+        if s_vec_uniform is None:
+            s_vec_uniform = np.asarray(s_vec, dtype=np.float64)
+        Q = np.array([np.asarray(q_fn(ti), dtype=np.float64) for ti in t])
+        if Q.ndim == 2:
+            j0 = int(np.argmax(np.abs(s_vec_uniform)))
+            a_t = Q[:, j0] / max(float(s_vec_uniform[j0]), 1e-12)
+        else:
+            a_t = Q
+        a_t_per_corner.append((label, a_t, color))
+        if label == "high-A / high-f":
+            if Q.ndim == 1:
+                Q = np.broadcast_to(Q[:, None], (len(t), Ny)).copy()
+            q_high_high = Q
+
+    with plt.rc_context(PLOT_STYLE):
+        fig = plt.figure(figsize=(15, 9), constrained_layout=True)
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.1])
+
+        ax_at = fig.add_subplot(gs[0, 0])
+        for label, a_t, color in a_t_per_corner:
+            ax_at.plot(t, a_t, color=color, label=label, linewidth=1.6)
+        ax_at.axvline(t_on, color="0.45", linestyle=":", alpha=0.8, label=f"t_on={t_on}")
+        ax_at.axvline(t_off, color="0.25", linestyle=":", alpha=0.8, label=f"t_off={t_off}")
+        ax_at.set_xlabel("Time")
+        ax_at.set_ylabel(r"$a(t)$")
+        ax_at.set_title("Windowed-sinusoid temporal forcing at (A, f) corners")
+        ax_at.legend(loc="upper right", fontsize=8)
+        ax_at.grid(True)
+
+        ax_sy = fig.add_subplot(gs[0, 1])
+        ax_sy.plot(y_grid, s_vec_uniform, color="C0", linewidth=2.0)
+        ax_sy.set_ylim(-0.1, 1.15)
+        ax_sy.set_xlabel("y")
+        ax_sy.set_ylabel(r"$s(y)$")
+        ax_sy.set_title("Uniform spatial profile (only family in this experiment)")
+        ax_sy.grid(True)
+
+        ax_q = fig.add_subplot(gs[1, :])
+        q_abs = max(float(np.max(np.abs(q_high_high))), 1e-12)
+        pcm = ax_q.pcolormesh(
+            t, y_grid, q_high_high.T,
+            cmap="coolwarm", vmin=-q_abs, vmax=q_abs, shading="auto",
+        )
+        ax_q.axvline(t_on, color="0.2", linestyle=":", alpha=0.6)
+        ax_q.axvline(t_off, color="0.2", linestyle=":", alpha=0.6)
+        ax_q.set_xlabel("Time")
+        ax_q.set_ylabel("y")
+        ax_q.set_title(rf"$q_L(y, t)$ at high-A / high-f corner (A={A_hi:.0f}, f={f_hi:.1f})")
+        fig.colorbar(pcm, ax=ax_q, label=r"$q_L$", shrink=0.85)
+
+        fig.suptitle("Sin Forcing Profiles — vary-interfaces experiment", fontsize=13)
+        _save_figure(fig, save_path, "interfaces", "sin_forcing_profiles", layout="constrained")
+
+
+def plot_ic_family_trajectory_breakdown(
+    trajectories: np.ndarray,
+    sim_params: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    t_window: tuple[float, float] = (0.0, 0.20),
+    n_snaps: int = 4,
+    save_path: str | Path | None = None,
+):
+    """Tile T - <T>(t) snapshots for one representative sim per IC family.
+
+    Rows: IC families (``uniform_2d``, ``random_sinusoid_2d``, ``grf_2d``,
+    ``hot_spot_2d``). Cols: ``n_snaps`` snapshots in the flux-active window.
+    Subtracts the per-snapshot scalar mean so uniform_2d still shows IC
+    texture (unlike y-perturbation, which would render uniform as blank).
+    Skips families that are not present in ``sim_params``.
+    """
+    picks = _pick_first_per_ic_family(sim_params)
+    if not picks:
+        raise ValueError("No sims with a recognized IC family.")
+
+    snap_indices = _snap_indices_in_window(t_grid, t_window[0], t_window[1], n_snaps)
+    nrows = len(picks)
+    ncols = len(snap_indices)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(3.8 * ncols + 1.5, 3.6 * nrows),
+            constrained_layout=True, squeeze=False,
+        )
+        for r, (fam, sid) in enumerate(picks):
+            fields = trajectories[sid, snap_indices].astype(np.float32)
+            scalar_means = fields.mean(axis=(1, 2), keepdims=True)
+            perturbations = fields - scalar_means
+            abs_max = max(float(np.max(np.abs(perturbations))), 1e-12)
+            iface = _resolve_interface_metadata(sim_params=sim_params, sim_id=sid)
+            row_pcm = None
+            for c, (t_idx, field) in enumerate(zip(snap_indices, perturbations)):
+                ax = axes[r, c]
+                row_pcm = _plot_field_2d(
+                    ax, x_grid, y_grid, field,
+                    cmap="coolwarm", vmin=-abs_max, vmax=abs_max,
+                    interface_positions=iface["positions"],
+                )
+                if r == 0:
+                    ax.set_title(f"t = {t_grid[t_idx]:.3f}")
+                if c != 0:
+                    ax.set_ylabel("")
+            row_label = (
+                f"{fam}\nsim {sid}\n"
+                f"$x_I$={iface['interface_x']:.3f}"
+            )
+            axes[r, 0].annotate(
+                row_label,
+                xy=(-0.32, 0.5), xycoords="axes fraction",
+                ha="right", va="center", fontsize=10,
+            )
+            fig.colorbar(row_pcm, ax=axes[r, :].tolist(), label=r"$T - \langle T \rangle$", shrink=0.85)
+
+        fig.suptitle("IC-Family Breakdown — per-snapshot mean removed", fontsize=14)
+        _save_figure(fig, save_path, "interfaces", "ic_family_trajectory_breakdown", layout="constrained")
+
+
+def plot_vary_interface_dataset_summary(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    sim_params: np.ndarray,
+    config: dict,
+    representative_sim_id: int | None = None,
+    save_path: str | Path | None = None,
+):
+    """Report-style overview of the vary-interfaces dataset.
+
+    Mirrors ``plot_dataset_summary`` but surfaces the new axes:
+    interface_x, sin A/f histograms, and IC-family counts.
+    """
+    config = _resolve_plot_config(config)
+    amplitudes, frequencies, R_c = _parameter_arrays(sim_params)
+    interface_x = _interface_x_array(sim_params)
+    sim_id = (
+        _select_representative_sim_id(sim_params) if representative_sim_id is None
+        else int(representative_sim_id)
+    )
+    iface = _resolve_interface_metadata(
+        config=config, sim_params=sim_params, sim_id=sim_id,
+    )
+    coverage = _lead_time_coverage_counts(trajectories, x_grid, y_grid, t_grid, sim_params, config)
+
+    ic_families = np.array(
+        [str(p.get("ic_family", "?")) for p in sim_params], dtype=object,
+    )
+    fam_counts = {fam: int(np.sum(ic_families == fam)) for fam in _IC_FAMILY_ORDER}
+
+    max_lead = max(
+        float(coverage["train"].max()) if len(coverage["train"]) > 0 else 0.0,
+        float(coverage["val"].max()) if len(coverage["val"]) > 0 else 0.0,
+        float(coverage["test"].max()) if len(coverage["test"]) > 0 else 0.0,
+        float(t_grid[-1] - t_grid[0]),
+    )
+    lead_bins = np.linspace(0.0, max_lead, 16)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+        temp_fields = np.stack([trajectories[sim_id, 0], trajectories[sim_id, -1]])
+        temp_vmin = float(np.min(temp_fields))
+        temp_vmax = float(np.max(temp_fields))
+        pcm = _plot_field_2d(
+            axes[0, 0], x_grid, y_grid, trajectories[sim_id, 0],
+            vmin=temp_vmin, vmax=temp_vmax,
+            interface_positions=iface["positions"],
+        )
+        axes[0, 0].set_title(f"Representative IC — sim {sim_id}, $x_I$={iface['interface_x']:.3f}")
+
+        _plot_field_2d(
+            axes[0, 1], x_grid, y_grid, trajectories[sim_id, -1],
+            vmin=temp_vmin, vmax=temp_vmax,
+            interface_positions=iface["positions"],
+        )
+        axes[0, 1].set_title(f"Representative Final — t={t_grid[-1]:.3f}")
+
+        axes[0, 2].hist(interface_x, bins=20, color="C0", edgecolor="white")
+        for x_lim in INTERFACE_X_RANGE:
+            axes[0, 2].axvline(x_lim, color="0.4", linestyle=":", linewidth=1.0)
+        axes[0, 2].set_xlabel(r"$x_I$")
+        axes[0, 2].set_ylabel("Count")
+        axes[0, 2].set_title(r"Interface location $x_I$")
+        axes[0, 2].grid(True)
+
+        axes[1, 0].hist(R_c, bins=20, color="C2", edgecolor="white")
+        for x_lim in RC_RANGE:
+            axes[1, 0].axvline(x_lim, color="0.4", linestyle=":", linewidth=1.0)
+        axes[1, 0].set_xlabel(r"$R_c$")
+        axes[1, 0].set_ylabel("Count")
+        axes[1, 0].set_title(r"Contact resistance $R_c$")
+        axes[1, 0].grid(True)
+
+        ax_a = axes[1, 1]
+        ax_a.hist(amplitudes, bins=20, color="C3", alpha=0.55, edgecolor="white", label="A (linear)")
+        ax_a.set_xlabel(r"$A$ (linear)")
+        ax_a.set_ylabel("Count (A)", color="C3")
+        ax_a.tick_params(axis="y", labelcolor="C3")
+        ax_f = ax_a.twiny()
+        log_lo, log_hi = np.log10(SIN_FREQ_RANGE[0]), np.log10(SIN_FREQ_RANGE[1])
+        log_bins = np.logspace(log_lo, log_hi, 20)
+        ax_f.hist(frequencies, bins=log_bins, color="C1", alpha=0.55,
+                  edgecolor="white", label="f (log)")
+        ax_f.set_xscale("log")
+        ax_f.set_xlabel(r"$f$ (log)", color="C1")
+        ax_f.tick_params(axis="x", labelcolor="C1")
+        ax_a.set_title("Sin amplitude / frequency")
+        ax_a.grid(True)
+
+        labels = list(fam_counts.keys())
+        counts = [fam_counts[f] for f in labels]
+        bar_colors = ["C0", "C1", "C2", "C3"]
+        axes[1, 2].bar(labels, counts, color=bar_colors, edgecolor="white")
+        axes[1, 2].set_ylabel("Sim count")
+        axes[1, 2].set_title("IC family counts")
+        axes[1, 2].tick_params(axis="x", rotation=20)
+        axes[1, 2].grid(True, axis="y")
+        inset = axes[1, 2].inset_axes([0.55, 0.55, 0.43, 0.40])
+        for label, values, color in [
+            ("Train", coverage["train"], "C0"),
+            ("Val", coverage["val"], "C2"),
+            ("Test", coverage["test"], "C3"),
+        ]:
+            if len(values) > 0:
+                inset.hist(values, bins=lead_bins, histtype="step", linewidth=1.2,
+                           label=label, color=color)
+        inset.set_title("Lead time", fontsize=8)
+        inset.tick_params(axis="both", labelsize=7)
+        inset.legend(loc="upper right", fontsize=6)
+
+        fig.colorbar(pcm, ax=axes[0, :2].tolist(), label="Temperature", shrink=0.92)
+
+        fig.suptitle(
+            f"Vary-Interfaces Dataset Summary — {len(sim_params)} sims",
+            fontsize=14,
+        )
+        _save_figure(fig, save_path, "interfaces", "vary_interface_dataset_summary", layout="constrained")

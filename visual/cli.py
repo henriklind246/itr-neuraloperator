@@ -15,6 +15,7 @@ from visual import (
     dataset_plots,
     forcing_plots,
     mms_plots,
+    paper_plots,
     physics_plots,
     sweep_plots,
     training_plots,
@@ -30,6 +31,7 @@ def main():
       python -m visual.cli --group training --csv <path> --out visual/
       python -m visual.cli --group data --data <path> --x-grid <path> --y-grid <path> --t-grid <path> --params <path> --out visual/
       python -m visual.cli --group sweep --experiment <path> --runs <path> --out visual/
+      python -m visual.cli --group paper --records <test_records.csv> --out visual/
       python -m visual.cli --plots prediction_vs_truth lead_time_error --checkpoint <path> --out visual/
 
     Optional data flags:
@@ -64,9 +66,19 @@ def main():
                         help="Which seed to show in convergence plot (default: 0)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint (for interface_error plot)")
+    parser.add_argument("--breakdown", type=str, default=None,
+                        help="Path to breakdown.json (for regime_error_breakdown)")
+    parser.add_argument("--records", type=str, default=None,
+                        help="Path to test_records.csv (paper figures)")
+    parser.add_argument("--records-forcing", type=str, default=None,
+                        help="Path to forcing test_records.csv (combined paper figures)")
+    parser.add_argument("--records-source", type=str, default=None,
+                        help="Path to source test_records.csv (combined paper figures)")
+    parser.add_argument("--records-interfaces", type=str, default=None,
+                        help="Path to interfaces test_records.csv (combined paper figures)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
-                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep"],
+                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper"],
                         help="Which plot group(s) to generate (default: all)")
     parser.add_argument("--plots", type=str, nargs="+", default=None,
                         help="Individual plot names to generate (overrides --group)")
@@ -109,6 +121,10 @@ def main():
         if _should_run("heat_flux_profile", groups, individual):
             print("--- heat_flux_profile ---")
             physics_plots.plot_heat_flux_profile(solver, T_hist, save_path=physics_dir / "heat_flux_profile.png")
+
+        if _should_run("bc_verification", groups, individual):
+            print("--- bc_verification ---")
+            physics_plots.plot_bc_verification(solver, T_hist, save_path=physics_dir / "bc_verification.png")
 
     # ---- MMS GROUP ----
     mms_plot_names = _plots_for_group("mms")
@@ -465,6 +481,342 @@ def main():
             else:
                 _print_skip("forcing_param_distributions_empirical", "need --params")
 
+    # ---- SOURCE GROUP ----
+    source_plot_names = _plots_for_group("source")
+    need_source = any(_should_run(p, groups, individual) for p in source_plot_names)
+
+    if need_source:
+        print("=== SOURCE GROUP ===")
+        source_dir = out_dir / "source"
+        checkpoint_conf = None
+        model = None
+
+        sim_params = None
+        if args.params:
+            sim_params = np.load(args.params, allow_pickle=True)
+
+        grid_data_plots = {
+            "source_dataset_summary",
+            "source_temporal_profile",
+            "source_field_snapshots",
+            "source_input_channels",
+            "patch_overlay_trajectory",
+            "energy_budget",
+            "patch_param_scatter",
+            "source_error_vs_params",
+            "source_interface_zone_error",
+            "patch_error_slices",
+            "patch_region_error_map",
+        }
+        needs_grid_data = any(_should_run(name, groups, individual) for name in grid_data_plots)
+        trajectories = x_grid = y_grid = t_grid = None
+        plot_config = None
+        split_datasets = None
+        solver_dt = None
+        if needs_grid_data:
+            if args.data and args.x_grid and args.y_grid and args.t_grid:
+                print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.y_grid}, {args.t_grid} ...")
+                trajectories, x_grid, y_grid, t_grid = dataset_plots._load_plot_data(args.data, args.x_grid, args.y_grid, args.t_grid)
+                from data.dataset import load_solver_dt
+                solver_dt = load_solver_dt(args.t_grid)
+            else:
+                for name in grid_data_plots:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "need --data, --x-grid, --y-grid, and --t-grid")
+
+        model_plot_names = {
+            "source_error_vs_params",
+            "source_interface_zone_error",
+            "patch_error_slices",
+            "patch_region_error_map",
+        }
+        needs_model = any(_should_run(name, groups, individual) for name in model_plot_names)
+        if needs_model and args.checkpoint:
+            try:
+                model, checkpoint_conf = dataset_plots._load_checkpoint_model(args.checkpoint)
+            except ValueError as exc:
+                for name in model_plot_names:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, str(exc))
+        elif needs_model:
+            for name in model_plot_names:
+                if _should_run(name, groups, individual):
+                    _print_skip(name, "need --checkpoint")
+
+        if trajectories is not None and sim_params is not None:
+            plot_config = dataset_plots._resolve_plot_config(checkpoint_conf)
+            split_datasets = dataset_plots._build_split_datasets(
+                trajectories, x_grid, y_grid, t_grid, sim_params, plot_config,
+                dt=solver_dt,
+            )
+
+        if trajectories is not None and sim_params is not None:
+            if _should_run("patch_param_scatter", groups, individual):
+                print("--- patch_param_scatter ---")
+                dataset_plots.plot_patch_param_scatter(
+                    sim_params, save_path=source_dir / "patch_param_scatter.png")
+
+            if _should_run("source_temporal_profile", groups, individual):
+                print("--- source_temporal_profile ---")
+                dataset_plots.plot_source_temporal_profile(
+                    sim_params, t_grid, save_path=source_dir / "source_temporal_profile.png")
+
+            if _should_run("source_field_snapshots", groups, individual):
+                print("--- source_field_snapshots ---")
+                dataset_plots.plot_source_field_snapshots(
+                    trajectories, x_grid, y_grid, t_grid, sim_params,
+                    save_path=source_dir / "source_field_snapshots.png")
+
+            if _should_run("source_input_channels", groups, individual):
+                print("--- source_input_channels ---")
+                dataset_plots.plot_source_input_channels(
+                    sim_params, x_grid, y_grid, t_grid,
+                    save_path=source_dir / "source_input_channels.png")
+
+            if _should_run("patch_overlay_trajectory", groups, individual):
+                print("--- patch_overlay_trajectory ---")
+                dataset_plots.plot_patch_overlay_trajectory(
+                    trajectories, x_grid, y_grid, t_grid, sim_params,
+                    save_path=source_dir / "patch_overlay_trajectory.png")
+
+            if _should_run("energy_budget", groups, individual):
+                print("--- energy_budget ---")
+                dataset_plots.plot_energy_budget(
+                    trajectories, x_grid, y_grid, t_grid, sim_params,
+                    save_path=source_dir / "energy_budget.png")
+
+            if split_datasets is not None and _should_run("source_dataset_summary", groups, individual):
+                print("--- source_dataset_summary ---")
+                dataset_plots.plot_source_dataset_summary(
+                    trajectories, x_grid, y_grid, t_grid, sim_params,
+                    config=plot_config, save_path=source_dir / "source_dataset_summary.png")
+
+            if model is not None and split_datasets is not None:
+                test_dataset = split_datasets["test"]
+                if _should_run("source_error_vs_params", groups, individual):
+                    print("--- source_error_vs_params ---")
+                    dataset_plots.plot_source_error_vs_params(
+                        model, test_dataset, x_grid, y_grid,
+                        config=plot_config, save_path=source_dir / "source_error_vs_params.png")
+
+                if _should_run("source_interface_zone_error", groups, individual):
+                    print("--- source_interface_zone_error ---")
+                    dataset_plots.plot_source_interface_zone_error(
+                        model, test_dataset, x_grid, y_grid,
+                        config=plot_config, save_path=source_dir / "source_interface_zone_error.png")
+
+                if _should_run("patch_error_slices", groups, individual):
+                    print("--- patch_error_slices ---")
+                    dataset_plots.plot_patch_error_slices(
+                        model, test_dataset, x_grid, y_grid,
+                        config=plot_config, sim_params=sim_params,
+                        save_path=source_dir / "patch_error_slices.png")
+
+                if _should_run("patch_region_error_map", groups, individual):
+                    print("--- patch_region_error_map ---")
+                    dataset_plots.plot_patch_region_error_map(
+                        model, test_dataset, x_grid, y_grid, sim_params,
+                        config=plot_config, save_path=source_dir / "patch_region_error_map.png")
+        elif needs_grid_data and trajectories is not None and sim_params is None:
+            for name in grid_data_plots:
+                if _should_run(name, groups, individual):
+                    _print_skip(name, "need --params")
+
+        if _should_run("regime_error_breakdown", groups, individual):
+            breakdown_path = args.breakdown
+            if breakdown_path is None and args.checkpoint:
+                candidate = Path(args.checkpoint).parent / "breakdown.json"
+                if candidate.is_file():
+                    breakdown_path = str(candidate)
+            if breakdown_path is not None:
+                print("--- regime_error_breakdown ---")
+                dataset_plots.plot_regime_error_breakdown(
+                    breakdown_path, save_path=source_dir / "regime_error_breakdown.png")
+            else:
+                _print_skip("regime_error_breakdown", "need --breakdown or checkpoint dir")
+
+    # ---- INTERFACES GROUP ----
+    interfaces_plot_names = _plots_for_group("interfaces")
+    need_interfaces = any(_should_run(p, groups, individual) for p in interfaces_plot_names)
+
+    if need_interfaces:
+        print("=== INTERFACES GROUP ===")
+        interfaces_dir = out_dir / "interfaces"
+
+        # Self-contained plots — no data files needed.
+        if _should_run("interface_flux_profiles", groups, individual):
+            print("--- interface_flux_profiles ---")
+            dataset_plots.plot_interface_flux_profiles(
+                save_path=interfaces_dir / "interface_flux_profiles.png")
+
+        if _should_run("sin_forcing_profiles", groups, individual):
+            print("--- sin_forcing_profiles ---")
+            dataset_plots.plot_sin_forcing_profiles(
+                save_path=interfaces_dir / "sin_forcing_profiles.png")
+
+        sim_params = None
+        if args.params:
+            sim_params = np.load(args.params, allow_pickle=True)
+
+        grid_data_plots = {
+            "interface_y_perturbation",
+            "interface_x_breakdown",
+            "ic_family_trajectory_breakdown",
+            "vary_interface_dataset_summary",
+        }
+        param_only_plots = {"interface_lhs_scatter", "vary_interface_lhs_scatter"}
+        needs_grid_data = any(_should_run(name, groups, individual) for name in grid_data_plots)
+        trajectories = x_grid = y_grid = t_grid = None
+        plot_config = None
+        split_datasets = None
+        solver_dt = None
+        if needs_grid_data:
+            if args.data and args.x_grid and args.y_grid and args.t_grid:
+                print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.y_grid}, {args.t_grid} ...")
+                trajectories, x_grid, y_grid, t_grid = dataset_plots._load_plot_data(args.data, args.x_grid, args.y_grid, args.t_grid)
+                from data.dataset import load_solver_dt
+                solver_dt = load_solver_dt(args.t_grid)
+            else:
+                for name in grid_data_plots:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "need --data, --x-grid, --y-grid, and --t-grid")
+
+        if sim_params is not None:
+            if _should_run("interface_lhs_scatter", groups, individual):
+                print("--- interface_lhs_scatter ---")
+                dataset_plots.plot_interface_lhs_scatter(
+                    sim_params, save_path=interfaces_dir / "interface_lhs_scatter.png")
+
+            if _should_run("vary_interface_lhs_scatter", groups, individual):
+                print("--- vary_interface_lhs_scatter ---")
+                dataset_plots.plot_vary_interface_lhs_scatter(
+                    sim_params, save_path=interfaces_dir / "vary_interface_lhs_scatter.png")
+        else:
+            for name in param_only_plots:
+                if _should_run(name, groups, individual):
+                    _print_skip(name, "need --params")
+
+        if trajectories is not None and sim_params is not None:
+            plot_config = dataset_plots._resolve_plot_config(None)
+            highlight_sid = dataset_plots._select_localized_sim_id(sim_params)
+
+            if _should_run("interface_y_perturbation", groups, individual):
+                print("--- interface_y_perturbation ---")
+                dataset_plots.plot_interface_y_perturbation(
+                    trajectories, highlight_sid, x_grid, y_grid, t_grid,
+                    sim_params=sim_params,
+                    save_path=interfaces_dir / "interface_y_perturbation.png")
+
+            if _should_run("interface_x_breakdown", groups, individual):
+                print("--- interface_x_breakdown ---")
+                dataset_plots.plot_interface_x_breakdown(
+                    trajectories, sim_params, x_grid, y_grid, t_grid,
+                    save_path=interfaces_dir / "interface_x_breakdown.png")
+
+            if _should_run("ic_family_trajectory_breakdown", groups, individual):
+                print("--- ic_family_trajectory_breakdown ---")
+                dataset_plots.plot_ic_family_trajectory_breakdown(
+                    trajectories, sim_params, x_grid, y_grid, t_grid,
+                    save_path=interfaces_dir / "ic_family_trajectory_breakdown.png")
+
+            if _should_run("vary_interface_dataset_summary", groups, individual):
+                print("--- vary_interface_dataset_summary ---")
+                dataset_plots.plot_vary_interface_dataset_summary(
+                    trajectories, x_grid, y_grid, t_grid, sim_params,
+                    config=plot_config,
+                    save_path=interfaces_dir / "vary_interface_dataset_summary.png")
+        elif needs_grid_data and trajectories is not None and sim_params is None:
+            for name in grid_data_plots:
+                if _should_run(name, groups, individual):
+                    _print_skip(name, "need --params")
+
+    # ---- PAPER GROUP ----
+    paper_plot_names = _plots_for_group("paper")
+    need_paper = any(_should_run(p, groups, individual) for p in paper_plot_names)
+
+    if need_paper:
+        print("=== PAPER GROUP ===")
+        paper_dir = out_dir / "paper"
+
+        active_records = None
+        records_path = args.records or args.csv
+        if records_path:
+            active_records = paper_plots._load_test_records(records_path)
+
+        summary_plots = {
+            "forcing_test_error_summary": paper_plots.plot_forcing_test_error_summary,
+            "source_test_error_summary": paper_plots.plot_source_test_error_summary,
+            "interfaces_test_error_summary": paper_plots.plot_interfaces_test_error_summary,
+        }
+        for name, fn in summary_plots.items():
+            if _should_run(name, groups, individual):
+                if active_records is not None:
+                    print(f"--- {name} ---")
+                    fn(active_records, save_path=paper_dir / f"{name}.png")
+                else:
+                    _print_skip(name, "need --records (or --csv) pointing to test_records.csv")
+
+        prediction_plots = {
+            "forcing_prediction_truth_residual": paper_plots.plot_forcing_prediction_truth_residual,
+            "source_prediction_truth_residual": paper_plots.plot_source_prediction_truth_residual,
+            "interfaces_prediction_truth_residual": paper_plots.plot_interfaces_prediction_truth_residual,
+        }
+        needs_pred = any(_should_run(name, groups, individual) for name in prediction_plots)
+        if needs_pred:
+            have_inputs = bool(
+                active_records is not None and args.checkpoint and args.data
+                and args.x_grid and args.y_grid and args.t_grid and args.params
+            )
+            if not have_inputs:
+                for name in prediction_plots:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "need --records, --checkpoint, --data, --x-grid, --y-grid, --t-grid, --params")
+            else:
+                try:
+                    model, checkpoint_conf = dataset_plots._load_checkpoint_model(args.checkpoint)
+                except ValueError as exc:
+                    model = None
+                    for name in prediction_plots:
+                        if _should_run(name, groups, individual):
+                            _print_skip(name, str(exc))
+                if model is not None:
+                    trajectories, x_grid, y_grid, t_grid = dataset_plots._load_plot_data(
+                        args.data, args.x_grid, args.y_grid, args.t_grid)
+                    from data.dataset import load_solver_dt
+                    solver_dt = load_solver_dt(args.t_grid)
+                    sim_params = np.load(args.params, allow_pickle=True)
+                    plot_config = dataset_plots._resolve_plot_config(checkpoint_conf)
+                    ds = paper_plots._records_dataset(
+                        model, trajectories, x_grid, y_grid, t_grid, sim_params,
+                        plot_config, dt=solver_dt)
+                    for name, fn in prediction_plots.items():
+                        if _should_run(name, groups, individual):
+                            print(f"--- {name} ---")
+                            fn(model, ds, active_records, save_path=paper_dir / f"{name}.png")
+
+        if _should_run("all_benchmarks_error_summary", groups, individual):
+            csv_map = {
+                "forcing": args.records_forcing,
+                "source": args.records_source,
+                "interfaces": args.records_interfaces,
+            }
+            if all(csv_map.values()):
+                print("--- all_benchmarks_error_summary ---")
+                records_by_benchmark = {
+                    name: paper_plots._load_test_records(path) for name, path in csv_map.items()
+                }
+                paper_plots.plot_all_benchmarks_error_summary(
+                    records_by_benchmark, save_path=paper_dir / "all_benchmarks_error_summary.png")
+            else:
+                _print_skip("all_benchmarks_error_summary",
+                            "need --records-forcing, --records-source, --records-interfaces")
+
+        if _should_run("all_benchmarks_prediction_truth_residual", groups, individual):
+            _print_skip(
+                "all_benchmarks_prediction_truth_residual",
+                "render programmatically: needs a (checkpoint, trajectories, params, records) bundle per benchmark",
+            )
+
     # ---- SWEEP GROUP ----
     sweep_plot_names = _plots_for_group("sweep")
     need_sweep = any(_should_run(p, groups, individual) for p in sweep_plot_names)
@@ -491,6 +843,10 @@ def main():
                     )
                 else:
                     _print_skip("sweep_convergence", "need --runs")
+
+            if _should_run("sweep_hyperparams", groups, individual):
+                print("--- sweep_hyperparams ---")
+                sweep_plots.plot_sweep_hyperparams(experiment_dir, save_path=sweep_dir / "sweep_hyperparams.png")
         else:
             for name in sweep_plot_names:
                 if _should_run(name, groups, individual):

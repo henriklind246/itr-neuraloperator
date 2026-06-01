@@ -33,10 +33,10 @@ Currently, `requirements.txt` is the safest install source. `pyproject.toml` doe
 
 ## Workflow Overview
 
-1. Generate simulation data with [data/generate_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/generate_dataset.py).
-2. Train a model or run a sweep with [scripts/run_train.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_train.py) or [src/operators/train.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/train.py).
-3. Evaluate saved checkpoints with [src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py).
-4. Generate plots with [visual/cli.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/cli.py) (per-group plot modules under `visual/`).
+1. Generate simulation data with [data/generate_dataset.py](data/generate_dataset.py).
+2. Train a model or run a sweep with [scripts/run_train.py](scripts/run_train.py) or [src/operators/train.py](src/operators/train.py).
+3. Evaluate saved checkpoints with [src/operators/eval.py](src/operators/eval.py).
+4. Generate plots with [visual/cli.py](visual/cli.py) (per-group plot modules under `visual/`).
 
 ## Current Entry Points
 
@@ -51,13 +51,13 @@ These are the current entry points that correspond to runnable code:
 
 These files are present but currently empty and should not be treated as working entry points:
 
-- [scripts/run_gen_data.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_gen_data.py)
-- [scripts/run_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_dataset.py)
-- [scripts/run_eval.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_eval.py)
+- [scripts/run_gen_data.py](scripts/run_gen_data.py)
+- [scripts/run_dataset.py](scripts/run_dataset.py)
+- [scripts/run_eval.py](scripts/run_eval.py)
 
 ## Data Generation
 
-[data/generate_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/generate_dataset.py) is the current entry point for synthetic data generation. It builds two-layer finite-difference solver configurations with sampled material properties and forcing parameters, runs the simulations, and saves the resulting trajectories for later training.
+[data/generate_dataset.py](data/generate_dataset.py) is the current entry point for synthetic data generation. It builds two-layer finite-difference solver configurations with sampled material properties and forcing parameters, runs the simulations, and saves the resulting trajectories for later training.
 
 The current default is `1024` simulations. The script writes:
 
@@ -66,7 +66,7 @@ The current default is `1024` simulations. The script writes:
 - `trajectories.npy`
 - `sim_params.npy`
 
-These files are later consumed by [data/dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/dataset.py).
+These files are later consumed by [data/dataset.py](data/dataset.py).
 
 ```bash
 python data/generate_dataset.py
@@ -78,7 +78,7 @@ Currently, the files are written to the working directory, so running from the r
 
 ### 7a. Hydra Sweep Workflow
 
-[scripts/run_train.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_train.py) is the current entry point for Hydra-based sweeps. Hydra handles multirun orchestration and output management, while Optuna is the hyperparameter search engine used by the Hydra sweeper. Optuna proposes trial parameter combinations from the configured search space in [conf/search_space/medium.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/search_space/medium.yaml), and each Hydra job corresponds to one Optuna trial. The sweeper configuration lives in [conf/hydra/sweeper/optuna_local.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/hydra/sweeper/optuna_local.yaml), and the optimization objective is the configured mean best validation score across seeds from [conf/config.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/config.yaml).
+[scripts/run_train.py](scripts/run_train.py) is the current entry point for Hydra-based sweeps. Hydra handles multirun orchestration and output management, while Optuna is the hyperparameter search engine used by the Hydra sweeper. Optuna proposes trial parameter combinations from the configured search space in [conf/search_space/medium.yaml](conf/search_space/medium.yaml), and each Hydra job corresponds to one Optuna trial. The sweeper configuration lives in [conf/hydra/sweeper/optuna_local.yaml](conf/hydra/sweeper/optuna_local.yaml), and the optimization objective is the configured mean best validation score across seeds from [conf/config.yaml](conf/config.yaml).
 
 Each invocation gets an experiment namespace such as `experiment0`. Each job is written under `runs/<experiment>/conf<job_num>/`, and each seed for that configuration is written under `seed<seed>/`. Resolved configs, JSON summaries, rankings, and `best_config.yaml` are written under `conf/generated/<experiment>/`.
 
@@ -89,7 +89,7 @@ python scripts/run_train.py -m tuning.n_trials=10
 
 ### 7b. Direct Training Module
 
-[src/operators/train.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/train.py) is the lower-level training entry point. It loads [conf/config.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/config.yaml), expects the dataset files to already exist, trains all configured seeds, and writes per-seed checkpoints together with `train_metrics.csv`.
+[src/operators/train.py](src/operators/train.py) is the lower-level training entry point. It loads [conf/config.yaml](conf/config.yaml), expects the dataset files to already exist, trains all configured seeds, and writes per-seed checkpoints together with `train_metrics.csv`.
 
 ```bash
 python -m src.operators.train
@@ -97,17 +97,17 @@ python -m src.operators.train
 
 ## Evaluation
 
-[src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py) is the current evaluation entry point. It loads `fno1d_best.pt` checkpoints from a run directory, computes per-seed test metrics, and writes `seed_report.json`.
+[src/operators/eval.py](src/operators/eval.py) is the current evaluation entry point. It loads `fno1d_best.pt` checkpoints from a run directory, computes per-seed test metrics, and writes `seed_report.json`.
 
 ```bash
 python -m src.operators.eval
 ```
 
-Currently, the module `__main__` assumes `runs/experiment0/config0`, which is a limitation of the current interface rather than a polished evaluation CLI. [scripts/run_eval.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_eval.py) is currently empty.
+Currently, the module `__main__` assumes `runs/experiment0/config0`, which is a limitation of the current interface rather than a polished evaluation CLI. [scripts/run_eval.py](scripts/run_eval.py) is currently empty.
 
 ## Plot Generation
 
-[visual/cli.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/cli.py) provides the current plot-generation CLI. It supports grouped outputs for `physics`, `mms`, `training`, `data`, and `sweep`. Each group's plot functions live in its own module under `visual/` (`physics_plots.py`, `mms_plots.py`, `training_plots.py`, `dataset_plots.py`, `sweep_plots.py`); shared helpers live in `visual/_common.py`.
+[visual/cli.py](visual/cli.py) provides the current plot-generation CLI. It supports grouped outputs for `physics`, `mms`, `training`, `data`, and `sweep`. Each group's plot functions live in its own module under `visual/` (`physics_plots.py`, `mms_plots.py`, `training_plots.py`, `dataset_plots.py`, `sweep_plots.py`); shared helpers live in `visual/_common.py`.
 
 Important flags:
 
@@ -138,8 +138,8 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 
 ## Configuration and Outputs
 
-- [conf/config.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/config.yaml) is the main training and sweep configuration.
-- [conf/paths/default.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/paths/default.yaml) defines the main path settings.
+- [conf/config.yaml](conf/config.yaml) is the main training and sweep configuration.
+- [conf/paths/default.yaml](conf/paths/default.yaml) defines the main path settings.
 - `runs/` stores training outputs and checkpoints.
 - `conf/generated/` stores resolved configs, trial summaries, rankings, and `best_config.yaml`.
 - `data/` is the intended home for generated datasets, even though the current direct generation script writes to the working directory.
@@ -148,18 +148,18 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 
 ## Project Layout
 
-- [data/generate_dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/generate_dataset.py): synthetic trajectory generation
-- [data/dataset.py](/Users/henriklind/Desktop/no-tps-ihcp/data/dataset.py): all-to-all snapshot-pair dataset construction and dataloaders
-- [src/physics/fv_solver_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/fv_solver_1d.py): multilayer finite-volume solver
-- [src/physics/mms_1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/physics/mms_1d.py): manufactured-solution verification
-- [src/operators/fno1d.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/fno1d.py): Fourier Neural Operator model
-- [src/operators/train.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/train.py): direct training module
-- [src/operators/eval.py](/Users/henriklind/Desktop/no-tps-ihcp/src/operators/eval.py): checkpoint evaluation and reporting
-- [scripts/run_train.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/run_train.py): Hydra + Optuna sweep entry point
-- [scripts/collect_best_config.py](/Users/henriklind/Desktop/no-tps-ihcp/scripts/collect_best_config.py): rebuild generated config rankings
-- [visual/cli.py](/Users/henriklind/Desktop/no-tps-ihcp/visual/cli.py): plot-generation CLI (dispatches to per-group modules in `visual/`)
-- [conf/config.yaml](/Users/henriklind/Desktop/no-tps-ihcp/conf/config.yaml): main configuration
-- [PROJECT_OVERVIEW.md](/Users/henriklind/Desktop/no-tps-ihcp/PROJECT_OVERVIEW.md): deeper technical overview
+- [data/generate_dataset.py](data/generate_dataset.py): synthetic trajectory generation
+- [data/dataset.py](data/dataset.py): all-to-all snapshot-pair dataset construction and dataloaders
+- [src/physics/fv_solver_1d.py](src/physics/fv_solver_1d.py): multilayer finite-volume solver
+- [src/physics/mms_1d.py](src/physics/mms_1d.py): manufactured-solution verification
+- [src/operators/fno1d.py](src/operators/fno1d.py): Fourier Neural Operator model
+- [src/operators/train.py](src/operators/train.py): direct training module
+- [src/operators/eval.py](src/operators/eval.py): checkpoint evaluation and reporting
+- [scripts/run_train.py](scripts/run_train.py): Hydra + Optuna sweep entry point
+- [scripts/collect_best_config.py](scripts/collect_best_config.py): rebuild generated config rankings
+- [visual/cli.py](visual/cli.py): plot-generation CLI (dispatches to per-group modules in `visual/`)
+- [conf/config.yaml](conf/config.yaml): main configuration
+- [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md): deeper technical overview
 
 ## Known Gaps
 
@@ -167,4 +167,4 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 - The top-level CLI surface is inconsistent.
 - Evaluation still defaults to a hard-coded run path in the module `__main__`.
 - Dataset generation currently writes to the working directory instead of a configurable output path.
-- Dependency metadata is split between [requirements.txt](/Users/henriklind/Desktop/no-tps-ihcp/requirements.txt) and [pyproject.toml](/Users/henriklind/Desktop/no-tps-ihcp/pyproject.toml).
+- Dependency metadata is split between [requirements.txt](requirements.txt) and [pyproject.toml](pyproject.toml).

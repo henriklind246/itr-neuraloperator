@@ -1,3 +1,4 @@
+import csv
 import inspect
 from math import comb
 
@@ -9,7 +10,8 @@ import torch
 matplotlib.use("Agg")
 
 from data.dataset import split_sim_ids
-from visual import _common, dataset_plots, forcing_plots, physics_plots
+from src.operators.eval import TEST_RECORD_FIELDS
+from visual import _common, dataset_plots, forcing_plots, paper_plots, physics_plots
 
 
 @pytest.fixture
@@ -78,7 +80,6 @@ class TestPlotRegistry:
             "flux_profiles",
             "lhs_scatter",
             "y_perturbation",
-            "sweep_hyperparams",
         ]:
             assert name not in _common.PLOT_REGISTRY
 
@@ -99,6 +100,42 @@ class TestPlotRegistry:
         ]:
             assert _common.PLOT_REGISTRY[name] == "forcing"
         assert "forcing" in _common.GROUPS
+
+    def test_source_plot_names_registered(self):
+        for name in [
+            "source_dataset_summary",
+            "patch_param_scatter",
+            "source_temporal_profile",
+            "source_field_snapshots",
+            "source_input_channels",
+            "patch_overlay_trajectory",
+            "energy_budget",
+            "regime_error_breakdown",
+            "patch_error_slices",
+            "patch_region_error_map",
+            "source_error_vs_params",
+            "source_interface_zone_error",
+        ]:
+            assert _common.PLOT_REGISTRY[name] == "source"
+        assert "source" in _common.GROUPS
+
+    def test_interface_plot_names_registered(self):
+        for name in [
+            "interface_y_perturbation",
+            "interface_lhs_scatter",
+            "vary_interface_lhs_scatter",
+            "interface_flux_profiles",
+            "sin_forcing_profiles",
+            "interface_x_breakdown",
+            "ic_family_trajectory_breakdown",
+            "vary_interface_dataset_summary",
+        ]:
+            assert _common.PLOT_REGISTRY[name] == "interfaces"
+        assert "interfaces" in _common.GROUPS
+
+    def test_bc_verification_and_sweep_hyperparams_registered(self):
+        assert _common.PLOT_REGISTRY["bc_verification"] == "physics"
+        assert _common.PLOT_REGISTRY["sweep_hyperparams"] == "sweep"
 
 
 class TestSnapshotPairSamples:
@@ -611,3 +648,350 @@ class TestPhysicsPlots:
         out_path = tmp_path / "multilayer_evolution.png"
         physics_plots.plot_multilayer_evolution(solver, T_hist, save_path=out_path)
         assert out_path.exists()
+
+    def test_bc_verification_smoke(self, tmp_path):
+        solver = physics_plots.create_demo_multilayer_solver()
+        T0 = np.full((solver.Nx, solver.Ny), solver.T_right(0.0))
+        _, _, _, T_hist = solver.solve(T0=T0, store_trajectory=True)
+        out_path = tmp_path / "bc_verification.png"
+        physics_plots.plot_bc_verification(solver, T_hist, save_path=out_path)
+        assert out_path.exists()
+
+
+class TestInterfacePlots:
+    def test_interface_flux_profiles_smoke(self, tmp_path):
+        out_path = tmp_path / "interface_flux_profiles.png"
+        dataset_plots.plot_interface_flux_profiles(save_path=out_path)
+        assert out_path.exists()
+
+    def test_sin_forcing_profiles_smoke(self, tmp_path):
+        out_path = tmp_path / "sin_forcing_profiles.png"
+        dataset_plots.plot_sin_forcing_profiles(save_path=out_path)
+        assert out_path.exists()
+
+
+class TestSourcePlots:
+    def test_patch_param_scatter_smoke(self, tmp_path, synthetic_source_sim_params):
+        out_path = tmp_path / "patch_param_scatter.png"
+        dataset_plots.plot_patch_param_scatter(
+            synthetic_source_sim_params, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_dataset_summary_smoke(
+        self, tmp_path, synthetic_trajectories, synthetic_source_sim_params, plot_config
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        source_config = {**plot_config, "benchmark": {"name": "source"}}
+        out_path = tmp_path / "source_dataset_summary.png"
+        dataset_plots.plot_source_dataset_summary(
+            trajectories,
+            x_grid,
+            y_grid,
+            t_grid,
+            synthetic_source_sim_params,
+            config=source_config,
+            save_path=out_path,
+        )
+        assert out_path.exists()
+
+    def test_source_checkpoint_loads_with_temporal_encoder_off(
+        self, small_source_fno2d_checkpoint
+    ):
+        model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
+        assert conf["model"]["parameters"]["cond_static_dim"] == 8
+        assert getattr(model, "use_temporal_encoder") is False
+
+    def test_patch_error_slices_smoke(
+        self,
+        tmp_path,
+        small_source_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
+        source_config = {**plot_config, "benchmark": {"name": "source"}}
+        datasets = dataset_plots._build_split_datasets(
+            trajectories, x_grid, y_grid, t_grid, synthetic_source_sim_params, source_config
+        )
+        out_path = tmp_path / "patch_error_slices.png"
+        dataset_plots.plot_patch_error_slices(
+            model,
+            datasets["test"],
+            x_grid,
+            y_grid,
+            config=source_config,
+            sim_params=synthetic_source_sim_params,
+            max_samples=16,
+            save_path=out_path,
+        )
+        assert out_path.exists()
+
+
+# ---------- paper-figure helpers ----------
+
+def _write_records_csv(path, rows):
+    """Write a minimal test_records.csv (blank cells for absent fields)."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TEST_RECORD_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in TEST_RECORD_FIELDS})
+
+
+def _forcing_record_rows():
+    """One row per temporal x spatial family combo (covers every box/heatmap cell)."""
+    rng = np.random.default_rng(0)
+    rows = []
+    for ti, temporal in enumerate(paper_plots.TEMPORAL_ORDER):
+        for si, spatial in enumerate(paper_plots.SPATIAL_ORDER):
+            sim_id = (ti * len(paper_plots.SPATIAL_ORDER) + si) % 20
+            rows.append({
+                "sim_id": sim_id, "s": 1, "j": 8,
+                "t_s": 0.02, "t_bar": 0.14 + 0.01 * si,
+                "R_c": float(rng.uniform(0.05, 1.0)), "benchmark": "forcing",
+                "temporal_family": temporal, "spatial_family": spatial,
+                "x_I": 0.5,
+                "rel_l2_pct": float(rng.uniform(0.5, 8.0)),
+                "iface_rel_l2_pct": float(rng.uniform(0.5, 12.0)),
+            })
+    return rows
+
+
+def _source_record_rows():
+    rng = np.random.default_rng(1)
+    rows = []
+    for i in range(15):
+        regime = paper_plots.REGIME_ORDER[i % len(paper_plots.REGIME_ORDER)]
+        x_h = {"left": 0.25, "near": 0.5, "right": 0.75}[regime]
+        rows.append({
+            "sim_id": i % 20, "s": 1, "j": 8,
+            "t_s": 0.02, "t_bar": 0.10 + 0.01 * i,
+            "R_c": float(rng.uniform(0.05, 1.0)), "benchmark": "source",
+            "x_h": x_h + float(rng.uniform(-0.05, 0.05)),
+            "y_h": float(rng.uniform(0.3, 0.7)),
+            "A": float(rng.uniform(50.0, 300.0)), "regime": regime,
+            "x_I": 0.5,
+            "rel_l2_pct": float(rng.uniform(0.5, 8.0)),
+            "iface_rel_l2_pct": float(rng.uniform(0.5, 12.0)),
+        })
+    return rows
+
+
+def _interfaces_record_rows():
+    rng = np.random.default_rng(2)
+    rows = []
+    for i in range(15):
+        x_I = float(np.linspace(0.2, 0.8, 15)[i])
+        rows.append({
+            "sim_id": i % 20, "s": 1, "j": 8,
+            "t_s": 0.02, "t_bar": 0.10 + 0.01 * i,
+            "R_c": float(rng.uniform(0.05, 1.0)), "benchmark": "interfaces",
+            "temporal_family": "sin", "spatial_family": "uniform",
+            "A": float(rng.uniform(50.0, 300.0)), "freq": float(rng.uniform(1.0, 10.0)),
+            "x_I": x_I,
+            "rel_l2_pct": float(rng.uniform(0.5, 8.0)),
+            "iface_rel_l2_pct": float(rng.uniform(0.5, 12.0)),
+        })
+    return rows
+
+
+@pytest.fixture
+def forcing_records(tmp_path):
+    path = tmp_path / "forcing_records.csv"
+    _write_records_csv(path, _forcing_record_rows())
+    return paper_plots._load_test_records(path)
+
+
+@pytest.fixture
+def source_records(tmp_path):
+    path = tmp_path / "source_records.csv"
+    _write_records_csv(path, _source_record_rows())
+    return paper_plots._load_test_records(path)
+
+
+@pytest.fixture
+def interfaces_records(tmp_path):
+    path = tmp_path / "interfaces_records.csv"
+    _write_records_csv(path, _interfaces_record_rows())
+    return paper_plots._load_test_records(path)
+
+
+class TestPaperRecordLoading:
+    def test_blank_floats_become_nan(self, forcing_records):
+        # Forcing rows leave x_h/A blank -> NaN; rel_l2_pct is always present.
+        assert np.all(np.isnan(forcing_records["x_h"]))
+        assert np.all(np.isfinite(forcing_records["rel_l2_pct"]))
+        assert int(forcing_records["_n"]) == 16
+
+    def test_representative_row_is_median_pick(self, forcing_records):
+        mask = np.ones(int(forcing_records["_n"]), dtype=bool)
+        row = paper_plots._representative_row(forcing_records, mask)
+        assert row >= 0
+        err = forcing_records["rel_l2_pct"]
+        median = float(np.median(err))
+        assert np.argmin(np.abs(err - median)) == row
+
+    def test_representative_row_empty_mask_returns_negative(self, forcing_records):
+        mask = np.zeros(int(forcing_records["_n"]), dtype=bool)
+        assert paper_plots._representative_row(forcing_records, mask) == -1
+
+
+class TestPaperSummaryPlots:
+    def test_forcing_summary_smoke(self, tmp_path, forcing_records):
+        out_path = tmp_path / "forcing_test_error_summary.png"
+        paper_plots.plot_forcing_test_error_summary(forcing_records, save_path=out_path)
+        assert out_path.exists()
+
+    def test_source_summary_smoke(self, tmp_path, source_records):
+        out_path = tmp_path / "source_test_error_summary.png"
+        paper_plots.plot_source_test_error_summary(source_records, save_path=out_path)
+        assert out_path.exists()
+
+    def test_source_summary_amplitude_panel_smoke(self, tmp_path, source_records):
+        out_path = tmp_path / "source_test_error_summary_amp.png"
+        paper_plots.plot_source_test_error_summary(
+            source_records, save_path=out_path, panel6="amplitude"
+        )
+        assert out_path.exists()
+
+    def test_interfaces_summary_smoke(self, tmp_path, interfaces_records):
+        out_path = tmp_path / "interfaces_test_error_summary.png"
+        paper_plots.plot_interfaces_test_error_summary(interfaces_records, save_path=out_path)
+        assert out_path.exists()
+
+    def test_all_benchmarks_summary_smoke(
+        self, tmp_path, forcing_records, source_records, interfaces_records
+    ):
+        out_path = tmp_path / "all_benchmarks_test_error_summary.png"
+        paper_plots.plot_all_benchmarks_error_summary(
+            {"forcing": forcing_records, "source": source_records,
+             "interfaces": interfaces_records},
+            save_path=out_path,
+        )
+        assert out_path.exists()
+
+
+class TestPaperPredictionPlots:
+    def test_forcing_prediction_smoke(
+        self,
+        tmp_path,
+        small_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_sim_params,
+        plot_config,
+        forcing_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = dataset_plots._load_checkpoint_model(small_fno2d_checkpoint)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config
+        )
+        out_path = tmp_path / "forcing_prediction_truth_residual.png"
+        paper_plots.plot_forcing_prediction_truth_residual(
+            model, ds, forcing_records, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_prediction_smoke(
+        self,
+        tmp_path,
+        small_source_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+        source_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
+        source_config = {**plot_config, "benchmark": {"name": "source"}}
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid,
+            synthetic_source_sim_params, source_config
+        )
+        out_path = tmp_path / "source_prediction_truth_residual.png"
+        paper_plots.plot_source_prediction_truth_residual(
+            model, ds, source_records, save_path=out_path
+        )
+        assert out_path.exists()
+
+
+class TestWriteTestRecords:
+    def test_writes_csv_with_expected_header(
+        self,
+        tmp_path,
+        small_fno2d,
+        synthetic_trajectories,
+        synthetic_sim_params,
+    ):
+        from src.operators.eval import write_test_records
+
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        traj_path = tmp_path / "trajectories.npy"
+        x_path = tmp_path / "x_grid.npy"
+        y_path = tmp_path / "y_grid.npy"
+        t_path = tmp_path / "t_grid.npy"
+        params_path = tmp_path / "sim_params.npy"
+        np.save(traj_path, trajectories)
+        np.save(x_path, x_grid)
+        np.save(y_path, y_grid)
+        np.save(t_path, t_grid)
+        np.save(params_path, synthetic_sim_params)
+
+        conf = {
+            "data": {
+                "trajectories.npy": str(traj_path),
+                "x_grid_path": str(x_path),
+                "y_grid_path": str(y_path),
+                "t_grid_path": str(t_path),
+                "sim_params_path": str(params_path),
+            },
+            "training": {
+                "batch_size": 4,
+                "n_snapshots_test": 3,
+                "device": "cpu",
+                "loss": {"interface_half_width": 0.05},
+            },
+            "model": {
+                "parameters": {
+                    "modes1": 2,
+                    "modes2": 2,
+                    "width": 8,
+                    "in_channels": 20,
+                    "out_channels": 1,
+                    "n_layers": 2,
+                    "cond_static_dim": 23,
+                    "cond_hidden": 256,
+                    "temporal_token_dim": 5,
+                    "temporal_samples": 64,
+                    "temporal_hidden": 16,
+                    "forcing_embed_dim": 16,
+                }
+            },
+        }
+        seed_dir = tmp_path / "seed42"
+        seed_dir.mkdir()
+        torch.save(
+            {
+                "model_state": small_fno2d.state_dict(),
+                "conf": conf,
+                "best_val": 1.23,
+                "mu_global": 0.0,
+                "sigma_global": 1.0,
+            },
+            seed_dir / "fno2d_best.pt",
+        )
+
+        out_path = write_test_records(tmp_path)
+        assert out_path.exists()
+        with open(out_path, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            data_rows = list(reader)
+        assert header == TEST_RECORD_FIELDS
+        assert len(data_rows) > 0
+        records = paper_plots._load_test_records(out_path)
+        assert np.all(records["benchmark"] == "forcing")
+        assert np.all(np.isfinite(records["rel_l2_pct"]))

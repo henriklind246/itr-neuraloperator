@@ -326,3 +326,87 @@ def plot_heat_flux_profile(
         ax_d.grid(True)
 
         _save_figure(fig, save_path, "physics", "heat_flux_profile")
+
+
+def plot_bc_verification(
+    solver: FVSolver2D,
+    T_hist: np.ndarray,
+    save_path: str | Path | None = None,
+):
+    """Postprocessed boundary-condition diagnostics for the 2D solver.
+
+    2x2 layout:
+        (0,0) T(x=1, y, t) heatmap with max |T - T_right| annotation
+        (0,1) Left-wall one-sided estimate of d_x T(0, y, t)
+        (1,0) Bottom-wall one-sided estimate of d_y T(x, 0, t)
+        (1,1) Top-wall one-sided estimate of d_y T(x, 1, t)
+
+    The derivatives are postprocessed from cell-center samples; the solver
+    enforces the BC fluxes to machine precision via its FV stencil.
+    """
+    T_hist = np.asarray(T_hist)
+    t = np.asarray(solver.t)
+    hx = float(solver.hx)
+    hy = float(solver.grid_y[1] - solver.grid_y[0])
+    T_right_target = float(solver.T_right(0.0))
+
+    T_right_field = T_hist[:, -1, :]
+    left_deriv = (T_hist[:, 1, :] - T_hist[:, 0, :]) / hx
+    bottom_deriv = (T_hist[:, :, 1] - T_hist[:, :, 0]) / hy
+    top_deriv = (T_hist[:, :, -1] - T_hist[:, :, -2]) / hy
+
+    max_right_err = float(np.max(np.abs(T_right_field - T_right_target)))
+    max_left = float(np.max(np.abs(left_deriv)))
+    max_bottom = float(np.max(np.abs(bottom_deriv)))
+    max_top = float(np.max(np.abs(top_deriv)))
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+
+        ax = axes[0, 0]
+        pc = ax.pcolormesh(t, solver.grid_y, T_right_field.T, cmap="inferno", shading="auto")
+        fig.colorbar(pc, ax=ax, label="T(x=1, y, t)")
+        ax.set_xlabel("t")
+        ax.set_ylabel("y")
+        ax.set_title(
+            f"Right Dirichlet: max |T - {T_right_target:.1f}| = {max_right_err:.2e}"
+        )
+
+        ax = axes[0, 1]
+        vlim = max(max_left, 1e-12)
+        pc = ax.pcolormesh(
+            t, solver.grid_y, left_deriv.T,
+            cmap="RdBu_r", shading="auto", vmin=-vlim, vmax=vlim,
+        )
+        fig.colorbar(pc, ax=ax, label=r"$\partial_x T(0, y, t)$")
+        ax.set_xlabel("t")
+        ax.set_ylabel("y")
+        ax.set_title(f"Left Neumann: max |dT/dx| = {max_left:.2e}")
+
+        ax = axes[1, 0]
+        vlim = max(max_bottom, 1e-12)
+        pc = ax.pcolormesh(
+            t, solver.grid_x, bottom_deriv.T,
+            cmap="RdBu_r", shading="auto", vmin=-vlim, vmax=vlim,
+        )
+        fig.colorbar(pc, ax=ax, label=r"$\partial_y T(x, 0, t)$")
+        ax.set_xlabel("t")
+        ax.set_ylabel("x")
+        ax.set_title(f"Bottom adiabatic: max |dT/dy| = {max_bottom:.2e}")
+
+        ax = axes[1, 1]
+        vlim = max(max_top, 1e-12)
+        pc = ax.pcolormesh(
+            t, solver.grid_x, top_deriv.T,
+            cmap="RdBu_r", shading="auto", vmin=-vlim, vmax=vlim,
+        )
+        fig.colorbar(pc, ax=ax, label=r"$\partial_y T(x, 1, t)$")
+        ax.set_xlabel("t")
+        ax.set_ylabel("x")
+        ax.set_title(f"Top adiabatic: max |dT/dy| = {max_top:.2e}")
+
+        fig.suptitle(
+            "BC verification (postprocessed cell-center differences; "
+            "solver-imposed fluxes are machine precision)"
+        )
+        _save_figure(fig, save_path, "physics", "bc_verification", layout="constrained")

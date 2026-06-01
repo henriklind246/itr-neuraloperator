@@ -14,6 +14,7 @@ from src.operators.fno2d import FNO2d
 from src.operators.losses import build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 from pathlib import Path
+import csv
 import math
 import json
 from datetime import datetime
@@ -260,3 +261,168 @@ def save_report(run_root: str, results: list[dict], summary: dict) -> None:
     with out_path.open("w") as f:
         json.dump(out, f, indent=2)
     print(f"Saved report -> {out_path}")
+
+
+# ---------- PER-SAMPLE TEST RECORDS (paper figures data source) ----------
+
+TEST_RECORD_FIELDS = [
+    "sim_id", "s", "j", "t_s", "t_bar", "R_c", "benchmark",
+    "temporal_family", "spatial_family",
+    "x_h", "y_h", "A", "freq", "regime",
+    "x_I", "rel_l2_pct", "iface_rel_l2_pct",
+]
+
+
+def _select_seed_checkpoint(run_root: Path, seed=None):
+    """Return (seed_dir, ckpt) for the requested seed or the lowest best_val.
+
+    With no `seed`, scans every ``seed*/fno2d_best.pt`` and picks the checkpoint
+    with the smallest ``best_val``. With an explicit `seed`, requires
+    ``seed{seed}/fno2d_best.pt`` to exist.
+    """
+    run_root = Path(run_root)
+    best = None  # (best_val, seed_dir, ckpt)
+    for seed_dir in sorted(run_root.glob("seed*")):
+        if seed is not None and seed_dir.name != f"seed{seed}":
+            continue
+        ckpt_path = seed_dir / "fno2d_best.pt"
+        if not ckpt_path.exists():
+            continue
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        best_val = float(ckpt.get("best_val", float("inf")))
+        if best is None or best_val < best[0]:
+            best = (best_val, seed_dir, ckpt)
+    if best is None:
+        suffix = f" for seed={seed}" if seed is not None else ""
+        raise FileNotFoundError(f"No fno2d_best.pt checkpoint found under {run_root}{suffix}")
+    return best[1], best[2]
+
+
+def _amp_freq_from_params(params: dict) -> tuple[float | None, float | None]:
+    """Return (amplitude, frequency) for a sim, or (None, None) when undefined.
+
+    Source carries a top-level patch ``A`` and no frequency; sin-forced
+    benchmarks (interfaces, and the sin family of forcing) expose ``A``/``f``
+    inside ``temporal_params``. Non-sin forcing families have no scalar
+    amplitude/frequency, so both come back None.
+    """
+    tp = params.get("temporal_params")
+    if isinstance(tp, dict) and params.get("temporal_family") == "sin":
+        A = tp.get("A")
+        f = tp.get("f")
+        return (None if A is None else float(A), None if f is None else float(f))
+    if "A" in params and tp is None:
+        return float(params["A"]), None
+    return None, None
+
+
+def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") -> Path:
+    """Write one per-(sim_id, s, j) test-pair record row for paper figures.
+
+    Loads the best (or requested) seed checkpoint under `run_root`, rebuilds the
+    test loader, and forwards every test pair through the model. Metrics are in
+    normalized space (same convention as ``train/val_rel_l2`` and
+    ``evaluate``'s ``rel_l2_norm``): ``rel_l2_pct`` is the global relative L2 and
+    ``iface_rel_l2_pct`` is the interface-band relative L2 computed around THAT
+    sample's own ``interface_x`` (dynamic for the interfaces benchmark). Returns
+    the written CSV path under the seed directory.
+    """
+    seed_dir, ckpt = _select_seed_checkpoint(Path(run_root), seed)
+    config = ckpt["conf"]
+    device = resolve_device(config.get("training", {}).get("device", "auto"))
+
+    test_loader, x_grid, y_grid = build_test_loader(
+        config,
+        mu_global=ckpt.get("mu_global"),
+        sigma_global=ckpt.get("sigma_global"),
+    )
+    dataset = test_loader.dataset
+    problem = problem_from_config(config)
+    benchmark = problem.name
+
+    model_cfg = config["model"]["parameters"]
+    fno = FNO2d(
+        modes1=model_cfg["modes1"],
+        modes2=model_cfg["modes2"],
+        width=model_cfg["width"],
+        in_channels=model_cfg.get("in_channels", 20),
+        out_channels=model_cfg.get("out_channels", 1),
+        n_layers=model_cfg.get("n_layers", 4),
+        cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
+        cond_hidden=model_cfg.get("cond_hidden", 256),
+        temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+        temporal_hidden=model_cfg.get("temporal_hidden", 128),
+        forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
+        forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
+        use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+    )
+    fno.load_state_dict(ckpt["model_state"])
+    fno.to(device)
+    fno.eval()
+    uses_forcing = bool(getattr(fno, "use_temporal_encoder", True))
+
+    hw = float(config.get("training", {}).get("loss", {}).get("interface_half_width", 0.05))
+
+    mask_cache: dict[float, torch.Tensor] = {}
+
+    def _mask_for(interface_x: float) -> torch.Tensor:
+        key = round(float(interface_x), 4)
+        if key not in mask_cache:
+            mask_cache[key] = build_interface_mask(x_grid, y_grid, key, hw).to(device)
+        return mask_cache[key]
+
+    rows = []
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            sim_id, s, j = dataset._pairs[idx]
+            sim_id, s, j = int(sim_id), int(s), int(j)
+            item = dataset[idx]
+
+            spatial = item["spatial"].unsqueeze(0).to(device)
+            cond = item["cond_static"].unsqueeze(0).to(device)
+            y_true = item["Y"].unsqueeze(0).to(device)
+            forcing_seq = item.get("forcing_seq")
+            if uses_forcing and forcing_seq is not None:
+                y_pred = fno(spatial, cond, forcing_seq.unsqueeze(0).to(device))
+            else:
+                y_pred = fno(spatial, cond)
+
+            rel_l2 = ((torch.mean((y_pred - y_true) ** 2) / torch.mean(y_true ** 2)) ** 0.5 * 100).item()
+
+            params = dataset.sim_params[sim_id]
+            interface_x = float(params.get("interface_x", 0.5))
+            iface_rel_l2 = compute_interface_rel_l2(y_pred, y_true, _mask_for(interface_x))
+
+            t_s_val = float(dataset.t_grid[s])
+            t_j_val = float(dataset.t_grid[j])
+            A, freq = _amp_freq_from_params(params)
+
+            rows.append({
+                "sim_id": sim_id,
+                "s": s,
+                "j": j,
+                "t_s": t_s_val,
+                "t_bar": t_j_val - t_s_val,
+                "R_c": float(params.get("R_c", "")) if "R_c" in params else "",
+                "benchmark": benchmark,
+                "temporal_family": params.get("temporal_family", ""),
+                "spatial_family": params.get("spatial_family", ""),
+                "x_h": float(params["x_h"]) if "x_h" in params else "",
+                "y_h": float(params["y_h"]) if "y_h" in params else "",
+                "A": "" if A is None else A,
+                "freq": "" if freq is None else freq,
+                "regime": params.get("regime", ""),
+                "x_I": interface_x,
+                "rel_l2_pct": rel_l2,
+                "iface_rel_l2_pct": iface_rel_l2,
+            })
+
+    rows.sort(key=lambda r: (r["sim_id"], r["s"], r["j"]))
+
+    out_path = seed_dir / out_name
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TEST_RECORD_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved {len(rows)} test records ({benchmark}) -> {out_path}")
+    return out_path

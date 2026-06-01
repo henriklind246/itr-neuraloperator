@@ -17,6 +17,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "face_conductance":          "physics",
     "multilayer_evolution":      "physics",
     "heat_flux_profile":         "physics",
+    "bc_verification":           "physics",
     # group: mms
     "mms_convergence":           "mms",
     "mms_order_estimation":      "mms",
@@ -52,9 +53,41 @@ PLOT_REGISTRY: dict[str, str] = {
     # group: sweep
     "sweep_ranking":             "sweep",
     "sweep_convergence":         "sweep",
+    "sweep_hyperparams":         "sweep",
+    # group: source
+    "source_dataset_summary":    "source",
+    "patch_param_scatter":       "source",
+    "source_temporal_profile":   "source",
+    "source_field_snapshots":    "source",
+    "source_input_channels":     "source",
+    "patch_overlay_trajectory":  "source",
+    "energy_budget":             "source",
+    "regime_error_breakdown":    "source",
+    "patch_error_slices":        "source",
+    "patch_region_error_map":    "source",
+    "source_error_vs_params":    "source",
+    "source_interface_zone_error": "source",
+    # group: interfaces
+    "interface_y_perturbation":  "interfaces",
+    "interface_lhs_scatter":     "interfaces",
+    "vary_interface_lhs_scatter": "interfaces",
+    "interface_flux_profiles":   "interfaces",
+    "sin_forcing_profiles":      "interfaces",
+    "interface_x_breakdown":     "interfaces",
+    "ic_family_trajectory_breakdown": "interfaces",
+    "vary_interface_dataset_summary": "interfaces",
+    # group: paper
+    "forcing_test_error_summary":               "paper",
+    "forcing_prediction_truth_residual":        "paper",
+    "source_test_error_summary":                "paper",
+    "source_prediction_truth_residual":         "paper",
+    "interfaces_test_error_summary":            "paper",
+    "interfaces_prediction_truth_residual":     "paper",
+    "all_benchmarks_error_summary":             "paper",
+    "all_benchmarks_prediction_truth_residual": "paper",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep"}
+GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper"}
 
 PLOT_STYLE = {
     "font.size": 10,
@@ -131,8 +164,17 @@ def _add_interface_lines(ax, positions: list[float], axis: str = "x") -> None:
         draw(position, color="0.35", linestyle=":", linewidth=1.2, alpha=0.9)
 
 
-def _resolve_interface_metadata(config: dict | None = None, solver=None) -> dict:
-    """Resolve interface metadata from solver geometry first, then config."""
+def _resolve_interface_metadata(config: dict | None = None, solver=None,
+                                sim_params=None, sim_id: int | None = None) -> dict:
+    """Resolve interface metadata.
+
+    Priority for ``interface_x``:
+        1. ``sim_params[sim_id]["interface_x"]`` if both are provided (per-sim
+           value from the vary-interfaces experiment).
+        2. config ``interface_x`` if present.
+        3. ``solver.interface_positions[0]`` if a solver is supplied.
+        4. Legacy fallback ``0.5`` so older configs/checkpoints still plot.
+    """
     positions: list[float] = []
     if solver is not None and hasattr(solver, "interface_positions"):
         positions = [float(pos) for pos in solver.interface_positions]
@@ -146,7 +188,17 @@ def _resolve_interface_metadata(config: dict | None = None, solver=None) -> dict
     interface_x = loss_cfg.get("interface_x", 0.5)
     interface_half_width = loss_cfg.get("interface_half_width", 0.05)
 
-    if positions:
+    per_sim_x = None
+    if sim_params is not None and sim_id is not None:
+        try:
+            per_sim_x = float(sim_params[int(sim_id)]["interface_x"])
+        except (KeyError, IndexError, TypeError):
+            per_sim_x = None
+
+    if per_sim_x is not None:
+        resolved_x = per_sim_x
+        positions = [resolved_x]
+    elif positions:
         resolved_x = float(interface_x) if interface_x is not None else positions[0]
     else:
         resolved_x = float(interface_x)
