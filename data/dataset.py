@@ -420,7 +420,7 @@ def load_sim_data(
     t_grid_path: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
-    trajectories = np.load(sim_traj_path)  # (num_sims, Nt, Nx, Ny)
+    trajectories = np.load(sim_traj_path, mmap_mode="r")  # (num_sims, Nt, Nx, Ny)
     x_grid = np.load(x_grid_path) # (Nx,)
     y_grid = np.load(y_grid_path) # (Ny,)
     t_grid = np.load(t_grid_path) # (Nt,)
