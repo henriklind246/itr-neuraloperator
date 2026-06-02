@@ -58,6 +58,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         n_snapshots=10,
         n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
         dt=solver_dt,
+        num_workers=0,
         temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
         problem=problem_from_config(config),
     )
