@@ -34,18 +34,35 @@ from src.operators.utils import resolve_device
 
 from omegaconf import OmegaConf
 
+from problems.registry import REGISTRY as _PROBLEM_REGISTRY
 
-VAL_PAIR_FIELDNAMES = [
+
+# Universal val-pair columns written for every benchmark. Benchmark-specific
+# conditioning columns are appended from each ProblemSpec.val_pair_fields, so
+# one CSV schema (the union) covers all benchmarks with empty cells where a
+# column does not apply.
+BASE_VAL_PAIR_FIELDNAMES = [
     "epoch",
     "sim_id",
-    "temporal_family",
-    "spatial_family",
+    "benchmark",
     "t_s",
     "t_bar",
     "R_c",
     "rel_l2",
     "iface_rel_l2",
 ]
+
+
+def _build_val_pair_fieldnames() -> list[str]:
+    extra: list[str] = []
+    for problem in _PROBLEM_REGISTRY.values():
+        for field in getattr(problem, "val_pair_fields", ()):
+            if field not in extra and field not in BASE_VAL_PAIR_FIELDNAMES:
+                extra.append(field)
+    return BASE_VAL_PAIR_FIELDNAMES + sorted(extra)
+
+
+VAL_PAIR_FIELDNAMES = _build_val_pair_fieldnames()
 
 
 def load_config(config_path: str | None = None) -> dict:
@@ -973,22 +990,25 @@ def _write_val_pair_rows(
     rel_l2: torch.Tensor,
     iface_rel_l2: torch.Tensor,
 ) -> None:
+    problem = getattr(dataset, "problem", None)
+    benchmark = getattr(problem, "name", "")
     rows = []
     for row_idx, (sim_id, s, j) in enumerate(pairs):
-        params = dataset.sim_params[int(sim_id)]
-        rows.append(
-            {
-                "epoch": int(epoch),
-                "sim_id": int(sim_id),
-                "temporal_family": params.get("temporal_family", ""),
-                "spatial_family": params.get("spatial_family", ""),
-                "t_s": float(dataset.t_grid[s]),
-                "t_bar": float(dataset.t_grid[j] - dataset.t_grid[s]),
-                "R_c": float(params["R_c"]),
-                "rel_l2": float(rel_l2[row_idx].item()),
-                "iface_rel_l2": float(iface_rel_l2[row_idx].item()),
-            }
-        )
+        sid = int(sim_id)
+        params = dataset.sim_params[sid]
+        row = {
+            "epoch": int(epoch),
+            "sim_id": sid,
+            "benchmark": benchmark,
+            "t_s": float(dataset.t_grid[s]),
+            "t_bar": float(dataset.t_grid[j] - dataset.t_grid[s]),
+            "R_c": float(params["R_c"]) if "R_c" in params else "",
+            "rel_l2": float(rel_l2[row_idx].item()),
+            "iface_rel_l2": float(iface_rel_l2[row_idx].item()),
+        }
+        if problem is not None:
+            row.update(problem.val_pair_row(dataset, sid, int(s), int(j)))
+        rows.append(row)
     writer.writerows(rows)
 
 
@@ -1028,7 +1048,9 @@ def validate(
             pair_path.parent.mkdir(parents=True, exist_ok=True)
             write_header = not pair_path.exists() or pair_path.stat().st_size == 0
             pair_file = pair_path.open("a", newline="")
-            pair_writer = csv.DictWriter(pair_file, fieldnames=VAL_PAIR_FIELDNAMES)
+            pair_writer = csv.DictWriter(
+                pair_file, fieldnames=VAL_PAIR_FIELDNAMES, restval="", extrasaction="ignore"
+            )
             if write_header:
                 pair_writer.writeheader()
 
@@ -1264,7 +1286,9 @@ def run_one_seed(
                 reader = csv.DictReader(f)
                 kept_rows = [row for row in reader if int(row["epoch"]) < start_epoch]
             with val_pairs_path.open("w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=VAL_PAIR_FIELDNAMES)
+                writer = csv.DictWriter(
+                    f, fieldnames=VAL_PAIR_FIELDNAMES, restval="", extrasaction="ignore"
+                )
                 writer.writeheader()
                 writer.writerows(kept_rows)
         elif not resuming and val_pairs_path.exists():

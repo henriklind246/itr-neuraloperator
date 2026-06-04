@@ -12,6 +12,11 @@ def resolve_device(device_str: str = "auto", local_rank: int | None = None) -> t
             return torch.device(f"cuda:{local_rank}")
         return torch.device(device_str)
 
+    if device_str == "mps":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
     if device_str == "auto":
         if torch.cuda.is_available():
             if local_rank is not None:
