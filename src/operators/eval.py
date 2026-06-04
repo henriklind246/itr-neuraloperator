@@ -30,6 +30,33 @@ Per-seed result keys:
 
 # -------- LOAD TEST SET ---------
 
+class _RamTestTrajectories:
+    """Serves only the test simulations from RAM, indexed by *absolute* sim_id.
+
+    The full trajectories file is memory-mapped (9.9 GB) and the test loader
+    accesses sims in a near-random order (pairs are sorted by lead time), which
+    causes heavy page-fault I/O — and, on Apple unified-memory machines, swap
+    thrashing once MPS GPU buffers compete for the same RAM. Caching just the
+    test sims (~15% of the data) as a contiguous in-RAM array removes that I/O
+    entirely while preserving the absolute-id indexing that ``build_item`` uses.
+    """
+
+    def __init__(self, memmap, test_ids):
+        self.shape = tuple(memmap.shape)  # (num_sims, Nt, Nx, Ny) — keep full semantics
+        self.dtype = memmap.dtype
+        # one sequential read per test sim into a compact contiguous cache
+        self._cache = {int(sid): __import__("numpy").ascontiguousarray(memmap[int(sid)])
+                       for sid in test_ids}
+
+    def __getitem__(self, key):
+        # build_item indexes as trajectories[sid, t, :, :]
+        if isinstance(key, tuple):
+            sid = int(key[0])
+            rest = key[1:]
+            return self._cache[sid][rest] if rest else self._cache[sid]
+        return self._cache[int(key)]
+
+
 def build_test_loader(config, mu_global=None, sigma_global=None):
     import numpy as np
 
@@ -62,6 +89,12 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
         problem=problem_from_config(config),
     )
+
+    # Cache only the test sims in RAM (removes random-access memmap I/O; avoids
+    # MPS unified-memory swap thrash). Disable via data.cache_test_in_ram=False.
+    if config.get("data", {}).get("cache_test_in_ram", True):
+        test_ds = testing_set.dataset
+        test_ds.trajectories = _RamTestTrajectories(trajectories, test_ds.sim_ids)
 
     return testing_set, x_grid, y_grid
 
