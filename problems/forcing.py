@@ -393,6 +393,17 @@ class ForcingProblem(ProblemSpec):
             "T_stats": T_stats,
         }
 
+    # ---- val-pair logging ----
+
+    val_pair_fields = ("temporal_family", "spatial_family")
+
+    def val_pair_row(self, ds, sim_id: int, s: int, j: int) -> dict[str, Any]:
+        p = ds.sim_params[int(sim_id)]
+        return {
+            "temporal_family": p.get("temporal_family", ""),
+            "spatial_family": p.get("spatial_family", ""),
+        }
+
     # ---- schema / labels ----
 
     def validate_schema(self, sim_params: np.ndarray, sim_ids: np.ndarray) -> None:
