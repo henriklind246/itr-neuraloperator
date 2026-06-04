@@ -290,6 +290,14 @@ class InterfacesProblem(ProblemSpec):
             "T_stats": T_stats,
         }
 
+    # ---- val-pair logging ----
+
+    val_pair_fields = ("interface_x",)
+
+    def val_pair_row(self, ds, sim_id: int, s: int, j: int) -> dict[str, Any]:
+        p = ds.sim_params[int(sim_id)]
+        return {"interface_x": float(p["interface_x"])}
+
     # ---- schema / labels ----
 
     def validate_schema(self, sim_params: np.ndarray, sim_ids: np.ndarray) -> None:

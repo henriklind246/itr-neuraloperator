@@ -356,6 +356,19 @@ class SourceProblem(ProblemSpec):
             "T_stats": T_stats,
         }
 
+    # ---- val-pair logging ----
+
+    val_pair_fields = ("x_h", "y_h", "A", "regime")
+
+    def val_pair_row(self, ds, sim_id: int, s: int, j: int) -> dict[str, Any]:
+        p = ds.sim_params[int(sim_id)]
+        return {
+            "x_h": float(p["x_h"]),
+            "y_h": float(p["y_h"]),
+            "A": float(p["A"]),
+            "regime": p.get("regime", ""),
+        }
+
     # ---- schema / labels ----
 
     def validate_schema(self, sim_params: np.ndarray, sim_ids: np.ndarray) -> None:
