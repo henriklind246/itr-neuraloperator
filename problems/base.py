@@ -94,6 +94,22 @@ class ProblemSpec(ABC):
 
     # ---- optional hooks (sane defaults) ----
 
+    #: Extra per-pair conditioning columns this benchmark contributes to
+    #: ``val_pairs.csv`` (on top of the universal ``epoch, sim_id, benchmark,
+    #: t_s, t_bar, R_c, rel_l2, iface_rel_l2``). The training writer takes the
+    #: union across all registered benchmarks as the CSV header and leaves
+    #: columns a benchmark does not populate empty.
+    val_pair_fields: tuple[str, ...] = ()
+
+    def val_pair_row(self, ds, sim_id: int, s: int, j: int) -> dict[str, Any]:
+        """Return this benchmark's extra val-pair columns for one (s -> j) pair.
+
+        Keys must be a subset of ``val_pair_fields``. The default is empty; the
+        universal columns are filled by the training loop. `ds` is the owning
+        `SnapshotPairDataset` (duck-typed: grids, sim_params available).
+        """
+        return {}
+
     def diagnostics(self, model, batch: dict, ctx: dict) -> dict:
         """Benchmark-specific probes run during training diagnostics."""
         return {}
