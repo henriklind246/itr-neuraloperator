@@ -307,18 +307,33 @@ class TestValidate:
             rows = list(csv.DictReader(f))
 
         assert len(rows) == len(dataset)
+        # Header is the full superset (union of every benchmark's columns).
         assert set(rows[0]) == {
             "epoch",
             "sim_id",
-            "temporal_family",
-            "spatial_family",
+            "benchmark",
             "t_s",
             "t_bar",
             "R_c",
             "rel_l2",
             "iface_rel_l2",
+            "A",
+            "interface_x",
+            "regime",
+            "spatial_family",
+            "temporal_family",
+            "x_h",
+            "y_h",
         }
         assert {int(row["epoch"]) for row in rows} == {7}
+        # The fixture is a forcing-style dataset, so only forcing's extra
+        # columns are populated; every other benchmark's columns stay empty.
+        for row in rows:
+            assert row["benchmark"] == "forcing"
+            assert row["temporal_family"] != ""
+            assert row["spatial_family"] != ""
+            for empty_col in ("A", "interface_x", "regime", "x_h", "y_h"):
+                assert row[empty_col] == ""
 
     def test_per_pair_csv_metrics_use_normalized_tensors(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories

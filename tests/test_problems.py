@@ -437,3 +437,55 @@ class TestProblemFromConfig:
     def test_defaults_to_forcing_when_missing(self):
         assert isinstance(problem_from_config({}), ForcingProblem)
         assert isinstance(problem_from_config({"benchmark": {}}), ForcingProblem)
+
+
+# ===================== val-pair logging hooks =====================
+
+class TestValPairRow:
+    """Each benchmark contributes exactly its declared val_pair_fields to
+    val_pairs.csv, so the superset header stays consistent and no benchmark
+    leaks columns it forbids elsewhere (e.g. source must not emit families)."""
+
+    def test_forcing_fields_and_row(self, forcing_dataset):
+        ds = forcing_dataset
+        spec = get_problem("forcing")
+        assert spec.val_pair_fields == ("temporal_family", "spatial_family")
+        sim_id, s, j = ds._pairs[0]
+        row = spec.val_pair_row(ds, sim_id, s, j)
+        assert set(row) == set(spec.val_pair_fields)
+        p = ds.sim_params[int(sim_id)]
+        assert row["temporal_family"] == p["temporal_family"]
+        assert row["spatial_family"] == p["spatial_family"]
+
+    def test_interfaces_fields_and_row(self, interfaces_dataset):
+        ds = interfaces_dataset
+        spec = get_problem("interfaces")
+        assert spec.val_pair_fields == ("interface_x",)
+        sim_id, s, j = ds._pairs[0]
+        row = spec.val_pair_row(ds, sim_id, s, j)
+        assert set(row) == set(spec.val_pair_fields)
+        assert row["interface_x"] == pytest.approx(
+            float(ds.sim_params[int(sim_id)]["interface_x"])
+        )
+
+    def test_source_fields_and_row(self, source_dataset):
+        ds = source_dataset
+        spec = get_problem("source")
+        assert spec.val_pair_fields == ("x_h", "y_h", "A", "regime")
+        sim_id, s, j = ds._pairs[0]
+        row = spec.val_pair_row(ds, sim_id, s, j)
+        assert set(row) == set(spec.val_pair_fields)
+        p = ds.sim_params[int(sim_id)]
+        assert row["x_h"] == pytest.approx(float(p["x_h"]))
+        assert row["y_h"] == pytest.approx(float(p["y_h"]))
+        assert row["A"] == pytest.approx(float(p["A"]))
+        assert row["regime"] == p["regime"]
+        # source forbids family columns everywhere; the val-pair hook must not
+        # reintroduce them.
+        assert "temporal_family" not in row
+        assert "spatial_family" not in row
+
+    def test_base_default_is_empty(self):
+        from problems.base import ProblemSpec
+
+        assert ProblemSpec.val_pair_fields == ()

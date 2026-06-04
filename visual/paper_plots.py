@@ -41,6 +41,8 @@ TEMPORAL_ORDER = ("sin", "exp", "pulse_train", "exp_train")
 SPATIAL_ORDER = ("uniform", "patch", "gaussian", "triangle")
 REGIME_ORDER = ("left", "near", "right")
 
+FORCING_ACTIVE_T_MAX = 0.20  # target time t_j below which boundary forcing is active
+
 _INT_COLS = ("sim_id", "s", "j")
 _FLOAT_COLS = (
     "t_s", "t_bar", "R_c", "x_h", "y_h", "A", "freq",
@@ -395,24 +397,33 @@ def plot_interfaces_test_error_summary(records, save_path=None):
 # ============================================================
 
 def plot_forcing_prediction_truth_residual(model, ds, records, save_path=None):
-    """Forcing benchmark truth/prediction/residual for three forcing regimes."""
-    selectors = [
-        _mask_in(records["temporal_family"], "sin") & _mask_in(records["spatial_family"], "uniform"),
-        _mask_in(records["temporal_family"], "exp") & _mask_in(records["spatial_family"], "gaussian"),
-        _mask_in(records["temporal_family"], ("pulse_train", "exp_train"))
-        & _mask_in(records["spatial_family"], ("patch", "triangle")),
-    ]
-    fallbacks = [
-        np.ones(int(records["_n"]), dtype=bool),
-        _mask_in(records["temporal_family"], "sin") & _mask_in(records["spatial_family"], "patch"),
-        _mask_in(records["temporal_family"], ("pulse_train", "exp_train")),
-    ]
+    """Forcing truth/prediction/residual, one row per temporal family, sampled
+    during the forcing-active window (target time t_j <= FORCING_ACTIVE_T_MAX).
+
+    Selecting the target snapshot from the forcing phase keeps y-direction
+    structure (2D coupling) visible instead of the late, near-1D x-diffusion
+    relaxation. Spatial family is secondary, so per-row selection prefers a
+    rotating spatial profile but relaxes it (then the time window) via fallbacks.
+    """
+    t_j = records["t_s"] + records["t_bar"]
+    active = t_j <= FORCING_ACTIVE_T_MAX
+    active_relaxed = t_j <= 0.25
+    preferred_spatial = {"sin": "uniform", "exp": "gaussian",
+                         "pulse_train": "patch", "exp_train": "triangle"}
+
     with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(3, 3, figsize=(12.5, 11.5))
-        for r, (primary, fallback) in enumerate(zip(selectors, fallbacks)):
-            row = _representative_row(records, primary)
-            if row < 0:
-                row = _representative_row(records, fallback)
+        fig, axes = plt.subplots(4, 3, figsize=(12.5, 15.3))
+        for r, fam in enumerate(TEMPORAL_ORDER):
+            fam_mask = _mask_in(records["temporal_family"], fam)
+            sp_mask = _mask_in(records["spatial_family"], preferred_spatial[fam])
+            row = -1
+            for mask in (fam_mask & active & sp_mask,
+                         fam_mask & active,
+                         fam_mask & active_relaxed,
+                         fam_mask):
+                row = _representative_row(records, mask)
+                if row >= 0:
+                    break
             if row < 0:
                 continue
             sid, s, j = (int(records[k][row]) for k in ("sim_id", "s", "j"))
