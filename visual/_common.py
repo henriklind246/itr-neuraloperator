@@ -85,6 +85,10 @@ PLOT_REGISTRY: dict[str, str] = {
     "interfaces_prediction_truth_residual":     "paper",
     "all_benchmarks_error_summary":             "paper",
     "all_benchmarks_prediction_truth_residual": "paper",
+    "forcing_interface_jump":                   "paper",
+    "source_interface_jump":                    "paper",
+    "interfaces_interface_jump":                "paper",
+    "all_benchmarks_interface_jump":            "paper",
 }
 
 GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper"}

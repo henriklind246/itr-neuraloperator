@@ -10,7 +10,6 @@ Three test cases:
 import numpy as np
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
-
 # ==============================================================
 # 1. y-independent MMS (identical physics to mms_1d.run_mms_once)
 # ==============================================================
@@ -481,6 +480,10 @@ def run_mms_2d_interface(N: int, dt=None, x_I: float = 0.5) -> tuple[float, floa
     return sim.hx, sim.dt, max_abs_err, l2_err
 
 
+# ======================================================
+# 4. Patch source MMS (internal source with R_c)
+# ======================================================
+
 def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float]:
     """
     Smooth-source MMS for the internal-source pathway.
@@ -791,4 +794,12 @@ if __name__ == '__main__':
     p = space_order_test_2d_off_center_interface([50, 100, 200])
     print(f"Spatial order: {p:.3f}")
     p = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Patch Source MMS ===")
+    h, dt, me, l2 = run_mms_2d_patch_source(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_patch_source([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_patch_source([0.04, 0.02, 0.01])
     print(f"Temporal order: {p:.3f}")

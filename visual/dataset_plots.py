@@ -196,6 +196,107 @@ def _jump_rms(jump_profile: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.asarray(jump_profile, dtype=np.float64) ** 2)))
 
 
+# ------------------------------------------------------------
+# Imperfect-interface CONTACT jump (physical Kelvin)
+# ------------------------------------------------------------
+# The node-to-node jump above mixes three effects: the left half-cell bulk
+# conduction drop, the contact discontinuity, and the right half-cell bulk drop.
+# The *contact* jump isolates the discontinuity at the imperfect interface:
+#
+#     dT_contact(t, y) = R_c * q_I = R_c * G * (T_left - T_right),
+#     G = 1 / (h_L/k_L + R_c + h_R/k_R),
+#
+# where G is the per-area interface conductance used by the FV solver
+# (src/physics/fv_solver_2d.py:376) and (h_L, h_R) are the node->interface
+# distances (h_L + h_R = hx). The FNO predicts nodal temperatures; we postprocess
+# them with the known interface law to obtain the implied contact jump.
+
+_DEFAULT_K_LEFT = 2.0
+_DEFAULT_K_RIGHT = 1.0
+
+
+def _resolve_layer_conductivities(ds, sid: int, config: dict | None = None) -> tuple[float, float]:
+    """Resolve (k_left, k_right) for the imperfect interface, sample-first.
+
+    Order: (1) per-sample material values if a dataset ever serializes them,
+    (2) config-declared layer conductivities, (3) the benchmark constants
+    (all current benchmarks use k_left=2.0, k_right=1.0).
+    """
+    try:
+        params = ds.sim_params[int(sid)]
+        kl, kr = params.get("k_left"), params.get("k_right")
+        if kl is not None and kr is not None:
+            return float(kl), float(kr)
+    except (AttributeError, KeyError, IndexError, TypeError):
+        pass
+    if config is not None:
+        layers = config.get("physics", {}).get("layers")
+        if layers and len(layers) >= 2:
+            try:
+                return float(layers[0]["k"]), float(layers[1]["k"])
+            except (KeyError, TypeError, IndexError):
+                pass
+    return _DEFAULT_K_LEFT, _DEFAULT_K_RIGHT
+
+
+def _interface_conductance_G(x_grid: np.ndarray, interface_x: float, R_c: float,
+                             k_left: float, k_right: float) -> float:
+    """Per-area interface conductance G = 1/(h_L/k_L + R_c + h_R/k_R)."""
+    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_x)
+    h_L = float(interface_x) - float(x_grid[left_node])
+    h_R = float(x_grid[right_node]) - float(interface_x)
+    return 1.0 / (h_L / float(k_left) + float(R_c) + h_R / float(k_right))
+
+
+def _interface_contact_jump_map(fields: np.ndarray, x_grid: np.ndarray, interface_x: float,
+                                R_c: float, k_left: float, k_right: float) -> np.ndarray:
+    """Return the physical contact-jump history dT_contact(t, y) in Kelvin.
+
+    ``fields`` is a stack of shape (Nt, Nx, Ny). Sign convention: positive means a
+    temperature drop left->right (T_L^face - T_R^face = R_c*q_I).
+    """
+    left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_x)
+    G = _interface_conductance_G(x_grid, interface_x, R_c, k_left, k_right)
+    jump = float(R_c) * G * (fields[:, left_node, :] - fields[:, right_node, :])
+    return np.asarray(jump, dtype=np.float64)
+
+
+def _contact_jump_reductions(jump_map: np.ndarray) -> dict[str, np.ndarray]:
+    """Per-time y-reductions of a contact-jump map (Nt, Ny) -> dict of (Nt,) arrays.
+
+    ``mean_abs``/``rms`` are robust magnitude headlines; ``signed_mean`` (with
+    ``signed_std`` for a band) is secondary and meaningful only where the
+    through-interface flux keeps one sign.
+    """
+    j = np.asarray(jump_map, dtype=np.float64)
+    return {
+        "mean_abs": np.mean(np.abs(j), axis=1),
+        "rms": np.sqrt(np.mean(j ** 2, axis=1)),
+        "signed_mean": np.mean(j, axis=1),
+        "signed_std": np.std(j, axis=1),
+    }
+
+
+def _jump_error_metrics(jump_pred: np.ndarray, jump_true: np.ndarray,
+                        eps: float = 1e-8) -> dict[str, float]:
+    """Absolute-Kelvin contact-jump error metrics (primary) + a guarded rel-L2.
+
+    The relative L2 is flagged ``rel_l2_pct_redundant`` because for a scalar R_c /
+    fixed-interface case it equals the node-to-node jump relative error (the
+    R_c*G scale factor cancels per case); use it only as a secondary annotation.
+    """
+    jp = np.asarray(jump_pred, dtype=np.float64)
+    jt = np.asarray(jump_true, dtype=np.float64)
+    diff = jp - jt
+    denom = float(np.sqrt(np.sum(jt ** 2)))
+    return {
+        "abs_rmse_K": float(np.sqrt(np.mean(diff ** 2))) if diff.size else 0.0,
+        "peak_abs_err_K": float(np.max(np.abs(diff))) if diff.size else 0.0,
+        "truth_peak_jump_K": float(np.max(np.abs(jt))) if jt.size else 0.0,
+        "rel_l2_pct_redundant": float(np.sqrt(np.sum(diff ** 2)) / max(denom, eps) * 100.0),
+    }
+
+
 def _shared_thumbnail_grid(n_panels: int) -> tuple[int, int]:
     """Return a near-square (nrows, ncols) layout for thumbnail-style figures."""
     if n_panels <= 0:

@@ -32,8 +32,17 @@ from data.dataset import (
 from visual._common import PLOT_STYLE, _save_figure
 from visual.dataset_plots import (
     _compute_binned_quantiles,
+    _contact_jump_reductions,
+    _future_target_indices,
+    _interface_conductance_G,
+    _interface_contact_jump_map,
+    _interface_flanking_nodes_from_grid,
+    _interface_jump_map,
+    _jump_error_metrics,
     _model_predict_item,
     _plot_field_2d,
+    _prepare_prediction_case,
+    _resolve_layer_conductivities,
 )
 
 
@@ -474,6 +483,200 @@ def plot_interfaces_prediction_truth_residual(model, ds, records, save_path=None
 
 
 # ============================================================
+# INTERFACE CONTACT-JUMP OVER LEAD TIME (per benchmark)
+# ============================================================
+# The FNO predicts nodal temperatures; we postprocess them with the known
+# imperfect-interface law to obtain the *implied* physical contact jump in
+# Kelvin: dT_contact = R_c * G * (T_left - T_right). These figures headline the
+# genuinely new content — the absolute-Kelvin jump magnitude and its absolute
+# error over lead time. Per-case RELATIVE L2 is omitted as a headline because for
+# a scalar R_c / fixed interface it equals the node-to-node jump rel error (the
+# R_c*G scale factor cancels per case).
+
+_JUMP_N_TARGETS = 20  # future targets rolled out per source snapshot
+
+
+def _jump_case(model, ds, sid: int, s: int, config, dt, n_targets: int = _JUMP_N_TARGETS):
+    """Roll one source snapshot forward; return contact-jump truth/pred arrays (K).
+
+    Reuses ``_prepare_prediction_case`` (physical-Kelvin Y_true/Y_pred of shape
+    ``(n_targets, Nx, Ny)``) and converts each field to the contact jump with the
+    same interface law the FV solver uses. Emits a debug line per case so a
+    silently wrong ``G`` (mismatched interface_x / R_c / conductivities) is caught.
+    """
+    target_indices = _future_target_indices(int(s), n_targets, len(ds.t_grid))
+    case = _prepare_prediction_case(
+        model, ds.trajectories, ds.x_grid, ds.y_grid, ds.t_grid,
+        ds.sim_params, int(sid), int(s), target_indices, config=config, dt=dt,
+    )
+    interface_x = float(case["interface_x"])
+    R_c = float(case["R_c"])
+    k_left, k_right = _resolve_layer_conductivities(ds, int(sid), config)
+
+    left_node, right_node = _interface_flanking_nodes_from_grid(ds.x_grid, interface_x)
+    h_L = float(interface_x) - float(ds.x_grid[left_node])
+    h_R = float(ds.x_grid[right_node]) - float(interface_x)
+    G = _interface_conductance_G(ds.x_grid, interface_x, R_c, k_left, k_right)
+
+    true_jump = _interface_contact_jump_map(case["Y_true"], ds.x_grid, interface_x, R_c, k_left, k_right)
+    pred_jump = _interface_contact_jump_map(case["Y_pred"], ds.x_grid, interface_x, R_c, k_left, k_right)
+    node_true = _interface_jump_map(case["Y_true"], left_node, right_node)
+    node_peak = float(np.max(np.abs(node_true))) if node_true.size else 0.0
+    contact_peak = float(np.max(np.abs(true_jump))) if true_jump.size else 0.0
+
+    print(
+        f"[jump] sid={int(sid)} s={int(s)} x_I={interface_x:.4f} R_c={R_c:.4f} "
+        f"k_L={k_left:.3f} k_R={k_right:.3f} h_L={h_L:.4f} h_R={h_R:.4f} "
+        f"G={G:.4f} R_c*G={R_c * G:.4f} max|node|={node_peak:.4g} max|contact|={contact_peak:.4g}"
+    )
+
+    return {
+        "t_bars": np.asarray(case["t_bars"], dtype=np.float64),
+        "y_grid": np.asarray(ds.y_grid, dtype=np.float64),
+        "true_jump": true_jump,
+        "pred_jump": pred_jump,
+        "true_red": _contact_jump_reductions(true_jump),
+        "pred_red": _contact_jump_reductions(pred_jump),
+        "metrics": _jump_error_metrics(pred_jump, true_jump),
+        "interface_x": interface_x,
+        "R_c": R_c,
+    }
+
+
+def _render_jump_row(axes_row, case, jump_abs: float, mag_ymax: float, *,
+                     row_label: str = "", col_titles: bool = False) -> None:
+    """Render one truth-jump | pred-jump | magnitude-vs-time row (absolute K)."""
+    ax_t, ax_p, ax_c = axes_row
+    t_bars = case["t_bars"]
+    y_grid = case["y_grid"]
+
+    pcm_t = ax_t.pcolormesh(t_bars, y_grid, case["true_jump"].T, cmap="coolwarm",
+                            vmin=-jump_abs, vmax=jump_abs, shading="auto")
+    pcm_p = ax_p.pcolormesh(t_bars, y_grid, case["pred_jump"].T, cmap="coolwarm",
+                            vmin=-jump_abs, vmax=jump_abs, shading="auto")
+    cbar_label = r"$\Delta T_\mathrm{contact}$ [K]"
+    ax_t.figure.colorbar(pcm_t, ax=ax_t, fraction=0.046, pad=0.04, label=cbar_label)
+    ax_p.figure.colorbar(pcm_p, ax=ax_p, fraction=0.046, pad=0.04, label=cbar_label)
+    for ax in (ax_t, ax_p):
+        ax.set_xlabel(r"lead time $\bar{t}$")
+    ax_t.set_ylabel((row_label + "\n" if row_label else "") + "y", fontsize=8)
+    ax_p.set_ylabel("y")
+
+    # Column 3: mean-|jump| magnitude vs lead time (truth vs pred), absolute K.
+    # CAVEAT: this y-reduced magnitude can overlap while pointwise error is large;
+    # any error claim must lean on abs_rmse_K (annotated), not on curve overlap.
+    ax_c.plot(t_bars, case["true_red"]["mean_abs"], "-o", ms=3, color="C0", label="truth")
+    ax_c.plot(t_bars, case["pred_red"]["mean_abs"], "--s", ms=3, color="C3", label="pred")
+    ax_c.set_xlabel(r"lead time $\bar{t}$")
+    ax_c.set_ylabel(r"mean $|\Delta T_\mathrm{contact}|$ [K]")
+    if mag_ymax > 0:
+        ax_c.set_ylim(0.0, mag_ymax * 1.08)
+    ax_c.legend(loc="upper right")
+    m = case["metrics"]
+    ax_c.text(
+        0.03, 0.96,
+        f"abs RMSE={m['abs_rmse_K']:.3g} K\n"
+        f"peak err={m['peak_abs_err_K']:.3g} K\n"
+        f"truth peak={m['truth_peak_jump_K']:.3g} K",
+        transform=ax_c.transAxes, va="top", ha="left",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+    )
+
+    if col_titles:
+        ax_t.set_title("Truth contact jump")
+        ax_p.set_title("Predicted contact jump")
+        ax_c.set_title(r"Mean $|$jump$|$ vs lead time")
+
+
+def _build_jump_figure(cases, labels, name: str, save_path):
+    """Assemble a per-benchmark contact-jump figure with shared symmetric scales."""
+    if not cases:
+        with plt.rc_context(PLOT_STYLE):
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            ax.text(0.5, 0.5, "No cases available", ha="center", va="center")
+            ax.axis("off")
+            return _save_figure(fig, save_path, "paper", name)
+
+    jump_abs = max(
+        [float(np.max(np.abs(c["true_jump"]))) for c in cases]
+        + [float(np.max(np.abs(c["pred_jump"]))) for c in cases]
+        + [1e-8]
+    )
+    mag_ymax = max(
+        [float(np.max(c["true_red"]["mean_abs"])) for c in cases]
+        + [float(np.max(c["pred_red"]["mean_abs"])) for c in cases]
+        + [1e-8]
+    )
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(len(cases), 3, figsize=(15, 4.1 * len(cases)), squeeze=False)
+        for r, (case, label) in enumerate(zip(cases, labels)):
+            _render_jump_row(axes[r], case, jump_abs, mag_ymax,
+                             row_label=label, col_titles=(r == 0))
+        return _save_figure(fig, save_path, "paper", name)
+
+
+def plot_forcing_interface_jump(model, ds, records, config, dt, save_path=None):
+    """Forcing contact-jump over lead time, one row per temporal family.
+
+    Picks the same representative cases as the forcing TPR figure (forcing-active
+    window, rotating spatial profile), then rolls each forward to show the
+    implied imperfect-interface temperature jump in Kelvin: truth map | pred map |
+    mean-|jump| vs lead time.
+    """
+    t_j = records["t_s"] + records["t_bar"]
+    active = t_j <= FORCING_ACTIVE_T_MAX
+    active_relaxed = t_j <= 0.25
+    preferred_spatial = {"sin": "uniform", "exp": "gaussian",
+                         "pulse_train": "patch", "exp_train": "triangle"}
+
+    cases, labels = [], []
+    for fam in TEMPORAL_ORDER:
+        fam_mask = _mask_in(records["temporal_family"], fam)
+        sp_mask = _mask_in(records["spatial_family"], preferred_spatial[fam])
+        row = -1
+        for mask in (fam_mask & active & sp_mask, fam_mask & active,
+                     fam_mask & active_relaxed, fam_mask):
+            row = _representative_row(records, mask)
+            if row >= 0:
+                break
+        if row < 0:
+            continue
+        sid, s = int(records["sim_id"][row]), int(records["s"][row])
+        case = _jump_case(model, ds, sid, s, config, dt)
+        cases.append(case)
+        labels.append(f"{fam}\nR_c={case['R_c']:.2f}")
+    return _build_jump_figure(cases, labels, "forcing_interface_jump", save_path)
+
+
+def plot_source_interface_jump(model, ds, records, config, dt, save_path=None):
+    """Source contact-jump over lead time for left/near/right patch regimes."""
+    cases, labels = [], []
+    for regime in REGIME_ORDER:
+        row = _representative_row(records, _mask_in(records["regime"], regime))
+        if row < 0:
+            continue
+        sid, s = int(records["sim_id"][row]), int(records["s"][row])
+        case = _jump_case(model, ds, sid, s, config, dt)
+        cases.append(case)
+        labels.append(f"{regime}\nx_I={case['interface_x']:.2f}, R_c={case['R_c']:.2f}")
+    return _build_jump_figure(cases, labels, "source_interface_jump", save_path)
+
+
+def plot_interfaces_interface_jump(model, ds, records, config, dt, save_path=None):
+    """Interfaces contact-jump over lead time at x_I≈0.25/0.50/0.75."""
+    cases, labels = [], []
+    for target in (0.25, 0.50, 0.75):
+        row = _row_for_x_I(records, target)
+        if row < 0:
+            continue
+        sid, s = int(records["sim_id"][row]), int(records["s"][row])
+        case = _jump_case(model, ds, sid, s, config, dt)
+        cases.append(case)
+        labels.append(f"x_I≈{target:.2f}\nx_I={case['interface_x']:.2f}, R_c={case['R_c']:.2f}")
+    return _build_jump_figure(cases, labels, "interfaces_interface_jump", save_path)
+
+
+# ============================================================
 # CROSS-BENCHMARK SYNTHESIS
 # ============================================================
 
@@ -556,3 +759,130 @@ def plot_all_benchmarks_prediction_truth_residual(forcing_ctx, source_ctx,
                             interface_positions=[x_I_val],
                             row_label="interfaces: " + _row_label(i_ds, i_rec, row))
         return _save_figure(fig, save_path, "paper", "all_benchmarks_prediction_truth_residual")
+
+
+def _aggregate_benchmark_jump(ctx, n_sims: int = 24, n_targets: int = _JUMP_N_TARGETS,
+                              seed: int = 0):
+    """Roll a fixed-protocol sample of test sims; stack per-lead-time jump curves.
+
+    Identical protocol across benchmarks for fairness: same sampled count, same
+    rollout start (s=0), same target lead-time indices, same fixed seed. Returns
+    per-sim stacks of shape ``(n_sims, n_lead)`` for truth/pred magnitude (K),
+    absolute jump RMSE (K), and scale-normalized relative jump error (%).
+    """
+    model, ds, records, config, dt = ctx
+    n_total = len(ds.t_grid)
+    if n_total < 2:
+        return None
+    s_start = 0
+    target_indices = _future_target_indices(s_start, n_targets, n_total)
+
+    sim_ids = np.unique(records["sim_id"])
+    rng = np.random.default_rng(seed)
+    if len(sim_ids) > n_sims:
+        sim_ids = np.sort(rng.choice(sim_ids, size=n_sims, replace=False))
+
+    truth_mag, pred_mag, abs_err, rel_err = [], [], [], []
+    t_bars_ref = None
+    for sid in sim_ids:
+        case = _prepare_prediction_case(
+            model, ds.trajectories, ds.x_grid, ds.y_grid, ds.t_grid,
+            ds.sim_params, int(sid), s_start, target_indices, config=config, dt=dt,
+        )
+        interface_x = float(case["interface_x"])
+        R_c = float(case["R_c"])
+        k_left, k_right = _resolve_layer_conductivities(ds, int(sid), config)
+        tj = _interface_contact_jump_map(case["Y_true"], ds.x_grid, interface_x, R_c, k_left, k_right)
+        pj = _interface_contact_jump_map(case["Y_pred"], ds.x_grid, interface_x, R_c, k_left, k_right)
+        diff = pj - tj
+        truth_mag.append(np.mean(np.abs(tj), axis=1))
+        pred_mag.append(np.mean(np.abs(pj), axis=1))
+        abs_err.append(np.sqrt(np.mean(diff ** 2, axis=1)))
+        denom = np.sqrt(np.sum(tj ** 2, axis=1))
+        rel_err.append(np.sqrt(np.sum(diff ** 2, axis=1)) / np.maximum(denom, 1e-8) * 100.0)
+        if t_bars_ref is None:
+            t_bars_ref = np.asarray(case["t_bars"], dtype=np.float64)
+
+    if t_bars_ref is None:
+        return None
+    return {
+        "t_bars": t_bars_ref,
+        "truth_mag": np.vstack(truth_mag),
+        "pred_mag": np.vstack(pred_mag),
+        "abs_err": np.vstack(abs_err),
+        "rel_err": np.vstack(rel_err),
+    }
+
+
+def plot_all_benchmarks_interface_jump(forcing_ctx, source_ctx, interfaces_ctx,
+                                       save_path=None, n_sims: int = 24, seed: int = 0):
+    """Combined cross-benchmark contact-jump synthesis (1x3), honest per-panel lanes.
+
+    Each ``*_ctx`` is ``(model, ds, records, config, dt)``. The three panels each
+    own one question and must not share a caption:
+
+    - (a) Magnitude/bias (absolute K): mean-|contact jump| vs lead time, truth
+      (solid) vs pred (dashed) per benchmark. Shows under/over-prediction of jump
+      magnitude. No difficulty claim.
+    - (b) Absolute jump-error magnitude (absolute K): median jump RMSE + IQR. This
+      is a SCALE comparison of error magnitude, NOT a difficulty ranking, because
+      benchmarks differ in characteristic jump magnitude.
+    - (c) Difficulty ranking (scale-normalized): relative jump error, median + IQR.
+      This equals the node-to-node jump rel-L2 per case (R_c*G cancels) — the honest
+      "which benchmark is hardest to learn" panel.
+    """
+    names = ("forcing", "source", "interfaces")
+    ctxs = (forcing_ctx, source_ctx, interfaces_ctx)
+    colors = {"forcing": "C0", "source": "C1", "interfaces": "C2"}
+    aggs = {name: _aggregate_benchmark_jump(ctx, n_sims=n_sims, seed=seed)
+            for name, ctx in zip(names, ctxs)}
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+
+        # (a) magnitude / bias view — absolute Kelvin.
+        for name in names:
+            a = aggs[name]
+            if a is None:
+                continue
+            c = colors[name]
+            axes[0].plot(a["t_bars"], a["truth_mag"].mean(axis=0), "-", color=c, label=f"{name} truth")
+            axes[0].plot(a["t_bars"], a["pred_mag"].mean(axis=0), "--", color=c, label=f"{name} pred")
+        axes[0].set_xlabel(r"lead time $\bar{t}$")
+        axes[0].set_ylabel(r"mean $|\Delta T_\mathrm{contact}|$ [K]")
+        axes[0].set_title("(a) Jump magnitude vs lead time\n(truth solid, pred dashed)")
+        axes[0].legend(fontsize=7)
+
+        # (b) absolute jump-error magnitude — SCALE comparison, not difficulty.
+        for name in names:
+            a = aggs[name]
+            if a is None:
+                continue
+            c = colors[name]
+            med = np.median(a["abs_err"], axis=0)
+            q25 = np.percentile(a["abs_err"], 25, axis=0)
+            q75 = np.percentile(a["abs_err"], 75, axis=0)
+            axes[1].plot(a["t_bars"], med, "-o", ms=3, color=c, label=name)
+            axes[1].fill_between(a["t_bars"], q25, q75, alpha=0.2, color=c)
+        axes[1].set_xlabel(r"lead time $\bar{t}$")
+        axes[1].set_ylabel("abs jump RMSE [K]")
+        axes[1].set_title("(b) Absolute jump-error magnitude\n(scale comparison, NOT difficulty)")
+        axes[1].legend(fontsize=7)
+
+        # (c) scale-normalized difficulty ranking = node-to-node jump rel-L2 per case.
+        for name in names:
+            a = aggs[name]
+            if a is None:
+                continue
+            c = colors[name]
+            med = np.median(a["rel_err"], axis=0)
+            q25 = np.percentile(a["rel_err"], 25, axis=0)
+            q75 = np.percentile(a["rel_err"], 75, axis=0)
+            axes[2].plot(a["t_bars"], med, "-o", ms=3, color=c, label=name)
+            axes[2].fill_between(a["t_bars"], q25, q75, alpha=0.2, color=c)
+        axes[2].set_xlabel(r"lead time $\bar{t}$")
+        axes[2].set_ylabel("relative jump error (%)")
+        axes[2].set_title("(c) Difficulty ranking (scale-normalized)\n= node-to-node jump rel-L2 per case")
+        axes[2].legend(fontsize=7)
+
+        return _save_figure(fig, save_path, "paper", "all_benchmarks_interface_jump")

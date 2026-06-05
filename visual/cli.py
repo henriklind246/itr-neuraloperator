@@ -761,14 +761,24 @@ def main():
             "source_prediction_truth_residual": paper_plots.plot_source_prediction_truth_residual,
             "interfaces_prediction_truth_residual": paper_plots.plot_interfaces_prediction_truth_residual,
         }
-        needs_pred = any(_should_run(name, groups, individual) for name in prediction_plots)
+        # Per-benchmark contact-jump plots share the same model/ds inputs but take
+        # the extra (config, dt) needed to compute the physical interface law.
+        jump_plots = {
+            "forcing_interface_jump": paper_plots.plot_forcing_interface_jump,
+            "source_interface_jump": paper_plots.plot_source_interface_jump,
+            "interfaces_interface_jump": paper_plots.plot_interfaces_interface_jump,
+        }
+        needs_pred = any(
+            _should_run(name, groups, individual)
+            for name in (*prediction_plots, *jump_plots)
+        )
         if needs_pred:
             have_inputs = bool(
                 active_records is not None and args.checkpoint and args.data
                 and args.x_grid and args.y_grid and args.t_grid and args.params
             )
             if not have_inputs:
-                for name in prediction_plots:
+                for name in (*prediction_plots, *jump_plots):
                     if _should_run(name, groups, individual):
                         _print_skip(name, "need --records, --checkpoint, --data, --x-grid, --y-grid, --t-grid, --params")
             else:
@@ -776,7 +786,7 @@ def main():
                     model, checkpoint_conf = dataset_plots._load_checkpoint_model(args.checkpoint)
                 except ValueError as exc:
                     model = None
-                    for name in prediction_plots:
+                    for name in (*prediction_plots, *jump_plots):
                         if _should_run(name, groups, individual):
                             _print_skip(name, str(exc))
                 if model is not None:
@@ -793,6 +803,11 @@ def main():
                         if _should_run(name, groups, individual):
                             print(f"--- {name} ---")
                             fn(model, ds, active_records, save_path=paper_dir / f"{name}.png")
+                    for name, fn in jump_plots.items():
+                        if _should_run(name, groups, individual):
+                            print(f"--- {name} ---")
+                            fn(model, ds, active_records, plot_config, solver_dt,
+                               save_path=paper_dir / f"{name}.png")
 
         if _should_run("all_benchmarks_error_summary", groups, individual):
             csv_map = {
@@ -815,6 +830,13 @@ def main():
             _print_skip(
                 "all_benchmarks_prediction_truth_residual",
                 "render programmatically: needs a (checkpoint, trajectories, params, records) bundle per benchmark",
+            )
+
+        if _should_run("all_benchmarks_interface_jump", groups, individual):
+            _print_skip(
+                "all_benchmarks_interface_jump",
+                "render programmatically via paper_plots.plot_all_benchmarks_interface_jump: "
+                "needs a (model, ds, records, config, dt) context per benchmark",
             )
 
     # ---- SWEEP GROUP ----
