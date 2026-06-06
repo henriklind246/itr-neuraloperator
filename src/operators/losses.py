@@ -87,6 +87,28 @@ def build_interface_mask(
     return torch.from_numpy(mask_2d)
 
 
+def build_boundary_mask(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    width: float = 0.05,
+) -> torch.Tensor:
+    """Return boolean tensor of shape (Nx, Ny) for nodes within ``width`` of any
+    domain edge.
+
+    The mask is True where x is within ``width`` of the left/right edges (a/b)
+    OR y is within ``width`` of the bottom/top edges (c/d). The bounds are read
+    from the grid extents, so the band is coordinate-based and therefore
+    resolution-agnostic. Used to isolate the FNO ``padding`` confound (the
+    absolute pad covers a shrinking fraction of the domain as resolution grows).
+    """
+    a, b = float(x_grid[0]), float(x_grid[-1])
+    c, d = float(y_grid[0]), float(y_grid[-1])
+    x_edge = (np.abs(x_grid - a) <= width) | (np.abs(x_grid - b) <= width)  # (Nx,)
+    y_edge = (np.abs(y_grid - c) <= width) | (np.abs(y_grid - d) <= width)  # (Ny,)
+    mask_2d = x_edge[:, None] | y_edge[None, :]  # (Nx, Ny)
+    return torch.from_numpy(mask_2d.copy())
+
+
 def compute_interface_rel_l2(
     y_pred: torch.Tensor,
     y_true: torch.Tensor,

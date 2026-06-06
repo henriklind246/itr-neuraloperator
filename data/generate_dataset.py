@@ -20,6 +20,7 @@ from src.physics.boundary_forcing import (
     build_qL_integral,
 )
 from src.physics.init_conditions import (
+    IC_FAMILIES,
     IC_SAMPLERS,
     sample_ic_family,
     build_ic,
@@ -100,6 +101,9 @@ def generate_sim_data(
     save_stride: int = 2,
     save_dir: Path | str | None = None,
     benchmark: str | None = None,
+    nx: int = 100,
+    ny: int = 100,
+    ic_families: list[str] | None = None,
 ) -> None:
     benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
     spec = get_problem(benchmark)
@@ -108,7 +112,7 @@ def generate_sim_data(
     rng_profile = np.random.default_rng(1)
 
     a, b, c, d = 0.0, 1.0, 0.0, 1.0
-    Nx, Ny = 100, 100
+    Nx, Ny = nx, ny
     dt = 0.005
     t_final = 0.3
 
@@ -133,7 +137,7 @@ def generate_sim_data(
     time_cfg = dict(
         num_sims=num_sims, dt=dt, t_final=t_final, lhs_seed=0,
         t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
-        T_right=300.0, b=b,
+        T_right=300.0, b=b, ic_families=ic_families,
     )
     base_kwargs = dict(
         a=a, b=b, c=c, d=d, Nx=Nx, Ny=Ny,
@@ -194,9 +198,37 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         default=os.environ.get("BENCHMARK", "forcing"),
         help="Benchmark adapter to generate data for (forcing|interfaces|source).",
     )
+    parser.add_argument("--nx", type=int, default=100, help="Number of x-direction grid nodes.")
+    parser.add_argument("--ny", type=int, default=100, help="Number of y-direction grid nodes.")
+    parser.add_argument(
+        "--exclude-ic",
+        action="append",
+        default=None,
+        choices=list(IC_FAMILIES.keys()),
+        help=(
+            "IC family to exclude from sampling (repeatable). "
+            "E.g. --exclude-ic grf_2d for the resolution-invariance test "
+            "(grf_2d cannot be reproduced across grids). Default: all families."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    generate_fn(num_sims=args.num_sims, save_dir=args.save_dir, benchmark=args.benchmark)
+    if args.exclude_ic:
+        excluded = set(args.exclude_ic)
+        ic_families = [f for f in IC_FAMILIES if f not in excluded]
+        if not ic_families:
+            parser.error("--exclude-ic cannot exclude every IC family.")
+    else:
+        ic_families = None
+
+    generate_fn(
+        num_sims=args.num_sims,
+        save_dir=args.save_dir,
+        benchmark=args.benchmark,
+        nx=args.nx,
+        ny=args.ny,
+        ic_families=ic_families,
+    )
     return 0
 
 
