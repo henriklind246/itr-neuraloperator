@@ -11,7 +11,7 @@ from data.dataset import (
     split_sim_ids,
 )
 from src.operators.fno2d import FNO2d
-from src.operators.losses import build_interface_mask, compute_interface_rel_l2
+from src.operators.losses import build_boundary_mask, build_interface_mask, compute_interface_rel_l2
 from src.operators.utils import resolve_device
 from pathlib import Path
 import csv
@@ -96,11 +96,12 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         test_ds = testing_set.dataset
         test_ds.trajectories = _RamTestTrajectories(trajectories, test_ds.sim_ids)
 
-    return testing_set, x_grid, y_grid
+    num_sims = int(trajectories.shape[0])
+    return testing_set, x_grid, y_grid, num_sims
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
-def evaluate(model, test_loader, device, iface_mask=None):
+def evaluate(model, test_loader, device, iface_mask=None, boundary_mask=None):
     """Return a dict of test metrics in both normalized and physical space.
 
     Keys:
@@ -111,6 +112,8 @@ def evaluate(model, test_loader, device, iface_mask=None):
                             denominator. Useful for "% of absolute T" intuition.
         iface_rel_l2_norm:  interface-weighted relative L2 (%) on normalized outputs.
         iface_rel_l2_phys:  interface-weighted relative L2 (%) in Kelvin.
+        boundary_rel_l2_norm/phys:  edge-band relative L2 (%) — diagnostic for the
+                            absolute-pad confound in cross-resolution eval.
     """
     with torch.no_grad():
         model.eval()
@@ -118,6 +121,8 @@ def evaluate(model, test_loader, device, iface_mask=None):
         rel_l2_phys = 0.0
         iface_rel_l2_norm = 0.0
         iface_rel_l2_phys = 0.0
+        boundary_rel_l2_norm = 0.0
+        boundary_rel_l2_phys = 0.0
 
         for batch in test_loader:
             x_spatial = batch["spatial"].to(device)
@@ -144,27 +149,37 @@ def evaluate(model, test_loader, device, iface_mask=None):
                 iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
                 iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
 
+            if boundary_mask is not None:
+                boundary_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, boundary_mask)
+                boundary_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, boundary_mask)
+
         n_batches = len(test_loader)
         rel_l2_norm /= n_batches
         rel_l2_phys /= n_batches
         iface_rel_l2_norm /= n_batches
         iface_rel_l2_phys /= n_batches
+        boundary_rel_l2_norm /= n_batches
+        boundary_rel_l2_phys /= n_batches
 
     return {
         "rel_l2_norm": rel_l2_norm,
         "rel_l2_phys": rel_l2_phys,
         "iface_rel_l2_norm": iface_rel_l2_norm,
         "iface_rel_l2_phys": iface_rel_l2_phys,
+        "boundary_rel_l2_norm": boundary_rel_l2_norm,
+        "boundary_rel_l2_phys": boundary_rel_l2_phys,
     }
 
 
 # --------- EVAL ALL SEEDS IN RUNS ---------
 
-def eval_all_seeds(run_root: str):
+def eval_all_seeds(run_root: str, data_dir: str | None = None, report_name: str = "seed_report.json"):
     run_root = Path(run_root)
     results = []
 
     print("Testing started.")
+    if data_dir is not None:
+        print(f"Overriding dataset paths with --data-dir: {data_dir}")
 
     for seed_dir in sorted(run_root.glob("seed*")):
         ckpt_path = seed_dir / "fno2d_best.pt"
@@ -175,7 +190,19 @@ def eval_all_seeds(run_root: str):
         config = ckpt['conf']
         device = resolve_device(config.get("training", {}).get("device", "auto"))
 
-        test_loader, x_grid, y_grid = build_test_loader(
+        # Cross-resolution eval: point the trained checkpoint at a different
+        # dataset (e.g. a finer grid). Only the test split is consumed, and the
+        # training-distribution normalization (mu_global/sigma_global from the
+        # checkpoint) is reused downstream, so this stays apples-to-apples.
+        if data_dir is not None:
+            data_dir_path = Path(data_dir)
+            config["data"]["trajectories.npy"] = str(data_dir_path / "trajectories.npy")
+            config["data"]["x_grid_path"] = str(data_dir_path / "x_grid.npy")
+            config["data"]["y_grid_path"] = str(data_dir_path / "y_grid.npy")
+            config["data"]["t_grid_path"] = str(data_dir_path / "t_grid.npy")
+            config["data"]["sim_params_path"] = str(data_dir_path / "sim_params.npy")
+
+        test_loader, x_grid, y_grid, num_sims = build_test_loader(
             config,
             mu_global=ckpt.get("mu_global"),
             sigma_global=ckpt.get("sigma_global"),
@@ -186,6 +213,7 @@ def eval_all_seeds(run_root: str):
             x_grid, y_grid,
             loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
         ).to(device)
+        boundary_mask = build_boundary_mask(x_grid, y_grid, width=0.05).to(device)
 
         model_cfg = config['model']['parameters']
         fno = FNO2d(
@@ -206,17 +234,23 @@ def eval_all_seeds(run_root: str):
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
-        metrics = evaluate(model=fno, test_loader=test_loader, device=device, iface_mask=iface_mask)
+        metrics = evaluate(
+            model=fno, test_loader=test_loader, device=device,
+            iface_mask=iface_mask, boundary_mask=boundary_mask,
+        )
 
         results.append(
             {
                 "seed": ckpt.get("seed", seed_dir.name),
                 "best_epoch": ckpt["epoch"],
                 "best_val": float(ckpt["best_val"]),
+                "num_sims": int(num_sims),
                 "test_rel_l2_norm": float(metrics["rel_l2_norm"]),
                 "test_rel_l2": float(metrics["rel_l2_phys"]),
                 "test_iface_rel_l2_norm": float(metrics["iface_rel_l2_norm"]),
                 "test_iface_rel_l2": float(metrics["iface_rel_l2_phys"]),
+                "test_boundary_rel_l2_norm": float(metrics["boundary_rel_l2_norm"]),
+                "test_boundary_rel_l2": float(metrics["boundary_rel_l2_phys"]),
                 "ckpt": str(ckpt_path),
             }
         )
@@ -246,12 +280,16 @@ def print_seed_report(results: list[dict]) -> dict:
     test_rel_l2 = [r["test_rel_l2"] for r in results]
     test_iface_norm = [r["test_iface_rel_l2_norm"] for r in results]
     test_iface = [r["test_iface_rel_l2"] for r in results]
+    test_bnd_norm = [r["test_boundary_rel_l2_norm"] for r in results]
+    test_bnd = [r["test_boundary_rel_l2"] for r in results]
 
     val_mu, val_std = mean_std(best_vals)
     norm_mu, norm_std = mean_std(test_rel_l2_norm)
     test_mu, test_std = mean_std(test_rel_l2)
     iface_norm_mu, iface_norm_std = mean_std(test_iface_norm)
     iface_mu, iface_std = mean_std(test_iface)
+    bnd_norm_mu, bnd_norm_std = mean_std(test_bnd_norm)
+    bnd_mu, bnd_std = mean_std(test_bnd)
 
     print("\n===== Seed Report =====")
     print(f"Number of seeds: {len(results)}")
@@ -260,6 +298,8 @@ def print_seed_report(results: list[dict]) -> dict:
     print(f"test_rel_l2 (physical)   mean, std: ({test_mu}, {test_std})")
     print(f"test_iface_rel_l2_norm   mean, std: ({iface_norm_mu}, {iface_norm_std})")
     print(f"test_iface_rel_l2 (phys) mean, std: ({iface_mu}, {iface_std})")
+    print(f"test_boundary_rel_l2_norm mean, std: ({bnd_norm_mu}, {bnd_norm_std})")
+    print(f"test_boundary_rel_l2(phys) mean, std: ({bnd_mu}, {bnd_std})")
 
     best = min(results, key=lambda r: r["test_rel_l2_norm"])
     print(
@@ -282,16 +322,21 @@ def print_seed_report(results: list[dict]) -> dict:
         "test_iface_rel_l2_norm_std": iface_norm_std,
         "test_iface_rel_l2_mean": iface_mu,
         "test_iface_rel_l2_std": iface_std,
+        "test_boundary_rel_l2_norm_mean": bnd_norm_mu,
+        "test_boundary_rel_l2_norm_std": bnd_norm_std,
+        "test_boundary_rel_l2_mean": bnd_mu,
+        "test_boundary_rel_l2_std": bnd_std,
     }
 
-def save_report(run_root: str, results: list[dict], summary: dict) -> None:
+def save_report(run_root: str, results: list[dict], summary: dict,
+                report_name: str = "seed_report.json") -> None:
     out = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "run_root": str(run_root),
         "summary": summary,
         "per_seed": results,
     }
-    out_path = Path(run_root) / "seed_report.json"
+    out_path = Path(run_root) / report_name
     with out_path.open("w") as f:
         json.dump(out, f, indent=2)
     print(f"Saved report -> {out_path}")
@@ -365,7 +410,7 @@ def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") 
     config = ckpt["conf"]
     device = resolve_device(config.get("training", {}).get("device", "auto"))
 
-    test_loader, x_grid, y_grid = build_test_loader(
+    test_loader, x_grid, y_grid, _num_sims = build_test_loader(
         config,
         mu_global=ckpt.get("mu_global"),
         sigma_global=ckpt.get("sigma_global"),
