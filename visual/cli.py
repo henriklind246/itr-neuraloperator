@@ -17,6 +17,7 @@ from visual import (
     mms_plots,
     paper_plots,
     physics_plots,
+    resinv_plots,
     sweep_plots,
     training_plots,
 )
@@ -64,6 +65,10 @@ def main():
                         help="Path to runs/experiment{N}/ directory (sweep convergence)")
     parser.add_argument("--sweep-seed", type=int, default=0,
                         help="Which seed to show in convergence plot (default: 0)")
+    parser.add_argument("--resinv-run-root", type=str, default=None,
+                        help="Directory with seed_report_r<N>.json files (resolution_invariance)")
+    parser.add_argument("--resinv-root", type=str, default=None,
+                        help="Directory with fv_drift_baseline.json (resolution_invariance overlay)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint (for interface_error plot)")
     parser.add_argument("--breakdown", type=str, default=None,
@@ -78,7 +83,7 @@ def main():
                         help="Path to interfaces test_records.csv (combined paper figures)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
-                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper"],
+                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv"],
                         help="Which plot group(s) to generate (default: all)")
     parser.add_argument("--plots", type=str, nargs="+", default=None,
                         help="Individual plot names to generate (overrides --group)")
@@ -873,6 +878,19 @@ def main():
             for name in sweep_plot_names:
                 if _should_run(name, groups, individual):
                     _print_skip(name, "need --experiment")
+
+    # ---- RESINV GROUP ----
+    if _should_run("resolution_invariance", groups, individual):
+        print("=== RESINV GROUP ===")
+        if args.resinv_run_root:
+            print("--- resolution_invariance ---")
+            resinv_plots.plot_resolution_invariance(
+                run_root=args.resinv_run_root,
+                resinv_root=args.resinv_root,
+                save_path=out_dir / "resinv" / "resolution_invariance.png",
+            )
+        else:
+            _print_skip("resolution_invariance", "need --resinv-run-root")
 
     print(f"\nAll requested plots saved to: {out_dir}")
 

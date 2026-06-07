@@ -54,6 +54,8 @@ PLOT_REGISTRY: dict[str, str] = {
     "sweep_ranking":             "sweep",
     "sweep_convergence":         "sweep",
     "sweep_hyperparams":         "sweep",
+    # group: resinv
+    "resolution_invariance":     "resinv",
     # group: source
     "source_dataset_summary":    "source",
     "patch_param_scatter":       "source",
@@ -91,7 +93,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "all_benchmarks_interface_jump":            "paper",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper"}
+GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv"}
 
 PLOT_STYLE = {
     "font.size": 10,
