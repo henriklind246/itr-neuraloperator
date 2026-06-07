@@ -44,6 +44,9 @@ conda activate itr
 # ──── DDP / NCCL env ────
 export OMP_NUM_THREADS=1
 export NCCL_ASYNC_ERROR_HANDLING=1
+# Collective timeout (minutes) for the process group; raised above NCCL's 10-min
+# default so rank-0-only validation doesn't trip the watchdog. See distributed.py.
+export DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-30}"
 # Uncomment on first runs to diagnose NCCL hangs:
 # export NCCL_DEBUG=INFO
 # export NCCL_P2P_DISABLE=1

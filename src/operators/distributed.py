@@ -10,9 +10,28 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+# Default process-group collective timeout. NCCL's library default (10 min) is
+# too tight: rank-0-only validation (full val set on one GPU + per-pair CSV
+# writes) can leave other ranks idling at the post-validation broadcast for
+# longer than that, tripping the watchdog and aborting the job. Override per-run
+# with the DDP_TIMEOUT_MIN environment variable (set in the DDP sbatch).
+_DEFAULT_DDP_TIMEOUT_MIN = 30.0
+
+
+def _resolve_timeout() -> timedelta:
+    raw = os.environ.get("DDP_TIMEOUT_MIN")
+    minutes = _DEFAULT_DDP_TIMEOUT_MIN
+    if raw is not None:
+        try:
+            minutes = float(raw)
+        except ValueError:
+            minutes = _DEFAULT_DDP_TIMEOUT_MIN
+    return timedelta(minutes=minutes)
 
 
 @dataclass(frozen=True)
@@ -46,7 +65,11 @@ def init_distributed() -> DistInfo:
 
         if not dist.is_initialized():
             backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend, init_method="env://")
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+                timeout=_resolve_timeout(),
+            )
 
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)

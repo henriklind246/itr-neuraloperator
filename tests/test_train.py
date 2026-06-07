@@ -1,3 +1,4 @@
+import copy
 import csv
 import random
 from pathlib import Path
@@ -662,6 +663,27 @@ class TestRunOneSeedResume:
         assert (run_dir / "fno2d_best.pt").exists()
         assert not (run_dir / "fno2d_latest.pt").exists()  # sentinel removed
         assert (run_dir / "train_metrics.csv").exists()
+
+    def test_fresh_run_writes_no_diagnostics_csv(self, tmp_path, seed_config):
+        """diagnostics.csv must not be written; val_pairs.csv must still be.
+
+        A stale diagnostics block is injected to confirm the logic is gone, not
+        merely disabled by config.
+        """
+        run_dir = tmp_path / "seed0"
+        cfg = copy.deepcopy(seed_config)
+        cfg["training"]["diagnostics"] = {
+            "enabled": True,
+            "every": 1,
+            "run_first_epoch": True,
+            "activation_batches": 2,
+            "sensitivity_batches": 2,
+        }
+
+        run_one_seed(cfg, seed=0, run_dir=run_dir)
+
+        assert not (run_dir / "diagnostics.csv").exists()
+        assert (run_dir / "val_pairs.csv").exists()
 
     def test_cosine_warm_restarts_scheduler(self, tmp_path, seed_config):
         """CosineWarmRestarts scheduler should complete training without error."""
