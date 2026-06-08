@@ -55,7 +55,11 @@ def eval_setup():
     return model, loader, device
 
 
-EXPECTED_METRIC_KEYS = {"rel_l2_norm", "rel_l2_phys", "iface_rel_l2_norm", "iface_rel_l2_phys"}
+EXPECTED_METRIC_KEYS = {
+    "rel_l2_norm", "rel_l2_phys",
+    "iface_rel_l2_norm", "iface_rel_l2_phys",
+    "boundary_rel_l2_norm", "boundary_rel_l2_phys",
+}
 
 
 class TestEvaluate:
@@ -126,7 +130,8 @@ class TestMeanStd:
 
 # ===================== print_seed_report =====================
 
-def _seed_result(seed, best_val, norm, phys, iface_norm, iface_phys):
+def _seed_result(seed, best_val, norm, phys, iface_norm, iface_phys,
+                 bnd_norm=0.1, bnd_phys=0.01):
     return {
         "seed": seed,
         "best_epoch": 10,
@@ -135,6 +140,8 @@ def _seed_result(seed, best_val, norm, phys, iface_norm, iface_phys):
         "test_rel_l2": phys,
         "test_iface_rel_l2_norm": iface_norm,
         "test_iface_rel_l2": iface_phys,
+        "test_boundary_rel_l2_norm": bnd_norm,
+        "test_boundary_rel_l2": bnd_phys,
         "ckpt": "x",
     }
 
