@@ -833,6 +833,7 @@ def run_one_seed(
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
         use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+        padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
     )
 
     # --- Resume state ---

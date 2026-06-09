@@ -86,6 +86,44 @@ class TestFNO2d:
 
         assert out.shape == (2, 11, 11, 1)
 
+    def test_padding_reference_resolution_scales_pad_cells(self):
+        model = FNO2d(
+            modes1=2,
+            modes2=2,
+            width=8,
+            in_channels=SPATIAL_IN_CHANNELS,
+            out_channels=1,
+            n_layers=2,
+            cond_static_dim=COND_STATIC_DIM,
+            temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16,
+            forcing_embed_dim=16,
+            forcing_spatial_dim=4,
+            padding_reference_resolution=100,
+        )
+
+        assert model._padding_for_shape(100, 100) == (8, 8)
+        assert model._padding_for_shape(200, 200) == (16, 16)
+        assert model._padding_for_shape(256, 256) == (21, 21)
+
+    def test_default_padding_keeps_fixed_cell_count(self):
+        model = FNO2d(
+            modes1=2,
+            modes2=2,
+            width=8,
+            in_channels=SPATIAL_IN_CHANNELS,
+            out_channels=1,
+            n_layers=2,
+            cond_static_dim=COND_STATIC_DIM,
+            temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16,
+            forcing_embed_dim=16,
+            forcing_spatial_dim=4,
+        )
+
+        assert model._padding_for_shape(100, 100) == (8, 8)
+        assert model._padding_for_shape(256, 256) == (8, 8)
+
     def test_cond_mlp_input_width_encoder_on(self):
         """With the temporal encoder on, the CIN MLP consumes
         cond_static_dim + forcing_embed_dim."""

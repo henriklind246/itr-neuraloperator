@@ -30,6 +30,15 @@ def main() -> int:
         default="seed_report.json",
         help="Filename for the saved report under run_root (e.g. seed_report_r200.json).",
     )
+    parser.add_argument(
+        "--padding-reference-resolution",
+        type=int,
+        default=None,
+        help=(
+            "Scale FNO padding to preserve the physical padding width from this "
+            "training resolution. For a 100x100-trained checkpoint, use 100."
+        ),
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root).expanduser()
@@ -47,7 +56,12 @@ def main() -> int:
 
     from src.operators.eval import eval_all_seeds, print_seed_report, save_report
 
-    results = eval_all_seeds(str(run_root), data_dir=args.data_dir, report_name=args.report_name)
+    results = eval_all_seeds(
+        str(run_root),
+        data_dir=args.data_dir,
+        report_name=args.report_name,
+        padding_reference_resolution=args.padding_reference_resolution,
+    )
     if not results:
         print(f"error: no fno2d_best.pt checkpoints found under {run_root}", file=sys.stderr)
         return 1

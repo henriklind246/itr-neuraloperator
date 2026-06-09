@@ -535,6 +535,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
         use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+        padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
     )
     model.load_state_dict(ckpt["model_state"])
     model.eval()

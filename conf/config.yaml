@@ -33,6 +33,7 @@ model:
     activation: "GELU"            # doc-only; FNO2d hardcodes GELU
     dropout: 0.0
     spectral_dropout: 0.0
+    padding_reference_resolution: null  # scale FNO pad cells with grid resolution; null = fixed pad=8
 
 training:
   device: "auto"

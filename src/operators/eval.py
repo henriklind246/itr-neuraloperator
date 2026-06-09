@@ -173,7 +173,12 @@ def evaluate(model, test_loader, device, iface_mask=None, boundary_mask=None):
 
 # --------- EVAL ALL SEEDS IN RUNS ---------
 
-def eval_all_seeds(run_root: str, data_dir: str | None = None, report_name: str = "seed_report.json"):
+def eval_all_seeds(
+    run_root: str,
+    data_dir: str | None = None,
+    report_name: str = "seed_report.json",
+    padding_reference_resolution: int | None = None,
+):
     run_root = Path(run_root)
     results = []
 
@@ -189,6 +194,8 @@ def eval_all_seeds(run_root: str, data_dir: str | None = None, report_name: str 
         ckpt = torch.load(ckpt_path, map_location="cpu")
         config = ckpt['conf']
         device = resolve_device(config.get("training", {}).get("device", "auto"))
+        if padding_reference_resolution is not None:
+            config["model"]["parameters"]["padding_reference_resolution"] = int(padding_reference_resolution)
 
         # Cross-resolution eval: point the trained checkpoint at a different
         # dataset (e.g. a finer grid). Only the test split is consumed, and the
@@ -230,6 +237,7 @@ def eval_all_seeds(run_root: str, data_dir: str | None = None, report_name: str 
             forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
             forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
             use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+            padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
@@ -434,6 +442,7 @@ def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") 
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+        padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
     )
     fno.load_state_dict(ckpt["model_state"])
     fno.to(device)

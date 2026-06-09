@@ -224,6 +224,7 @@ class FNO2d(nn.Module):
         dropout: float = 0.0,
         spectral_dropout: float = 0.0,
         use_temporal_encoder: bool = True,
+        padding_reference_resolution: int | None = None,
     ):
         super().__init__()
         self.modes1 = modes1
@@ -239,6 +240,7 @@ class FNO2d(nn.Module):
         self.forcing_spatial_dim = forcing_spatial_dim
         self.use_temporal_encoder = use_temporal_encoder
         self.padding = 8  # pad spatial dim for non-periodic signals
+        self.padding_reference_resolution = padding_reference_resolution
 
         # Spatial-forcing channels (s_y * z_a) are only injected when the temporal
         # branch is active; with the encoder off the lift sees in_channels alone.
@@ -291,6 +293,14 @@ class FNO2d(nn.Module):
         self.activation = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
+    def _padding_for_shape(self, Nx: int, Ny: int) -> tuple[int, int]:
+        if self.padding_reference_resolution is None:
+            return self.padding, self.padding
+        ref = max(int(self.padding_reference_resolution) - 1, 1)
+        pad_x = int(round(self.padding * max(int(Nx) - 1, 1) / ref))
+        pad_y = int(round(self.padding * max(int(Ny) - 1, 1) / ref))
+        return max(pad_x, 0), max(pad_y, 0)
+
     def forward(self, spatial, cond_static, forcing_seq=None):
         """
         spatial      : (B, Nx, Ny, in_channels)
@@ -328,7 +338,8 @@ class FNO2d(nn.Module):
 
         Nx0 = x.size(-2)
         Ny0 = x.size(-1)
-        x = F.pad(x, (0, self.padding, 0, self.padding))   # (B, width, Nx + pad, Ny + pad)
+        pad_x, pad_y = self._padding_for_shape(Nx0, Ny0)
+        x = F.pad(x, (0, pad_y, 0, pad_x))   # (B, width, Nx + pad_x, Ny + pad_y)
 
         # Fourier blocks
         for l in range(self.n_layers):
