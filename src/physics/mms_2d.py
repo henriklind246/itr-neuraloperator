@@ -234,6 +234,91 @@ def run_mms_2d_yflux(N: int, dt=None) -> tuple[float, float, float, float]:
 
 
 # ==============================================================
+# 2d. x-linear MMS (isolates the y-Laplacian truncation)
+# ==============================================================
+
+def run_mms_x_linear(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    y-direction-isolating manufactured solution: linear in x, curved in y.
+
+    T*(x, y, t) = 300 + A sin(wt) (b-x) cos(pi (y-c)/(d-c))
+
+    The (b-x) factor is linear in x, so d²T*/dx² = 0 exactly and the FV
+    x-stencil is reproduced with no truncation error. The only spatial
+    truncation comes from the y-Laplacian acting on cos(pi (y-c)/(d-c)), so the
+    observed spatial order measures the y-direction stencil. This is the mirror
+    image of run_mms_y_independent (curved in x, flat in y), which isolates x.
+
+    Scope: because the solver enforces an isotropic grid (hx == hy) and N drives
+    both, this isolates the y diffusion stencil on a uniform grid. It catches a
+    y-Laplacian curvature bug that would otherwise be masked by the correct
+    x-error; it cannot catch a bug that only manifests at hy != hx.
+
+    Boundary conditions:
+      Left:       q*(y,t) = -k dT*/dx|_{x=a} = k A sin(wt) cos(pi (y-c)/(d-c))
+                            (separable a(t) s(y); no (b-a)^3 factor since x is linear)
+      Right:      T*(b,y,t) = 300            (factor (b-x) vanishes)
+      Top/bottom: dT*/dy = 0 at y=c, y=d     (sin(0) = sin(pi) = 0)
+
+    Returns (h, dt, max_abs_error, l2_error).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.0
+    A = 10.0
+    kappa = np.pi / Ly
+
+    def cos_y(Y):
+        return np.cos(kappa * (Y - c))
+
+    def T_star(X, Y, t):
+        return 300.0 + A * np.sin(omega * t + phase) * (b - X) * cos_y(Y)
+
+    def q_star(t):
+        # Vector-valued: shape (Ny,). -k dT*/dx|_{x=a} with d/dx[(b-x)] = -1.
+        return k * A * np.sin(omega * t + phase) * cos_y(np.linspace(c, d, N))
+
+    def s_star(X, Y, t):
+        g = np.sin(omega * t + phase)
+        gp = omega * np.cos(omega * t + phase)
+        P = (b - X)
+        cy = cos_y(Y)
+        # dT/dt
+        s_t = rho * cp * A * gp * P * cy
+        # k d²T/dx² = 0 (linear in x)
+        # k d²T/dy² = -k A g (b-x) kappa^2 cos_y
+        s_yy = -k * A * g * P * kappa ** 2 * cy
+        return s_t - s_yy
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_star,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ==============================================================
 # 2c. smooth-in-time left-flux MMS with exact step-integral forcing
 # ==============================================================
 
@@ -707,6 +792,23 @@ def time_order_test_2d_yflux(dt_list: list) -> float:
     return float(np.mean(_pairwise_orders(dt_list, results)))
 
 
+def space_order_test_x_linear(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_x_linear(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_x_linear(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_x_linear(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
 def time_order_test_2d_smooth_forcing_integral(dt_list: list) -> float:
     results = []
     for dt_val in dt_list:
@@ -778,6 +880,14 @@ if __name__ == '__main__':
     p = space_order_test_2d_yflux([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
     p = time_order_test_2d_yflux([0.02, 0.01, 0.005])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== x-linear MMS (isolates y-Laplacian) ===")
+    h, dt, me, l2 = run_mms_x_linear(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_x_linear([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_x_linear([0.02, 0.01, 0.005])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Interface MMS ===")
