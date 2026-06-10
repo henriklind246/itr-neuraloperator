@@ -1,0 +1,9 @@
+# @package _global_
+# Temporal-encoder representation: lean spatial channels plus a (128, 2)
+# forcing_seq token stream consumed by the temporal branch. Orthogonal to the
+# active `benchmark`; the resolved ProblemSpec owns all representation-determined
+# dims (in_channels, cond_static_dim, temporal_token_dim, use_temporal_encoder,
+# s_y_channel, use_forcing_time_aug).
+
+benchmark:
+  representation: temporal_encoder
