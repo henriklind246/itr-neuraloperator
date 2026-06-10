@@ -14,7 +14,6 @@ from matplotlib.patches import Rectangle
 
 from data.dataset import (
     A_AMP_REF,
-    COND_STATIC_DIM,
     RC_RANGE,
     TEMPORAL_SAMPLES,
     T_EPS,
@@ -40,7 +39,7 @@ from src.physics.boundary_forcing import (
 from problems.source import (
     INTERFACE_X,
     SOURCE_BINS,
-    SPATIAL_IN_CHANNELS as SOURCE_SPATIAL_IN_CHANNELS,
+    SPATIAL_CHANNELS_BINS as SOURCE_SPATIAL_IN_CHANNELS,
 )
 from problems.interfaces import INTERFACE_X_RANGE
 from src.physics.internal_source import (
@@ -519,22 +518,25 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
     if "modes1" not in model_cfg or "modes2" not in model_cfg:
         raise ValueError("Checkpoint is not a 2D FNO checkpoint: missing modes1/modes2")
 
+    dims = problem_from_config(conf).dims
     model = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg.get("width", 64),
-        in_channels=model_cfg.get("in_channels", 20),
+        in_channels=dims.in_channels,
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
+        cond_static_dim=dims.cond_static_dim,
         cond_hidden=model_cfg.get("cond_hidden", 256),
-        temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+        temporal_token_dim=dims.temporal_token_dim,
         temporal_hidden=model_cfg.get("temporal_hidden", 128),
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
-        use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+        use_temporal_encoder=dims.use_temporal_encoder,
+        use_forcing_time_aug=dims.use_forcing_time_aug,
+        s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
     )
     model.load_state_dict(ckpt["model_state"])
@@ -647,174 +649,77 @@ def _prepare_prediction_case(
         train_ids, _, _ = _split(trajectories.shape[0], 0.7, 0.15, seed=0)
         mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
-    if problem.name != "forcing":
-        plot_dataset = SnapshotPairDataset(
-            trajectories=trajectories,
-            t_grid=t_grid,
-            x_grid=x_grid,
-            y_grid=y_grid,
-            sim_ids=np.array([sim_id], dtype=np.int64),
-            sim_params=sim_params,
-            mu_global=float(mu_global),
-            sigma_global=float(sigma_global),
-            n_snapshots=None,
-            noise_std=0.0,
-            dt=dt,
-            temporal_samples=config.get("model", {}).get("parameters", {}).get(
-                "temporal_samples", TEMPORAL_SAMPLES,
-            ),
-            problem=problem,
-        )
-        items = [
-            problem.build_item(plot_dataset, int(sim_id), int(s), int(target_idx))
-            for target_idx in target_indices
-        ]
-        spatial = torch.from_numpy(np.stack([item["spatial"] for item in items], axis=0))
-        cond_static = torch.from_numpy(np.stack([item["cond_static"] for item in items], axis=0))
-        forcing_seq = None
-        if all("forcing_seq" in item for item in items):
-            forcing_seq = torch.from_numpy(np.stack([item["forcing_seq"] for item in items], axis=0))
-
-        device = next(model.parameters()).device
-        use_temporal = bool(getattr(model, "use_temporal_encoder", True))
-        with torch.no_grad():
-            if use_temporal and forcing_seq is not None:
-                Y_pred_norm = model(
-                    spatial.to(device),
-                    cond_static.to(device),
-                    forcing_seq.to(device),
-                ).cpu().numpy()[..., 0]
-            else:
-                Y_pred_norm = model(
-                    spatial.to(device),
-                    cond_static.to(device),
-                ).cpu().numpy()[..., 0]
-
-        Y_pred_rows = []
-        Y_true_rows = []
-        for row, item in enumerate(items):
-            stats = np.asarray(item["T_stats"], dtype=np.float32)
-            mu_s = float(stats[0])
-            sigma_s = float(stats[1])
-            Y_pred_rows.append((Y_pred_norm[row] * (sigma_s + T_EPS) + mu_s).astype(np.float32))
-            Y_true_rows.append((item["Y"][..., 0] * (sigma_s + T_EPS) + mu_s).astype(np.float32))
-            if stats.shape[0] > 2:
-                interface_meta = {
-                    **interface_meta,
-                    "interface_x": float(stats[2]),
-                    "positions": [float(stats[2])],
-                }
-
-        params = sim_params[int(sim_id)]
-        amp, freq = _sin_amp_freq(params)
-        return {
-            "interface_x": interface_meta["interface_x"],
-            "interface_positions": interface_meta["positions"],
-            "interface_half_width": interface_meta["interface_half_width"],
-            "t_targets": t_targets,
-            "t_bars": t_grid[target_indices] - t_grid[s],
-            "source_time": float(t_grid[s]),
-            "Y_pred": np.stack(Y_pred_rows, axis=0),
-            "Y_true": np.stack(Y_true_rows, axis=0),
-            "amp": amp,
-            "freq": freq,
-            "R_c": float(params["R_c"]),
-        }
-
-    T_source = trajectories[sim_id, s].astype(np.float32)
-    T_source_norm = (T_source - mu_global) / (sigma_global + T_EPS)
-    x_norm = ((x_grid - x_grid[0]) / (x_grid[-1] - x_grid[0])).astype(np.float32)
-    y_norm = ((y_grid - y_grid[0]) / (y_grid[-1] - y_grid[0])).astype(np.float32)
-    X_norm = np.broadcast_to(x_norm[:, None], T_source.shape).astype(np.float32)
-    Y_norm = np.broadcast_to(y_norm[None, :], T_source.shape).astype(np.float32)
-
-    params = sim_params[sim_id]
-    amp, freq = _sin_amp_freq(params)
-    R_c = float(params["R_c"])
-    spatial_family = params["spatial_family"]
-    spatial_params = params["spatial_params"]
-    temporal_family = params["temporal_family"]
-    temporal_params = params["temporal_params"]
-
-    s_vec = np.asarray(SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params), dtype=np.float32)
-    S_y = np.broadcast_to(np.asarray(s_vec, dtype=np.float32)[None, :], T_source.shape)
-    spatial_base = np.stack([T_source_norm, X_norm, Y_norm, S_y], axis=-1).astype(np.float32)
-
-    t_bars = t_grid[target_indices] - t_grid[s]
-    t_s_norm = t_grid[s] / t_grid[-1]
-    t_final_grid = float(t_grid[-1])
-    A_cum_ref = float(A_AMP_REF * t_final_grid)
-    q_ref = np.float32(SIN_AMP_RANGE[1] * t_final_grid / FORCING_BINS)
-
-    q = TEMPORAL_BUILDERS[temporal_family](**temporal_params)
-
-    Nx, Ny = T_source.shape
-    spatial_rows = []
-    cond_rows = []
-    forcing_rows = []
-    for target_idx in target_indices:
-        bins = integrate_temporal_bins(
-            temporal_family, temporal_params,
-            float(t_grid[s]), float(t_grid[target_idx]),
-            K=FORCING_BINS,
-        ).astype(np.float32)
-        Q_y_bins = (s_vec[None, :, None] * bins[None, None, :] / q_ref).astype(np.float32)
-        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (Nx, Ny, FORCING_BINS))
-        spatial_rows.append(np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32))
-
-        t_s_val = float(t_grid[s])
-        t_j_val = float(t_grid[target_idx])
-        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, TEMPORAL_SAMPLES)
-        forcing_summary = build_forcing_summary(
-            a_m, t_samples, t_s_val, t_j_val, t_final_grid, A_AMP_REF,
-        )
-        cond_rows.append(
-            build_cond_vector(
-                t_bar_norm=float(t_grid[target_idx] - t_grid[s]) / t_final_grid,
-                t_s_norm=float(t_s_norm),
-                R_c=R_c,
-                spatial_family=spatial_family, spatial_params=spatial_params,
-                temporal_family=temporal_family,
-                forcing_summary=forcing_summary,
-            )
-        )
-        forcing_rows.append(
-            build_forcing_seq(
-                q,
-                t_s=t_s_val,
-                t_j=t_j_val,
-                t_final=t_final_grid,
-                M=TEMPORAL_SAMPLES,
-                A_amp_ref=A_AMP_REF,
-                A_cum_ref=A_cum_ref,
-            )
-        )
-    x_spatial_batch = np.stack(spatial_rows, axis=0).astype(np.float32)
-    cond_batch = np.stack(cond_rows, axis=0).astype(np.float32)
-    forcing_batch = np.stack(forcing_rows, axis=0).astype(np.float32)
+    plot_dataset = SnapshotPairDataset(
+        trajectories=trajectories,
+        t_grid=t_grid,
+        x_grid=x_grid,
+        y_grid=y_grid,
+        sim_ids=np.array([sim_id], dtype=np.int64),
+        sim_params=sim_params,
+        mu_global=float(mu_global),
+        sigma_global=float(sigma_global),
+        n_snapshots=None,
+        noise_std=0.0,
+        dt=dt,
+        temporal_samples=config.get("model", {}).get("parameters", {}).get(
+            "temporal_samples", TEMPORAL_SAMPLES,
+        ),
+        problem=problem,
+    )
+    items = [
+        problem.build_item(plot_dataset, int(sim_id), int(s), int(target_idx))
+        for target_idx in target_indices
+    ]
+    spatial = torch.from_numpy(np.stack([item["spatial"] for item in items], axis=0))
+    cond_static = torch.from_numpy(np.stack([item["cond_static"] for item in items], axis=0))
+    forcing_seq = None
+    if all("forcing_seq" in item for item in items):
+        forcing_seq = torch.from_numpy(np.stack([item["forcing_seq"] for item in items], axis=0))
 
     device = next(model.parameters()).device
+    use_temporal = bool(getattr(model, "use_temporal_encoder", True))
     with torch.no_grad():
-        x_tensor = torch.from_numpy(x_spatial_batch).to(device)
-        c_tensor = torch.from_numpy(cond_batch).to(device)
-        f_tensor = torch.from_numpy(forcing_batch).to(device)
-        Y_pred_norm = model(x_tensor, c_tensor, f_tensor).cpu().numpy()[..., 0]
+        if use_temporal and forcing_seq is not None:
+            Y_pred_norm = model(
+                spatial.to(device),
+                cond_static.to(device),
+                forcing_seq.to(device),
+            ).cpu().numpy()[..., 0]
+        else:
+            Y_pred_norm = model(
+                spatial.to(device),
+                cond_static.to(device),
+            ).cpu().numpy()[..., 0]
 
-    Y_pred = (Y_pred_norm * (sigma_global + T_EPS) + mu_global).astype(np.float32)
-    Y_true = trajectories[sim_id, target_indices].astype(np.float32)
+    Y_pred_rows = []
+    Y_true_rows = []
+    for row, item in enumerate(items):
+        stats = np.asarray(item["T_stats"], dtype=np.float32)
+        mu_s = float(stats[0])
+        sigma_s = float(stats[1])
+        Y_pred_rows.append((Y_pred_norm[row] * (sigma_s + T_EPS) + mu_s).astype(np.float32))
+        Y_true_rows.append((item["Y"][..., 0] * (sigma_s + T_EPS) + mu_s).astype(np.float32))
+        if stats.shape[0] > 2:
+            interface_meta = {
+                **interface_meta,
+                "interface_x": float(stats[2]),
+                "positions": [float(stats[2])],
+            }
 
+    params = sim_params[int(sim_id)]
+    amp, freq = _sin_amp_freq(params)
     return {
         "interface_x": interface_meta["interface_x"],
         "interface_positions": interface_meta["positions"],
         "interface_half_width": interface_meta["interface_half_width"],
         "t_targets": t_targets,
-        "t_bars": t_bars,
+        "t_bars": t_grid[target_indices] - t_grid[s],
         "source_time": float(t_grid[s]),
-        "Y_pred": Y_pred,
-        "Y_true": Y_true,
+        "Y_pred": np.stack(Y_pred_rows, axis=0),
+        "Y_true": np.stack(Y_true_rows, axis=0),
         "amp": amp,
         "freq": freq,
-        "R_c": R_c,
+        "R_c": float(params["R_c"]),
     }
 
 

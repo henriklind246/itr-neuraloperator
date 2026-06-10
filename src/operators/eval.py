@@ -1,6 +1,5 @@
 import torch
 from data.dataset import (
-    COND_STATIC_DIM,
     TEMPORAL_SAMPLES,
     T_EPS,
     compute_global_stats,
@@ -223,20 +222,23 @@ def eval_all_seeds(
         boundary_mask = build_boundary_mask(x_grid, y_grid, width=0.05).to(device)
 
         model_cfg = config['model']['parameters']
+        dims = problem_from_config(config).dims
         fno = FNO2d(
             modes1=model_cfg["modes1"],
             modes2=model_cfg["modes2"],
             width=model_cfg["width"],
-            in_channels=model_cfg.get("in_channels", 20),
+            in_channels=dims.in_channels,
             out_channels=model_cfg.get("out_channels", 1),
             n_layers=model_cfg.get("n_layers", 4),
-            cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
+            cond_static_dim=dims.cond_static_dim,
             cond_hidden=model_cfg.get("cond_hidden", 256),
-            temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+            temporal_token_dim=dims.temporal_token_dim,
             temporal_hidden=model_cfg.get("temporal_hidden", 128),
             forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
             forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
-            use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+            use_temporal_encoder=dims.use_temporal_encoder,
+            use_forcing_time_aug=dims.use_forcing_time_aug,
+            s_y_channel=dims.s_y_channel,
             padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         )
         fno.load_state_dict(ckpt['model_state'])
@@ -426,22 +428,25 @@ def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") 
     dataset = test_loader.dataset
     problem = problem_from_config(config)
     benchmark = problem.name
+    dims = problem.dims
 
     model_cfg = config["model"]["parameters"]
     fno = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", 20),
+        in_channels=dims.in_channels,
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
+        cond_static_dim=dims.cond_static_dim,
         cond_hidden=model_cfg.get("cond_hidden", 256),
-        temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+        temporal_token_dim=dims.temporal_token_dim,
         temporal_hidden=model_cfg.get("temporal_hidden", 128),
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
-        use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+        use_temporal_encoder=dims.use_temporal_encoder,
+        use_forcing_time_aug=dims.use_forcing_time_aug,
+        s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
     )
     fno.load_state_dict(ckpt["model_state"])

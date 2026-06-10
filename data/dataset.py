@@ -23,9 +23,16 @@ from problems.registry import get_problem
 
 
 def problem_from_config(config: dict) -> ProblemSpec:
-    """Resolve the active ProblemSpec from a loaded config's benchmark section."""
-    name = str((config.get("benchmark") or {}).get("name", "forcing"))
-    return get_problem(name)
+    """Resolve the active ProblemSpec from a loaded config's benchmark section.
+
+    Reads both the ``name`` and ``representation`` axes (the latter defaults to
+    ``temporal_encoder``) so the resolved spec is the single source of truth for
+    all representation-determined tensor dims.
+    """
+    benchmark = config.get("benchmark") or {}
+    name = str(benchmark.get("name", "forcing"))
+    representation = str(benchmark.get("representation", "temporal_encoder"))
+    return get_problem(name, representation)
 
 
 RC_RANGE = (0.05, 1.0)

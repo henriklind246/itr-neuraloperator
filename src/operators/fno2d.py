@@ -224,6 +224,8 @@ class FNO2d(nn.Module):
         dropout: float = 0.0,
         spectral_dropout: float = 0.0,
         use_temporal_encoder: bool = True,
+        use_forcing_time_aug: bool = False,
+        s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
     ):
         super().__init__()
@@ -239,6 +241,8 @@ class FNO2d(nn.Module):
         self.forcing_embed_dim = forcing_embed_dim
         self.forcing_spatial_dim = forcing_spatial_dim
         self.use_temporal_encoder = use_temporal_encoder
+        self.use_forcing_time_aug = use_forcing_time_aug
+        self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
 
@@ -253,6 +257,15 @@ class FNO2d(nn.Module):
         # the hand-crafted Q_y_bins were removed).
         if use_temporal_encoder:
             self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
+
+        # Time-augmented spatial forcing: fold [t_bar_norm, t_s_norm] into h_a before
+        # projecting to spatial-forcing weights, so the learned field can vary with lead.
+        if use_temporal_encoder and use_forcing_time_aug:
+            self.forcing_aug_mlp = nn.Sequential(
+                nn.Linear(forcing_embed_dim + 2, forcing_embed_dim),
+                nn.GELU(),
+                nn.Linear(forcing_embed_dim, forcing_embed_dim),
+            )
 
         # ------- FOURIER LAYERS -------------
         self.spectral_layers = nn.ModuleList([
@@ -315,10 +328,15 @@ class FNO2d(nn.Module):
             # Temporal branch
             h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
 
-            # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}.
-            # Dataset convention: spatial = [T_source_norm, x_norm, y_norm, s_y, Q_y_bin_0..15]; s_y is channel 3.
-            z_a = self.forcing_to_spatial(h_a)                    # (B, K)
-            s_y = spatial[..., 3:4]                               # (B, Nx, Ny, 1)
+            # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}. The s_y channel
+            # index is representation-specific (forcing/source: 3; interfaces: 5).
+            if self.use_forcing_time_aug:
+                t_feats = cond_static[:, 0:2]                     # (B, 2) = [t_bar_norm, t_s_norm]
+                h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
+                z_a = self.forcing_to_spatial(h_aug)              # (B, K)
+            else:
+                z_a = self.forcing_to_spatial(h_a)                # (B, K)
+            s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]  # (B, Nx, Ny, 1)
             Nx, Ny = spatial.size(1), spatial.size(2)
             z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1) # (B, Nx, Ny, K)
             forcing_field = s_y * z_grid                          # (B, Nx, Ny, K)
