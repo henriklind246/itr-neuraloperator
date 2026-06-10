@@ -4,12 +4,11 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, ProblemSpec
+from problems.base import ProblemDims, ProblemSpec, empty_forcing_seq
 from src.physics.boundary_forcing import (
     GAUSS_SIGMA_RANGE,
     PATCH_W_RANGE,
     TRIANGLE_ELL_RANGE,
-    TEMPORAL_FAMILY_ORDER,
     TEMPORAL_BUILDERS,
     TEMPORAL_SAMPLERS,
     SPATIAL_BUILDERS,
@@ -35,17 +34,22 @@ SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
 _BASE_DIM = 3
 _SPATIAL_ONEHOT_DIM = len(SPATIAL_FAMILY_ORDER)
 _SPATIAL_PARAM_DIM = 4
-_TEMPORAL_ONEHOT_DIM = len(TEMPORAL_FAMILY_ORDER)
-_FORCING_SUMMARY_DIM = 8
 COND_STATIC_DIM = (
     _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
-    + _TEMPORAL_ONEHOT_DIM + _FORCING_SUMMARY_DIM
-)  # 23
+)  # 11 (forcing-agnostic: no temporal one-hot, no forcing summary)
 
-TEMPORAL_SAMPLES = 64
-TEMPORAL_TOKEN_DIM = 5
+# temporal_encoder mode: 128 samples x 2 tokens [r_m, a_m / A_ref].
+FORCING_TEMPORAL_SAMPLES = 128
+FORCING_TEMPORAL_TOKEN_DIM = 2
 A_AMP_REF = 300.0
-SPATIAL_IN_CHANNELS = 4 + FORCING_BINS  # 20
+
+# Spatial channels per representation. temporal_encoder mode lifts the lean
+# [T_tilde, x, y, s_y] base; bins mode appends the FORCING_BINS integral Q-bins.
+SPATIAL_CHANNELS_TEMPORAL = 4
+SPATIAL_CHANNELS_BINS = SPATIAL_CHANNELS_TEMPORAL + FORCING_BINS  # 20
+
+# s_y is the 4th spatial channel (index 3) in both representations.
+S_Y_CHANNEL = 3
 
 _LOG_SIGMA_LO = float(np.log(GAUSS_SIGMA_RANGE[0]))
 _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
@@ -54,10 +58,14 @@ _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
 # ----- conditioning / forcing-sequence builders -----
 
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      spatial_family: str, spatial_params: dict,
-                      temporal_family: str,
-                      forcing_summary: np.ndarray) -> np.ndarray:
-    """Assemble the 23-dim static conditioning vector (see COND_STATIC_DIM)."""
+                      spatial_family: str, spatial_params: dict) -> np.ndarray:
+    """Assemble the 11-dim forcing-agnostic static conditioning vector.
+
+    Layout: [t_bar_norm, t_s_norm, R_c_norm, spatial_onehot(4),
+    spatial_params(4)]. Carries no temporal-family identity or forcing
+    summary; in temporal_encoder mode the only temporal forcing information
+    lives in forcing_seq, in bins mode it lives in the Q-bin spatial channels.
+    """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     base = np.array([t_bar_norm, t_s_norm, R_c_norm], dtype=np.float32)
 
@@ -75,16 +83,7 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
         ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
     spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
 
-    temporal_oh = np.zeros(_TEMPORAL_ONEHOT_DIM, dtype=np.float32)
-    temporal_oh[TEMPORAL_FAMILY_ORDER.index(temporal_family)] = 1.0
-
-    fs = np.asarray(forcing_summary, dtype=np.float32).reshape(-1)
-    if fs.shape[0] != _FORCING_SUMMARY_DIM:
-        raise ValueError(
-            f"forcing_summary must have shape ({_FORCING_SUMMARY_DIM},), got {fs.shape}"
-        )
-
-    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh, fs]).astype(np.float32)
+    return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
 
 
 def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
@@ -104,80 +103,22 @@ def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray
     return t_samples, a_m
 
 
-def _forcing_seq_from_samples(
+def _forcing_seq_2tok_from_samples(
     t_samples: np.ndarray,
     a_m: np.ndarray,
-    t_s: float,
-    t_j: float,
-    t_final: float,
+    *,
     A_amp_ref: float,
-    A_cum_ref: float,
 ) -> np.ndarray:
-    t_bar = float(t_j) - float(t_s)
-    M = t_samples.shape[0]
-    r = np.linspace(0.0, 1.0, M, dtype=np.float32)
+    """temporal_encoder forcing sequence: (M, 2) tokens [r_m, a_m / A_ref].
 
-    A_cum = np.empty_like(a_m)
-    A_cum[0] = 0.0
-    A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
-
+    r_m is the normalized sample position in [0, 1] over [t_s, t_j]; the second
+    token is the amplitude sample scaled by the reference. Shared by every
+    benchmark's temporal_encoder representation (forcing, source, interfaces).
+    """
+    r = np.linspace(0.0, 1.0, t_samples.shape[0], dtype=np.float32)
     tok0 = r
-    tok1 = a_m / np.float32(A_amp_ref)
-    tok2 = A_cum / np.float32(A_cum_ref)
-    tok3 = ((1.0 - r) * t_bar / float(t_final)).astype(np.float32)
-    tok4 = (t_samples / float(t_final)).astype(np.float32)
-    return np.stack([tok0, tok1, tok2, tok3, tok4], axis=-1).astype(np.float32)
-
-
-def build_forcing_seq(
-    q,
-    t_s: float,
-    t_j: float,
-    t_final: float,
-    M: int = TEMPORAL_SAMPLES,
-    A_amp_ref: float = A_AMP_REF,
-    A_cum_ref: float | None = None,
-) -> np.ndarray:
-    """Sample a(t) on M points over [t_s, t_j] and build the (M, 5) token array."""
-    if A_cum_ref is None:
-        A_cum_ref = float(A_amp_ref) * float(t_final)
-    t_samples, a_m = _sample_a(q, t_s, t_j, int(M))
-    return _forcing_seq_from_samples(t_samples, a_m, t_s, t_j, t_final, A_amp_ref, A_cum_ref)
-
-
-def build_forcing_summary(
-    a_vals: np.ndarray,
-    t_vals: np.ndarray,
-    t_s: float,
-    t_j: float,
-    t_final: float,
-    A_amp_ref: float = A_AMP_REF,
-) -> np.ndarray:
-    """Global interval-level descriptors S1..S8 of a(t) over [t_s, t_j]."""
-    A_ref = float(A_amp_ref)
-    dt_interval = max(float(t_j) - float(t_s), 1e-8)
-    denom_impulse = A_ref * float(t_final)
-
-    if hasattr(np, "trapezoid"):
-        trapz = np.trapezoid
-    else:
-        trapz = np.trapz
-    I_signed = float(trapz(a_vals, t_vals))
-    I_abs = float(trapz(np.abs(a_vals), t_vals))
-    I_pos = float(trapz(np.clip(a_vals, 0.0, None), t_vals))
-    I_neg = float(trapz(np.clip(-a_vals, 0.0, None), t_vals))
-    I_sq = float(trapz(a_vals ** 2, t_vals))
-
-    S1 = I_signed / denom_impulse
-    S2 = I_abs / denom_impulse
-    S3 = I_pos / denom_impulse
-    S4 = I_neg / denom_impulse
-    S5 = (I_signed / dt_interval) / A_ref
-    S6 = np.sqrt(max(I_sq / dt_interval, 0.0)) / A_ref
-    S7 = float(np.max(np.abs(a_vals))) / A_ref
-    S8 = float(a_vals[-1]) / A_ref
-
-    return np.array([S1, S2, S3, S4, S5, S6, S7, S8], dtype=np.float32)
+    tok1 = (a_m / np.float32(A_amp_ref)).astype(np.float32)
+    return np.stack([tok0, tok1], axis=-1).astype(np.float32)
 
 
 def _generate_lhs_R_c(num_sims: int, seed: int = 0) -> np.ndarray:
@@ -201,20 +142,47 @@ def _generate_lhs_R_c(num_sims: int, seed: int = 0) -> np.ndarray:
 class ForcingProblem(ProblemSpec):
     """Separable boundary flux q_L(y, t) = a(t) * s(y) benchmark.
 
-    20 spatial channels [T_tilde, x, y, s_y, Q_y_bin_0..15], 23 static
-    conditioning dims, a (64, 5) forcing_seq, temporal encoder on, interface
-    fixed at x = 0.5.
+    Two representations over the same trajectories/sim_params:
+
+    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, s_y], 11
+      forcing-agnostic static dims, a (128, 2) forcing_seq [r_m, a_m / A_ref],
+      temporal encoder on with time-augmented spatial injection.
+    - ``bins``: 20 spatial channels [T_tilde, x, y, s_y, Q_y_bin_0..15], same
+      11 static dims, an empty forcing_seq, temporal encoder off.
+
+    Interface fixed at x = 0.5.
     """
 
     name = "forcing"
-    dims = ProblemDims(
-        in_channels=SPATIAL_IN_CHANNELS,
-        cond_static_dim=COND_STATIC_DIM,
-        has_forcing_seq=True,
-        temporal_token_dim=TEMPORAL_TOKEN_DIM,
-        t_stats_dim=2,
-        use_temporal_encoder=True,
-    )
+
+    def __init__(self, representation: str = "temporal_encoder"):
+        self.representation = representation
+        if representation == "temporal_encoder":
+            self.dims = ProblemDims(
+                in_channels=SPATIAL_CHANNELS_TEMPORAL,
+                cond_static_dim=COND_STATIC_DIM,
+                has_forcing_seq=True,
+                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                t_stats_dim=2,
+                use_temporal_encoder=True,
+                s_y_channel=S_Y_CHANNEL,
+                use_forcing_time_aug=True,
+            )
+        elif representation == "bins":
+            self.dims = ProblemDims(
+                in_channels=SPATIAL_CHANNELS_BINS,
+                cond_static_dim=COND_STATIC_DIM,
+                has_forcing_seq=False,
+                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                t_stats_dim=2,
+                use_temporal_encoder=False,
+                s_y_channel=S_Y_CHANNEL,
+                use_forcing_time_aug=False,
+            )
+        else:
+            raise ValueError(
+                f"Unknown representation {representation!r} for benchmark {self.name!r}."
+            )
 
     # ---- data generation ----
 
@@ -322,10 +290,13 @@ class ForcingProblem(ProblemSpec):
     # ---- dataset item ----
 
     def setup_dataset(self, ds) -> None:
-        ds.A_cum_ref = float(A_AMP_REF * ds.t_final)
-        ds.q_ref = np.float32(SIN_AMP_RANGE[1] * ds.t_final / FORCING_BINS)
-        ds._r = np.linspace(0.0, 1.0, ds.temporal_samples, dtype=np.float32)
-        ds._q_callables = {}
+        if self.representation == "temporal_encoder":
+            # Force the 128-sample token grid regardless of the config default.
+            ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
+            ds._r = np.linspace(0.0, 1.0, ds.temporal_samples, dtype=np.float32)
+            ds._q_callables = {}
+        else:
+            ds.q_ref = np.float32(SIN_AMP_RANGE[1] * ds.t_final / FORCING_BINS)
 
         profiles = {}
         for sim_id in ds.sim_ids:
@@ -360,31 +331,9 @@ class ForcingProblem(ProblemSpec):
 
         s_y = ds.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
-        bins = integrate_temporal_bins_signed(
-            params["temporal_family"],
-            params["temporal_params"],
-            t_s_val,
-            t_j_val,
-            K=FORCING_BINS,
+        spatial_base = np.stack(
+            [T_source_norm, ds.X_norm, ds.Y_norm, S_y], axis=-1,
         ).astype(np.float32)
-        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
-        Q_y_bins_2d = np.broadcast_to(Q_y_bins, (ds.Nx, ds.Ny, FORCING_BINS))
-        spatial_base = np.stack([T_source_norm, ds.X_norm, ds.Y_norm, S_y], axis=-1).astype(np.float32)
-        spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
-
-        if sid not in ds._q_callables:
-            ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
-                **params["temporal_params"]
-            )
-        q = ds._q_callables[sid]
-
-        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-        forcing_seq = _forcing_seq_from_samples(
-            t_samples, a_m, t_s_val, t_j_val, ds.t_final, A_AMP_REF, ds.A_cum_ref,
-        )
-        forcing_summary = build_forcing_summary(
-            a_m, t_samples, t_s_val, t_j_val, ds.t_final, A_AMP_REF,
-        )
 
         cond_static = build_cond_vector(
             t_bar_norm=t_bar_norm,
@@ -392,12 +341,34 @@ class ForcingProblem(ProblemSpec):
             R_c=R_c,
             spatial_family=spatial_family,
             spatial_params=spatial_params,
-            temporal_family=params["temporal_family"],
-            forcing_summary=forcing_summary,
         )
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global], dtype=np.float32)
+
+        if self.representation == "temporal_encoder":
+            if sid not in ds._q_callables:
+                ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
+                    **params["temporal_params"]
+                )
+            q = ds._q_callables[sid]
+            t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+            forcing_seq = _forcing_seq_2tok_from_samples(
+                t_samples, a_m, A_amp_ref=A_AMP_REF,
+            )
+            spatial = spatial_base
+        else:
+            bins = integrate_temporal_bins_signed(
+                params["temporal_family"],
+                params["temporal_params"],
+                t_s_val,
+                t_j_val,
+                K=FORCING_BINS,
+            ).astype(np.float32)
+            Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
+            Q_y_bins_2d = np.broadcast_to(Q_y_bins, (ds.Nx, ds.Ny, FORCING_BINS))
+            spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
+            forcing_seq = empty_forcing_seq()
 
         return {
             "spatial": spatial,

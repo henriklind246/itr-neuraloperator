@@ -4,8 +4,14 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, ProblemSpec
-from problems.forcing import T_EPS
+from problems.base import ProblemDims, ProblemSpec, empty_forcing_seq
+from problems.forcing import (
+    FORCING_TEMPORAL_SAMPLES,
+    FORCING_TEMPORAL_TOKEN_DIM,
+    T_EPS,
+    _forcing_seq_2tok_from_samples,
+    _sample_a,
+)
 import src.physics.internal_source as _internal_source
 from src.physics.internal_source import (
     PATCH_H,
@@ -15,6 +21,7 @@ from src.physics.internal_source import (
     build_patch_source,
     integrate_sin2_pulse,
     make_patch_indicator,
+    make_sin2_pulse,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
@@ -25,9 +32,16 @@ RC_RANGE = (0.05, 1.0)
 INTERFACE_X = 0.5
 T_OFF_FRAC = 0.75
 
-COND_STATIC_DIM = 8
+COND_STATIC_DIM = 7  # base 3 + [x_h, y_h, w_h, h_h]; no source amplitude leak
 SOURCE_BINS = 16
-SPATIAL_IN_CHANNELS = 4 + SOURCE_BINS  # 20
+
+# Spatial channels per representation. temporal_encoder mode lifts the lean
+# [T_tilde, x, y, S_h] base; bins mode appends the SOURCE_BINS integral Q-bins.
+SPATIAL_CHANNELS_TEMPORAL = 4
+SPATIAL_CHANNELS_BINS = SPATIAL_CHANNELS_TEMPORAL + SOURCE_BINS  # 20
+
+# S_h is the 4th spatial channel (index 3) in both representations.
+S_Y_CHANNEL = 3
 
 # Stratified-sampling shares for x_h relative to the interface (left/near/right).
 STRATIFIED_SHARES = {"left": 0.35, "near": 0.30, "right": 0.35}
@@ -54,23 +68,21 @@ def _q_ref(t_final: float) -> float:
 # ----- conditioning -----
 
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      x_h: float, y_h: float, w_h: float, h_h: float,
-                      A: float) -> np.ndarray:
-    """Assemble the 8-dim static conditioning vector.
+                      x_h: float, y_h: float, w_h: float, h_h: float) -> np.ndarray:
+    """Assemble the 7-dim static conditioning vector.
 
     Layout: [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm,
-    h_h_norm, A_norm] (A_norm is log-uniform over PATCH_A_RANGE).
+    h_h_norm]. The source amplitude A is deliberately excluded from
+    conditioning; the heating signal is carried by the temporal token stream
+    (temporal_encoder mode) or the source-bin channels (bins mode).
     """
-    A_min, A_max = _patch_a_range()
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     x_h_norm = (x_h - PATCH_X_RANGE[0]) / (PATCH_X_RANGE[1] - PATCH_X_RANGE[0])
     y_h_norm = (y_h - PATCH_Y_RANGE[0]) / (PATCH_Y_RANGE[1] - PATCH_Y_RANGE[0])
     w_h_norm = w_h / 1.0
     h_h_norm = h_h / 1.0
-    A_norm = (np.log(A) - np.log(A_min)) / (np.log(A_max) - np.log(A_min))
     return np.array(
-        [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm,
-         w_h_norm, h_h_norm, A_norm],
+        [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm],
         dtype=np.float32,
     )
 
@@ -168,22 +180,48 @@ def _generate_lhs_samples(num_sims: int, seed: int = 0,
 class SourceProblem(ProblemSpec):
     """Internal volumetric chip-heating patch benchmark.
 
-    20 spatial channels [T_tilde, x, y, S_h, Q_0..15], 8 static conditioning
-    dims, no forcing_seq, temporal encoder off, interface fixed at x = 0.5.
-    The forward heating pulse is encoded entirely through the source-bin
-    channels, so the model conditions on the patch location/amplitude rather
-    than a temporal token stream.
+    Two representations over the same trajectories/sim_params:
+
+    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, S_h], 7 static
+      conditioning dims, a (128, 2) forcing_seq sampling the sin^2 heating
+      pulse, temporal encoder on.
+    - ``bins``: 20 spatial channels [T_tilde, x, y, S_h, Q_0..15], same 7
+      static dims, an empty forcing_seq, temporal encoder off.
+
+    The source amplitude A never enters conditioning. Interface fixed at
+    x = 0.5.
     """
 
     name = "source"
-    dims = ProblemDims(
-        in_channels=SPATIAL_IN_CHANNELS,
-        cond_static_dim=COND_STATIC_DIM,
-        has_forcing_seq=False,
-        temporal_token_dim=0,
-        t_stats_dim=3,
-        use_temporal_encoder=False,
-    )
+
+    def __init__(self, representation: str = "temporal_encoder"):
+        self.representation = representation
+        if representation == "temporal_encoder":
+            self.dims = ProblemDims(
+                in_channels=SPATIAL_CHANNELS_TEMPORAL,
+                cond_static_dim=COND_STATIC_DIM,
+                has_forcing_seq=True,
+                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                t_stats_dim=3,
+                use_temporal_encoder=True,
+                s_y_channel=S_Y_CHANNEL,
+                use_forcing_time_aug=False,
+            )
+        elif representation == "bins":
+            self.dims = ProblemDims(
+                in_channels=SPATIAL_CHANNELS_BINS,
+                cond_static_dim=COND_STATIC_DIM,
+                has_forcing_seq=False,
+                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                t_stats_dim=3,
+                use_temporal_encoder=False,
+                s_y_channel=S_Y_CHANNEL,
+                use_forcing_time_aug=False,
+            )
+        else:
+            raise ValueError(
+                f"Unknown representation {representation!r} for benchmark {self.name!r}."
+            )
 
     # ---- data generation ----
 
@@ -275,10 +313,16 @@ class SourceProblem(ProblemSpec):
     # ---- dataset item ----
 
     def setup_dataset(self, ds) -> None:
-        ds.source_bins = SOURCE_BINS
-        ds.q_ref = _q_ref(ds.t_final)
         ds._X, ds._Y = np.meshgrid(ds.x_grid, ds.y_grid, indexing="ij")
         ds._patch_mask_cache = {}
+        if self.representation == "temporal_encoder":
+            # Force the 128-sample token grid regardless of the config default.
+            ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
+            ds.a_amp_ref = float(_patch_a_range()[1])
+            ds._q_callables = {}
+        else:
+            ds.source_bins = SOURCE_BINS
+            ds.q_ref = _q_ref(ds.t_final)
 
     def _patch_mask(self, ds, sid: int) -> np.ndarray:
         if sid not in ds._patch_mask_cache:
@@ -326,16 +370,8 @@ class SourceProblem(ProblemSpec):
         t_s_norm = t_s_val / ds.t_final
 
         S_h = self._patch_mask(ds, sid)
-        Q_bins = self._source_bin_channels(ds, sid, t_s_val, t_j_val)
-        spatial = np.concatenate(
-            [
-                T_source_norm[..., None],
-                ds.X_norm[..., None],
-                ds.Y_norm[..., None],
-                S_h[..., None],
-                Q_bins,
-            ],
-            axis=-1,
+        spatial_base = np.stack(
+            [T_source_norm, ds.X_norm, ds.Y_norm, S_h], axis=-1,
         ).astype(np.float32)
 
         cond_static = build_cond_vector(
@@ -343,15 +379,31 @@ class SourceProblem(ProblemSpec):
             R_c=R_c,
             x_h=float(params["x_h"]), y_h=float(params["y_h"]),
             w_h=float(params["w_h"]), h_h=float(params["h_h"]),
-            A=float(params["A"]),
         )
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global, interface_x], dtype=np.float32)
 
+        if self.representation == "temporal_encoder":
+            A = float(params["A"])
+            t_off = float(params["t_off"])
+            if sid not in ds._q_callables:
+                ds._q_callables[sid] = make_sin2_pulse(A, t_off)
+            q = ds._q_callables[sid]
+            t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+            forcing_seq = _forcing_seq_2tok_from_samples(
+                t_samples, a_m, A_amp_ref=ds.a_amp_ref,
+            )
+            spatial = spatial_base
+        else:
+            Q_bins = self._source_bin_channels(ds, sid, t_s_val, t_j_val)
+            spatial = np.concatenate([spatial_base, Q_bins], axis=-1).astype(np.float32)
+            forcing_seq = empty_forcing_seq()
+
         return {
             "spatial": spatial,
             "cond_static": cond_static,
+            "forcing_seq": forcing_seq,
             "Y": Y,
             "T_stats": T_stats,
         }

@@ -4,19 +4,23 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, ProblemSpec
+from problems.base import ProblemDims, ProblemSpec, empty_forcing_seq
 from problems.forcing import (
+    FORCING_TEMPORAL_SAMPLES,
+    FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
-    _forcing_seq_from_samples,
+    _forcing_seq_2tok_from_samples,
     _sample_a,
 )
 from src.physics.boundary_forcing import (
+    FORCING_BINS,
     SIN_AMP_RANGE,
     SPATIAL_BUILDERS,
     SPATIAL_SAMPLERS,
     TEMPORAL_BUILDERS,
     TEMPORAL_SAMPLERS,
     build_qL,
+    integrate_temporal_bins_signed,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
@@ -27,12 +31,19 @@ RC_RANGE = (0.05, 1.0)
 INTERFACE_X_RANGE = (0.2, 0.8)
 
 COND_STATIC_DIM = 4
-SPATIAL_IN_CHANNELS = 6
-TEMPORAL_SAMPLES = 64
-TEMPORAL_TOKEN_DIM = 5
 A_AMP_REF = float(SIN_AMP_RANGE[1])
 K_LEFT = 2.0
 K_RIGHT = 1.0
+
+# Spatial channels per representation. temporal_encoder mode lifts the lean
+# [T_tilde, x, y, K_norm, D_norm, s_y] base; bins mode appends FORCING_BINS
+# integral Q-bins.
+SPATIAL_CHANNELS_TEMPORAL = 6
+SPATIAL_CHANNELS_BINS = SPATIAL_CHANNELS_TEMPORAL + FORCING_BINS  # 22
+
+# s_y is the 6th spatial channel (index 5) in both representations; the model's
+# learned forcing injection must read this channel, not K_norm at index 3.
+S_Y_CHANNEL = 5
 
 # 2D LHS column order; must match generate_lhs_samples in vary-interfaces.
 LHS_PARAM_RANGES = {"R_c": RC_RANGE, "interface_x": INTERFACE_X_RANGE}
@@ -100,20 +111,48 @@ class InterfacesProblem(ProblemSpec):
     """Varying-interface benchmark: fixed sin/uniform forcing, interface_x
     sampled in [0.2, 0.8].
 
-    6 spatial channels [T_tilde, x, y, K_norm, D_norm, s_y], 4 static
-    conditioning dims, a (64, 5) forcing_seq, temporal encoder on, and a
-    3-dim T_stats whose slot 2 carries interface_x for dynamic mask building.
+    Two representations over the same trajectories/sim_params:
+
+    - ``temporal_encoder``: 6 spatial channels [T_tilde, x, y, K_norm, D_norm,
+      s_y], 4 static conditioning dims, a (128, 2) forcing_seq [r_m, a_m/A_ref],
+      temporal encoder on with time-augmented spatial injection.
+    - ``bins``: 22 spatial channels [..., s_y, Q_y_bin_0..15], same 4 static
+      dims, an empty forcing_seq, temporal encoder off.
+
+    s_y lives at spatial channel 5 in both modes; the 3-dim T_stats carries
+    interface_x in slot 2 for dynamic mask building.
     """
 
     name = "interfaces"
-    dims = ProblemDims(
-        in_channels=SPATIAL_IN_CHANNELS,
-        cond_static_dim=COND_STATIC_DIM,
-        has_forcing_seq=True,
-        temporal_token_dim=TEMPORAL_TOKEN_DIM,
-        t_stats_dim=3,
-        use_temporal_encoder=True,
-    )
+
+    def __init__(self, representation: str = "temporal_encoder"):
+        self.representation = representation
+        if representation == "temporal_encoder":
+            self.dims = ProblemDims(
+                in_channels=SPATIAL_CHANNELS_TEMPORAL,
+                cond_static_dim=COND_STATIC_DIM,
+                has_forcing_seq=True,
+                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                t_stats_dim=3,
+                use_temporal_encoder=True,
+                s_y_channel=S_Y_CHANNEL,
+                use_forcing_time_aug=True,
+            )
+        elif representation == "bins":
+            self.dims = ProblemDims(
+                in_channels=SPATIAL_CHANNELS_BINS,
+                cond_static_dim=COND_STATIC_DIM,
+                has_forcing_seq=False,
+                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                t_stats_dim=3,
+                use_temporal_encoder=False,
+                s_y_channel=S_Y_CHANNEL,
+                use_forcing_time_aug=False,
+            )
+        else:
+            raise ValueError(
+                f"Unknown representation {representation!r} for benchmark {self.name!r}."
+            )
 
     # ---- data generation ----
 
@@ -211,8 +250,12 @@ class InterfacesProblem(ProblemSpec):
     # ---- dataset item ----
 
     def setup_dataset(self, ds) -> None:
-        ds.A_cum_ref = float(A_AMP_REF * ds.t_final)
-        ds._q_callables = {}
+        if self.representation == "temporal_encoder":
+            # Force the 128-sample token grid regardless of the config default.
+            ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
+            ds._q_callables = {}
+        else:
+            ds.q_ref = np.float32(SIN_AMP_RANGE[1] * ds.t_final / FORCING_BINS)
 
         profiles = {}
         for sim_id in ds.sim_ids:
@@ -257,20 +300,9 @@ class InterfacesProblem(ProblemSpec):
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
         K_norm = self._material_channel(ds, interface_x)
         D_norm = self._signed_distance_channel(ds, interface_x)
-        spatial = np.stack(
+        spatial_base = np.stack(
             [T_source_norm, ds.X_norm, ds.Y_norm, K_norm, D_norm, S_y], axis=-1,
         ).astype(np.float32)
-
-        if sid not in ds._q_callables:
-            ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
-                **params["temporal_params"]
-            )
-        q = ds._q_callables[sid]
-
-        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-        forcing_seq = _forcing_seq_from_samples(
-            t_samples, a_m, t_s_val, t_j_val, ds.t_final, A_AMP_REF, ds.A_cum_ref,
-        )
 
         cond_static = build_cond_vector(
             t_bar_norm=float(t_bar_norm),
@@ -281,6 +313,30 @@ class InterfacesProblem(ProblemSpec):
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global, interface_x], dtype=np.float32)
+
+        if self.representation == "temporal_encoder":
+            if sid not in ds._q_callables:
+                ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
+                    **params["temporal_params"]
+                )
+            q = ds._q_callables[sid]
+            t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+            forcing_seq = _forcing_seq_2tok_from_samples(
+                t_samples, a_m, A_amp_ref=A_AMP_REF,
+            )
+            spatial = spatial_base
+        else:
+            bins = integrate_temporal_bins_signed(
+                params["temporal_family"],
+                params["temporal_params"],
+                t_s_val,
+                t_j_val,
+                K=FORCING_BINS,
+            ).astype(np.float32)
+            Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
+            Q_y_bins_2d = np.broadcast_to(Q_y_bins, (ds.Nx, ds.Ny, FORCING_BINS))
+            spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
+            forcing_seq = empty_forcing_seq()
 
         return {
             "spatial": spatial,
