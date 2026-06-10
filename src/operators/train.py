@@ -17,7 +17,6 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam, AdamW
 
 from data.dataset import (
-    COND_STATIC_DIM,
     TEMPORAL_SAMPLES,
     SnapshotPairDataset,
     compute_global_stats,
@@ -99,6 +98,23 @@ def load_config(config_path: str | None = None) -> dict:
     if not benchmark_path.exists():
         raise FileNotFoundError(f"Benchmark config not found: {benchmark_path}")
     cfg = OmegaConf.merge(cfg, OmegaConf.load(benchmark_path))
+
+    # Compose the representation group the same way. Name comes from
+    # $REPRESENTATION, else the `defaults` list, else "temporal_encoder". The
+    # group file is `# @package _global_` and sets `benchmark.representation`.
+    representation_name = os.environ.get("REPRESENTATION")
+    if representation_name is None:
+        representation_name = "temporal_encoder"
+        for entry in cfg.get("defaults", []) or []:
+            if not isinstance(entry, str):
+                d = OmegaConf.to_container(entry)
+                if isinstance(d, dict) and "representation" in d:
+                    representation_name = d["representation"]
+                    break
+    representation_path = project_root / "conf" / "representation" / f"{representation_name}.yaml"
+    if not representation_path.exists():
+        raise FileNotFoundError(f"Representation config not found: {representation_path}")
+    cfg = OmegaConf.merge(cfg, OmegaConf.load(representation_path))
 
     # Remove Hydra-only sections that can't resolve outside Hydra
     for key in ("hydra", "defaults"):
@@ -187,6 +203,21 @@ def _capture_job_context(run_path: Path) -> None:
     lines.append(f"argv={' '.join(sys.argv)}")
     lines.append(f"start_utc={datetime.now(timezone.utc).isoformat()}")
     (run_path / "slurm_job.txt").write_text("\n".join(lines) + "\n")
+
+
+def _stamp_resolved_dims(config: dict, dims) -> None:
+    """Record the spec-owned model dims into config["model"]["parameters"].
+
+    These dims are resolved from the (benchmark, representation) pair, not the
+    YAML, so without this the dumped config_used.yaml leaves them null.
+    """
+    params = config.setdefault("model", {}).setdefault("parameters", {})
+    params["in_channels"] = dims.in_channels
+    params["cond_static_dim"] = dims.cond_static_dim
+    params["temporal_token_dim"] = dims.temporal_token_dim
+    params["use_temporal_encoder"] = dims.use_temporal_encoder
+    params["s_y_channel"] = dims.s_y_channel
+    params["use_forcing_time_aug"] = dims.use_forcing_time_aug
 
 
 def _dump_resolved_config(run_path: Path, config: dict) -> None:
@@ -743,6 +774,14 @@ def run_one_seed(
     run_path.mkdir(parents=True, exist_ok=True)
 
     _t_start = time.time()
+
+    # Resolve the ProblemSpec up front and stamp the representation-determined
+    # dims into config["model"]["parameters"] so config_used.yaml records the
+    # dims the model is actually built with (they are owned by the spec, not the
+    # benchmark/representation YAML).
+    spec = problem_from_config(config)
+    _stamp_resolved_dims(config, spec.dims)
+
     if is_main:
         _capture_git_provenance(run_path)
         _capture_job_context(run_path)
@@ -799,7 +838,7 @@ def run_one_seed(
             world_size=dist_info.world_size,
             rank=dist_info.rank,
             sampler_seed=seed,
-            problem=problem_from_config(config),
+            problem=spec,
         )
     else:
         training_set = train_loader_override
@@ -817,22 +856,25 @@ def run_one_seed(
         print(f"Training on: {device} (world_size={dist_info.world_size})")
 
     model_cfg = config["model"]["parameters"]
+    dims = spec.dims
     fno = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
         width=model_cfg["width"],
-        in_channels=model_cfg.get("in_channels", 20),
+        in_channels=dims.in_channels,
         out_channels=model_cfg.get("out_channels", 1),
         n_layers=model_cfg.get("n_layers", 4),
-        cond_static_dim=model_cfg.get("cond_static_dim", COND_STATIC_DIM),
+        cond_static_dim=dims.cond_static_dim,
         cond_hidden=model_cfg.get("cond_hidden", 256),
-        temporal_token_dim=model_cfg.get("temporal_token_dim", 5),
+        temporal_token_dim=dims.temporal_token_dim,
         temporal_hidden=model_cfg.get("temporal_hidden", 128),
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
-        use_temporal_encoder=model_cfg.get("use_temporal_encoder", True),
+        use_temporal_encoder=dims.use_temporal_encoder,
+        use_forcing_time_aug=dims.use_forcing_time_aug,
+        s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
     )
 
