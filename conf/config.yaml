@@ -2,6 +2,7 @@ defaults:
   - paths: default
   - search_space: medium
   - benchmark: forcing
+  - representation: temporal_encoder
   - override hydra/sweeper: optuna_local
   - _self_
 
@@ -19,7 +20,8 @@ model:
   type: "2D FNO time-conditioned (temporal branch)"
   parameters:
     # Representational dims (in_channels, cond_static_dim, temporal_token_dim,
-    # use_temporal_encoder) are owned by the active `benchmark` config group.
+    # use_temporal_encoder, s_y_channel, use_forcing_time_aug) are resolved by
+    # the ProblemSpec from the (benchmark, representation) pair, not set here.
     modes1: 16
     modes2: 16
     width: 64
