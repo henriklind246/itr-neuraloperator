@@ -10,15 +10,28 @@ if TYPE_CHECKING:
     from src.physics.fv_solver_2d import FVSolver2D
 
 
+def empty_forcing_seq() -> np.ndarray:
+    """The placeholder ``forcing_seq`` for bins-mode items.
+
+    Bins-mode benchmarks carry no temporal token stream, but the dataset item
+    must keep a fixed set of keys so default collation does not break. They emit
+    this explicit empty ``(0, 0)`` tensor (collated to ``(B, 0, 0)``); ``FNO2d``
+    ignores ``forcing_seq`` whenever ``use_temporal_encoder`` is off.
+    """
+    return np.zeros((0, 0), dtype=np.float32)
+
+
 @dataclass(frozen=True)
 class ProblemDims:
     """Per-benchmark tensor contract.
 
     `in_channels` and `cond_static_dim` size the model's lift and conditioning
     MLP. `has_forcing_seq` / `use_temporal_encoder` toggle the temporal branch
-    (source has neither). `t_stats_dim` is the width of the denormalization
+    (bins mode has neither). `t_stats_dim` is the width of the denormalization
     stats vector (2 = [mu, sigma]; 3 adds a per-benchmark scalar such as
-    interface_x).
+    interface_x). `s_y_channel` is the spatial channel the model multiplies the
+    learned forcing weights against; `use_forcing_time_aug` augments the temporal
+    embedding with the lead/start time before projecting those weights.
     """
 
     in_channels: int
@@ -27,6 +40,8 @@ class ProblemDims:
     temporal_token_dim: int
     t_stats_dim: int
     use_temporal_encoder: bool
+    s_y_channel: int = 3
+    use_forcing_time_aug: bool = False
 
 
 class ProblemSpec(ABC):
