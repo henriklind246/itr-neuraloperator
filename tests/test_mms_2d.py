@@ -1,16 +1,20 @@
 import pytest
 
 from src.physics.mms_2d import (
+    near_node_interface_x_I,
+    patch_source_neumann_residual,
     run_mms_2d_interface,
     run_mms_2d_patch_source,
     run_mms_2d_smooth_forcing_integral,
     run_mms_2d_yflux,
     run_mms_x_linear,
     smooth_forcing_left_flux_sign_sample,
+    space_order_test_2d_near_node_interface,
     space_order_test_2d_off_center_interface,
     space_order_test_2d_patch_source,
     space_order_test_2d_yflux,
     space_order_test_x_linear,
+    time_order_test_2d_near_node_interface,
     time_order_test_2d_off_center_interface,
     time_order_test_2d_patch_source,
     time_order_test_2d_smooth_forcing_integral,
@@ -37,6 +41,28 @@ class TestOffCenterInterfaceMMS:
 
     def test_temporal_convergence_is_second_order(self):
         order = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005], x_I=0.4734)
+        assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
+
+
+class TestNearNodeInterfaceMMS:
+    """Interface placed 1% of a cell from a grid node — near-node stress for the
+    asymmetric face conductance and control volumes. Geometry held fixed
+    (h_min/hx = 0.01) across resolutions."""
+
+    def test_runs_near_node(self):
+        x_I = near_node_interface_x_I(N=100, eps=0.01)
+        h, dt, max_err, l2_err = run_mms_2d_interface(N=100, dt=0.0001, x_I=x_I)
+        assert h > 0 and dt > 0
+        assert max_err > 0 and l2_err > 0
+        assert max_err < 1e-2
+        assert l2_err < 5e-3
+
+    def test_spatial_convergence_is_second_order(self):
+        order = space_order_test_2d_near_node_interface([50, 100, 200], eps=0.01)
+        assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
+
+    def test_temporal_convergence_is_second_order(self):
+        order = time_order_test_2d_near_node_interface([0.02, 0.01, 0.005], eps=0.01)
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
 
@@ -105,6 +131,13 @@ class TestSmoothForcingIntegralMMS:
 class TestPatchSourceMMS:
     """Verifies the internal volumetric source path (source benchmark) with a
     smooth Gaussian-envelope manufactured solution."""
+
+    def test_neumann_bc_satisfied_exactly(self):
+        # F_y(x, c) and F_y(x, d) must vanish to roundoff (exact top/bottom
+        # Neumann). This is the failure mode of the old isotropic Gaussian.
+        res_c, res_d = patch_source_neumann_residual(N=101)
+        assert res_c < 1e-10, f"F_y at y=c not zero: {res_c:.3e}"
+        assert res_d < 1e-10, f"F_y at y=d not zero: {res_d:.3e}"
 
     def test_runs_at_default_grid(self):
         h, dt, max_err, l2_err = run_mms_2d_patch_source(N=101, dt=0.0001)

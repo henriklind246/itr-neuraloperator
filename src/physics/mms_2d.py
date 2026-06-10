@@ -574,31 +574,40 @@ def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float
     Smooth-source MMS for the internal-source pathway.
 
     Manufactured solution:
-      T*(x,y,t) = 300 + g(t) * phi(x) * psi(y)
+      T*(x,y,t) = 300 + g(t) * Ex(x) * Ey(y) * phi(x) * psi(y)
       g(t)  = sin(omega * t),  omega = 6*pi
       phi(x) = (x-a)^2 (b-x)^2
       psi(y) = cos(pi*(y-c)/(d-c))
 
-    The factors are chosen so that:
-      - phi(a) = phi(b) = 0 and phi'(a) = phi'(b) = 0 → left flux is identically
-        zero AND right boundary stays at T = 300. Matches the
-        zero-Neumann / 300-Dirichlet wall conditions used by the internal-source
-        experiment.
-      - psi'(c) = psi'(d) = 0 → top/bottom Neumann zero-flux conditions hold.
+    Wall conditions:
+      - phi(a) = phi'(a) = 0 keeps the left flux exactly zero. phi(b) = 0 keeps
+        the right wall at T = 300; phi'(b) = 0 aids smoothness but is not needed
+        for that Dirichlet condition. Matches the zero-Neumann / 300-Dirichlet
+        walls of the internal-source experiment.
+      - The y-envelope Ey = Gy * W and psi enforce the top/bottom zero-Neumann
+        condition *exactly* (see below).
+
+    To localize the source like the real patch experiment, the field is
+    modulated by a separable envelope env(x,y) = Ex(x) * Ey(y) centered at
+    (x_h, y_h). Ex is a plain Gaussian; Ey = Gy * W multiplies a Gaussian Gy by
+    a smooth boundary cutoff W(r), r = (y-c)/(d-c), with double zeros at both
+    walls:
+      W(c) = W(d) = 0  and  W_y(c) = W_y(d) = 0.
+    Hence Ey(c) = Ey(d) = 0 and Ey_y(c) = Ey_y(d) = 0. Together with
+    psi_y(c) = psi_y(d) = 0 this gives F_y(x,c) = F_y(x,d) = 0 exactly, so T*
+    satisfies the imposed top/bottom Neumann BC analytically — not merely to
+    Gaussian-tail tolerance as the earlier isotropic envelope did.
+
+    sigma_y still localizes the source but is no longer load-bearing for BC
+    correctness. W is normalized so W(y_h) = 1 for the current centered hotspot;
+    with y_h = 0.5 the cutoff is symmetric (W_y(0.5) = 0) so the Ey peak stays at
+    y = 0.5. For y_h != 0.5, W_y(y_h) != 0 could shift the effective Ey peak
+    slightly off y_h.
 
     The required source is globally smooth (NOT a rectangular indicator):
       s*(X, Y, t) = rho*cp * dT/dt - k * d^2T/dx^2 - k * d^2T/dy^2
-
-    To localize the source like the real patch experiment, we additionally
-    modulate by a Gaussian envelope centered at (x_h, y_h). The Gaussian is
-    smooth, so convergence orders are preserved, but the source is concentrated
-    in a region of size sigma, mimicking the patch.
-
-      env(X, Y) = exp(-((X - x_h)^2 + (Y - y_h)^2) / (2 sigma^2))
-
-    NOTE: The manufactured T* is the *full* analytic solution including the
-    Gaussian-shaped source. We therefore compute s* directly from derivatives
-    of T*_full(X, Y, t) = 300 + g(t) * env(X, Y) * phi(X) * psi(Y).
+    computed directly from derivatives of the full analytic field
+      T*(X, Y, t) = 300 + g(t) * F(X, Y),  F = Ex * Ey * phi * psi.
 
     This verifies the source pathway end-to-end with the expected
     second-order spatial and temporal convergence.
@@ -617,29 +626,53 @@ def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float
     kappa = np.pi / Ly
 
     x_h, y_h = 0.5, 0.5
-    # sigma must keep the source negligible at the Neumann walls (x=a, y=c, y=d).
-    # The solver point-samples the source at boundary half-cells, so a source that
-    # is non-trivial there leaves an O(1) half-cell quadrature residual that does
-    # not vanish under refinement (sigma=0.15 stalls at ~3.5e-4, order ~0.1).
-    # sigma=0.10 gives env ~ 4e-6 at the walls, recovering clean 2nd order, and
-    # still matches the strictly-interior real patch source.
-    sigma = 0.10
-    inv_2sig2 = 1.0 / (2.0 * sigma ** 2)
+    # sigma_y localizes the source; the Neumann BC is now enforced exactly by the
+    # W(y) cutoff, not by the Gaussian tail being small at the walls.
+    sigma_x = 0.10
+    sigma_y = 0.10
 
-    def env(X, Y):
-        return np.exp(-((X - x_h) ** 2 + (Y - y_h) ** 2) * inv_2sig2)
+    def Ex(X):
+        return np.exp(-((X - x_h) ** 2) / (2.0 * sigma_x ** 2))
 
-    def env_x(X, Y):
-        return -((X - x_h) / sigma ** 2) * env(X, Y)
+    def Ex_x(X):
+        return -((X - x_h) / sigma_x ** 2) * Ex(X)
 
-    def env_xx(X, Y):
-        return ((X - x_h) ** 2 / sigma ** 4 - 1.0 / sigma ** 2) * env(X, Y)
+    def Ex_xx(X):
+        return ((X - x_h) ** 2 / sigma_x ** 4 - 1.0 / sigma_x ** 2) * Ex(X)
 
-    def env_y(X, Y):
-        return -((Y - y_h) / sigma ** 2) * env(X, Y)
+    def Gy(Y):
+        return np.exp(-((Y - y_h) ** 2) / (2.0 * sigma_y ** 2))
 
-    def env_yy(X, Y):
-        return ((Y - y_h) ** 2 / sigma ** 4 - 1.0 / sigma ** 2) * env(X, Y)
+    def Gy_y(Y):
+        return -((Y - y_h) / sigma_y ** 2) * Gy(Y)
+
+    def Gy_yy(Y):
+        return ((Y - y_h) ** 2 / sigma_y ** 4 - 1.0 / sigma_y ** 2) * Gy(Y)
+
+    r_h = (y_h - c) / Ly
+    assert 0.0 < r_h < 1.0  # y_h must be strictly interior; W_norm = 0 at the walls
+    W_norm = r_h ** 2 * (1.0 - r_h) ** 2
+
+    def W(Y):
+        r = (Y - c) / Ly
+        return (r ** 2 * (1.0 - r) ** 2) / W_norm
+
+    def W_y(Y):
+        r = (Y - c) / Ly
+        return (2.0 * r * (1.0 - r) * (1.0 - 2.0 * r) / Ly) / W_norm
+
+    def W_yy(Y):
+        r = (Y - c) / Ly
+        return ((2.0 - 12.0 * r + 12.0 * r ** 2) / Ly ** 2) / W_norm
+
+    def Ey(Y):
+        return Gy(Y) * W(Y)
+
+    def Ey_y(Y):
+        return Gy_y(Y) * W(Y) + Gy(Y) * W_y(Y)
+
+    def Ey_yy(Y):
+        return Gy_yy(Y) * W(Y) + 2.0 * Gy_y(Y) * W_y(Y) + Gy(Y) * W_yy(Y)
 
     def phi(X):
         return (X - a) ** 2 * (b - X) ** 2
@@ -660,19 +693,15 @@ def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float
         return -kappa ** 2 * np.cos(kappa * (Y - c))
 
     def F(X, Y):
-        return env(X, Y) * phi(X) * psi(Y)
+        return Ex(X) * Ey(Y) * phi(X) * psi(Y)
 
     def F_xx(X, Y):
-        e = env(X, Y)
-        ex = env_x(X, Y)
-        exx = env_xx(X, Y)
-        return (exx * phi(X) + 2.0 * ex * phi_x(X) + e * phi_xx(X)) * psi(Y)
+        return (Ex_xx(X) * phi(X) + 2.0 * Ex_x(X) * phi_x(X) + Ex(X) * phi_xx(X)) \
+            * Ey(Y) * psi(Y)
 
     def F_yy(X, Y):
-        e = env(X, Y)
-        ey = env_y(X, Y)
-        eyy = env_yy(X, Y)
-        return (eyy * psi(Y) + 2.0 * ey * psi_y(Y) + e * psi_yy(Y)) * phi(X)
+        return Ex(X) * phi(X) * (
+            Ey_yy(Y) * psi(Y) + 2.0 * Ey_y(Y) * psi_y(Y) + Ey(Y) * psi_yy(Y))
 
     def T_star(X, Y, t):
         return 300.0 + np.sin(omega * t) * F(X, Y)
@@ -710,6 +739,64 @@ def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float
     max_abs_err = float(np.max(np.abs(error)))
     l2_err = float(np.sqrt(np.mean(error ** 2)))
     return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+def patch_source_neumann_residual(N: int = 101) -> tuple[float, float]:
+    """Max |dF/dy| of the patch-source manufactured field at the top/bottom walls.
+
+    F = Ex(x) Ey(y) phi(x) psi(y), so dF/dy = Ex phi (Ey_y psi + Ey psi_y). The
+    Neumann-compatible cutoff gives Ey(c)=Ey(d)=Ey_y(c)=Ey_y(d)=0 and
+    psi_y(c)=psi_y(d)=0, so both residuals must be zero to roundoff. Returns
+    (max|F_y(x,c)|, max|F_y(x,d)|) over the x-grid.
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    Ly = d - c
+    kappa = np.pi / Ly
+    x_h, y_h = 0.5, 0.5
+    sigma_x = 0.10
+    sigma_y = 0.10
+
+    X = np.linspace(a, b, N)
+
+    def Ex(x):
+        return np.exp(-((x - x_h) ** 2) / (2.0 * sigma_x ** 2))
+
+    def phi(x):
+        return (x - a) ** 2 * (b - x) ** 2
+
+    def Gy(y):
+        return np.exp(-((y - y_h) ** 2) / (2.0 * sigma_y ** 2))
+
+    def Gy_y(y):
+        return -((y - y_h) / sigma_y ** 2) * Gy(y)
+
+    r_h = (y_h - c) / Ly
+    W_norm = r_h ** 2 * (1.0 - r_h) ** 2
+
+    def W(y):
+        r = (y - c) / Ly
+        return (r ** 2 * (1.0 - r) ** 2) / W_norm
+
+    def W_y(y):
+        r = (y - c) / Ly
+        return (2.0 * r * (1.0 - r) * (1.0 - 2.0 * r) / Ly) / W_norm
+
+    def Ey(y):
+        return Gy(y) * W(y)
+
+    def Ey_y(y):
+        return Gy_y(y) * W(y) + Gy(y) * W_y(y)
+
+    def psi(y):
+        return np.cos(kappa * (y - c))
+
+    def psi_y(y):
+        return -kappa * np.sin(kappa * (y - c))
+
+    def F_y(y):
+        return Ex(X) * phi(X) * (Ey_y(y) * psi(y) + Ey(y) * psi_y(y))
+
+    return float(np.max(np.abs(F_y(c)))), float(np.max(np.abs(F_y(d))))
 
 
 # ==============================================================
@@ -836,6 +923,37 @@ def time_order_test_2d_off_center_interface(dt_list: list, x_I: float = 0.4734) 
     return float(np.mean(_pairwise_orders(dt_list, results)))
 
 
+def near_node_interface_x_I(N: int, eps: float = 0.01) -> float:
+    """Interface eps*hx to the right of a near-center grid node, so the smaller
+    node gap is exactly eps*hx (default 1% of the cell). Recompute per N to hold
+    the near-node geometry fixed under refinement. Domain is [0, 1]."""
+    a, b = 0.0, 1.0
+    hx = (b - a) / (N - 1)
+    i0 = (N - 1) // 2          # interior node near x = 0.5
+    return a + (i0 + eps) * hx  # h_L = eps*hx (close to left node i0), h_R = (1-eps)*hx
+
+
+def space_order_test_2d_near_node_interface(N_list: list, eps: float = 0.01) -> float:
+    """Spatial convergence with the interface eps*hx from a node at every N."""
+    results, hs = [], []
+    for N in N_list:
+        x_I = near_node_interface_x_I(N, eps=eps)
+        h, _, _, l2 = run_mms_2d_interface(N, dt=0.0001, x_I=x_I)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_near_node_interface(dt_list: list, N: int = 200, eps: float = 0.01) -> float:
+    """Temporal convergence with the interface eps*hx from a node (fixed N)."""
+    x_I = near_node_interface_x_I(N, eps=eps)
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_interface(N, dt=dt_val, x_I=x_I)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
 def space_order_test_2d_patch_source(N_list: list) -> float:
     results, hs = [], []
     for N in N_list:
@@ -890,6 +1008,12 @@ if __name__ == '__main__':
     p = time_order_test_x_linear([0.02, 0.01, 0.005])
     print(f"Temporal order: {p:.3f}")
 
+    print("\n=== Smooth-Forcing Integral MMS (temporal only) ===")
+    h, dt, me, l2 = run_mms_2d_smooth_forcing_integral(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = time_order_test_2d_smooth_forcing_integral([0.02, 0.01, 0.005])
+    print(f"Temporal order: {p:.3f}")
+
     print("\n=== 2D Interface MMS ===")
     h, dt, me, l2 = run_mms_2d_interface(N=100)
     print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
@@ -904,6 +1028,14 @@ if __name__ == '__main__':
     p = space_order_test_2d_off_center_interface([50, 100, 200])
     print(f"Spatial order: {p:.3f}")
     p = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Near-Node Interface MMS (h_min/hx=0.01) ===")
+    h, dt, me, l2 = run_mms_2d_interface(N=100, dt=0.0001, x_I=near_node_interface_x_I(100))
+    print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_near_node_interface([50, 100, 200])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_near_node_interface([0.02, 0.01, 0.005])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Patch Source MMS ===")
