@@ -163,6 +163,64 @@ class TestFNO2d:
         out = model(spatial, cond_static)
         assert out.shape == (2, 11, 11, 1)
 
+    def test_s_y_channel_selects_forcing_source_channel(self):
+        """The learned spatial forcing field reads s_y from `s_y_channel`. Two
+        models with identical weights but different s_y_channel must produce
+        different outputs when those two channels differ — proving interfaces'
+        channel-5 fix is honored rather than the legacy hard-coded channel 3."""
+        torch.manual_seed(0)
+        common = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=8, out_channels=1, n_layers=2,
+            cond_static_dim=4, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+        )
+        m3 = FNO2d(**common, s_y_channel=3)
+        m5 = FNO2d(**common, s_y_channel=5)
+        m5.load_state_dict(m3.state_dict())
+        m3.eval()
+        m5.eval()
+
+        spatial = torch.randn(2, 11, 11, 8)
+        # Make channels 3 and 5 clearly distinct so the selection matters.
+        spatial[..., 3] = 1.0
+        spatial[..., 5] = -1.0
+        cond_static = torch.randn(2, 4)
+        forcing_seq = torch.randn(2, 16, 2)
+
+        with torch.no_grad():
+            out3 = m3(spatial, cond_static, forcing_seq)
+            out5 = m5(spatial, cond_static, forcing_seq)
+        assert not torch.allclose(out3, out5)
+
+    def test_forcing_time_aug_builds_aug_mlp(self):
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=6, out_channels=1, n_layers=2,
+            cond_static_dim=4, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_forcing_time_aug=True, s_y_channel=5,
+        )
+        assert hasattr(model, "forcing_aug_mlp")
+        # first linear folds [t_bar_norm, t_s_norm] into h_a: embed_dim + 2.
+        assert model.forcing_aug_mlp[0].in_features == 16 + 2
+
+        spatial = torch.randn(2, 11, 11, 6)
+        cond_static = torch.randn(2, 4)
+        forcing_seq = torch.randn(2, 16, 2)
+        out = model(spatial, cond_static, forcing_seq)
+        assert out.shape == (2, 11, 11, 1)
+
+    def test_no_forcing_time_aug_omits_aug_mlp(self):
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=4, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_forcing_time_aug=False,
+        )
+        assert not hasattr(model, "forcing_aug_mlp")
+
     def test_near_identity_init_at_step_zero(self):
         """Soft identity init: head weights small-random (std=1e-3), bias at γ=1, β=0.
 

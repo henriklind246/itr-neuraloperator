@@ -29,10 +29,12 @@ from src.operators.train import (
     run_config_seeds,
 )
 
-SPATIAL_IN_CHANNELS = 20
-COND_STATIC_DIM = 23
-TEMPORAL_TOKEN_DIM = 5
-TEMPORAL_SAMPLES = 64
+# Active default = forcing benchmark, temporal_encoder representation:
+# 4 spatial channels [T_tilde, x, y, s_y], 11 static cond dims, (128, 2) tokens.
+SPATIAL_IN_CHANNELS = 4
+COND_STATIC_DIM = 11
+TEMPORAL_TOKEN_DIM = 2
+TEMPORAL_SAMPLES = 128
 
 
 class ZeroModel(torch.nn.Module):

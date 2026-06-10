@@ -682,7 +682,7 @@ class TestSourcePlots:
         self, tmp_path, synthetic_trajectories, synthetic_source_sim_params, plot_config
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        source_config = {**plot_config, "benchmark": {"name": "source"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
         out_path = tmp_path / "source_dataset_summary.png"
         dataset_plots.plot_source_dataset_summary(
             trajectories,
@@ -699,7 +699,7 @@ class TestSourcePlots:
         self, small_source_fno2d_checkpoint
     ):
         model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        assert conf["model"]["parameters"]["cond_static_dim"] == 8
+        assert conf["model"]["parameters"]["cond_static_dim"] == 7
         assert getattr(model, "use_temporal_encoder") is False
 
     def test_patch_error_slices_smoke(
@@ -712,7 +712,7 @@ class TestSourcePlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        source_config = {**plot_config, "benchmark": {"name": "source"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
         datasets = dataset_plots._build_split_datasets(
             trajectories, x_grid, y_grid, t_grid, synthetic_source_sim_params, source_config
         )
@@ -906,7 +906,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        source_config = {**plot_config, "benchmark": {"name": "source"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid,
             synthetic_source_sim_params, source_config
@@ -959,13 +959,13 @@ class TestWriteTestRecords:
                     "modes1": 2,
                     "modes2": 2,
                     "width": 8,
-                    "in_channels": 20,
+                    "in_channels": 4,
                     "out_channels": 1,
                     "n_layers": 2,
-                    "cond_static_dim": 23,
+                    "cond_static_dim": 11,
                     "cond_hidden": 256,
-                    "temporal_token_dim": 5,
-                    "temporal_samples": 64,
+                    "temporal_token_dim": 2,
+                    "temporal_samples": 128,
                     "temporal_hidden": 16,
                     "forcing_embed_dim": 16,
                 }

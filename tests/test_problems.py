@@ -3,13 +3,42 @@ import pytest
 
 from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
-from problems.forcing import ForcingProblem
+from problems.forcing import FORCING_TEMPORAL_SAMPLES, ForcingProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
+
+# Target (benchmark x representation) tensor contract. Single source of truth for
+# the dims/shape/absence tests below; mirrors the plan's contract table.
+CONTRACTS = {
+    ("forcing", "temporal_encoder"): dict(
+        in_ch=4, cond=11, has_fseq=True, token=2, t_stats=2,
+        encoder=True, s_y=3, aug=True,
+    ),
+    ("forcing", "bins"): dict(
+        in_ch=20, cond=11, has_fseq=False, token=2, t_stats=2,
+        encoder=False, s_y=3, aug=False,
+    ),
+    ("source", "temporal_encoder"): dict(
+        in_ch=4, cond=7, has_fseq=True, token=2, t_stats=3,
+        encoder=True, s_y=3, aug=False,
+    ),
+    ("source", "bins"): dict(
+        in_ch=20, cond=7, has_fseq=False, token=2, t_stats=3,
+        encoder=False, s_y=3, aug=False,
+    ),
+    ("interfaces", "temporal_encoder"): dict(
+        in_ch=6, cond=4, has_fseq=True, token=2, t_stats=3,
+        encoder=True, s_y=5, aug=True,
+    ),
+    ("interfaces", "bins"): dict(
+        in_ch=22, cond=4, has_fseq=False, token=2, t_stats=3,
+        encoder=False, s_y=5, aug=False,
+    ),
+}
 
 
 def _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec):
@@ -91,68 +120,55 @@ class TestRegistry:
         with pytest.raises(KeyError, match="Unknown benchmark"):
             get_problem("does_not_exist")
 
-    def test_forcing_dims(self):
-        dims = get_problem("forcing").dims
-        assert dims.in_channels == 20
-        assert dims.cond_static_dim == 23
-        assert dims.has_forcing_seq is True
-        assert dims.temporal_token_dim == 5
-        assert dims.t_stats_dim == 2
-        assert dims.use_temporal_encoder is True
+    def test_default_representation_is_temporal_encoder(self):
+        assert get_problem("forcing").representation == "temporal_encoder"
 
-    @pytest.mark.parametrize(
-        "name,in_ch,cond,has_fseq,t_stats,encoder",
-        [
-            ("forcing", 20, 23, True, 2, True),
-            ("interfaces", 6, 4, True, 3, True),
-            ("source", 20, 8, False, 3, False),
-        ],
-    )
-    def test_dims_per_benchmark(self, name, in_ch, cond, has_fseq, t_stats, encoder):
-        dims = get_problem(name).dims
-        assert dims.in_channels == in_ch
-        assert dims.cond_static_dim == cond
-        assert dims.has_forcing_seq is has_fseq
-        assert dims.t_stats_dim == t_stats
-        assert dims.use_temporal_encoder is encoder
+    def test_unknown_representation_raises(self):
+        with pytest.raises(ValueError, match="representation"):
+            get_problem("forcing", "does_not_exist")
+
+    @pytest.mark.parametrize("key", list(CONTRACTS))
+    def test_dims_per_benchmark_representation(self, key):
+        name, representation = key
+        c = CONTRACTS[key]
+        dims = get_problem(name, representation).dims
+        assert dims.in_channels == c["in_ch"]
+        assert dims.cond_static_dim == c["cond"]
+        assert dims.has_forcing_seq is c["has_fseq"]
+        assert dims.temporal_token_dim == c["token"]
+        assert dims.t_stats_dim == c["t_stats"]
+        assert dims.use_temporal_encoder is c["encoder"]
+        assert dims.s_y_channel == c["s_y"]
+        assert dims.use_forcing_time_aug is c["aug"]
 
 
-# ===================== item parity (independent oracle) =====================
+# ===================== forcing item shape contract =====================
 
-class TestForcingItemParity:
-    """The adapter must reproduce dataset.__getitem__ bit-for-bit.
+class TestForcingItem:
+    """forcing/temporal_encoder item shapes: lean 4-channel spatial, cond 11,
+    a 128x2 forcing_seq, T_stats 2."""
 
-    The dataset and the adapter implement the 20/23 representation
-    independently, so allclose agreement proves the abstraction did not change
-    the numerics.
-    """
-
-    def test_build_item_matches_getitem(self, forcing_dataset):
+    def test_item_keys_shapes(self, forcing_dataset):
+        ds = forcing_dataset
         spec = get_problem("forcing")
-        # Independent caches so neither path warms the other's lazily.
-        ds_a = forcing_dataset
-        for idx in range(0, len(ds_a), max(1, len(ds_a) // 12)):
-            ref = ds_a[idx]
-            sim_id, s, j = ds_a._pairs[idx]
-            item = spec.build_item(ds_a, sim_id, s, j)
-
-            assert item["spatial"].shape == (ds_a.Nx, ds_a.Ny, 20)
-            assert item["cond_static"].shape == (23,)
-            assert item["forcing_seq"].shape == (ds_a.temporal_samples, 5)
-            assert item["Y"].shape == (ds_a.Nx, ds_a.Ny, 1)
-            assert item["T_stats"].shape == (2,)
-
-            np.testing.assert_allclose(item["spatial"], ref["spatial"].numpy(), rtol=0, atol=0)
-            np.testing.assert_allclose(item["cond_static"], ref["cond_static"].numpy(), rtol=0, atol=0)
-            np.testing.assert_allclose(item["forcing_seq"], ref["forcing_seq"].numpy(), rtol=0, atol=0)
-            np.testing.assert_allclose(item["Y"], ref["Y"].numpy(), rtol=0, atol=0)
-            np.testing.assert_allclose(item["T_stats"], ref["T_stats"].numpy(), rtol=0, atol=0)
-
-    def test_item_keys(self, forcing_dataset):
-        spec = get_problem("forcing")
-        sim_id, s, j = forcing_dataset._pairs[0]
-        item = spec.build_item(forcing_dataset, sim_id, s, j)
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, 4)
+        assert item["cond_static"].shape == (11,)
+        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
+        assert item["T_stats"].shape == (2,)
+
+    def test_getitem_matches_build_item(self, forcing_dataset):
+        ds = forcing_dataset
+        spec = get_problem("forcing")
+        ref = ds[0]
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert set(item) == set(ref.keys())
+        for k in item:
+            np.testing.assert_allclose(item[k], ref[k].numpy(), rtol=0, atol=0)
 
 
 # ===================== schema validation =====================
@@ -248,7 +264,7 @@ class TestInterfacesItem:
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 6)
         assert item["cond_static"].shape == (4,)
-        assert item["forcing_seq"].shape == (ds.temporal_samples, 5)
+        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (3,)
 
@@ -336,10 +352,11 @@ class TestSourceItem:
         spec = get_problem("source")
         sim_id, s, j = ds._pairs[0]
         item = spec.build_item(ds, sim_id, s, j)
-        # No forcing_seq for the encoder-off source benchmark.
-        assert set(item) == {"spatial", "cond_static", "Y", "T_stats"}
-        assert item["spatial"].shape == (ds.Nx, ds.Ny, 20)
-        assert item["cond_static"].shape == (8,)
+        # source/temporal_encoder: lean 4-channel spatial, cond 7, pulse 128x2.
+        assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, 4)
+        assert item["cond_static"].shape == (7,)
+        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (3,)
 
@@ -437,6 +454,143 @@ class TestProblemFromConfig:
     def test_defaults_to_forcing_when_missing(self):
         assert isinstance(problem_from_config({}), ForcingProblem)
         assert isinstance(problem_from_config({"benchmark": {}}), ForcingProblem)
+
+    def test_reads_representation_axis(self):
+        spec = problem_from_config(
+            {"benchmark": {"name": "forcing", "representation": "bins"}}
+        )
+        assert spec.representation == "bins"
+        assert spec.dims.in_channels == 20
+        assert spec.dims.use_temporal_encoder is False
+
+    def test_defaults_to_temporal_encoder_when_representation_missing(self):
+        spec = problem_from_config({"benchmark": {"name": "source"}})
+        assert spec.representation == "temporal_encoder"
+
+
+# ===================== representation x benchmark contracts =====================
+
+def _dataset_for(name, representation, synthetic_trajectories, forcing_sim_params):
+    """Build a dataset for any (benchmark, representation) at the synthetic grid.
+
+    The representation does not change sim_params (both modes derive from the
+    same trajectories + sim_params), so the per-benchmark sim_params are built
+    once and reused across representations.
+    """
+    trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+    spec = get_problem(name, representation)
+    if name == "forcing":
+        sim_params = forcing_sim_params
+    else:
+        sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
+    return spec, _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
+
+
+class TestRepresentationContracts:
+    @pytest.mark.parametrize("key", list(CONTRACTS))
+    def test_item_shapes(self, key, synthetic_trajectories, synthetic_sim_params):
+        name, representation = key
+        c = CONTRACTS[key]
+        spec, ds = _dataset_for(
+            name, representation, synthetic_trajectories, synthetic_sim_params
+        )
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, c["in_ch"])
+        assert item["cond_static"].shape == (c["cond"],)
+        assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
+        assert item["T_stats"].shape == (c["t_stats"],)
+
+        if c["has_fseq"]:
+            assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, c["token"])
+        else:
+            # bins mode emits an explicit empty forcing_seq (fixed item shape).
+            assert item["forcing_seq"].shape[-2] == 0
+
+    @pytest.mark.parametrize("key", list(CONTRACTS))
+    def test_getitem_matches_build_item(self, key, synthetic_trajectories, synthetic_sim_params):
+        name, representation = key
+        spec, ds = _dataset_for(
+            name, representation, synthetic_trajectories, synthetic_sim_params
+        )
+        ref = ds[0]
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert set(item) == set(ref.keys())
+        for k in item:
+            np.testing.assert_allclose(item[k], ref[k].numpy(), rtol=0, atol=0)
+
+
+class TestRepresentationAbsence:
+    @pytest.mark.parametrize(
+        "name", ["forcing", "source", "interfaces"]
+    )
+    def test_temporal_has_no_integral_bins(self, name, synthetic_trajectories, synthetic_sim_params):
+        """temporal_encoder spatial channels carry no Q-integral bins; bins mode
+        adds exactly the extra bin channels on top of the lean stack."""
+        spec_t, ds_t = _dataset_for(
+            name, "temporal_encoder", synthetic_trajectories, synthetic_sim_params
+        )
+        spec_b, ds_b = _dataset_for(
+            name, "bins", synthetic_trajectories, synthetic_sim_params
+        )
+        lean = CONTRACTS[(name, "temporal_encoder")]["in_ch"]
+        bins = CONTRACTS[(name, "bins")]["in_ch"]
+        # 16 integral bins are present only in bins mode.
+        assert bins - lean == 16
+
+    def test_bins_forcing_seq_is_empty(self, synthetic_trajectories, synthetic_sim_params):
+        spec, ds = _dataset_for(
+            "forcing", "bins", synthetic_trajectories, synthetic_sim_params
+        )
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert item["forcing_seq"].size == 0
+
+    def test_source_cond_has_no_A_norm(self, synthetic_trajectories, synthetic_sim_params):
+        # source cond is base 3 + (x_h, y_h, w_h, h_h) = 7; A_norm is dropped.
+        for representation in ("temporal_encoder", "bins"):
+            spec, ds = _dataset_for(
+                "source", representation, synthetic_trajectories, synthetic_sim_params
+            )
+            sim_id, s, j = ds._pairs[0]
+            item = spec.build_item(ds, sim_id, s, j)
+            assert item["cond_static"].shape == (7,)
+
+    def test_interfaces_temporal_reads_s_y_channel_5(self):
+        # The learned spatial forcing must read s_y at channel 5, not K_norm at 3.
+        assert get_problem("interfaces", "temporal_encoder").dims.s_y_channel == 5
+        assert get_problem("forcing", "temporal_encoder").dims.s_y_channel == 3
+        assert get_problem("source", "temporal_encoder").dims.s_y_channel == 3
+
+
+class TestRepresentationReconstruction:
+    """Both representations are derivable from the same trajectories + sim_params;
+    building one then the other from the same (sid, s, j) must succeed with the
+    contracted shapes (catches benchmarks whose stored metadata is insufficient
+    for the new representation)."""
+
+    @pytest.mark.parametrize("name", ["forcing", "source", "interfaces"])
+    def test_both_representations_from_same_pair(self, name, synthetic_trajectories, synthetic_sim_params):
+        spec_t, ds_t = _dataset_for(
+            name, "temporal_encoder", synthetic_trajectories, synthetic_sim_params
+        )
+        spec_b, ds_b = _dataset_for(
+            name, "bins", synthetic_trajectories, synthetic_sim_params
+        )
+        sim_id, s, j = ds_t._pairs[0]
+        item_t = spec_t.build_item(ds_t, sim_id, s, j)
+        item_b = spec_b.build_item(ds_b, sim_id, s, j)
+
+        ct = CONTRACTS[(name, "temporal_encoder")]
+        cb = CONTRACTS[(name, "bins")]
+        assert item_t["spatial"].shape[-1] == ct["in_ch"]
+        assert item_b["spatial"].shape[-1] == cb["in_ch"]
+        # Y target is representation-invariant.
+        np.testing.assert_allclose(
+            item_t["Y"], item_b["Y"], rtol=0, atol=0
+        )
 
 
 # ===================== val-pair logging hooks =====================

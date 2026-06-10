@@ -6,10 +6,15 @@ from src.physics.fv_solver_1d import FVSolver1D, Layer1D
 from src.operators.fno1d import FNO1d
 from src.operators.fno2d import FNO2d
 
-SPATIAL_IN_CHANNELS = 20
-COND_STATIC_DIM = 23
-TEMPORAL_TOKEN_DIM = 5
-TEMPORAL_SAMPLES = 64
+# Forcing benchmark, temporal_encoder representation (dataset/model default).
+FORCING_IN_CHANNELS = 4
+FORCING_COND_STATIC_DIM = 11
+FORCING_TEMPORAL_TOKEN_DIM = 2
+FORCING_TEMPORAL_SAMPLES = 128
+
+# Source benchmark, bins representation (temporal encoder off, no A_norm leak).
+SOURCE_IN_CHANNELS = 20
+SOURCE_COND_STATIC_DIM = 7
 
 
 # ---------- solver fixtures ----------
@@ -163,18 +168,20 @@ def small_fno():
 
 @pytest.fixture
 def small_fno2d():
-    """Tiny FNO2d for fast plot tests."""
+    """Tiny forcing/temporal_encoder FNO2d for fast plot tests."""
     return FNO2d(
         modes1=2,
         modes2=2,
         width=8,
-        in_channels=SPATIAL_IN_CHANNELS,
+        in_channels=FORCING_IN_CHANNELS,
         out_channels=1,
         n_layers=2,
-        cond_static_dim=COND_STATIC_DIM,
-        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        cond_static_dim=FORCING_COND_STATIC_DIM,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
         temporal_hidden=16,
         forcing_embed_dim=16,
+        use_forcing_time_aug=True,
+        s_y_channel=3,
     )
 
 
@@ -191,13 +198,13 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
                         "modes1": 2,
                         "modes2": 2,
                         "width": 8,
-                        "in_channels": SPATIAL_IN_CHANNELS,
+                        "in_channels": FORCING_IN_CHANNELS,
                         "out_channels": 1,
                         "n_layers": 2,
-                        "cond_static_dim": COND_STATIC_DIM,
+                        "cond_static_dim": FORCING_COND_STATIC_DIM,
                         "cond_hidden": 256,
-                        "temporal_token_dim": TEMPORAL_TOKEN_DIM,
-                        "temporal_samples": TEMPORAL_SAMPLES,
+                        "temporal_token_dim": FORCING_TEMPORAL_TOKEN_DIM,
+                        "temporal_samples": FORCING_TEMPORAL_SAMPLES,
                         "temporal_hidden": 16,
                         "forcing_embed_dim": 16,
                         "dropout": 0.0,
@@ -215,15 +222,15 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
 
 @pytest.fixture
 def small_source_fno2d():
-    """Tiny source-benchmark FNO2d (temporal encoder off, 8 static dims)."""
+    """Tiny source-benchmark FNO2d (bins representation: encoder off, 7 static dims)."""
     return FNO2d(
         modes1=2,
         modes2=2,
         width=8,
-        in_channels=SPATIAL_IN_CHANNELS,
+        in_channels=SOURCE_IN_CHANNELS,
         out_channels=1,
         n_layers=2,
-        cond_static_dim=8,
+        cond_static_dim=SOURCE_COND_STATIC_DIM,
         use_temporal_encoder=False,
     )
 
@@ -236,16 +243,16 @@ def small_source_fno2d_checkpoint(tmp_path, small_source_fno2d):
         {
             "model_state": small_source_fno2d.state_dict(),
             "conf": {
-                "benchmark": {"name": "source"},
+                "benchmark": {"name": "source", "representation": "bins"},
                 "model": {
                     "parameters": {
                         "modes1": 2,
                         "modes2": 2,
                         "width": 8,
-                        "in_channels": SPATIAL_IN_CHANNELS,
+                        "in_channels": SOURCE_IN_CHANNELS,
                         "out_channels": 1,
                         "n_layers": 2,
-                        "cond_static_dim": 8,
+                        "cond_static_dim": SOURCE_COND_STATIC_DIM,
                         "use_temporal_encoder": False,
                         "dropout": 0.0,
                         "spectral_dropout": 0.0,

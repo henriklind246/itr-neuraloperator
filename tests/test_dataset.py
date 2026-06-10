@@ -3,7 +3,6 @@ import pytest
 import torch
 
 from data.dataset import (
-    COND_STATIC_DIM,
     TEMPORAL_SAMPLES,
     TEMPORAL_TOKEN_DIM,
     A_AMP_REF,
@@ -17,6 +16,13 @@ from data.dataset import (
     build_forcing_seq,
     build_forcing_summary,
 )
+from problems.forcing import (
+    COND_STATIC_DIM,
+    FORCING_TEMPORAL_SAMPLES,
+    FORCING_TEMPORAL_TOKEN_DIM,
+    SPATIAL_CHANNELS_TEMPORAL,
+    _sample_a,
+)
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
     TEMPORAL_BUILDERS,
@@ -25,7 +31,11 @@ from src.physics.boundary_forcing import (
 # Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
-SPATIAL_IN_CHANNELS = 20
+# Active dataset default = forcing benchmark, temporal_encoder representation:
+# 4 spatial channels [T_tilde, x, y, s_y], 11 static cond dims, (128, 2) tokens.
+# TEMPORAL_SAMPLES / TEMPORAL_TOKEN_DIM (64, 5) imported above stay scoped to the
+# legacy standalone build_forcing_seq / build_forcing_summary helper tests.
+SPATIAL_IN_CHANNELS = SPATIAL_CHANNELS_TEMPORAL
 
 
 def _unpack(item):
@@ -225,7 +235,7 @@ class TestSnapshotPairDataset:
         Nx, Ny = 11, 11
         assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
         assert cond_static.shape == (COND_STATIC_DIM,)
-        assert forcing_seq.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        assert forcing_seq.shape == (FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
 
@@ -284,72 +294,17 @@ class TestSnapshotPairDataset:
         assert forcing_seq[0, 0].item() == pytest.approx(0.0, abs=1e-6)
         assert forcing_seq[-1, 0].item() == pytest.approx(1.0, abs=1e-6)
 
-    def test_forcing_seq_dt_to_target_endpoints(self, dataset_subsampled):
+    def test_forcing_seq_tok1_matches_amplitude(self, dataset_subsampled):
+        """temporal_encoder tok1 == a(t) sampled over [t_s, t_j], scaled by A_AMP_REF."""
         _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
         sim_id, s, j = dataset_subsampled._pairs[0]
-        t_bar = float(dataset_subsampled.t_grid[j] - dataset_subsampled.t_grid[s])
-        t_final = float(dataset_subsampled.t_final)
-        # tok3 = (1 - r) * t_bar / t_final; at r=0 it's t_bar/t_final, at r=1 it's 0
-        assert forcing_seq[0, 3].item() == pytest.approx(t_bar / t_final, abs=1e-5)
-        assert forcing_seq[-1, 3].item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_forcing_seq_t_m_endpoints(self, dataset_subsampled):
-        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
-        sim_id, s, j = dataset_subsampled._pairs[0]
+        params = dataset_subsampled.sim_params[sim_id]
+        q = TEMPORAL_BUILDERS[params["temporal_family"]](**params["temporal_params"])
         t_s = float(dataset_subsampled.t_grid[s])
         t_j = float(dataset_subsampled.t_grid[j])
-        t_final = float(dataset_subsampled.t_final)
-        # tok4 = t_m / t_final
-        assert forcing_seq[0, 4].item() == pytest.approx(t_s / t_final, abs=1e-5)
-        assert forcing_seq[-1, 4].item() == pytest.approx(t_j / t_final, abs=1e-5)
-
-    def test_forcing_seq_cumulative_matches_trapezoid(self, dataset_subsampled):
-        """tok2 should be the signed trapezoidal cumulative of tok1 * A_AMP_REF, divided by A_cum_ref."""
-        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
-        A_cum_ref = float(dataset_subsampled.A_cum_ref)
-        sim_id, s, j = dataset_subsampled._pairs[0]
-        t_s = float(dataset_subsampled.t_grid[s])
-        t_j = float(dataset_subsampled.t_grid[j])
-        M = TEMPORAL_SAMPLES
-        r = np.linspace(0.0, 1.0, M, dtype=np.float32)
-        t_samples = t_s + r * (t_j - t_s)
-        a_m = (forcing_seq[:, 1].numpy() * A_AMP_REF).astype(np.float32)
-        A_cum = np.empty_like(a_m)
-        A_cum[0] = 0.0
-        A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
-        expected_tok2 = A_cum / A_cum_ref
-        np.testing.assert_allclose(forcing_seq[:, 2].numpy(), expected_tok2, atol=1e-5)
-
-    def test_forcing_seq_starts_at_zero_cumulative(self, dataset_subsampled):
-        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
-        assert forcing_seq[0, 2].item() == pytest.approx(0.0, abs=1e-6)
-
-    def test_forcing_seq_pulse_train_monotone(self, synthetic_trajectories):
-        """For a fixed nonnegative pulse_train, cumulative tok2 must be monotone nondecreasing."""
-        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        t_final = float(t_grid[-1])
-        sim_params = np.array([{
-            "R_c": 0.5,
-            "T0": np.zeros((trajectories.shape[2], trajectories.shape[3]), dtype=np.float32),
-            "temporal_family": "pulse_train",
-            "temporal_params": {
-                "Np": 2,
-                "A_list":  [100.0, 200.0],
-                "t_list":  [0.05, 0.20],
-                "dt_list": [0.05, 0.10],
-            },
-            "spatial_family": "uniform",
-            "spatial_params": {},
-        }], dtype=object)
-        ds = SnapshotPairDataset(
-            trajectories=trajectories[:1], t_grid=t_grid, x_grid=x_grid, y_grid=y_grid,
-            sim_ids=np.array([0]), sim_params=sim_params,
-            mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
-            n_snapshots=6, t_final=t_final,
-        )
-        _, _, forcing_seq, _, _ = _unpack(ds[0])
-        diffs = np.diff(forcing_seq[:, 2].numpy())
-        assert np.all(diffs >= -1e-6)
+        _, a_m = _sample_a(q, t_s, t_j, FORCING_TEMPORAL_SAMPLES)
+        expected_tok1 = (a_m / A_AMP_REF).astype(np.float32)
+        np.testing.assert_allclose(forcing_seq[:, 1].numpy(), expected_tok1, atol=1e-5)
 
     def test_t_bar_positive(self, dataset_subsampled):
         for i in range(min(10, len(dataset_subsampled))):
@@ -511,12 +466,13 @@ class TestCreateDataloaders:
         assert spatial.shape[2] == 11
         assert spatial.shape[3] == SPATIAL_IN_CHANNELS
         assert cond_static.shape[1] == COND_STATIC_DIM
-        assert forcing_seq.shape[1] == TEMPORAL_SAMPLES
-        assert forcing_seq.shape[2] == TEMPORAL_TOKEN_DIM
+        assert forcing_seq.shape[1] == FORCING_TEMPORAL_SAMPLES
+        assert forcing_seq.shape[2] == FORCING_TEMPORAL_TOKEN_DIM
         assert Y.shape[-1] == 1
         assert T_stats.shape[-1] == 2
 
-    def test_temporal_samples_override(self, synthetic_trajectories, synthetic_sim_params):
+    def test_temporal_samples_pinned_in_temporal_mode(self, synthetic_trajectories, synthetic_sim_params):
+        """temporal_encoder forcing pins the token grid to 128 regardless of config."""
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
         train_loader, _, _ = create_dataloaders(
@@ -528,7 +484,7 @@ class TestCreateDataloaders:
             temporal_samples=32,
         )
         _, _, forcing_seq, _, _ = _unpack(next(iter(train_loader)))
-        assert forcing_seq.shape[1] == 32
+        assert forcing_seq.shape[1] == FORCING_TEMPORAL_SAMPLES
 
     def test_no_data_leakage(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
@@ -670,7 +626,7 @@ class TestSolverDatasetIntegration:
         spatial, cond_static, forcing_seq, Y, T_stats = _unpack(ds[0])
         assert spatial.shape == (Nx, Ny, SPATIAL_IN_CHANNELS)
         assert cond_static.shape == (COND_STATIC_DIM,)
-        assert forcing_seq.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        assert forcing_seq.shape == (FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM)
         assert Y.shape == (Nx, Ny, 1)
         assert T_stats.shape == (2,)
         assert torch.all(torch.isfinite(spatial))
@@ -678,18 +634,17 @@ class TestSolverDatasetIntegration:
         assert torch.all(torch.isfinite(Y))
 
 
-# ===================== Static conditioning vector layout (23 dims) =====================
+# ===================== Static conditioning vector layout (11 dims) =====================
 
-# Slot offsets must match data/dataset.py build_cond_vector.
+# Slot offsets must match problems/forcing.py build_cond_vector.
 _OFF_SPATIAL_OH       = 3
 _OFF_SPATIAL_P        = 7
-_OFF_TEMPORAL_OH      = 11
-_OFF_FORCING_SUMMARY  = 15
 
 
 class TestCondStaticLayout:
-    """Verifies the 23-dim static conditioning vector layout: base + spatial
-    one-hot + spatial params + temporal one-hot + 8-dim forcing summary."""
+    """Verifies the 11-dim forcing static conditioning vector layout: base
+    (t_bar, t_s, R_c) + spatial one-hot (4) + spatial params (4). The forcing
+    representation carries no temporal one-hot or forcing-summary dims."""
 
     def _make_dataset(self, spatial_family, spatial_params,
                       temporal_family, temporal_params,
@@ -782,59 +737,6 @@ class TestCondStaticLayout:
             ds = self._make_dataset(sf, sp, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
             _, cond_static, _, _, _ = _unpack(ds[0])
             assert cond_static[_OFF_SPATIAL_OH:_OFF_SPATIAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
-
-    @pytest.mark.parametrize(
-        ("temporal_family", "temporal_params", "expected_slot"),
-        [
-            ("sin", dict(A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5), 0),
-            ("exp", dict(A=200.0, t0=0.0, tau=0.05), 1),
-            ("pulse_train", dict(A_list=[150.0, 200.0], t_list=[0.0, 0.1], dt_list=[0.02, 0.02]), 2),
-            ("exp_train", dict(A_list=[150.0, 200.0], t_list=[0.0, 0.1], tau_list=[0.05, 0.05]), 3),
-        ],
-    )
-    def test_temporal_onehot_matches_family(self, synthetic_trajectories,
-                                            temporal_family, temporal_params, expected_slot):
-        ds = self._make_dataset("uniform", {}, temporal_family, temporal_params,
-                                synthetic_trajectories)
-        _, cond_static, _, _, _ = _unpack(ds[0])
-        assert cond_static.shape == (COND_STATIC_DIM,)
-        for slot in range(4):
-            expected = 1.0 if slot == expected_slot else 0.0
-            assert cond_static[_OFF_TEMPORAL_OH + slot].item() == expected
-
-    def test_temporal_onehot_sums_to_one(self, synthetic_trajectories):
-        for tf, tp in [
-            ("sin", dict(A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)),
-            ("exp", dict(A=200.0, t0=0.0, tau=0.05)),
-            ("pulse_train", dict(A_list=[150.0], t_list=[0.0], dt_list=[0.02])),
-            ("exp_train", dict(A_list=[150.0], t_list=[0.0], tau_list=[0.05])),
-        ]:
-            ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
-            _, cond_static, _, _, _ = _unpack(ds[0])
-            assert cond_static[_OFF_TEMPORAL_OH:_OFF_TEMPORAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
-
-    def test_forcing_summary_slot_populated_and_finite(self, synthetic_trajectories):
-        """[15:23] block must be filled (not all-zero for a non-trivial forcing)
-        and finite for every temporal family."""
-        for tf, tp in [
-            ("sin", dict(A=175.0, f=10.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)),
-            ("exp", dict(A=200.0, t0=0.0, tau=0.05)),
-            ("pulse_train", dict(A_list=[150.0], t_list=[0.0], dt_list=[0.02])),
-            ("exp_train", dict(A_list=[150.0], t_list=[0.0], tau_list=[0.05])),
-        ]:
-            ds = self._make_dataset("uniform", {}, tf, tp, synthetic_trajectories)
-            _, cond_static, _, _, _ = _unpack(ds[0])
-            block = cond_static[_OFF_FORCING_SUMMARY:_OFF_FORCING_SUMMARY + 8]
-            assert block.shape == (8,)
-            assert torch.all(torch.isfinite(block))
-            # S2 (abs impulse), S6 (RMS), S7 (peak) are nonneg by construction.
-            # Cannot assert strict positivity: for narrow pulse_train forcings,
-            # the smallest-lead-time pair can lie entirely outside the pulse
-            # support, in which case a(t) = 0 over [t_s, t_j] and all eight
-            # summaries are exactly zero. That is correct behavior.
-            assert block[1].item() >= 0.0
-            assert block[5].item() >= 0.0
-            assert block[6].item() >= 0.0
 
 
 # ===================== build_forcing_summary helper =====================
