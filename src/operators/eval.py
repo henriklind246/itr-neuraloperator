@@ -11,6 +11,12 @@ from data.dataset import (
 )
 from src.operators.fno2d import FNO2d
 from src.operators.losses import build_boundary_mask, build_interface_mask, compute_interface_rel_l2
+from src.operators.rollout import (
+    RolloutOptions,
+    predict_autoregressive,
+    rollout_is_active,
+    rollout_options_from_config,
+)
 from src.operators.utils import resolve_device
 from pathlib import Path
 import csv
@@ -100,7 +106,14 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
-def evaluate(model, test_loader, device, iface_mask=None, boundary_mask=None):
+def evaluate(
+    model,
+    test_loader,
+    device,
+    iface_mask=None,
+    boundary_mask=None,
+    rollout_options: RolloutOptions | None = None,
+):
     """Return a dict of test metrics in both normalized and physical space.
 
     Keys:
@@ -114,6 +127,16 @@ def evaluate(model, test_loader, device, iface_mask=None, boundary_mask=None):
         boundary_rel_l2_norm/phys:  edge-band relative L2 (%) — diagnostic for the
                             absolute-pad confound in cross-resolution eval.
     """
+    if rollout_is_active(rollout_options):
+        return _evaluate_rollout(
+            model=model,
+            test_loader=test_loader,
+            device=device,
+            rollout_options=rollout_options,
+            iface_mask=iface_mask,
+            boundary_mask=boundary_mask,
+        )
+
     with torch.no_grad():
         model.eval()
         rel_l2_norm = 0.0
@@ -170,6 +193,79 @@ def evaluate(model, test_loader, device, iface_mask=None, boundary_mask=None):
     }
 
 
+def _evaluate_rollout(
+    model,
+    test_loader,
+    device,
+    rollout_options: RolloutOptions,
+    iface_mask=None,
+    boundary_mask=None,
+):
+    dataset = test_loader.dataset
+    if not hasattr(dataset, "_pairs"):
+        raise ValueError("rollout evaluation requires a SnapshotPairDataset with _pairs")
+
+    with torch.no_grad():
+        model.eval()
+        rel_l2_norm = 0.0
+        rel_l2_phys = 0.0
+        iface_rel_l2_norm = 0.0
+        iface_rel_l2_phys = 0.0
+        boundary_rel_l2_norm = 0.0
+        boundary_rel_l2_phys = 0.0
+
+        for idx in range(len(dataset)):
+            sim_id, s, j = dataset._pairs[idx]
+            item = dataset[idx]
+            y_batch = item["Y"].unsqueeze(0).to(device)
+            T_stats = item["T_stats"].unsqueeze(0).to(device)
+
+            y_pred = predict_autoregressive(
+                model=model,
+                dataset=dataset,
+                sim_id=int(sim_id),
+                s=int(s),
+                j=int(j),
+                num_substeps=rollout_options.num_substeps,
+                device=device,
+            )
+
+            batch_rel_l2_norm = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
+            rel_l2_norm += batch_rel_l2_norm.item()
+
+            mu_s = T_stats[:, 0]
+            sigma_s = T_stats[:, 1]
+            y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
+            y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
+            batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
+            rel_l2_phys += batch_rel_l2_phys.item()
+
+            if iface_mask is not None:
+                iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
+                iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
+
+            if boundary_mask is not None:
+                boundary_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, boundary_mask)
+                boundary_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, boundary_mask)
+
+        n_items = len(dataset)
+        rel_l2_norm /= n_items
+        rel_l2_phys /= n_items
+        iface_rel_l2_norm /= n_items
+        iface_rel_l2_phys /= n_items
+        boundary_rel_l2_norm /= n_items
+        boundary_rel_l2_phys /= n_items
+
+    return {
+        "rel_l2_norm": rel_l2_norm,
+        "rel_l2_phys": rel_l2_phys,
+        "iface_rel_l2_norm": iface_rel_l2_norm,
+        "iface_rel_l2_phys": iface_rel_l2_phys,
+        "boundary_rel_l2_norm": boundary_rel_l2_norm,
+        "boundary_rel_l2_phys": boundary_rel_l2_phys,
+    }
+
+
 # --------- EVAL ALL SEEDS IN RUNS ---------
 
 def eval_all_seeds(
@@ -177,6 +273,9 @@ def eval_all_seeds(
     data_dir: str | None = None,
     report_name: str = "seed_report.json",
     padding_reference_resolution: int | None = None,
+    rollout_enabled: bool | None = None,
+    rollout_num_substeps: int | None = None,
+    rollout_partition: str | None = None,
 ):
     run_root = Path(run_root)
     results = []
@@ -193,6 +292,12 @@ def eval_all_seeds(
         ckpt = torch.load(ckpt_path, map_location="cpu")
         config = ckpt['conf']
         device = resolve_device(config.get("training", {}).get("device", "auto"))
+        rollout_options = rollout_options_from_config(
+            config,
+            enabled=rollout_enabled,
+            num_substeps=rollout_num_substeps,
+            partition=rollout_partition,
+        )
         if padding_reference_resolution is not None:
             config["model"]["parameters"]["padding_reference_resolution"] = int(padding_reference_resolution)
 
@@ -247,6 +352,7 @@ def eval_all_seeds(
         metrics = evaluate(
             model=fno, test_loader=test_loader, device=device,
             iface_mask=iface_mask, boundary_mask=boundary_mask,
+            rollout_options=rollout_options,
         )
 
         results.append(
@@ -261,6 +367,9 @@ def eval_all_seeds(
                 "test_iface_rel_l2": float(metrics["iface_rel_l2_phys"]),
                 "test_boundary_rel_l2_norm": float(metrics["boundary_rel_l2_norm"]),
                 "test_boundary_rel_l2": float(metrics["boundary_rel_l2_phys"]),
+                "rollout_enabled": bool(rollout_options.enabled),
+                "rollout_num_substeps": int(rollout_options.num_substeps),
+                "rollout_partition": rollout_options.partition,
                 "ckpt": str(ckpt_path),
             }
         )
@@ -405,7 +514,14 @@ def _amp_freq_from_params(params: dict) -> tuple[float | None, float | None]:
     return None, None
 
 
-def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") -> Path:
+def write_test_records(
+    run_root,
+    seed=None,
+    out_name: str = "test_records.csv",
+    rollout_enabled: bool | None = None,
+    rollout_num_substeps: int | None = None,
+    rollout_partition: str | None = None,
+) -> Path:
     """Write one per-(sim_id, s, j) test-pair record row for paper figures.
 
     Loads the best (or requested) seed checkpoint under `run_root`, rebuilds the
@@ -419,6 +535,12 @@ def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") 
     seed_dir, ckpt = _select_seed_checkpoint(Path(run_root), seed)
     config = ckpt["conf"]
     device = resolve_device(config.get("training", {}).get("device", "auto"))
+    rollout_options = rollout_options_from_config(
+        config,
+        enabled=rollout_enabled,
+        num_substeps=rollout_num_substeps,
+        partition=rollout_partition,
+    )
 
     test_loader, x_grid, y_grid, _num_sims = build_test_loader(
         config,
@@ -475,7 +597,17 @@ def write_test_records(run_root, seed=None, out_name: str = "test_records.csv") 
             cond = item["cond_static"].unsqueeze(0).to(device)
             y_true = item["Y"].unsqueeze(0).to(device)
             forcing_seq = item.get("forcing_seq")
-            if uses_forcing and forcing_seq is not None:
+            if rollout_is_active(rollout_options):
+                y_pred = predict_autoregressive(
+                    model=fno,
+                    dataset=dataset,
+                    sim_id=sim_id,
+                    s=s,
+                    j=j,
+                    num_substeps=rollout_options.num_substeps,
+                    device=device,
+                )
+            elif uses_forcing and forcing_seq is not None:
                 y_pred = fno(spatial, cond, forcing_seq.unsqueeze(0).to(device))
             else:
                 y_pred = fno(spatial, cond)
