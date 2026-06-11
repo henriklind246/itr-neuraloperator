@@ -249,8 +249,10 @@ class TestForcingSampleParity:
             assert g["R_c"] == r["R_c"]
             assert g["temporal_family"] == r["temporal_family"]
             assert g["spatial_family"] == r["spatial_family"]
-            assert g["ic_family"] == r["ic_family"]
+            assert g["ic_family"] == r["ic_family"] == "uniform_2d"
+            assert g["ic_params"] == r["ic_params"] == {"T0_offset": 0.0}
             np.testing.assert_allclose(g["T0"], r["T0"], rtol=0, atol=0)
+            np.testing.assert_allclose(g["T0"], 300.0)
 
 
 # ===================== interfaces adapter =====================
@@ -342,6 +344,10 @@ class TestInterfacesSampleParity:
             assert p["spatial_family"] == "uniform"
             assert 0.05 <= p["R_c"] <= 1.0
             assert 0.2 <= p["interface_x"] <= 0.8
+
+    def test_interfaces_keep_varying_initial_conditions(self, interfaces_dataset):
+        ds = interfaces_dataset
+        assert any(not np.allclose(p["T0"], 300.0) for p in ds.sim_params)
 
 
 # ===================== source adapter =====================
@@ -439,6 +445,15 @@ class TestSourceSampleParity:
         # stratified x_h sampling should populate more than one regime
         assert regimes <= {"left", "near", "right"}
         assert len(regimes) >= 2
+
+    def test_uniform_300_initial_conditions(self, source_dataset):
+        ds = source_dataset
+        for p in ds.sim_params:
+            assert p["ic_family"] == "uniform_2d"
+            assert p["ic_params"] == {"T0_offset": 0.0}
+            assert p["T0"].shape == (ds.Nx, ds.Ny)
+            assert p["T0"].dtype == np.float32
+            np.testing.assert_allclose(p["T0"], 300.0)
 
 
 class TestProblemFromConfig:

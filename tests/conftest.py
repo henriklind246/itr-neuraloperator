@@ -80,7 +80,7 @@ def synthetic_sim_params(synthetic_trajectories):
     params = []
     for _ in range(num_sims):
         R_c = float(rng.uniform(0.05, 1.0))
-        T0 = rng.standard_normal((Nx, Ny)).astype(np.float32)
+        T0 = np.full((Nx, Ny), 300.0, dtype=np.float32)
         temporal_family = sample_temporal_family(rng)
         temporal_params = TEMPORAL_SAMPLERS[temporal_family](
             rng, dt=dt, t_final=t_final, t_on=0.0, t_off=0.2,
@@ -94,6 +94,8 @@ def synthetic_sim_params(synthetic_trajectories):
             "temporal_params": temporal_params,
             "spatial_family": spatial_family,
             "spatial_params": spatial_params,
+            "ic_family": "uniform_2d",
+            "ic_params": {"T0_offset": 0.0},
         })
     return np.array(params, dtype=object)
 
@@ -137,8 +139,9 @@ def synthetic_source_sim_params(synthetic_trajectories):
             "A": A,
             "t_off": t_off,
             "regime": _classify_regime(x_h, INTERFACE_X, PATCH_W),
-            "T0": rng.standard_normal((Nx, Ny)).astype(np.float32),
+            "T0": np.full((Nx, Ny), 300.0, dtype=np.float32),
             "ic_family": "uniform_2d",
+            "ic_params": {"T0_offset": 0.0},
         })
     return np.array(params, dtype=object)
 
