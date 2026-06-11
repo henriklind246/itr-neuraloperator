@@ -21,9 +21,6 @@ from src.physics.boundary_forcing import (
 )
 from src.physics.init_conditions import (
     IC_FAMILIES,
-    IC_SAMPLERS,
-    sample_ic_family,
-    build_ic,
 )
 from problems.registry import get_problem
 
@@ -69,12 +66,9 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     for i in range(num_sims):
         R_c = float(R_c_values[i])
 
-        # IC family + params per sim. The smoothstep taper inside build_ic
-        # drives the deviation to zero at the right Dirichlet edge so the
-        # exact pin in the last column does not introduce a discontinuity.
-        ic_family = sample_ic_family(rng)
-        ic_params = IC_SAMPLERS[ic_family](rng, Nx=X.shape[0], Ny=X.shape[1])
-        T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b)
+        ic_family = "uniform_2d"
+        ic_params = {"T0_offset": 0.0}
+        T0 = np.full(X.shape, 300.0, dtype=np.float32)
 
         temporal_family = sample_temporal_family(rng_profile)
         temporal_params = TEMPORAL_SAMPLERS[temporal_family](rng_profile, dt=dt, t_final=t_final, **temporal_window)

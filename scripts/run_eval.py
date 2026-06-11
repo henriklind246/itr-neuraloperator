@@ -39,6 +39,15 @@ def main() -> int:
             "training resolution. For a 100x100-trained checkpoint, use 100."
         ),
     )
+    parser.add_argument(
+        "--rollout-num-substeps",
+        type=int,
+        default=None,
+        help=(
+            "Opt into homogeneous autoregressive rollout with this many substeps. "
+            "Omit to use checkpoint/config defaults; values greater than 1 enable rollout."
+        ),
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root).expanduser()
@@ -56,11 +65,17 @@ def main() -> int:
 
     from src.operators.eval import eval_all_seeds, print_seed_report, save_report
 
+    rollout_enabled = None
+    if args.rollout_num_substeps is not None:
+        rollout_enabled = args.rollout_num_substeps > 1
+
     results = eval_all_seeds(
         str(run_root),
         data_dir=args.data_dir,
         report_name=args.report_name,
         padding_reference_resolution=args.padding_reference_resolution,
+        rollout_enabled=rollout_enabled,
+        rollout_num_substeps=args.rollout_num_substeps,
     )
     if not results:
         print(f"error: no fno2d_best.pt checkpoints found under {run_root}", file=sys.stderr)

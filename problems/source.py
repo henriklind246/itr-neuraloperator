@@ -24,7 +24,6 @@ from src.physics.internal_source import (
     make_sin2_pulse,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
-from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
 
 # ----- representation constants (canonical home for the source benchmark) ------
 
@@ -233,12 +232,9 @@ class SourceProblem(ProblemSpec):
         time_cfg: dict[str, Any],
     ) -> list[dict]:
         X = grids["X"]
-        Y = grids["Y"]
-        Nx, Ny = X.shape[0], X.shape[1]
 
         num_sims = int(time_cfg["num_sims"])
         t_final = float(time_cfg["t_final"])
-        T_right = float(time_cfg.get("T_right", 300.0))
         lhs_seed = int(time_cfg.get("lhs_seed", 0))
         stratified_x_h = bool(time_cfg.get("stratified_x_h", True))
 
@@ -255,9 +251,9 @@ class SourceProblem(ProblemSpec):
             A = float(samples["A"][i])
             regime = _classify_regime(x_h, INTERFACE_X, PATCH_W)
 
-            ic_family = sample_ic_family(rng)
-            ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
-            T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=1.0)
+            ic_family = "uniform_2d"
+            ic_params = {"T0_offset": 0.0}
+            T0 = np.full(X.shape, 300.0, dtype=np.float32)
 
             sim_params.append({
                 "R_c": R_c,

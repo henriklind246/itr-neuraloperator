@@ -88,6 +88,12 @@ data:
   y_shape: "B, Nx, Ny, 1"
   num_sims: 10000
 
+evaluation:
+  rollout:
+    enabled: false
+    num_substeps: 1
+    partition: homogeneous
+
 hydra:
   mode: MULTIRUN
   job:

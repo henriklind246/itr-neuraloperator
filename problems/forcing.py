@@ -21,7 +21,6 @@ from src.physics.boundary_forcing import (
     build_qL,
     build_qL_integral,
 )
-from src.physics.init_conditions import IC_FAMILIES, IC_SAMPLERS, sample_ic_family, build_ic
 from src.physics.fv_solver_2d import FVSolver2D
 
 # ----- representation constants (canonical home for the forcing benchmark) -----
@@ -194,14 +193,9 @@ class ForcingProblem(ProblemSpec):
         time_cfg: dict[str, Any],
     ) -> list[dict]:
         X = grids["X"]
-        Y = grids["Y"]
-        Nx, Ny = X.shape[0], X.shape[1]
-
         num_sims = int(time_cfg["num_sims"])
         dt = float(time_cfg["dt"])
         t_final = float(time_cfg["t_final"])
-        b = float(time_cfg.get("b", 1.0))
-        T_right = float(time_cfg.get("T_right", 300.0))
         lhs_seed = int(time_cfg.get("lhs_seed", 0))
         temporal_window = dict(
             t_on=float(time_cfg.get("t_on", 0.0)),
@@ -212,27 +206,13 @@ class ForcingProblem(ProblemSpec):
 
         R_c_values = _generate_lhs_R_c(num_sims, seed=lhs_seed)
 
-        # Optional IC-family restriction (e.g. exclude grf_2d for the spatial
-        # resolution-invariance sweep). None => unchanged default (uniform over
-        # all families). One rng.choice draw per sim either way, so the IC rng
-        # stream stays in lock-step across resolutions.
-        ic_families = time_cfg.get("ic_families")
-        if ic_families is None:
-            ic_probs = None
-        else:
-            allowed = set(ic_families)
-            ic_probs = np.array(
-                [1.0 if fam in allowed else 0.0 for fam in IC_FAMILIES],
-                dtype=float,
-            )
-
         sim_params = []
         for i in range(num_sims):
             R_c = float(R_c_values[i])
 
-            ic_family = sample_ic_family(rng, probs=ic_probs)
-            ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
-            T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b)
+            ic_family = "uniform_2d"
+            ic_params = {"T0_offset": 0.0}
+            T0 = np.full(X.shape, 300.0, dtype=np.float32)
 
             temporal_family = sample_temporal_family(rng_profile)
             temporal_params = TEMPORAL_SAMPLERS[temporal_family](
