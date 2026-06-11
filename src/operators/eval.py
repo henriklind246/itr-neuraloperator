@@ -10,7 +10,13 @@ from data.dataset import (
     split_sim_ids,
 )
 from src.operators.fno2d import FNO2d
-from src.operators.losses import build_boundary_mask, build_interface_mask, compute_interface_rel_l2
+from src.operators.losses import (
+    build_boundary_mask,
+    build_interface_band,
+    build_interface_mask,
+    compute_interface_rel_l2,
+    get_batch_interface_x,
+)
 from src.operators.rollout import (
     RolloutOptions,
     predict_autoregressive,
@@ -106,6 +112,19 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
+def _band_rel_l2(y_pred, y_true, band_float):
+    """Per-sample interface-band rel L2 (%), masked-sum form.
+
+    ``band_float`` is a (B, Nx, 1, 1) float tensor selecting each sample's
+    interface columns. The voxel count cancels between numerator and
+    denominator, so this matches ``compute_interface_rel_l2``'s mean/mean ratio
+    while allowing the band to differ per sample.
+    """
+    num = torch.sum(band_float * (y_pred - y_true) ** 2)
+    den = torch.sum(band_float * y_true ** 2)
+    return (torch.sqrt(num / den) * 100).item()
+
+
 def evaluate(
     model,
     test_loader,
@@ -113,6 +132,9 @@ def evaluate(
     iface_mask=None,
     boundary_mask=None,
     rollout_options: RolloutOptions | None = None,
+    x_grid=None,
+    interface_half_width: float = 0.05,
+    use_per_sample_interface: bool = False,
 ):
     """Return a dict of test metrics in both normalized and physical space.
 
@@ -135,7 +157,14 @@ def evaluate(
             rollout_options=rollout_options,
             iface_mask=iface_mask,
             boundary_mask=boundary_mask,
+            x_grid=x_grid,
+            interface_half_width=interface_half_width,
+            use_per_sample_interface=use_per_sample_interface,
         )
+
+    x_grid_t = None
+    if use_per_sample_interface and x_grid is not None:
+        x_grid_t = torch.as_tensor(x_grid, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         model.eval()
@@ -167,7 +196,15 @@ def evaluate(
             batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
             rel_l2_phys += batch_rel_l2_phys.item()
 
-            if iface_mask is not None:
+            iface_x = get_batch_interface_x(
+                batch, device, use_per_sample_interface=use_per_sample_interface
+            )
+            if iface_x is not None and x_grid_t is not None:
+                band = build_interface_band(x_grid_t, iface_x, interface_half_width)
+                bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
+                iface_rel_l2_norm += _band_rel_l2(y_pred, y_batch, bf)
+                iface_rel_l2_phys += _band_rel_l2(y_pred_phys, y_true_phys, bf)
+            elif iface_mask is not None:
                 iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
                 iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
 
@@ -200,10 +237,17 @@ def _evaluate_rollout(
     rollout_options: RolloutOptions,
     iface_mask=None,
     boundary_mask=None,
+    x_grid=None,
+    interface_half_width: float = 0.05,
+    use_per_sample_interface: bool = False,
 ):
     dataset = test_loader.dataset
     if not hasattr(dataset, "_pairs"):
         raise ValueError("rollout evaluation requires a SnapshotPairDataset with _pairs")
+
+    x_grid_t = None
+    if use_per_sample_interface and x_grid is not None:
+        x_grid_t = torch.as_tensor(x_grid, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         model.eval()
@@ -219,6 +263,7 @@ def _evaluate_rollout(
             item = dataset[idx]
             y_batch = item["Y"].unsqueeze(0).to(device)
             T_stats = item["T_stats"].unsqueeze(0).to(device)
+            item_batch = {"T_stats": T_stats}
 
             y_pred = predict_autoregressive(
                 model=model,
@@ -240,7 +285,15 @@ def _evaluate_rollout(
             batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
             rel_l2_phys += batch_rel_l2_phys.item()
 
-            if iface_mask is not None:
+            iface_x = get_batch_interface_x(
+                item_batch, device, use_per_sample_interface=use_per_sample_interface
+            )
+            if iface_x is not None and x_grid_t is not None:
+                band = build_interface_band(x_grid_t, iface_x, interface_half_width)
+                bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
+                iface_rel_l2_norm += _band_rel_l2(y_pred, y_batch, bf)
+                iface_rel_l2_phys += _band_rel_l2(y_pred_phys, y_true_phys, bf)
+            elif iface_mask is not None:
                 iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
                 iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
 
@@ -325,6 +378,7 @@ def eval_all_seeds(
             loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
         ).to(device)
         boundary_mask = build_boundary_mask(x_grid, y_grid, width=0.05).to(device)
+        use_per_sample_interface = bool(loss_cfg.get("per_sample_interface_x", False))
 
         model_cfg = config['model']['parameters']
         dims = problem_from_config(config).dims
@@ -353,6 +407,9 @@ def eval_all_seeds(
             model=fno, test_loader=test_loader, device=device,
             iface_mask=iface_mask, boundary_mask=boundary_mask,
             rollout_options=rollout_options,
+            x_grid=x_grid,
+            interface_half_width=loss_cfg.get("interface_half_width", 0.05),
+            use_per_sample_interface=use_per_sample_interface,
         )
 
         results.append(

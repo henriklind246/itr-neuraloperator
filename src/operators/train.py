@@ -28,7 +28,12 @@ from data.dataset import (
 )
 from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
-from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
+from src.operators.losses import (
+    SpatiallyWeightedMSE,
+    build_interface_band,
+    build_interface_mask,
+    get_batch_interface_x,
+)
 from src.operators.utils import resolve_device
 
 from omegaconf import OmegaConf
@@ -568,6 +573,7 @@ def train_one_epoch(
     iface_mask=None,
     grad_clip=None,
     dist_info: DistInfo | None = None,
+    use_per_sample_interface: bool = False,
 ) -> tuple[float, float, float]:
     """Train one epoch. Under DDP, reduces sums (loss, MSE, ||y||^2, iface MSE,
     ||y_iface||^2, sample counts) across ranks and computes true global metrics
@@ -585,16 +591,18 @@ def train_one_epoch(
     n_samples = 0
     n_iface_voxels = 0  # number of (sample, iface_voxel) entries summed
 
-    # T_stats is not used since error metrics are computed in z-score temp. source space
     for batch in train_loader:
         x_spatial = batch["spatial"].to(device)
         cond_static = batch["cond_static"].to(device)
         forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
         y_batch = batch["Y"].to(device)
+        iface_x = get_batch_interface_x(
+            batch, device, use_per_sample_interface=use_per_sample_interface
+        )
 
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond_static, forcing_seq)
-        loss = loss_fn(y_pred, y_batch)
+        loss = loss_fn(y_pred, y_batch, iface_x)
         loss.backward()
 
         if grad_clip is not None:
@@ -609,7 +617,16 @@ def train_one_epoch(
             mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
             target_sq_sum += torch.sum(y_batch ** 2).item()
 
-            if iface_mask is not None:
+            if iface_x is not None:
+                Ny = y_batch.shape[2]
+                band = build_interface_band(
+                    loss_fn.x_grid_t, iface_x, loss_fn.interface_half_width
+                )  # (B, Nx)
+                bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
+                iface_mse_sum += torch.sum(bf * (y_pred - y_batch) ** 2).item()
+                iface_target_sq_sum += torch.sum(bf * y_batch ** 2).item()
+                n_iface_voxels += int(band.sum().item()) * Ny
+            elif iface_mask is not None:
                 pred_iface = y_pred[:, iface_mask, :]
                 true_iface = y_batch[:, iface_mask, :]
                 iface_mse_sum += torch.sum((pred_iface - true_iface) ** 2).item()
@@ -633,7 +650,7 @@ def train_one_epoch(
 
     training_loss = loss_sum / max(n_samples, 1)
     train_rel_l2 = math.sqrt(mse_sum / max(target_sq_sum, 1e-12)) * 100.0
-    if iface_mask is not None and n_iface_voxels > 0:
+    if n_iface_voxels > 0:
         train_iface_rel_l2 = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
     else:
         train_iface_rel_l2 = 0.0
@@ -685,6 +702,9 @@ def validate(
     dataset: SnapshotPairDataset | None = None,
     pair_csv_path: str | Path | None = None,
     epoch: int | None = None,
+    x_grid_t: torch.Tensor | None = None,
+    interface_half_width: float = 0.05,
+    use_per_sample_interface: bool = False,
 ) -> tuple[float, float]:
     """Return (val_rel_l2, val_iface_rel_l2) after validation.
 
@@ -724,12 +744,21 @@ def validate(
                 cond_static = batch["cond_static"].to(device)
                 forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
                 y_batch = batch["Y"].to(device)
+                iface_x = get_batch_interface_x(
+                    batch, device, use_per_sample_interface=use_per_sample_interface
+                )
 
                 y_pred = model(x_spatial, cond_static, forcing_seq)
                 mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
                 target_sq_sum += torch.sum(y_batch ** 2).item()
 
-                if iface_mask is not None:
+                bf = None
+                if iface_x is not None and x_grid_t is not None:
+                    band = build_interface_band(x_grid_t, iface_x, interface_half_width)  # (B, Nx)
+                    bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
+                    iface_mse_sum += torch.sum(bf * (y_pred - y_batch) ** 2).item()
+                    iface_target_sq_sum += torch.sum(bf * y_batch ** 2).item()
+                elif iface_mask is not None:
                     pred_iface = y_pred[:, iface_mask, :]
                     true_iface = y_batch[:, iface_mask, :]
                     iface_mse_sum += torch.sum((pred_iface - true_iface) ** 2).item()
@@ -737,7 +766,11 @@ def validate(
 
                 if write_pairs and pair_writer is not None and dataset is not None:
                     rel_l2 = _per_pair_rel_l2_percent(y_pred, y_batch).cpu()
-                    if iface_mask is not None:
+                    if bf is not None:
+                        num = torch.sum(bf * (y_pred - y_batch) ** 2, dim=(1, 2, 3))
+                        den = torch.sum(bf * y_batch ** 2, dim=(1, 2, 3)).clamp_min(1e-12)
+                        iface_rel_l2 = (torch.sqrt(num / den) * 100.0).cpu()
+                    elif iface_mask is not None:
                         pred_iface_b = y_pred[:, iface_mask, :]
                         true_iface_b = y_batch[:, iface_mask, :]
                         iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface_b[:, :, None, :], true_iface_b[:, :, None, :]).cpu()
@@ -752,7 +785,7 @@ def validate(
                 pair_file.close()
 
         val_loss = math.sqrt(mse_sum / max(target_sq_sum, 1e-12)) * 100.0
-        if iface_mask is not None:
+        if iface_target_sq_sum > 0.0:
             val_iface = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
         else:
             val_iface = 0.0
@@ -930,6 +963,8 @@ def run_one_seed(
         loss_cfg.get("interface_x", 0.5), loss_cfg.get("interface_half_width", 0.05),
     ).to(device)
 
+    use_per_sample_interface = bool(loss_cfg.get("per_sample_interface_x", False))
+
     epochs = config["training"]["epochs"]
     validate_every = config["training"]["validate_every"]
     patience = config["training"]["patience"]
@@ -992,6 +1027,7 @@ def run_one_seed(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
             grad_clip=grad_clip, dist_info=dist_info,
+            use_per_sample_interface=use_per_sample_interface,
         )
         scheduler.step()
 
@@ -1015,6 +1051,9 @@ def run_one_seed(
                     dataset=validation_set.dataset,
                     pair_csv_path=val_pairs_path,
                     epoch=epoch,
+                    x_grid_t=loss_fn.x_grid_t,
+                    interface_half_width=loss_cfg.get("interface_half_width", 0.05),
+                    use_per_sample_interface=use_per_sample_interface,
                 )
                 print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
 

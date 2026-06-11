@@ -886,3 +886,276 @@ def plot_all_benchmarks_interface_jump(forcing_ctx, source_ctx, interfaces_ctx,
         axes[2].legend(fontsize=7)
 
         return _save_figure(fig, save_path, "paper", "all_benchmarks_interface_jump")
+
+
+# ============================================================
+# TAIL / MAX ERROR STATS PER BENCHMARK PER METRIC
+# ============================================================
+
+# Explicit, unit-bearing metric names (what lands in the table/plots) mapped to
+# the underlying per-sample record columns. Both are normalized-space percentages.
+TAIL_METRICS = {
+    "global_rel_l2_pct": "rel_l2_pct",
+    "iface_rel_l2_pct": "iface_rel_l2_pct",
+}
+
+# Order in which strata dims appear in plots/table.
+_TAIL_STAT_KEYS = ("n", "mean", "median", "p90", "p99", "max")
+_TAIL_SUMMARY_FIELDS = (
+    "benchmark", "metric", "stratum", "group",
+    "n", "mean", "median", "p90", "p99", "max",
+)
+
+
+def _tail_stats(values: np.ndarray) -> dict[str, float]:
+    """Tail/summary stats over the finite entries of ``values``.
+
+    Returns ``{n, mean, median, p90, p99, max}``. ``n`` is the finite count;
+    when ``n == 0`` every stat (except ``n``) is NaN so callers never crash on
+    empty groups. Percentiles use ``method="linear"`` (numpy default) so the
+    table and any verification test agree exactly.
+    """
+    v = _finite(values)
+    n = int(v.size)
+    if n == 0:
+        return {"n": 0, "mean": np.nan, "median": np.nan,
+                "p90": np.nan, "p99": np.nan, "max": np.nan}
+    p90, p99 = np.percentile(v, [90, 99], method="linear")
+    return {
+        "n": n,
+        "mean": float(np.mean(v)),
+        "median": float(np.median(v)),
+        "p90": float(p90),
+        "p99": float(p99),
+        "max": float(np.max(v)),
+    }
+
+
+def _quantile_bin_strata(values: np.ndarray, n_bins: int = 4,
+                         label: str = "lead_time") -> list[tuple[str, str, np.ndarray]]:
+    """Quantile-binned strata over a numeric column.
+
+    Bin edges are quantiles over the finite values, de-duplicated with
+    ``np.unique``. Degenerate columns (constant or near-constant, fewer than 2
+    unique edges) yield no strata — the caller simply omits that dimension. The
+    final bin is right-inclusive so the maximum value lands in the last bin.
+    Returned masks are over the full-length array (rows with non-finite values
+    fall in no bin).
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return []
+    qs = np.linspace(0.0, 1.0, n_bins + 1)
+    edges = np.unique(np.quantile(arr[finite], qs))
+    if edges.size < 2:
+        return []
+    strata: list[tuple[str, str, np.ndarray]] = []
+    for k in range(edges.size - 1):
+        lo, hi = edges[k], edges[k + 1]
+        if k == edges.size - 2:
+            mask = finite & (arr >= lo) & (arr <= hi)
+        else:
+            mask = finite & (arr >= lo) & (arr < hi)
+        group = f"[{lo:.3g}, {hi:.3g}{']' if k == edges.size - 2 else ')'}"
+        strata.append((label, group, mask))
+    return strata
+
+
+def _benchmark_strata(records: dict[str, np.ndarray],
+                      benchmark: str) -> list[tuple[str, str, np.ndarray]]:
+    """Strata (dim, group, full-length mask) for one benchmark's records.
+
+    Always emits ``("overall", "all", ones)`` as an all-rows mask (NOT a
+    stratum-finite mask) so a row with a valid error but a missing ``t_bar`` or
+    ``x_I`` is never dropped from the overall distribution; metric finiteness is
+    applied later inside ``_tail_stats``. Benchmark-specific categorical strata
+    are only added when their column is present and non-empty (forcing does not
+    require ``regime``; source does not require ``temporal_family``; etc.).
+    Numeric strata (lead time, interface position) use ``_quantile_bin_strata``.
+    """
+    n = int(records.get("_n", 0))
+    strata: list[tuple[str, str, np.ndarray]] = [
+        ("overall", "all", np.ones(n, dtype=bool)),
+    ]
+
+    def _has_str(col: str) -> bool:
+        return col in records and any(str(v) != "" for v in records[col])
+
+    if benchmark == "forcing":
+        if _has_str("temporal_family"):
+            for fam in TEMPORAL_ORDER:
+                m = _mask_in(records["temporal_family"], fam)
+                if m.any():
+                    strata.append(("temporal_family", fam, m))
+        if _has_str("spatial_family"):
+            for fam in SPATIAL_ORDER:
+                m = _mask_in(records["spatial_family"], fam)
+                if m.any():
+                    strata.append(("spatial_family", fam, m))
+    elif benchmark == "source":
+        if _has_str("regime"):
+            for regime in REGIME_ORDER:
+                m = _mask_in(records["regime"], regime)
+                if m.any():
+                    strata.append(("regime", regime, m))
+    elif benchmark == "interfaces":
+        if "x_I" in records:
+            strata.extend(_quantile_bin_strata(records["x_I"], label="x_I"))
+
+    if "t_bar" in records:
+        strata.extend(_quantile_bin_strata(records["t_bar"], label="lead_time"))
+
+    return strata
+
+
+def _slice_records(records: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, np.ndarray]:
+    """Slice every same-length column of ``records`` down to ``mask`` rows."""
+    n = int(records.get("_n", 0))
+    out: dict[str, np.ndarray] = {}
+    for key, arr in records.items():
+        if key == "_n":
+            continue
+        a = np.asarray(arr)
+        if a.shape[:1] == (n,):
+            out[key] = a[mask]
+        else:
+            out[key] = a
+    out["_n"] = np.int64(int(mask.sum()))
+    return out
+
+
+def compute_tail_stats(records: dict[str, np.ndarray],
+                       benchmark: str | None = None) -> list[dict]:
+    """Per-(benchmark, metric, stratum, group) tail stats from test records.
+
+    Each row is ``{benchmark, metric, stratum, group, n, mean, median, p90,
+    p99, max}`` for both ``TAIL_METRICS`` across every stratum from
+    ``_benchmark_strata``. Metric finiteness is enforced per stat inside
+    ``_tail_stats``, so the ``overall/all`` mask stays an all-rows mask.
+
+    Mixed-benchmark handling: if ``benchmark`` is given it is authoritative; if
+    ``None`` and the records carry exactly one benchmark, that value is used; if
+    ``None`` and several benchmarks are present, the records are first sliced to
+    each benchmark's rows (a benchmark-specific dict) and strata are computed on
+    the sliced dict — masks built on the full mixed array are never reused.
+    Small-``n`` groups are kept; ``n`` is reported in every row so p99/max
+    reliability is judgeable.
+    """
+    if benchmark is None and "benchmark" in records and int(records.get("_n", 0)) > 0:
+        uniq = sorted({str(v) for v in records["benchmark"]})
+        if len(uniq) == 1:
+            benchmark = uniq[0]
+        elif len(uniq) > 1:
+            rows: list[dict] = []
+            for bm in uniq:
+                sub = _slice_records(records, _mask_in(records["benchmark"], bm))
+                rows.extend(compute_tail_stats(sub, benchmark=bm))
+            return rows
+
+    bm_name = "" if benchmark is None else str(benchmark)
+    rows: list[dict] = []
+    for metric_name, col in TAIL_METRICS.items():
+        if col not in records:
+            continue
+        values = records[col]
+        for dim, group, mask in _benchmark_strata(records, bm_name):
+            stats = _tail_stats(values[mask])
+            row = {"benchmark": bm_name, "metric": metric_name,
+                   "stratum": dim, "group": group}
+            row.update(stats)
+            rows.append(row)
+    return rows
+
+
+def write_tail_summary(records_by_benchmark: dict[str, dict[str, np.ndarray]],
+                       out_path: str | Path) -> Path:
+    """Write a combined ``tail_summary.csv`` over one or more benchmarks.
+
+    For each ``benchmark -> records`` pair the dict key is authoritative and is
+    passed explicitly to ``compute_tail_stats`` so a missing or stale
+    ``benchmark`` column in the records never matters. Rows from every benchmark
+    are concatenated into a single CSV.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    all_rows: list[dict] = []
+    for benchmark, records in records_by_benchmark.items():
+        all_rows.extend(compute_tail_stats(records, benchmark=benchmark))
+
+    def _fmt(key: str, value) -> str:
+        if key == "n":
+            return str(int(value))
+        if key in ("benchmark", "metric", "stratum", "group"):
+            return str(value)
+        return "" if value is None or (isinstance(value, float) and np.isnan(value)) else f"{float(value):.6g}"
+
+    with out_path.open("w", newline="") as f:
+        writer = _csv.writer(f)
+        writer.writerow(_TAIL_SUMMARY_FIELDS)
+        for row in all_rows:
+            writer.writerow([_fmt(k, row.get(k)) for k in _TAIL_SUMMARY_FIELDS])
+    return out_path
+
+
+def plot_benchmark_tail_errors(records: dict[str, np.ndarray], save_path=None):
+    """Per-benchmark tail-error figure: rows = metrics, columns = stratum dims.
+
+    The benchmark is auto-detected from the records (single unique value). Each
+    panel shows p90/p99 as grouped bars (C0/C3) with max as a black-diamond
+    marker overlaid per group, so an outlier max never crushes the p90/p99 bars.
+    A log y-scale is used only when every plotted tail value in the panel is
+    strictly positive (and the max/p90 spread is large); any zero keeps the
+    panel linear, and no epsilon is ever added to the stats themselves. The CSV
+    written by ``write_tail_summary`` remains the authoritative numeric result.
+    """
+    benchmark = ""
+    if "benchmark" in records and int(records.get("_n", 0)) > 0:
+        uniq = sorted({str(v) for v in records["benchmark"]})
+        benchmark = uniq[0] if len(uniq) == 1 else (uniq[0] if uniq else "")
+
+    strata = _benchmark_strata(records, benchmark)
+    dims: list[str] = []
+    for dim, _group, _mask in strata:
+        if dim not in dims:
+            dims.append(dim)
+    metric_names = list(TAIL_METRICS.keys())
+
+    n_rows = len(metric_names)
+    n_cols = max(1, len(dims))
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.2 * n_cols, 3.8 * n_rows),
+                                 squeeze=False)
+        for r, metric_name in enumerate(metric_names):
+            col = TAIL_METRICS[metric_name]
+            values = records.get(col)
+            for c, dim in enumerate(dims):
+                ax = axes[r][c]
+                groups = [(g, m) for (d, g, m) in strata if d == dim]
+                labels, p90s, p99s, maxes = [], [], [], []
+                for g, m in groups:
+                    stats = _tail_stats(values[m]) if values is not None else _tail_stats(np.array([]))
+                    labels.append(g)
+                    p90s.append(stats["p90"])
+                    p99s.append(stats["p99"])
+                    maxes.append(stats["max"])
+                x = np.arange(len(labels))
+                ax.bar(x - 0.2, p90s, width=0.4, label="p90", color="C0")
+                ax.bar(x + 0.2, p99s, width=0.4, label="p99", color="C3")
+                ax.plot(x, maxes, "D", color="k", ms=5, label="max")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=7)
+                if r == 0:
+                    ax.set_title(dim)
+                if c == 0:
+                    ax.set_ylabel(f"{metric_name}\nrel-L2 (%)")
+                plotted = np.array(p90s + p99s + maxes, dtype=np.float64)
+                finite = plotted[np.isfinite(plotted)]
+                if finite.size and np.all(finite > 0):
+                    pos_p90 = np.array([p for p in p90s if np.isfinite(p) and p > 0], dtype=np.float64)
+                    if pos_p90.size and float(np.max(finite)) / float(np.min(pos_p90)) > 50.0:
+                        ax.set_yscale("log")
+                if r == 0 and c == n_cols - 1:
+                    ax.legend(fontsize=7)
+        fig.suptitle(f"{benchmark or 'benchmark'}: tail errors (p90/p99/max) by stratum")
+        return _save_figure(fig, save_path, "paper", f"{benchmark or 'benchmark'}_tail_errors")

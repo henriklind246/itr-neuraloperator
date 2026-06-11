@@ -137,6 +137,14 @@ class TestPlotRegistry:
         assert _common.PLOT_REGISTRY["bc_verification"] == "physics"
         assert _common.PLOT_REGISTRY["sweep_hyperparams"] == "sweep"
 
+    def test_tail_error_plot_names_registered(self):
+        for name in [
+            "forcing_tail_errors",
+            "source_tail_errors",
+            "interfaces_tail_errors",
+        ]:
+            assert _common.PLOT_REGISTRY[name] == "paper"
+
 
 class TestSnapshotPairSamples:
     def test_signature_has_no_legacy_window_params(self):
@@ -872,6 +880,133 @@ class TestPaperSummaryPlots:
             save_path=out_path,
         )
         assert out_path.exists()
+
+
+class TestTailErrorStats:
+    def test_tail_stats_percentiles_exact(self):
+        v = np.linspace(0.0, 100.0, 101)
+        stats = paper_plots._tail_stats(v)
+        p90, p99 = np.percentile(v, [90, 99], method="linear")
+        assert stats["n"] == 101
+        assert stats["p90"] == pytest.approx(float(p90))
+        assert stats["p99"] == pytest.approx(float(p99))
+        assert stats["max"] == pytest.approx(float(np.max(v)))
+        assert stats["mean"] == pytest.approx(float(np.mean(v)))
+        assert stats["median"] == pytest.approx(float(np.median(v)))
+
+    def test_tail_stats_empty_returns_nans(self):
+        stats = paper_plots._tail_stats(np.array([np.nan, np.inf, -np.inf]))
+        assert stats["n"] == 0
+        for key in ("mean", "median", "p90", "p99", "max"):
+            assert np.isnan(stats[key])
+
+    def test_forcing_tail_errors_smoke(self, tmp_path, forcing_records):
+        out_path = tmp_path / "forcing_tail_errors.png"
+        paper_plots.plot_benchmark_tail_errors(forcing_records, save_path=out_path)
+        assert out_path.exists()
+
+    def test_source_tail_errors_smoke(self, tmp_path, source_records):
+        out_path = tmp_path / "source_tail_errors.png"
+        paper_plots.plot_benchmark_tail_errors(source_records, save_path=out_path)
+        assert out_path.exists()
+
+    def test_interfaces_tail_errors_smoke(self, tmp_path, interfaces_records):
+        out_path = tmp_path / "interfaces_tail_errors.png"
+        paper_plots.plot_benchmark_tail_errors(interfaces_records, save_path=out_path)
+        assert out_path.exists()
+
+    def test_write_tail_summary(
+        self, tmp_path, forcing_records, source_records, interfaces_records
+    ):
+        out_path = tmp_path / "tail_summary.csv"
+        paper_plots.write_tail_summary(
+            {"forcing": forcing_records, "source": source_records,
+             "interfaces": interfaces_records},
+            out_path,
+        )
+        assert out_path.exists()
+        with open(out_path, newline="") as f:
+            reader = csv.DictReader(f)
+            assert reader.fieldnames == list(paper_plots._TAIL_SUMMARY_FIELDS)
+            rows = list(reader)
+
+        benchmarks = {r["benchmark"] for r in rows}
+        assert benchmarks == {"forcing", "source", "interfaces"}
+        metrics = {r["metric"] for r in rows}
+        assert metrics == set(paper_plots.TAIL_METRICS.keys())
+
+        for bm in ("forcing", "source", "interfaces"):
+            for metric in paper_plots.TAIL_METRICS:
+                overall = [r for r in rows if r["benchmark"] == bm
+                           and r["metric"] == metric
+                           and r["stratum"] == "overall" and r["group"] == "all"]
+                assert len(overall) == 1
+
+        for r in rows:
+            if int(r["n"]) == 0:
+                continue
+            p90, p99, mx = float(r["p90"]), float(r["p99"]), float(r["max"])
+            assert p90 <= p99 <= mx
+
+    def test_quantile_bin_degenerate(self):
+        # Constant x_I and constant t_bar must omit the degenerate numeric strata
+        # while still emitting overall/all and not crashing.
+        records = {
+            "_n": np.int64(6),
+            "benchmark": np.array(["interfaces"] * 6, dtype=object),
+            "x_I": np.full(6, 0.5, dtype=np.float64),
+            "t_bar": np.full(6, 0.1, dtype=np.float64),
+            "rel_l2_pct": np.linspace(1.0, 6.0, 6),
+            "iface_rel_l2_pct": np.linspace(2.0, 7.0, 6),
+        }
+        strata = paper_plots._benchmark_strata(records, "interfaces")
+        dims = {dim for dim, _g, _m in strata}
+        assert ("overall", "all") in [(d, g) for d, g, _m in strata]
+        assert "x_I" not in dims
+        assert "lead_time" not in dims
+        rows = paper_plots.compute_tail_stats(records, benchmark="interfaces")
+        assert any(r["stratum"] == "overall" for r in rows)
+
+    def test_benchmark_strata_missing_columns(self, forcing_records, source_records):
+        # Forcing has no regime; source has no temporal_family. Strata must build
+        # without requiring the absent column.
+        f_strata = paper_plots._benchmark_strata(forcing_records, "forcing")
+        f_dims = {dim for dim, _g, _m in f_strata}
+        assert "temporal_family" in f_dims
+        assert "regime" not in f_dims
+
+        s_strata = paper_plots._benchmark_strata(source_records, "source")
+        s_dims = {dim for dim, _g, _m in s_strata}
+        assert "regime" in s_dims
+        assert "temporal_family" not in s_dims
+
+    def test_compute_tail_stats_mixed_benchmark(
+        self, forcing_records, source_records
+    ):
+        # A mixed-benchmark records dict must be split per benchmark internally.
+        n_f = int(forcing_records["_n"])
+        n_s = int(source_records["_n"])
+        mixed = {"_n": np.int64(n_f + n_s)}
+        keys = set(forcing_records) | set(source_records)
+        keys.discard("_n")
+        for key in keys:
+            f_arr = forcing_records.get(key)
+            s_arr = source_records.get(key)
+            if f_arr is None:
+                f_arr = np.full(n_f, np.nan) if key in paper_plots._FLOAT_COLS \
+                    else np.array([""] * n_f, dtype=object)
+            if s_arr is None:
+                s_arr = np.full(n_s, np.nan) if key in paper_plots._FLOAT_COLS \
+                    else np.array([""] * n_s, dtype=object)
+            mixed[key] = np.concatenate([np.asarray(f_arr), np.asarray(s_arr)])
+        rows = paper_plots.compute_tail_stats(mixed, benchmark=None)
+        assert {r["benchmark"] for r in rows} == {"forcing", "source"}
+        # Source overall n must equal the source row count (no mixed-mask leakage).
+        src_overall = [r for r in rows if r["benchmark"] == "source"
+                       and r["stratum"] == "overall"
+                       and r["metric"] == "global_rel_l2_pct"]
+        assert len(src_overall) == 1
+        assert src_overall[0]["n"] == n_s
 
 
 class TestPaperPredictionPlots:

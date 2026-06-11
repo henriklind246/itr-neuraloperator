@@ -101,6 +101,126 @@ class TestEvaluate:
         assert not model.training
 
 
+# ===================== evaluate per-sample interface =====================
+
+_ITEM_KEYS_IFACE = ("spatial", "cond_static", "forcing_seq", "Y", "T_stats")
+
+
+def _make_iface_loader(interface_x_col, n=4, Nx=11, Ny=11):
+    """Loader whose T_stats carries a slot-2 interface_x column."""
+    x_spatial = torch.randn(n, Nx, Ny, SPATIAL_IN_CHANNELS)
+    cond_static = torch.rand(n, COND_STATIC_DIM)
+    forcing_seq = torch.randn(n, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+    Y = torch.randn(n, Nx, Ny, 1)
+    T_stats = torch.stack([
+        torch.zeros(n),            # mu_s
+        torch.ones(n),             # sigma_s
+        interface_x_col,           # slot 2: interface_x
+    ], dim=-1)
+    return DataLoader(
+        TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
+        batch_size=2,
+        collate_fn=_dict_collate,
+    )
+
+
+@pytest.fixture
+def iface_model():
+    Nx = Ny = 11
+    model = FNO2d(
+        modes1=2, modes2=2, width=8,
+        in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+    )
+    model.eval()
+    return model
+
+
+class TestEvaluatePerSampleInterface:
+    def _grids(self, Nx=11, Ny=11):
+        import numpy as np
+        return (
+            np.linspace(0.0, 1.0, Nx).astype("float32"),
+            np.linspace(0.0, 1.0, Ny).astype("float32"),
+        )
+
+    def test_dynamic_half_matches_fixed_mask(self, iface_model):
+        """interface_x == 0.5 everywhere: per-sample band matches the fixed x=0.5 mask."""
+        from src.operators.losses import build_interface_mask
+        torch.manual_seed(0)
+        x_grid, y_grid = self._grids()
+        loader = _make_iface_loader(torch.full((4,), 0.5))
+        mask = build_interface_mask(x_grid, y_grid, 0.5, 0.05)
+
+        fixed = evaluate(iface_model, loader, torch.device("cpu"), iface_mask=mask)
+        dynamic = evaluate(
+            iface_model, loader, torch.device("cpu"),
+            iface_mask=mask, x_grid=x_grid, interface_half_width=0.05,
+            use_per_sample_interface=True,
+        )
+        assert dynamic["iface_rel_l2_norm"] == pytest.approx(fixed["iface_rel_l2_norm"], rel=1e-5)
+
+    def test_flag_off_uses_fixed_mask_even_with_slot2(self, iface_model):
+        """source-like: slot 2 present but flag off -> fixed mask path (ignores x_grid)."""
+        from src.operators.losses import build_interface_mask
+        torch.manual_seed(0)
+        x_grid, y_grid = self._grids()
+        loader = _make_iface_loader(torch.full((4,), 0.5))
+        mask = build_interface_mask(x_grid, y_grid, 0.5, 0.05)
+
+        fixed = evaluate(iface_model, loader, torch.device("cpu"), iface_mask=mask)
+        flag_off = evaluate(
+            iface_model, loader, torch.device("cpu"),
+            iface_mask=mask, x_grid=x_grid, interface_half_width=0.05,
+            use_per_sample_interface=False,
+        )
+        assert flag_off["iface_rel_l2_norm"] == pytest.approx(fixed["iface_rel_l2_norm"], rel=1e-6)
+
+    def test_dynamic_differs_from_fixed_when_interface_off_center(self, iface_model):
+        """interface_x away from 0.5 should drive a different interface metric than the fixed mask."""
+        from src.operators.losses import build_interface_mask
+        torch.manual_seed(3)
+        x_grid, y_grid = self._grids()
+        loader = _make_iface_loader(torch.full((4,), 0.2))
+        mask = build_interface_mask(x_grid, y_grid, 0.5, 0.05)
+
+        fixed = evaluate(iface_model, loader, torch.device("cpu"), iface_mask=mask)
+        dynamic = evaluate(
+            iface_model, loader, torch.device("cpu"),
+            iface_mask=mask, x_grid=x_grid, interface_half_width=0.05,
+            use_per_sample_interface=True,
+        )
+        assert dynamic["iface_rel_l2_norm"] != pytest.approx(fixed["iface_rel_l2_norm"], rel=1e-6)
+
+    def test_forcing_like_two_col_tstats_falls_back(self, iface_model):
+        """forcing has t_stats_dim=2: flag on but no slot 2 -> fixed mask fallback."""
+        from src.operators.losses import build_interface_mask
+        torch.manual_seed(0)
+        x_grid, y_grid = self._grids()
+        # 2-column T_stats loader (no interface slot)
+        x_spatial = torch.randn(4, 11, 11, SPATIAL_IN_CHANNELS)
+        cond_static = torch.rand(4, COND_STATIC_DIM)
+        forcing_seq = torch.randn(4, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        Y = torch.randn(4, 11, 11, 1)
+        T_stats = torch.stack([torch.zeros(4), torch.ones(4)], dim=-1)
+        loader = DataLoader(
+            TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
+            batch_size=2, collate_fn=_dict_collate,
+        )
+        mask = build_interface_mask(x_grid, y_grid, 0.5, 0.05)
+
+        fixed = evaluate(iface_model, loader, torch.device("cpu"), iface_mask=mask)
+        dynamic = evaluate(
+            iface_model, loader, torch.device("cpu"),
+            iface_mask=mask, x_grid=x_grid, interface_half_width=0.05,
+            use_per_sample_interface=True,
+        )
+        assert dynamic["iface_rel_l2_norm"] == pytest.approx(fixed["iface_rel_l2_norm"], rel=1e-6)
+
+
 # ===================== mean_std =====================
 
 class TestMeanStd:

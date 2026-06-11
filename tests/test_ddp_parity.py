@@ -95,8 +95,12 @@ def _loss_fn():
     )
 
 
-def _grads_on(model_state, batch):
-    """Gradient of the mean-reduction loss over the given batch."""
+def _grads_on(model_state, batch, interface_x=None):
+    """Gradient of the mean-reduction loss over the given batch.
+
+    ``interface_x is None`` exercises the byte-identical fixed-band path; a
+    ``(n,)`` tensor exercises the per-sample band path.
+    """
     model = _build_model()
     model.load_state_dict(model_state)
     model.eval()  # disable spectral dropout so the grad is deterministic
@@ -105,12 +109,12 @@ def _grads_on(model_state, batch):
 
     model.zero_grad(set_to_none=False)
     pred = model(spatial, cond, forcing)
-    loss = loss_fn(pred, y)
+    loss = loss_fn(pred, y, interface_x)
     loss.backward()
     return {name: p.grad.detach().clone() for name, p in model.named_parameters()}
 
 
-def _ddp_averaged_grads(world_size, model_state, batch):
+def _ddp_averaged_grads(world_size, model_state, batch, interface_x=None):
     """Emulate DDP: per-rank grad on an equal shard, then average across ranks.
 
     DDP's gradient all-reduce uses ReduceOp.AVG (== SUM / world_size). Each rank
@@ -126,7 +130,8 @@ def _ddp_averaged_grads(world_size, model_state, batch):
     for rank in range(world_size):
         sl = slice(rank * per, (rank + 1) * per)
         shard = (spatial[sl], cond[sl], forcing[sl], y[sl])
-        g = _grads_on(model_state, shard)
+        ix = None if interface_x is None else interface_x[sl]
+        g = _grads_on(model_state, shard, ix)
         if accum is None:
             accum = {k: v.clone() for k, v in g.items()}
         else:
@@ -159,6 +164,39 @@ def test_ddp_gradient_matches_single_process(world_size):
     assert not mismatches, (
         "DDP-averaged gradient differs from single-process gradient on identical "
         f"data (world_size={world_size}). Worst offenders "
+        "(param, max_abs_diff, ref_scale): "
+        + "; ".join(f"{n}: {d:.3e} vs scale {r:.3e}" for n, d, r in mismatches[:8])
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_ddp_gradient_matches_single_process_per_sample(world_size):
+    """Per-sample interface band must preserve DDP/single-process gradient parity.
+
+    The per-sample weight is mean-1-normalized per sample, so the loss stays a
+    mean reduction that is linear across equal shards. DDP-averaging the per-rank
+    gradients must therefore still equal the single-process gradient on the same
+    global batch with the same per-sample ``interface_x`` vector."""
+    n = 16 * world_size
+    model = _build_model()
+    model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    batch = _make_batch(n)
+    g = torch.Generator().manual_seed(4321)
+    interface_x = 0.2 + 0.6 * torch.rand(n, generator=g)  # sampled in [0.2, 0.8]
+
+    single = _grads_on(model_state, batch, interface_x)
+    ddp = _ddp_averaged_grads(world_size, model_state, batch, interface_x)
+
+    mismatches = []
+    for name in single:
+        if not torch.allclose(single[name], ddp[name], atol=1e-6, rtol=1e-4):
+            max_abs = (single[name] - ddp[name]).abs().max().item()
+            ref = single[name].abs().max().item()
+            mismatches.append((name, max_abs, ref))
+
+    assert not mismatches, (
+        "Per-sample interface DDP-averaged gradient differs from single-process "
+        f"gradient (world_size={world_size}). Worst offenders "
         "(param, max_abs_diff, ref_scale): "
         + "; ".join(f"{n}: {d:.3e} vs scale {r:.3e}" for n, d, r in mismatches[:8])
     )

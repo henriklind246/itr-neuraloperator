@@ -13,3 +13,5 @@ training:
     interface_x: 0.5
     interface_half_width: 0.05
     interface_weight: 10.0
+    # Interface fixed at x = 0.5; use the static weight band/metric.
+    per_sample_interface_x: false

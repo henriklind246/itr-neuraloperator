@@ -62,8 +62,10 @@ training:
     step_size: 50
     gamma: 0.5
   optimizer: "AdamW"
-  # training.loss.{interface_x, interface_half_width, interface_weight} are
-  # owned by the active `benchmark` config group (per-benchmark loss region).
+  # training.loss.{interface_x, interface_half_width, interface_weight,
+  # per_sample_interface_x} are owned by the active `benchmark` config group
+  # (per-benchmark loss region). per_sample_interface_x defaults to false in code
+  # (loss_cfg.get(...)) and is set true only for the interfaces benchmark.
   validate_every: 10
   patience: 20
   checkpoint_metric: "val_rel_l2"

@@ -13,3 +13,6 @@ training:
     interface_x: 0.5
     interface_half_width: 0.05
     interface_weight: 10.0
+    # interface_x varies per sim in [0.2, 0.8]; track each sample's location for
+    # the weighted loss and interface metric instead of the fixed interface_x.
+    per_sample_interface_x: true

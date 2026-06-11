@@ -2,7 +2,13 @@ import numpy as np
 import pytest
 import torch
 
-from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask, compute_interface_rel_l2
+from src.operators.losses import (
+    SpatiallyWeightedMSE,
+    build_interface_band,
+    build_interface_mask,
+    compute_interface_rel_l2,
+    get_batch_interface_x,
+)
 
 
 # ===================== SpatiallyWeightedMSE =====================
@@ -74,6 +80,137 @@ class TestSpatiallyWeightedMSE:
         loss.backward()
         assert y_pred.grad is not None
         assert y_pred.grad.shape == y_pred.shape
+
+
+# ===================== build_interface_band (per-sample) =====================
+
+class TestBuildInterfaceBand:
+    @pytest.fixture
+    def x_grid_t(self):
+        return torch.linspace(0.0, 1.0, 101)
+
+    def test_band_true_within_half_width(self, x_grid_t):
+        """Band True exactly where |x - interface_x| <= half_width."""
+        interface_x = torch.tensor([0.5])
+        hw = 0.05
+        band = build_interface_band(x_grid_t, interface_x, hw)  # (1, Nx)
+        assert band.shape == (1, 101)
+        assert band.dtype == torch.bool
+        expected = (torch.abs(x_grid_t - 0.5) <= hw)
+        assert torch.equal(band[0], expected)
+
+    def test_band_shifts_with_interface_x(self, x_grid_t):
+        """Center of the band tracks interface_x per sample."""
+        hw = 0.05
+        for cx in [0.2, 0.35, 0.8]:
+            band = build_interface_band(x_grid_t, torch.tensor([cx]), hw)[0]
+            true_idx = torch.nonzero(band).flatten()
+            center_x = x_grid_t[true_idx].mean().item()
+            assert center_x == pytest.approx(cx, abs=hw)
+
+    def test_band_batched(self, x_grid_t):
+        """Each row of the batch follows its own interface_x."""
+        interface_x = torch.tensor([0.2, 0.5, 0.8])
+        hw = 0.05
+        band = build_interface_band(x_grid_t, interface_x, hw)  # (3, Nx)
+        assert band.shape == (3, 101)
+        for b, cx in enumerate([0.2, 0.5, 0.8]):
+            expected = (torch.abs(x_grid_t - cx) <= hw)
+            assert torch.equal(band[b], expected)
+
+
+# ===================== SpatiallyWeightedMSE per-sample forward =====================
+
+class TestSpatiallyWeightedMSEPerSample:
+    @pytest.fixture
+    def x_grid(self):
+        return np.linspace(0.0, 1.0, 101).astype(np.float32)
+
+    @pytest.fixture
+    def y_grid(self):
+        return np.linspace(0.0, 1.0, 21).astype(np.float32)
+
+    def test_dynamic_half_matches_fixed_buffer(self, x_grid, y_grid):
+        """Per-sample interface_x == 0.5 must match the fixed-buffer path numerically."""
+        loss_fn = SpatiallyWeightedMSE(
+            x_grid, y_grid, interface_x=0.5, interface_half_width=0.05, interface_weight=10.0
+        )
+        torch.manual_seed(0)
+        y_pred = torch.randn(4, 101, 21, 1)
+        y_true = torch.randn(4, 101, 21, 1)
+
+        fixed = loss_fn(y_pred, y_true)  # interface_x=None -> fixed buffer
+        iface_x = torch.full((4,), 0.5)
+        dynamic = loss_fn(y_pred, y_true, iface_x)
+        torch.testing.assert_close(dynamic, fixed)
+
+    def test_per_sample_weights_mean_one(self, x_grid, y_grid):
+        """Per-sample weights normalize to mean 1.0 for each sample independently."""
+        loss_fn = SpatiallyWeightedMSE(
+            x_grid, y_grid, interface_half_width=0.05, interface_weight=7.0
+        )
+        iface_x = torch.tensor([0.2, 0.5, 0.8])
+        band = build_interface_band(loss_fn.x_grid_t, iface_x, loss_fn.interface_half_width)
+        raw = 1.0 + (loss_fn.interface_weight - 1.0) * band.float()
+        w = raw / raw.mean(dim=1, keepdim=True)
+        means = w.mean(dim=1)
+        assert torch.allclose(means, torch.ones_like(means), atol=1e-6)
+
+    def test_none_path_is_fixed_buffer(self, x_grid, y_grid):
+        """interface_x=None is the byte-identical regression guard (fixed buffer)."""
+        loss_fn = SpatiallyWeightedMSE(x_grid, y_grid, interface_weight=10.0)
+        torch.manual_seed(1)
+        y_pred = torch.randn(3, 101, 21, 1)
+        y_true = torch.randn(3, 101, 21, 1)
+        expected = torch.mean(loss_fn.weights * (y_pred - y_true) ** 2)
+        assert loss_fn(y_pred, y_true).item() == expected.item()
+
+    def test_per_sample_broadcasts_against_output(self, x_grid, y_grid):
+        """Per-sample forward returns a scalar over (B, Nx, Ny, 1) predictions."""
+        loss_fn = SpatiallyWeightedMSE(x_grid, y_grid, interface_weight=10.0)
+        y_pred = torch.randn(5, 101, 21, 1)
+        y_true = torch.randn(5, 101, 21, 1)
+        iface_x = torch.linspace(0.2, 0.8, 5)
+        out = loss_fn(y_pred, y_true, iface_x)
+        assert out.dim() == 0
+        assert out.item() >= 0.0
+
+    def test_works_after_to_device(self, x_grid, y_grid):
+        """x_grid_t buffer moves with .to(device); per-sample forward still runs."""
+        loss_fn = SpatiallyWeightedMSE(x_grid, y_grid, interface_weight=10.0).to("cpu")
+        assert loss_fn.x_grid_t.device == torch.device("cpu")
+        y_pred = torch.randn(2, 101, 21, 1)
+        y_true = torch.randn(2, 101, 21, 1)
+        iface_x = torch.tensor([0.3, 0.7])
+        out = loss_fn(y_pred, y_true, iface_x)
+        assert torch.isfinite(out)
+
+
+# ===================== get_batch_interface_x (selector) =====================
+
+class TestGetBatchInterfaceX:
+    def test_returns_none_when_flag_off(self):
+        """Flag off keeps source/forcing on the fixed path even with slot 2 present."""
+        batch = {"T_stats": torch.tensor([[1.0, 2.0, 0.5], [1.0, 2.0, 0.5]])}
+        out = get_batch_interface_x(batch, torch.device("cpu"), use_per_sample_interface=False)
+        assert out is None
+
+    def test_returns_none_when_no_slot2(self):
+        """forcing has t_stats_dim=2; no slot 2 -> None even with flag on."""
+        batch = {"T_stats": torch.tensor([[1.0, 2.0], [1.0, 2.0]])}
+        out = get_batch_interface_x(batch, torch.device("cpu"), use_per_sample_interface=True)
+        assert out is None
+
+    def test_returns_slot2_when_flag_on(self):
+        """interfaces: flag on AND slot 2 present -> per-sample interface_x vector."""
+        batch = {"T_stats": torch.tensor([[1.0, 2.0, 0.3], [1.0, 2.0, 0.7]])}
+        out = get_batch_interface_x(batch, torch.device("cpu"), use_per_sample_interface=True)
+        assert out is not None
+        assert torch.equal(out, torch.tensor([0.3, 0.7]))
+
+    def test_returns_none_when_no_t_stats(self):
+        out = get_batch_interface_x({}, torch.device("cpu"), use_per_sample_interface=True)
+        assert out is None
 
 
 # ===================== build_interface_mask =====================

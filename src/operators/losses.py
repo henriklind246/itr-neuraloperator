@@ -47,6 +47,9 @@ class SpatiallyWeightedMSE(nn.Module):
         Nx = len(x_grid)
         Ny = len(y_grid)
 
+        self.interface_half_width = float(interface_half_width)
+        self.interface_weight = float(interface_weight)
+
         raw = np.ones((Nx, Ny), dtype=np.float32)
         x_mask = np.abs(x_grid - interface_x) <= interface_half_width
         raw[x_mask, :] = interface_weight
@@ -58,15 +61,80 @@ class SpatiallyWeightedMSE(nn.Module):
         weight_tensor = torch.from_numpy(raw).reshape(1, Nx, Ny, 1)
         self.register_buffer("weights", weight_tensor)
 
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # 1D x-grid kept on-device so per-sample weights can be built from a
+        # batch of interface locations (interfaces benchmark).
+        x_grid_t = torch.from_numpy(np.asarray(x_grid, dtype=np.float32))
+        self.register_buffer("x_grid_t", x_grid_t)
+
+    def forward(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        interface_x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute weighted MSE: mean(weights * (y_pred - y_true)^2).
 
         Parameters
         ----------
         y_pred, y_true : torch.Tensor
             Shape (B, Nx, Ny, 1).
+        interface_x : torch.Tensor or None
+            Per-sample interface locations, shape (B,). When None, the fixed
+            weight band baked at construction is used. When provided, a per-sample
+            band centered on each ``interface_x`` is built and normalized to mean
+            1.0 per sample.
         """
-        return torch.mean(self.weights * (y_pred - y_true) ** 2)
+        if interface_x is None:
+            return torch.mean(self.weights * (y_pred - y_true) ** 2)
+
+        band = build_interface_band(
+            self.x_grid_t, interface_x, self.interface_half_width
+        )  # (B, Nx) bool
+        raw = 1.0 + (self.interface_weight - 1.0) * band.to(y_pred.dtype)  # (B, Nx)
+        w = raw / raw.mean(dim=1, keepdim=True)  # mean-1 per sample
+        w = w.reshape(w.shape[0], w.shape[1], 1, 1)  # (B, Nx, 1, 1)
+        return torch.mean(w * (y_pred - y_true) ** 2)
+
+
+def build_interface_band(
+    x_grid_t: torch.Tensor,
+    interface_x: torch.Tensor,
+    half_width: float,
+) -> torch.Tensor:
+    """Return per-sample interface band, shape (B, Nx), bool.
+
+    True where ``|x - interface_x| <= half_width``.
+
+    Parameters
+    ----------
+    x_grid_t : torch.Tensor
+        1D spatial grid along x, shape (Nx,).
+    interface_x : torch.Tensor
+        Per-sample interface locations, shape (B,).
+    half_width : float
+        Half-width of the band in x-coordinates.
+    """
+    x = x_grid_t.reshape(1, -1)  # (1, Nx)
+    centers = interface_x.reshape(-1, 1).to(x.dtype)  # (B, 1)
+    return (torch.abs(x - centers) <= half_width)
+
+
+def get_batch_interface_x(
+    batch: dict,
+    device: torch.device,
+    *,
+    use_per_sample_interface: bool,
+) -> torch.Tensor | None:
+    """Return per-sample interface locations from a batch, or None.
+
+    Gating is intentionally by the explicit ``use_per_sample_interface`` flag AND
+    the presence of a third T_stats column (slot 2 = interface_x). ``source`` has
+    slot 2 = 0.5 always, so the flag (off for source) keeps it on the fixed path.
+    """
+    t_stats = batch.get("T_stats", None)
+    if use_per_sample_interface and t_stats is not None and t_stats.shape[1] > 2:
+        return t_stats[:, 2].to(device)
+    return None
 
 
 def build_interface_mask(

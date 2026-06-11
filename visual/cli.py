@@ -761,6 +761,34 @@ def main():
                 else:
                     _print_skip(name, "need --records (or --csv) pointing to test_records.csv")
 
+        tail_plot_names = ("forcing_tail_errors", "source_tail_errors", "interfaces_tail_errors")
+        for name in tail_plot_names:
+            if _should_run(name, groups, individual):
+                if active_records is not None:
+                    print(f"--- {name} ---")
+                    paper_plots.plot_benchmark_tail_errors(
+                        active_records, save_path=paper_dir / f"{name}.png")
+                else:
+                    _print_skip(name, "need --records (or --csv) pointing to test_records.csv")
+
+        # tail_summary.csv is decoupled from plot selection: write it whenever
+        # single-records data is available, keyed by the benchmark in the records.
+        if active_records is not None and int(active_records.get("_n", 0)) > 0:
+            uniq = sorted({str(v) for v in active_records["benchmark"]}) \
+                if "benchmark" in active_records else []
+            if len(uniq) > 1:
+                records_by_benchmark = {
+                    bm: paper_plots._slice_records(
+                        active_records, paper_plots._mask_in(active_records["benchmark"], bm))
+                    for bm in uniq
+                }
+            else:
+                records_by_benchmark = {(uniq[0] if uniq else "all"): active_records}
+            paper_dir.mkdir(parents=True, exist_ok=True)
+            out_csv = paper_plots.write_tail_summary(
+                records_by_benchmark, paper_dir / "tail_summary.csv")
+            print(f"Wrote tail summary to: {out_csv}")
+
         prediction_plots = {
             "forcing_prediction_truth_residual": paper_plots.plot_forcing_prediction_truth_residual,
             "source_prediction_truth_residual": paper_plots.plot_source_prediction_truth_residual,
@@ -814,22 +842,32 @@ def main():
                             fn(model, ds, active_records, plot_config, solver_dt,
                                save_path=paper_dir / f"{name}.png")
 
+        csv_map = {
+            "forcing": args.records_forcing,
+            "source": args.records_source,
+            "interfaces": args.records_interfaces,
+        }
+        supplied = {name: path for name, path in csv_map.items() if path}
+        combined_records = {
+            name: paper_plots._load_test_records(path) for name, path in supplied.items()
+        }
+
         if _should_run("all_benchmarks_error_summary", groups, individual):
-            csv_map = {
-                "forcing": args.records_forcing,
-                "source": args.records_source,
-                "interfaces": args.records_interfaces,
-            }
             if all(csv_map.values()):
                 print("--- all_benchmarks_error_summary ---")
-                records_by_benchmark = {
-                    name: paper_plots._load_test_records(path) for name, path in csv_map.items()
-                }
                 paper_plots.plot_all_benchmarks_error_summary(
-                    records_by_benchmark, save_path=paper_dir / "all_benchmarks_error_summary.png")
+                    combined_records, save_path=paper_dir / "all_benchmarks_error_summary.png")
             else:
                 _print_skip("all_benchmarks_error_summary",
                             "need --records-forcing, --records-source, --records-interfaces")
+
+        # In combined mode, write one tail_summary.csv covering whichever
+        # benchmark CSVs were supplied, regardless of which plots were requested.
+        if combined_records:
+            paper_dir.mkdir(parents=True, exist_ok=True)
+            out_csv = paper_plots.write_tail_summary(
+                combined_records, paper_dir / "tail_summary.csv")
+            print(f"Wrote tail summary to: {out_csv}")
 
         if _should_run("all_benchmarks_prediction_truth_residual", groups, individual):
             _print_skip(

@@ -424,6 +424,101 @@ class TestEncoderOffDictBatch:
         assert isinstance(val_iface, float) and val_iface >= 0
 
 
+# ===================== per-sample interface metric =====================
+
+class TestPerSampleInterfaceMetric:
+    """interfaces benchmark: loss/metric follow each sample's interface_x."""
+
+    def _setup(self, interface_x_value=0.5, n=4, Nx=11, Ny=11):
+        model = _make_tiny_fno()
+        x_spatial = torch.randn(n, Nx, Ny, SPATIAL_IN_CHANNELS)
+        cond_static = torch.rand(n, COND_STATIC_DIM)
+        forcing_seq = torch.randn(n, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        Y = torch.randn(n, Nx, Ny, 1)
+        # 3-column T_stats: [mu, sigma, interface_x] (interfaces/source schema)
+        T_stats = torch.stack(
+            [torch.zeros(n), torch.ones(n), torch.full((n,), float(interface_x_value))],
+            dim=-1,
+        )
+        loader = DataLoader(
+            TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
+            batch_size=2,
+            collate_fn=_dict_collate,
+        )
+        x_grid = np.linspace(0.0, 1.0, Nx).astype(np.float32)
+        y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
+        loss_fn = SpatiallyWeightedMSE(
+            x_grid, y_grid, interface_x=0.5, interface_half_width=0.05, interface_weight=1.0
+        )
+        iface_mask = build_interface_mask(x_grid, y_grid, 0.5, 0.05)
+        return model, loader, loss_fn, iface_mask, torch.from_numpy(x_grid)
+
+    def test_validate_persample_matches_fixed_when_all_half(self):
+        """All interface_x == 0.5: per-sample band metric equals the fixed-mask metric."""
+        model, loader, _, iface_mask, x_grid_t = self._setup(0.5)
+        device = torch.device("cpu")
+        _, fixed = validate(model, loader, device, iface_mask=iface_mask)
+        _, dyn = validate(
+            model, loader, device, iface_mask=iface_mask,
+            x_grid_t=x_grid_t, interface_half_width=0.05, use_per_sample_interface=True,
+        )
+        assert dyn == pytest.approx(fixed, rel=1e-5)
+
+    def test_validate_persample_differs_when_off_center(self):
+        """interface_x == 0.2 must drive the metric off the fixed x=0.5 band."""
+        model, loader, _, iface_mask, x_grid_t = self._setup(0.2)
+        device = torch.device("cpu")
+        _, fixed = validate(model, loader, device, iface_mask=iface_mask)
+        _, dyn = validate(
+            model, loader, device, iface_mask=iface_mask,
+            x_grid_t=x_grid_t, interface_half_width=0.05, use_per_sample_interface=True,
+        )
+        assert dyn != pytest.approx(fixed, rel=1e-6)
+
+    def test_train_one_epoch_persample_matches_fixed_when_all_half(self):
+        """lr=0 freezes params: per-sample masked-sum metric == boolean-slice metric at 0.5."""
+        model, loader, loss_fn, iface_mask, _ = self._setup(0.5)
+        device = torch.device("cpu")
+        opt = torch.optim.SGD(model.parameters(), lr=0.0)
+        _, _, fixed = train_one_epoch(
+            model, loader, opt, loss_fn, device,
+            iface_mask=iface_mask, use_per_sample_interface=False,
+        )
+        _, _, dyn = train_one_epoch(
+            model, loader, opt, loss_fn, device,
+            iface_mask=iface_mask, use_per_sample_interface=True,
+        )
+        assert dyn == pytest.approx(fixed, rel=1e-5)
+
+
+# ===================== per-sample interface config flag =====================
+
+class TestPerSampleInterfaceConfig:
+    """Guard the config gating so a refactor can't silently disable the fix."""
+
+    def _load_loss_cfg(self, rel):
+        import yaml
+        path = Path(__file__).resolve().parents[1] / rel
+        with path.open(encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        return cfg["training"]["loss"]
+
+    def test_interfaces_enables_per_sample(self):
+        assert self._load_loss_cfg("conf/benchmark/interfaces.yaml")["per_sample_interface_x"] is True
+
+    def test_forcing_disables_per_sample(self):
+        assert self._load_loss_cfg("conf/benchmark/forcing.yaml")["per_sample_interface_x"] is False
+
+    def test_source_disables_per_sample(self):
+        assert self._load_loss_cfg("conf/benchmark/source.yaml")["per_sample_interface_x"] is False
+
+    def test_code_default_off_keeps_fixed_path(self):
+        """Code default (flag off) returns None even when slot 2 exists (source case)."""
+        from src.operators.losses import get_batch_interface_x
+        batch = {"T_stats": torch.tensor([[0.0, 1.0, 0.5]])}
+        assert get_batch_interface_x(batch, torch.device("cpu"), use_per_sample_interface=False) is None
+
+
 # ===================== RIGNO scheduler =====================
 
 class TestRIGNOThreePhaseSchedule:
