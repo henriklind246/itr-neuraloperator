@@ -18,6 +18,7 @@ from visual import (
     paper_plots,
     physics_plots,
     resinv_plots,
+    rollout_plots,
     sweep_plots,
     training_plots,
 )
@@ -69,6 +70,12 @@ def main():
                         help="Directory with seed_report_r<N>.json files (resolution_invariance)")
     parser.add_argument("--resinv-root", type=str, default=None,
                         help="Directory with fv_drift_baseline.json (resolution_invariance overlay)")
+    parser.add_argument("--rollout-run-root", type=str, default=None,
+                        help="Config dir with *eval.json reports (rollout_partition_error)")
+    parser.add_argument("--rollout-report-glob", type=str, default="*eval*.json",
+                        help="Glob for rollout eval reports under --rollout-run-root")
+    parser.add_argument("--rollout-allow-missing", action="store_true",
+                        help="Plot NaN for rollout reports missing a required metric")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint (for interface_error plot)")
     parser.add_argument("--breakdown", type=str, default=None,
@@ -83,7 +90,7 @@ def main():
                         help="Path to interfaces test_records.csv (combined paper figures)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
-                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv"],
+                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout"],
                         help="Which plot group(s) to generate (default: all)")
     parser.add_argument("--plots", type=str, nargs="+", default=None,
                         help="Individual plot names to generate (overrides --group)")
@@ -929,6 +936,20 @@ def main():
             )
         else:
             _print_skip("resolution_invariance", "need --resinv-run-root")
+
+    # ---- ROLLOUT GROUP ----
+    if _should_run("rollout_partition_error", groups, individual):
+        print("=== ROLLOUT GROUP ===")
+        if args.rollout_run_root:
+            print("--- rollout_partition_error ---")
+            rollout_plots.plot_rollout_partition_error(
+                run_root=args.rollout_run_root,
+                report_glob=args.rollout_report_glob,
+                allow_missing=args.rollout_allow_missing,
+                save_path=out_dir / "rollout" / "rollout_partition_error.png",
+            )
+        else:
+            _print_skip("rollout_partition_error", "need --rollout-run-root")
 
     print(f"\nAll requested plots saved to: {out_dir}")
 

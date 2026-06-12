@@ -331,9 +331,9 @@ def plot_forcing_bin_encoding(
     `Q_y_bin_0..15` channels in the spatial input tensor (before weighting
     by `s(y) / q_ref`).
 
-    Sanity expectation: `sin` panel can show negative bins; `exp`,
-    `pulse_train`, `exp_train` panels show non-negative bins by
-    construction.
+    Sanity expectation: the `sin` family is half-wave rectified and should not
+    show negative bins. Train families can be signed if configured with
+    negative amplitudes.
     """
     if t_j is None:
         t_j = t_off

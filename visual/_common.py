@@ -94,9 +94,11 @@ PLOT_REGISTRY: dict[str, str] = {
     "forcing_tail_errors":                      "paper",
     "source_tail_errors":                       "paper",
     "interfaces_tail_errors":                   "paper",
+    # group: rollout
+    "rollout_partition_error":                  "rollout",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv"}
+GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout"}
 
 PLOT_STYLE = {
     "font.size": 10,

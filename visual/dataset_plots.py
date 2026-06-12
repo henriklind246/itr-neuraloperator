@@ -98,7 +98,7 @@ def _forcing_label(params: dict) -> str:
     fam = params.get("temporal_family", "?")
     tp = params.get("temporal_params", {})
     if fam == "sin":
-        return f"sin A={tp['A']:.0f} f={tp['f']:.2f}"
+        return f"rectified sin A={tp['A']:.0f} f={tp['f']:.2f}"
     if fam == "exp":
         return f"exp A={tp['A']:.0f} t0={tp['t0']:.2f} tau={tp['tau']:.3f}"
     if fam in ("pulse_train", "exp_train"):
@@ -3524,7 +3524,7 @@ def plot_sin_forcing_profiles(
     dt: float = 0.005,
     save_path: str | Path | None = None,
 ):
-    """Visualize the windowed-sinusoid forcing space (sin-only experiment).
+    """Visualize the half-wave-rectified windowed-sinusoid forcing space.
 
     Mirrors ``plot_interface_flux_profiles`` but focused on the sin family
     alone. Shows a(t) at four (A, f) corners, the uniform spatial profile, and
