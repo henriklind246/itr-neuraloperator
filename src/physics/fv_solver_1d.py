@@ -16,7 +16,19 @@ def ic(x : np.ndarray,  a: float, b: float) -> np.ndarray:
     return np.cos((np.pi*x)/(2*L)) + 0.1*np.sin((np.pi*x)/L)
 
 # create sinusoid function with a Tukey (tapered cosine) window
-def windowed_sin_flux(f : float, A : float, t_on : float, t_off: float, phase = 0.0, tukey_alpha: float = 0.5):
+def windowed_sin_flux(
+        f: float,
+        A: float,
+        t_on: float,
+        t_off: float,
+        phase=0.0,
+        tukey_alpha: float = 0.5,
+        rectified: bool = True,
+):
+    """Tukey-windowed half-wave-rectified sinusoidal heat flux."""
+    if not rectified:
+        raise ValueError("windowed_sin_flux now supports only rectified=True.")
+
     def q(t):
         if t < t_on or t > t_off:
             return 0.0
@@ -31,13 +43,58 @@ def windowed_sin_flux(f : float, A : float, t_on : float, t_off: float, phase = 
             w = 0.5 * (1 + np.cos(2 * np.pi * (tau - 1 + tukey_alpha / 2) / tukey_alpha))
         else:
             w = 1.0
-        return w * A * np.sin(2 * np.pi * f * t + phase)
+        return w * A * max(np.sin(2 * np.pi * f * t + phase), 0.0)
     return q
 
 def compute_dt(h : float, alpha_val : float, lam : float, flux_frequency : float) -> float:
    rule_a = (lam * h**2) / alpha_val
    rule_b = np.inf if flux_frequency <= 0.0 else 1.0 /(20.0 * flux_frequency)
    return min(rule_a, rule_b)
+
+
+def compute_dt_2d(h: float, alpha_val: float, lam: float, flux_frequency: float) -> float:
+   """Raw 2D equal-spacing diffusion timestep heuristic.
+
+   This is an accuracy/data-resolution heuristic for Crank-Nicolson, not a
+   stability requirement. Interface contact resistance is intentionally excluded.
+   """
+   rule_a = (lam * h**2) / (2.0 * alpha_val)
+   rule_b = np.inf if flux_frequency <= 0.0 else 1.0 /(20.0 * flux_frequency)
+   return min(rule_a, rule_b)
+
+
+def build_time_grid(
+        t_final: float,
+        dt: float,
+        *,
+        explicit_dt: bool,
+        tol: float = 1e-12,
+) -> tuple[float, np.ndarray]:
+    """Resolve a timestep and exact final-time grid.
+
+    Explicit dt must divide t_final. Heuristic-computed dt is treated as a
+    maximum allowed step and adjusted downward so t_final is reached exactly.
+    """
+    t_final = float(t_final)
+    dt = float(dt)
+    if not np.isfinite(t_final) or t_final <= 0.0:
+        raise ValueError(f"t_final must be finite and > 0, got {t_final}.")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be finite and > 0, got {dt}.")
+
+    ratio = t_final / dt
+    if explicit_dt:
+        Nt = int(round(ratio))
+        if Nt < 1 or not np.isclose(ratio, Nt, atol=tol, rtol=tol):
+            raise ValueError(
+                f"Explicit dt={dt} does not divide t_final={t_final}; "
+                f"t_final/dt={ratio}."
+            )
+    else:
+        Nt = max(1, int(np.ceil(ratio - tol)))
+
+    actual_dt = t_final / Nt
+    return actual_dt, np.linspace(0.0, t_final, Nt + 1)
 
 # data for creating a generic layer in 1D
 @dataclass(frozen=True)
@@ -155,13 +212,16 @@ class FVSolver1D:
         alpha_nodes = self.k_nodes / (self.rho_nodes * self.cp_nodes)
         alpha_max = float(np.max(alpha_nodes))
 
-        # allow for dt to be passed int explicitly
+        # allow for dt to be passed in explicitly
         if dt is not None:
-            self.dt = float(dt)
+            self.dt, self.t = build_time_grid(
+                t_final, dt, explicit_dt=True, tol=self.tol
+            )
         else:
-            self.dt = compute_dt(self.h, alpha_max, self.lam_target, self.flux_f)
-
-        self.t = (np.arange(0.0, t_final + 1e-12, self.dt))  # + 1e-12 because np.arnage() does NOT include the stop point
+            dt_raw = compute_dt(self.h, alpha_max, self.lam_target, self.flux_f)
+            self.dt, self.t = build_time_grid(
+                t_final, dt_raw, explicit_dt=False, tol=self.tol
+            )
 
         # -------- LOCAL CN COEFFICIENTS ------
         self.r_minus, self.r_plus = self._build_local_cn_coefficients()
@@ -238,6 +298,15 @@ class FVSolver1D:
 
             if face_idx < 0 or face_idx > self.N - 2:
                 raise ValueError(f"Computed face index {face_idx} out of range for interface x={x_int}")
+
+            if face_idx in interface_face_map:
+                prev_left, prev_right = interface_face_map[face_idx]
+                prev_x = self.interface_positions[prev_left]
+                raise ValueError(
+                    f"Multiple interfaces map to face slot {face_idx}: "
+                    f"x={prev_x} layers {prev_left}/{prev_right} and "
+                    f"x={x_int} layers {j}/{j + 1}."
+                )
 
             interface_face_map[face_idx] = (j, j+1)
 

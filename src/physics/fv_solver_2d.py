@@ -5,7 +5,8 @@ from scipy.sparse.linalg import splu
 from src.physics.fv_solver_1d import (
     Layer1D,
     windowed_sin_flux,
-    compute_dt,
+    compute_dt_2d,
+    build_time_grid,
 )
 
 # ---------- SOLVER RESTRICTIONS -----------
@@ -199,11 +200,14 @@ class FVSolver2D:
         alpha_max = float(np.max(alpha_nodes))
 
         if dt is not None:
-            self.dt = float(dt)
+            self.dt, self.t = build_time_grid(
+                t_final, dt, explicit_dt=True, tol=self.tol
+            )
         else:
-            self.dt = compute_dt(self.hx, alpha_max, self.lam_target, self.flux_f)
-
-        self.t = np.arange(0.0, t_final + 1e-12, self.dt)
+            dt_raw = compute_dt_2d(self.hx, alpha_max, self.lam_target, self.flux_f)
+            self.dt, self.t = build_time_grid(
+                t_final, dt_raw, explicit_dt=False, tol=self.tol
+            )
 
         # -------- CN COEFFICIENTS --------
         self.r_w, self.r_e, self.r_s, self.r_n = (
@@ -309,6 +313,15 @@ class FVSolver2D:
                 raise ValueError(
                     f"Interface x={x_int} is too close to a node "
                     f"(h_L={h_L}, h_R={h_R})."
+                )
+
+            if face_idx in interface_face_map:
+                prev_left, prev_right = interface_face_map[face_idx]
+                prev_x = self.interface_positions[prev_left]
+                raise ValueError(
+                    f"Multiple interfaces map to face slot {face_idx}: "
+                    f"x={prev_x} layers {prev_left}/{prev_right} and "
+                    f"x={x_int} layers {j}/{j + 1}."
                 )
 
             # after validation, create face map and dict of interface offsets
@@ -735,4 +748,3 @@ if __name__ == '__main__':
     print(f"T_final shape: {T_final.shape}")
     print(f"interface positions: {sim.interface_positions}")
     print(f"interface face map: {sim.interface_face_map}")
-
