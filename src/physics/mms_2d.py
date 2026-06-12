@@ -620,7 +620,7 @@ def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float
     rho, cp, k = 1.0, 1.0, 1.0
 
     # omega=6*pi keeps the CN temporal truncation above the spatial error floor
-    # at N=201 across dt in [0.04, 0.02, 0.01], so the temporal study is not
+    # at N=201 across dt in [0.037, 0.0185, 0.00925], so the temporal study is not
     # contaminated by spatial error (the solution amplitude here is small).
     omega = 6.0 * np.pi
     kappa = np.pi / Ly
@@ -981,7 +981,7 @@ if __name__ == '__main__':
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_y_independent([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_y_independent([0.02, 0.01, 0.005])
+    p = time_order_test_y_independent([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== Full 2D MMS ===")
@@ -989,7 +989,7 @@ if __name__ == '__main__':
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_2d([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_2d([0.02, 0.01, 0.005])
+    p = time_order_test_2d([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== y-dependent Left-Flux MMS (vector q_left) ===")
@@ -997,7 +997,7 @@ if __name__ == '__main__':
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_2d_yflux([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_2d_yflux([0.02, 0.01, 0.005])
+    p = time_order_test_2d_yflux([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== x-linear MMS (isolates y-Laplacian) ===")
@@ -1005,13 +1005,13 @@ if __name__ == '__main__':
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_x_linear([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_x_linear([0.02, 0.01, 0.005])
+    p = time_order_test_x_linear([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== Smooth-Forcing Integral MMS (temporal only) ===")
     h, dt, me, l2 = run_mms_2d_smooth_forcing_integral(N=101)
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
-    p = time_order_test_2d_smooth_forcing_integral([0.02, 0.01, 0.005])
+    p = time_order_test_2d_smooth_forcing_integral([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Interface MMS ===")
@@ -1019,7 +1019,7 @@ if __name__ == '__main__':
     print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_2d_interface([50, 100, 200])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_2d_interface([0.02, 0.01, 0.005])
+    p = time_order_test_2d_interface([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Off-Center Interface MMS (x_I=0.4734) ===")
@@ -1027,7 +1027,7 @@ if __name__ == '__main__':
     print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_2d_off_center_interface([50, 100, 200])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005])
+    p = time_order_test_2d_off_center_interface([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Near-Node Interface MMS (h_min/hx=0.01) ===")
@@ -1035,7 +1035,7 @@ if __name__ == '__main__':
     print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_2d_near_node_interface([50, 100, 200])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_2d_near_node_interface([0.02, 0.01, 0.005])
+    p = time_order_test_2d_near_node_interface([0.0185, 0.00925, 0.004625])
     print(f"Temporal order: {p:.3f}")
 
     print("\n=== 2D Patch Source MMS ===")
@@ -1043,5 +1043,5 @@ if __name__ == '__main__':
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
     p = space_order_test_2d_patch_source([21, 41, 81, 161])
     print(f"Spatial order: {p:.3f}")
-    p = time_order_test_2d_patch_source([0.04, 0.02, 0.01])
+    p = time_order_test_2d_patch_source([0.037, 0.0185, 0.00925])
     print(f"Temporal order: {p:.3f}")

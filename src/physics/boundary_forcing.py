@@ -7,8 +7,9 @@ Separable left-boundary forcing q_L(y, t) = a(t) * s(y).
 Spatial families: uniform, patch, gaussian, triangle. Each is normalized so
 max_y s(y) = 1 analytically.
 
-Temporal families: sin (windowed sinusoid), exp (single exponential decay),
-pulse_train (rectangular pulse train), exp_train (exponential pulse train).
+Temporal families: sin (Tukey-windowed half-wave-rectified sinusoid), exp
+(single exponential decay), pulse_train (rectangular pulse train), exp_train
+(exponential pulse train).
 
 Sampling lives here, not in the solver. `build_qL` returns a callable
 q_left(t) that the solver consumes via `q_left_fn`.
@@ -41,6 +42,17 @@ NP_CHOICES = (1, 2, 3, 4)
 NP_MAX = 4
 PULSE_SLOTS = 4
 FORCING_BINS = 16
+SIN_INTEGRAL_SAMPLES = 2049
+
+# Startup ramp on a(t) so q_L(0) = 0 (consistent with a zero left gradient at
+# t=0). `ramp_seconds` is a physical dataset parameter persisted with the data;
+# `default_ramp_seconds` is only the fallback initializer. 2*dt stays well under
+# the shortest sampled pulse width (5*dt), so whole pulses are not swallowed.
+RAMP_DT_MULT = 2.0
+
+
+def default_ramp_seconds(dt: float) -> float:
+    return RAMP_DT_MULT * float(dt)
 
 # -------- SPATIAL PROFILE FUNCTIONS -----
 
@@ -67,8 +79,10 @@ SPATIAL_BUILDERS = {
 # -------- TEMPORAL FORCING FUNCTIONS ----------
 
 def temporal_sin(A: float, f: float, t_on: float, t_off: float,
-                 phase: float = 0.0, tukey_alpha: float = 0.5):
-    return windowed_sin_flux(f, A, t_on, t_off, phase, tukey_alpha)
+                 phase: float = 0.0, tukey_alpha: float = 0.5,
+                 rectified: bool = True):
+    """Tukey-windowed half-wave-rectified sinusoidal temporal forcing."""
+    return windowed_sin_flux(f, A, t_on, t_off, phase, tukey_alpha, rectified=rectified)
 
 def temporal_exp(A: float, t0: float, tau: float):
     def q(t):
@@ -121,9 +135,9 @@ def integrate_temporal(
 
     if temporal_family == "sin":
         q = temporal_sin(**temporal_params)
-        t = np.linspace(t_lo, t_hi, 65)
+        t = np.linspace(t_lo, t_hi, SIN_INTEGRAL_SAMPLES)
         values = np.array([q(float(tn)) for tn in t], dtype=float)
-        return float(np.trapezoid(np.maximum(values, 0.0), t))
+        return float(_trapz(np.maximum(values, 0.0), t))
 
     if temporal_family == "exp":
         A = float(temporal_params["A"])
@@ -201,7 +215,7 @@ def integrate_temporal_signed(
 
     if temporal_family == "sin":
         q = temporal_sin(**temporal_params)
-        t = np.linspace(t_lo, t_hi, 65)
+        t = np.linspace(t_lo, t_hi, SIN_INTEGRAL_SAMPLES)
         values = np.array([q(float(tn)) for tn in t], dtype=float)
         return float(_trapz(values, t))
 
@@ -262,26 +276,143 @@ def integrate_temporal_bins_signed(
         dtype=float,
     )
 
+# --------- STARTUP RAMP (q_L(0) = 0) ----------
+
+def ramp_envelope(t, t_ramp: float):
+    """Smoothstep startup envelope: 0 at t=0, 1 for t >= t_ramp, monotone.
+
+    `t` may be scalar or array. For t_ramp <= 0 the envelope is identically 1.
+    """
+    t_ramp = float(t_ramp)
+    if t_ramp <= 0.0:
+        return np.ones_like(np.asarray(t, dtype=float)) if np.ndim(t) else 1.0
+    s = np.clip(np.asarray(t, dtype=float) / t_ramp, 0.0, 1.0)
+    env = 3.0 * s ** 2 - 2.0 * s ** 3
+    return env if np.ndim(t) else float(env)
+
+
+def ramped_temporal(temporal_family: str, temporal_params: dict, t_ramp: float):
+    """Return a(t) callable with the startup ramp applied: ramp(t) * a(t)."""
+    a_fn = TEMPORAL_BUILDERS[temporal_family](**temporal_params)
+
+    def a_ramped(t):
+        return ramp_envelope(t, t_ramp) * a_fn(t)
+
+    return a_ramped
+
+
+def _integrate_ramp_window(a_fn, t_lo: float, t_hi: float, t_ramp: float) -> float:
+    """Numerically integrate ramp_envelope(t) * a_fn(t) over [t_lo, t_hi].
+
+    Used only inside the ramp window [0, t_ramp]; this interval is ~2*dt wide,
+    so a fine quadrature is cheap. Uses scipy.integrate.quad when available,
+    falling back to a fine trapezoid otherwise.
+    """
+    if t_hi <= t_lo:
+        return 0.0
+
+    def integrand(t):
+        return ramp_envelope(t, t_ramp) * a_fn(t)
+
+    try:
+        from scipy.integrate import quad
+        val, _ = quad(integrand, float(t_lo), float(t_hi), limit=100)
+        return float(val)
+    except Exception:
+        t = np.linspace(float(t_lo), float(t_hi), 1025)
+        values = np.array([integrand(float(tn)) for tn in t], dtype=float)
+        return float(_trapz(values, t))
+
+
+def integrate_temporal_ramped_signed(
+    temporal_family: str,
+    temporal_params: dict,
+    t_lo: float,
+    t_hi: float,
+    t_ramp: float,
+) -> float:
+    """Signed integral of ramp_envelope(t) * a(t) over [t_lo, t_hi].
+
+    Split at t_ramp: numerical quadrature over the ramp window (where the
+    envelope is nontrivial) plus the exact analytic `integrate_temporal_signed`
+    beyond t_ramp (where the envelope is identically 1).
+    """
+    t_lo = float(t_lo)
+    t_hi = float(t_hi)
+    t_ramp = float(t_ramp)
+    if t_hi <= t_lo:
+        return 0.0
+    if t_ramp <= 0.0:
+        return integrate_temporal_signed(temporal_family, temporal_params, t_lo, t_hi)
+
+    total = 0.0
+    # Ramp window [t_lo, min(t_hi, t_ramp)] uses quadrature.
+    hi_r = min(t_hi, t_ramp)
+    if hi_r > t_lo:
+        a_fn = TEMPORAL_BUILDERS[temporal_family](**temporal_params)
+        total += _integrate_ramp_window(a_fn, t_lo, hi_r, t_ramp)
+    # Beyond the ramp the envelope is 1: exact analytic integral.
+    lo_a = max(t_lo, t_ramp)
+    if t_hi > lo_a:
+        total += integrate_temporal_signed(temporal_family, temporal_params, lo_a, t_hi)
+    return float(total)
+
+
+def integrate_temporal_bins_ramped_signed(
+    temporal_family: str,
+    temporal_params: dict,
+    t_s: float,
+    t_j: float,
+    t_ramp: float,
+    K: int = FORCING_BINS,
+) -> np.ndarray:
+    edges = np.linspace(float(t_s), float(t_j), int(K) + 1)
+    return np.array(
+        [
+            integrate_temporal_ramped_signed(
+                temporal_family, temporal_params, edges[k], edges[k + 1], t_ramp
+            )
+            for k in range(int(K))
+        ],
+        dtype=float,
+    )
+
 # --------- SAMPLER FUNCTIONS ----------
 
-def sample_uniform_params(rng: np.random.Generator) -> dict:
+def sample_uniform_params(rng: np.random.Generator, **_unused) -> dict:
     return {}
 
-def sample_patch_params(rng: np.random.Generator) -> dict:
-    w = float(rng.uniform(*PATCH_W_RANGE))
-    y_c = float(rng.uniform(0.5 * w, 1.0 - 0.5 * w))
+def _span(c: float, d: float) -> float:
+    span = float(d) - float(c)
+    if span <= 0.0:
+        raise ValueError(f"Expected d > c for y-domain, got c={c}, d={d}.")
+    return span
+
+
+def _scale_interval(frac_range: tuple[float, float], c: float, d: float) -> tuple[float, float]:
+    span = _span(c, d)
+    return float(c) + frac_range[0] * span, float(c) + frac_range[1] * span
+
+
+def sample_patch_params(rng: np.random.Generator, c: float = 0.0, d: float = 1.0) -> dict:
+    span = _span(c, d)
+    w = float(rng.uniform(*PATCH_W_RANGE)) * span
+    y_c = float(rng.uniform(float(c) + 0.5 * w, float(d) - 0.5 * w))
     return {"y_c": y_c, "w": w}
 
-def sample_gauss_params(rng: np.random.Generator) -> dict:
+def sample_gauss_params(rng: np.random.Generator, c: float = 0.0, d: float = 1.0) -> dict:
+    span = _span(c, d)
     lo, hi = GAUSS_SIGMA_RANGE
     u = rng.uniform(0.0, 1.0)
-    sigma_y = float(lo * (hi / lo) ** u)
-    y_c = float(rng.uniform(*GAUSS_CENTER_RANGE))
+    sigma_y = float(lo * (hi / lo) ** u) * span
+    y_lo, y_hi = _scale_interval(GAUSS_CENTER_RANGE, c, d)
+    y_c = float(rng.uniform(y_lo, y_hi))
     return {"y_c": y_c, "sigma_y": sigma_y}
 
-def sample_triangle_params(rng: np.random.Generator) -> dict:
-    ell = float(rng.uniform(*TRIANGLE_ELL_RANGE))
-    y_c = float(rng.uniform(ell, 1.0 - ell))
+def sample_triangle_params(rng: np.random.Generator, c: float = 0.0, d: float = 1.0) -> dict:
+    span = _span(c, d)
+    ell = float(rng.uniform(*TRIANGLE_ELL_RANGE)) * span
+    y_c = float(rng.uniform(float(c) + ell, float(d) - ell))
     return {"y_c": y_c, "ell": ell}
 
 SPATIAL_SAMPLERS = {
@@ -299,7 +430,7 @@ def sample_sin_params(rng: np.random.Generator, dt: float, t_final: float,
     u = rng.uniform(0.0, 1.0)
     f = float(lo * (hi / lo) ** u)
     return {"A": A, "f": f, "t_on": t_on, "t_off": t_off,
-            "phase": phase, "tukey_alpha": tukey_alpha}
+            "phase": phase, "tukey_alpha": tukey_alpha, "rectified": True}
 
 def sample_exp_params(rng: np.random.Generator, dt: float, t_final: float,
                       **_unused) -> dict:
@@ -379,15 +510,15 @@ def sample_temporal_family(rng: np.random.Generator,
 
 def build_qL(temporal_family: str, temporal_params: dict,
              spatial_family: str, spatial_params: dict,
-             y_grid: np.ndarray):
+             y_grid: np.ndarray, t_ramp: float = 0.0):
     """
     Build a callable q_left(t) -> (Ny,) and return the static spatial profile.
 
     `temporal_params` keys must match `TEMPORAL_BUILDERS[temporal_family]`
     signature exactly. The samplers in `TEMPORAL_SAMPLERS` produce the
-    canonical schema.
+    canonical schema. `t_ramp > 0` applies the startup ramp so q_L(0) = 0.
     """
-    a_fn = TEMPORAL_BUILDERS[temporal_family](**temporal_params)
+    a_fn = ramped_temporal(temporal_family, temporal_params, t_ramp)
     s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
     s_vec = np.asarray(s_vec, dtype=float)
 
@@ -399,18 +530,20 @@ def build_qL(temporal_family: str, temporal_params: dict,
 
 def build_qL_integral(temporal_family: str, temporal_params: dict,
                       spatial_family: str, spatial_params: dict,
-                      y_grid: np.ndarray):
+                      y_grid: np.ndarray, t_ramp: float = 0.0):
     """
     Build a callable q_left_integral(t_lo, t_hi) -> (Ny,) returning the exact signed
     time-integral of q_L(y, t) over [t_lo, t_hi]. Uses the separable structure
-    q_L(y, t) = a(t) * s(y), so the integral is integrate_temporal_signed(...) * s_vec.
+    q_L(y, t) = a(t) * s(y), so the integral is
+    integrate_temporal_ramped_signed(...) * s_vec. `t_ramp > 0` applies the
+    startup ramp so q_L(0) = 0.
     """
     s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
     s_vec = np.asarray(s_vec, dtype=float)
 
     def q_left_integral(t_lo, t_hi):
-        return integrate_temporal_signed(
-            temporal_family, temporal_params, t_lo, t_hi
+        return integrate_temporal_ramped_signed(
+            temporal_family, temporal_params, t_lo, t_hi, t_ramp
         ) * s_vec
 
     return q_left_integral, s_vec

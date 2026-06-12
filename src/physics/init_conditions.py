@@ -145,10 +145,23 @@ def sample_ic_family(rng: np.random.Generator,
 
 # -------- TAPER + WRAPPER --------
 
+def _smoothstep_window(dist: np.ndarray, edge_width: float) -> np.ndarray:
+    s = np.clip(dist / edge_width, 0.0, 1.0)
+    return 3.0 * s ** 2 - 2.0 * s ** 3
+
+
 def right_edge_taper(X: np.ndarray, b: float = 1.0,
                      edge_width: float = EDGE_TAPER_WIDTH) -> np.ndarray:
-    s = np.clip((b - X) / edge_width, 0.0, 1.0)
-    return 3.0 * s ** 2 - 2.0 * s ** 3
+    return _smoothstep_window(b - X, edge_width)
+
+
+def boundary_taper(X: np.ndarray, Y: np.ndarray,
+                   edge_width: float = EDGE_TAPER_WIDTH) -> np.ndarray:
+    x_lo, x_hi = X.min(), X.max()
+    y_lo, y_hi = Y.min(), Y.max()
+    wx = _smoothstep_window(X - x_lo, edge_width) * _smoothstep_window(x_hi - X, edge_width)
+    wy = _smoothstep_window(Y - y_lo, edge_width) * _smoothstep_window(y_hi - Y, edge_width)
+    return wx * wy
 
 
 def build_ic(ic_family: str, ic_params: dict,
@@ -157,7 +170,7 @@ def build_ic(ic_family: str, ic_params: dict,
              pin_right_edge: bool = True) -> np.ndarray:
     dev = IC_BUILDERS[ic_family](X, Y, **ic_params)
     if taper:
-        dev = dev * right_edge_taper(X, b=b)
+        dev = dev * boundary_taper(X, Y)
     T0 = (dev + T_right).astype(np.float32)
     if pin_right_edge:
         T0[-1, :] = np.float32(T_right)

@@ -235,7 +235,7 @@ if __name__ == '__main__':
     order_x = space_order_test(N_list=N_list)
     print(f"Spatial order (mean): {order_x:.3f}")
 
-    dt_list = [0.02, 0.01, 0.005]
+    dt_list = [0.0185, 0.00925, 0.004625]
     order_t = time_order_test(dt_list=dt_list)
     print(f"Temporal order (mean): {order_t:.3f}")
 
@@ -247,6 +247,5 @@ if __name__ == '__main__':
     p_x = space_order_test_interface([50, 100, 200])
     print(f"Spatial order (mean): {p_x:.3f}")
 
-    p_t = time_order_test_interface([0.02, 0.01, 0.005])
+    p_t = time_order_test_interface([0.0185, 0.00925, 0.004625])
     print(f"Temporal order (mean): {p_t:.3f}")
-
