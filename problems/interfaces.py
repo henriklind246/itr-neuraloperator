@@ -17,10 +17,11 @@ from src.physics.boundary_forcing import (
     SIN_AMP_RANGE,
     SPATIAL_BUILDERS,
     SPATIAL_SAMPLERS,
-    TEMPORAL_BUILDERS,
     TEMPORAL_SAMPLERS,
     build_qL,
-    integrate_temporal_bins_signed,
+    default_ramp_seconds,
+    integrate_temporal_bins_ramped_signed,
+    ramped_temporal,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
@@ -53,16 +54,24 @@ _NODE_JITTER_FRAC = 0.25
 
 # ----- conditioning -----
 
+def _physical_interface_range(a: float, b: float) -> tuple[float, float]:
+    span = float(b) - float(a)
+    return (
+        float(a) + INTERFACE_X_RANGE[0] * span,
+        float(a) + INTERFACE_X_RANGE[1] * span,
+    )
+
+
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      interface_x: float) -> np.ndarray:
+                      interface_x: float,
+                      interface_x_range: tuple[float, float] = INTERFACE_X_RANGE) -> np.ndarray:
     """Assemble the 4-dim static conditioning vector.
 
     Layout: [t_bar_norm, t_s_norm, R_c_norm, interface_x_norm].
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    interface_x_norm = (interface_x - INTERFACE_X_RANGE[0]) / (
-        INTERFACE_X_RANGE[1] - INTERFACE_X_RANGE[0]
-    )
+    x_lo, x_hi = map(float, interface_x_range)
+    interface_x_norm = (interface_x - x_lo) / (x_hi - x_lo)
     return np.array(
         [t_bar_norm, t_s_norm, R_c_norm, interface_x_norm], dtype=np.float32
     )
@@ -166,9 +175,12 @@ class InterfacesProblem(ProblemSpec):
         X = grids["X"]
         Y = grids["Y"]
         x_grid = grids["x_grid"]
+        y_grid = grids["y_grid"]
         Nx, Ny = X.shape[0], X.shape[1]
         a = float(x_grid[0])
         b = float(x_grid[-1])
+        c = float(y_grid[0])
+        d = float(y_grid[-1])
 
         num_sims = int(time_cfg["num_sims"])
         dt = float(time_cfg["dt"])
@@ -185,7 +197,8 @@ class InterfacesProblem(ProblemSpec):
 
         samples_scaled = _generate_lhs_samples(num_sims, seed=lhs_seed)
         R_c_values = samples_scaled[:, 0]
-        interface_x_values = _jitter_off_node(samples_scaled[:, 1], a=a, b=b, Nx=Nx)
+        interface_x_values = a + samples_scaled[:, 1] * (b - a)
+        interface_x_values = _jitter_off_node(interface_x_values, a=a, b=b, Nx=Nx)
 
         sim_params = []
         for i in range(num_sims):
@@ -202,7 +215,7 @@ class InterfacesProblem(ProblemSpec):
             )
 
             spatial_family = "uniform"
-            spatial_params = SPATIAL_SAMPLERS["uniform"](rng_profile)
+            spatial_params = SPATIAL_SAMPLERS["uniform"](rng_profile, c=c, d=d)
 
             sim_params.append({
                 "R_c": R_c,
@@ -220,17 +233,22 @@ class InterfacesProblem(ProblemSpec):
 
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
         y_grid = base_kwargs["y_grid"]
+        a = float(base_kwargs["a"])
+        b = float(base_kwargs["b"])
         x_I = float(params["interface_x"])
         layers = [
-            Layer2D(x_left=0.0, x_right=x_I, rho=1.0, cp=1.0, k=K_LEFT),
-            Layer2D(x_left=x_I, x_right=1.0, rho=1.0, cp=1.0, k=K_RIGHT),
+            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=K_LEFT),
+            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=K_RIGHT),
         ]
+        ramp = base_kwargs.get("ramp_seconds")
+        t_ramp = float(ramp) if ramp is not None else default_ramp_seconds(base_kwargs["dt"])
         q_left_fn, _ = build_qL(
             temporal_family=params["temporal_family"],
             temporal_params=params["temporal_params"],
             spatial_family=params["spatial_family"],
             spatial_params=params["spatial_params"],
             y_grid=y_grid,
+            t_ramp=t_ramp,
         )
         return FVSolver2D(
             a=base_kwargs["a"], b=base_kwargs["b"],
@@ -309,6 +327,9 @@ class InterfacesProblem(ProblemSpec):
             t_s_norm=float(t_s_norm),
             R_c=R_c,
             interface_x=interface_x,
+            interface_x_range=_physical_interface_range(
+                float(ds.x_grid[0]), float(ds.x_grid[-1])
+            ),
         )
 
         Y = T_target_norm[:, :, None].astype(np.float32)
@@ -316,8 +337,10 @@ class InterfacesProblem(ProblemSpec):
 
         if self.representation == "temporal_encoder":
             if sid not in ds._q_callables:
-                ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
-                    **params["temporal_params"]
+                ds._q_callables[sid] = ramped_temporal(
+                    params["temporal_family"],
+                    params["temporal_params"],
+                    ds.ramp_seconds,
                 )
             q = ds._q_callables[sid]
             t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
@@ -326,11 +349,12 @@ class InterfacesProblem(ProblemSpec):
             )
             spatial = spatial_base
         else:
-            bins = integrate_temporal_bins_signed(
+            bins = integrate_temporal_bins_ramped_signed(
                 params["temporal_family"],
                 params["temporal_params"],
                 t_s_val,
                 t_j_val,
+                ds.ramp_seconds,
                 K=FORCING_BINS,
             ).astype(np.float32)
             Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
@@ -389,5 +413,5 @@ class InterfacesProblem(ProblemSpec):
         if interface_x is not None:
             bits.append(f"x_I={interface_x:.2f}")
         if A is not None and f is not None:
-            bits.append(f"sin A={A:.0f} f={f:.1f}")
+            bits.append(f"rectified sin A={A:.0f} f={f:.1f}")
         return " ".join(bits) if bits else self.name

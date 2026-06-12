@@ -48,6 +48,15 @@ def main() -> int:
             "Omit to use checkpoint/config defaults; values greater than 1 enable rollout."
         ),
     )
+    parser.add_argument(
+        "--long-lead-only",
+        action="store_true",
+        help=(
+            "Evaluate only full-span pairs (source t=0 -> target t_final), one per "
+            "test sim — the hardest, maximum-lead prediction where autoregressive "
+            "rollout is expected to help most."
+        ),
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root).expanduser()
@@ -76,6 +85,7 @@ def main() -> int:
         padding_reference_resolution=args.padding_reference_resolution,
         rollout_enabled=rollout_enabled,
         rollout_num_substeps=args.rollout_num_substeps,
+        long_lead_only=args.long_lead_only,
     )
     if not results:
         print(f"error: no fno2d_best.pt checkpoints found under {run_root}", file=sys.stderr)

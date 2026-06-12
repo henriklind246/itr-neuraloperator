@@ -66,8 +66,20 @@ def _q_ref(t_final: float) -> float:
 
 # ----- conditioning -----
 
-def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      x_h: float, y_h: float, w_h: float, h_h: float) -> np.ndarray:
+def build_cond_vector(
+    t_bar_norm: float,
+    t_s_norm: float,
+    R_c: float,
+    x_h: float,
+    y_h: float,
+    w_h: float,
+    h_h: float,
+    *,
+    x_center_range: tuple[float, float] = PATCH_X_RANGE,
+    y_center_range: tuple[float, float] = PATCH_Y_RANGE,
+    x_length_scale: float = 1.0,
+    y_length_scale: float = 1.0,
+) -> np.ndarray:
     """Assemble the 7-dim static conditioning vector.
 
     Layout: [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm,
@@ -76,10 +88,10 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
     (temporal_encoder mode) or the source-bin channels (bins mode).
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    x_h_norm = (x_h - PATCH_X_RANGE[0]) / (PATCH_X_RANGE[1] - PATCH_X_RANGE[0])
-    y_h_norm = (y_h - PATCH_Y_RANGE[0]) / (PATCH_Y_RANGE[1] - PATCH_Y_RANGE[0])
-    w_h_norm = w_h / 1.0
-    h_h_norm = h_h / 1.0
+    x_h_norm = (x_h - x_center_range[0]) / (x_center_range[1] - x_center_range[0])
+    y_h_norm = (y_h - y_center_range[0]) / (y_center_range[1] - y_center_range[0])
+    w_h_norm = w_h / x_length_scale
+    h_h_norm = h_h / y_length_scale
     return np.array(
         [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm],
         dtype=np.float32,
@@ -176,6 +188,47 @@ def _generate_lhs_samples(num_sims: int, seed: int = 0,
     return scaled
 
 
+def _scale_fraction(value: float, lo: float, hi: float) -> float:
+    return float(lo) + float(value) * (float(hi) - float(lo))
+
+
+def _patch_center_ranges(
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+    w_h: float,
+    h_h: float,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    return (
+        (float(a) + 0.5 * float(w_h), float(b) - 0.5 * float(w_h)),
+        (float(c) + 0.5 * float(h_h), float(d) - 0.5 * float(h_h)),
+    )
+
+
+def _validate_patch_bounds(
+    *,
+    x_h: float,
+    y_h: float,
+    w_h: float,
+    h_h: float,
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+) -> None:
+    x_min = float(x_h) - 0.5 * float(w_h)
+    x_max = float(x_h) + 0.5 * float(w_h)
+    y_min = float(y_h) - 0.5 * float(h_h)
+    y_max = float(y_h) + 0.5 * float(h_h)
+    if x_min < float(a) or x_max > float(b) or y_min < float(c) or y_max > float(d):
+        raise ValueError(
+            "Source patch extends outside the domain: "
+            f"x=[{x_min}, {x_max}] vs [{a}, {b}], "
+            f"y=[{y_min}, {y_max}] vs [{c}, {d}]."
+        )
+
+
 class SourceProblem(ProblemSpec):
     """Internal volumetric chip-heating patch benchmark.
 
@@ -232,6 +285,14 @@ class SourceProblem(ProblemSpec):
         time_cfg: dict[str, Any],
     ) -> list[dict]:
         X = grids["X"]
+        x_grid = grids["x_grid"]
+        y_grid = grids["y_grid"]
+        a, b = float(x_grid[0]), float(x_grid[-1])
+        c, d = float(y_grid[0]), float(y_grid[-1])
+        Lx, Ly = b - a, d - c
+        interface_x = _scale_fraction(INTERFACE_X, a, b)
+        w_h = PATCH_W * Lx
+        h_h = PATCH_H * Ly
 
         num_sims = int(time_cfg["num_sims"])
         t_final = float(time_cfg["t_final"])
@@ -246,10 +307,14 @@ class SourceProblem(ProblemSpec):
         sim_params = []
         for i in range(num_sims):
             R_c = float(samples["R_c"][i])
-            x_h = float(samples["x_h"][i])
-            y_h = float(samples["y_h"][i])
+            x_h = _scale_fraction(float(samples["x_h"][i]), a, b)
+            y_h = _scale_fraction(float(samples["y_h"][i]), c, d)
             A = float(samples["A"][i])
-            regime = _classify_regime(x_h, INTERFACE_X, PATCH_W)
+            regime = _classify_regime(x_h, interface_x, w_h)
+            _validate_patch_bounds(
+                x_h=x_h, y_h=y_h, w_h=w_h, h_h=h_h,
+                a=a, b=b, c=c, d=d,
+            )
 
             ic_family = "uniform_2d"
             ic_params = {"T0_offset": 0.0}
@@ -257,11 +322,11 @@ class SourceProblem(ProblemSpec):
 
             sim_params.append({
                 "R_c": R_c,
-                "interface_x": INTERFACE_X,
+                "interface_x": interface_x,
                 "x_h": x_h,
                 "y_h": y_h,
-                "w_h": PATCH_W,
-                "h_h": PATCH_H,
+                "w_h": w_h,
+                "h_h": h_h,
                 "A": A,
                 "t_off": t_off,
                 "regime": regime,
@@ -277,9 +342,11 @@ class SourceProblem(ProblemSpec):
         Y = base_kwargs["Y"]
         y_grid = base_kwargs["y_grid"]
         x_I = float(params["interface_x"])
+        a = float(base_kwargs["a"])
+        b = float(base_kwargs["b"])
         layers = [
-            Layer2D(x_left=0.0, x_right=x_I, rho=1.0, cp=1.0, k=2.0),
-            Layer2D(x_left=x_I, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=2.0),
+            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=1.0),
         ]
         # Zero-flux left boundary in vector form so the solver's flux detection
         # uses the vector branch.
@@ -375,6 +442,18 @@ class SourceProblem(ProblemSpec):
             R_c=R_c,
             x_h=float(params["x_h"]), y_h=float(params["y_h"]),
             w_h=float(params["w_h"]), h_h=float(params["h_h"]),
+            x_center_range=_patch_center_ranges(
+                float(ds.x_grid[0]), float(ds.x_grid[-1]),
+                float(ds.y_grid[0]), float(ds.y_grid[-1]),
+                float(params["w_h"]), float(params["h_h"]),
+            )[0],
+            y_center_range=_patch_center_ranges(
+                float(ds.x_grid[0]), float(ds.x_grid[-1]),
+                float(ds.y_grid[0]), float(ds.y_grid[-1]),
+                float(params["w_h"]), float(params["h_h"]),
+            )[1],
+            x_length_scale=float(ds.x_grid[-1] - ds.x_grid[0]),
+            y_length_scale=float(ds.y_grid[-1] - ds.y_grid[0]),
         )
 
         Y = T_target_norm[:, :, None].astype(np.float32)

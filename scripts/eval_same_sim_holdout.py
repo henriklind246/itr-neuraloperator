@@ -82,6 +82,7 @@ def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int)
     from data.dataset import (
         SnapshotPairDataset,
         compute_global_stats,
+        load_ramp_seconds,
         load_sim_data,
         load_solver_dt,
         problem_from_config,
@@ -97,6 +98,7 @@ def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int)
     )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
     solver_dt = load_solver_dt(config["data"]["t_grid_path"])
+    ramp_seconds = load_ramp_seconds(config["data"]["t_grid_path"])
     train_ids, _, _ = split_sim_ids(trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
     mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
 
@@ -112,6 +114,7 @@ def _build_same_sim_loaders(config: dict, val_pair_frac: float, split_seed: int)
         n_snapshots=config["training"].get("n_snapshots", 15),
         noise_std=config["training"].get("noise_std", 0.0),
         dt=solver_dt,
+        ramp_seconds=ramp_seconds,
         problem=problem_from_config(config),
     )
     train_pairs, val_pairs = split_pairs_within_sims(train_dataset, val_pair_frac=val_pair_frac, seed=split_seed)

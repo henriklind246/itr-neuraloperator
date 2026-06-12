@@ -12,8 +12,8 @@ from problems import source as source_problem
 from problems.base import ProblemSpec, empty_forcing_seq
 from src.physics.boundary_forcing import (
     FORCING_BINS,
-    TEMPORAL_BUILDERS,
-    integrate_temporal_bins_signed,
+    integrate_temporal_bins_ramped_signed,
+    ramped_temporal,
 )
 from src.physics.internal_source import make_sin2_pulse
 
@@ -100,8 +100,10 @@ def _q_callable_for_boundary(ds, sid: int, params: dict):
     if not hasattr(ds, "_q_callables"):
         ds._q_callables = {}
     if sid not in ds._q_callables:
-        ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
-            **params["temporal_params"]
+        ds._q_callables[sid] = ramped_temporal(
+            params["temporal_family"],
+            params["temporal_params"],
+            ds.ramp_seconds,
         )
     return ds._q_callables[sid]
 
@@ -126,6 +128,7 @@ def _build_forcing_rollout_item(
         R_c=float(params["R_c"]),
         spatial_family=params["spatial_family"],
         spatial_params=params["spatial_params"],
+        y_bounds=(float(ds.y_grid[0]), float(ds.y_grid[-1])),
     )
 
     if problem.representation == "temporal_encoder":
@@ -138,11 +141,12 @@ def _build_forcing_rollout_item(
         )
     else:
         s_y = ds.s_y_profiles[sid]
-        bins = integrate_temporal_bins_signed(
+        bins = integrate_temporal_bins_ramped_signed(
             params["temporal_family"],
             params["temporal_params"],
             float(t_lo),
             float(t_hi),
+            ds.ramp_seconds,
             K=FORCING_BINS,
         ).astype(np.float32)
         Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
@@ -173,6 +177,9 @@ def _build_interfaces_rollout_item(
         t_s_norm=t_s_norm,
         R_c=float(params["R_c"]),
         interface_x=float(params["interface_x"]),
+        interface_x_range=interfaces_problem._physical_interface_range(
+            float(ds.x_grid[0]), float(ds.x_grid[-1])
+        ),
     )
 
     if problem.representation == "temporal_encoder":
@@ -185,11 +192,12 @@ def _build_interfaces_rollout_item(
         )
     else:
         s_y = ds.s_y_profiles[sid]
-        bins = integrate_temporal_bins_signed(
+        bins = integrate_temporal_bins_ramped_signed(
             params["temporal_family"],
             params["temporal_params"],
             float(t_lo),
             float(t_hi),
+            ds.ramp_seconds,
             K=FORCING_BINS,
         ).astype(np.float32)
         Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
@@ -223,6 +231,18 @@ def _build_source_rollout_item(
         y_h=float(params["y_h"]),
         w_h=float(params["w_h"]),
         h_h=float(params["h_h"]),
+        x_center_range=source_problem._patch_center_ranges(
+            float(ds.x_grid[0]), float(ds.x_grid[-1]),
+            float(ds.y_grid[0]), float(ds.y_grid[-1]),
+            float(params["w_h"]), float(params["h_h"]),
+        )[0],
+        y_center_range=source_problem._patch_center_ranges(
+            float(ds.x_grid[0]), float(ds.x_grid[-1]),
+            float(ds.y_grid[0]), float(ds.y_grid[-1]),
+            float(params["w_h"]), float(params["h_h"]),
+        )[1],
+        x_length_scale=float(ds.x_grid[-1] - ds.x_grid[0]),
+        y_length_scale=float(ds.y_grid[-1] - ds.y_grid[0]),
     )
 
     if problem.representation == "temporal_encoder":

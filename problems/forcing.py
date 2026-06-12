@@ -9,13 +9,14 @@ from src.physics.boundary_forcing import (
     GAUSS_SIGMA_RANGE,
     PATCH_W_RANGE,
     TRIANGLE_ELL_RANGE,
-    TEMPORAL_BUILDERS,
     TEMPORAL_SAMPLERS,
     SPATIAL_BUILDERS,
     SPATIAL_SAMPLERS,
     SIN_AMP_RANGE,
     FORCING_BINS,
-    integrate_temporal_bins_signed,
+    default_ramp_seconds,
+    integrate_temporal_bins_ramped_signed,
+    ramped_temporal,
     sample_spatial_family,
     sample_temporal_family,
     build_qL,
@@ -56,8 +57,19 @@ _LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
 
 # ----- conditioning / forcing-sequence builders -----
 
+def _normalize_y_position(y: float, y_bounds: tuple[float, float]) -> float:
+    y_lo, y_hi = map(float, y_bounds)
+    return (float(y) - y_lo) / (y_hi - y_lo)
+
+
+def _normalize_y_length(length: float, y_bounds: tuple[float, float]) -> float:
+    y_lo, y_hi = map(float, y_bounds)
+    return float(length) / (y_hi - y_lo)
+
+
 def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      spatial_family: str, spatial_params: dict) -> np.ndarray:
+                      spatial_family: str, spatial_params: dict,
+                      y_bounds: tuple[float, float] = (0.0, 1.0)) -> np.ndarray:
     """Assemble the 11-dim forcing-agnostic static conditioning vector.
 
     Layout: [t_bar_norm, t_s_norm, R_c_norm, spatial_onehot(4),
@@ -72,14 +84,17 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
     spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
     y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
     if spatial_family == "patch":
-        y_c_norm = float(spatial_params["y_c"])
-        w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
+        y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
+        w_frac = _normalize_y_length(spatial_params["w"], y_bounds)
+        w_norm = (w_frac - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
     elif spatial_family == "gaussian":
-        y_c_norm = float(spatial_params["y_c"])
-        sigma_y_norm = (np.log(spatial_params["sigma_y"]) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
+        y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
+        sigma_frac = _normalize_y_length(spatial_params["sigma_y"], y_bounds)
+        sigma_y_norm = (np.log(sigma_frac) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
     elif spatial_family == "triangle":
-        y_c_norm = float(spatial_params["y_c"])
-        ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
+        y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
+        ell_frac = _normalize_y_length(spatial_params["ell"], y_bounds)
+        ell_norm = (ell_frac - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
     spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
 
     return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
@@ -193,6 +208,12 @@ class ForcingProblem(ProblemSpec):
         time_cfg: dict[str, Any],
     ) -> list[dict]:
         X = grids["X"]
+        y_grid = grids.get("y_grid")
+        if y_grid is None:
+            Y = grids["Y"]
+            c, d = float(np.min(Y)), float(np.max(Y))
+        else:
+            c, d = float(y_grid[0]), float(y_grid[-1])
         num_sims = int(time_cfg["num_sims"])
         dt = float(time_cfg["dt"])
         t_final = float(time_cfg["t_final"])
@@ -220,7 +241,7 @@ class ForcingProblem(ProblemSpec):
             )
 
             spatial_family = sample_spatial_family(rng_profile)
-            spatial_params = SPATIAL_SAMPLERS[spatial_family](rng_profile)
+            spatial_params = SPATIAL_SAMPLERS[spatial_family](rng_profile, c=c, d=d)
 
             sim_params.append({
                 "R_c": R_c,
@@ -237,12 +258,15 @@ class ForcingProblem(ProblemSpec):
 
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
         y_grid = base_kwargs["y_grid"]
+        ramp = base_kwargs.get("ramp_seconds")
+        t_ramp = float(ramp) if ramp is not None else default_ramp_seconds(base_kwargs["dt"])
         q_left_fn, _ = build_qL(
             temporal_family=params["temporal_family"],
             temporal_params=params["temporal_params"],
             spatial_family=params["spatial_family"],
             spatial_params=params["spatial_params"],
             y_grid=y_grid,
+            t_ramp=t_ramp,
         )
         q_left_integral_fn, _ = build_qL_integral(
             temporal_family=params["temporal_family"],
@@ -250,6 +274,7 @@ class ForcingProblem(ProblemSpec):
             spatial_family=params["spatial_family"],
             spatial_params=params["spatial_params"],
             y_grid=y_grid,
+            t_ramp=t_ramp,
         )
         return FVSolver2D(
             a=base_kwargs["a"], b=base_kwargs["b"],
@@ -321,6 +346,7 @@ class ForcingProblem(ProblemSpec):
             R_c=R_c,
             spatial_family=spatial_family,
             spatial_params=spatial_params,
+            y_bounds=(float(ds.y_grid[0]), float(ds.y_grid[-1])),
         )
 
         Y = T_target_norm[:, :, None].astype(np.float32)
@@ -328,8 +354,10 @@ class ForcingProblem(ProblemSpec):
 
         if self.representation == "temporal_encoder":
             if sid not in ds._q_callables:
-                ds._q_callables[sid] = TEMPORAL_BUILDERS[params["temporal_family"]](
-                    **params["temporal_params"]
+                ds._q_callables[sid] = ramped_temporal(
+                    params["temporal_family"],
+                    params["temporal_params"],
+                    ds.ramp_seconds,
                 )
             q = ds._q_callables[sid]
             t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
@@ -338,11 +366,12 @@ class ForcingProblem(ProblemSpec):
             )
             spatial = spatial_base
         else:
-            bins = integrate_temporal_bins_signed(
+            bins = integrate_temporal_bins_ramped_signed(
                 params["temporal_family"],
                 params["temporal_params"],
                 t_s_val,
                 t_j_val,
+                ds.ramp_seconds,
                 K=FORCING_BINS,
             ).astype(np.float32)
             Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
@@ -391,5 +420,5 @@ class ForcingProblem(ProblemSpec):
             A = tp.get("A")
             f = tp.get("f")
             if A is not None and f is not None:
-                return f"{spatial}/sin A={A:.0f} f={f:.1f}"
+                return f"{spatial}/rectified sin A={A:.0f} f={f:.1f}"
         return f"{spatial}/{temporal}"

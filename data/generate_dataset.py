@@ -8,12 +8,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+from src.physics.fv_solver_1d import build_time_grid
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.boundary_forcing import (
     SPATIAL_FAMILIES,
     TEMPORAL_FAMILIES,
     SPATIAL_SAMPLERS,
     TEMPORAL_SAMPLERS,
+    default_ramp_seconds,
     sample_spatial_family,
     sample_temporal_family,
     build_qL,
@@ -74,7 +76,7 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
         temporal_params = TEMPORAL_SAMPLERS[temporal_family](rng_profile, dt=dt, t_final=t_final, **temporal_window)
 
         spatial_family = sample_spatial_family(rng_profile)
-        spatial_params = SPATIAL_SAMPLERS[spatial_family](rng_profile)
+        spatial_params = SPATIAL_SAMPLERS[spatial_family](rng_profile, c=c, d=d)
 
         sim_params.append({
             "R_c": R_c,
@@ -98,6 +100,7 @@ def generate_sim_data(
     nx: int = 100,
     ny: int = 100,
     ic_families: list[str] | None = None,
+    ramp_seconds: float | None = None,
 ) -> None:
     benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
     spec = get_problem(benchmark)
@@ -110,6 +113,12 @@ def generate_sim_data(
     dt = 0.005
     t_final = 0.3
 
+    # Physical startup-ramp width applied to q_L so q_L(0)=0. Resolve once here
+    # (CLI override else dt-derived default) and persist the resolved value with
+    # the dataset so the solver flux and the model's forcing conditioning use the
+    # exact same ramp, independent of dt.
+    t_ramp = float(ramp_seconds) if ramp_seconds is not None else default_ramp_seconds(dt)
+
     t_on, t_off = 0.0, 0.2
     phase = 0.0
     tukey_alpha = 0.5
@@ -118,13 +127,14 @@ def generate_sim_data(
     y_grid = np.linspace(c, d, Ny)
     X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
 
-    t_grid_template = np.arange(0.0, t_final + 1e-12, dt)
+    dt, t_grid_template = build_time_grid(t_final, dt, explicit_dt=True)
     Nt = len(t_grid_template)
     Nt_saved = len(t_grid_template[::save_stride])
 
+    x_mid = 0.5 * (a + b)
     layers = [
-        Layer2D(x_left=0.0, x_right=0.5, rho=1.0, cp=1.0, k=2.0),
-        Layer2D(x_left=0.5, x_right=1.0, rho=1.0, cp=1.0, k=1.0),
+        Layer2D(x_left=a, x_right=x_mid, rho=1.0, cp=1.0, k=2.0),
+        Layer2D(x_left=x_mid, x_right=b, rho=1.0, cp=1.0, k=1.0),
     ]
 
     grids = {"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid}
@@ -138,6 +148,7 @@ def generate_sim_data(
         lam_target=0.8, layers=layers, t_final=t_final,
         flux_f=0.0, flux_A=0.0, t_on=t_on, t_off=t_off, phase=phase,
         dt=dt, tukey_alpha=tukey_alpha, y_grid=y_grid, X=X, Y=Y,
+        ramp_seconds=t_ramp,
     )
 
     print(f"Benchmark: {benchmark}", flush=True)
@@ -173,6 +184,9 @@ def generate_sim_data(
     # so the dataset can normalize tau / dt_n cond slots against the same bounds
     # used during sampling.
     np.save(save_path / "dt.npy", np.float64(dt))
+    # Persist the resolved physical ramp width so build_item reproduces the exact
+    # q_L(t) the solver integrated, decoupled from dt across regenerations.
+    np.save(save_path / "ramp_seconds.npy", np.float64(t_ramp))
     np.save(save_path / "trajectories.npy", trajectories)
     np.save(save_path / "sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
     print("Saved to:", save_path, x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape, flush=True)
@@ -194,6 +208,15 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
     )
     parser.add_argument("--nx", type=int, default=100, help="Number of x-direction grid nodes.")
     parser.add_argument("--ny", type=int, default=100, help="Number of y-direction grid nodes.")
+    parser.add_argument(
+        "--ramp-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Physical startup-ramp width (seconds) applied to q_L so q_L(0)=0. "
+            "Defaults to 2*dt. The resolved value is persisted with the dataset."
+        ),
+    )
     parser.add_argument(
         "--exclude-ic",
         action="append",
@@ -222,6 +245,7 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         nx=args.nx,
         ny=args.ny,
         ic_families=ic_families,
+        ramp_seconds=args.ramp_seconds,
     )
     return 0
 

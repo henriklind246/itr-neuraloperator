@@ -4,8 +4,10 @@ from data.dataset import (
     T_EPS,
     compute_global_stats,
     create_dataloaders,
+    load_ramp_seconds,
     load_sim_data,
     load_solver_dt,
+    long_lead_pairs,
     problem_from_config,
     split_sim_ids,
 )
@@ -68,7 +70,7 @@ class _RamTestTrajectories:
         return self._cache[int(key)]
 
 
-def build_test_loader(config, mu_global=None, sigma_global=None):
+def build_test_loader(config, mu_global=None, sigma_global=None, long_lead_only=False):
     import numpy as np
 
     trajectories, x_grid, y_grid, t_grid = load_sim_data(
@@ -79,6 +81,7 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
     )
     sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
     solver_dt = load_solver_dt(config["data"]["t_grid_path"])
+    ramp_seconds = load_ramp_seconds(config["data"]["t_grid_path"])
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
 
@@ -96,10 +99,28 @@ def build_test_loader(config, mu_global=None, sigma_global=None):
         n_snapshots=10,
         n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
         dt=solver_dt,
+        ramp_seconds=ramp_seconds,
         num_workers=0,
         temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
         problem=problem_from_config(config),
     )
+
+    # Restrict to full-span pairs (source t=0 -> target t_final) so eval measures
+    # only the hardest, maximum-lead prediction (one pair per test sim).
+    if long_lead_only:
+        test_ds = testing_set.dataset
+        pairs = long_lead_pairs(test_ds)
+        if not pairs:
+            raise ValueError(
+                "long_lead_only: no full-span (source t=0 -> target t_final) pairs "
+                "found in the test set."
+            )
+        test_ds._pairs = pairs
+        test_ds._lead_times = np.array(
+            [float(test_ds.t_grid[j] - test_ds.t_grid[s]) for _, s, j in pairs],
+            dtype=np.float32,
+        )
+        test_ds._active_len = len(pairs)
 
     # Cache only the test sims in RAM (removes random-access memmap I/O; avoids
     # MPS unified-memory swap thrash). Disable via data.cache_test_in_ram=False.
@@ -329,6 +350,7 @@ def eval_all_seeds(
     rollout_enabled: bool | None = None,
     rollout_num_substeps: int | None = None,
     rollout_partition: str | None = None,
+    long_lead_only: bool = False,
 ):
     run_root = Path(run_root)
     results = []
@@ -370,6 +392,7 @@ def eval_all_seeds(
             config,
             mu_global=ckpt.get("mu_global"),
             sigma_global=ckpt.get("sigma_global"),
+            long_lead_only=long_lead_only,
         )
 
         loss_cfg = config.get("training", {}).get("loss", {})
@@ -427,6 +450,7 @@ def eval_all_seeds(
                 "rollout_enabled": bool(rollout_options.enabled),
                 "rollout_num_substeps": int(rollout_options.num_substeps),
                 "rollout_partition": rollout_options.partition,
+                "long_lead_only": bool(long_lead_only),
                 "ckpt": str(ckpt_path),
             }
         )
