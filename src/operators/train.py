@@ -21,6 +21,7 @@ from data.dataset import (
     SnapshotPairDataset,
     compute_global_stats,
     create_dataloaders,
+    load_ramp_seconds,
     load_sim_data,
     load_solver_dt,
     problem_from_config,
@@ -850,6 +851,7 @@ def run_one_seed(
         )
         sim_params = np.load(config["data"]["sim_params_path"], allow_pickle=True)
         solver_dt = load_solver_dt(config["data"]["t_grid_path"])
+        ramp_seconds = load_ramp_seconds(config["data"]["t_grid_path"])
 
         train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
         mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
@@ -867,6 +869,7 @@ def run_one_seed(
             noise_std=config["training"].get("noise_std", 0.0),
             num_workers=num_workers,
             dt=solver_dt,
+            ramp_seconds=ramp_seconds,
             temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
             world_size=dist_info.world_size,
             rank=dist_info.rank,
