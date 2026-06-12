@@ -15,6 +15,7 @@ from src.physics.boundary_forcing import (
     TEMPORAL_BUILDERS,
     TEMPORAL_FAMILY_ORDER,
     integrate_temporal_bins_signed,
+    default_ramp_seconds,
     FORCING_BINS,
     SIN_AMP_RANGE,
 )
@@ -279,6 +280,7 @@ class SnapshotPairDataset(Dataset):
         noise_std: float = 0.0,
         dt: float | None = None,
         t_final: float | None = None,
+        ramp_seconds: float | None = None,
         temporal_samples: int = TEMPORAL_SAMPLES,
         problem: ProblemSpec | None = None,
     ):
@@ -301,6 +303,15 @@ class SnapshotPairDataset(Dataset):
         # consumes a(t) directly through TEMPORAL_BUILDERS, not via dt/tau.
         self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
         self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
+
+        # Physical startup-ramp width for q_L(0)=0. Read from the dataset's stored
+        # value when available so the model's forcing conditioning uses the exact
+        # ramp the solver used; fall back to the dt-derived default for datasets
+        # generated before ramp_seconds was persisted.
+        self.ramp_seconds = (
+            float(ramp_seconds) if ramp_seconds is not None
+            else default_ramp_seconds(self.dt)
+        )
 
         # Number of a(t) samples the temporal branch consumes. Benchmark-
         # specific caches (lazy callables, spatial profiles, normalization
@@ -418,6 +429,18 @@ def split_pairs_within_sims(
     return train_dataset, val_dataset
 
 
+def long_lead_pairs(dataset: SnapshotPairDataset) -> list[tuple[int, int, int]]:
+    """Return only full-span pairs: source at the first snapshot (t=0) and target
+    at the last snapshot (t_final). One per sim; the maximum-lead pair."""
+    s_first = int(dataset.t_indices[0])
+    j_last = int(dataset.t_indices[-1])
+    return [
+        (int(sim), int(s), int(j))
+        for (sim, s, j) in dataset._pairs
+        if int(s) == s_first and int(j) == j_last
+    ]
+
+
 # --------- LOAD RAW SIM. DATA --------
 
 def load_sim_data(
@@ -466,6 +489,21 @@ def load_solver_dt(t_grid_path: str | Path) -> float | None:
     if not dt_path.exists():
         return None
     return float(np.load(dt_path))
+
+
+def load_ramp_seconds(t_grid_path: str | Path) -> float | None:
+    """Return the stored startup-ramp width saved with the trajectories, or None.
+
+    Looks for `ramp_seconds.npy` in the same directory as `t_grid_path`. The
+    resolved physical ramp is persisted at generation time so the model's
+    forcing conditioning reproduces the exact q_L(t) the solver integrated,
+    independent of `dt`. Absent for datasets generated before the ramp was added;
+    callers fall back to `default_ramp_seconds(dt)`.
+    """
+    ramp_path = Path(t_grid_path).parent / "ramp_seconds.npy"
+    if not ramp_path.exists():
+        return None
+    return float(np.load(ramp_path))
 
 
 # ------- SLICE ALL SIMS INTO TRAIN/VAL/TEST SPLITS -------
@@ -528,6 +566,7 @@ def create_dataloaders(
     num_workers: int | None = None,
     dt: float | None = None,
     t_final: float | None = None,
+    ramp_seconds: float | None = None,
     temporal_samples: int = TEMPORAL_SAMPLES,
     world_size: int = 1,
     rank: int = 0,
@@ -572,6 +611,7 @@ def create_dataloaders(
         noise_std=noise_std,
         dt=dt,
         t_final=t_final,
+        ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,
     )
@@ -588,6 +628,7 @@ def create_dataloaders(
         n_snapshots=n_snapshots,
         dt=dt,
         t_final=t_final,
+        ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,
     )
@@ -604,6 +645,7 @@ def create_dataloaders(
         n_snapshots=n_test,
         dt=dt,
         t_final=t_final,
+        ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,
     )
