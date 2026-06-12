@@ -219,6 +219,7 @@ class TestGenerateSimData:
             "y_grid.npy",
             "t_grid.npy",
             "dt.npy",
+            "ramp_seconds.npy",
             "trajectories.npy",
             "sim_params.npy",
         ]
@@ -231,6 +232,7 @@ class TestGenerateSimData:
         y_grid = np.load(data_dir / "y_grid.npy")
         t_grid = np.load(data_dir / "t_grid.npy")
         dt = np.load(data_dir / "dt.npy")
+        ramp_seconds = np.load(data_dir / "ramp_seconds.npy")
         sim_params = np.load(data_dir / "sim_params.npy", allow_pickle=True)
 
         assert trajectories.shape == (2, 31, 100, 100)
@@ -239,6 +241,7 @@ class TestGenerateSimData:
         assert y_grid.shape == (100,)
         assert t_grid.shape == (31,)
         assert float(dt) == DT
+        assert float(ramp_seconds) == 2.0 * DT
         assert sim_params.shape == (2,)
         for entry in sim_params:
             assert entry["ic_family"] == "uniform_2d"

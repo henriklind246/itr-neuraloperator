@@ -1,7 +1,14 @@
 import numpy as np
 import pytest
 
-from src.physics.fv_solver_1d import FVSolver1D, Layer1D, ic, windowed_sin_flux, compute_dt
+from src.physics.fv_solver_1d import (
+    FVSolver1D,
+    Layer1D,
+    ic,
+    windowed_sin_flux,
+    compute_dt,
+    compute_dt_2d,
+)
 
 
 # ===================== ic() =====================
@@ -25,12 +32,12 @@ class TestIC:
 # ===================== windowed_sin_flux() =====================
 
 class TestWindowedSinFlux:
-    """Tests with alpha=0 (rectangular window, backward-compatible behavior)."""
+    """Tests with alpha=0 (rectangular half-wave rectified behavior)."""
 
     def test_inside_window(self):
         q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, phase=0.0, tukey_alpha=0.0)
         t = 0.25
-        expected = 50.0 * np.sin(2 * np.pi * 2.0 * t)
+        expected = 50.0 * max(np.sin(2 * np.pi * 2.0 * t), 0.0)
         assert pytest.approx(q(t), abs=1e-12) == expected
 
     def test_outside_window_before(self):
@@ -44,8 +51,8 @@ class TestWindowedSinFlux:
     def test_at_window_boundaries(self):
         q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.2, t_off=0.8, tukey_alpha=0.0)
         # t_on and t_off are inside the window (<=)
-        assert q(0.2) == 50.0 * np.sin(2 * np.pi * 2.0 * 0.2)
-        assert q(0.8) == 50.0 * np.sin(2 * np.pi * 2.0 * 0.8)
+        assert q(0.2) == 50.0 * max(np.sin(2 * np.pi * 2.0 * 0.2), 0.0)
+        assert q(0.8) == 50.0 * max(np.sin(2 * np.pi * 2.0 * 0.8), 0.0)
 
     def test_phase_shift(self):
         q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.0, t_off=1.0, phase=np.pi / 2, tukey_alpha=0.0)
@@ -77,13 +84,19 @@ class TestWindowedSinFluxTukey:
         q = windowed_sin_flux(f=1.0, A=1.0, t_on=0.0, t_off=1.0, tukey_alpha=0.4)
         # tau=0.5 is well inside the flat region (alpha/2=0.2 to 1-alpha/2=0.8)
         t = 0.5
-        expected = np.sin(2 * np.pi * 1.0 * t)  # envelope = 1.0
+        expected = max(np.sin(2 * np.pi * 1.0 * t), 0.0)  # envelope = 1.0
         assert pytest.approx(q(t), abs=1e-14) == expected
 
     def test_outside_window_still_zero(self):
         q = windowed_sin_flux(f=2.0, A=50.0, t_on=0.2, t_off=0.8, tukey_alpha=0.5)
         assert q(0.1) == 0.0
         assert q(0.9) == 0.0
+
+    def test_negative_lobes_are_rectified_to_zero(self):
+        q = windowed_sin_flux(f=1.0, A=2.0, t_on=0.0, t_off=1.0, tukey_alpha=0.0)
+        assert q(0.75) == pytest.approx(0.0, abs=1e-15)
+        values = np.array([q(float(t)) for t in np.linspace(0.0, 1.0, 101)])
+        assert np.all(values >= 0.0)
 
 
 # ===================== compute_dt() =====================
@@ -106,6 +119,10 @@ class TestComputeDt:
     def test_always_positive(self):
         assert compute_dt(0.01, 1.0, 0.5, 2.0) > 0
 
+    def test_2d_raw_diffusion_rule_halves_equal_spacing_1d_rule(self):
+        h, alpha, lam, f = 0.01, 1.0, 0.5, 0.0
+        assert compute_dt_2d(h, alpha, lam, f) == pytest.approx(0.5 * compute_dt(h, alpha, lam, f))
+
 
 # ===================== FVSolver1D.__init__ =====================
 
@@ -126,7 +143,27 @@ class TestSolverInit:
         solver = FVSolver1D(N=11, dt=0.001, a=0, b=1, layers=layers,
                             lam_target=0.5, t_final=0.5, flux_f=2.0, flux_A=50.0,
                             t_on=0.0, t_off=0.5, phase=0.0)
-        assert solver.dt == 0.001
+        assert solver.dt == pytest.approx(0.001)
+        assert solver.t[-1] == pytest.approx(0.5)
+        assert len(solver.t) == 501
+
+    def test_explicit_dt_must_reach_t_final(self):
+        layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
+        with pytest.raises(ValueError, match="does not divide t_final"):
+            FVSolver1D(N=11, dt=0.3, a=0, b=1, layers=layers,
+                       lam_target=0.5, t_final=1.0, flux_f=2.0, flux_A=50.0,
+                       t_on=0.0, t_off=1.0, phase=0.0)
+
+    def test_computed_dt_adjusts_down_to_reach_t_final(self):
+        layers = [Layer1D(x_left=0.0, x_right=1.0, rho=1.0, cp=1.0, k=1.0)]
+        solver = FVSolver1D(N=11, a=0, b=1, layers=layers,
+                            lam_target=0.3, t_final=0.5, flux_f=0.0, flux_A=50.0,
+                            t_on=0.0, t_off=0.5, phase=0.0)
+        dt_raw = compute_dt(solver.h, 1.0, 0.3, 0.0)
+        Nt = len(solver.t) - 1
+        assert solver.dt <= dt_raw
+        assert solver.t[-1] == pytest.approx(0.5)
+        assert solver.dt == pytest.approx(0.5 / Nt)
 
     def test_diffusivity_at_nodes(self, small_solver):
         expected_alpha = 1.0 / (1.0 * 1.0)  # k/(rho*cp) for uniform material

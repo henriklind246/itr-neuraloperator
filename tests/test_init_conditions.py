@@ -15,6 +15,8 @@ from src.physics.init_conditions import (
     SINU_KMAX,
     SINU_N_CHOICES,
     UNIFORM_OFFSET_RANGE,
+    EDGE_TAPER_WIDTH,
+    boundary_taper,
     build_ic,
     right_edge_taper,
     sample_ic_family,
@@ -223,3 +225,99 @@ class TestBuildIC:
                       taper=False, pin_right_edge=True)
         assert np.allclose(T0[:-1, :], 311.0)
         np.testing.assert_allclose(T0[-1, :], 300.0)
+
+
+# Non-uniform IC families whose deviation is a deterministic continuous function
+# of (x, y) and therefore comparable across grid resolutions. grf_2d is excluded:
+# its FFT realization depends on Nx*Ny rng draws so it cannot be reproduced under
+# refinement (see plan / generate_dataset --exclude-ic).
+_GRID_COMPARABLE_FAMILIES = {
+    "random_sinusoid_2d": dict(
+        A_list=[5.0, 3.0], nx_list=[2, 3], ny_list=[1, 2], phi_list=[0.3, 1.1],
+    ),
+    "hot_spot_2d": dict(
+        A_list=[20.0, -15.0], mu_x_list=[0.4, 0.6], mu_y_list=[0.5, 0.3],
+        sigma_list=[0.15, 0.12],
+    ),
+}
+
+
+class TestBoundaryTaper:
+    def test_zero_on_all_outer_node_lines(self):
+        X, Y = _mesh(Nx=100, Ny=100)
+        w = boundary_taper(X, Y)
+        assert np.allclose(w[0, :], 0.0)
+        assert np.allclose(w[-1, :], 0.0)
+        assert np.allclose(w[:, 0], 0.0)
+        assert np.allclose(w[:, -1], 0.0)
+
+    def test_window_in_unit_interval(self):
+        X, Y = _mesh(Nx=64, Ny=80)
+        w = boundary_taper(X, Y)
+        assert np.all((0.0 <= w) & (w <= 1.0 + 1e-12))
+
+    def test_interior_saturates_to_one(self):
+        # Points more than edge_width from every boundary have all four smoothstep
+        # factors equal to 1, so the window is exactly 1 there.
+        X, Y = _mesh(Nx=100, Ny=100)
+        w = boundary_taper(X, Y)
+        interior = (
+            (X > X.min() + EDGE_TAPER_WIDTH) & (X < X.max() - EDGE_TAPER_WIDTH)
+            & (Y > Y.min() + EDGE_TAPER_WIDTH) & (Y < Y.max() - EDGE_TAPER_WIDTH)
+        )
+        assert np.allclose(w[interior], 1.0)
+        assert w.max() == pytest.approx(1.0)
+
+    def test_separable_product_structure(self):
+        # boundary_taper factorizes as wx(X) * wy(Y).
+        X, Y = _mesh(Nx=41, Ny=37)
+        w = boundary_taper(X, Y)
+        from src.physics.init_conditions import _smoothstep_window
+        x_lo, x_hi = X.min(), X.max()
+        y_lo, y_hi = Y.min(), Y.max()
+        wx = _smoothstep_window(X - x_lo, EDGE_TAPER_WIDTH) * _smoothstep_window(x_hi - X, EDGE_TAPER_WIDTH)
+        wy = _smoothstep_window(Y - y_lo, EDGE_TAPER_WIDTH) * _smoothstep_window(y_hi - Y, EDGE_TAPER_WIDTH)
+        assert np.allclose(w, wx * wy)
+
+
+class TestBuildICBoundaryCompatibility:
+    @pytest.mark.parametrize("fam", list(_GRID_COMPARABLE_FAMILIES.keys()) + ["grf_2d"])
+    def test_all_four_outer_node_lines_equal_t_right_no_pin(self, fam):
+        # With the 4-sided taper every outer node line collapses to T_right even
+        # without the right-edge pin (W=0 on all outer node lines).
+        X, Y = _mesh(Nx=51, Ny=49)
+        rng = np.random.default_rng(5)
+        p = IC_SAMPLERS[fam](rng, Nx=51, Ny=49)
+        T0 = build_ic(fam, p, X, Y, T_right=305.0, b=1.0,
+                      taper=True, pin_right_edge=False)
+        np.testing.assert_allclose(T0[0, :], 305.0, atol=1e-4)
+        np.testing.assert_allclose(T0[-1, :], 305.0, atol=1e-4)
+        np.testing.assert_allclose(T0[:, 0], 305.0, atol=1e-4)
+        np.testing.assert_allclose(T0[:, -1], 305.0, atol=1e-4)
+
+    @pytest.mark.parametrize("fam", list(_GRID_COMPARABLE_FAMILIES.keys()))
+    def test_left_top_bottom_normal_gradient_shrinks_under_refinement(self, fam):
+        # Smoothstep has phi(0)=phi'(0)=0, so near each outer node line the
+        # tapered deviation is O(dist^2) and the one-sided discrete normal
+        # gradient is O(h): it must shrink under grid refinement and stay far
+        # below the interior gradient magnitude. No fixed absolute threshold.
+        params = _GRID_COMPARABLE_FAMILIES[fam]
+
+        def boundary_and_interior_grads(N):
+            X, Y = _mesh(Nx=N, Ny=N)
+            h = 1.0 / (N - 1)
+            T0 = build_ic(fam, params, X, Y, T_right=300.0, b=1.0,
+                          taper=True, pin_right_edge=False)
+            left = np.abs(T0[1, :] - T0[0, :]).max() / h
+            bottom = np.abs(T0[:, 1] - T0[:, 0]).max() / h
+            top = np.abs(T0[:, -1] - T0[:, -2]).max() / h
+            interior = np.abs(np.diff(T0, axis=0)).max() / h
+            return dict(left=left, bottom=bottom, top=top, interior=interior)
+
+        coarse = boundary_and_interior_grads(51)
+        fine = boundary_and_interior_grads(101)
+        for edge in ("left", "bottom", "top"):
+            # Boundary normal gradient decreases under refinement (O(h)).
+            assert fine[edge] < coarse[edge], (fam, edge, fine[edge], coarse[edge])
+            # ... and is much smaller than a representative interior gradient.
+            assert fine[edge] < 0.25 * fine["interior"], (fam, edge)

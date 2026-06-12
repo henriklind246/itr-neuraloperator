@@ -25,6 +25,9 @@ from src.physics.mms_2d import (
 
 pytestmark = pytest.mark.slow
 
+MMS_DT_LIST = [0.0185, 0.00925, 0.004625]
+MMS_PATCH_DT_LIST = [0.037, 0.0185, 0.00925]
+
 
 class TestOffCenterInterfaceMMS:
     def test_runs_at_off_center_x_I(self):
@@ -40,7 +43,7 @@ class TestOffCenterInterfaceMMS:
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
     def test_temporal_convergence_is_second_order(self):
-        order = time_order_test_2d_off_center_interface([0.02, 0.01, 0.005], x_I=0.4734)
+        order = time_order_test_2d_off_center_interface(MMS_DT_LIST, x_I=0.4734)
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
 
@@ -62,7 +65,7 @@ class TestNearNodeInterfaceMMS:
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
     def test_temporal_convergence_is_second_order(self):
-        order = time_order_test_2d_near_node_interface([0.02, 0.01, 0.005], eps=0.01)
+        order = time_order_test_2d_near_node_interface(MMS_DT_LIST, eps=0.01)
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
 
@@ -81,7 +84,7 @@ class TestYFluxMMS:
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
     def test_temporal_convergence_is_second_order(self):
-        order = time_order_test_2d_yflux([0.02, 0.01, 0.005])
+        order = time_order_test_2d_yflux(MMS_DT_LIST)
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
 
@@ -104,7 +107,7 @@ class TestXLinearMMS:
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
     def test_temporal_convergence_is_second_order(self):
-        order = time_order_test_x_linear([0.02, 0.01, 0.005])
+        order = time_order_test_x_linear(MMS_DT_LIST)
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
 
@@ -119,7 +122,7 @@ class TestSmoothForcingIntegralMMS:
         assert l2_err < 5e-3
 
     def test_temporal_convergence_is_second_order(self):
-        order = time_order_test_2d_smooth_forcing_integral([0.02, 0.01, 0.005])
+        order = time_order_test_2d_smooth_forcing_integral(MMS_DT_LIST)
         assert order >= 1.85, f"expected >= 1.85, got {order:.3f}"
 
     def test_left_flux_sign_convention_matches_mms_derivative(self):
@@ -151,5 +154,5 @@ class TestPatchSourceMMS:
         assert order >= 1.90, f"expected >= 1.90, got {order:.3f}"
 
     def test_temporal_convergence_is_second_order(self):
-        order = time_order_test_2d_patch_source([0.04, 0.02, 0.01])
+        order = time_order_test_2d_patch_source(MMS_PATCH_DT_LIST)
         assert order >= 1.85, f"expected >= 1.85, got {order:.3f}"

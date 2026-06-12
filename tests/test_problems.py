@@ -483,6 +483,77 @@ class TestProblemFromConfig:
         assert spec.representation == "temporal_encoder"
 
 
+class TestGeometryAwareProblemSampling:
+    def _grids(self, *, a=2.0, b=4.0, c=-1.0, d=1.0, Nx=40, Ny=40):
+        x_grid = np.linspace(a, b, Nx)
+        y_grid = np.linspace(c, d, Ny)
+        X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
+        return x_grid, y_grid, X, Y
+
+    def test_forcing_spatial_params_are_physical_and_bounded(self):
+        x_grid, y_grid, X, Y = self._grids(c=-1.0, d=2.0, Nx=39, Ny=58)
+        spec = get_problem("forcing")
+        params = spec.sample_sim_params(
+            rng=np.random.default_rng(0),
+            rng_profile=np.random.default_rng(1),
+            grids={"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid},
+            time_cfg=dict(num_sims=20, dt=0.005, t_final=0.3, lhs_seed=0,
+                          t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5),
+        )
+        c, d = float(y_grid[0]), float(y_grid[-1])
+        for p in params:
+            sp = p["spatial_params"]
+            if p["spatial_family"] == "patch":
+                assert sp["y_c"] - 0.5 * sp["w"] >= c - 1e-12
+                assert sp["y_c"] + 0.5 * sp["w"] <= d + 1e-12
+            elif p["spatial_family"] == "triangle":
+                assert sp["y_c"] - sp["ell"] >= c - 1e-12
+                assert sp["y_c"] + sp["ell"] <= d + 1e-12
+            elif p["spatial_family"] == "gaussian":
+                assert c <= sp["y_c"] <= d
+
+    def test_interfaces_metadata_is_physical_and_solver_layers_use_domain(self):
+        x_grid, y_grid, X, Y = self._grids()
+        spec = get_problem("interfaces")
+        params = spec.sample_sim_params(
+            rng=np.random.default_rng(0),
+            rng_profile=np.random.default_rng(1),
+            grids={"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid},
+            time_cfg=dict(num_sims=5, dt=0.005, t_final=0.3, lhs_seed=0,
+                          t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5,
+                          T_right=300.0, b=float(x_grid[-1])),
+        )
+        assert all(2.4 <= p["interface_x"] <= 3.6 for p in params)
+        base_kwargs = dict(
+            a=2.0, b=4.0, c=-1.0, d=1.0, Nx=40, Ny=40,
+            lam_target=0.8, layers=None, t_final=0.3,
+            flux_f=0.0, flux_A=0.0, t_on=0.0, t_off=0.2, phase=0.0,
+            dt=0.005, tukey_alpha=0.5, y_grid=y_grid,
+        )
+        solver = spec.configure_solver(params[0], base_kwargs)
+        assert solver.layers[0].x_left == pytest.approx(2.0)
+        assert solver.layers[-1].x_right == pytest.approx(4.0)
+        assert solver.interface_positions[0] == pytest.approx(params[0]["interface_x"])
+
+    def test_source_patch_metadata_is_physical_and_bounded(self):
+        x_grid, y_grid, X, Y = self._grids()
+        spec = get_problem("source")
+        params = spec.sample_sim_params(
+            rng=np.random.default_rng(0),
+            rng_profile=np.random.default_rng(1),
+            grids={"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid},
+            time_cfg=dict(num_sims=20, dt=0.005, t_final=0.3, lhs_seed=0),
+        )
+        a, b = float(x_grid[0]), float(x_grid[-1])
+        c, d = float(y_grid[0]), float(y_grid[-1])
+        for p in params:
+            assert p["interface_x"] == pytest.approx(3.0)
+            assert p["x_h"] - 0.5 * p["w_h"] >= a - 1e-12
+            assert p["x_h"] + 0.5 * p["w_h"] <= b + 1e-12
+            assert p["y_h"] - 0.5 * p["h_h"] >= c - 1e-12
+            assert p["y_h"] + 0.5 * p["h_h"] <= d + 1e-12
+
+
 # ===================== representation x benchmark contracts =====================
 
 def _dataset_for(name, representation, synthetic_trajectories, forcing_sim_params):

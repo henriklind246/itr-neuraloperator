@@ -1,5 +1,6 @@
 import csv
 import inspect
+import json
 from math import comb
 
 import matplotlib
@@ -144,6 +145,81 @@ class TestPlotRegistry:
             "interfaces_tail_errors",
         ]:
             assert _common.PLOT_REGISTRY[name] == "paper"
+
+    def test_rollout_plot_name_registered(self):
+        assert _common.PLOT_REGISTRY["rollout_partition_error"] == "rollout"
+        assert "rollout" in _common.GROUPS
+
+
+def _write_rollout_report(path, num_substeps, global_norm):
+    report = {
+        "timestamp": "2026-06-11T16:00:00",
+        "summary": {"rollout_num_substeps": num_substeps},
+        "per_seed": [
+            {
+                "seed": 42,
+                "num_sims": 50,
+                "rollout_num_substeps": num_substeps,
+                "test_rel_l2_norm": global_norm,
+                "test_iface_rel_l2_norm": global_norm * 1.1,
+                "test_boundary_rel_l2_norm": global_norm * 1.05,
+            }
+        ],
+    }
+    with open(path, "w") as f:
+        json.dump(report, f)
+
+
+class TestRolloutPlots:
+    def test_loader_keys_by_num_substeps_no_scaling(self, tmp_path):
+        from visual import rollout_plots
+
+        _write_rollout_report(tmp_path / "directeval.json", 1, 0.51)
+        _write_rollout_report(tmp_path / "rollouteval_s5.json", 5, 1.90)
+
+        reports = rollout_plots._load_rollout_reports(tmp_path)
+
+        assert sorted(reports) == [1, 5]
+        # rel_l2_norm fields are already percentages: stored verbatim, no x100.
+        assert reports[1]["test_rel_l2_norm_mean"] == pytest.approx(0.51)
+        assert reports[5]["test_rel_l2_norm_mean"] == pytest.approx(1.90)
+        assert reports[1]["seed_signature"] == (42,)
+
+    def test_loader_fails_on_missing_metric(self, tmp_path):
+        from visual import rollout_plots
+
+        report = {
+            "timestamp": "2026-06-11T16:00:00",
+            "summary": {"rollout_num_substeps": 3},
+            "per_seed": [
+                {
+                    "seed": 42,
+                    "num_sims": 50,
+                    "rollout_num_substeps": 3,
+                    "test_rel_l2_norm": 1.0,
+                    "test_iface_rel_l2_norm": 1.1,
+                }
+            ],
+        }
+        with open(tmp_path / "rollouteval_s3.json", "w") as f:
+            json.dump(report, f)
+
+        with pytest.raises(ValueError, match="test_boundary_rel_l2_norm"):
+            rollout_plots._load_rollout_reports(tmp_path)
+
+        reports = rollout_plots._load_rollout_reports(tmp_path, allow_missing=True)
+        assert np.isnan(reports[3]["test_boundary_rel_l2_norm_mean"])
+
+    def test_plot_smoke_writes_png(self, tmp_path):
+        from visual import rollout_plots
+
+        _write_rollout_report(tmp_path / "directeval.json", 1, 0.51)
+        _write_rollout_report(tmp_path / "rollouteval_s5.json", 5, 1.90)
+        out_path = tmp_path / "rollout_partition_error.png"
+
+        rollout_plots.plot_rollout_partition_error(tmp_path, save_path=out_path)
+
+        assert out_path.exists()
 
 
 class TestSnapshotPairSamples:

@@ -15,7 +15,7 @@ Test groups:
 import numpy as np
 import pytest
 
-from src.physics.fv_solver_1d import FVSolver1D, Layer1D
+from src.physics.fv_solver_1d import FVSolver1D, Layer1D, compute_dt_2d
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 
@@ -90,8 +90,81 @@ class TestGridAndDataModel:
     def test_layer2d_is_layer1d(self):
         assert Layer2D is Layer1D
 
+    def test_explicit_dt_must_reach_t_final(self):
+        with pytest.raises(ValueError, match="does not divide t_final"):
+            make_single_layer_2d(dt=0.3, t_final=1.0)
+
+    def test_computed_dt_uses_2d_raw_heuristic_as_max_step(self):
+        sim = make_single_layer_2d(
+            Nx=11, Ny=11, lam_target=0.3, flux_f=0.0, t_final=0.5,
+        )
+        dt_raw = compute_dt_2d(sim.hx, 1.0, 0.3, 0.0)
+        Nt = len(sim.t) - 1
+        assert dt_raw == pytest.approx(0.3 * sim.hx**2 / 2.0)
+        assert sim.dt <= dt_raw
+        assert sim.t[-1] == pytest.approx(0.5)
+        assert sim.dt == pytest.approx(0.5 / Nt)
+
+    def test_nonunit_domain_with_isotropic_spacing(self):
+        # Lx=2, Ly=3. Choose node counts so hx=hy=1/19.
+        sim = make_single_layer_2d(
+            a=2.0, b=4.0, c=-1.0, d=2.0,
+            Nx=39, Ny=58,
+            layers=[Layer2D(2.0, 4.0, 1.0, 1.0, 1.0)],
+            dt=0.005,
+            t_final=0.1,
+        )
+        assert sim.grid_x[0] == pytest.approx(2.0)
+        assert sim.grid_x[-1] == pytest.approx(4.0)
+        assert sim.grid_y[0] == pytest.approx(-1.0)
+        assert sim.grid_y[-1] == pytest.approx(2.0)
+        assert sim.hx == pytest.approx(sim.grid_y[1] - sim.grid_y[0])
+
 
 # ==================== TEST 2: TINY-GRID MATRIX (Nx=4, Ny=3) ====================
+
+class TestInterfaceValidation2D:
+
+    def test_duplicate_off_midpoint_interfaces_in_same_face_slot_raise(self):
+        layers = [
+            Layer2D(0.0, 0.43, 1.0, 1.0, 2.0),
+            Layer2D(0.43, 0.47, 1.0, 1.0, 1.5),
+            Layer2D(0.47, 1.0, 1.0, 1.0, 1.0),
+        ]
+        with pytest.raises(ValueError, match="Multiple interfaces map to face slot 4"):
+            FVSolver2D(
+                a=0.0, b=1.0, c=0.0, d=1.0,
+                Nx=11, Ny=11,
+                lam_target=0.5,
+                layers=layers,
+                t_final=0.1,
+                flux_f=0.0, flux_A=0.0,
+                t_on=0.0, t_off=0.1, phase=0.0,
+                dt=0.001,
+            )
+
+    def test_duplicate_slot_error_reports_both_locations(self):
+        layers = [
+            Layer2D(0.0, 0.40000000001, 1.0, 1.0, 2.0),
+            Layer2D(0.40000000001, 0.49999999999, 1.0, 1.0, 1.5),
+            Layer2D(0.49999999999, 1.0, 1.0, 1.0, 1.0),
+        ]
+        with pytest.raises(ValueError) as excinfo:
+            FVSolver2D(
+                a=0.0, b=1.0, c=0.0, d=1.0,
+                Nx=11, Ny=11,
+                lam_target=0.5,
+                layers=layers,
+                t_final=0.1,
+                flux_f=0.0, flux_A=0.0,
+                t_on=0.0, t_off=0.1, phase=0.0,
+                dt=0.001,
+            )
+        msg = str(excinfo.value)
+        assert "face slot 4" in msg
+        assert "0.40000000001" in msg
+        assert "0.49999999999" in msg
+
 
 class TestTinyGridMatrix:
     """
@@ -966,6 +1039,9 @@ from src.physics.mms_2d import (
 )
 
 
+MMS_DT_LIST = [0.0185, 0.00925, 0.004625]
+
+
 class TestMMS2D:
     """MMS convergence verification for the 2D solver."""
 
@@ -981,7 +1057,7 @@ class TestMMS2D:
         assert 1.9 < p < 2.1, f"Spatial order {p:.3f}"
 
     def test_y_independent_temporal_order(self):
-        p = time_order_test_y_independent([0.02, 0.01, 0.005])
+        p = time_order_test_y_independent(MMS_DT_LIST)
         assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
 
     # --- Full 2D (y-dependent correction) ---
@@ -996,7 +1072,7 @@ class TestMMS2D:
         assert 1.9 < p < 2.1, f"Spatial order {p:.3f}"
 
     def test_2d_temporal_order(self):
-        p = time_order_test_2d([0.02, 0.01, 0.005])
+        p = time_order_test_2d(MMS_DT_LIST)
         assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
 
     # --- Interface (piecewise 2D with R_c) ---
@@ -1011,7 +1087,7 @@ class TestMMS2D:
         assert 1.9 < p < 2.1, f"Spatial order {p:.3f}"
 
     def test_interface_temporal_order(self):
-        p = time_order_test_2d_interface([0.02, 0.01, 0.005])
+        p = time_order_test_2d_interface(MMS_DT_LIST)
         assert 1.9 < p < 2.1, f"Temporal order {p:.3f}"
 
 

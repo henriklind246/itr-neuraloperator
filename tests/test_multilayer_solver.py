@@ -694,6 +694,9 @@ from src.physics.mms_1d import (
 )
 
 
+MMS_DT_LIST = [0.0185, 0.00925, 0.004625]
+
+
 class TestMmsInterfaceResistance:
     """MMS convergence verification for the CN scheme with interface resistance.
 
@@ -721,7 +724,7 @@ class TestMmsInterfaceResistance:
 
     def test_9d_temporal_order_two(self):
         """Temporal convergence order ≈ 2 (N fixed large, vary dt)."""
-        p = time_order_test_interface(dt_list=[0.02, 0.01, 0.005])
+        p = time_order_test_interface(dt_list=MMS_DT_LIST)
         assert 1.9 < p < 2.1, f"Temporal order {p:.3f} outside [1.9, 2.1]"
 
 
@@ -754,7 +757,7 @@ class TestMmsInterfaceConvergenceTable:
 
     def test_print_interface_temporal_table(self):
         """Temporal convergence table for interface-resistance MMS."""
-        dt_list = [0.02, 0.01, 0.005]
+        dt_list = MMS_DT_LIST
         N_fixed = 800
         errs = []
         for dt in dt_list:

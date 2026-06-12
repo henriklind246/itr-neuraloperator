@@ -39,12 +39,21 @@ from src.physics.boundary_forcing import (
     sample_exp_params,
     sample_pulse_train_params,
     sample_exp_train_params,
+    temporal_sin,
     temporal_exp,
     temporal_pulse_train,
     temporal_exp_train,
     build_qL,
+    build_qL_integral,
     encode_spatial_params,
     encode_temporal_params,
+    RAMP_DT_MULT,
+    default_ramp_seconds,
+    ramp_envelope,
+    ramped_temporal,
+    integrate_temporal_signed,
+    integrate_temporal_ramped_signed,
+    integrate_temporal_bins_ramped_signed,
 )
 from src.physics.fv_solver_1d import windowed_sin_flux
 
@@ -142,6 +151,25 @@ class TestSamplers:
             p = sample_gauss_params(rng)
             assert GAUSS_CENTER_RANGE[0] <= p["y_c"] <= GAUSS_CENTER_RANGE[1]
             assert GAUSS_SIGMA_RANGE[0] - 1e-12 <= p["sigma_y"] <= GAUSS_SIGMA_RANGE[1] + 1e-12
+
+    def test_spatial_samplers_scale_to_physical_y_domain(self):
+        rng = np.random.default_rng(0)
+        c, d = -1.0, 2.0
+        span = d - c
+        for _ in range(1000):
+            patch = sample_patch_params(rng, c=c, d=d)
+            assert PATCH_W_RANGE[0] * span <= patch["w"] <= PATCH_W_RANGE[1] * span
+            assert patch["y_c"] - patch["w"] / 2 >= c - 1e-12
+            assert patch["y_c"] + patch["w"] / 2 <= d + 1e-12
+
+            tri = sample_triangle_params(rng, c=c, d=d)
+            assert TRIANGLE_ELL_RANGE[0] * span <= tri["ell"] <= TRIANGLE_ELL_RANGE[1] * span
+            assert tri["y_c"] - tri["ell"] >= c - 1e-12
+            assert tri["y_c"] + tri["ell"] <= d + 1e-12
+
+            gauss = sample_gauss_params(rng, c=c, d=d)
+            assert c + GAUSS_CENTER_RANGE[0] * span <= gauss["y_c"] <= c + GAUSS_CENTER_RANGE[1] * span
+            assert GAUSS_SIGMA_RANGE[0] * span - 1e-12 <= gauss["sigma_y"] <= GAUSS_SIGMA_RANGE[1] * span + 1e-12
 
     def test_spatial_family_sampler_covers_all(self):
         rng = np.random.default_rng(0)
@@ -271,6 +299,14 @@ class TestTemporalBuilders:
         v = 100.0 * np.exp(-0.1 / 0.05) + 200.0 * np.exp(0.0)
         assert q(0.1) == pytest.approx(v)
 
+    def test_sin_is_half_wave_rectified(self):
+        q = temporal_sin(A=3.0, f=1.0, t_on=0.0, t_off=1.0,
+                         phase=0.0, tukey_alpha=0.0)
+        assert q(0.25) == pytest.approx(3.0)
+        assert q(0.75) == pytest.approx(0.0, abs=1e-15)
+        values = np.array([q(float(t)) for t in np.linspace(0.0, 1.0, 257)])
+        assert np.all(values >= 0.0)
+
     def test_all_builders_finite_scalar(self):
         rng = np.random.default_rng(0)
         for fam in TEMPORAL_FAMILIES:
@@ -296,6 +332,7 @@ class TestTemporalSamplers:
             assert SIN_FREQ_RANGE[0] - 1e-12 <= p["f"] <= SIN_FREQ_RANGE[1] + 1e-12
             assert p["t_on"] == 0.0
             assert p["t_off"] == 0.2
+            assert p["rectified"] is True
 
     def test_exp_in_bounds(self):
         rng = np.random.default_rng(0)
@@ -444,3 +481,229 @@ class TestBuildQLAllFamilies:
                 v = q_left(float(t))
                 assert v.shape == Y.shape
                 assert np.all(np.isfinite(v))
+
+
+# --------- STARTUP RAMP (q_L(0) = 0) ---------
+
+T_RAMP = default_ramp_seconds(DT)
+
+
+def _fine_ref_ramped_integral(fam, params, t_lo, t_hi, t_ramp, n=400001):
+    """High-resolution trapezoid reference for integral of ramp(t)*a(t).
+
+    Robust for smooth integrands (no discontinuity strictly inside the
+    interval). Used only with families/params that are smooth on the test
+    interval so the trapezoid error is negligible at float64 scale.
+    """
+    a_fn = TEMPORAL_BUILDERS[fam](**params)
+    t = np.linspace(float(t_lo), float(t_hi), n)
+    vals = np.array(
+        [ramp_envelope(float(tn), t_ramp) * a_fn(float(tn)) for tn in t],
+        dtype=float,
+    )
+    _trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    return float(_trapz(vals, t))
+
+
+class TestDefaultRampSeconds:
+
+    def test_is_two_dt(self):
+        assert default_ramp_seconds(DT) == pytest.approx(RAMP_DT_MULT * DT)
+
+    def test_below_shortest_pulse_width(self):
+        # Shortest sampled pulse width is 5*dt (DT_PULSE_FRAC_LO * dt). The ramp
+        # must stay under it so whole pulses are not swallowed by the ramp.
+        assert default_ramp_seconds(DT) < 5.0 * DT
+
+
+class TestRampEnvelope:
+
+    def test_zero_at_origin(self):
+        assert ramp_envelope(0.0, T_RAMP) == pytest.approx(0.0, abs=1e-15)
+
+    def test_one_at_and_after_ramp(self):
+        assert ramp_envelope(T_RAMP, T_RAMP) == pytest.approx(1.0, abs=1e-15)
+        assert ramp_envelope(2.0 * T_RAMP, T_RAMP) == pytest.approx(1.0, abs=1e-15)
+        assert ramp_envelope(T_FINAL, T_RAMP) == pytest.approx(1.0, abs=1e-15)
+
+    def test_monotone_nondecreasing(self):
+        t = np.linspace(0.0, 1.5 * T_RAMP, 257)
+        env = ramp_envelope(t, T_RAMP)
+        assert np.all(np.diff(env) >= -1e-15)
+        assert env[0] == pytest.approx(0.0, abs=1e-15)
+        assert env[-1] == pytest.approx(1.0, abs=1e-15)
+
+    def test_zero_ramp_is_identity_one(self):
+        # t_ramp <= 0 disables the ramp (envelope identically 1).
+        assert ramp_envelope(0.0, 0.0) == 1.0
+        arr = ramp_envelope(np.array([0.0, 0.1, 0.2]), 0.0)
+        assert np.allclose(arr, 1.0)
+
+    def test_smoothstep_flat_start(self):
+        # Smoothstep has zero slope at t=0; the very first sub-step is tiny.
+        eps = 1e-6 * T_RAMP
+        assert ramp_envelope(eps, T_RAMP) < 1e-10
+
+
+class TestQLeftStartsAtZero:
+    """q_L(0) = 0 for every temporal family, including adversarial params that
+    would otherwise fire at t=0 (exp t0=0, trains with t_n=0, sin tukey=0)."""
+
+    def _adversarial_params(self):
+        return {
+            "sin": dict(A=50.0, f=2.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.0),
+            "exp": dict(A=200.0, t0=0.0, tau=0.1),
+            "pulse_train": dict(A_list=[100.0, 200.0], t_list=[0.0, 0.1], dt_list=[0.05, 0.05]),
+            "exp_train": dict(A_list=[100.0, 200.0], t_list=[0.0, 0.1], tau_list=[0.05, 0.05]),
+        }
+
+    def test_sampled_params_zero_at_origin(self):
+        rng = np.random.default_rng(0)
+        for fam in TEMPORAL_FAMILIES:
+            for _ in range(50):
+                p = TEMPORAL_SAMPLERS[fam](rng, dt=DT, t_final=T_FINAL,
+                                           t_on=0.0, t_off=0.2)
+                q_left, _ = build_qL(fam, p, "uniform", {}, Y, t_ramp=T_RAMP)
+                assert np.allclose(q_left(0.0), 0.0, atol=1e-12)
+
+    def test_adversarial_params_zero_at_origin(self):
+        for fam, p in self._adversarial_params().items():
+            q_left, _ = build_qL(fam, p, "uniform", {}, Y, t_ramp=T_RAMP)
+            assert np.allclose(q_left(0.0), 0.0, atol=1e-12), fam
+
+    def test_no_ramp_can_be_nonzero_at_origin(self):
+        # Without the ramp, an adversarial exp (t0=0) fires immediately; this
+        # documents why the ramp is needed.
+        p = dict(A=200.0, t0=0.0, tau=0.1)
+        q_left, _ = build_qL("exp", p, "uniform", {}, Y, t_ramp=0.0)
+        assert not np.allclose(q_left(0.0), 0.0)
+
+    def test_ramped_value_matches_envelope_times_raw(self):
+        p = dict(A=200.0, t0=0.0, tau=0.1)
+        q_raw, _ = build_qL("exp", p, "uniform", {}, Y, t_ramp=0.0)
+        q_ramped, _ = build_qL("exp", p, "uniform", {}, Y, t_ramp=T_RAMP)
+        for t in (0.0, 0.25 * T_RAMP, 0.5 * T_RAMP, T_RAMP, 0.1):
+            expected = ramp_envelope(t, T_RAMP) * q_raw(t)
+            assert np.allclose(q_ramped(t), expected, atol=1e-12)
+
+
+class TestRampedIntegral:
+    """integrate_temporal_ramped_signed: split-at-t_ramp logic and accuracy."""
+
+    # Families whose post-ramp integrate_temporal_signed is EXACT analytic, so a
+    # fine trapezoid reference of ramp(t)*a(t) is valid over arbitrary smooth
+    # intervals. The single first pulse (t_n=0, width 0.1) is constant/smooth
+    # inside its window, and exp/exp_train are smooth everywhere.
+    def _analytic_smooth_cases(self):
+        return {
+            "exp": dict(A=200.0, t0=0.0, tau=0.1),
+            "pulse_train": dict(A_list=[150.0], t_list=[0.0], dt_list=[0.1]),
+            "exp_train": dict(A_list=[150.0], t_list=[0.0], tau_list=[0.1]),
+        }
+
+    # sin is added only for ramp-window-internal intervals: there the ramped
+    # integral is pure quadrature (no analytic tail), so it matches a fine
+    # reference. Outside the window sin's signed integral is itself fixed-sample
+    # quadrature, so a fine reference is not the right oracle for it.
+    def _all_smooth_cases(self):
+        cases = dict(self._analytic_smooth_cases())
+        cases["sin"] = dict(A=50.0, f=2.0, t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5)
+        return cases
+
+    def test_ramp_window_intervals_match_reference(self):
+        # Intervals fully inside [0, t_ramp]: the ramped integral is pure
+        # quadrature (no analytic tail), so every family matches a fine reference.
+        intervals = [(0.0, DT), (DT, 2.0 * DT), (0.0, T_RAMP),
+                     (0.25 * T_RAMP, 0.75 * T_RAMP)]
+        for fam, p in self._all_smooth_cases().items():
+            for t_lo, t_hi in intervals:
+                got = integrate_temporal_ramped_signed(fam, p, t_lo, t_hi, T_RAMP)
+                ref = _fine_ref_ramped_integral(fam, p, t_lo, t_hi, T_RAMP)
+                assert got == pytest.approx(ref, rel=1e-6, abs=1e-9), (fam, t_lo, t_hi)
+
+    def test_solver_relevant_intervals_match_reference(self):
+        # Solver CN forcing consumes the first steps [0,dt],[dt,2dt],[2dt,3dt].
+        # Validate against a fine reference for analytic-exact families (the
+        # post-ramp tail is exact, so the whole-interval reference is valid).
+        intervals = [(0.0, DT), (DT, 2.0 * DT), (2.0 * DT, 3.0 * DT)]
+        for fam, p in self._analytic_smooth_cases().items():
+            for t_lo, t_hi in intervals:
+                got = integrate_temporal_ramped_signed(fam, p, t_lo, t_hi, T_RAMP)
+                ref = _fine_ref_ramped_integral(fam, p, t_lo, t_hi, T_RAMP)
+                assert got == pytest.approx(ref, rel=1e-6, abs=1e-9), (fam, t_lo, t_hi)
+
+    def test_crossing_interval_matches_reference(self):
+        # t_lo < t_ramp < t_hi exercises both the quadrature and analytic halves.
+        # t_hi=0.08 stays strictly inside the single pulse window [0,0.1] so the
+        # integrand has no endpoint discontinuity. analytic-exact families only.
+        t_lo, t_hi = 0.4 * T_RAMP, 0.08
+        for fam, p in self._analytic_smooth_cases().items():
+            got = integrate_temporal_ramped_signed(fam, p, t_lo, t_hi, T_RAMP)
+            ref = _fine_ref_ramped_integral(fam, p, t_lo, t_hi, T_RAMP)
+            assert got == pytest.approx(ref, rel=1e-6, abs=1e-9), fam
+
+    def test_additivity_at_ramp_boundary(self):
+        # The full integral must equal the sum of the ramp-window part and the
+        # post-ramp part, for any family/params (exact by construction).
+        rng = np.random.default_rng(1)
+        t_lo, t_hi = 0.3 * T_RAMP, 0.12
+        for fam in TEMPORAL_FAMILIES:
+            for _ in range(20):
+                p = TEMPORAL_SAMPLERS[fam](rng, dt=DT, t_final=T_FINAL,
+                                           t_on=0.0, t_off=0.2)
+                full = integrate_temporal_ramped_signed(fam, p, t_lo, t_hi, T_RAMP)
+                left = integrate_temporal_ramped_signed(fam, p, t_lo, T_RAMP, T_RAMP)
+                right = integrate_temporal_ramped_signed(fam, p, T_RAMP, t_hi, T_RAMP)
+                assert full == pytest.approx(left + right, rel=1e-9, abs=1e-12)
+
+    def test_beyond_ramp_equals_analytic(self):
+        # For t_lo >= t_ramp the envelope is identically 1, so the ramped integral
+        # must equal the exact analytic signed integral.
+        rng = np.random.default_rng(2)
+        t_lo, t_hi = 1.5 * T_RAMP, 0.2
+        for fam in TEMPORAL_FAMILIES:
+            for _ in range(50):
+                p = TEMPORAL_SAMPLERS[fam](rng, dt=DT, t_final=T_FINAL,
+                                           t_on=0.0, t_off=0.2)
+                ramped = integrate_temporal_ramped_signed(fam, p, t_lo, t_hi, T_RAMP)
+                analytic = integrate_temporal_signed(fam, p, t_lo, t_hi)
+                assert ramped == pytest.approx(analytic, rel=1e-12, abs=1e-12)
+
+    def test_zero_ramp_equals_analytic_everywhere(self):
+        rng = np.random.default_rng(3)
+        for fam in TEMPORAL_FAMILIES:
+            p = TEMPORAL_SAMPLERS[fam](rng, dt=DT, t_final=T_FINAL,
+                                       t_on=0.0, t_off=0.2)
+            ramped = integrate_temporal_ramped_signed(fam, p, 0.0, 0.15, 0.0)
+            analytic = integrate_temporal_signed(fam, p, 0.0, 0.15)
+            assert ramped == pytest.approx(analytic, rel=1e-12, abs=1e-12)
+
+    def test_empty_interval_is_zero(self):
+        p = dict(A=200.0, t0=0.0, tau=0.1)
+        assert integrate_temporal_ramped_signed("exp", p, 0.1, 0.1, T_RAMP) == 0.0
+        assert integrate_temporal_ramped_signed("exp", p, 0.2, 0.1, T_RAMP) == 0.0
+
+    def test_bins_sum_to_full_integral(self):
+        # Additivity is float-tight only when the post-ramp integrator is exactly
+        # additive: exp/pulse_train/exp_train use closed-form analytic integrals.
+        # sin's signed integral is fixed-sample quadrature whose accuracy depends
+        # on interval width, so per-bin quadrature does not sum to the
+        # whole-window quadrature; sin additivity is covered structurally by the
+        # additivity-at-ramp-boundary test instead.
+        rng = np.random.default_rng(4)
+        t_s, t_j = 0.0, 0.18
+        analytic_families = ["exp", "pulse_train", "exp_train"]
+        for fam in analytic_families:
+            p = TEMPORAL_SAMPLERS[fam](rng, dt=DT, t_final=T_FINAL,
+                                       t_on=0.0, t_off=0.2)
+            bins = integrate_temporal_bins_ramped_signed(fam, p, t_s, t_j, T_RAMP)
+            full = integrate_temporal_ramped_signed(fam, p, t_s, t_j, T_RAMP)
+            assert bins.sum() == pytest.approx(full, rel=1e-9, abs=1e-10), fam
+
+    def test_build_qL_integral_is_separable(self):
+        # build_qL_integral returns integrate_temporal_ramped_signed(...) * s_vec.
+        p = dict(A=200.0, t0=0.0, tau=0.1)
+        q_int, s_vec = build_qL_integral("exp", p, "gaussian",
+                                         {"y_c": 0.5, "sigma_y": 0.1}, Y, t_ramp=T_RAMP)
+        scalar = integrate_temporal_ramped_signed("exp", p, 0.0, 0.1, T_RAMP)
+        assert np.allclose(q_int(0.0, 0.1), scalar * s_vec, atol=1e-12)

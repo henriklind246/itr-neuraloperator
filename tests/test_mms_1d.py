@@ -6,6 +6,8 @@ from src.physics.mms_1d import run_mms_once, run_mms_interface
 
 pytestmark = pytest.mark.slow
 
+MMS_DT_LIST = [0.0185, 0.00925, 0.004625]
+
 
 class TestRunMMSOnce:
     def test_returns_four_floats(self):
@@ -64,7 +66,7 @@ class TestTimeOrderTest:
         Stops at dt=0.005 to avoid spatial-floor contamination.
         """
         N_fixed = 801
-        dt_list = [0.02, 0.01, 0.005]
+        dt_list = MMS_DT_LIST
         errs = []
         for dt in dt_list:
             _, _, _, l2 = run_mms_once(N_fixed, dt=dt)
@@ -105,7 +107,7 @@ class TestConvergenceTableOutput:
 
     def test_print_temporal_convergence_table(self):
         """Temporal convergence table for single-layer MMS."""
-        dt_list = [0.02, 0.01, 0.005]
+        dt_list = MMS_DT_LIST
         N_fixed = 801
         errs = []
         for dt in dt_list:

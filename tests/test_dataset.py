@@ -10,6 +10,7 @@ from data.dataset import (
     load_sim_data,
     split_sim_ids,
     split_pairs_within_sims,
+    long_lead_pairs,
     SnapshotPairDataset,
     create_dataloaders,
     collate_fn,
@@ -403,6 +404,18 @@ class TestSnapshotPairDataset:
         train_pairs, val_pairs = split_pairs_within_sims(dataset_subsampled, val_pair_frac=0.2, seed=123)
         assert train_pairs._q_callables is not val_pairs._q_callables
         assert train_pairs._q_callables is not dataset_subsampled._q_callables
+
+    def test_long_lead_pairs_full_span_only(self, dataset_subsampled):
+        s_first = int(dataset_subsampled.t_indices[0])
+        j_last = int(dataset_subsampled.t_indices[-1])
+        pairs = long_lead_pairs(dataset_subsampled)
+
+        # one full-span pair per sim, all at (t=0 -> t_final)
+        assert len(pairs) == len(dataset_subsampled.sim_ids)
+        assert all(s == s_first and j == j_last for _, s, j in pairs)
+        assert {sim for sim, _, _ in pairs} == {int(s) for s in dataset_subsampled.sim_ids}
+        # the full-span pair is the maximum-lead pair (pairs are lead-sorted)
+        assert dataset_subsampled._pairs[-1] in pairs
 
 
 # ===================== build_forcing_seq helper =====================
