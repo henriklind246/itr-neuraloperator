@@ -33,7 +33,12 @@ def problem_from_config(config: dict) -> ProblemSpec:
     benchmark = config.get("benchmark") or {}
     name = str(benchmark.get("name", "forcing"))
     representation = str(benchmark.get("representation", "temporal_encoder"))
-    return get_problem(name, representation)
+    spec = get_problem(name, representation)
+    if "rc_channel_mode" in benchmark:
+        spec.rc_channel_mode = str(benchmark.get("rc_channel_mode"))
+    if "rc_ell" in benchmark:
+        spec.rc_ell = float(benchmark.get("rc_ell"))
+    return spec
 
 
 RC_RANGE = (0.05, 1.0)
