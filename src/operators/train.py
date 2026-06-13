@@ -744,6 +744,12 @@ def validate(
         _n_batches = 0
         try:
             for batch in val_loader:
+                if epoch is not None and _n_batches % 50 == 0:
+                    print(
+                        f"[val-progress] epoch={epoch} batch={_n_batches} "
+                        f"elapsed={time.perf_counter() - _t_val_start:.1f}s",
+                        flush=True,
+                    )
                 x_spatial = batch["spatial"].to(device)
                 cond_static = batch["cond_static"].to(device)
                 forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
