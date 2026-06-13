@@ -453,6 +453,128 @@ class TestConstantSolution2D:
         assert max_err < 1e-10, f"Constant+R_c drifted: max error = {max_err}"
 
 
+# ============= TEST 3b: PER-ROW (SPATIALLY-VARYING) R_c(y) =============
+
+class TestPerRowInterfaceResistance:
+    """Spatially-varying interface resistance R_c(y) along a vertical interface.
+
+    A scalar R_c must remain byte-for-byte identical to the legacy uniform path;
+    a (Ny,) array applies the series-resistance formula per row using the actual
+    one-sided distances to the interface.
+    """
+
+    @staticmethod
+    def _two_layer_kwargs(Nx=20, Ny=20):
+        return dict(
+            a=0.0, b=1.0, c=0.0, d=1.0,
+            Nx=Nx, Ny=Ny,
+            lam_target=0.5,
+            layers=[
+                Layer2D(0.0, 0.5, rho=1.0, cp=1.0, k=2.0),
+                Layer2D(0.5, 1.0, rho=1.0, cp=1.0, k=1.0),
+            ],
+            t_final=0.1,
+            flux_f=0.0, flux_A=0.0,
+            t_on=0.0, t_off=0.1, phase=0.0,
+            q_left_fn=lambda t: 0.0,
+            T_right_fn=lambda t: 300.0,
+        )
+
+    def test_uniform_array_matches_scalar_bitwise(self):
+        """A constant (Ny,) R_c array reproduces the scalar G_x exactly."""
+        Rc = 0.37
+        kw = self._two_layer_kwargs()
+        sim_scalar = FVSolver2D(interface_R=[Rc], **kw)
+        sim_array = FVSolver2D(interface_R=[np.full(kw["Ny"], Rc)], **kw)
+        G_scalar = sim_scalar._build_face_conductance_x()
+        G_array = sim_array._build_face_conductance_x()
+        assert G_scalar.shape == (kw["Nx"] - 1, kw["Ny"])
+        assert np.array_equal(G_scalar, G_array)
+
+    def test_per_row_uses_actual_one_sided_distances(self):
+        """The interface row equals 1/((x_I-x_L)/k_L + Rc[j] + (x_R-x_I)/k_R)."""
+        Ny = 20
+        kw = self._two_layer_kwargs(Ny=Ny)
+        rng = np.random.default_rng(0)
+        Rc = 0.1 + 0.5 * rng.random(Ny)
+        sim = FVSolver2D(interface_R=[Rc], **kw)
+        G = sim._build_face_conductance_x()
+
+        # Locate the single interface face and pull the solver's own geometry.
+        assert len(sim.interface_face_map) == 1
+        i = next(iter(sim.interface_face_map))
+        left_idx, right_idx = sim.interface_face_map[i]
+        h_L, h_R = sim.interface_offsets[i]
+        kL = sim.layers[left_idx].k
+        kR = sim.layers[right_idx].k
+        expected_row = 1.0 / (h_L / kL + Rc + h_R / kR)
+        np.testing.assert_allclose(G[i, :], expected_row, rtol=0, atol=0)
+
+        # Non-interface faces stay row-uniform (independent of j).
+        for ii in range(sim.Nx - 1):
+            if ii == i:
+                continue
+            assert np.allclose(G[ii, :], G[ii, 0], rtol=0, atol=0)
+
+    def test_flat_void_profile_full_solve_matches_scalar(self):
+        """R_amp=0 (flat profile) full solve equals the constant-R_c solve.
+
+        Proves existing constant-R_c benchmarks are unaffected by the per-row
+        code path: a flat make_rc_void_profile is bit-for-bit the scalar solve.
+        """
+        from src.physics.internal_source import make_rc_void_profile
+
+        Nx = Ny = 24
+        kw = self._two_layer_kwargs(Nx=Nx, Ny=Ny)
+        R_base = 0.42
+        sim_scalar = FVSolver2D(interface_R=[R_base], **kw)
+        flat = make_rc_void_profile(
+            sim_scalar.grid_y, R_base=R_base, R_amp=0.0, y0=0.5, sigma=0.1
+        )
+        sim_array = FVSolver2D(interface_R=[flat], **kw)
+
+        # A non-trivial transient: warm left half, cool right half.
+        T0 = np.full((Nx, Ny), 300.0)
+        T0[: Nx // 2, :] = 350.0
+        _, _, _, T_scalar = sim_scalar.solve(T0=T0.copy(), store_trajectory=False)
+        _, _, _, T_array = sim_array.solve(T0=T0.copy(), store_trajectory=False)
+        assert np.array_equal(T_scalar, T_array)
+
+    def test_void_increases_local_resistance(self):
+        """A central void (higher R_c) lowers interface conductance there."""
+        from src.physics.internal_source import make_rc_void_profile
+
+        Ny = 40
+        kw = self._two_layer_kwargs(Nx=Ny, Ny=Ny)
+        prof = make_rc_void_profile(
+            np.linspace(0.0, 1.0, Ny), R_base=0.1, R_amp=1.0, y0=0.5, sigma=0.1
+        )
+        sim = FVSolver2D(interface_R=[prof], **kw)
+        G = sim._build_face_conductance_x()
+        i = next(iter(sim.interface_face_map))
+        # Center row (peak R_c) must have strictly lower conductance than edges.
+        center = Ny // 2
+        assert G[i, center] < G[i, 0]
+        assert G[i, center] < G[i, -1]
+
+    def test_wrong_length_array_rejected(self):
+        kw = self._two_layer_kwargs(Ny=20)
+        with pytest.raises(ValueError):
+            FVSolver2D(interface_R=[np.ones(19)], **kw)
+
+    def test_two_d_array_rejected(self):
+        kw = self._two_layer_kwargs(Ny=20)
+        with pytest.raises(ValueError):
+            FVSolver2D(interface_R=[np.ones((20, 1))], **kw)
+
+    def test_negative_entry_in_array_rejected(self):
+        kw = self._two_layer_kwargs(Ny=20)
+        bad = np.full(20, 0.1)
+        bad[5] = -0.01
+        with pytest.raises(ValueError):
+            FVSolver2D(interface_R=[bad], **kw)
+
+
 # ==================== TEST 4: 1D EQUIVALENCE ====================
 
 class TestOneDEquivalence:

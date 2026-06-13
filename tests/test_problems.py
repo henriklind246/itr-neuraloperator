@@ -6,6 +6,7 @@ from problems.registry import get_problem
 from problems.forcing import FORCING_TEMPORAL_SAMPLES, ForcingProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
+from problems.source_itr import SourceItrProblem
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 _SYNTH_MU = 0.0
@@ -28,6 +29,14 @@ CONTRACTS = {
     ),
     ("source", "bins"): dict(
         in_ch=20, cond=7, has_fseq=False, token=2, t_stats=3,
+        encoder=False, s_y=3, aug=False,
+    ),
+    ("source_itr", "temporal_encoder"): dict(
+        in_ch=5, cond=10, has_fseq=True, token=2, t_stats=3,
+        encoder=True, s_y=3, aug=False,
+    ),
+    ("source_itr", "bins"): dict(
+        in_ch=21, cond=10, has_fseq=False, token=2, t_stats=3,
         encoder=False, s_y=3, aug=False,
     ),
     ("interfaces", "temporal_encoder"): dict(
@@ -104,6 +113,14 @@ def source_dataset(synthetic_trajectories):
     return _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
 
 
+@pytest.fixture
+def source_itr_dataset(synthetic_trajectories):
+    trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+    spec = get_problem("source_itr")
+    sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
+    return _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
+
+
 # ===================== registry / dims =====================
 
 class TestRegistry:
@@ -115,6 +132,9 @@ class TestRegistry:
 
     def test_source_registered(self):
         assert isinstance(get_problem("source"), SourceProblem)
+
+    def test_source_itr_registered(self):
+        assert isinstance(get_problem("source_itr"), SourceItrProblem)
 
     def test_unknown_raises(self):
         with pytest.raises(KeyError, match="Unknown benchmark"):
@@ -456,6 +476,178 @@ class TestSourceSampleParity:
             np.testing.assert_allclose(p["T0"], 300.0)
 
 
+# ===================== source_itr adapter =====================
+
+class TestSourceItrItem:
+    def test_item_keys_shapes(self, source_itr_dataset):
+        ds = source_itr_dataset
+        spec = get_problem("source_itr")
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        # source_itr/temporal_encoder: 5-channel spatial (adds Rc_y), cond 10.
+        assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, 5)
+        assert item["cond_static"].shape == (10,)
+        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
+        assert item["T_stats"].shape == (3,)
+
+    def test_rc_channel_index_is_4(self, source_itr_dataset):
+        # The normalized R_c(y) channel is spatial index 4; under broadcast it is
+        # constant in x (one column of the y-profile reproduces the whole field).
+        ds = source_itr_dataset
+        spec = get_problem("source_itr")
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        rc_channel = item["spatial"][:, :, 4]
+        # broadcast mode: every x-row equals the y-profile.
+        np.testing.assert_allclose(
+            rc_channel,
+            np.broadcast_to(rc_channel[0:1, :], rc_channel.shape),
+            rtol=0, atol=0,
+        )
+
+    def test_rc_channel_matches_log_norm_profile(self, source_itr_dataset):
+        from problems.source_itr import rc_log_norm
+        from src.physics.internal_source import make_rc_void_profile
+
+        ds = source_itr_dataset
+        spec = get_problem("source_itr")
+        sim_id, s, j = ds._pairs[0]
+        p = ds.sim_params[int(sim_id)]
+        item = spec.build_item(ds, sim_id, s, j)
+        expected = rc_log_norm(
+            make_rc_void_profile(
+                ds.y_grid,
+                R_base=float(p["R_c_base"]), R_amp=float(p["R_c_amp"]),
+                y0=float(p["R_c_y0"]), sigma=float(p["R_c_sigma"]),
+            )
+        )
+        np.testing.assert_allclose(item["spatial"][0, :, 4], expected, rtol=0, atol=0)
+
+    def test_localized_mode_decays_away_from_interface(self, synthetic_trajectories):
+        # localized mode multiplies the y-profile by exp(-((x - x_I)/ell)^2), so
+        # the channel magnitude at x far from the interface is below that at x_I.
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = SourceItrProblem("temporal_encoder")
+        spec.rc_channel_mode = "localized"
+        spec.rc_ell = 0.05
+        sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
+        ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        rc_channel = item["spatial"][:, :, 4]
+        i_near = int(np.argmin(np.abs(ds.x_grid - 0.5)))
+        col = int(np.argmax(np.abs(rc_channel[i_near, :])))
+        assert abs(rc_channel[0, col]) < abs(rc_channel[i_near, col])
+
+    def test_t_stats_carries_interface_x(self, source_itr_dataset):
+        ds = source_itr_dataset
+        spec = get_problem("source_itr")
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert item["T_stats"][2] == np.float32(0.5)
+
+    def test_getitem_matches_build_item(self, source_itr_dataset):
+        ds = source_itr_dataset
+        spec = get_problem("source_itr")
+        ref = ds[0]
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert set(item) == set(ref.keys())
+        for k in item:
+            np.testing.assert_allclose(item[k], ref[k].numpy(), rtol=0, atol=0)
+
+
+class TestSourceItrSchema:
+    def test_accepts_valid(self, source_itr_dataset):
+        ds = source_itr_dataset
+        get_problem("source_itr").validate_schema(ds.sim_params, ds.sim_ids)
+
+    def test_rejects_missing_void_keys(self):
+        spec = get_problem("source_itr")
+        # All source keys present but the four void keys are missing.
+        bad = np.array([{
+            "R_c": 0.5, "interface_x": 0.5, "x_h": 0.3, "y_h": 0.5,
+            "A": 5000.0, "t_off": 0.225, "w_h": 0.1, "h_h": 0.1,
+        }], dtype=object)
+        with pytest.raises(ValueError, match="missing keys"):
+            spec.validate_schema(bad, np.array([0]))
+
+
+class TestSourceItrSampleParity:
+    def test_void_params_present_and_bounded(self, source_itr_dataset):
+        from src.physics.internal_source import RC_VOID_RANGES, R_PEAK_MAX
+        ds = source_itr_dataset
+        b_lo, b_hi = RC_VOID_RANGES["R_base"]
+        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+        s_lo, s_hi = RC_VOID_RANGES["sigma"]
+        for p in ds.sim_params:
+            assert b_lo <= p["R_c_base"] <= b_hi
+            assert 0.0 <= p["R_c_amp"] <= R_PEAK_MAX - p["R_c_base"] + 1e-9
+            assert y0_lo <= p["R_c_y0"] <= y0_hi
+            assert s_lo <= p["R_c_sigma"] <= s_hi
+            # R_c mirrors R_c_base so the universal column stays valid.
+            assert p["R_c"] == pytest.approx(p["R_c_base"])
+
+    def test_patch_sampling_matches_source(self, synthetic_trajectories):
+        # source_itr must reuse source's patch/A/IC stream unchanged.
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        src = get_problem("source")
+        itr = get_problem("source_itr")
+        p_src = _adapter_sim_params(src, trajectories, x_grid, y_grid, t_grid)
+        p_itr = _adapter_sim_params(itr, trajectories, x_grid, y_grid, t_grid)
+        for a, b in zip(p_src, p_itr):
+            assert a["x_h"] == pytest.approx(b["x_h"])
+            assert a["y_h"] == pytest.approx(b["y_h"])
+            assert a["A"] == pytest.approx(b["A"])
+            assert a["regime"] == b["regime"]
+
+
+class TestSourceItrSolver:
+    def test_wires_per_row_interface_resistance(self, synthetic_trajectories):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem("source_itr")
+        sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
+        params = sim_params[0]
+        Nx = Ny = 20
+        xg = np.linspace(0.0, 1.0, Nx)
+        yg = np.linspace(0.0, 1.0, Ny)
+        X, Y = np.meshgrid(xg, yg, indexing="ij")
+        base_kwargs = dict(
+            a=0.0, b=1.0, c=0.0, d=1.0, Nx=Nx, Ny=Ny,
+            lam_target=0.8, layers=None, t_final=0.3,
+            flux_f=0.0, flux_A=0.0, t_on=0.0, t_off=0.2, phase=0.0,
+            dt=0.005, tukey_alpha=0.5, y_grid=yg, X=X, Y=Y,
+        )
+        solver = spec.configure_solver(params, base_kwargs)
+        assert isinstance(solver, FVSolver2D)
+        assert solver.source is not None
+        # interface_R is a per-row (Ny,) profile, not a scalar.
+        rc = solver.interface_R[0]
+        assert np.ndim(rc) == 1
+        assert np.shape(rc) == (Ny,)
+
+
+class TestSourceItrValPairRow:
+    def test_fields_and_row(self, source_itr_dataset):
+        ds = source_itr_dataset
+        spec = get_problem("source_itr")
+        assert spec.val_pair_fields == (
+            "x_h", "y_h", "A", "regime", "R_c_amp", "R_c_y0", "R_c_sigma"
+        )
+        sim_id, s, j = ds._pairs[0]
+        row = spec.val_pair_row(ds, sim_id, s, j)
+        assert set(row) == set(spec.val_pair_fields)
+        p = ds.sim_params[int(sim_id)]
+        assert row["R_c_amp"] == pytest.approx(float(p["R_c_amp"]))
+        assert row["R_c_y0"] == pytest.approx(float(p["R_c_y0"]))
+        assert row["R_c_sigma"] == pytest.approx(float(p["R_c_sigma"]))
+        # void benchmark still forbids family columns.
+        assert "temporal_family" not in row
+        assert "spatial_family" not in row
+
+
 class TestProblemFromConfig:
     @pytest.mark.parametrize(
         "name,cls",
@@ -481,6 +673,22 @@ class TestProblemFromConfig:
     def test_defaults_to_temporal_encoder_when_representation_missing(self):
         spec = problem_from_config({"benchmark": {"name": "source"}})
         assert spec.representation == "temporal_encoder"
+
+    def test_source_itr_defaults_broadcast_channel_mode(self):
+        spec = problem_from_config({"benchmark": {"name": "source_itr"}})
+        assert isinstance(spec, SourceItrProblem)
+        assert spec.rc_channel_mode == "broadcast"
+
+    def test_source_itr_reads_rc_channel_knobs(self):
+        spec = problem_from_config({
+            "benchmark": {
+                "name": "source_itr",
+                "rc_channel_mode": "localized",
+                "rc_ell": 0.08,
+            }
+        })
+        assert spec.rc_channel_mode == "localized"
+        assert spec.rc_ell == pytest.approx(0.08)
 
 
 class TestGeometryAwareProblemSampling:

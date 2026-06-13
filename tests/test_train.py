@@ -327,6 +327,9 @@ class TestValidate:
             "temporal_family",
             "x_h",
             "y_h",
+            "R_c_amp",
+            "R_c_y0",
+            "R_c_sigma",
         }
         assert {int(row["epoch"]) for row in rows} == {7}
         # The fixture is a forcing-style dataset, so only forcing's extra
@@ -335,7 +338,16 @@ class TestValidate:
             assert row["benchmark"] == "forcing"
             assert row["temporal_family"] != ""
             assert row["spatial_family"] != ""
-            for empty_col in ("A", "interface_x", "regime", "x_h", "y_h"):
+            for empty_col in (
+                "A",
+                "interface_x",
+                "regime",
+                "x_h",
+                "y_h",
+                "R_c_amp",
+                "R_c_y0",
+                "R_c_sigma",
+            ):
                 assert row[empty_col] == ""
 
     def test_per_pair_csv_metrics_use_normalized_tensors(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
