@@ -107,3 +107,50 @@ def build_patch_source(
         return amp * mask.astype(np.float64)
 
     return source
+
+
+# ---------------------------------------------------------------------------
+# Spatially-varying interface resistance (Gaussian void)
+# ---------------------------------------------------------------------------
+# R_c(y) = R_base + R_amp * exp(-((y - y0) / sigma)^2)
+#
+# Models a localized delamination / air-gap void in the thermal interface
+# material along the fixed x = 0.5 interface: a single smooth positive bump in
+# the contact resistance centered at y0 with width sigma. The amplitude bound is
+# *dependent* on R_base so the profile is physical by construction (no clipping):
+#   R_c(y) in [R_base, R_base + R_amp] subset [RC_MIN, R_PEAK_MAX].
+# Sampling R_amp in [0, R_PEAK_MAX - R_base] makes the (R_base, R_amp) joint
+# distribution triangular (high base => low admissible amp); this is an
+# in-distribution correlation, so avoid independence/extrapolation claims on it.
+RC_MIN: float = 0.05
+R_PEAK_MAX: float = 3.0
+RC_VOID_RANGES: dict[str, tuple[float, float]] = {
+    "R_base": (0.05, 1.0),
+    # Upper amp bound is resolved per-sample as (R_PEAK_MAX - R_base); the value
+    # here is the global maximum used for normalization (R_base at its floor).
+    "R_amp": (0.0, R_PEAK_MAX - RC_MIN),
+    "y0": (0.1, 0.9),
+    # sigma >= 0.05 spans ~5 cells on Ny = 100, keeping the void resolved.
+    "sigma": (0.05, 0.2),
+}
+
+
+def make_rc_void_profile(
+    y_grid: np.ndarray,
+    R_base: float,
+    R_amp: float,
+    y0: float,
+    sigma: float,
+) -> np.ndarray:
+    """Return the (Ny,) Gaussian-void interface-resistance profile R_c(y).
+
+    Evaluated at the cell-center coordinates `y_grid`:
+        R_c(y) = R_base + R_amp * exp(-((y - y0) / sigma)^2).
+    With R_amp = 0 this returns a flat R_base profile (used by the parity /
+    regression tests). Returns float64 so it feeds the solver's series-resistance
+    formula at full precision.
+    """
+    if sigma <= 0.0:
+        raise ValueError(f"sigma must be positive, got {sigma}.")
+    y = np.asarray(y_grid, dtype=np.float64)
+    return R_base + R_amp * np.exp(-(((y - y0) / sigma) ** 2))

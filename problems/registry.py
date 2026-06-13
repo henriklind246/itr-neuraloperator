@@ -4,12 +4,14 @@ from problems.base import ProblemSpec
 from problems.forcing import ForcingProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
+from problems.source_itr import SourceItrProblem
 
 # Benchmarks register here as constructors taking a representation string.
 REGISTRY: dict[str, type[ProblemSpec]] = {
     "forcing": ForcingProblem,
     "interfaces": InterfacesProblem,
     "source": SourceProblem,
+    "source_itr": SourceItrProblem,
 }
 
 # The two public representation values. Every benchmark supports both.
