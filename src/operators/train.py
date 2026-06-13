@@ -739,6 +739,9 @@ def validate(
             if write_header:
                 pair_writer.writeheader()
 
+        _t_val_start = time.perf_counter()
+        _t_write_total = 0.0
+        _n_batches = 0
         try:
             for batch in val_loader:
                 x_spatial = batch["spatial"].to(device)
@@ -752,6 +755,7 @@ def validate(
                 y_pred = model(x_spatial, cond_static, forcing_seq)
                 mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
                 target_sq_sum += torch.sum(y_batch ** 2).item()
+                _n_batches += 1
 
                 bf = None
                 if iface_x is not None and x_grid_t is not None:
@@ -766,6 +770,7 @@ def validate(
                     iface_target_sq_sum += torch.sum(true_iface ** 2).item()
 
                 if write_pairs and pair_writer is not None and dataset is not None:
+                    _tw = time.perf_counter()
                     rel_l2 = _per_pair_rel_l2_percent(y_pred, y_batch).cpu()
                     if bf is not None:
                         num = torch.sum(bf * (y_pred - y_batch) ** 2, dim=(1, 2, 3))
@@ -781,9 +786,19 @@ def validate(
                     pairs = dataset._pairs[pair_cursor:pair_cursor + batch_size]
                     _write_val_pair_rows(pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2)
                     pair_cursor += batch_size
+                    _t_write_total += time.perf_counter() - _tw
         finally:
             if pair_file is not None:
                 pair_file.close()
+
+        _t_val_total = time.perf_counter() - _t_val_start
+        if epoch is not None:
+            print(
+                f"[val-timing] epoch={epoch} batches={_n_batches} "
+                f"total={_t_val_total:.1f}s forward={_t_val_total - _t_write_total:.1f}s "
+                f"val_pairs_write={_t_write_total:.1f}s",
+                flush=True,
+            )
 
         val_loss = math.sqrt(mse_sum / max(target_sq_sum, 1e-12)) * 100.0
         if iface_target_sq_sum > 0.0:
@@ -1035,7 +1050,7 @@ def run_one_seed(
         scheduler.step()
 
         if is_main:
-            print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%")
+            print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%", flush=True)
 
         is_best = 0
         val_loss = None
@@ -1058,7 +1073,7 @@ def run_one_seed(
                     interface_half_width=loss_cfg.get("interface_half_width", 0.05),
                     use_per_sample_interface=use_per_sample_interface,
                 )
-                print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%")
+                print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%", flush=True)
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -1079,7 +1094,7 @@ def run_one_seed(
                         },
                         best_path,
                     )
-                    print(f"Saved new best: {best_val_loss} -> {best_path}")
+                    print(f"Saved new best: {best_val_loss} -> {best_path}", flush=True)
                 else:
                     bad_epochs += 1
                     if bad_epochs >= patience:
