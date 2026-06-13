@@ -109,13 +109,30 @@ class FVSolver2D:
                     f"interface_R has length {len(interface_R)} but there are "
                     f"{num_interfaces} interface(s). Must match exactly."
                 )
+            # Normalize each entry to a canonical internal type: a Python float
+            # (scalar, spatially-uniform R_c) or a (Ny,) float array (per-row,
+            # spatially-varying R_c(y)). Reject lists, (Ny, 1), object arrays,
+            # and any other shape so downstream face-conductance assembly can
+            # branch cleanly on ndim. The scalar branch is preserved exactly for
+            # backward compatibility with constant-R_c benchmarks.
+            normalized = []
             for j, Rc in enumerate(interface_R):
-                if Rc < 0.0:
+                Rc_arr = np.asarray(Rc, dtype=float)
+                if np.any(Rc_arr < 0.0):
                     raise ValueError(
                         f"interface_R[{j}] = {Rc} is negative. "
                         f"Contact resistance must be >= 0."
                     )
-            self.interface_R = list(interface_R)
+                if Rc_arr.ndim == 0:
+                    normalized.append(float(Rc_arr))
+                elif Rc_arr.shape == (self.Ny,):
+                    normalized.append(Rc_arr)
+                else:
+                    raise ValueError(
+                        f"interface_R[{j}] has shape {Rc_arr.shape}; must be a "
+                        f"scalar or a 1D array of length Ny={self.Ny}."
+                    )
+            self.interface_R = normalized
 
         # -------- BCs --------
         if q_left_fn is not None:
@@ -375,9 +392,15 @@ class FVSolver2D:
         x-direction face conductance G_x[i, j] between nodes (i,j) and (i+1,j).
         Shape: (Nx-1, Ny).
 
-        Independent of j (vertical interfaces only) — computed as 1D and broadcast.
+        Interior and non-interface faces are independent of j. An interface face
+        may carry either a scalar R_c (spatially-uniform, broadcast across rows)
+        or a per-row R_c(y) array of length Ny (spatially-varying interface),
+        in which case the series conductance is evaluated per row j using the
+        actual one-sided distances to the interface:
+            G_x[i, j] = 1 / ((x_I - x_L)/k_L + R_c[j] + (x_R - x_I)/k_R).
+        With a scalar R_c this reproduces the uniform-broadcast result exactly.
         """
-        G_x_1d = np.zeros(self.Nx - 1, dtype=float)
+        G_x = np.zeros((self.Nx - 1, self.Ny), dtype=float)
 
         for i, x_face in enumerate(self.face_positions_x):
             if i in self.interface_face_map:
@@ -386,12 +409,16 @@ class FVSolver2D:
                 kL = self.layers[left_idx].k
                 kR = self.layers[right_idx].k
                 Rc = self.interface_R[left_idx]
-                G_x_1d[i] = 1.0 / (h_L / kL + Rc + h_R / kR)
+                # Rc is normalized in __init__ to a float (uniform) or a (Ny,)
+                # array (per-row). Both use the same series-resistance formula;
+                # the float broadcasts to a constant row, matching the legacy
+                # uniform path bit-for-bit.
+                G_x[i, :] = 1.0 / (h_L / kL + Rc + h_R / kR)
             else:
                 layer_idx = self._layer_index_for_face_interior(x_face)
-                G_x_1d[i] = self.layers[layer_idx].k / self.hx
+                G_x[i, :] = self.layers[layer_idx].k / self.hx
 
-        return np.tile(G_x_1d[:, np.newaxis], (1, self.Ny))
+        return G_x
 
     def _build_face_conductance_y(self) -> np.ndarray:
         """
