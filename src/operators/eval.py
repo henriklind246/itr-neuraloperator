@@ -13,11 +13,18 @@ from data.dataset import (
 )
 from src.operators.fno2d import FNO2d
 from src.operators.losses import (
+    EPS_JUMP,
     build_boundary_mask,
     build_interface_band,
     build_interface_mask,
     compute_interface_rel_l2,
     get_batch_interface_x,
+    interface_flanking_nodes,
+    interface_flanking_nodes_per_sample,
+    per_sample_node_jump_errors,
+    per_sample_nrmse,
+    per_sample_sq_rms,
+    tail_stats,
 )
 from src.operators.rollout import (
     RolloutOptions,
@@ -156,6 +163,7 @@ def evaluate(
     x_grid=None,
     interface_half_width: float = 0.05,
     use_per_sample_interface: bool = False,
+    interface_x: float = 0.5,
 ):
     """Return a dict of test metrics in both normalized and physical space.
 
@@ -184,8 +192,12 @@ def evaluate(
         )
 
     x_grid_t = None
-    if use_per_sample_interface and x_grid is not None:
+    if x_grid is not None:
         x_grid_t = torch.as_tensor(x_grid, dtype=torch.float32, device=device)
+
+    fixed_left = fixed_right = None
+    if x_grid is not None and not use_per_sample_interface:
+        fixed_left, fixed_right = interface_flanking_nodes(x_grid, interface_x)
 
     with torch.no_grad():
         model.eval()
@@ -195,6 +207,13 @@ def evaluate(
         iface_rel_l2_phys = 0.0
         boundary_rel_l2_norm = 0.0
         boundary_rel_l2_phys = 0.0
+
+        # Unified per-sample metric accumulators (mean-over-pairs convention).
+        nrmse_all: list[torch.Tensor] = []
+        rmse_K_all: list[torch.Tensor] = []
+        node_jump_rmse_K_all: list[torch.Tensor] = []
+        node_jump_nrmse_all: list[torch.Tensor] = []
+        max_err_K = 0.0
 
         for batch in test_loader:
             x_spatial = batch["spatial"].to(device)
@@ -217,9 +236,33 @@ def evaluate(
             batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
             rel_l2_phys += batch_rel_l2_phys.item()
 
+            # --- Unified per-sample metrics (nRMSE is normalization-invariant;
+            # Kelvin metrics scale by the per-sample sigma). ---
+            sig = sigma_s.reshape(-1)
+            rms_i = per_sample_sq_rms(y_pred, y_batch)
+            nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
+            rmse_K_all.append((rms_i * sig).cpu())
+            max_err_K = max(
+                max_err_K,
+                torch.max(torch.abs(y_pred_phys - y_true_phys)).item(),
+            )
+
             iface_x = get_batch_interface_x(
                 batch, device, use_per_sample_interface=use_per_sample_interface
             )
+
+            left, right = fixed_left, fixed_right
+            if use_per_sample_interface and iface_x is not None and x_grid_t is not None:
+                left, right = interface_flanking_nodes_per_sample(x_grid_t, iface_x)
+            if left is not None and right is not None:
+                err_rms_i, true_jump_rms_i = per_sample_node_jump_errors(
+                    y_pred, y_batch, left, right
+                )
+                node_jump_rmse_K_all.append((err_rms_i * sig).cpu())
+                node_jump_nrmse_all.append(
+                    (err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)).cpu()
+                )
+
             if iface_x is not None and x_grid_t is not None:
                 band = build_interface_band(x_grid_t, iface_x, interface_half_width)
                 bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
@@ -241,6 +284,15 @@ def evaluate(
         boundary_rel_l2_norm /= n_batches
         boundary_rel_l2_phys /= n_batches
 
+    nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
+    rmse_K_mean = float(torch.cat(rmse_K_all).mean()) if rmse_K_all else 0.0
+    if node_jump_nrmse_all:
+        jump_nrmse_stats = tail_stats(torch.cat(node_jump_nrmse_all))
+        node_jump_rmse_K_mean = float(torch.cat(node_jump_rmse_K_all).mean())
+    else:
+        jump_nrmse_stats = tail_stats(torch.empty(0))
+        node_jump_rmse_K_mean = 0.0
+
     return {
         "rel_l2_norm": rel_l2_norm,
         "rel_l2_phys": rel_l2_phys,
@@ -248,6 +300,17 @@ def evaluate(
         "iface_rel_l2_phys": iface_rel_l2_phys,
         "boundary_rel_l2_norm": boundary_rel_l2_norm,
         "boundary_rel_l2_phys": boundary_rel_l2_phys,
+        "nrmse": nrmse_stats["mean"] * 100.0,
+        "nrmse_p90": nrmse_stats["p90"] * 100.0,
+        "nrmse_p99": nrmse_stats["p99"] * 100.0,
+        "nrmse_max": nrmse_stats["max"] * 100.0,
+        "rmse_K": rmse_K_mean,
+        "max_err_K": max_err_K,
+        "node_jump_rmse_K": node_jump_rmse_K_mean,
+        "node_jump_nrmse": jump_nrmse_stats["mean"] * 100.0,
+        "node_jump_nrmse_p90": jump_nrmse_stats["p90"] * 100.0,
+        "node_jump_nrmse_p99": jump_nrmse_stats["p99"] * 100.0,
+        "node_jump_nrmse_max": jump_nrmse_stats["max"] * 100.0,
     }
 
 
@@ -433,6 +496,7 @@ def eval_all_seeds(
             x_grid=x_grid,
             interface_half_width=loss_cfg.get("interface_half_width", 0.05),
             use_per_sample_interface=use_per_sample_interface,
+            interface_x=loss_cfg.get("interface_x", 0.5),
         )
 
         results.append(
@@ -447,6 +511,17 @@ def eval_all_seeds(
                 "test_iface_rel_l2": float(metrics["iface_rel_l2_phys"]),
                 "test_boundary_rel_l2_norm": float(metrics["boundary_rel_l2_norm"]),
                 "test_boundary_rel_l2": float(metrics["boundary_rel_l2_phys"]),
+                "test_nrmse": float(metrics.get("nrmse", 0.0)),
+                "test_nrmse_p90": float(metrics.get("nrmse_p90", 0.0)),
+                "test_nrmse_p99": float(metrics.get("nrmse_p99", 0.0)),
+                "test_nrmse_max": float(metrics.get("nrmse_max", 0.0)),
+                "test_rmse_K": float(metrics.get("rmse_K", 0.0)),
+                "test_max_err_K": float(metrics.get("max_err_K", 0.0)),
+                "test_node_jump_rmse_K": float(metrics.get("node_jump_rmse_K", 0.0)),
+                "test_node_jump_nrmse": float(metrics.get("node_jump_nrmse", 0.0)),
+                "test_node_jump_nrmse_p90": float(metrics.get("node_jump_nrmse_p90", 0.0)),
+                "test_node_jump_nrmse_p99": float(metrics.get("node_jump_nrmse_p99", 0.0)),
+                "test_node_jump_nrmse_max": float(metrics.get("node_jump_nrmse_max", 0.0)),
                 "rollout_enabled": bool(rollout_options.enabled),
                 "rollout_num_substeps": int(rollout_options.num_substeps),
                 "rollout_partition": rollout_options.partition,
@@ -491,6 +566,18 @@ def print_seed_report(results: list[dict]) -> dict:
     bnd_norm_mu, bnd_norm_std = mean_std(test_bnd_norm)
     bnd_mu, bnd_std = mean_std(test_bnd)
 
+    def _seed_stat(key: str) -> tuple[float, float]:
+        return mean_std([r.get(key, 0.0) for r in results])
+
+    nrmse_mu, nrmse_std = _seed_stat("test_nrmse")
+    nrmse_p90_mu, _ = _seed_stat("test_nrmse_p90")
+    nrmse_p99_mu, _ = _seed_stat("test_nrmse_p99")
+    nrmse_max_mu, _ = _seed_stat("test_nrmse_max")
+    rmse_K_mu, rmse_K_std = _seed_stat("test_rmse_K")
+    max_err_K_mu, _ = _seed_stat("test_max_err_K")
+    jump_rmse_K_mu, jump_rmse_K_std = _seed_stat("test_node_jump_rmse_K")
+    jump_nrmse_mu, jump_nrmse_std = _seed_stat("test_node_jump_nrmse")
+
     print("\n===== Seed Report =====")
     print(f"Number of seeds: {len(results)}")
     print(f"best_val_loss            mean, std: ({val_mu}, {val_std})")
@@ -500,6 +587,12 @@ def print_seed_report(results: list[dict]) -> dict:
     print(f"test_iface_rel_l2 (phys) mean, std: ({iface_mu}, {iface_std})")
     print(f"test_boundary_rel_l2_norm mean, std: ({bnd_norm_mu}, {bnd_norm_std})")
     print(f"test_boundary_rel_l2(phys) mean, std: ({bnd_mu}, {bnd_std})")
+    print(f"test_nrmse (%)           mean, std: ({nrmse_mu}, {nrmse_std})   <- headline, normalization-invariant")
+    print(f"test_nrmse tails (%)     p90/p99/max: ({nrmse_p90_mu}, {nrmse_p99_mu}, {nrmse_max_mu})")
+    print(f"test_rmse_K              mean, std: ({rmse_K_mu}, {rmse_K_std})   (Kelvin)")
+    print(f"test_max_err_K           mean: {max_err_K_mu}   (Kelvin worst-case)")
+    print(f"test_node_jump_rmse_K    mean, std: ({jump_rmse_K_mu}, {jump_rmse_K_std})   (Kelvin)")
+    print(f"test_node_jump_nrmse (%) mean, std: ({jump_nrmse_mu}, {jump_nrmse_std})   <- offset-free interface")
 
     best = min(results, key=lambda r: r["test_rel_l2_norm"])
     print(
@@ -526,6 +619,18 @@ def print_seed_report(results: list[dict]) -> dict:
         "test_boundary_rel_l2_norm_std": bnd_norm_std,
         "test_boundary_rel_l2_mean": bnd_mu,
         "test_boundary_rel_l2_std": bnd_std,
+        "test_nrmse_mean": nrmse_mu,
+        "test_nrmse_std": nrmse_std,
+        "test_nrmse_p90_mean": nrmse_p90_mu,
+        "test_nrmse_p99_mean": nrmse_p99_mu,
+        "test_nrmse_max_mean": nrmse_max_mu,
+        "test_rmse_K_mean": rmse_K_mu,
+        "test_rmse_K_std": rmse_K_std,
+        "test_max_err_K_mean": max_err_K_mu,
+        "test_node_jump_rmse_K_mean": jump_rmse_K_mu,
+        "test_node_jump_rmse_K_std": jump_rmse_K_std,
+        "test_node_jump_nrmse_mean": jump_nrmse_mu,
+        "test_node_jump_nrmse_std": jump_nrmse_std,
     }
 
 def save_report(run_root: str, results: list[dict], summary: dict,
@@ -549,6 +654,7 @@ TEST_RECORD_FIELDS = [
     "temporal_family", "spatial_family",
     "x_h", "y_h", "A", "freq", "regime",
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
+    "nrmse_pct", "rmse_K", "node_jump_rmse_K", "node_jump_nrmse_pct",
 ]
 
 
@@ -667,6 +773,15 @@ def write_test_records(
             mask_cache[key] = build_interface_mask(x_grid, y_grid, key, hw).to(device)
         return mask_cache[key]
 
+    sigma_global = float(ckpt.get("sigma_global") or 1.0)
+    flank_cache: dict[float, tuple[int, int]] = {}
+
+    def _flank_for(interface_x: float) -> tuple[int, int]:
+        key = round(float(interface_x), 4)
+        if key not in flank_cache:
+            flank_cache[key] = interface_flanking_nodes(x_grid, key)
+        return flank_cache[key]
+
     rows = []
     with torch.no_grad():
         for idx in range(len(dataset)):
@@ -699,6 +814,16 @@ def write_test_records(
             interface_x = float(params.get("interface_x", 0.5))
             iface_rel_l2 = compute_interface_rel_l2(y_pred, y_true, _mask_for(interface_x))
 
+            rms_i = per_sample_sq_rms(y_pred, y_true)
+            nrmse_pct = float(per_sample_nrmse(y_pred, y_true).item()) * 100.0
+            rmse_K = float(rms_i.item()) * sigma_global
+            left_n, right_n = _flank_for(interface_x)
+            jump_err, jump_true = per_sample_node_jump_errors(y_pred, y_true, left_n, right_n)
+            node_jump_rmse_K = float(jump_err.item()) * sigma_global
+            node_jump_nrmse_pct = float(
+                (jump_err / jump_true.clamp_min(EPS_JUMP)).item()
+            ) * 100.0
+
             t_s_val = float(dataset.t_grid[s])
             t_j_val = float(dataset.t_grid[j])
             A, freq = _amp_freq_from_params(params)
@@ -721,6 +846,10 @@ def write_test_records(
                 "x_I": interface_x,
                 "rel_l2_pct": rel_l2,
                 "iface_rel_l2_pct": iface_rel_l2,
+                "nrmse_pct": nrmse_pct,
+                "rmse_K": rmse_K,
+                "node_jump_rmse_K": node_jump_rmse_K,
+                "node_jump_nrmse_pct": node_jump_nrmse_pct,
             })
 
     rows.sort(key=lambda r: (r["sim_id"], r["s"], r["j"]))

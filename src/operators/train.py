@@ -30,10 +30,17 @@ from data.dataset import (
 from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
 from src.operators.losses import (
+    EPS_JUMP,
     SpatiallyWeightedMSE,
     build_interface_band,
     build_interface_mask,
     get_batch_interface_x,
+    interface_flanking_nodes,
+    interface_flanking_nodes_per_sample,
+    per_sample_node_jump_errors,
+    per_sample_nrmse,
+    per_sample_sq_rms,
+    tail_stats,
 )
 from src.operators.utils import resolve_device
 
@@ -55,6 +62,10 @@ BASE_VAL_PAIR_FIELDNAMES = [
     "R_c",
     "rel_l2",
     "iface_rel_l2",
+    "nrmse",
+    "rmse_K",
+    "node_jump_rmse_K",
+    "node_jump_nrmse",
 ]
 
 
@@ -238,8 +249,17 @@ def _summarize_metrics_csv(csv_path: Path) -> dict:
         v = row.get(key, "")
         return float(v) if v not in ("", None) else None
 
+    _extra_keys = (
+        "train_nrmse", "train_rmse_K", "train_max_err_K",
+        "train_node_jump_rmse_K", "train_node_jump_nrmse",
+        "val_nrmse", "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
+        "val_rmse_K", "val_max_err_K",
+        "val_node_jump_rmse_K", "val_node_jump_nrmse",
+        "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
+    )
+
     def _row(row):
-        return {
+        out = {
             "epoch": int(row["epoch"]),
             "train_rel_l2": _f(row, "train_rel_l2"),
             "train_iface_rel_l2": _f(row, "train_iface_rel_l2"),
@@ -247,6 +267,9 @@ def _summarize_metrics_csv(csv_path: Path) -> dict:
             "val_iface_rel_l2": _f(row, "val_iface_rel_l2"),
             "lr": _f(row, "lr"),
         }
+        for k in _extra_keys:
+            out[k] = _f(row, k)
+        return out
 
     best_rows = [r for r in rows if r.get("is_best") == "1"]
     best_row = _row(best_rows[-1]) if best_rows else _row(rows[-1])
@@ -293,11 +316,29 @@ def _write_final_metrics(
             "val_iface_rel_l2": best["val_iface_rel_l2"],
             "train_rel_l2": best["train_rel_l2"],
             "train_iface_rel_l2": best["train_iface_rel_l2"],
+            "val_nrmse": best["val_nrmse"],
+            "val_nrmse_p90": best["val_nrmse_p90"],
+            "val_nrmse_p99": best["val_nrmse_p99"],
+            "val_nrmse_max": best["val_nrmse_max"],
+            "val_rmse_K": best["val_rmse_K"],
+            "val_max_err_K": best["val_max_err_K"],
+            "val_node_jump_rmse_K": best["val_node_jump_rmse_K"],
+            "val_node_jump_nrmse": best["val_node_jump_nrmse"],
+            "train_nrmse": best["train_nrmse"],
+            "train_rmse_K": best["train_rmse_K"],
+            "train_max_err_K": best["train_max_err_K"],
+            "train_node_jump_rmse_K": best["train_node_jump_rmse_K"],
+            "train_node_jump_nrmse": best["train_node_jump_nrmse"],
         },
         "final": {
             "epoch": final["epoch"],
             "train_rel_l2": final["train_rel_l2"],
             "train_iface_rel_l2": final["train_iface_rel_l2"],
+            "train_nrmse": final["train_nrmse"],
+            "train_rmse_K": final["train_rmse_K"],
+            "train_max_err_K": final["train_max_err_K"],
+            "train_node_jump_rmse_K": final["train_node_jump_rmse_K"],
+            "train_node_jump_nrmse": final["train_node_jump_nrmse"],
             "lr": final["lr"],
         },
         "epochs_trained": summary["total_epochs"],
@@ -575,10 +616,22 @@ def train_one_epoch(
     grad_clip=None,
     dist_info: DistInfo | None = None,
     use_per_sample_interface: bool = False,
-) -> tuple[float, float, float]:
-    """Train one epoch. Under DDP, reduces sums (loss, MSE, ||y||^2, iface MSE,
-    ||y_iface||^2, sample counts) across ranks and computes true global metrics
-    from those sums — not an average of per-rank ratios."""
+    x_grid: np.ndarray | None = None,
+    interface_x: float = 0.5,
+    sigma_global: float = 1.0,
+) -> dict[str, float]:
+    """Train one epoch and return a dict of epoch metrics.
+
+    Under DDP, reduces sums (loss, MSE, ||y||^2, iface MSE, ||y_iface||^2, sample
+    counts, and the unified per-sample metric sums) across ranks and computes
+    true global metrics from those sums — not an average of per-rank ratios.
+
+    The unified headline metrics (``nrmse``, ``rmse_K``, ``node_jump_rmse_K``,
+    ``node_jump_nrmse``) are accumulated as **summed per-sample** scalars and
+    divided by ``n_samples`` after the reduce, so the train headline equals the
+    mean-over-pairs definition used by validate/evaluate (not a pooled RMSE).
+    ``max_err_K`` is a worst-case over the split (MAX-reduced under DDP).
+    """
     if dist_info is None:
         dist_info = get_dist_info()
 
@@ -591,6 +644,18 @@ def train_one_epoch(
     iface_target_sq_sum = 0.0
     n_samples = 0
     n_iface_voxels = 0  # number of (sample, iface_voxel) entries summed
+
+    # Unified metric accumulators (summed per-sample; mean after the reduce).
+    nrmse_sum = 0.0
+    rmse_K_sum = 0.0
+    node_jump_rmse_K_sum = 0.0
+    node_jump_nrmse_sum = 0.0
+    max_abs_err = 0.0  # normalized; scaled to Kelvin after the reduce
+
+    # Fixed-interface flanking nodes (per-sample handled inside the loop).
+    fixed_left = fixed_right = None
+    if x_grid is not None and not use_per_sample_interface:
+        fixed_left, fixed_right = interface_flanking_nodes(x_grid, interface_x)
 
     for batch in train_loader:
         x_spatial = batch["spatial"].to(device)
@@ -618,6 +683,24 @@ def train_one_epoch(
             mse_sum += torch.sum((y_pred - y_batch) ** 2).item()
             target_sq_sum += torch.sum(y_batch ** 2).item()
 
+            # --- unified per-sample metrics ---
+            rms_i = per_sample_sq_rms(y_pred, y_batch)  # (B,)
+            nrmse_sum += torch.sum(per_sample_nrmse(y_pred, y_batch)).item()
+            rmse_K_sum += torch.sum(rms_i).item() * sigma_global
+            max_abs_err = max(max_abs_err, torch.max(torch.abs(y_pred - y_batch)).item())
+
+            left, right = fixed_left, fixed_right
+            if use_per_sample_interface and iface_x is not None:
+                left, right = interface_flanking_nodes_per_sample(loss_fn.x_grid_t, iface_x)
+            if left is not None and right is not None:
+                err_rms_i, true_jump_rms_i = per_sample_node_jump_errors(
+                    y_pred, y_batch, left, right
+                )
+                node_jump_rmse_K_sum += torch.sum(err_rms_i).item() * sigma_global
+                node_jump_nrmse_sum += torch.sum(
+                    err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)
+                ).item()
+
             if iface_x is not None:
                 Ny = y_batch.shape[2]
                 band = build_interface_band(
@@ -637,7 +720,8 @@ def train_one_epoch(
     if dist_info.is_distributed:
         t = torch.tensor(
             [loss_sum, mse_sum, target_sq_sum, iface_mse_sum, iface_target_sq_sum,
-             float(n_samples), float(n_iface_voxels)],
+             float(n_samples), float(n_iface_voxels),
+             nrmse_sum, rmse_K_sum, node_jump_rmse_K_sum, node_jump_nrmse_sum],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -648,20 +732,57 @@ def train_one_epoch(
         iface_target_sq_sum = t[4].item()
         n_samples = int(t[5].item())
         n_iface_voxels = int(t[6].item())
+        nrmse_sum = t[7].item()
+        rmse_K_sum = t[8].item()
+        node_jump_rmse_K_sum = t[9].item()
+        node_jump_nrmse_sum = t[10].item()
 
-    training_loss = loss_sum / max(n_samples, 1)
+        m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
+        dist.all_reduce(m, op=dist.ReduceOp.MAX)
+        max_abs_err = m[0].item()
+
+    denom = max(n_samples, 1)
+    training_loss = loss_sum / denom
     train_rel_l2 = math.sqrt(mse_sum / max(target_sq_sum, 1e-12)) * 100.0
     if n_iface_voxels > 0:
         train_iface_rel_l2 = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
     else:
         train_iface_rel_l2 = 0.0
-    return training_loss, train_rel_l2, train_iface_rel_l2
+    return {
+        "loss": training_loss,
+        "rel_l2": train_rel_l2,
+        "iface_rel_l2": train_iface_rel_l2,
+        "nrmse": (nrmse_sum / denom) * 100.0,
+        "rmse_K": rmse_K_sum / denom,
+        "max_err_K": max_abs_err * sigma_global,
+        "node_jump_rmse_K": node_jump_rmse_K_sum / denom,
+        "node_jump_nrmse": (node_jump_nrmse_sum / denom) * 100.0,
+    }
 
 
 def _per_pair_rel_l2_percent(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
     numerator = torch.mean((y_pred - y_true) ** 2, dim=(1, 2, 3))
     denominator = torch.mean(y_true ** 2, dim=(1, 2, 3)).clamp_min(1e-12)
     return torch.sqrt(numerator / denominator) * 100.0
+
+
+# Allowed checkpoint-selection metrics -> key into the `validate` metric dict.
+# All are "lower is better". Default keeps legacy `val_rel_l2` selection.
+_CHECKPOINT_METRIC_KEYS = {
+    "val_rel_l2": "rel_l2",
+    "val_nrmse": "nrmse",
+    "val_jump_nrmse": "node_jump_nrmse",
+}
+
+
+def _selection_metric_value(val_metrics: dict[str, float], checkpoint_metric: str) -> float:
+    """Resolve the scalar used for checkpoint selection from the val metric dict.
+
+    Unknown names fall back to the legacy ``rel_l2`` headline so a typo never
+    silently picks an arbitrary metric.
+    """
+    key = _CHECKPOINT_METRIC_KEYS.get(checkpoint_metric, "rel_l2")
+    return float(val_metrics[key])
 
 
 def _write_val_pair_rows(
@@ -671,6 +792,10 @@ def _write_val_pair_rows(
     pairs: list[tuple[int, int, int]],
     rel_l2: torch.Tensor,
     iface_rel_l2: torch.Tensor,
+    nrmse: torch.Tensor,
+    rmse_K: torch.Tensor,
+    node_jump_rmse_K: torch.Tensor,
+    node_jump_nrmse: torch.Tensor,
 ) -> None:
     problem = getattr(dataset, "problem", None)
     benchmark = getattr(problem, "name", "")
@@ -687,6 +812,10 @@ def _write_val_pair_rows(
             "R_c": float(params["R_c"]) if "R_c" in params else "",
             "rel_l2": float(rel_l2[row_idx].item()),
             "iface_rel_l2": float(iface_rel_l2[row_idx].item()),
+            "nrmse": float(nrmse[row_idx].item()),
+            "rmse_K": float(rmse_K[row_idx].item()),
+            "node_jump_rmse_K": float(node_jump_rmse_K[row_idx].item()),
+            "node_jump_nrmse": float(node_jump_nrmse[row_idx].item()),
         }
         if problem is not None:
             row.update(problem.val_pair_row(dataset, sid, int(s), int(j)))
@@ -706,15 +835,24 @@ def validate(
     x_grid_t: torch.Tensor | None = None,
     interface_half_width: float = 0.05,
     use_per_sample_interface: bool = False,
-) -> tuple[float, float]:
-    """Return (val_rel_l2, val_iface_rel_l2) after validation.
+    interface_x: float = 0.5,
+    sigma_global: float = 1.0,
+) -> dict[str, float]:
+    """Return a metric dict after validation.
+
+    The dict always carries ``rel_l2`` (legacy normalized rel-L2 headline) and
+    ``iface_rel_l2`` so existing checkpoint selection keeps working, plus the
+    unified metric suite: per-sample ``nrmse`` (mean + p90/p99/max tails),
+    Kelvin ``rmse_K`` / ``max_err_K``, and node-jump ``node_jump_rmse_K`` /
+    ``node_jump_nrmse`` (mean + tails).
 
     Pass the **unwrapped** model (not the DDP wrapper) — see Fix 1: a rank-0-only
     DDP forward would deadlock other ranks waiting on a collective.
     Validation is intended to run on rank 0 only; the caller broadcasts results.
 
-    Metric semantics: global ratio sqrt(sum MSE / sum target_sq), consistent
-    with `train_one_epoch`.
+    ``rel_l2`` keeps the global-ratio semantics of `train_one_epoch`. The new
+    headline metrics use the mean-over-pairs convention (per-sample values
+    aggregated), so they compare directly to `evaluate`.
     """
     with torch.no_grad():
         model.eval()
@@ -723,6 +861,18 @@ def validate(
         target_sq_sum = 0.0
         iface_mse_sum = 0.0
         iface_target_sq_sum = 0.0
+
+        nrmse_all: list[torch.Tensor] = []
+        rmse_K_all: list[torch.Tensor] = []
+        node_jump_rmse_K_all: list[torch.Tensor] = []
+        node_jump_nrmse_all: list[torch.Tensor] = []
+        max_abs_err = 0.0
+
+        fixed_left = fixed_right = None
+        if x_grid_t is not None and not use_per_sample_interface:
+            fixed_left, fixed_right = interface_flanking_nodes(
+                x_grid_t.detach().cpu().numpy(), interface_x
+            )
 
         pair_cursor = 0
         write_pairs = dataset is not None and pair_csv_path is not None and epoch is not None
@@ -763,6 +913,26 @@ def validate(
                 target_sq_sum += torch.sum(y_batch ** 2).item()
                 _n_batches += 1
 
+                # --- Unified per-sample metrics (mean-over-pairs convention) ---
+                rms_i = per_sample_sq_rms(y_pred, y_batch)
+                nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
+                rmse_K_all.append((rms_i * sigma_global).cpu())
+                max_abs_err = max(
+                    max_abs_err, torch.max(torch.abs(y_pred - y_batch)).item()
+                )
+
+                left, right = fixed_left, fixed_right
+                if use_per_sample_interface and iface_x is not None and x_grid_t is not None:
+                    left, right = interface_flanking_nodes_per_sample(x_grid_t, iface_x)
+                jump_nrmse_i = None
+                if left is not None and right is not None:
+                    err_rms_i, true_jump_rms_i = per_sample_node_jump_errors(
+                        y_pred, y_batch, left, right
+                    )
+                    node_jump_rmse_K_all.append((err_rms_i * sigma_global).cpu())
+                    jump_nrmse_i = (err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)).cpu()
+                    node_jump_nrmse_all.append(jump_nrmse_i)
+
                 bf = None
                 if iface_x is not None and x_grid_t is not None:
                     band = build_interface_band(x_grid_t, iface_x, interface_half_width)  # (B, Nx)
@@ -790,7 +960,18 @@ def validate(
                         iface_rel_l2 = torch.zeros_like(rel_l2)
                     batch_size = x_spatial.shape[0]
                     pairs = dataset._pairs[pair_cursor:pair_cursor + batch_size]
-                    _write_val_pair_rows(pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2)
+                    nrmse_pct = nrmse_all[-1] * 100.0
+                    rmse_K_b = rmse_K_all[-1]
+                    if jump_nrmse_i is not None:
+                        node_jump_rmse_K_b = node_jump_rmse_K_all[-1]
+                        node_jump_nrmse_pct = jump_nrmse_i * 100.0
+                    else:
+                        node_jump_rmse_K_b = torch.zeros_like(rel_l2)
+                        node_jump_nrmse_pct = torch.zeros_like(rel_l2)
+                    _write_val_pair_rows(
+                        pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2,
+                        nrmse_pct, rmse_K_b, node_jump_rmse_K_b, node_jump_nrmse_pct,
+                    )
                     pair_cursor += batch_size
                     _t_write_total += time.perf_counter() - _tw
         finally:
@@ -811,7 +992,31 @@ def validate(
             val_iface = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
         else:
             val_iface = 0.0
-        return val_loss, val_iface
+
+        nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
+        rmse_K_mean = float(torch.cat(rmse_K_all).mean()) if rmse_K_all else 0.0
+        if node_jump_nrmse_all:
+            jump_nrmse_stats = tail_stats(torch.cat(node_jump_nrmse_all))
+            node_jump_rmse_K_mean = float(torch.cat(node_jump_rmse_K_all).mean())
+        else:
+            jump_nrmse_stats = tail_stats(torch.empty(0))
+            node_jump_rmse_K_mean = 0.0
+
+        return {
+            "rel_l2": val_loss,
+            "iface_rel_l2": val_iface,
+            "nrmse": nrmse_stats["mean"] * 100.0,
+            "nrmse_p90": nrmse_stats["p90"] * 100.0,
+            "nrmse_p99": nrmse_stats["p99"] * 100.0,
+            "nrmse_max": nrmse_stats["max"] * 100.0,
+            "rmse_K": rmse_K_mean,
+            "max_err_K": max_abs_err * sigma_global,
+            "node_jump_rmse_K": node_jump_rmse_K_mean,
+            "node_jump_nrmse": jump_nrmse_stats["mean"] * 100.0,
+            "node_jump_nrmse_p90": jump_nrmse_stats["p90"] * 100.0,
+            "node_jump_nrmse_p99": jump_nrmse_stats["p99"] * 100.0,
+            "node_jump_nrmse_max": jump_nrmse_stats["max"] * 100.0,
+        }
 
 
 def run_one_seed(
@@ -992,13 +1197,24 @@ def run_one_seed(
     epochs = config["training"]["epochs"]
     validate_every = config["training"]["validate_every"]
     patience = config["training"]["patience"]
+    checkpoint_metric = config["training"].get("checkpoint_metric", "val_rel_l2")
 
     best_path = run_path / "fno2d_best.pt"
 
     # --- CSV setup (rank 0 only) ---
     csv_path = run_path / "train_metrics.csv"
     val_pairs_path = run_path / "val_pairs.csv"
-    fieldnames = ["epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2", "val_rel_l2", "val_iface_rel_l2", "lr", "is_best"]
+    fieldnames = [
+        "epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2",
+        "train_nrmse", "train_rmse_K", "train_max_err_K",
+        "train_node_jump_rmse_K", "train_node_jump_nrmse",
+        "val_rel_l2", "val_iface_rel_l2",
+        "val_nrmse", "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
+        "val_rmse_K", "val_max_err_K",
+        "val_node_jump_rmse_K", "val_node_jump_nrmse",
+        "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
+        "lr", "is_best",
+    ]
     csv_file = None
     csv_writer = None
 
@@ -1047,12 +1263,17 @@ def run_one_seed(
 
         lr = optimizer.param_groups[0]["lr"]
 
-        train_loss, train_rel_l2, train_iface_rel_l2 = train_one_epoch(
+        train_metrics = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
             grad_clip=grad_clip, dist_info=dist_info,
             use_per_sample_interface=use_per_sample_interface,
+            x_grid=x_grid, interface_x=loss_cfg.get("interface_x", 0.5),
+            sigma_global=sigma_global,
         )
+        train_loss = train_metrics["loss"]
+        train_rel_l2 = train_metrics["rel_l2"]
+        train_iface_rel_l2 = train_metrics["iface_rel_l2"]
         scheduler.step()
 
         if is_main:
@@ -1061,13 +1282,14 @@ def run_one_seed(
         is_best = 0
         val_loss = None
         val_iface_rel_l2 = None
+        val_metrics = None
 
         if (epoch % validate_every) == 0:
             # Validation runs on rank 0 only, using the UNWRAPPED model (Fix 1).
-            # All ranks then receive (val_loss, val_iface, is_best, bad_epochs,
-            # best_val_loss, should_stop) via broadcast (Fix 2).
+            # All ranks then receive the val metric dict and control-flow state
+            # via broadcast (Fix 2).
             if is_main:
-                val_loss, val_iface_rel_l2 = validate(
+                val_metrics = validate(
                     model=fno_unwrapped,
                     val_loader=validation_set,
                     device=device,
@@ -1078,11 +1300,17 @@ def run_one_seed(
                     x_grid_t=loss_fn.x_grid_t,
                     interface_half_width=loss_cfg.get("interface_half_width", 0.05),
                     use_per_sample_interface=use_per_sample_interface,
+                    interface_x=loss_cfg.get("interface_x", 0.5),
+                    sigma_global=sigma_global,
                 )
+                val_loss = val_metrics["rel_l2"]
+                val_iface_rel_l2 = val_metrics["iface_rel_l2"]
                 print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%", flush=True)
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                # Checkpoint selection: lower is better for every supported metric.
+                selection_value = _selection_metric_value(val_metrics, checkpoint_metric)
+                if selection_value < best_val_loss:
+                    best_val_loss = selection_value
                     bad_epochs = 0
                     is_best = 1
                     torch.save(
@@ -1100,7 +1328,7 @@ def run_one_seed(
                         },
                         best_path,
                     )
-                    print(f"Saved new best: {best_val_loss} -> {best_path}", flush=True)
+                    print(f"Saved new best ({checkpoint_metric}): {best_val_loss} -> {best_path}", flush=True)
                 else:
                     bad_epochs += 1
                     if bad_epochs >= patience:
@@ -1110,8 +1338,7 @@ def run_one_seed(
             # Broadcast control-flow state so every rank stays in lockstep (Fix 2).
             if dist_info.is_distributed:
                 state = {
-                    "val_loss": val_loss,
-                    "val_iface_rel_l2": val_iface_rel_l2,
+                    "val_metrics": val_metrics,
                     "best_val_loss": best_val_loss,
                     "bad_epochs": bad_epochs,
                     "is_best": is_best,
@@ -1120,8 +1347,9 @@ def run_one_seed(
                 obj_list = [state if is_main else None]
                 dist.broadcast_object_list(obj_list, src=0)
                 state = obj_list[0]
-                val_loss = state["val_loss"]
-                val_iface_rel_l2 = state["val_iface_rel_l2"]
+                val_metrics = state["val_metrics"]
+                val_loss = None if val_metrics is None else val_metrics["rel_l2"]
+                val_iface_rel_l2 = None if val_metrics is None else val_metrics["iface_rel_l2"]
                 best_val_loss = state["best_val_loss"]
                 bad_epochs = state["bad_epochs"]
                 is_best = state["is_best"]
@@ -1145,14 +1373,33 @@ def run_one_seed(
                 latest_path,
             )
 
+            def _vm(key: str) -> str | float:
+                return "" if val_metrics is None else float(val_metrics[key])
+
             csv_writer.writerow(
                 {
                     "epoch": epoch,
                     "train_loss": float(train_loss),
                     "train_rel_l2": float(train_rel_l2),
                     "train_iface_rel_l2": float(train_iface_rel_l2),
-                    "val_rel_l2": "" if val_loss is None else float(val_loss),
-                    "val_iface_rel_l2": "" if val_iface_rel_l2 is None else float(val_iface_rel_l2),
+                    "train_nrmse": float(train_metrics["nrmse"]),
+                    "train_rmse_K": float(train_metrics["rmse_K"]),
+                    "train_max_err_K": float(train_metrics["max_err_K"]),
+                    "train_node_jump_rmse_K": float(train_metrics["node_jump_rmse_K"]),
+                    "train_node_jump_nrmse": float(train_metrics["node_jump_nrmse"]),
+                    "val_rel_l2": _vm("rel_l2"),
+                    "val_iface_rel_l2": _vm("iface_rel_l2"),
+                    "val_nrmse": _vm("nrmse"),
+                    "val_nrmse_p90": _vm("nrmse_p90"),
+                    "val_nrmse_p99": _vm("nrmse_p99"),
+                    "val_nrmse_max": _vm("nrmse_max"),
+                    "val_rmse_K": _vm("rmse_K"),
+                    "val_max_err_K": _vm("max_err_K"),
+                    "val_node_jump_rmse_K": _vm("node_jump_rmse_K"),
+                    "val_node_jump_nrmse": _vm("node_jump_nrmse"),
+                    "val_node_jump_nrmse_p90": _vm("node_jump_nrmse_p90"),
+                    "val_node_jump_nrmse_p99": _vm("node_jump_nrmse_p99"),
+                    "val_node_jump_nrmse_max": _vm("node_jump_nrmse_max"),
                     "lr": float(lr),
                     "is_best": int(is_best),
                 }
