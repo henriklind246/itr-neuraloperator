@@ -41,13 +41,16 @@ from problems.source import (
     SOURCE_BINS,
     SPATIAL_CHANNELS_BINS as SOURCE_SPATIAL_IN_CHANNELS,
 )
+from problems.source_itr import rc_log_norm
 from problems.interfaces import INTERFACE_X_RANGE
 from src.physics.internal_source import (
     PATCH_A_RANGE,
     PATCH_H,
     PATCH_W,
+    RC_VOID_RANGES,
     build_patch_source,
     integrate_sin2_pulse,
+    make_rc_void_profile,
     make_patch_indicator,
     make_sin2_pulse,
 )
@@ -238,13 +241,15 @@ def _resolve_layer_conductivities(ds, sid: int, config: dict | None = None) -> t
     return _DEFAULT_K_LEFT, _DEFAULT_K_RIGHT
 
 
-def _interface_conductance_G(x_grid: np.ndarray, interface_x: float, R_c: float,
-                             k_left: float, k_right: float) -> float:
+def _interface_conductance_G(x_grid: np.ndarray, interface_x: float, R_c,
+                             k_left: float, k_right: float):
     """Per-area interface conductance G = 1/(h_L/k_L + R_c + h_R/k_R)."""
     left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_x)
     h_L = float(interface_x) - float(x_grid[left_node])
     h_R = float(x_grid[right_node]) - float(interface_x)
-    return 1.0 / (h_L / float(k_left) + float(R_c) + h_R / float(k_right))
+    Rc = np.asarray(R_c, dtype=np.float64)
+    G = 1.0 / (h_L / float(k_left) + Rc + h_R / float(k_right))
+    return float(G) if G.ndim == 0 else G
 
 
 def _interface_contact_jump_map(fields: np.ndarray, x_grid: np.ndarray, interface_x: float,
@@ -869,6 +874,7 @@ def _compute_pair_error_records(
     target_indices = np.array([dataset._pairs[idx][2] for idx in sample_indices], dtype=np.int64)
 
     return {
+        "sim_id": sim_ids,
         "lead_time": np.array([dataset._lead_times[idx] for idx in sample_indices], dtype=np.float32),
         "global_rel_l2": global_rel.numpy(),
         "iface_rel_l2": iface_rel.numpy(),
@@ -2051,6 +2057,102 @@ def _patch_param_arrays(sim_params: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def _void_param_arrays(sim_params: np.ndarray) -> dict[str, np.ndarray]:
+    """Pull source-ITR Gaussian-void parameters into arrays."""
+    R_base = np.array([float(p["R_c_base"]) for p in sim_params], dtype=np.float64)
+    R_amp = np.array([float(p["R_c_amp"]) for p in sim_params], dtype=np.float64)
+    return {
+        "R_c_base": R_base,
+        "R_c_amp": R_amp,
+        "R_c_y0": np.array([float(p["R_c_y0"]) for p in sim_params], dtype=np.float64),
+        "R_c_sigma": np.array([float(p["R_c_sigma"]) for p in sim_params], dtype=np.float64),
+        "R_c_peak": R_base + R_amp,
+    }
+
+
+def _interface_conductance_profile(
+    y_grid: np.ndarray,
+    R_c_y: np.ndarray,
+    x_grid: np.ndarray | None = None,
+    interface_x: float = INTERFACE_X,
+    k_left: float = _DEFAULT_K_LEFT,
+    k_right: float = _DEFAULT_K_RIGHT,
+) -> np.ndarray:
+    """Return the per-row interface conductance profile with solver-matching distances."""
+    y = np.asarray(y_grid, dtype=np.float64)
+    Rc = np.asarray(R_c_y, dtype=np.float64)
+    if x_grid is not None:
+        x = np.asarray(x_grid, dtype=np.float64)
+        return np.asarray(
+            _interface_conductance_G(x, interface_x, Rc, k_left, k_right),
+            dtype=np.float64,
+        )
+
+    dy = float(y[1] - y[0]) if len(y) > 1 else 1.0
+    return 1.0 / ((0.5 * dy) / float(k_left) + Rc + (0.5 * dy) / float(k_right))
+
+
+def _void_severity_arrays(
+    sim_params: np.ndarray,
+    y_grid: np.ndarray,
+    x_grid: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Return sampled void parameters plus integrated severity metrics."""
+    arrs = _void_param_arrays(sim_params)
+    y = np.asarray(y_grid, dtype=np.float64)
+    excess_integral = np.zeros(len(sim_params), dtype=np.float64)
+    conductance_deficit = np.zeros(len(sim_params), dtype=np.float64)
+
+    for i, p in enumerate(sim_params):
+        Rc_y = make_rc_void_profile(
+            y,
+            R_base=float(p["R_c_base"]),
+            R_amp=float(p["R_c_amp"]),
+            y0=float(p["R_c_y0"]),
+            sigma=float(p["R_c_sigma"]),
+        )
+        base = np.full_like(Rc_y, float(p["R_c_base"]), dtype=np.float64)
+        G_base = _interface_conductance_profile(
+            y, base, x_grid=x_grid, interface_x=float(p.get("interface_x", INTERFACE_X))
+        )
+        G_y = _interface_conductance_profile(
+            y, Rc_y, x_grid=x_grid, interface_x=float(p.get("interface_x", INTERFACE_X))
+        )
+        excess_integral[i] = float(np.trapezoid(Rc_y - float(p["R_c_base"]), y))
+        conductance_deficit[i] = float(np.trapezoid(G_base - G_y, y))
+
+    arrs["R_c_excess_integral"] = excess_integral
+    arrs["conductance_deficit"] = conductance_deficit
+    arrs["is_void_active"] = arrs["R_c_amp"] > 1e-12
+    return arrs
+
+
+def _representative_void_sim_ids(
+    sim_params: np.ndarray,
+    y_grid: np.ndarray,
+    x_grid: np.ndarray | None = None,
+) -> list[int]:
+    """Pick deterministic low/median/high severity source-ITR samples."""
+    severity = _void_severity_arrays(sim_params, y_grid, x_grid)["R_c_excess_integral"]
+    if len(severity) == 0:
+        return []
+    order = np.argsort(severity)
+    picks = [int(order[0]), int(order[len(order) // 2]), int(order[-1])]
+    out: list[int] = []
+    for sid in picks:
+        if sid not in out:
+            out.append(sid)
+    return out
+
+
+def _require_source_itr_params(sim_params: np.ndarray) -> None:
+    required = ("R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma")
+    for i, p in enumerate(sim_params):
+        missing = [key for key in required if key not in p]
+        if missing:
+            raise ValueError(f"sim_params[{i}] missing source-ITR keys {missing}.")
+
+
 def _select_representative_source_sim_id(sim_params: np.ndarray) -> int:
     """Choose a deterministic representative source sim near the median patch params."""
     arrs = _patch_param_arrays(sim_params)
@@ -2232,6 +2334,373 @@ def _bilinear_resample(
 # ============================================================
 # SOURCE BENCHMARK — plots (ported from experiment/source-itr)
 # ============================================================
+
+def plot_source_itr_void_profiles(
+    sim_params: np.ndarray,
+    y_grid: np.ndarray,
+    x_grid: np.ndarray | None = None,
+    save_path: str | Path | None = None,
+):
+    """Explain sampled Gaussian-void interface resistance profiles."""
+    _require_source_itr_params(sim_params)
+    y = np.asarray(y_grid, dtype=np.float64)
+    severity = _void_severity_arrays(sim_params, y, x_grid)
+    representative_ids = _representative_void_sim_ids(sim_params, y, x_grid)
+
+    profile_rows = []
+    for sid in representative_ids:
+        p = sim_params[int(sid)]
+        Rc_y = make_rc_void_profile(
+            y,
+            R_base=float(p["R_c_base"]),
+            R_amp=float(p["R_c_amp"]),
+            y0=float(p["R_c_y0"]),
+            sigma=float(p["R_c_sigma"]),
+        )
+        G_y = _interface_conductance_profile(
+            y, Rc_y, x_grid=x_grid, interface_x=float(p.get("interface_x", INTERFACE_X))
+        )
+        profile_rows.append((int(sid), p, Rc_y, rc_log_norm(Rc_y), G_y))
+
+    colors = plt.cm.viridis(np.linspace(0.15, 0.85, max(len(profile_rows), 1)))
+    active = severity["is_void_active"]
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+
+        ax = axes[0, 0]
+        for color, (sid, p, Rc_y, _Rc_norm, _G_y) in zip(colors, profile_rows):
+            label = (
+                f"sim {sid}: peak={float(p['R_c_base']) + float(p['R_c_amp']):.2f}, "
+                f"area={severity['R_c_excess_integral'][sid]:.3f}"
+            )
+            ax.plot(y, Rc_y, color=color, label=label)
+            if float(p["R_c_amp"]) > 1e-12:
+                ax.axvline(float(p["R_c_y0"]), color=color, linestyle=":", linewidth=1.0, alpha=0.5)
+        ax.set_xlabel("y")
+        ax.set_ylabel(r"$R_c(y)$")
+        ax.set_title("Physical interface resistance")
+        ax.legend(loc="upper right")
+        ax.grid(True)
+
+        ax = axes[0, 1]
+        for color, (sid, _p, _Rc_y, Rc_norm, _G_y) in zip(colors, profile_rows):
+            ax.plot(y, Rc_norm, color=color, label=f"sim {sid}")
+        ax.axhline(-1.0, color="0.7", linestyle=":", linewidth=1.0)
+        ax.axhline(1.0, color="0.7", linestyle=":", linewidth=1.0)
+        ax.set_xlabel("y")
+        ax.set_ylabel("normalized channel")
+        ax.set_title(r"Model input channel: log-normalized $R_c(y)$")
+        ax.grid(True)
+
+        ax = axes[1, 0]
+        for color, (sid, _p, _Rc_y, _Rc_norm, G_y) in zip(colors, profile_rows):
+            ax.plot(y, G_y, color=color, label=f"sim {sid}")
+        ax.set_xlabel("y")
+        ax.set_ylabel(r"$G(y)$")
+        ax.set_title("Discrete interface conductance")
+        ax.grid(True)
+
+        ax = axes[1, 1]
+        if np.any(active):
+            peak_active = severity["R_c_peak"][active]
+            peak_size = (peak_active - float(np.min(peak_active))) / max(
+                float(np.max(peak_active) - np.min(peak_active)), 1e-12
+            )
+            scatter = ax.scatter(
+                severity["R_c_y0"][active],
+                severity["R_c_sigma"][active],
+                c=severity["R_c_excess_integral"][active],
+                s=35 + 70 * peak_size,
+                cmap="magma",
+                alpha=0.78,
+                edgecolors="white",
+                linewidths=0.4,
+            )
+            fig.colorbar(scatter, ax=ax, label=r"$\int (R_c(y)-R_{base})\,dy$")
+        if np.any(~active):
+            ax.scatter(
+                np.full(int(np.sum(~active)), np.nanmean(severity["R_c_y0"])),
+                np.full(int(np.sum(~active)), RC_VOID_RANGES["sigma"][0]),
+                marker="x",
+                color="0.45",
+                s=32,
+                alpha=0.8,
+                label="flat profile",
+            )
+            ax.legend(loc="upper right")
+        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
+        ax.set_xlim(y0_lo - 0.03, y0_hi + 0.03)
+        ax.set_ylim(sig_lo * 0.85, sig_hi * 1.08)
+        ax.set_xlabel(r"void center $y_0$")
+        ax.set_ylabel(r"void width $\sigma$")
+        ax.set_title("Void location/width coverage")
+        ax.grid(True)
+
+        fig.suptitle("Source-ITR Gaussian Void Profiles")
+        _save_figure(fig, save_path, "source", "source_itr_void_profiles", layout="constrained")
+
+
+def _aggregate_void_errors_by_sim(
+    records: dict[str, np.ndarray],
+    sim_params: np.ndarray,
+    y_grid: np.ndarray,
+    x_grid: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Aggregate sampled pair errors to one row per simulation."""
+    severity = _void_severity_arrays(sim_params, y_grid, x_grid)
+    sim_ids = np.asarray(records["sim_id"], dtype=np.int64)
+    unique = np.unique(sim_ids)
+    rows: dict[str, list] = {
+        "sim_id": [],
+        "iface_median": [],
+        "iface_p90": [],
+        "global_median": [],
+        "lead_median": [],
+        "pair_count": [],
+    }
+    for key in (
+        "R_c_base",
+        "R_c_amp",
+        "R_c_y0",
+        "R_c_sigma",
+        "R_c_peak",
+        "R_c_excess_integral",
+        "conductance_deficit",
+        "is_void_active",
+    ):
+        rows[key] = []
+
+    for sid in unique:
+        mask = sim_ids == int(sid)
+        rows["sim_id"].append(int(sid))
+        rows["iface_median"].append(float(np.median(records["iface_rel_l2"][mask])))
+        rows["iface_p90"].append(float(np.percentile(records["iface_rel_l2"][mask], 90)))
+        rows["global_median"].append(float(np.median(records["global_rel_l2"][mask])))
+        rows["lead_median"].append(float(np.median(records["lead_time"][mask])))
+        rows["pair_count"].append(int(np.sum(mask)))
+        for key in (
+            "R_c_base",
+            "R_c_amp",
+            "R_c_y0",
+            "R_c_sigma",
+            "R_c_peak",
+            "R_c_excess_integral",
+            "conductance_deficit",
+            "is_void_active",
+        ):
+            rows[key].append(severity[key][int(sid)])
+
+    out: dict[str, np.ndarray] = {}
+    for key, values in rows.items():
+        dtype = bool if key == "is_void_active" else np.float64
+        if key in {"sim_id", "pair_count"}:
+            dtype = np.int64
+        out[key] = np.asarray(values, dtype=dtype)
+    return out
+
+
+def _sim_horizon_void_rows(
+    records: dict[str, np.ndarray],
+    sim_params: np.ndarray,
+    y_grid: np.ndarray,
+    x_grid: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Aggregate pair errors by simulation and lead-time tertile."""
+    severity = _void_severity_arrays(sim_params, y_grid, x_grid)
+    sim_ids = np.asarray(records["sim_id"], dtype=np.int64)
+    lead = np.asarray(records["lead_time"], dtype=np.float64)
+    iface = np.asarray(records["iface_rel_l2"], dtype=np.float64)
+    if len(lead) == 0:
+        return {"severity": np.array([]), "lead_mid": np.array([]), "iface_median": np.array([]), "label": np.array([], dtype=object)}
+
+    edges = np.unique(np.quantile(lead, np.linspace(0.0, 1.0, 4)))
+    if len(edges) < 2:
+        edges = np.array([float(np.min(lead)) - 1e-9, float(np.max(lead)) + 1e-9])
+
+    rows = {"severity": [], "lead_mid": [], "iface_median": [], "label": []}
+    for b in range(len(edges) - 1):
+        lo = float(edges[b])
+        hi = float(edges[b + 1])
+        if b == len(edges) - 2:
+            lead_mask = (lead >= lo) & (lead <= hi)
+        else:
+            lead_mask = (lead >= lo) & (lead < hi)
+        label = f"{lo:.3f}-{hi:.3f}"
+        for sid in np.unique(sim_ids[lead_mask]):
+            mask = lead_mask & (sim_ids == int(sid))
+            if not np.any(mask):
+                continue
+            rows["severity"].append(float(severity["R_c_excess_integral"][int(sid)]))
+            rows["lead_mid"].append(0.5 * (lo + hi))
+            rows["iface_median"].append(float(np.median(iface[mask])))
+            rows["label"].append(label)
+
+    return {
+        "severity": np.asarray(rows["severity"], dtype=np.float64),
+        "lead_mid": np.asarray(rows["lead_mid"], dtype=np.float64),
+        "iface_median": np.asarray(rows["iface_median"], dtype=np.float64),
+        "label": np.asarray(rows["label"], dtype=object),
+    }
+
+
+def plot_source_itr_error_vs_void_params(
+    model,
+    dataset: SnapshotPairDataset,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    config: dict | None = None,
+    max_samples: int = 256,
+    batch_size: int = 64,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Plot source-ITR held-out error against Gaussian-void parameters."""
+    _require_source_itr_params(dataset.sim_params)
+    records = _compute_pair_error_records(
+        model=model,
+        dataset=dataset,
+        x_grid=x_grid,
+        y_grid=y_grid,
+        config=config,
+        max_samples=max_samples,
+        batch_size=batch_size,
+        seed=seed,
+    )
+    sim_rows = _aggregate_void_errors_by_sim(records, dataset.sim_params, y_grid, x_grid)
+    horizon_rows = _sim_horizon_void_rows(records, dataset.sim_params, y_grid, x_grid)
+    pair_severity = _void_severity_arrays(dataset.sim_params, y_grid, x_grid)["R_c_excess_integral"][
+        np.asarray(records["sim_id"], dtype=np.int64)
+    ]
+    active = sim_rows["is_void_active"]
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(19, 10.5), constrained_layout=True)
+
+        ax = axes[0, 0]
+        ax.scatter(pair_severity, records["iface_rel_l2"], s=10, alpha=0.08, color="0.25", edgecolors="none", label="pair")
+        sim_scatter = ax.scatter(
+            sim_rows["R_c_excess_integral"],
+            sim_rows["iface_median"],
+            c=sim_rows["lead_median"],
+            cmap="viridis",
+            s=52,
+            alpha=0.88,
+            edgecolors="white",
+            linewidths=0.5,
+            label="sim median",
+        )
+        fig.colorbar(sim_scatter, ax=ax, label="Median lead time")
+        centers, med, q25, q75, _ = _compute_binned_quantiles(
+            sim_rows["R_c_excess_integral"], sim_rows["iface_median"], 6
+        )
+        if len(centers):
+            ax.plot(centers, med, color="C3", marker="o", label="binned median")
+            ax.fill_between(centers, q25, q75, color="C3", alpha=0.14, label="IQR")
+        ax.set_xlabel(r"$\int (R_c(y)-R_{base})\,dy$")
+        ax.set_ylabel("Interface rel. L2 (%)")
+        ax.set_title("Per-simulation median vs integrated severity")
+        ax.legend(loc="best")
+        ax.grid(True)
+
+        ax = axes[0, 1]
+        scatter = ax.scatter(
+            sim_rows["R_c_peak"],
+            sim_rows["iface_p90"],
+            c=sim_rows["conductance_deficit"],
+            cmap="magma",
+            s=56,
+            alpha=0.85,
+            edgecolors="white",
+            linewidths=0.5,
+        )
+        fig.colorbar(scatter, ax=ax, label=r"$\int (G_{base}-G(y))\,dy$")
+        ax.set_xlabel(r"peak $R_c$")
+        ax.set_ylabel("Interface rel. L2 p90 (%)")
+        ax.set_title("Tail error vs peak resistance")
+        ax.grid(True)
+
+        ax = axes[0, 2]
+        if np.any(active):
+            scatter = ax.scatter(
+                sim_rows["R_c_y0"][active],
+                sim_rows["R_c_sigma"][active],
+                c=sim_rows["iface_median"][active],
+                s=48 + 80 * (
+                    sim_rows["R_c_excess_integral"][active]
+                    / max(float(np.max(sim_rows["R_c_excess_integral"][active])), 1e-12)
+                ),
+                cmap="plasma",
+                alpha=0.82,
+                edgecolors="white",
+                linewidths=0.5,
+            )
+            fig.colorbar(scatter, ax=ax, label="Median interface rel. L2 (%)")
+        if np.any(~active):
+            ax.text(
+                0.02, 0.04,
+                f"{int(np.sum(~active))} flat profiles excluded from y0/sigma",
+                transform=ax.transAxes,
+                color="0.35",
+                fontsize=8,
+            )
+        ax.set_xlabel(r"void center $y_0$")
+        ax.set_ylabel(r"void width $\sigma$")
+        ax.set_title("Location/width colored by error")
+        ax.grid(True)
+
+        ax = axes[1, 0]
+        if len(horizon_rows["severity"]):
+            for label in np.unique(horizon_rows["label"]):
+                mask = horizon_rows["label"] == label
+                centers, med, _q25, _q75, counts = _compute_binned_quantiles(
+                    horizon_rows["severity"][mask],
+                    horizon_rows["iface_median"][mask],
+                    5,
+                )
+                if len(centers):
+                    ax.plot(centers, med, marker="o", label=f"Δt {label} (n={int(np.sum(counts))})")
+        ax.set_xlabel(r"$\int (R_c(y)-R_{base})\,dy$")
+        ax.set_ylabel("Median interface rel. L2 (%)")
+        ax.set_title("Severity trend by horizon bin")
+        ax.legend(loc="best")
+        ax.grid(True)
+
+        ax = axes[1, 1]
+        pcm = _grid_error_heatmap(
+            ax,
+            horizon_rows["severity"],
+            horizon_rows["lead_mid"],
+            horizon_rows["iface_median"],
+            n_bins=5,
+            xlabel=r"integrated void severity",
+            ylabel="lead-time bin midpoint",
+        )
+        ax.set_title("Median error by severity × horizon")
+        if pcm is not None:
+            fig.colorbar(pcm, ax=ax, label="Median interface rel. L2 (%)")
+
+        ax = axes[1, 2]
+        scatter = ax.scatter(
+            sim_rows["global_median"],
+            sim_rows["iface_median"],
+            c=sim_rows["R_c_excess_integral"],
+            cmap="viridis",
+            s=54,
+            alpha=0.86,
+            edgecolors="white",
+            linewidths=0.5,
+        )
+        fig.colorbar(scatter, ax=ax, label="Integrated severity")
+        ax.set_xlabel("Global rel. L2 median (%)")
+        ax.set_ylabel("Interface rel. L2 median (%)")
+        ax.set_title("Interface error vs global error")
+        ax.grid(True)
+
+        fig.suptitle("Source-ITR Error vs Gaussian-Void Parameters")
+        _save_figure(fig, save_path, "source", "source_itr_error_vs_void_params", layout="constrained")
+
 
 def plot_source_error_vs_params(
     model,

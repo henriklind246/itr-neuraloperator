@@ -1,5 +1,6 @@
 import copy
 import csv
+import math
 import random
 from pathlib import Path
 
@@ -184,28 +185,34 @@ def tiny_training_setup():
 # ===================== train_one_epoch =====================
 
 class TestTrainOneEpoch:
-    def test_returns_tuple_of_floats(self, tiny_training_setup):
+    def test_returns_metric_dict(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
         result = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
-        assert isinstance(result, tuple) and len(result) == 3
-        loss, rel_l2, iface_rel_l2 = result
-        assert isinstance(loss, float)
-        assert isinstance(rel_l2, float)
-        assert isinstance(iface_rel_l2, float)
+        assert isinstance(result, dict)
+        expected = {
+            "loss", "rel_l2", "iface_rel_l2", "nrmse", "rmse_K",
+            "max_err_K", "node_jump_rmse_K", "node_jump_nrmse",
+        }
+        assert expected.issubset(result)
+        for k in expected:
+            assert isinstance(result[k], float)
 
     def test_loss_is_finite(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
-        loss, rel_l2, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
-        assert np.isfinite(loss)
-        assert np.isfinite(rel_l2)
-        assert np.isfinite(iface_rel_l2)
+        result = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
+        assert np.isfinite(result["loss"])
+        assert np.isfinite(result["rel_l2"])
+        assert np.isfinite(result["iface_rel_l2"])
+        assert np.isfinite(result["nrmse"])
+        assert np.isfinite(result["rmse_K"])
 
     def test_loss_is_nonnegative(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
-        loss, rel_l2, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
-        assert loss >= 0
-        assert rel_l2 >= 0
-        assert iface_rel_l2 >= 0
+        result = train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
+        assert result["loss"] >= 0
+        assert result["rel_l2"] >= 0
+        assert result["iface_rel_l2"] >= 0
+        assert result["nrmse"] >= 0
 
     def test_updates_parameters(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
@@ -219,24 +226,24 @@ class TestTrainOneEpoch:
 
     def test_no_iface_mask_returns_zero_iface_metric(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, _ = tiny_training_setup
-        _, _, iface_rel_l2 = train_one_epoch(model, loader, optimizer, loss_fn, device)
-        assert iface_rel_l2 == 0.0
+        result = train_one_epoch(model, loader, optimizer, loss_fn, device)
+        assert result["iface_rel_l2"] == 0.0
 
     def test_grad_clip_runs_without_error(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
-        loss, _, _ = train_one_epoch(
+        result = train_one_epoch(
             model, loader, optimizer, loss_fn, device,
             iface_mask=iface_mask, grad_clip=0.01,
         )
-        assert np.isfinite(loss)
+        assert np.isfinite(result["loss"])
 
     def test_grad_clip_none_is_noop(self, tiny_training_setup):
         model, loader, optimizer, loss_fn, device, iface_mask = tiny_training_setup
-        loss, _, _ = train_one_epoch(
+        result = train_one_epoch(
             model, loader, optimizer, loss_fn, device,
             iface_mask=iface_mask, grad_clip=None,
         )
-        assert np.isfinite(loss)
+        assert np.isfinite(result["loss"])
 
 
 # ===================== validate =====================
@@ -250,19 +257,25 @@ class TestValidate:
 
         assert rel_l2.item() == pytest.approx(100.0)
 
-    def test_returns_tuple(self, tiny_training_setup):
+    def test_returns_metric_dict(self, tiny_training_setup):
         model, loader, _, _, device, iface_mask = tiny_training_setup
         result = validate(model, loader, device, iface_mask=iface_mask)
-        assert isinstance(result, tuple) and len(result) == 2
-        val_rel_l2, val_iface = result
-        assert isinstance(val_rel_l2, float)
-        assert isinstance(val_iface, float)
+        assert isinstance(result, dict)
+        expected = {
+            "rel_l2", "iface_rel_l2", "nrmse", "nrmse_p90", "nrmse_p99",
+            "nrmse_max", "rmse_K", "max_err_K", "node_jump_rmse_K",
+            "node_jump_nrmse",
+        }
+        assert expected.issubset(result)
+        for k in expected:
+            assert isinstance(result[k], float)
 
     def test_loss_is_nonnegative(self, tiny_training_setup):
         model, loader, _, _, device, iface_mask = tiny_training_setup
-        val_rel_l2, val_iface = validate(model, loader, device, iface_mask=iface_mask)
-        assert val_rel_l2 >= 0
-        assert val_iface >= 0
+        result = validate(model, loader, device, iface_mask=iface_mask)
+        assert result["rel_l2"] >= 0
+        assert result["iface_rel_l2"] >= 0
+        assert result["nrmse"] >= 0
 
     def test_no_gradient_accumulation(self, tiny_training_setup):
         model, loader, _, _, device, iface_mask = tiny_training_setup
@@ -320,6 +333,10 @@ class TestValidate:
             "R_c",
             "rel_l2",
             "iface_rel_l2",
+            "nrmse",
+            "rmse_K",
+            "node_jump_rmse_K",
+            "node_jump_nrmse",
             "A",
             "interface_x",
             "regime",
@@ -412,12 +429,13 @@ class TestEncoderOffDictBatch:
 
     def test_train_one_epoch_without_forcing_seq(self):
         model, loader, optimizer, loss_fn, device, iface_mask = self._setup()
-        loss, rel_l2, iface_rel_l2 = train_one_epoch(
+        result = train_one_epoch(
             model, loader, optimizer, loss_fn, device, iface_mask=iface_mask,
         )
-        assert np.isfinite(loss) and loss >= 0
-        assert np.isfinite(rel_l2) and rel_l2 >= 0
-        assert np.isfinite(iface_rel_l2)
+        assert np.isfinite(result["loss"]) and result["loss"] >= 0
+        assert np.isfinite(result["rel_l2"]) and result["rel_l2"] >= 0
+        assert np.isfinite(result["iface_rel_l2"])
+        assert np.isfinite(result["nrmse"]) and result["nrmse"] >= 0
 
     def test_train_updates_parameters(self):
         model, loader, optimizer, loss_fn, device, iface_mask = self._setup()
@@ -431,9 +449,10 @@ class TestEncoderOffDictBatch:
 
     def test_validate_without_forcing_seq(self):
         model, loader, _, _, device, iface_mask = self._setup()
-        val_rel_l2, val_iface = validate(model, loader, device, iface_mask=iface_mask)
-        assert isinstance(val_rel_l2, float) and val_rel_l2 >= 0
-        assert isinstance(val_iface, float) and val_iface >= 0
+        result = validate(model, loader, device, iface_mask=iface_mask)
+        assert isinstance(result["rel_l2"], float) and result["rel_l2"] >= 0
+        assert isinstance(result["iface_rel_l2"], float) and result["iface_rel_l2"] >= 0
+        assert isinstance(result["nrmse"], float) and result["nrmse"] >= 0
 
 
 # ===================== per-sample interface metric =====================
@@ -469,22 +488,22 @@ class TestPerSampleInterfaceMetric:
         """All interface_x == 0.5: per-sample band metric equals the fixed-mask metric."""
         model, loader, _, iface_mask, x_grid_t = self._setup(0.5)
         device = torch.device("cpu")
-        _, fixed = validate(model, loader, device, iface_mask=iface_mask)
-        _, dyn = validate(
+        fixed = validate(model, loader, device, iface_mask=iface_mask)["iface_rel_l2"]
+        dyn = validate(
             model, loader, device, iface_mask=iface_mask,
             x_grid_t=x_grid_t, interface_half_width=0.05, use_per_sample_interface=True,
-        )
+        )["iface_rel_l2"]
         assert dyn == pytest.approx(fixed, rel=1e-5)
 
     def test_validate_persample_differs_when_off_center(self):
         """interface_x == 0.2 must drive the metric off the fixed x=0.5 band."""
         model, loader, _, iface_mask, x_grid_t = self._setup(0.2)
         device = torch.device("cpu")
-        _, fixed = validate(model, loader, device, iface_mask=iface_mask)
-        _, dyn = validate(
+        fixed = validate(model, loader, device, iface_mask=iface_mask)["iface_rel_l2"]
+        dyn = validate(
             model, loader, device, iface_mask=iface_mask,
             x_grid_t=x_grid_t, interface_half_width=0.05, use_per_sample_interface=True,
-        )
+        )["iface_rel_l2"]
         assert dyn != pytest.approx(fixed, rel=1e-6)
 
     def test_train_one_epoch_persample_matches_fixed_when_all_half(self):
@@ -492,14 +511,14 @@ class TestPerSampleInterfaceMetric:
         model, loader, loss_fn, iface_mask, _ = self._setup(0.5)
         device = torch.device("cpu")
         opt = torch.optim.SGD(model.parameters(), lr=0.0)
-        _, _, fixed = train_one_epoch(
+        fixed = train_one_epoch(
             model, loader, opt, loss_fn, device,
             iface_mask=iface_mask, use_per_sample_interface=False,
-        )
-        _, _, dyn = train_one_epoch(
+        )["iface_rel_l2"]
+        dyn = train_one_epoch(
             model, loader, opt, loss_fn, device,
             iface_mask=iface_mask, use_per_sample_interface=True,
-        )
+        )["iface_rel_l2"]
         assert dyn == pytest.approx(fixed, rel=1e-5)
 
 
@@ -772,6 +791,56 @@ class TestRunOneSeedResume:
         assert (run_dir / "fno2d_best.pt").exists()
         assert not (run_dir / "fno2d_latest.pt").exists()  # sentinel removed
         assert (run_dir / "train_metrics.csv").exists()
+
+    def test_train_metrics_csv_has_new_metric_columns(self, tmp_path, seed_config):
+        """End-to-end run emits the new nRMSE / Kelvin / node-jump columns, finite."""
+        run_dir = tmp_path / "seed0"
+        run_one_seed(seed_config, seed=0, run_dir=run_dir)
+
+        csv_path = run_dir / "train_metrics.csv"
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert rows
+
+        train_cols = (
+            "train_nrmse", "train_rmse_K", "train_max_err_K",
+            "train_node_jump_rmse_K", "train_node_jump_nrmse",
+        )
+        for col in train_cols:
+            assert col in rows[0], col
+            assert math.isfinite(float(rows[0][col])), col
+
+        # Validation columns are only populated on validation epochs.
+        val_rows = [r for r in rows if r.get("val_nrmse", "") != ""]
+        assert val_rows
+        val_cols = (
+            "val_nrmse", "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
+            "val_rmse_K", "val_max_err_K",
+            "val_node_jump_rmse_K", "val_node_jump_nrmse",
+            "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
+        )
+        for col in val_cols:
+            assert col in val_rows[0], col
+            assert math.isfinite(float(val_rows[0][col])), col
+
+    def test_checkpoint_metric_nrmse_selects_on_nrmse(self, tmp_path, seed_config):
+        """Setting checkpoint_metric=val_nrmse drives best_val selection off nRMSE."""
+        cfg = copy.deepcopy(seed_config)
+        cfg["training"]["checkpoint_metric"] = "val_nrmse"
+        run_dir = tmp_path / "seed0_nrmse"
+        result = run_one_seed(cfg, seed=0, run_dir=run_dir)
+
+        ckpt = torch.load(run_dir / "fno2d_best.pt", map_location="cpu", weights_only=False)
+        best_epoch = int(ckpt["epoch"])
+
+        csv_path = run_dir / "train_metrics.csv"
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        val_rows = [r for r in rows if r.get("val_nrmse", "") != ""]
+        best_val_nrmse = min(float(r["val_nrmse"]) for r in val_rows)
+        chosen = next(r for r in rows if int(r["epoch"]) == best_epoch)
+        assert float(chosen["val_nrmse"]) == pytest.approx(best_val_nrmse, rel=1e-6)
+        assert result["best_val"] == pytest.approx(best_val_nrmse, rel=1e-6)
 
     def test_fresh_run_writes_no_diagnostics_csv(self, tmp_path, seed_config):
         """diagnostics.csv must not be written; val_pairs.csv must still be.

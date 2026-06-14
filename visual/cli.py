@@ -519,18 +519,34 @@ def main():
             "source_interface_zone_error",
             "patch_error_slices",
             "patch_region_error_map",
+            "source_itr_error_vs_void_params",
         }
+        y_grid_only_plots = {"source_itr_void_profiles"}
         needs_grid_data = any(_should_run(name, groups, individual) for name in grid_data_plots)
+        needs_y_grid_only = any(_should_run(name, groups, individual) for name in y_grid_only_plots)
         trajectories = x_grid = y_grid = t_grid = None
+        profile_x_grid = profile_y_grid = None
         plot_config = None
         split_datasets = None
         solver_dt = None
+        if needs_y_grid_only:
+            if args.y_grid:
+                profile_y_grid = np.load(args.y_grid)
+                profile_x_grid = np.load(args.x_grid) if args.x_grid else None
+            else:
+                for name in y_grid_only_plots:
+                    if _should_run(name, groups, individual):
+                        _print_skip(name, "need --y-grid")
+
         if needs_grid_data:
             if args.data and args.x_grid and args.y_grid and args.t_grid:
                 print(f"Loading trajectories and grids from {args.data}, {args.x_grid}, {args.y_grid}, {args.t_grid} ...")
                 trajectories, x_grid, y_grid, t_grid = dataset_plots._load_plot_data(args.data, args.x_grid, args.y_grid, args.t_grid)
                 from data.dataset import load_solver_dt
                 solver_dt = load_solver_dt(args.t_grid)
+                if profile_y_grid is None:
+                    profile_y_grid = y_grid
+                    profile_x_grid = x_grid
             else:
                 for name in grid_data_plots:
                     if _should_run(name, groups, individual):
@@ -541,6 +557,7 @@ def main():
             "source_interface_zone_error",
             "patch_error_slices",
             "patch_region_error_map",
+            "source_itr_error_vs_void_params",
         }
         needs_model = any(_should_run(name, groups, individual) for name in model_plot_names)
         if needs_model and args.checkpoint:
@@ -567,6 +584,15 @@ def main():
                 print("--- patch_param_scatter ---")
                 dataset_plots.plot_patch_param_scatter(
                     sim_params, save_path=source_dir / "patch_param_scatter.png")
+
+            if _should_run("source_itr_void_profiles", groups, individual) and profile_y_grid is not None:
+                print("--- source_itr_void_profiles ---")
+                dataset_plots.plot_source_itr_void_profiles(
+                    sim_params,
+                    profile_y_grid,
+                    x_grid=profile_x_grid,
+                    save_path=source_dir / "source_itr_void_profiles.png",
+                )
 
             if _should_run("source_temporal_profile", groups, individual):
                 print("--- source_temporal_profile ---")
@@ -629,10 +655,29 @@ def main():
                     dataset_plots.plot_patch_region_error_map(
                         model, test_dataset, x_grid, y_grid, sim_params,
                         config=plot_config, save_path=source_dir / "patch_region_error_map.png")
+
+                if _should_run("source_itr_error_vs_void_params", groups, individual):
+                    print("--- source_itr_error_vs_void_params ---")
+                    dataset_plots.plot_source_itr_error_vs_void_params(
+                        model, test_dataset, x_grid, y_grid,
+                        config=plot_config,
+                        save_path=source_dir / "source_itr_error_vs_void_params.png")
         elif needs_grid_data and trajectories is not None and sim_params is None:
             for name in grid_data_plots:
                 if _should_run(name, groups, individual):
                     _print_skip(name, "need --params")
+
+        if trajectories is None and sim_params is not None and _should_run("source_itr_void_profiles", groups, individual):
+            if profile_y_grid is not None:
+                print("--- source_itr_void_profiles ---")
+                dataset_plots.plot_source_itr_void_profiles(
+                    sim_params,
+                    profile_y_grid,
+                    x_grid=profile_x_grid,
+                    save_path=source_dir / "source_itr_void_profiles.png",
+                )
+        elif trajectories is None and sim_params is None and _should_run("source_itr_void_profiles", groups, individual):
+            _print_skip("source_itr_void_profiles", "need --params")
 
         if _should_run("regime_error_breakdown", groups, individual):
             breakdown_path = args.breakdown

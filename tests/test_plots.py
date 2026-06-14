@@ -116,6 +116,8 @@ class TestPlotRegistry:
             "patch_region_error_map",
             "source_error_vs_params",
             "source_interface_zone_error",
+            "source_itr_void_profiles",
+            "source_itr_error_vs_void_params",
         ]:
             assert _common.PLOT_REGISTRY[name] == "source"
         assert "source" in _common.GROUPS
@@ -754,12 +756,62 @@ class TestInterfacePlots:
         assert out_path.exists()
 
 
+def _source_itr_params_from_source(synthetic_source_sim_params):
+    params = []
+    for i, p in enumerate(synthetic_source_sim_params):
+        q = dict(p)
+        R_base = 0.08 + 0.035 * (i % 12)
+        R_amp = 0.0 if i % 6 == 0 else 0.25 + 0.08 * (i % 5)
+        q["R_c_base"] = float(R_base)
+        q["R_c_amp"] = float(R_amp)
+        q["R_c_y0"] = float(0.15 + 0.7 * ((i * 3) % 19) / 18.0)
+        q["R_c_sigma"] = float(0.05 + 0.15 * ((i * 5) % 19) / 18.0)
+        q["R_c"] = float(R_base)
+        params.append(q)
+    return np.array(params, dtype=object)
+
+
 class TestSourcePlots:
     def test_patch_param_scatter_smoke(self, tmp_path, synthetic_source_sim_params):
         out_path = tmp_path / "patch_param_scatter.png"
         dataset_plots.plot_patch_param_scatter(
             synthetic_source_sim_params, save_path=out_path
         )
+        assert out_path.exists()
+
+    def test_source_itr_void_severity_handles_flat_profile(self, synthetic_source_sim_params):
+        y_grid = np.linspace(0.0, 1.0, 101, dtype=np.float32)
+        params = _source_itr_params_from_source(synthetic_source_sim_params[:3])
+        params[0]["R_c_amp"] = 0.0
+        params[1]["R_c_amp"] = 0.4
+        params[1]["R_c_sigma"] = 0.05
+        params[2]["R_c_amp"] = 0.4
+        params[2]["R_c_sigma"] = 0.16
+
+        severity = dataset_plots._void_severity_arrays(params, y_grid)
+
+        assert severity["R_c_excess_integral"][0] == pytest.approx(0.0)
+        assert severity["conductance_deficit"][0] == pytest.approx(0.0)
+        assert severity["is_void_active"][0] == np.bool_(False)
+        assert severity["R_c_excess_integral"][2] > severity["R_c_excess_integral"][1]
+
+    def test_source_itr_void_profiles_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+    ):
+        _trajectories, x_grid, y_grid, _t_grid = synthetic_trajectories
+        sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
+        out_path = tmp_path / "source_itr_void_profiles.png"
+
+        dataset_plots.plot_source_itr_void_profiles(
+            sim_params,
+            y_grid,
+            x_grid=x_grid,
+            save_path=out_path,
+        )
+
         assert out_path.exists()
 
     def test_source_dataset_summary_smoke(
@@ -811,6 +863,49 @@ class TestSourcePlots:
             max_samples=16,
             save_path=out_path,
         )
+        assert out_path.exists()
+
+    def test_source_itr_error_vs_void_params_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+    ):
+        from problems.source_itr import COND_STATIC_DIM, SPATIAL_CHANNELS_BINS
+        from src.operators.fno2d import FNO2d
+
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
+        source_itr_config = {
+            **plot_config,
+            "benchmark": {"name": "source_itr", "representation": "bins"},
+        }
+        datasets = dataset_plots._build_split_datasets(
+            trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
+        )
+        model = FNO2d(
+            modes1=2,
+            modes2=2,
+            width=8,
+            in_channels=SPATIAL_CHANNELS_BINS,
+            out_channels=1,
+            n_layers=2,
+            cond_static_dim=COND_STATIC_DIM,
+            use_temporal_encoder=False,
+        )
+        out_path = tmp_path / "source_itr_error_vs_void_params.png"
+
+        dataset_plots.plot_source_itr_error_vs_void_params(
+            model,
+            datasets["test"],
+            x_grid,
+            y_grid,
+            config=source_itr_config,
+            max_samples=16,
+            save_path=out_path,
+        )
+
         assert out_path.exists()
 
 

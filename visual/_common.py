@@ -69,6 +69,8 @@ PLOT_REGISTRY: dict[str, str] = {
     "patch_region_error_map":    "source",
     "source_error_vs_params":    "source",
     "source_interface_zone_error": "source",
+    "source_itr_void_profiles":  "source",
+    "source_itr_error_vs_void_params": "source",
     # group: interfaces
     "interface_y_perturbation":  "interfaces",
     "interface_lhs_scatter":     "interfaces",

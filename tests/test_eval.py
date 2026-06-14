@@ -59,6 +59,11 @@ EXPECTED_METRIC_KEYS = {
     "rel_l2_norm", "rel_l2_phys",
     "iface_rel_l2_norm", "iface_rel_l2_phys",
     "boundary_rel_l2_norm", "boundary_rel_l2_phys",
+    "nrmse", "nrmse_p90", "nrmse_p99", "nrmse_max",
+    "rmse_K", "max_err_K",
+    "node_jump_rmse_K",
+    "node_jump_nrmse", "node_jump_nrmse_p90",
+    "node_jump_nrmse_p99", "node_jump_nrmse_max",
 }
 
 
@@ -99,6 +104,75 @@ class TestEvaluate:
         model, loader, device = eval_setup
         evaluate(model, loader, device)
         assert not model.training
+
+    def test_new_metrics_finite_and_nonnegative(self, eval_setup):
+        model, loader, device = eval_setup
+        result = evaluate(model, loader, device)
+        for k in (
+            "nrmse", "nrmse_p90", "nrmse_p99", "nrmse_max",
+            "rmse_K", "max_err_K",
+            "node_jump_rmse_K",
+            "node_jump_nrmse", "node_jump_nrmse_p90",
+            "node_jump_nrmse_p99", "node_jump_nrmse_max",
+        ):
+            assert math.isfinite(result[k]), k
+            assert result[k] >= 0.0, k
+
+    def test_nrmse_tail_ordering(self, eval_setup):
+        model, loader, device = eval_setup
+        result = evaluate(model, loader, device)
+        assert result["nrmse"] <= result["nrmse_p90"] + 1e-6
+        assert result["nrmse_p90"] <= result["nrmse_p99"] + 1e-6
+        assert result["nrmse_p99"] <= result["nrmse_max"] + 1e-6
+
+
+# ===================== evaluate nRMSE invariance / batching =====================
+
+
+def _fixed_eval_loader(sigma, n=8, Nx=11, Ny=11, batch_size=2, seed=0):
+    """Deterministic loader; T_stats sigma_s column set to `sigma` for Kelvin scaling."""
+    g = torch.Generator().manual_seed(seed)
+    x_spatial = torch.randn(n, Nx, Ny, SPATIAL_IN_CHANNELS, generator=g)
+    cond_static = torch.rand(n, COND_STATIC_DIM, generator=g)
+    forcing_seq = torch.randn(n, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM, generator=g)
+    Y = torch.randn(n, Nx, Ny, 1, generator=g)
+    T_stats = torch.stack([
+        torch.zeros(n),
+        torch.full((n,), float(sigma)),
+    ], dim=-1)
+    return DataLoader(
+        TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
+        batch_size=batch_size,
+        collate_fn=_dict_collate,
+    )
+
+
+class TestEvaluateNRMSEInvariance:
+    def test_nrmse_invariant_to_sigma(self, eval_setup):
+        """nRMSE is normalization-invariant: same value for any sigma_global (z-scored == Kelvin)."""
+        model, _, device = eval_setup
+        model.eval()
+        a = evaluate(model, _fixed_eval_loader(1.0), device)
+        b = evaluate(model, _fixed_eval_loader(7.5), device)
+        assert a["nrmse"] == pytest.approx(b["nrmse"], rel=1e-5)
+        assert a["node_jump_nrmse"] == pytest.approx(b["node_jump_nrmse"], rel=1e-5)
+
+    def test_rmse_K_scales_with_sigma(self, eval_setup):
+        """Kelvin RMSE is a scalar multiple of sigma_global."""
+        model, _, device = eval_setup
+        model.eval()
+        a = evaluate(model, _fixed_eval_loader(1.0), device)
+        b = evaluate(model, _fixed_eval_loader(7.5), device)
+        assert b["rmse_K"] == pytest.approx(a["rmse_K"] * 7.5, rel=1e-5)
+
+    def test_nrmse_independent_of_batch_size(self, eval_setup):
+        """Per-sample mean nRMSE does not depend on how batches are chunked."""
+        model, _, device = eval_setup
+        model.eval()
+        a = evaluate(model, _fixed_eval_loader(1.0, batch_size=2), device)
+        b = evaluate(model, _fixed_eval_loader(1.0, batch_size=4), device)
+        assert a["nrmse"] == pytest.approx(b["nrmse"], rel=1e-5)
+        assert a["node_jump_nrmse"] == pytest.approx(b["node_jump_nrmse"], rel=1e-5)
 
 
 # ===================== evaluate per-sample interface =====================

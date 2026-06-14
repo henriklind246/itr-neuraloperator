@@ -3,11 +3,20 @@ import pytest
 import torch
 
 from src.operators.losses import (
+    EPS_JUMP,
+    EPS_STD,
     SpatiallyWeightedMSE,
     build_interface_band,
     build_interface_mask,
     compute_interface_rel_l2,
     get_batch_interface_x,
+    interface_flanking_nodes,
+    interface_flanking_nodes_per_sample,
+    per_sample_contact_jump_rmse,
+    per_sample_node_jump_errors,
+    per_sample_nrmse,
+    per_sample_sq_rms,
+    tail_stats,
 )
 
 
@@ -301,3 +310,219 @@ class TestComputeInterfaceRelL2:
         y_pred[:, 2, :, :] = 100.0
         result = compute_interface_rel_l2(y_pred, y_true, mask)
         assert result == pytest.approx(0.0, abs=1e-6)
+
+
+# ===================== interface_flanking_nodes =====================
+
+class TestInterfaceFlankingNodes:
+    def test_fixed_midpoint(self):
+        """Interface at 0.5 on a 101-node grid flanks nodes 49/50 or 50/51."""
+        x_grid = np.linspace(0.0, 1.0, 101).astype(np.float32)
+        left, right = interface_flanking_nodes(x_grid, 0.5)
+        assert right == left + 1
+        assert x_grid[left] <= 0.5 <= x_grid[right]
+
+    def test_left_right_straddle_interface(self):
+        """For several interface_x the flanking pair must straddle it."""
+        x_grid = np.linspace(0.0, 1.0, 101).astype(np.float32)
+        for cx in [0.2, 0.37, 0.63, 0.8]:
+            left, right = interface_flanking_nodes(x_grid, cx)
+            assert x_grid[left] <= cx <= x_grid[right]
+            assert right == left + 1
+
+    def test_outside_grid_raises(self):
+        x_grid = np.linspace(0.0, 0.3, 31).astype(np.float32)
+        with pytest.raises(ValueError):
+            interface_flanking_nodes(x_grid, 0.9)
+
+    def test_per_sample_matches_scalar(self):
+        """Vectorized per-sample flanking nodes match the scalar form row-wise."""
+        x_grid = np.linspace(0.0, 1.0, 101).astype(np.float32)
+        x_grid_t = torch.as_tensor(x_grid)
+        centers = [0.2, 0.5, 0.8]
+        left_v, right_v = interface_flanking_nodes_per_sample(
+            x_grid_t, torch.tensor(centers)
+        )
+        for i, cx in enumerate(centers):
+            ls, rs = interface_flanking_nodes(x_grid, cx)
+            assert int(left_v[i]) == ls
+            assert int(right_v[i]) == rs
+
+
+# ===================== per_sample nRMSE (headline) =====================
+
+class TestPerSampleNRMSE:
+    def test_normalization_invariance(self):
+        """Scaling pred and true by the same constant leaves nRMSE unchanged."""
+        torch.manual_seed(0)
+        y_true = torch.randn(4, 21, 11, 1) * 3.0 + 7.0
+        y_pred = y_true + 0.1 * torch.randn(4, 21, 11, 1)
+        base = per_sample_nrmse(y_pred, y_true)
+        for c in [2.0, 50.0, 300.0]:
+            scaled = per_sample_nrmse(y_pred * c, y_true * c)
+            torch.testing.assert_close(scaled, base, rtol=1e-5, atol=1e-7)
+
+    def test_eps_std_floor_keeps_finite(self):
+        """A near-constant target (std≈0) must not blow up nRMSE."""
+        y_true = torch.full((2, 21, 11, 1), 5.0)
+        y_pred = y_true + 1e-3
+        out = per_sample_nrmse(y_pred, y_true)
+        assert torch.all(torch.isfinite(out))
+        # Denominator is floored at EPS_STD, so nrmse ≈ rms / EPS_STD.
+        rms = per_sample_sq_rms(y_pred, y_true)
+        torch.testing.assert_close(out, rms / EPS_STD, rtol=1e-4, atol=1e-4)
+
+    def test_perfect_prediction_is_zero(self):
+        y = torch.randn(3, 21, 11, 1)
+        out = per_sample_nrmse(y, y)
+        assert torch.allclose(out, torch.zeros(3), atol=1e-7)
+
+    def test_matches_manual_definition(self):
+        torch.manual_seed(1)
+        y_true = torch.randn(5, 9, 7, 1) * 2.0
+        y_pred = y_true + 0.2 * torch.randn(5, 9, 7, 1)
+        rms = torch.sqrt(((y_pred - y_true) ** 2).mean(dim=(1, 2, 3)))
+        std = y_true.std(dim=(1, 2, 3), unbiased=False)
+        expected = rms / std.clamp_min(EPS_STD)
+        torch.testing.assert_close(per_sample_nrmse(y_pred, y_true), expected)
+
+
+# ===================== node-jump errors (interface fidelity) =====================
+
+class TestPerSampleNodeJumpErrors:
+    def test_non_circular_uses_own_fields(self):
+        """Predicted jump comes from y_pred, true jump from y_true."""
+        B, Nx, Ny = 2, 11, 5
+        y_true = torch.zeros(B, Nx, Ny, 1)
+        y_pred = torch.zeros(B, Nx, Ny, 1)
+        left, right = 4, 5
+        # Build a known step across the interface for each field.
+        y_true[:, right] = 2.0
+        y_pred[:, right] = 2.5  # pred over-predicts the jump by 0.5
+        err_rms, true_rms = per_sample_node_jump_errors(y_pred, y_true, left, right)
+        torch.testing.assert_close(err_rms, torch.full((B,), 0.5))
+        torch.testing.assert_close(true_rms, torch.full((B,), 2.0))
+
+    def test_zero_error_when_fields_equal(self):
+        y = torch.randn(3, 11, 5, 1)
+        err_rms, true_rms = per_sample_node_jump_errors(y, y, 4, 5)
+        assert torch.allclose(err_rms, torch.zeros(3), atol=1e-7)
+
+    def test_per_sample_left_right_tensor(self):
+        """Long-tensor (per-sample) flanking nodes select per-row columns."""
+        B, Nx, Ny = 3, 11, 4
+        y_true = torch.zeros(B, Nx, Ny, 1)
+        y_pred = torch.zeros(B, Nx, Ny, 1)
+        left = torch.tensor([2, 4, 6])
+        right = left + 1
+        for b in range(B):
+            y_true[b, right[b]] = 1.0
+            y_pred[b, right[b]] = 1.0 + 0.3 * (b + 1)
+        err_rms, _ = per_sample_node_jump_errors(y_pred, y_true, left, right)
+        torch.testing.assert_close(
+            err_rms, torch.tensor([0.3, 0.6, 0.9])
+        )
+
+    def test_normalized_jump_offset_free(self):
+        """A constant additive offset on both fields leaves the jump error unchanged."""
+        B, Nx, Ny = 2, 11, 5
+        y_true = torch.randn(B, Nx, Ny, 1)
+        y_pred = torch.randn(B, Nx, Ny, 1)
+        e0, t0 = per_sample_node_jump_errors(y_pred, y_true, 4, 5)
+        e1, t1 = per_sample_node_jump_errors(y_pred + 300.0, y_true + 300.0, 4, 5)
+        torch.testing.assert_close(e0, e1)
+        torch.testing.assert_close(t0, t1)
+
+
+# ===================== contact-jump RMSE (source_itr) =====================
+
+class TestPerSampleContactJumpRMSE:
+    def test_matches_weighted_reference(self):
+        """Contact jump equals the R_c(y)·G(y)-weighted node-jump difference."""
+        B, Nx, Ny = 2, 11, 6
+        left, right = 4, 5
+        torch.manual_seed(0)
+        y_true = torch.randn(B, Nx, Ny, 1)
+        y_pred = torch.randn(B, Nx, Ny, 1)
+        weight_y = torch.linspace(0.5, 2.0, Ny)  # stand-in for R_c(y)·G(y)
+        out = per_sample_contact_jump_rmse(y_pred, y_true, left, right, weight_y)
+
+        pl, pr = y_pred[:, left, :, 0], y_pred[:, right, :, 0]
+        tl, tr = y_true[:, left, :, 0], y_true[:, right, :, 0]
+        cj_pred = weight_y * (pl - pr)
+        cj_true = weight_y * (tl - tr)
+        expected = torch.sqrt(((cj_pred - cj_true) ** 2).mean(dim=1))
+        torch.testing.assert_close(out, expected)
+
+    def test_zero_weight_gives_zero(self):
+        B, Nx, Ny = 2, 11, 6
+        y_true = torch.randn(B, Nx, Ny, 1)
+        y_pred = torch.randn(B, Nx, Ny, 1)
+        out = per_sample_contact_jump_rmse(
+            y_pred, y_true, 4, 5, torch.zeros(Ny)
+        )
+        assert torch.allclose(out, torch.zeros(B), atol=1e-7)
+
+
+# ===================== aggregation: train-mean == val/test mean-of-pairs =====================
+
+class TestMeanOfPairsAggregation:
+    def test_summed_per_sample_equals_concat_mean(self):
+        """Σ metric_i / n over minibatches equals the mean over all pairs."""
+        torch.manual_seed(0)
+        y_true = torch.randn(12, 9, 7, 1)
+        y_pred = y_true + 0.1 * torch.randn(12, 9, 7, 1)
+
+        # Pooled-over-all-pairs reference (val/test convention).
+        all_nrmse = per_sample_nrmse(y_pred, y_true)
+        pooled_mean = all_nrmse.mean()
+
+        # Train convention: sum per-sample over minibatches, divide by n.
+        running_sum = 0.0
+        n = 0
+        for start in range(0, 12, 4):
+            sl = slice(start, start + 4)
+            vals = per_sample_nrmse(y_pred[sl], y_true[sl])
+            running_sum += float(vals.sum())
+            n += vals.numel()
+        train_mean = running_sum / n
+        assert train_mean == pytest.approx(float(pooled_mean), rel=1e-6)
+
+    def test_differs_from_pooled_rmse(self):
+        """Mean-of-per-sample-RMSE is not the same as a single pooled RMSE."""
+        torch.manual_seed(3)
+        y_true = torch.zeros(8, 9, 7, 1)
+        # Per-sample error magnitudes span two orders so the two aggregations
+        # diverge (pooled RMSE is dominated by the largest-error samples).
+        err_scale = torch.logspace(-1, 2, 8).reshape(-1, 1, 1, 1)
+        y_pred = y_true + err_scale * torch.randn(8, 9, 7, 1)
+        per_sample = per_sample_sq_rms(y_pred, y_true).mean()
+        pooled = torch.sqrt(((y_pred - y_true) ** 2).mean())
+        assert abs(float(per_sample) - float(pooled)) > 1.0
+
+
+# ===================== tail_stats =====================
+
+class TestTailStats:
+    def test_matches_numpy_percentile(self):
+        torch.manual_seed(0)
+        v = torch.rand(1000)
+        out = tail_stats(v)
+        vn = v.double().numpy()
+        assert out["mean"] == pytest.approx(float(np.mean(vn)), rel=1e-6)
+        assert out["max"] == pytest.approx(float(np.max(vn)), rel=1e-6)
+        assert out["p90"] == pytest.approx(
+            float(np.percentile(vn, 90, method="linear")), rel=1e-6
+        )
+        assert out["p99"] == pytest.approx(
+            float(np.percentile(vn, 99, method="linear")), rel=1e-6
+        )
+
+    def test_empty_returns_zeros(self):
+        out = tail_stats(torch.empty(0))
+        assert out == {"mean": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0}
+
+    def test_ordering_mean_le_p90_le_p99_le_max(self):
+        v = torch.rand(500)
+        out = tail_stats(v)
+        assert out["mean"] <= out["p90"] <= out["p99"] <= out["max"]
