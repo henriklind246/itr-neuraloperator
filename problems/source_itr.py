@@ -210,8 +210,8 @@ class SourceItrProblem(SourceProblem):
         a = float(base_kwargs["a"])
         b = float(base_kwargs["b"])
         layers = [
-            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=2.0),
-            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=1.0),
+            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=3.0),
+            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=35.0),
         ]
         q_left_fn = lambda t: np.zeros_like(y_grid)
         # Build the source via the parent's patch builder by delegating the

@@ -345,8 +345,8 @@ class SourceProblem(ProblemSpec):
         a = float(base_kwargs["a"])
         b = float(base_kwargs["b"])
         layers = [
-            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=2.0),
-            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=1.0),
+            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=3.0),
+            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=35.0),
         ]
         # Zero-flux left boundary in vector form so the solver's flux detection
         # uses the vector branch.
