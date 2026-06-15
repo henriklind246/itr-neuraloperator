@@ -67,6 +67,12 @@ training:
   # (per-benchmark loss region). per_sample_interface_x defaults to false in code
   # (loss_cfg.get(...)) and is set true only for the interfaces benchmark.
   validate_every: 10
+  # Cap on the number of per-pair diagnostic rows written to val_pairs.csv per
+  # validation pass. A fixed, seeded subset of pairs is written (same subset
+  # every pass, so per-pair error stays trackable across epochs). Does NOT affect
+  # reported val_* metrics or checkpoint selection — only the diagnostic CSV.
+  # null (or a value >= total pairs) writes every pair (legacy behavior).
+  val_pairs_max_rows: 5000
   patience: 20
   # Validation metric used to select best_val / early-stopping. Allowed values:
   #   val_rel_l2    (default) normalized-space relative L2 — unchanged baseline

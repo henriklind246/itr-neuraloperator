@@ -30,7 +30,16 @@ BENCHMARK_COND_COLS = {
     "forcing": [],
     "interfaces": ["interface_x"],
     "source": ["x_h", "y_h", "A"],
+    "source_itr": ["x_h", "y_h", "A"],
 }
+
+# Per-pair metrics to report side-by-side in every stratification table. The
+# point is to expose that the relative metric (nrmse) and the Kelvin metric
+# (rmse_K) move in opposite directions across the regime / x_h axis: the
+# small-signal nrmse divergence is a metric artifact confined to the regime
+# where the model is most accurate in Kelvin. gnrmse_pct is the fixed-scale
+# dimensionless companion (= rmse_K / sigma_global * 100), so it tracks rmse_K.
+STRAT_METRICS = ["rel_l2", "rmse_K", "gnrmse_pct", "nrmse"]
 
 
 def _quantile(q: float):
@@ -90,6 +99,29 @@ def _cond_cols(df: pd.DataFrame, benchmark: str) -> list[str]:
     return [c for c in cols if _is_varying_numeric(df, c)]
 
 
+def _present_strat_metrics(df: pd.DataFrame) -> list[str]:
+    """Subset of STRAT_METRICS actually present (and numeric) in the CSV."""
+    return [
+        m for m in STRAT_METRICS
+        if m in df.columns and pd.api.types.is_numeric_dtype(df[m])
+    ]
+
+
+def _strat_table(latest: pd.DataFrame, bins, metrics: list[str]) -> pd.DataFrame:
+    """Per-stratum mean of each metric plus the nrmse p99 (tail) when present.
+
+    No monotonicity is assumed: this just reports per-stratum values so the data
+    can show whether nrmse and rmse_K diverge across the axis.
+    """
+    agg_spec = {m: "mean" for m in metrics}
+    grouped = latest.groupby(bins, observed=True)
+    table = grouped.agg(agg_spec)
+    if "nrmse" in latest.columns and pd.api.types.is_numeric_dtype(latest["nrmse"]):
+        table["nrmse_p99"] = grouped["nrmse"].quantile(0.99)
+    table["count"] = grouped.size()
+    return table
+
+
 # --------------------------------------------------------------------------- #
 # text reports
 # --------------------------------------------------------------------------- #
@@ -108,14 +140,47 @@ def report_worst_sims(latest: pd.DataFrame) -> None:
 
 def report_regime_stratification(latest: pd.DataFrame, cond_cols: list[str]) -> None:
     print("\n=== 3. Error stratified by conditioning variables (final epoch) ===")
+    metrics = _present_strat_metrics(latest)
+    print(f"metrics reported per stratum: {metrics} (+ nrmse_p99 when available)")
+    print(
+        "watch for nrmse rising while rmse_K/gnrmse_pct fall across a stratum "
+        "axis -> small-signal nrmse divergence (a metric artifact)."
+    )
     if not cond_cols:
         print("(no varying conditioning columns found)")
         return
     for col in cond_cols:
         bins = pd.qcut(latest[col], 5, duplicates="drop")
-        agg = latest.groupby(bins, observed=True)["rel_l2"].agg(["mean", "median", _quantile(0.99)])
+        table = _strat_table(latest, bins, metrics)
         print(f"\n-- by {col} quintile --")
-        print(agg.to_string(float_format=lambda x: f"{x:.4f}"))
+        print(table.to_string(float_format=lambda x: f"{x:.4f}"))
+
+
+def report_xh_deciles(latest: pd.DataFrame, benchmark: str) -> None:
+    """Source/source_itr: stratify the new metrics by x_h decile.
+
+    x_h (patch x-position relative to the fixed interface at x=0.5) is the regime
+    axis for the source benchmarks: high-x_h patches sit in the near-isothermal
+    right slab where per-sample signal scale collapses and nrmse diverges while
+    rmse_K stays small. This is the paper's central stratification proof.
+    """
+    if benchmark not in ("source", "source_itr"):
+        return
+    if not _is_varying_numeric(latest, "x_h"):
+        return
+    print("\n=== 3b. New metrics stratified by x_h decile (final epoch) ===")
+    metrics = _present_strat_metrics(latest)
+    bins = pd.qcut(latest["x_h"], 10, duplicates="drop")
+    table = _strat_table(latest, bins, metrics)
+    print(table.to_string(float_format=lambda x: f"{x:.4f}"))
+    if "regime" in latest.columns and latest["regime"].nunique() > 1:
+        print("\n-- by patch regime --")
+        rtable = (
+            latest.groupby("regime", observed=True)
+            .agg({m: "mean" for m in metrics})
+            .assign(count=latest.groupby("regime", observed=True).size())
+        )
+        print(rtable.to_string(float_format=lambda x: f"{x:.4f}"))
 
 
 def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
@@ -129,7 +194,7 @@ def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
         bins = pd.qcut(latest["interface_x"], 5, duplicates="drop")
         agg = latest.groupby(bins, observed=True)["rel_l2"].agg(["mean", "median", _quantile(0.99)])
         print(agg.to_string(float_format=lambda x: f"{x:.4f}"))
-    elif benchmark == "source" and "regime" in latest.columns:
+    elif benchmark in ("source", "source_itr") and "regime" in latest.columns:
         agg = latest.groupby("regime")["rel_l2"].agg(["mean", "median", "count"])
         print(agg.sort_values("mean").to_string(float_format=lambda x: f"{x:.4f}"))
     else:
@@ -160,9 +225,10 @@ def report_tails(latest: pd.DataFrame, cond_cols: list[str]) -> None:
         f"mean={s.mean():.4f}  p50={s.median():.4f}  "
         f"p90={s.quantile(0.9):.4f}  p99={s.quantile(0.99):.4f}  max={s.max():.4f}"
     )
-    print("\nTop-20 worst pairs:")
+    print("\nTop-20 worst pairs (by rel_l2):")
     struct_cols = [c for c in ("temporal_family", "spatial_family", "regime") if c in latest.columns]
-    cols = ["sim_id", *struct_cols, *cond_cols, "rel_l2"]
+    metric_cols = [c for c in ("nrmse", "rmse_K", "gnrmse_pct") if c in latest.columns]
+    cols = ["sim_id", *struct_cols, *cond_cols, "rel_l2", *metric_cols]
     if "iface_rel_l2" in latest.columns:
         cols.append("iface_rel_l2")
     cols = list(dict.fromkeys(cols))  # dedupe, preserve order
@@ -264,7 +330,7 @@ def plot_structure(latest: pd.DataFrame, benchmark: str, out: Path) -> None:
         _plot_ic_family_heatmap(latest, out)
     elif benchmark == "interfaces":
         _plot_error_vs_interface_x(latest, out)
-    elif benchmark == "source":
+    elif benchmark in ("source", "source_itr"):
         _plot_source_structure(latest, out)
     else:
         print(f"  [skip] 05_structure: no structure plot for benchmark={benchmark!r}")
@@ -382,6 +448,7 @@ def main() -> None:
     report_training_dynamics(df)
     report_worst_sims(latest)
     report_regime_stratification(latest, cond_cols)
+    report_xh_deciles(latest, benchmark)
     report_structure(latest, benchmark)
     report_between_vs_within(latest)
     report_tails(latest, cond_cols)

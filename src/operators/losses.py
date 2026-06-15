@@ -382,14 +382,29 @@ def per_sample_contact_jump_rmse(
 
 
 def tail_stats(values: torch.Tensor) -> dict:
-    """Return {mean, p90, p99, max} of a 1D tensor of per-pair metric values."""
+    """Return distributional stats of a 1D tensor of per-pair metric values.
+
+    Keys: mean, p25, p50, p75, iqr, p90, p99, max. The p25/p50/p75/iqr keys are
+    additive; existing callers reading mean/p90/p99/max keep working unchanged.
+    """
     v = values.detach().to(torch.float64).reshape(-1)
     if v.numel() == 0:
-        return {"mean": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0}
-    q = torch.quantile(v, torch.tensor([0.90, 0.99], dtype=v.dtype, device=v.device))
+        return {
+            "mean": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "iqr": 0.0,
+            "p90": 0.0, "p99": 0.0, "max": 0.0,
+        }
+    q = torch.quantile(
+        v,
+        torch.tensor([0.25, 0.50, 0.75, 0.90, 0.99], dtype=v.dtype, device=v.device),
+    )
+    p25, p50, p75 = float(q[0]), float(q[1]), float(q[2])
     return {
         "mean": float(v.mean()),
-        "p90": float(q[0]),
-        "p99": float(q[1]),
+        "p25": p25,
+        "p50": p50,
+        "p75": p75,
+        "iqr": p75 - p25,
+        "p90": float(q[3]),
+        "p99": float(q[4]),
         "max": float(v.max()),
     }
