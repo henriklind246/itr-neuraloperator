@@ -211,8 +211,10 @@ def evaluate(
         # Unified per-sample metric accumulators (mean-over-pairs convention).
         nrmse_all: list[torch.Tensor] = []
         rmse_K_all: list[torch.Tensor] = []
+        gnrmse_all: list[torch.Tensor] = []
         node_jump_rmse_K_all: list[torch.Tensor] = []
         node_jump_nrmse_all: list[torch.Tensor] = []
+        node_jump_gnrmse_all: list[torch.Tensor] = []
         max_err_K = 0.0
 
         for batch in test_loader:
@@ -242,6 +244,7 @@ def evaluate(
             rms_i = per_sample_sq_rms(y_pred, y_batch)
             nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
             rmse_K_all.append((rms_i * sig).cpu())
+            gnrmse_all.append(rms_i.cpu())
             max_err_K = max(
                 max_err_K,
                 torch.max(torch.abs(y_pred_phys - y_true_phys)).item(),
@@ -259,6 +262,7 @@ def evaluate(
                     y_pred, y_batch, left, right
                 )
                 node_jump_rmse_K_all.append((err_rms_i * sig).cpu())
+                node_jump_gnrmse_all.append(err_rms_i.cpu())
                 node_jump_nrmse_all.append(
                     (err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)).cpu()
                 )
@@ -285,13 +289,16 @@ def evaluate(
         boundary_rel_l2_phys /= n_batches
 
     nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
-    rmse_K_mean = float(torch.cat(rmse_K_all).mean()) if rmse_K_all else 0.0
+    rmse_K_stats = tail_stats(torch.cat(rmse_K_all)) if rmse_K_all else tail_stats(torch.empty(0))
+    gnrmse_stats = tail_stats(torch.cat(gnrmse_all)) if gnrmse_all else tail_stats(torch.empty(0))
     if node_jump_nrmse_all:
         jump_nrmse_stats = tail_stats(torch.cat(node_jump_nrmse_all))
         node_jump_rmse_K_mean = float(torch.cat(node_jump_rmse_K_all).mean())
+        node_jump_gnrmse_stats = tail_stats(torch.cat(node_jump_gnrmse_all))
     else:
         jump_nrmse_stats = tail_stats(torch.empty(0))
         node_jump_rmse_K_mean = 0.0
+        node_jump_gnrmse_stats = tail_stats(torch.empty(0))
 
     return {
         "rel_l2_norm": rel_l2_norm,
@@ -301,16 +308,25 @@ def evaluate(
         "boundary_rel_l2_norm": boundary_rel_l2_norm,
         "boundary_rel_l2_phys": boundary_rel_l2_phys,
         "nrmse": nrmse_stats["mean"] * 100.0,
+        "nrmse_p50": nrmse_stats["p50"] * 100.0,
+        "nrmse_iqr": nrmse_stats["iqr"] * 100.0,
         "nrmse_p90": nrmse_stats["p90"] * 100.0,
         "nrmse_p99": nrmse_stats["p99"] * 100.0,
         "nrmse_max": nrmse_stats["max"] * 100.0,
-        "rmse_K": rmse_K_mean,
+        "rmse_K": rmse_K_stats["mean"],
+        "rmse_K_p90": rmse_K_stats["p90"],
+        "rmse_K_p99": rmse_K_stats["p99"],
+        "rmse_K_max": rmse_K_stats["max"],
+        "gnrmse_pct": gnrmse_stats["mean"] * 100.0,
+        "gnrmse_pct_p99": gnrmse_stats["p99"] * 100.0,
         "max_err_K": max_err_K,
         "node_jump_rmse_K": node_jump_rmse_K_mean,
         "node_jump_nrmse": jump_nrmse_stats["mean"] * 100.0,
         "node_jump_nrmse_p90": jump_nrmse_stats["p90"] * 100.0,
         "node_jump_nrmse_p99": jump_nrmse_stats["p99"] * 100.0,
         "node_jump_nrmse_max": jump_nrmse_stats["max"] * 100.0,
+        "node_jump_gnrmse_pct": node_jump_gnrmse_stats["mean"] * 100.0,
+        "node_jump_gnrmse_pct_p99": node_jump_gnrmse_stats["p99"] * 100.0,
     }
 
 
@@ -512,16 +528,25 @@ def eval_all_seeds(
                 "test_boundary_rel_l2_norm": float(metrics["boundary_rel_l2_norm"]),
                 "test_boundary_rel_l2": float(metrics["boundary_rel_l2_phys"]),
                 "test_nrmse": float(metrics.get("nrmse", 0.0)),
+                "test_nrmse_p50": float(metrics.get("nrmse_p50", 0.0)),
+                "test_nrmse_iqr": float(metrics.get("nrmse_iqr", 0.0)),
                 "test_nrmse_p90": float(metrics.get("nrmse_p90", 0.0)),
                 "test_nrmse_p99": float(metrics.get("nrmse_p99", 0.0)),
                 "test_nrmse_max": float(metrics.get("nrmse_max", 0.0)),
                 "test_rmse_K": float(metrics.get("rmse_K", 0.0)),
+                "test_rmse_K_p90": float(metrics.get("rmse_K_p90", 0.0)),
+                "test_rmse_K_p99": float(metrics.get("rmse_K_p99", 0.0)),
+                "test_rmse_K_max": float(metrics.get("rmse_K_max", 0.0)),
+                "test_gnrmse_pct": float(metrics.get("gnrmse_pct", 0.0)),
+                "test_gnrmse_pct_p99": float(metrics.get("gnrmse_pct_p99", 0.0)),
                 "test_max_err_K": float(metrics.get("max_err_K", 0.0)),
                 "test_node_jump_rmse_K": float(metrics.get("node_jump_rmse_K", 0.0)),
                 "test_node_jump_nrmse": float(metrics.get("node_jump_nrmse", 0.0)),
                 "test_node_jump_nrmse_p90": float(metrics.get("node_jump_nrmse_p90", 0.0)),
                 "test_node_jump_nrmse_p99": float(metrics.get("node_jump_nrmse_p99", 0.0)),
                 "test_node_jump_nrmse_max": float(metrics.get("node_jump_nrmse_max", 0.0)),
+                "test_node_jump_gnrmse_pct": float(metrics.get("node_jump_gnrmse_pct", 0.0)),
+                "test_node_jump_gnrmse_pct_p99": float(metrics.get("node_jump_gnrmse_pct_p99", 0.0)),
                 "rollout_enabled": bool(rollout_options.enabled),
                 "rollout_num_substeps": int(rollout_options.num_substeps),
                 "rollout_partition": rollout_options.partition,
@@ -570,13 +595,22 @@ def print_seed_report(results: list[dict]) -> dict:
         return mean_std([r.get(key, 0.0) for r in results])
 
     nrmse_mu, nrmse_std = _seed_stat("test_nrmse")
+    nrmse_p50_mu, _ = _seed_stat("test_nrmse_p50")
+    nrmse_iqr_mu, _ = _seed_stat("test_nrmse_iqr")
     nrmse_p90_mu, _ = _seed_stat("test_nrmse_p90")
     nrmse_p99_mu, _ = _seed_stat("test_nrmse_p99")
     nrmse_max_mu, _ = _seed_stat("test_nrmse_max")
     rmse_K_mu, rmse_K_std = _seed_stat("test_rmse_K")
+    rmse_K_p90_mu, _ = _seed_stat("test_rmse_K_p90")
+    rmse_K_p99_mu, _ = _seed_stat("test_rmse_K_p99")
+    rmse_K_max_mu, _ = _seed_stat("test_rmse_K_max")
+    gnrmse_pct_mu, gnrmse_pct_std = _seed_stat("test_gnrmse_pct")
+    gnrmse_pct_p99_mu, _ = _seed_stat("test_gnrmse_pct_p99")
     max_err_K_mu, _ = _seed_stat("test_max_err_K")
     jump_rmse_K_mu, jump_rmse_K_std = _seed_stat("test_node_jump_rmse_K")
     jump_nrmse_mu, jump_nrmse_std = _seed_stat("test_node_jump_nrmse")
+    jump_gnrmse_pct_mu, jump_gnrmse_pct_std = _seed_stat("test_node_jump_gnrmse_pct")
+    jump_gnrmse_pct_p99_mu, _ = _seed_stat("test_node_jump_gnrmse_pct_p99")
 
     print("\n===== Seed Report =====")
     print(f"Number of seeds: {len(results)}")
@@ -587,11 +621,14 @@ def print_seed_report(results: list[dict]) -> dict:
     print(f"test_iface_rel_l2 (phys) mean, std: ({iface_mu}, {iface_std})")
     print(f"test_boundary_rel_l2_norm mean, std: ({bnd_norm_mu}, {bnd_norm_std})")
     print(f"test_boundary_rel_l2(phys) mean, std: ({bnd_mu}, {bnd_std})")
-    print(f"test_nrmse (%)           mean, std: ({nrmse_mu}, {nrmse_std})   <- headline, normalization-invariant")
-    print(f"test_nrmse tails (%)     p90/p99/max: ({nrmse_p90_mu}, {nrmse_p99_mu}, {nrmse_max_mu})")
-    print(f"test_rmse_K              mean, std: ({rmse_K_mu}, {rmse_K_std})   (Kelvin)")
-    print(f"test_max_err_K           mean: {max_err_K_mu}   (Kelvin worst-case)")
+    print(f"test_rmse_K (Kelvin)     mean, std: ({rmse_K_mu}, {rmse_K_std})   <- physical headline")
+    print(f"test_rmse_K tails (K)    p90/p99/max_sample: ({rmse_K_p90_mu}, {rmse_K_p99_mu}, {rmse_K_max_mu})")
+    print(f"test_max_err_K           mean: {max_err_K_mu}   (Kelvin pointwise worst-case)")
+    print(f"test_gnrmse (%)          mean, p99: ({gnrmse_pct_mu}, {gnrmse_pct_p99_mu})   (= rmse_K/sigma_global)")
+    print(f"test_nrmse (%)           mean, std: ({nrmse_mu}, {nrmse_std})   <- diagnostic, small-signal divergence")
+    print(f"test_nrmse dist (%)      p50/IQR/p90/p99/max: ({nrmse_p50_mu}, {nrmse_iqr_mu}, {nrmse_p90_mu}, {nrmse_p99_mu}, {nrmse_max_mu})")
     print(f"test_node_jump_rmse_K    mean, std: ({jump_rmse_K_mu}, {jump_rmse_K_std})   (Kelvin)")
+    print(f"test_node_jump_gnrmse(%) mean, p99: ({jump_gnrmse_pct_mu}, {jump_gnrmse_pct_p99_mu})")
     print(f"test_node_jump_nrmse (%) mean, std: ({jump_nrmse_mu}, {jump_nrmse_std})   <- offset-free interface")
 
     best = min(results, key=lambda r: r["test_rel_l2_norm"])
@@ -621,16 +658,27 @@ def print_seed_report(results: list[dict]) -> dict:
         "test_boundary_rel_l2_std": bnd_std,
         "test_nrmse_mean": nrmse_mu,
         "test_nrmse_std": nrmse_std,
+        "test_nrmse_p50_mean": nrmse_p50_mu,
+        "test_nrmse_iqr_mean": nrmse_iqr_mu,
         "test_nrmse_p90_mean": nrmse_p90_mu,
         "test_nrmse_p99_mean": nrmse_p99_mu,
         "test_nrmse_max_mean": nrmse_max_mu,
         "test_rmse_K_mean": rmse_K_mu,
         "test_rmse_K_std": rmse_K_std,
+        "test_rmse_K_p90_mean": rmse_K_p90_mu,
+        "test_rmse_K_p99_mean": rmse_K_p99_mu,
+        "test_rmse_K_max_mean": rmse_K_max_mu,
+        "test_gnrmse_pct_mean": gnrmse_pct_mu,
+        "test_gnrmse_pct_std": gnrmse_pct_std,
+        "test_gnrmse_pct_p99_mean": gnrmse_pct_p99_mu,
         "test_max_err_K_mean": max_err_K_mu,
         "test_node_jump_rmse_K_mean": jump_rmse_K_mu,
         "test_node_jump_rmse_K_std": jump_rmse_K_std,
         "test_node_jump_nrmse_mean": jump_nrmse_mu,
         "test_node_jump_nrmse_std": jump_nrmse_std,
+        "test_node_jump_gnrmse_pct_mean": jump_gnrmse_pct_mu,
+        "test_node_jump_gnrmse_pct_std": jump_gnrmse_pct_std,
+        "test_node_jump_gnrmse_pct_p99_mean": jump_gnrmse_pct_p99_mu,
     }
 
 def save_report(run_root: str, results: list[dict], summary: dict,
@@ -654,7 +702,8 @@ TEST_RECORD_FIELDS = [
     "temporal_family", "spatial_family",
     "x_h", "y_h", "A", "freq", "regime",
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
-    "nrmse_pct", "rmse_K", "node_jump_rmse_K", "node_jump_nrmse_pct",
+    "nrmse_pct", "rmse_K", "gnrmse_pct",
+    "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
 ]
 
 
@@ -817,9 +866,11 @@ def write_test_records(
             rms_i = per_sample_sq_rms(y_pred, y_true)
             nrmse_pct = float(per_sample_nrmse(y_pred, y_true).item()) * 100.0
             rmse_K = float(rms_i.item()) * sigma_global
+            gnrmse_pct = float(rms_i.item()) * 100.0
             left_n, right_n = _flank_for(interface_x)
             jump_err, jump_true = per_sample_node_jump_errors(y_pred, y_true, left_n, right_n)
             node_jump_rmse_K = float(jump_err.item()) * sigma_global
+            node_jump_gnrmse_pct = float(jump_err.item()) * 100.0
             node_jump_nrmse_pct = float(
                 (jump_err / jump_true.clamp_min(EPS_JUMP)).item()
             ) * 100.0
@@ -848,8 +899,10 @@ def write_test_records(
                 "iface_rel_l2_pct": iface_rel_l2,
                 "nrmse_pct": nrmse_pct,
                 "rmse_K": rmse_K,
+                "gnrmse_pct": gnrmse_pct,
                 "node_jump_rmse_K": node_jump_rmse_K,
                 "node_jump_nrmse_pct": node_jump_nrmse_pct,
+                "node_jump_gnrmse_pct": node_jump_gnrmse_pct,
             })
 
     rows.sort(key=lambda r: (r["sim_id"], r["s"], r["j"]))

@@ -64,8 +64,10 @@ BASE_VAL_PAIR_FIELDNAMES = [
     "iface_rel_l2",
     "nrmse",
     "rmse_K",
+    "gnrmse_pct",
     "node_jump_rmse_K",
     "node_jump_nrmse",
+    "node_jump_gnrmse_pct",
 ]
 
 
@@ -79,6 +81,13 @@ def _build_val_pair_fieldnames() -> list[str]:
 
 
 VAL_PAIR_FIELDNAMES = _build_val_pair_fieldnames()
+
+
+# Fixed seed for selecting which validation pairs are written to val_pairs.csv
+# when training.val_pairs_max_rows caps the per-pass row count. Holding the seed
+# constant makes the written subset identical on every validation pass, so
+# per-pair error can be tracked across epochs.
+VAL_PAIRS_SUBSAMPLE_SEED = 0
 
 
 def load_config(config_path: str | None = None) -> dict:
@@ -250,12 +259,15 @@ def _summarize_metrics_csv(csv_path: Path) -> dict:
         return float(v) if v not in ("", None) else None
 
     _extra_keys = (
-        "train_nrmse", "train_rmse_K", "train_max_err_K",
-        "train_node_jump_rmse_K", "train_node_jump_nrmse",
-        "val_nrmse", "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
-        "val_rmse_K", "val_max_err_K",
+        "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
+        "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
+        "val_nrmse", "val_nrmse_p50", "val_nrmse_iqr",
+        "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
+        "val_rmse_K", "val_rmse_K_p90", "val_rmse_K_p99", "val_rmse_K_max",
+        "val_gnrmse_pct", "val_gnrmse_pct_p99", "val_max_err_K",
         "val_node_jump_rmse_K", "val_node_jump_nrmse",
         "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
+        "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
     )
 
     def _row(row):
@@ -317,18 +329,29 @@ def _write_final_metrics(
             "train_rel_l2": best["train_rel_l2"],
             "train_iface_rel_l2": best["train_iface_rel_l2"],
             "val_nrmse": best["val_nrmse"],
+            "val_nrmse_p50": best["val_nrmse_p50"],
+            "val_nrmse_iqr": best["val_nrmse_iqr"],
             "val_nrmse_p90": best["val_nrmse_p90"],
             "val_nrmse_p99": best["val_nrmse_p99"],
             "val_nrmse_max": best["val_nrmse_max"],
             "val_rmse_K": best["val_rmse_K"],
+            "val_rmse_K_p90": best["val_rmse_K_p90"],
+            "val_rmse_K_p99": best["val_rmse_K_p99"],
+            "val_rmse_K_max": best["val_rmse_K_max"],
+            "val_gnrmse_pct": best["val_gnrmse_pct"],
+            "val_gnrmse_pct_p99": best["val_gnrmse_pct_p99"],
             "val_max_err_K": best["val_max_err_K"],
             "val_node_jump_rmse_K": best["val_node_jump_rmse_K"],
             "val_node_jump_nrmse": best["val_node_jump_nrmse"],
+            "val_node_jump_gnrmse_pct": best["val_node_jump_gnrmse_pct"],
+            "val_node_jump_gnrmse_pct_p99": best["val_node_jump_gnrmse_pct_p99"],
             "train_nrmse": best["train_nrmse"],
             "train_rmse_K": best["train_rmse_K"],
+            "train_gnrmse_pct": best["train_gnrmse_pct"],
             "train_max_err_K": best["train_max_err_K"],
             "train_node_jump_rmse_K": best["train_node_jump_rmse_K"],
             "train_node_jump_nrmse": best["train_node_jump_nrmse"],
+            "train_node_jump_gnrmse_pct": best["train_node_jump_gnrmse_pct"],
         },
         "final": {
             "epoch": final["epoch"],
@@ -336,9 +359,11 @@ def _write_final_metrics(
             "train_iface_rel_l2": final["train_iface_rel_l2"],
             "train_nrmse": final["train_nrmse"],
             "train_rmse_K": final["train_rmse_K"],
+            "train_gnrmse_pct": final["train_gnrmse_pct"],
             "train_max_err_K": final["train_max_err_K"],
             "train_node_jump_rmse_K": final["train_node_jump_rmse_K"],
             "train_node_jump_nrmse": final["train_node_jump_nrmse"],
+            "train_node_jump_gnrmse_pct": final["train_node_jump_gnrmse_pct"],
             "lr": final["lr"],
         },
         "epochs_trained": summary["total_epochs"],
@@ -648,8 +673,10 @@ def train_one_epoch(
     # Unified metric accumulators (summed per-sample; mean after the reduce).
     nrmse_sum = 0.0
     rmse_K_sum = 0.0
+    gnrmse_sum = 0.0  # sum of per-sample normalized RMS (= rmse_K/sigma); *100 for pct
     node_jump_rmse_K_sum = 0.0
     node_jump_nrmse_sum = 0.0
+    node_jump_gnrmse_sum = 0.0  # sum of per-sample normalized jump RMS; *100 for pct
     max_abs_err = 0.0  # normalized; scaled to Kelvin after the reduce
 
     # Fixed-interface flanking nodes (per-sample handled inside the loop).
@@ -687,6 +714,7 @@ def train_one_epoch(
             rms_i = per_sample_sq_rms(y_pred, y_batch)  # (B,)
             nrmse_sum += torch.sum(per_sample_nrmse(y_pred, y_batch)).item()
             rmse_K_sum += torch.sum(rms_i).item() * sigma_global
+            gnrmse_sum += torch.sum(rms_i).item()
             max_abs_err = max(max_abs_err, torch.max(torch.abs(y_pred - y_batch)).item())
 
             left, right = fixed_left, fixed_right
@@ -697,6 +725,7 @@ def train_one_epoch(
                     y_pred, y_batch, left, right
                 )
                 node_jump_rmse_K_sum += torch.sum(err_rms_i).item() * sigma_global
+                node_jump_gnrmse_sum += torch.sum(err_rms_i).item()
                 node_jump_nrmse_sum += torch.sum(
                     err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)
                 ).item()
@@ -721,7 +750,8 @@ def train_one_epoch(
         t = torch.tensor(
             [loss_sum, mse_sum, target_sq_sum, iface_mse_sum, iface_target_sq_sum,
              float(n_samples), float(n_iface_voxels),
-             nrmse_sum, rmse_K_sum, node_jump_rmse_K_sum, node_jump_nrmse_sum],
+             nrmse_sum, rmse_K_sum, node_jump_rmse_K_sum, node_jump_nrmse_sum,
+             gnrmse_sum, node_jump_gnrmse_sum],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -736,6 +766,8 @@ def train_one_epoch(
         rmse_K_sum = t[8].item()
         node_jump_rmse_K_sum = t[9].item()
         node_jump_nrmse_sum = t[10].item()
+        gnrmse_sum = t[11].item()
+        node_jump_gnrmse_sum = t[12].item()
 
         m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
@@ -754,9 +786,11 @@ def train_one_epoch(
         "iface_rel_l2": train_iface_rel_l2,
         "nrmse": (nrmse_sum / denom) * 100.0,
         "rmse_K": rmse_K_sum / denom,
+        "gnrmse_pct": (gnrmse_sum / denom) * 100.0,
         "max_err_K": max_abs_err * sigma_global,
         "node_jump_rmse_K": node_jump_rmse_K_sum / denom,
         "node_jump_nrmse": (node_jump_nrmse_sum / denom) * 100.0,
+        "node_jump_gnrmse_pct": (node_jump_gnrmse_sum / denom) * 100.0,
     }
 
 
@@ -794,8 +828,10 @@ def _write_val_pair_rows(
     iface_rel_l2: torch.Tensor,
     nrmse: torch.Tensor,
     rmse_K: torch.Tensor,
+    gnrmse_pct: torch.Tensor,
     node_jump_rmse_K: torch.Tensor,
     node_jump_nrmse: torch.Tensor,
+    node_jump_gnrmse_pct: torch.Tensor,
 ) -> None:
     problem = getattr(dataset, "problem", None)
     benchmark = getattr(problem, "name", "")
@@ -814,8 +850,10 @@ def _write_val_pair_rows(
             "iface_rel_l2": float(iface_rel_l2[row_idx].item()),
             "nrmse": float(nrmse[row_idx].item()),
             "rmse_K": float(rmse_K[row_idx].item()),
+            "gnrmse_pct": float(gnrmse_pct[row_idx].item()),
             "node_jump_rmse_K": float(node_jump_rmse_K[row_idx].item()),
             "node_jump_nrmse": float(node_jump_nrmse[row_idx].item()),
+            "node_jump_gnrmse_pct": float(node_jump_gnrmse_pct[row_idx].item()),
         }
         if problem is not None:
             row.update(problem.val_pair_row(dataset, sid, int(s), int(j)))
@@ -831,6 +869,7 @@ def validate(
     iface_mask=None,
     dataset: SnapshotPairDataset | None = None,
     pair_csv_path: str | Path | None = None,
+    val_pairs_max_rows: int | None = None,
     epoch: int | None = None,
     x_grid_t: torch.Tensor | None = None,
     interface_half_width: float = 0.05,
@@ -864,8 +903,10 @@ def validate(
 
         nrmse_all: list[torch.Tensor] = []
         rmse_K_all: list[torch.Tensor] = []
+        gnrmse_all: list[torch.Tensor] = []  # per-sample normalized RMS (= rms_i)
         node_jump_rmse_K_all: list[torch.Tensor] = []
         node_jump_nrmse_all: list[torch.Tensor] = []
+        node_jump_gnrmse_all: list[torch.Tensor] = []  # per-sample normalized jump RMS
         max_abs_err = 0.0
 
         fixed_left = fixed_right = None
@@ -874,10 +915,19 @@ def validate(
                 x_grid_t.detach().cpu().numpy(), interface_x
             )
 
+        if val_pairs_max_rows is not None and val_pairs_max_rows < 1:
+            raise ValueError("training.val_pairs_max_rows must be positive or null")
+
         pair_cursor = 0
         write_pairs = dataset is not None and pair_csv_path is not None and epoch is not None
         pair_file = None
         pair_writer = None
+        # Boolean mask over global dataset._pairs indices selecting which pairs to
+        # write. None means "write every pair" (no cap / cap >= total). The val
+        # loader is unshuffled with no reordering sampler (data/dataset.py:685-714)
+        # and SnapshotPairDataset yields _pairs in order, so batch position maps
+        # directly to the global pair index via pair_cursor.
+        sel_mask = None
         if write_pairs:
             pair_path = Path(pair_csv_path)
             pair_path.parent.mkdir(parents=True, exist_ok=True)
@@ -888,6 +938,18 @@ def validate(
             )
             if write_header:
                 pair_writer.writeheader()
+
+            total_pairs = len(dataset._pairs)
+            if val_pairs_max_rows is not None and val_pairs_max_rows < total_pairs:
+                rng = np.random.default_rng(VAL_PAIRS_SUBSAMPLE_SEED)
+                chosen = rng.choice(total_pairs, size=val_pairs_max_rows, replace=False)
+                sel_mask = np.zeros(total_pairs, dtype=bool)
+                sel_mask[chosen] = True
+            n_sel = int(sel_mask.sum()) if sel_mask is not None else total_pairs
+            print(
+                f"[val-pairs] writing {n_sel} / {total_pairs} validation pairs",
+                flush=True,
+            )
 
         _t_val_start = time.perf_counter()
         _t_write_total = 0.0
@@ -917,6 +979,7 @@ def validate(
                 rms_i = per_sample_sq_rms(y_pred, y_batch)
                 nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
                 rmse_K_all.append((rms_i * sigma_global).cpu())
+                gnrmse_all.append(rms_i.cpu())
                 max_abs_err = max(
                     max_abs_err, torch.max(torch.abs(y_pred - y_batch)).item()
                 )
@@ -930,6 +993,7 @@ def validate(
                         y_pred, y_batch, left, right
                     )
                     node_jump_rmse_K_all.append((err_rms_i * sigma_global).cpu())
+                    node_jump_gnrmse_all.append(err_rms_i.cpu())
                     jump_nrmse_i = (err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)).cpu()
                     node_jump_nrmse_all.append(jump_nrmse_i)
 
@@ -947,31 +1011,69 @@ def validate(
 
                 if write_pairs and pair_writer is not None and dataset is not None:
                     _tw = time.perf_counter()
-                    rel_l2 = _per_pair_rel_l2_percent(y_pred, y_batch).cpu()
-                    if bf is not None:
-                        num = torch.sum(bf * (y_pred - y_batch) ** 2, dim=(1, 2, 3))
-                        den = torch.sum(bf * y_batch ** 2, dim=(1, 2, 3)).clamp_min(1e-12)
-                        iface_rel_l2 = (torch.sqrt(num / den) * 100.0).cpu()
-                    elif iface_mask is not None:
-                        pred_iface_b = y_pred[:, iface_mask, :]
-                        true_iface_b = y_batch[:, iface_mask, :]
-                        iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface_b[:, :, None, :], true_iface_b[:, :, None, :]).cpu()
-                    else:
-                        iface_rel_l2 = torch.zeros_like(rel_l2)
                     batch_size = x_spatial.shape[0]
-                    pairs = dataset._pairs[pair_cursor:pair_cursor + batch_size]
-                    nrmse_pct = nrmse_all[-1] * 100.0
-                    rmse_K_b = rmse_K_all[-1]
-                    if jump_nrmse_i is not None:
-                        node_jump_rmse_K_b = node_jump_rmse_K_all[-1]
-                        node_jump_nrmse_pct = jump_nrmse_i * 100.0
+                    # Select which rows of this batch to write before computing
+                    # any per-pair diagnostic metric, so the cap saves compute as
+                    # well as I/O. The full-batch aggregation above is untouched.
+                    if sel_mask is None:
+                        local = None
                     else:
-                        node_jump_rmse_K_b = torch.zeros_like(rel_l2)
-                        node_jump_nrmse_pct = torch.zeros_like(rel_l2)
-                    _write_val_pair_rows(
-                        pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2,
-                        nrmse_pct, rmse_K_b, node_jump_rmse_K_b, node_jump_nrmse_pct,
-                    )
+                        local = np.nonzero(sel_mask[pair_cursor:pair_cursor + batch_size])[0]
+                    if local is None or len(local) > 0:
+                        base_pairs = dataset._pairs[pair_cursor:pair_cursor + batch_size]
+                        if local is None:
+                            yp, yt, bf_l = y_pred, y_batch, bf
+                            pairs = base_pairs
+                            nrmse_pct = nrmse_all[-1] * 100.0
+                            rmse_K_b = rmse_K_all[-1]
+                            gnrmse_pct_b = gnrmse_all[-1] * 100.0
+                            jump_src = jump_nrmse_i
+                            node_jump_rmse_src = (
+                                node_jump_rmse_K_all[-1] if jump_nrmse_i is not None else None
+                            )
+                            node_jump_gnrmse_src = (
+                                node_jump_gnrmse_all[-1] if jump_nrmse_i is not None else None
+                            )
+                        else:
+                            idx_cpu = torch.from_numpy(local).long()
+                            idx_dev = idx_cpu.to(y_pred.device)
+                            yp, yt = y_pred[idx_dev], y_batch[idx_dev]
+                            bf_l = bf[idx_dev] if bf is not None else None
+                            pairs = [base_pairs[i] for i in local]
+                            nrmse_pct = (nrmse_all[-1] * 100.0)[idx_cpu]
+                            rmse_K_b = rmse_K_all[-1][idx_cpu]
+                            gnrmse_pct_b = (gnrmse_all[-1] * 100.0)[idx_cpu]
+                            jump_src = jump_nrmse_i[idx_cpu] if jump_nrmse_i is not None else None
+                            node_jump_rmse_src = (
+                                node_jump_rmse_K_all[-1][idx_cpu] if jump_nrmse_i is not None else None
+                            )
+                            node_jump_gnrmse_src = (
+                                node_jump_gnrmse_all[-1][idx_cpu] if jump_nrmse_i is not None else None
+                            )
+                        rel_l2 = _per_pair_rel_l2_percent(yp, yt).cpu()
+                        if bf_l is not None:
+                            num = torch.sum(bf_l * (yp - yt) ** 2, dim=(1, 2, 3))
+                            den = torch.sum(bf_l * yt ** 2, dim=(1, 2, 3)).clamp_min(1e-12)
+                            iface_rel_l2 = (torch.sqrt(num / den) * 100.0).cpu()
+                        elif iface_mask is not None:
+                            pred_iface_b = yp[:, iface_mask, :]
+                            true_iface_b = yt[:, iface_mask, :]
+                            iface_rel_l2 = _per_pair_rel_l2_percent(pred_iface_b[:, :, None, :], true_iface_b[:, :, None, :]).cpu()
+                        else:
+                            iface_rel_l2 = torch.zeros_like(rel_l2)
+                        if jump_src is not None:
+                            node_jump_rmse_K_b = node_jump_rmse_src
+                            node_jump_nrmse_pct = jump_src * 100.0
+                            node_jump_gnrmse_pct_b = node_jump_gnrmse_src * 100.0
+                        else:
+                            node_jump_rmse_K_b = torch.zeros_like(rel_l2)
+                            node_jump_nrmse_pct = torch.zeros_like(rel_l2)
+                            node_jump_gnrmse_pct_b = torch.zeros_like(rel_l2)
+                        _write_val_pair_rows(
+                            pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2,
+                            nrmse_pct, rmse_K_b, gnrmse_pct_b, node_jump_rmse_K_b,
+                            node_jump_nrmse_pct, node_jump_gnrmse_pct_b,
+                        )
                     pair_cursor += batch_size
                     _t_write_total += time.perf_counter() - _tw
         finally:
@@ -994,28 +1096,40 @@ def validate(
             val_iface = 0.0
 
         nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
-        rmse_K_mean = float(torch.cat(rmse_K_all).mean()) if rmse_K_all else 0.0
+        rmse_K_stats = tail_stats(torch.cat(rmse_K_all)) if rmse_K_all else tail_stats(torch.empty(0))
+        gnrmse_stats = tail_stats(torch.cat(gnrmse_all)) if gnrmse_all else tail_stats(torch.empty(0))
         if node_jump_nrmse_all:
             jump_nrmse_stats = tail_stats(torch.cat(node_jump_nrmse_all))
             node_jump_rmse_K_mean = float(torch.cat(node_jump_rmse_K_all).mean())
+            node_jump_gnrmse_stats = tail_stats(torch.cat(node_jump_gnrmse_all))
         else:
             jump_nrmse_stats = tail_stats(torch.empty(0))
             node_jump_rmse_K_mean = 0.0
+            node_jump_gnrmse_stats = tail_stats(torch.empty(0))
 
         return {
             "rel_l2": val_loss,
             "iface_rel_l2": val_iface,
             "nrmse": nrmse_stats["mean"] * 100.0,
+            "nrmse_p50": nrmse_stats["p50"] * 100.0,
+            "nrmse_iqr": nrmse_stats["iqr"] * 100.0,
             "nrmse_p90": nrmse_stats["p90"] * 100.0,
             "nrmse_p99": nrmse_stats["p99"] * 100.0,
             "nrmse_max": nrmse_stats["max"] * 100.0,
-            "rmse_K": rmse_K_mean,
+            "rmse_K": rmse_K_stats["mean"],
+            "rmse_K_p90": rmse_K_stats["p90"],
+            "rmse_K_p99": rmse_K_stats["p99"],
+            "rmse_K_max": rmse_K_stats["max"],
+            "gnrmse_pct": gnrmse_stats["mean"] * 100.0,
+            "gnrmse_pct_p99": gnrmse_stats["p99"] * 100.0,
             "max_err_K": max_abs_err * sigma_global,
             "node_jump_rmse_K": node_jump_rmse_K_mean,
             "node_jump_nrmse": jump_nrmse_stats["mean"] * 100.0,
             "node_jump_nrmse_p90": jump_nrmse_stats["p90"] * 100.0,
             "node_jump_nrmse_p99": jump_nrmse_stats["p99"] * 100.0,
             "node_jump_nrmse_max": jump_nrmse_stats["max"] * 100.0,
+            "node_jump_gnrmse_pct": node_jump_gnrmse_stats["mean"] * 100.0,
+            "node_jump_gnrmse_pct_p99": node_jump_gnrmse_stats["p99"] * 100.0,
         }
 
 
@@ -1206,13 +1320,16 @@ def run_one_seed(
     val_pairs_path = run_path / "val_pairs.csv"
     fieldnames = [
         "epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2",
-        "train_nrmse", "train_rmse_K", "train_max_err_K",
-        "train_node_jump_rmse_K", "train_node_jump_nrmse",
+        "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
+        "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
         "val_rel_l2", "val_iface_rel_l2",
-        "val_nrmse", "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
-        "val_rmse_K", "val_max_err_K",
+        "val_nrmse", "val_nrmse_p50", "val_nrmse_iqr",
+        "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
+        "val_rmse_K", "val_rmse_K_p90", "val_rmse_K_p99", "val_rmse_K_max",
+        "val_gnrmse_pct", "val_gnrmse_pct_p99", "val_max_err_K",
         "val_node_jump_rmse_K", "val_node_jump_nrmse",
         "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
+        "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
         "lr", "is_best",
     ]
     csv_file = None
@@ -1277,7 +1394,14 @@ def run_one_seed(
         scheduler.step()
 
         if is_main:
-            print(f"Epoch {epoch}: train_loss={train_loss:.6f}, train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}%", flush=True)
+            print(
+                f"Epoch {epoch}: train_loss={train_loss:.6f}, "
+                f"train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}% | "
+                f"nrmse={train_metrics['nrmse']:.3f}% gnrmse={train_metrics['gnrmse_pct']:.3f}% "
+                f"rmse_K={train_metrics['rmse_K']:.4f}K max_err_K={train_metrics['max_err_K']:.4f}K "
+                f"node_jump_rmse_K={train_metrics['node_jump_rmse_K']:.4f}K",
+                flush=True,
+            )
 
         is_best = 0
         val_loss = None
@@ -1296,6 +1420,7 @@ def run_one_seed(
                     iface_mask=iface_mask,
                     dataset=validation_set.dataset,
                     pair_csv_path=val_pairs_path,
+                    val_pairs_max_rows=config["training"].get("val_pairs_max_rows", None),
                     epoch=epoch,
                     x_grid_t=loss_fn.x_grid_t,
                     interface_half_width=loss_cfg.get("interface_half_width", 0.05),
@@ -1306,6 +1431,24 @@ def run_one_seed(
                 val_loss = val_metrics["rel_l2"]
                 val_iface_rel_l2 = val_metrics["iface_rel_l2"]
                 print(f"Validation loss for epoch {epoch}: rel_l2={val_loss:.4f}%, iface_rel_l2={val_iface_rel_l2:.4f}%", flush=True)
+                print(
+                    "  [val metric suite]\n"
+                    f"    Kelvin    : rmse_K mean={val_metrics['rmse_K']:.4f}K "
+                    f"p99={val_metrics['rmse_K_p99']:.4f}K "
+                    f"max_sample={val_metrics['rmse_K_max']:.4f}K | "
+                    f"pointwise max_err_K={val_metrics['max_err_K']:.4f}K\n"
+                    f"    dimensionless: gnrmse_pct mean={val_metrics['gnrmse_pct']:.3f}% "
+                    f"p99={val_metrics['gnrmse_pct_p99']:.3f}% | "
+                    f"nrmse mean={val_metrics['nrmse']:.3f}% median={val_metrics['nrmse_p50']:.3f}% "
+                    f"IQR={val_metrics['nrmse_iqr']:.3f}% p99={val_metrics['nrmse_p99']:.3f}% "
+                    f"max={val_metrics['nrmse_max']:.3f}%\n"
+                    f"    interface : node_jump_rmse_K={val_metrics['node_jump_rmse_K']:.4f}K | "
+                    f"node_jump_gnrmse_pct mean={val_metrics['node_jump_gnrmse_pct']:.3f}% "
+                    f"p99={val_metrics['node_jump_gnrmse_pct_p99']:.3f}% | "
+                    f"node_jump_nrmse mean={val_metrics['node_jump_nrmse']:.3f}% "
+                    f"p99={val_metrics['node_jump_nrmse_p99']:.3f}%",
+                    flush=True,
+                )
 
                 # Checkpoint selection: lower is better for every supported metric.
                 selection_value = _selection_metric_value(val_metrics, checkpoint_metric)
@@ -1384,22 +1527,33 @@ def run_one_seed(
                     "train_iface_rel_l2": float(train_iface_rel_l2),
                     "train_nrmse": float(train_metrics["nrmse"]),
                     "train_rmse_K": float(train_metrics["rmse_K"]),
+                    "train_gnrmse_pct": float(train_metrics["gnrmse_pct"]),
                     "train_max_err_K": float(train_metrics["max_err_K"]),
                     "train_node_jump_rmse_K": float(train_metrics["node_jump_rmse_K"]),
                     "train_node_jump_nrmse": float(train_metrics["node_jump_nrmse"]),
+                    "train_node_jump_gnrmse_pct": float(train_metrics["node_jump_gnrmse_pct"]),
                     "val_rel_l2": _vm("rel_l2"),
                     "val_iface_rel_l2": _vm("iface_rel_l2"),
                     "val_nrmse": _vm("nrmse"),
+                    "val_nrmse_p50": _vm("nrmse_p50"),
+                    "val_nrmse_iqr": _vm("nrmse_iqr"),
                     "val_nrmse_p90": _vm("nrmse_p90"),
                     "val_nrmse_p99": _vm("nrmse_p99"),
                     "val_nrmse_max": _vm("nrmse_max"),
                     "val_rmse_K": _vm("rmse_K"),
+                    "val_rmse_K_p90": _vm("rmse_K_p90"),
+                    "val_rmse_K_p99": _vm("rmse_K_p99"),
+                    "val_rmse_K_max": _vm("rmse_K_max"),
+                    "val_gnrmse_pct": _vm("gnrmse_pct"),
+                    "val_gnrmse_pct_p99": _vm("gnrmse_pct_p99"),
                     "val_max_err_K": _vm("max_err_K"),
                     "val_node_jump_rmse_K": _vm("node_jump_rmse_K"),
                     "val_node_jump_nrmse": _vm("node_jump_nrmse"),
                     "val_node_jump_nrmse_p90": _vm("node_jump_nrmse_p90"),
                     "val_node_jump_nrmse_p99": _vm("node_jump_nrmse_p99"),
                     "val_node_jump_nrmse_max": _vm("node_jump_nrmse_max"),
+                    "val_node_jump_gnrmse_pct": _vm("node_jump_gnrmse_pct"),
+                    "val_node_jump_gnrmse_pct_p99": _vm("node_jump_gnrmse_pct_p99"),
                     "lr": float(lr),
                     "is_best": int(is_best),
                 }
