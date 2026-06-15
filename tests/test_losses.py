@@ -511,18 +511,53 @@ class TestTailStats:
         vn = v.double().numpy()
         assert out["mean"] == pytest.approx(float(np.mean(vn)), rel=1e-6)
         assert out["max"] == pytest.approx(float(np.max(vn)), rel=1e-6)
-        assert out["p90"] == pytest.approx(
-            float(np.percentile(vn, 90, method="linear")), rel=1e-6
-        )
-        assert out["p99"] == pytest.approx(
-            float(np.percentile(vn, 99, method="linear")), rel=1e-6
-        )
+        for q, key in [(25, "p25"), (50, "p50"), (75, "p75"), (90, "p90"), (99, "p99")]:
+            assert out[key] == pytest.approx(
+                float(np.percentile(vn, q, method="linear")), rel=1e-6
+            )
+        assert out["iqr"] == pytest.approx(out["p75"] - out["p25"], rel=1e-6)
 
     def test_empty_returns_zeros(self):
         out = tail_stats(torch.empty(0))
-        assert out == {"mean": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0}
+        assert out == {
+            "mean": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "iqr": 0.0,
+            "p90": 0.0, "p99": 0.0, "max": 0.0,
+        }
 
     def test_ordering_mean_le_p90_le_p99_le_max(self):
         v = torch.rand(500)
         out = tail_stats(v)
-        assert out["mean"] <= out["p90"] <= out["p99"] <= out["max"]
+        assert out["p25"] <= out["p50"] <= out["p75"] <= out["p90"] <= out["p99"] <= out["max"]
+        assert out["mean"] <= out["max"]
+        assert out["iqr"] >= 0.0
+
+
+# ===================== gnrmse_pct identities (dimensionless restatements) =====================
+
+class TestGnrmsePctIdentities:
+    def test_gnrmse_pct_equals_rmse_K_over_sigma(self):
+        """gnrmse_pct == rmse_K / sigma_global * 100 (unit restatement of rmse_K)."""
+        torch.manual_seed(0)
+        sigma_global = 4.2
+        y_true = torch.randn(6, 9, 7, 1) * 2.0 + 5.0
+        y_pred = y_true + 0.1 * torch.randn(6, 9, 7, 1)
+
+        rms_i = per_sample_sq_rms(y_pred, y_true)
+        gnrmse_pct = rms_i * 100.0
+        rmse_K = rms_i * sigma_global
+        torch.testing.assert_close(gnrmse_pct, rmse_K / sigma_global * 100.0)
+
+    def test_node_jump_gnrmse_pct_equals_jump_rmse_K_over_sigma(self):
+        """node_jump_gnrmse_pct == node_jump_rmse_K / sigma_global * 100."""
+        torch.manual_seed(1)
+        sigma_global = 3.7
+        y_true = torch.randn(5, 11, 5, 1)
+        y_pred = y_true + 0.2 * torch.randn(5, 11, 5, 1)
+        left, right = 4, 5
+
+        err_rms_i, _ = per_sample_node_jump_errors(y_pred, y_true, left, right)
+        node_jump_gnrmse_pct = err_rms_i * 100.0
+        node_jump_rmse_K = err_rms_i * sigma_global
+        torch.testing.assert_close(
+            node_jump_gnrmse_pct, node_jump_rmse_K / sigma_global * 100.0
+        )

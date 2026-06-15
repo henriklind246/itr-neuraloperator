@@ -59,11 +59,13 @@ EXPECTED_METRIC_KEYS = {
     "rel_l2_norm", "rel_l2_phys",
     "iface_rel_l2_norm", "iface_rel_l2_phys",
     "boundary_rel_l2_norm", "boundary_rel_l2_phys",
-    "nrmse", "nrmse_p90", "nrmse_p99", "nrmse_max",
-    "rmse_K", "max_err_K",
+    "nrmse", "nrmse_p50", "nrmse_iqr", "nrmse_p90", "nrmse_p99", "nrmse_max",
+    "rmse_K", "rmse_K_p90", "rmse_K_p99", "rmse_K_max",
+    "gnrmse_pct", "gnrmse_pct_p99", "max_err_K",
     "node_jump_rmse_K",
     "node_jump_nrmse", "node_jump_nrmse_p90",
     "node_jump_nrmse_p99", "node_jump_nrmse_max",
+    "node_jump_gnrmse_pct", "node_jump_gnrmse_pct_p99",
 }
 
 
@@ -109,11 +111,13 @@ class TestEvaluate:
         model, loader, device = eval_setup
         result = evaluate(model, loader, device)
         for k in (
-            "nrmse", "nrmse_p90", "nrmse_p99", "nrmse_max",
-            "rmse_K", "max_err_K",
+            "nrmse", "nrmse_p50", "nrmse_iqr", "nrmse_p90", "nrmse_p99", "nrmse_max",
+            "rmse_K", "rmse_K_p90", "rmse_K_p99", "rmse_K_max",
+            "gnrmse_pct", "gnrmse_pct_p99", "max_err_K",
             "node_jump_rmse_K",
             "node_jump_nrmse", "node_jump_nrmse_p90",
             "node_jump_nrmse_p99", "node_jump_nrmse_max",
+            "node_jump_gnrmse_pct", "node_jump_gnrmse_pct_p99",
         ):
             assert math.isfinite(result[k]), k
             assert result[k] >= 0.0, k
@@ -164,6 +168,22 @@ class TestEvaluateNRMSEInvariance:
         a = evaluate(model, _fixed_eval_loader(1.0), device)
         b = evaluate(model, _fixed_eval_loader(7.5), device)
         assert b["rmse_K"] == pytest.approx(a["rmse_K"] * 7.5, rel=1e-5)
+
+    def test_gnrmse_pct_is_rmse_K_over_sigma(self, eval_setup):
+        """gnrmse_pct == rmse_K / sigma_global * 100 (dimensionless restatement)."""
+        model, _, device = eval_setup
+        model.eval()
+        sigma = 7.5
+        r = evaluate(model, _fixed_eval_loader(sigma), device)
+        assert r["gnrmse_pct"] == pytest.approx(r["rmse_K"] / sigma * 100.0, rel=1e-5)
+
+    def test_gnrmse_pct_invariant_to_sigma(self, eval_setup):
+        """gnrmse_pct is normalized (= rms*100), so independent of sigma_global."""
+        model, _, device = eval_setup
+        model.eval()
+        a = evaluate(model, _fixed_eval_loader(1.0), device)
+        b = evaluate(model, _fixed_eval_loader(7.5), device)
+        assert a["gnrmse_pct"] == pytest.approx(b["gnrmse_pct"], rel=1e-5)
 
     def test_nrmse_independent_of_batch_size(self, eval_setup):
         """Per-sample mean nRMSE does not depend on how batches are chunked."""

@@ -335,8 +335,10 @@ class TestValidate:
             "iface_rel_l2",
             "nrmse",
             "rmse_K",
+            "gnrmse_pct",
             "node_jump_rmse_K",
             "node_jump_nrmse",
+            "node_jump_gnrmse_pct",
             "A",
             "interface_x",
             "regime",
@@ -401,6 +403,131 @@ class TestValidate:
         for row in rows:
             assert float(row["rel_l2"]) == pytest.approx(100.0)
             assert float(row["iface_rel_l2"]) == pytest.approx(100.0)
+
+    def _capped_dataset(self, synthetic_trajectories, synthetic_sim_params):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        dataset = SnapshotPairDataset(
+            trajectories=trajectories,
+            t_grid=t_grid,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            sim_ids=np.array([0, 1]),
+            sim_params=synthetic_sim_params,
+            mu_global=0.0,
+            sigma_global=1.0,
+            n_snapshots=4,
+        )
+        return dataset, x_grid, y_grid
+
+    def test_val_pairs_max_rows_caps_written_rows(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        dataset, x_grid, y_grid = self._capped_dataset(synthetic_trajectories, synthetic_sim_params)
+        cap = 5
+        assert cap < len(dataset)
+        loader = DataLoader(dataset, batch_size=3, shuffle=False)
+        csv_path = tmp_path / "val_pairs.csv"
+
+        validate(
+            _make_tiny_fno(),
+            loader,
+            torch.device("cpu"),
+            iface_mask=build_interface_mask(x_grid, y_grid),
+            dataset=dataset,
+            pair_csv_path=csv_path,
+            val_pairs_max_rows=cap,
+            epoch=3,
+        )
+
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == cap
+
+    def test_val_pairs_cap_does_not_change_metrics(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        dataset, x_grid, y_grid = self._capped_dataset(synthetic_trajectories, synthetic_sim_params)
+        iface_mask = build_interface_mask(x_grid, y_grid)
+        model = _make_tiny_fno()
+
+        def run(cap, name):
+            loader = DataLoader(dataset, batch_size=3, shuffle=False)
+            return validate(
+                model,
+                loader,
+                torch.device("cpu"),
+                iface_mask=iface_mask,
+                dataset=dataset,
+                pair_csv_path=tmp_path / name,
+                val_pairs_max_rows=cap,
+                epoch=3,
+            )
+
+        uncapped = run(None, "uncapped.csv")
+        capped = run(5, "capped.csv")
+
+        assert set(uncapped) == set(capped)
+        for k in uncapped:
+            assert capped[k] == pytest.approx(uncapped[k])
+
+    def test_val_pairs_subset_stable_across_passes(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        dataset, x_grid, y_grid = self._capped_dataset(synthetic_trajectories, synthetic_sim_params)
+        iface_mask = build_interface_mask(x_grid, y_grid)
+        model = _make_tiny_fno()
+
+        def written_identities(name):
+            loader = DataLoader(dataset, batch_size=3, shuffle=False)
+            csv_path = tmp_path / name
+            validate(
+                model,
+                loader,
+                torch.device("cpu"),
+                iface_mask=iface_mask,
+                dataset=dataset,
+                pair_csv_path=csv_path,
+                val_pairs_max_rows=5,
+                epoch=3,
+            )
+            with csv_path.open("r", newline="") as f:
+                rows = list(csv.DictReader(f))
+            # (sim_id, t_s, t_bar) maps 1:1 to (sim_id, s, j) since t_grid is monotonic.
+            return {(r["sim_id"], r["t_s"], r["t_bar"]) for r in rows}
+
+        first = written_identities("pass1.csv")
+        second = written_identities("pass2.csv")
+        assert len(first) == 5
+        assert first == second
+
+    def test_val_pairs_cap_geq_total_writes_all(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        dataset, x_grid, y_grid = self._capped_dataset(synthetic_trajectories, synthetic_sim_params)
+        loader = DataLoader(dataset, batch_size=3, shuffle=False)
+        csv_path = tmp_path / "val_pairs.csv"
+
+        validate(
+            _make_tiny_fno(),
+            loader,
+            torch.device("cpu"),
+            iface_mask=build_interface_mask(x_grid, y_grid),
+            dataset=dataset,
+            pair_csv_path=csv_path,
+            val_pairs_max_rows=len(dataset) + 100,
+            epoch=3,
+        )
+
+        with csv_path.open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == len(dataset)
+
+    def test_val_pairs_max_rows_rejects_nonpositive(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+        dataset, x_grid, y_grid = self._capped_dataset(synthetic_trajectories, synthetic_sim_params)
+        loader = DataLoader(dataset, batch_size=3, shuffle=False)
+        with pytest.raises(ValueError):
+            validate(
+                _make_tiny_fno(),
+                loader,
+                torch.device("cpu"),
+                iface_mask=build_interface_mask(x_grid, y_grid),
+                dataset=dataset,
+                pair_csv_path=tmp_path / "val_pairs.csv",
+                val_pairs_max_rows=0,
+                epoch=3,
+            )
 
 
 # ===================== encoder-off (source) dict batches =====================
@@ -805,6 +932,7 @@ class TestRunOneSeedResume:
         train_cols = (
             "train_nrmse", "train_rmse_K", "train_max_err_K",
             "train_node_jump_rmse_K", "train_node_jump_nrmse",
+            "train_gnrmse_pct", "train_node_jump_gnrmse_pct",
         )
         for col in train_cols:
             assert col in rows[0], col
@@ -814,10 +942,13 @@ class TestRunOneSeedResume:
         val_rows = [r for r in rows if r.get("val_nrmse", "") != ""]
         assert val_rows
         val_cols = (
-            "val_nrmse", "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
-            "val_rmse_K", "val_max_err_K",
+            "val_nrmse", "val_nrmse_p50", "val_nrmse_iqr",
+            "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
+            "val_rmse_K", "val_rmse_K_p90", "val_rmse_K_p99", "val_rmse_K_max",
+            "val_gnrmse_pct", "val_gnrmse_pct_p99", "val_max_err_K",
             "val_node_jump_rmse_K", "val_node_jump_nrmse",
             "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
+            "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
         )
         for col in val_cols:
             assert col in val_rows[0], col
