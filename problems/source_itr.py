@@ -203,8 +203,6 @@ class SourceItrProblem(SourceProblem):
         return sim_params
 
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
-        X = base_kwargs["X"]
-        Y = base_kwargs["Y"]
         y_grid = base_kwargs["y_grid"]
         x_I = float(params["interface_x"])
         a = float(base_kwargs["a"])
@@ -219,7 +217,6 @@ class SourceItrProblem(SourceProblem):
         from src.physics.internal_source import build_patch_source
 
         source = build_patch_source(
-            X=X, Y=Y,
             x_h=params["x_h"], y_h=params["y_h"],
             w=params["w_h"], h=params["h_h"],
             A=params["A"], t_off=params["t_off"],

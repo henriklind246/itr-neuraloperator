@@ -215,14 +215,15 @@ def _jump_rms(jump_profile: np.ndarray) -> float:
 
 _DEFAULT_K_LEFT = 2.0
 _DEFAULT_K_RIGHT = 1.0
+_SOURCE_K_LEFT = 3.0
+_SOURCE_K_RIGHT = 35.0
 
 
 def _resolve_layer_conductivities(ds, sid: int, config: dict | None = None) -> tuple[float, float]:
     """Resolve (k_left, k_right) for the imperfect interface, sample-first.
 
     Order: (1) per-sample material values if a dataset ever serializes them,
-    (2) config-declared layer conductivities, (3) the benchmark constants
-    (all current benchmarks use k_left=2.0, k_right=1.0).
+    (2) config-declared layer conductivities, (3) benchmark constants.
     """
     try:
         params = ds.sim_params[int(sid)]
@@ -238,6 +239,15 @@ def _resolve_layer_conductivities(ds, sid: int, config: dict | None = None) -> t
                 return float(layers[0]["k"]), float(layers[1]["k"])
             except (KeyError, TypeError, IndexError):
                 pass
+        benchmark = str(config.get("benchmark", {}).get("name", ""))
+        if benchmark in ("source", "source_itr"):
+            return _SOURCE_K_LEFT, _SOURCE_K_RIGHT
+    try:
+        problem_name = str(getattr(ds.problem, "name", ""))
+        if problem_name in ("source", "source_itr"):
+            return _SOURCE_K_LEFT, _SOURCE_K_RIGHT
+    except AttributeError:
+        pass
     return _DEFAULT_K_LEFT, _DEFAULT_K_RIGHT
 
 
@@ -253,7 +263,7 @@ def _interface_conductance_G(x_grid: np.ndarray, interface_x: float, R_c,
 
 
 def _interface_contact_jump_map(fields: np.ndarray, x_grid: np.ndarray, interface_x: float,
-                                R_c: float, k_left: float, k_right: float) -> np.ndarray:
+                                R_c, k_left: float, k_right: float) -> np.ndarray:
     """Return the physical contact-jump history dT_contact(t, y) in Kelvin.
 
     ``fields`` is a stack of shape (Nt, Nx, Ny). Sign convention: positive means a
@@ -261,7 +271,8 @@ def _interface_contact_jump_map(fields: np.ndarray, x_grid: np.ndarray, interfac
     """
     left_node, right_node = _interface_flanking_nodes_from_grid(x_grid, interface_x)
     G = _interface_conductance_G(x_grid, interface_x, R_c, k_left, k_right)
-    jump = float(R_c) * G * (fields[:, left_node, :] - fields[:, right_node, :])
+    Rc = np.asarray(R_c, dtype=np.float64)
+    jump = Rc * G * (fields[:, left_node, :] - fields[:, right_node, :])
     return np.asarray(jump, dtype=np.float64)
 
 
@@ -3309,7 +3320,7 @@ def plot_source_field_snapshots(
     t_final = float(t_grid[-1])
 
     X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
-    source = build_patch_source(X, Y, x_h, y_h, w_h, h_h, A, t_off)
+    source = build_patch_source(x_h, y_h, w_h, h_h, A, t_off)
 
     times = np.array([
         0.25 * t_off,

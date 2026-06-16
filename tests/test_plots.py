@@ -72,6 +72,19 @@ class TestPlotRegistry:
         ]:
             assert _common.PLOT_REGISTRY[name] == "data"
 
+    def test_new_paper_profile_plot_names_registered(self):
+        for name in [
+            "forcing_temperature_profiles",
+            "source_temperature_profiles",
+            "source_itr_temperature_profiles",
+            "interfaces_temperature_profiles",
+            "forcing_interface_jump_profiles",
+            "source_interface_jump_profiles",
+            "source_itr_interface_jump_profiles",
+            "interfaces_interface_jump_profiles",
+        ]:
+            assert _common.PLOT_REGISTRY[name] == "paper"
+
     def test_retired_plot_names_removed(self):
         for name in [
             "dataset_samples",
@@ -771,6 +784,69 @@ def _source_itr_params_from_source(synthetic_source_sim_params):
     return np.array(params, dtype=object)
 
 
+def _interfaces_params_from_forcing(synthetic_sim_params):
+    params = []
+    x_values = np.linspace(0.2, 0.8, len(synthetic_sim_params))
+    for i, p in enumerate(synthetic_sim_params):
+        q = dict(p)
+        q["interface_x"] = float(x_values[i])
+        q["temporal_family"] = "sin"
+        q["temporal_params"] = {
+            "A": 100.0,
+            "f": 5.0,
+            "t_on": 0.0,
+            "t_off": 0.2,
+            "phase": 0.0,
+            "tukey_alpha": 0.5,
+            "rectified": True,
+        }
+        q["spatial_family"] = "uniform"
+        q["spatial_params"] = {}
+        params.append(q)
+    return np.array(params, dtype=object)
+
+
+def _small_source_itr_model():
+    from problems.source_itr import COND_STATIC_DIM, SPATIAL_CHANNELS_BINS
+    from src.operators.fno2d import FNO2d
+
+    return FNO2d(
+        modes1=2,
+        modes2=2,
+        width=8,
+        in_channels=SPATIAL_CHANNELS_BINS,
+        out_channels=1,
+        n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        use_temporal_encoder=False,
+    )
+
+
+def _small_interfaces_model():
+    from problems.interfaces import (
+        COND_STATIC_DIM,
+        FORCING_TEMPORAL_TOKEN_DIM,
+        S_Y_CHANNEL,
+        SPATIAL_CHANNELS_TEMPORAL,
+    )
+    from src.operators.fno2d import FNO2d
+
+    return FNO2d(
+        modes1=2,
+        modes2=2,
+        width=8,
+        in_channels=SPATIAL_CHANNELS_TEMPORAL,
+        out_channels=1,
+        n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+        use_forcing_time_aug=True,
+        s_y_channel=S_Y_CHANNEL,
+    )
+
+
 class TestSourcePlots:
     def test_patch_param_scatter_smoke(self, tmp_path, synthetic_source_sim_params):
         out_path = tmp_path / "patch_param_scatter.png"
@@ -988,6 +1064,18 @@ def forcing_records(tmp_path):
 def source_records(tmp_path):
     path = tmp_path / "source_records.csv"
     _write_records_csv(path, _source_record_rows())
+    return paper_plots._load_test_records(path)
+
+
+@pytest.fixture
+def source_itr_records(tmp_path):
+    path = tmp_path / "source_itr_records.csv"
+    rows = []
+    for row in _source_record_rows():
+        updated = dict(row)
+        updated["benchmark"] = "source_itr"
+        rows.append(updated)
+    _write_records_csv(path, rows)
     return paper_plots._load_test_records(path)
 
 
@@ -1222,6 +1310,189 @@ class TestPaperPredictionPlots:
             model, ds, source_records, save_path=out_path
         )
         assert out_path.exists()
+
+    def test_forcing_temperature_profiles_smoke(
+        self,
+        tmp_path,
+        small_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_sim_params,
+        plot_config,
+        forcing_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = dataset_plots._load_checkpoint_model(small_fno2d_checkpoint)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config
+        )
+        out_path = tmp_path / "forcing_temperature_profiles.png"
+        paper_plots.plot_forcing_temperature_profiles(
+            model, ds, forcing_records, plot_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_temperature_profiles_smoke(
+        self,
+        tmp_path,
+        small_source_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+        source_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid,
+            synthetic_source_sim_params, source_config
+        )
+        out_path = tmp_path / "source_temperature_profiles.png"
+        paper_plots.plot_source_temperature_profiles(
+            model, ds, source_records, source_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_itr_temperature_profiles_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+        source_itr_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model = _small_source_itr_model()
+        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "bins"}}
+        sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
+        )
+        out_path = tmp_path / "source_itr_temperature_profiles.png"
+        paper_plots.plot_source_itr_temperature_profiles(
+            model, ds, source_itr_records, source_itr_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_interfaces_temperature_profiles_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_sim_params,
+        plot_config,
+        interfaces_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model = _small_interfaces_model()
+        interfaces_config = {**plot_config, "benchmark": {"name": "interfaces", "representation": "temporal_encoder"}}
+        sim_params = _interfaces_params_from_forcing(synthetic_sim_params)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, sim_params, interfaces_config
+        )
+        out_path = tmp_path / "interfaces_temperature_profiles.png"
+        paper_plots.plot_interfaces_temperature_profiles(
+            model, ds, interfaces_records, interfaces_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_forcing_interface_jump_profiles_smoke(
+        self,
+        tmp_path,
+        small_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_sim_params,
+        plot_config,
+        forcing_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = dataset_plots._load_checkpoint_model(small_fno2d_checkpoint)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, plot_config
+        )
+        out_path = tmp_path / "forcing_interface_jump_profiles.png"
+        paper_plots.plot_forcing_interface_jump_profiles(
+            model, ds, forcing_records, plot_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_interface_jump_profiles_smoke(
+        self,
+        tmp_path,
+        small_source_fno2d_checkpoint,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+        source_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid,
+            synthetic_source_sim_params, source_config
+        )
+        out_path = tmp_path / "source_interface_jump_profiles.png"
+        paper_plots.plot_source_interface_jump_profiles(
+            model, ds, source_records, source_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_itr_interface_jump_profiles_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+        source_itr_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model = _small_source_itr_model()
+        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "bins"}}
+        sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
+        )
+        out_path = tmp_path / "source_itr_interface_jump_profiles.png"
+        paper_plots.plot_source_itr_interface_jump_profiles(
+            model, ds, source_itr_records, source_itr_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_interfaces_interface_jump_profiles_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_sim_params,
+        plot_config,
+        interfaces_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model = _small_interfaces_model()
+        interfaces_config = {**plot_config, "benchmark": {"name": "interfaces", "representation": "temporal_encoder"}}
+        sim_params = _interfaces_params_from_forcing(synthetic_sim_params)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, sim_params, interfaces_config
+        )
+        out_path = tmp_path / "interfaces_interface_jump_profiles.png"
+        paper_plots.plot_interfaces_interface_jump_profiles(
+            model, ds, interfaces_records, interfaces_config, None, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_contact_jump_map_accepts_vector_resistance(self):
+        x_grid = np.array([0.0, 0.5, 1.0], dtype=np.float64)
+        fields = np.zeros((1, 3, 3), dtype=np.float64)
+        fields[:, 0, :] = np.array([4.0, 4.0, 4.0])
+        fields[:, 1, :] = np.array([1.0, 1.0, 1.0])
+        scalar = dataset_plots._interface_contact_jump_map(
+            fields, x_grid, 0.25, 0.2, 2.0, 1.0
+        )
+        vector = dataset_plots._interface_contact_jump_map(
+            fields, x_grid, 0.25, np.array([0.1, 0.2, 0.4]), 2.0, 1.0
+        )
+        assert vector.shape == scalar.shape == (1, 3)
+        assert not np.allclose(vector, scalar)
+        assert vector[0, 2] > vector[0, 0]
 
 
 class TestWriteTestRecords:

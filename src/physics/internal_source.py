@@ -22,8 +22,23 @@ extrapolation places A_min at ~1500 (5 K floor) and A_max at ~15000
 
 PATCH_W = 0.1
 PATCH_H = 0.1
-PATCH_X_RANGE = (0.05, 0.95)
-PATCH_Y_RANGE = (0.05, 0.95)
+
+# Domain bounds of the conduction problem (the unit square). The admissible
+# patch-center ranges are derived from these bounds and the patch size rather
+# than hard-coded, so they stay correct if the domain ever changes:
+#   x_h in [a + w/2, b - w/2],  y_h in [c + h/2, d - h/2].
+DOMAIN_X: tuple[float, float] = (0.0, 1.0)
+DOMAIN_Y: tuple[float, float] = (0.0, 1.0)
+
+
+def patch_center_range(lo: float, hi: float, length: float) -> tuple[float, float]:
+    """Center range that keeps a `length`-sized patch fully inside [lo, hi]."""
+    half = 0.5 * length
+    return (lo + half, hi - half)
+
+
+PATCH_X_RANGE = patch_center_range(*DOMAIN_X, PATCH_W)
+PATCH_Y_RANGE = patch_center_range(*DOMAIN_Y, PATCH_H)
 PATCH_A_RANGE: tuple[float, float] = (1500.0, 15000.0)
 
 
@@ -81,8 +96,6 @@ def integrate_sin2_pulse(A: float, t_off: float, t0: float, t1: float) -> float:
 
 
 def build_patch_source(
-    X: np.ndarray,
-    Y: np.ndarray,
     x_h: float,
     y_h: float,
     w: float,
@@ -90,12 +103,12 @@ def build_patch_source(
     A: float,
     t_off: float,
 ) -> Callable[[np.ndarray, np.ndarray, float], np.ndarray]:
-    """Construct the solver-facing source(X, Y, t) = a(t) * S_h(X, Y).
+    """Construct the solver-facing source(Xq, Yq, t) = a(t) * S_h(Xq, Yq).
 
-    The returned callable matches FVSolver2D's expected source signature.
-    The indicator is pre-built against the full (X, Y) grid; the solver passes
-    sub-arrays (active y-rows) so we re-evaluate the indicator on the supplied
-    coords rather than slicing a buffered mask.
+    The returned callable matches FVSolver2D's expected source signature. The
+    solver may pass sub-arrays (active y-rows), so the patch indicator is
+    evaluated on the supplied query coordinates Xq, Yq on every call rather than
+    against a buffered full-grid mask.
     """
     pulse = make_sin2_pulse(A, t_off)
 

@@ -49,11 +49,16 @@ def ic_random_sinusoid_2d(X: np.ndarray, Y: np.ndarray,
 
 
 def ic_grf_2d(X: np.ndarray, Y: np.ndarray,
-              ell: float, sigma: float, wn_seed: int,
-              Lx: float = 1.0, Ly: float = 1.0) -> np.ndarray:
+              ell: float, sigma: float, wn_seed: int) -> np.ndarray:
     Nx, Ny = X.shape
-    kx = 2.0 * np.pi * np.fft.fftfreq(Nx, d=Lx / Nx)
-    ky = 2.0 * np.pi * np.fft.fftfreq(Ny, d=Ly / Ny)
+    # Spacing is taken from the endpoint-including solver grid (linspace(a, b, N),
+    # so dx = (b - a) / (N - 1)). Using L / N instead would misstate the
+    # wavenumbers, and hence the correlation length `ell`, by a factor of
+    # (N - 1) / N.
+    dx = float(X[-1, 0] - X[0, 0]) / (Nx - 1)
+    dy = float(Y[0, -1] - Y[0, 0]) / (Ny - 1)
+    kx = 2.0 * np.pi * np.fft.fftfreq(Nx, d=dx)
+    ky = 2.0 * np.pi * np.fft.fftfreq(Ny, d=dy)
     KX, KY = np.meshgrid(kx, ky, indexing="ij")
     Pk = np.exp(-(KX ** 2 + KY ** 2) * (ell ** 2) / 2.0)
     W = np.random.default_rng(int(wn_seed)).standard_normal((Nx, Ny))

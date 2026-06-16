@@ -84,6 +84,37 @@ def temporal_sin(A: float, f: float, t_on: float, t_off: float,
     """Tukey-windowed half-wave-rectified sinusoidal temporal forcing."""
     return windowed_sin_flux(f, A, t_on, t_off, phase, tukey_alpha, rectified=rectified)
 
+
+def _windowed_sin_values(t, A: float, f: float, t_on: float, t_off: float,
+                         phase: float = 0.0, tukey_alpha: float = 0.5,
+                         rectified: bool = True) -> np.ndarray:
+    """Vectorized evaluation of `temporal_sin` / `windowed_sin_flux` over `t`.
+
+    Bit-for-bit equivalent to mapping the scalar `windowed_sin_flux` closure
+    over `t`, but avoids a Python-level call per sample. The quadrature in the
+    `sin` branch evaluates this at 2049 points per bin x 16 bins per item, so
+    the scalar map dominated DataLoader item construction for `sin` forcing.
+    Pinned against the scalar reference in tests/test_boundary_forcing.py.
+    """
+    if not rectified:
+        raise ValueError("windowed_sin_flux now supports only rectified=True.")
+    t = np.asarray(t, dtype=float)
+    W = float(t_off) - float(t_on)
+    tau = (t - float(t_on)) / W
+    if tukey_alpha <= 0.0:
+        w = np.ones_like(t)
+    else:
+        w = np.ones_like(t)
+        left = tau < tukey_alpha / 2
+        right = tau > 1.0 - tukey_alpha / 2
+        w[left] = 0.5 * (1.0 - np.cos(2 * np.pi * tau[left] / tukey_alpha))
+        w[right] = 0.5 * (
+            1.0 + np.cos(2 * np.pi * (tau[right] - 1.0 + tukey_alpha / 2) / tukey_alpha)
+        )
+    vals = w * A * np.maximum(np.sin(2 * np.pi * f * t + phase), 0.0)
+    vals[(t < float(t_on)) | (t > float(t_off))] = 0.0
+    return vals
+
 def temporal_exp(A: float, t0: float, tau: float):
     def q(t):
         if t < t0:
@@ -134,9 +165,8 @@ def integrate_temporal(
         return 0.0
 
     if temporal_family == "sin":
-        q = temporal_sin(**temporal_params)
         t = np.linspace(t_lo, t_hi, SIN_INTEGRAL_SAMPLES)
-        values = np.array([q(float(tn)) for tn in t], dtype=float)
+        values = _windowed_sin_values(t, **temporal_params)
         return float(_trapz(np.maximum(values, 0.0), t))
 
     if temporal_family == "exp":
@@ -214,9 +244,8 @@ def integrate_temporal_signed(
         return 0.0
 
     if temporal_family == "sin":
-        q = temporal_sin(**temporal_params)
         t = np.linspace(t_lo, t_hi, SIN_INTEGRAL_SAMPLES)
-        values = np.array([q(float(tn)) for tn in t], dtype=float)
+        values = _windowed_sin_values(t, **temporal_params)
         return float(_trapz(values, t))
 
     if temporal_family == "exp":

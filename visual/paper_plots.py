@@ -44,6 +44,7 @@ from visual.dataset_plots import (
     _prepare_prediction_case,
     _resolve_layer_conductivities,
 )
+from src.physics.internal_source import make_rc_void_profile
 
 
 TEMPORAL_ORDER = ("sin", "exp", "pulse_train", "exp_train")
@@ -330,6 +331,137 @@ def _row_label(ds, records, row: int) -> str:
     return f"{label}\n" + " ".join(suffix) if suffix else label
 
 
+def _nearest_index(grid: np.ndarray, value: float) -> int:
+    """Return the index of the grid node nearest to ``value``."""
+    return int(np.argmin(np.abs(np.asarray(grid, dtype=np.float64) - float(value))))
+
+
+def _format_coord(value: float) -> str:
+    return f"{float(value):.3f}"
+
+
+def _debug_scalar(value) -> float:
+    arr = np.asarray(value, dtype=np.float64)
+    return float(arr) if arr.ndim == 0 else float(np.mean(arr))
+
+
+def _source_itr_rc_profile(params: dict, y_grid: np.ndarray):
+    required = ("R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma")
+    if all(k in params for k in required):
+        return make_rc_void_profile(
+            np.asarray(y_grid, dtype=np.float64),
+            R_base=float(params["R_c_base"]),
+            R_amp=float(params["R_c_amp"]),
+            y0=float(params["R_c_y0"]),
+            sigma=float(params["R_c_sigma"]),
+        )
+    return float(params["R_c"])
+
+
+def _interface_R_for_sim(ds, sid: int):
+    params = ds.sim_params[int(sid)]
+    if getattr(ds.problem, "name", "") == "source_itr":
+        return _source_itr_rc_profile(params, ds.y_grid)
+    return float(params["R_c"])
+
+
+def _selected_forcing_rows(records) -> list[tuple[str, int]]:
+    t_j = records["t_s"] + records["t_bar"]
+    active = t_j <= FORCING_ACTIVE_T_MAX
+    active_relaxed = t_j <= 0.25
+    preferred_spatial = {"sin": "uniform", "exp": "gaussian",
+                         "pulse_train": "patch", "exp_train": "triangle"}
+
+    selected = []
+    for fam in TEMPORAL_ORDER:
+        fam_mask = _mask_in(records["temporal_family"], fam)
+        sp_mask = _mask_in(records["spatial_family"], preferred_spatial[fam])
+        row = -1
+        for mask in (fam_mask & active & sp_mask,
+                     fam_mask & active,
+                     fam_mask & active_relaxed,
+                     fam_mask):
+            row = _representative_row(records, mask)
+            if row >= 0:
+                break
+        if row >= 0:
+            selected.append((fam, row))
+    return selected
+
+
+def _selected_source_rows(records, ds=None, prefer_void: bool = False) -> list[tuple[str, int]]:
+    selected = []
+    for regime in REGIME_ORDER:
+        mask = _mask_in(records["regime"], regime)
+        row = _representative_row(records, mask)
+        if prefer_void and ds is not None:
+            idx = np.where(mask & np.isfinite(records["rel_l2_pct"]))[0]
+            if idx.size:
+                amps = np.array([
+                    float(ds.sim_params[int(records["sim_id"][i])].get("R_c_amp", 0.0))
+                    for i in idx
+                ])
+                row = int(idx[int(np.argmax(amps))])
+        if row >= 0:
+            selected.append((regime, row))
+    return selected
+
+
+def _selected_interface_rows(records) -> list[tuple[str, int]]:
+    selected = []
+    for target in (0.25, 0.50, 0.75):
+        row = _row_for_x_I(records, target)
+        if row >= 0:
+            selected.append((f"x_I≈{target:.2f}", row))
+    return selected
+
+
+def _predict_phys_case(model, ds, sid: int, s: int, target_indices: np.ndarray, config, dt):
+    return _prepare_prediction_case(
+        model, ds.trajectories, ds.x_grid, ds.y_grid, ds.t_grid, ds.sim_params,
+        int(sid), int(s), np.asarray(target_indices, dtype=int), config=config, dt=dt,
+    )
+
+
+def _slice_points_for_case(ds, sid: int) -> tuple[float, float]:
+    params = ds.sim_params[int(sid)]
+    name = getattr(ds.problem, "name", "")
+    if name in ("source", "source_itr"):
+        return float(params["y_h"]), float(params["x_h"])
+    if name == "forcing":
+        spatial_params = params.get("spatial_params", {})
+        y_value = float(spatial_params.get("y_c", 0.5))
+        return y_value, 0.25
+    if name == "interfaces":
+        interface_x = float(params.get("interface_x", 0.5))
+        left_node, _right_node = _interface_flanking_nodes_from_grid(ds.x_grid, interface_x)
+        return 0.5, float(ds.x_grid[left_node])
+    return 0.5, 0.5
+
+
+def _patch_for_case(ds, sid: int):
+    params = ds.sim_params[int(sid)]
+    if all(k in params for k in ("x_h", "y_h", "w_h", "h_h")):
+        return (
+            float(params["x_h"]), float(params["y_h"]),
+            float(params["w_h"]), float(params["h_h"]),
+        )
+    return None
+
+
+def _row_metric_text(records, row: int, extra: str | None = None) -> str:
+    bits = []
+    rel = records["rel_l2_pct"][row]
+    iface = records["iface_rel_l2_pct"][row]
+    if np.isfinite(rel):
+        bits.append(f"L2={rel:.2f}%")
+    if np.isfinite(iface):
+        bits.append(f"iface={iface:.2f}%")
+    if extra:
+        bits.append(extra)
+    return "\n".join(bits)
+
+
 # ============================================================
 # TEST-ERROR SUMMARIES (2x3)
 # ============================================================
@@ -483,6 +615,129 @@ def plot_interfaces_prediction_truth_residual(model, ds, records, save_path=None
 
 
 # ============================================================
+# TEMPERATURE PROFILES (FVM vs FNO line slices)
+# ============================================================
+
+def _render_temperature_profile_row(axes_row, ds, records, row: int, label: str,
+                                    case, *, col_titles: bool = False) -> None:
+    ax_x, ax_y, ax_err = axes_row
+    sid = int(records["sim_id"][row])
+    y_value, x_value = _slice_points_for_case(ds, sid)
+    y_idx = _nearest_index(ds.y_grid, y_value)
+    x_idx = _nearest_index(ds.x_grid, x_value)
+    y_actual = float(ds.y_grid[y_idx])
+    x_actual = float(ds.x_grid[x_idx])
+
+    Y_true = np.asarray(case["Y_true"][0], dtype=np.float64)
+    Y_pred = np.asarray(case["Y_pred"][0], dtype=np.float64)
+    err = Y_pred - Y_true
+    true_x = Y_true[:, y_idx]
+    pred_x = Y_pred[:, y_idx]
+    true_y = Y_true[x_idx, :]
+    pred_y = Y_pred[x_idx, :]
+    err_x = err[:, y_idx]
+    err_y = err[x_idx, :]
+    rmse_x = float(np.sqrt(np.mean(err_x ** 2)))
+    rmse_y = float(np.sqrt(np.mean(err_y ** 2)))
+
+    interface_x = float(case["interface_x"])
+    patch = _patch_for_case(ds, sid)
+    ax_x.plot(ds.x_grid, true_x, color="black", label="FVM")
+    ax_x.plot(ds.x_grid, pred_x, color="C3", linestyle="--", label="FNO")
+    ax_x.axvline(interface_x, color="0.35", linestyle=":", linewidth=1.1)
+    if patch is not None:
+        x_h, _y_h, w_h, _h_h = patch
+        ax_x.axvspan(x_h - 0.5 * w_h, x_h + 0.5 * w_h, color="C2", alpha=0.12)
+    ax_x.set_xlabel("x")
+    ax_x.set_ylabel((label + "\n" if label else "") + "T [K]", fontsize=8)
+    ax_x.grid(True)
+
+    ax_y.plot(ds.y_grid, true_y, color="black", label="FVM")
+    ax_y.plot(ds.y_grid, pred_y, color="C3", linestyle="--", label="FNO")
+    if patch is not None:
+        _x_h, y_h, _w_h, h_h = patch
+        ax_y.axvspan(y_h - 0.5 * h_h, y_h + 0.5 * h_h, color="C2", alpha=0.12)
+    ax_y.set_xlabel("y")
+    ax_y.set_ylabel("T [K]")
+    ax_y.grid(True)
+
+    ax_err.plot(ds.x_grid, err_x, color="C0", label=f"x slice, y={_format_coord(y_actual)}")
+    ax_err.plot(ds.y_grid, err_y, color="C1", linestyle="--", label=f"y slice, x={_format_coord(x_actual)}")
+    ax_err.axhline(0.0, color="0.35", linestyle=":", linewidth=1.0)
+    ax_err.set_xlabel("coordinate")
+    ax_err.set_ylabel("FNO - FVM [K]")
+    ax_err.grid(True)
+    metric_text = _row_metric_text(records, row, extra=f"RMSE_x={rmse_x:.3g}K\nRMSE_y={rmse_y:.3g}K")
+    if metric_text:
+        ax_err.text(
+            0.03, 0.96, metric_text,
+            transform=ax_err.transAxes, va="top", ha="left",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+        )
+
+    if col_titles:
+        ax_x.set_title(f"T vs x at y={_format_coord(y_actual)}")
+        ax_y.set_title(f"T vs y at x={_format_coord(x_actual)}")
+        ax_err.set_title("Signed profile error")
+        ax_x.legend(loc="best")
+        ax_err.legend(loc="best")
+
+
+def _build_temperature_profile_figure(model, ds, records, selected, config, dt,
+                                      name: str, save_path):
+    if not selected:
+        with plt.rc_context(PLOT_STYLE):
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            ax.text(0.5, 0.5, "No cases available", ha="center", va="center")
+            ax.axis("off")
+            return _save_figure(fig, save_path, "paper", name)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(len(selected), 3, figsize=(15, 4.0 * len(selected)), squeeze=False)
+        for r, (label, row) in enumerate(selected):
+            sid, s, j = (int(records[k][row]) for k in ("sim_id", "s", "j"))
+            case = _predict_phys_case(model, ds, sid, s, np.array([j], dtype=int), config, dt)
+            full_label = f"{label}\n{_row_label(ds, records, row)}"
+            _render_temperature_profile_row(
+                axes[r], ds, records, row, full_label, case, col_titles=(r == 0)
+            )
+        fig.tight_layout()
+        return _save_figure(fig, save_path, "paper", name)
+
+
+def plot_forcing_temperature_profiles(model, ds, records, config, dt, save_path=None):
+    """Forcing FVM-vs-FNO temperature line profiles, one row per temporal family."""
+    return _build_temperature_profile_figure(
+        model, ds, records, _selected_forcing_rows(records), config, dt,
+        "forcing_temperature_profiles", save_path,
+    )
+
+
+def plot_source_temperature_profiles(model, ds, records, config, dt, save_path=None):
+    """Source FVM-vs-FNO temperature line profiles for left/near/right patches."""
+    return _build_temperature_profile_figure(
+        model, ds, records, _selected_source_rows(records), config, dt,
+        "source_temperature_profiles", save_path,
+    )
+
+
+def plot_source_itr_temperature_profiles(model, ds, records, config, dt, save_path=None):
+    """Source-ITR FVM-vs-FNO temperature line profiles, preferring visible voids."""
+    return _build_temperature_profile_figure(
+        model, ds, records, _selected_source_rows(records, ds=ds, prefer_void=True), config, dt,
+        "source_itr_temperature_profiles", save_path,
+    )
+
+
+def plot_interfaces_temperature_profiles(model, ds, records, config, dt, save_path=None):
+    """Interfaces FVM-vs-FNO temperature line profiles at low/mid/high interface x."""
+    return _build_temperature_profile_figure(
+        model, ds, records, _selected_interface_rows(records), config, dt,
+        "interfaces_temperature_profiles", save_path,
+    )
+
+
+# ============================================================
 # INTERFACE CONTACT-JUMP OVER LEAD TIME (per benchmark)
 # ============================================================
 # The FNO predicts nodal temperatures; we postprocess them with the known
@@ -511,15 +766,16 @@ def _jump_case(model, ds, sid: int, s: int, config, dt, n_targets: int = _JUMP_N
     )
     interface_x = float(case["interface_x"])
     R_c = float(case["R_c"])
+    interface_R = _interface_R_for_sim(ds, int(sid))
     k_left, k_right = _resolve_layer_conductivities(ds, int(sid), config)
 
     left_node, right_node = _interface_flanking_nodes_from_grid(ds.x_grid, interface_x)
     h_L = float(interface_x) - float(ds.x_grid[left_node])
     h_R = float(ds.x_grid[right_node]) - float(interface_x)
-    G = _interface_conductance_G(ds.x_grid, interface_x, R_c, k_left, k_right)
+    G = _interface_conductance_G(ds.x_grid, interface_x, interface_R, k_left, k_right)
 
-    true_jump = _interface_contact_jump_map(case["Y_true"], ds.x_grid, interface_x, R_c, k_left, k_right)
-    pred_jump = _interface_contact_jump_map(case["Y_pred"], ds.x_grid, interface_x, R_c, k_left, k_right)
+    true_jump = _interface_contact_jump_map(case["Y_true"], ds.x_grid, interface_x, interface_R, k_left, k_right)
+    pred_jump = _interface_contact_jump_map(case["Y_pred"], ds.x_grid, interface_x, interface_R, k_left, k_right)
     node_true = _interface_jump_map(case["Y_true"], left_node, right_node)
     node_peak = float(np.max(np.abs(node_true))) if node_true.size else 0.0
     contact_peak = float(np.max(np.abs(true_jump))) if true_jump.size else 0.0
@@ -527,7 +783,8 @@ def _jump_case(model, ds, sid: int, s: int, config, dt, n_targets: int = _JUMP_N
     print(
         f"[jump] sid={int(sid)} s={int(s)} x_I={interface_x:.4f} R_c={R_c:.4f} "
         f"k_L={k_left:.3f} k_R={k_right:.3f} h_L={h_L:.4f} h_R={h_R:.4f} "
-        f"G={G:.4f} R_c*G={R_c * G:.4f} max|node|={node_peak:.4g} max|contact|={contact_peak:.4g}"
+        f"G={_debug_scalar(G):.4f} R_c*G={_debug_scalar(np.asarray(interface_R) * np.asarray(G)):.4f} "
+        f"max|node|={node_peak:.4g} max|contact|={contact_peak:.4g}"
     )
 
     return {
@@ -540,6 +797,7 @@ def _jump_case(model, ds, sid: int, s: int, config, dt, n_targets: int = _JUMP_N
         "metrics": _jump_error_metrics(pred_jump, true_jump),
         "interface_x": interface_x,
         "R_c": R_c,
+        "interface_R": interface_R,
     }
 
 
@@ -676,6 +934,150 @@ def plot_interfaces_interface_jump(model, ds, records, config, dt, save_path=Non
     return _build_jump_figure(cases, labels, "interfaces_interface_jump", save_path)
 
 
+def _jump_profile_case(model, ds, records, row: int, config, dt,
+                       n_targets: int = _JUMP_N_TARGETS):
+    sid, s, j = (int(records[k][row]) for k in ("sim_id", "s", "j"))
+    future = _future_target_indices(s, n_targets, len(ds.t_grid))
+    target_indices = np.unique(np.concatenate([future, np.array([j], dtype=int)]))
+    case = _predict_phys_case(model, ds, sid, s, target_indices, config, dt)
+    interface_x = float(case["interface_x"])
+    interface_R = _interface_R_for_sim(ds, sid)
+    k_left, k_right = _resolve_layer_conductivities(ds, sid, config)
+    true_jump = _interface_contact_jump_map(
+        case["Y_true"], ds.x_grid, interface_x, interface_R, k_left, k_right
+    )
+    pred_jump = _interface_contact_jump_map(
+        case["Y_pred"], ds.x_grid, interface_x, interface_R, k_left, k_right
+    )
+    fixed_idx = int(np.where(target_indices == j)[0][0])
+    return {
+        "sid": sid,
+        "s": s,
+        "j": j,
+        "t_bars": np.asarray(case["t_bars"], dtype=np.float64),
+        "y_grid": np.asarray(ds.y_grid, dtype=np.float64),
+        "true_jump": true_jump,
+        "pred_jump": pred_jump,
+        "fixed_idx": fixed_idx,
+        "interface_x": interface_x,
+        "R_c": float(case["R_c"]),
+    }
+
+
+def _render_jump_profile_row(axes_row, ds, records, row: int, label: str, case,
+                             *, col_titles: bool = False) -> None:
+    ax_t, ax_te, ax_y, ax_ye = axes_row
+    sid = int(records["sim_id"][row])
+    y_value, _x_value = _slice_points_for_case(ds, sid)
+    y_idx = _nearest_index(ds.y_grid, y_value)
+    y_actual = float(ds.y_grid[y_idx])
+    t_bars = case["t_bars"]
+    y_grid = case["y_grid"]
+    jt = case["true_jump"]
+    jp = case["pred_jump"]
+    diff = jp - jt
+    fixed_idx = int(case["fixed_idx"])
+    fixed_t = float(t_bars[fixed_idx])
+    rmse_time = float(np.sqrt(np.mean(diff[:, y_idx] ** 2)))
+    rmse_y = float(np.sqrt(np.mean(diff[fixed_idx, :] ** 2)))
+
+    ax_t.plot(t_bars, jt[:, y_idx], color="black", label="FVM")
+    ax_t.plot(t_bars, jp[:, y_idx], color="C3", linestyle="--", label="FNO")
+    ax_t.axvline(fixed_t, color="0.35", linestyle=":", linewidth=1.0)
+    ax_t.set_xlabel(r"lead time $\bar{t}$")
+    ax_t.set_ylabel((label + "\n" if label else "") + r"$\Delta T_\mathrm{contact}$ [K]", fontsize=8)
+    ax_t.grid(True)
+
+    ax_te.plot(t_bars, diff[:, y_idx], color="C0")
+    ax_te.axhline(0.0, color="0.35", linestyle=":", linewidth=1.0)
+    ax_te.axvline(fixed_t, color="0.35", linestyle=":", linewidth=1.0)
+    ax_te.set_xlabel(r"lead time $\bar{t}$")
+    ax_te.set_ylabel("FNO - FVM [K]")
+    ax_te.grid(True)
+
+    ax_y.plot(y_grid, jt[fixed_idx, :], color="black", label="FVM")
+    ax_y.plot(y_grid, jp[fixed_idx, :], color="C3", linestyle="--", label="FNO")
+    ax_y.axvline(y_actual, color="0.35", linestyle=":", linewidth=1.0)
+    ax_y.set_xlabel("y")
+    ax_y.set_ylabel(r"$\Delta T_\mathrm{contact}$ [K]")
+    ax_y.grid(True)
+
+    ax_ye.plot(y_grid, diff[fixed_idx, :], color="C1")
+    ax_ye.axhline(0.0, color="0.35", linestyle=":", linewidth=1.0)
+    ax_ye.axvline(y_actual, color="0.35", linestyle=":", linewidth=1.0)
+    ax_ye.set_xlabel("y")
+    ax_ye.set_ylabel("FNO - FVM [K]")
+    ax_ye.grid(True)
+    metric_text = _row_metric_text(records, row, extra=f"RMSE_t={rmse_time:.3g}K\nRMSE_y={rmse_y:.3g}K")
+    if metric_text:
+        ax_ye.text(
+            0.03, 0.96, metric_text,
+            transform=ax_ye.transAxes, va="top", ha="left",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+        )
+
+    if col_titles:
+        ax_t.set_title(f"Jump vs time at y={_format_coord(y_actual)}")
+        ax_te.set_title("Jump error vs time")
+        ax_y.set_title(f"Jump vs y at lead={_format_coord(fixed_t)}")
+        ax_ye.set_title("Jump error vs y")
+        ax_t.legend(loc="best")
+        ax_y.legend(loc="best")
+
+
+def _build_interface_jump_profile_figure(model, ds, records, selected, config, dt,
+                                         name: str, save_path):
+    if not selected:
+        with plt.rc_context(PLOT_STYLE):
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            ax.text(0.5, 0.5, "No cases available", ha="center", va="center")
+            ax.axis("off")
+            return _save_figure(fig, save_path, "paper", name)
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(len(selected), 4, figsize=(18, 3.9 * len(selected)), squeeze=False)
+        for r, (label, row) in enumerate(selected):
+            case = _jump_profile_case(model, ds, records, row, config, dt)
+            full_label = f"{label}\n{_row_label(ds, records, row)}"
+            _render_jump_profile_row(
+                axes[r], ds, records, row, full_label, case, col_titles=(r == 0)
+            )
+        fig.tight_layout()
+        return _save_figure(fig, save_path, "paper", name)
+
+
+def plot_forcing_interface_jump_profiles(model, ds, records, config, dt, save_path=None):
+    """Forcing contact-jump line profiles and errors, one row per temporal family."""
+    return _build_interface_jump_profile_figure(
+        model, ds, records, _selected_forcing_rows(records), config, dt,
+        "forcing_interface_jump_profiles", save_path,
+    )
+
+
+def plot_source_interface_jump_profiles(model, ds, records, config, dt, save_path=None):
+    """Source contact-jump line profiles and errors for left/near/right patches."""
+    return _build_interface_jump_profile_figure(
+        model, ds, records, _selected_source_rows(records), config, dt,
+        "source_interface_jump_profiles", save_path,
+    )
+
+
+def plot_source_itr_interface_jump_profiles(model, ds, records, config, dt, save_path=None):
+    """Source-ITR contact-jump line profiles using the per-row R_c(y) law."""
+    return _build_interface_jump_profile_figure(
+        model, ds, records, _selected_source_rows(records, ds=ds, prefer_void=True), config, dt,
+        "source_itr_interface_jump_profiles", save_path,
+    )
+
+
+def plot_interfaces_interface_jump_profiles(model, ds, records, config, dt, save_path=None):
+    """Interfaces contact-jump line profiles and errors at low/mid/high interface x."""
+    return _build_interface_jump_profile_figure(
+        model, ds, records, _selected_interface_rows(records), config, dt,
+        "interfaces_interface_jump_profiles", save_path,
+    )
+
+
 # ============================================================
 # CROSS-BENCHMARK SYNTHESIS
 # ============================================================
@@ -790,10 +1192,10 @@ def _aggregate_benchmark_jump(ctx, n_sims: int = 24, n_targets: int = _JUMP_N_TA
             ds.sim_params, int(sid), s_start, target_indices, config=config, dt=dt,
         )
         interface_x = float(case["interface_x"])
-        R_c = float(case["R_c"])
+        interface_R = _interface_R_for_sim(ds, int(sid))
         k_left, k_right = _resolve_layer_conductivities(ds, int(sid), config)
-        tj = _interface_contact_jump_map(case["Y_true"], ds.x_grid, interface_x, R_c, k_left, k_right)
-        pj = _interface_contact_jump_map(case["Y_pred"], ds.x_grid, interface_x, R_c, k_left, k_right)
+        tj = _interface_contact_jump_map(case["Y_true"], ds.x_grid, interface_x, interface_R, k_left, k_right)
+        pj = _interface_contact_jump_map(case["Y_pred"], ds.x_grid, interface_x, interface_R, k_left, k_right)
         diff = pj - tj
         truth_mag.append(np.mean(np.abs(tj), axis=1))
         pred_mag.append(np.mean(np.abs(pj), axis=1))

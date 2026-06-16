@@ -40,6 +40,7 @@ from src.physics.boundary_forcing import (
     sample_pulse_train_params,
     sample_exp_train_params,
     temporal_sin,
+    _windowed_sin_values,
     temporal_exp,
     temporal_pulse_train,
     temporal_exp_train,
@@ -707,3 +708,37 @@ class TestRampedIntegral:
                                          {"y_c": 0.5, "sigma_y": 0.1}, Y, t_ramp=T_RAMP)
         scalar = integrate_temporal_ramped_signed("exp", p, 0.0, 0.1, T_RAMP)
         assert np.allclose(q_int(0.0, 0.1), scalar * s_vec, atol=1e-12)
+
+
+class TestWindowedSinVectorization:
+    """Pin the vectorized `_windowed_sin_values` to the scalar reference.
+
+    The integral quadrature swapped a per-sample Python call to
+    `windowed_sin_flux` for this vectorized helper. They must stay bit-for-bit
+    equivalent; this test guards against drift if the 1D reference changes.
+    """
+
+    @pytest.mark.parametrize("params", [
+        dict(A=2.0, f=0.25, t_on=0.0, t_off=1.0, phase=0.0, tukey_alpha=0.0),
+        dict(A=120.0, f=3.0, t_on=0.0, t_off=0.6, phase=0.2, tukey_alpha=0.25),
+        dict(A=300.0, f=20.0, t_on=0.1, t_off=0.9, phase=-0.5, tukey_alpha=0.5),
+        dict(A=50.0, f=1.0, t_on=0.2, t_off=0.8, phase=1.3, tukey_alpha=1.0),
+    ])
+    def test_matches_scalar_windowed_sin_flux(self, params):
+        # Sample a grid that includes points outside [t_on, t_off] and the
+        # exact window endpoints.
+        t = np.linspace(-0.1, 1.1, 257)
+        q = windowed_sin_flux(
+            params["f"], params["A"], params["t_on"], params["t_off"],
+            params["phase"], params["tukey_alpha"],
+        )
+        expected = np.array([q(float(tn)) for tn in t], dtype=float)
+        got = _windowed_sin_values(t, **params)
+        np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-12)
+
+    def test_rejects_unrectified(self):
+        with pytest.raises(ValueError):
+            _windowed_sin_values(
+                np.linspace(0.0, 1.0, 5), A=1.0, f=1.0, t_on=0.0, t_off=1.0,
+                rectified=False,
+            )
