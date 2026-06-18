@@ -24,6 +24,7 @@ from data.dataset import (
     load_ramp_seconds,
     load_sim_data,
     load_solver_dt,
+    one_step_physics_view,
     problem_from_config,
     split_sim_ids,
 )
@@ -40,8 +41,10 @@ from src.operators.losses import (
     per_sample_node_jump_errors,
     per_sample_nrmse,
     per_sample_sq_rms,
+    physics_residual_loss,
     tail_stats,
 )
+from src.physics.fv_residual import build_cn_geom_batched
 from src.operators.utils import resolve_device
 
 from omegaconf import OmegaConf
@@ -631,6 +634,118 @@ def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
     raise ValueError(f"Unsupported scheduler type: {sched_type}")
 
 
+def _physics_batch_loss(model, physics_loader, phys_iter, geom_cfg, device):
+    """Draw one physics batch (cycling the loader), forward the model for the
+    one-step prediction ``T^{n+1}``, and return ``(loss, batch_size, phys_iter)``.
+
+    The input snapshot's normalized temperature (spatial channel 0) is the truth
+    ``T^n``; the per-sample contact resistance ``R_c`` is recovered from
+    ``cond_static`` and used to build the batched CN face conductances so the
+    interface jump physics is exact per sample.
+    """
+    try:
+        pbatch = next(phys_iter)
+    except StopIteration:
+        phys_iter = iter(physics_loader)
+        pbatch = next(phys_iter)
+
+    x_spatial = pbatch["spatial"].to(device)
+    cond_static = pbatch["cond_static"].to(device)
+    forcing_seq = pbatch["forcing_seq"].to(device) if "forcing_seq" in pbatch else None
+
+    T_n = x_spatial[..., 0:1]
+    y_pred = model(x_spatial, cond_static, forcing_seq)
+
+    rc_lo, rc_hi = geom_cfg["rc_range"]
+    R_c = cond_static[:, geom_cfg["rc_index"]] * (rc_hi - rc_lo) + rc_lo
+    geom = build_cn_geom_batched(
+        geom_cfg["x_grid"], geom_cfg["y_grid"],
+        geom_cfg["k_left"], geom_cfg["k_right"], geom_cfg["interface_x"],
+        R_c, geom_cfg["dt"], sigma_global=geom_cfg["sigma_global"],
+        device=device, dtype=y_pred.dtype,
+    )
+    p_loss = physics_residual_loss(T_n, y_pred, geom)
+    return p_loss, x_spatial.shape[0], phys_iter
+
+
+def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, batch_size, num_workers):
+    """Build the dedicated one-step (W1) physics loader and the geometry config
+    used to assemble the per-sample CN residual.
+
+    Reads its own ``save_stride=1`` dataset (``physics.data_dir`` or, as a
+    fallback, the main ``data`` paths — only correct if that set is itself
+    ``save_stride=1``) so consecutive snapshots are exactly one solver step
+    ``dt`` apart. Stage 1 is ``forcing``-only: the two-slab ``k=2/k=1`` interface
+    at ``x=0.5`` and scalar ``R_c`` in ``[0.05, 1.0]`` (cond_static index 2).
+
+    Normalizes the physics inputs with the MAIN training set's
+    ``(mu_global, sigma_global)`` (passed in) — the model was normalized with
+    those stats, so the physics set must reuse them or the model sees
+    OOD-scaled inputs and the residual's ``sigma_global`` rescale is wrong.
+    """
+    from torch.utils.data import DataLoader
+    from data.dataset import collate_fn
+
+    data_dir = phys_cfg.get("data_dir") or None
+    if data_dir is not None:
+        base = Path(data_dir)
+        traj_path = str(base / "trajectories.npy")
+        x_path = str(base / "x_grid.npy")
+        y_path = str(base / "y_grid.npy")
+        t_path = str(base / "t_grid.npy")
+        sim_params_path = str(base / "sim_params.npy")
+    else:
+        traj_path = config["data"]["trajectories.npy"]
+        x_path = config["data"]["x_grid_path"]
+        y_path = config["data"]["y_grid_path"]
+        t_path = config["data"]["t_grid_path"]
+        sim_params_path = config["data"]["sim_params_path"]
+
+    trajectories, xg, yg, tg = load_sim_data(
+        sim_traj_path=traj_path, x_grid_path=x_path,
+        y_grid_path=y_path, t_grid_path=t_path,
+    )
+    sim_params = np.load(sim_params_path, allow_pickle=True)
+    solver_dt = load_solver_dt(t_path)
+    ramp_seconds = load_ramp_seconds(t_path)
+    train_ids, _, _ = split_sim_ids(
+        num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0
+    )
+
+    phys_dataset = SnapshotPairDataset(
+        trajectories=trajectories, t_grid=tg, x_grid=xg, y_grid=yg,
+        sim_ids=train_ids, sim_params=sim_params,
+        mu_global=mu_global, sigma_global=sigma_global,
+        n_snapshots=None, noise_std=0.0,
+        dt=solver_dt, ramp_seconds=ramp_seconds,
+        temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
+        problem=spec,
+    )
+    phys_dataset = one_step_physics_view(phys_dataset)
+
+    pbs = phys_cfg.get("physics_batch_size") or batch_size
+    pin = torch.cuda.is_available()
+    workers = num_workers if num_workers is not None else (4 if pin else 0)
+    loader = DataLoader(
+        phys_dataset, batch_size=pbs, shuffle=True,
+        pin_memory=pin, num_workers=workers,
+        persistent_workers=workers > 0, collate_fn=collate_fn,
+    )
+
+    geom_cfg = {
+        "x_grid": np.asarray(xg, dtype=float),
+        "y_grid": np.asarray(yg, dtype=float),
+        "k_left": 2.0,
+        "k_right": 1.0,
+        "interface_x": float(phys_cfg.get("interface_x", 0.5)),
+        "dt": float(phys_cfg.get("dt", solver_dt)),
+        "sigma_global": float(sigma_global),
+        "rc_range": (0.05, 1.0),
+        "rc_index": 2,
+    }
+    return loader, geom_cfg
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -644,6 +759,10 @@ def train_one_epoch(
     x_grid: np.ndarray | None = None,
     interface_x: float = 0.5,
     sigma_global: float = 1.0,
+    physics_loader=None,
+    physics_geom_cfg=None,
+    lambda_data: float = 1.0,
+    lambda_physics: float = 0.0,
 ) -> dict[str, float]:
     """Train one epoch and return a dict of epoch metrics.
 
@@ -684,6 +803,14 @@ def train_one_epoch(
     if x_grid is not None and not use_per_sample_interface:
         fixed_left, fixed_right = interface_flanking_nodes(x_grid, interface_x)
 
+    # Physics-residual regularizer. Disabled => the branch below is skipped
+    # entirely (no loader build, no batch draw, no residual), so the data stream
+    # and RNG order are byte-identical to a data-only run.
+    phys_enabled = physics_loader is not None and lambda_physics > 0.0
+    phys_iter = iter(physics_loader) if phys_enabled else None
+    phys_loss_sum = 0.0
+    n_phys = 0
+
     for batch in train_loader:
         x_spatial = batch["spatial"].to(device)
         cond_static = batch["cond_static"].to(device)
@@ -696,7 +823,15 @@ def train_one_epoch(
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond_static, forcing_seq)
         loss = loss_fn(y_pred, y_batch, iface_x)
-        loss.backward()
+        if phys_enabled:
+            p_loss, p_b, phys_iter = _physics_batch_loss(
+                model, physics_loader, phys_iter, physics_geom_cfg, device
+            )
+            (lambda_data * loss + lambda_physics * p_loss).backward()
+            phys_loss_sum += p_loss.item() * p_b
+            n_phys += p_b
+        else:
+            loss.backward()
 
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -751,7 +886,7 @@ def train_one_epoch(
             [loss_sum, mse_sum, target_sq_sum, iface_mse_sum, iface_target_sq_sum,
              float(n_samples), float(n_iface_voxels),
              nrmse_sum, rmse_K_sum, node_jump_rmse_K_sum, node_jump_nrmse_sum,
-             gnrmse_sum, node_jump_gnrmse_sum],
+             gnrmse_sum, node_jump_gnrmse_sum, phys_loss_sum, float(n_phys)],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -768,6 +903,8 @@ def train_one_epoch(
         node_jump_nrmse_sum = t[10].item()
         gnrmse_sum = t[11].item()
         node_jump_gnrmse_sum = t[12].item()
+        phys_loss_sum = t[13].item()
+        n_phys = int(t[14].item())
 
         m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
@@ -791,6 +928,7 @@ def train_one_epoch(
         "node_jump_rmse_K": node_jump_rmse_K_sum / denom,
         "node_jump_nrmse": (node_jump_nrmse_sum / denom) * 100.0,
         "node_jump_gnrmse_pct": (node_jump_gnrmse_sum / denom) * 100.0,
+        "physics_loss": phys_loss_sum / max(n_phys, 1),
     }
 
 
@@ -1308,6 +1446,29 @@ def run_one_seed(
 
     use_per_sample_interface = bool(loss_cfg.get("per_sample_interface_x", False))
 
+    # Physics-residual regularizer (W1). Build the dedicated one-step loader +
+    # geometry config ONLY when active; lambda_physics=0 is a TRUE no-op (nothing
+    # below is constructed, so the data stream and RNG are untouched).
+    phys_cfg = config["training"].get("physics", {})
+    lambda_physics = float(phys_cfg.get("lambda_physics", 0.0))
+    lambda_data = float(phys_cfg.get("lambda_data", 1.0))
+    physics_loader = None
+    physics_geom_cfg = None
+    if lambda_physics > 0.0:
+        physics_loader, physics_geom_cfg = _build_physics_loader(
+            config, phys_cfg, spec, mu_global, sigma_global,
+            batch_size=config["training"]["batch_size"],
+            num_workers=resolve_num_workers(config, dist_info.world_size),
+        )
+        if is_main:
+            print(
+                f"Physics regularizer ON: lambda_data={lambda_data}, "
+                f"lambda_physics={lambda_physics}, "
+                f"residual={phys_cfg.get('residual', 'interior')}, "
+                f"mode={phys_cfg.get('mode', 'one_step')}",
+                flush=True,
+            )
+
     epochs = config["training"]["epochs"]
     validate_every = config["training"]["validate_every"]
     patience = config["training"]["patience"]
@@ -1319,7 +1480,7 @@ def run_one_seed(
     csv_path = run_path / "train_metrics.csv"
     val_pairs_path = run_path / "val_pairs.csv"
     fieldnames = [
-        "epoch", "train_loss", "train_rel_l2", "train_iface_rel_l2",
+        "epoch", "train_loss", "train_physics_loss", "train_rel_l2", "train_iface_rel_l2",
         "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
         "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
         "val_rel_l2", "val_iface_rel_l2",
@@ -1387,6 +1548,10 @@ def run_one_seed(
             use_per_sample_interface=use_per_sample_interface,
             x_grid=x_grid, interface_x=loss_cfg.get("interface_x", 0.5),
             sigma_global=sigma_global,
+            physics_loader=physics_loader,
+            physics_geom_cfg=physics_geom_cfg,
+            lambda_data=lambda_data,
+            lambda_physics=lambda_physics,
         )
         train_loss = train_metrics["loss"]
         train_rel_l2 = train_metrics["rel_l2"]
@@ -1523,6 +1688,7 @@ def run_one_seed(
                 {
                     "epoch": epoch,
                     "train_loss": float(train_loss),
+                    "train_physics_loss": float(train_metrics["physics_loss"]),
                     "train_rel_l2": float(train_rel_l2),
                     "train_iface_rel_l2": float(train_iface_rel_l2),
                     "train_nrmse": float(train_metrics["nrmse"]),

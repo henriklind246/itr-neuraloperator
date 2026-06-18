@@ -26,6 +26,16 @@ def main() -> int:
         help="Output CSV filename, written under the selected seed directory.",
     )
     parser.add_argument(
+        "--data-dir",
+        default=None,
+        help=(
+            "Optional dataset directory to evaluate against instead of the paths "
+            "baked into the checkpoint. Points the checkpoint at this dataset's "
+            "test split (e.g. a freshly generated benchmark set); the "
+            "checkpoint's training-distribution normalization is reused."
+        ),
+    )
+    parser.add_argument(
         "--rollout-num-substeps",
         type=int,
         default=None,
@@ -51,6 +61,7 @@ def main() -> int:
         str(run_root),
         seed=args.seed,
         out_name=args.out_name,
+        data_dir=args.data_dir,
         rollout_enabled=rollout_enabled,
         rollout_num_substeps=args.rollout_num_substeps,
     )

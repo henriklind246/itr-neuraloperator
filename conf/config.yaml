@@ -86,6 +86,38 @@ training:
   num_workers: null
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
+  # Physics-informed FV-residual regularizer. The combined objective is
+  #   L = lambda_data * L_data + lambda_physics * L_phys.
+  # lambda_physics: 0.0 is a TRUE no-op: train.py must skip building the physics
+  # loader, drawing a physics batch, and computing the residual entirely (not
+  # multiply by zero), so the data stream / RNG order is byte-identical to today.
+  physics:
+    lambda_data: 1.0
+    lambda_physics: 0.0
+    residual: interior          # interior | full_bc (full_bc is Stage 2)
+    mode: one_step              # one_step (W1) | collocation (W2)
+    dt: 0.005                   # one solver step (save_stride=1 spacing)
+    physics_batch_size: null    # null -> reuse training.batch_size
+    # Directory of the dedicated save_stride=1 physics dataset (consecutive
+    # snapshots one solver step dt apart, CN-exact). The main data.data_dir set is
+    # save_stride=2 (0.01 apart = two solver steps) and is INVALID for the one-step
+    # residual, so the physics loader reads its own set. null -> reuse
+    # paths.data_dir (only correct if that set itself was generated save_stride=1).
+    data_dir: null
+    # Collocation-lead curriculum (used only when mode=collocation). The sampler
+    # draws collocation leads in [dt, current_max_lead(epoch)], ramping the max
+    # lead from start to max over warmup epochs (optimization-stability device).
+    collocation_lead_start: 0.01
+    collocation_lead_max: 0.01
+    collocation_lead_warmup_epochs: 0
+    # full_bc per-region weights (default region-equal: each REGION contributes
+    # equally, deliberately giving the few-celled boundary rows more influence
+    # than a global mean(r_ij^2) would). Used only when residual=full_bc.
+    full_bc_region_weights:
+      interior: 1.0
+      left_neumann: 1.0
+      right_dirichlet: 1.0
+      topbot_adiabatic: 1.0
 
 data:
   t_grid_path: ${paths.data_dir}/t_grid.npy

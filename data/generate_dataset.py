@@ -209,6 +209,18 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
     parser.add_argument("--nx", type=int, default=100, help="Number of x-direction grid nodes.")
     parser.add_argument("--ny", type=int, default=100, help="Number of y-direction grid nodes.")
     parser.add_argument(
+        "--save-stride",
+        type=int,
+        default=2,
+        help=(
+            "Snapshot decimation stride. Default 2. Use 1 for the "
+            "physics-informed FV-residual set (consecutive snapshots one solver "
+            "step dt apart; CN-exact). Note Nt_saved ~doubles and the all-to-all "
+            "pair count is quadratic in Nt_saved -- generate a SMALL save-stride=1 "
+            "set, not the full all-to-all corpus."
+        ),
+    )
+    parser.add_argument(
         "--ramp-seconds",
         type=float,
         default=None,
@@ -244,6 +256,7 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         benchmark=args.benchmark,
         nx=args.nx,
         ny=args.ny,
+        save_stride=args.save_stride,
         ic_families=ic_families,
         ramp_seconds=args.ramp_seconds,
     )

@@ -207,6 +207,35 @@ def compute_interface_rel_l2(
     return rel_l2.item()
 
 
+def physics_residual_loss(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom,
+    extra_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean squared interior CN cell-balance residual (Stage 1, interior-only).
+
+    ``T_n`` / ``T_np1`` are normalized temperature fields one solver step ``dt``
+    apart in the training loss layout ``(B, Nx, Ny, 1)`` (a trailing channel of
+    1) or ``(B, Nx, Ny)``. The interior residual is the nondimensional per-step
+    (normalized) temperature residual directly (the r-coefficients fold in dt,
+    the CN 1/2, and the cell capacity), so the loss is ``mean(res^2)`` over the
+    interior-mask cells — no extra capacity-scale division on the interior path.
+
+    The mean is over masked cells only (zeroed boundary/Dirichlet cells are
+    excluded from the denominator) so the loss magnitude is independent of the
+    masked-out fraction.
+    """
+    from src.physics.fv_residual import interior_cn_residual
+
+    if T_n.dim() == 4:
+        T_n = T_n[..., 0]
+        T_np1 = T_np1[..., 0]
+    res, mask = interior_cn_residual(T_n, T_np1, geom, extra_mask=extra_mask)
+    denom = res.shape[0] * int(mask.sum())
+    return res.pow(2).sum() / denom
+
+
 # ---------------------------------------------------------------------------
 # Unified metric suite (per-sample, normalization-invariant headline + jump +
 # Kelvin + tails). Shared by train.py (train_one_epoch / validate) and

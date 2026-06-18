@@ -446,6 +446,26 @@ def long_lead_pairs(dataset: SnapshotPairDataset) -> list[tuple[int, int, int]]:
     ]
 
 
+def one_step_physics_view(dataset: SnapshotPairDataset) -> SnapshotPairDataset:
+    """Restrict `dataset` to consecutive one-step pairs (`j == s+1` in t_indices):
+    O(Nt) pairs per sim instead of the O(Nt^2) all-to-all corpus. This is the W1
+    physics-residual supply.
+
+    The caller MUST pass a `save_stride=1` dataset with every snapshot retained
+    (`n_snapshots=None`) so that adjacent `t_indices` are exactly one solver step
+    `dt` apart — the CN-exact spacing the interior residual assumes. With a
+    subsampled or strided grid the "one-step" pair would span several solver steps
+    and the residual would be wrong.
+    """
+    t_idx = dataset.t_indices
+    pairs = [
+        (int(sim_id), int(t_idx[i]), int(t_idx[i + 1]))
+        for sim_id in dataset.sim_ids
+        for i in range(len(t_idx) - 1)
+    ]
+    return _dataset_with_pairs(dataset, pairs)
+
+
 # --------- LOAD RAW SIM. DATA --------
 
 def load_sim_data(

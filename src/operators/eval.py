@@ -754,6 +754,7 @@ def write_test_records(
     run_root,
     seed=None,
     out_name: str = "test_records.csv",
+    data_dir: str | None = None,
     rollout_enabled: bool | None = None,
     rollout_num_substeps: int | None = None,
     rollout_partition: str | None = None,
@@ -777,6 +778,17 @@ def write_test_records(
         num_substeps=rollout_num_substeps,
         partition=rollout_partition,
     )
+
+    # Point the trained checkpoint at a different dataset (e.g. a freshly
+    # generated benchmark set). Only the test split is consumed, and the
+    # checkpoint's mu_global/sigma_global are reused, mirroring eval_all_seeds.
+    if data_dir is not None:
+        data_dir_path = Path(data_dir)
+        config["data"]["trajectories.npy"] = str(data_dir_path / "trajectories.npy")
+        config["data"]["x_grid_path"] = str(data_dir_path / "x_grid.npy")
+        config["data"]["y_grid_path"] = str(data_dir_path / "y_grid.npy")
+        config["data"]["t_grid_path"] = str(data_dir_path / "t_grid.npy")
+        config["data"]["sim_params_path"] = str(data_dir_path / "sim_params.npy")
 
     test_loader, x_grid, y_grid, _num_sims = build_test_loader(
         config,
