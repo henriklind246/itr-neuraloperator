@@ -35,7 +35,9 @@ model:
     activation: "GELU"            # doc-only; FNO2d hardcodes GELU
     dropout: 0.0
     spectral_dropout: 0.0
-    padding_reference_resolution: null  # scale FNO pad cells with grid resolution; null = fixed pad=8
+    padding_reference_resolution: 100  # scale FNO pad cells with grid resolution; set = training grid (null = fixed pad=8)
+    padding_mode: replicate       # boundary extension for the FNO domain pad: zeros|replicate|reflect
+    cin_exclude_padding: true     # compute CIN instance stats over the unpadded region only
 
 training:
   device: "auto"

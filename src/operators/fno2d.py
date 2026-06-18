@@ -106,15 +106,32 @@ class SpectralConv2d(nn.Module):
 # --------- Conditional Instance Normalization ---------
 
 class ConditionalInstanceNorm2d(nn.Module):
-    """Instance normalization + external affine (γ, β) from conditioning MLP."""
+    """Instance normalization + external affine (γ, β) from conditioning MLP.
 
-    def __init__(self, num_features: int):
+    When ``valid_shape`` is passed, the per-(B, C) instance statistics are
+    computed over the top-left ``(Nx0, Ny0)`` valid region only, so the
+    domain-padding buffer (which after the first spectral block holds spurious
+    globally-extrapolated values) does not pollute the normalization. The full
+    tensor is still normalized with those valid-region statistics; the pad
+    region is cropped downstream. With ``valid_shape=None`` this is identical to
+    the native ``InstanceNorm2d`` path.
+    """
+
+    def __init__(self, num_features: int, eps: float = 1e-5):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
+        self.eps = eps
+        self.norm = nn.InstanceNorm2d(num_features, affine=False, eps=eps)
 
     def forward(self, x, gamma, beta, valid_shape: tuple[int, int] | None = None):
         # x: (B, C, Nx, Ny),  gamma/beta: (B, C)
-        out = self.norm(x)
+        if valid_shape is None:
+            out = self.norm(x)
+        else:
+            Nx0, Ny0 = valid_shape
+            valid = x[:, :, :Nx0, :Ny0]
+            mean = valid.mean(dim=(-2, -1), keepdim=True)
+            var = valid.var(dim=(-2, -1), keepdim=True, unbiased=False)
+            out = (x - mean) / torch.sqrt(var + self.eps)
         return gamma[:, :, None, None] * out + beta[:, :, None, None]
 
 
@@ -227,6 +244,8 @@ class FNO2d(nn.Module):
         use_forcing_time_aug: bool = False,
         s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
+        padding_mode: str = "zeros",
+        cin_exclude_padding: bool = False,
     ):
         super().__init__()
         self.modes1 = modes1
@@ -245,6 +264,12 @@ class FNO2d(nn.Module):
         self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
+        if padding_mode not in ("zeros", "replicate", "reflect"):
+            raise ValueError(
+                f"padding_mode must be one of zeros|replicate|reflect, got {padding_mode!r}"
+            )
+        self.padding_mode = padding_mode
+        self.cin_exclude_padding = cin_exclude_padding
 
         # Spatial-forcing channels (s_y * z_a) are only injected when the temporal
         # branch is active; with the encoder off the lift sees in_channels alone.
@@ -357,7 +382,13 @@ class FNO2d(nn.Module):
         Nx0 = x.size(-2)
         Ny0 = x.size(-1)
         pad_x, pad_y = self._padding_for_shape(Nx0, Ny0)
-        x = F.pad(x, (0, pad_y, 0, pad_x))   # (B, width, Nx + pad_x, Ny + pad_y)
+        if self.padding_mode == "zeros":
+            x = F.pad(x, (0, pad_y, 0, pad_x))   # zero (constant) buffer
+        else:
+            # replicate/reflect give a continuous extension at the edge, cutting
+            # the spectral leakage that a hard zero step injects near the
+            # boundary (and that sharpens with resolution).
+            x = F.pad(x, (0, pad_y, 0, pad_x), mode=self.padding_mode)
 
         # Fourier blocks
         for l in range(self.n_layers):
@@ -367,7 +398,8 @@ class FNO2d(nn.Module):
             x1 = self.spectral_layers[l](x)
             x2 = self.conv_layers[l](x)
             x = x1 + x2
-            x = self.cin_layers[l](x, gamma, beta, valid_shape=(Nx0, Ny0))
+            valid_shape = (Nx0, Ny0) if self.cin_exclude_padding else None
+            x = self.cin_layers[l](x, gamma, beta, valid_shape=valid_shape)
             x = self.drop(self.activation(x))
 
         # Unpad + Project

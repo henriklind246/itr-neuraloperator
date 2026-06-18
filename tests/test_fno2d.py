@@ -41,17 +41,36 @@ class TestConditionalInstanceNorm2d:
         assert torch.allclose(mean, torch.zeros_like(mean), atol=1e-6)
         assert torch.allclose(var, torch.ones_like(var), atol=1e-4)
 
-    def test_valid_shape_is_ignored_for_native_instance_norm(self):
+    def test_valid_shape_normalizes_over_valid_region_only(self):
         torch.manual_seed(0)
         cin = ConditionalInstanceNorm2d(num_features=3)
         gamma = torch.ones(2, 3)
         beta = torch.zeros(2, 3)
-        x = torch.randn(2, 3, 4, 5)
+        x = torch.randn(2, 3, 6, 7)
+        # Corrupt the pad region (everything outside the top-left 4x5 block) with
+        # large spurious values; valid-region stats must ignore them.
+        x[:, :, 4:, :] = 50.0
+        x[:, :, :, 5:] = -50.0
+
+        out = cin(x, gamma, beta, valid_shape=(4, 5))
+
+        valid = out[:, :, :4, :5]
+        mean = valid.mean(dim=(-2, -1))
+        var = valid.var(dim=(-2, -1), unbiased=False)
+        assert torch.allclose(mean, torch.zeros_like(mean), atol=1e-5)
+        assert torch.allclose(var, torch.ones_like(var), atol=1e-4)
+
+    def test_valid_shape_differs_from_full_tensor_norm(self):
+        torch.manual_seed(0)
+        cin = ConditionalInstanceNorm2d(num_features=3)
+        gamma = torch.ones(2, 3)
+        beta = torch.zeros(2, 3)
+        x = torch.randn(2, 3, 6, 7)
+        x[:, :, 4:, :] = 50.0
 
         out_full = cin(x, gamma, beta)
-        out_with_shape = cin(x, gamma, beta, valid_shape=(3, 4))
-
-        assert torch.equal(out_full, out_with_shape)
+        out_valid = cin(x, gamma, beta, valid_shape=(4, 7))
+        assert not torch.allclose(out_full, out_valid)
 
 
 class TestTemporalForcingEncoder:
@@ -123,6 +142,65 @@ class TestFNO2d:
 
         assert model._padding_for_shape(100, 100) == (8, 8)
         assert model._padding_for_shape(256, 256) == (8, 8)
+
+    def test_padding_mode_default_is_zeros_and_replicate_changes_output(self):
+        common = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+            cond_static_dim=COND_STATIC_DIM,
+            temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+        )
+        m_zeros = FNO2d(**common)
+        assert m_zeros.padding_mode == "zeros"
+        assert m_zeros.cin_exclude_padding is False
+        m_rep = FNO2d(**common, padding_mode="replicate")
+        m_rep.load_state_dict(m_zeros.state_dict())
+        m_zeros.eval()
+        m_rep.eval()
+
+        spatial = torch.randn(2, 11, 11, SPATIAL_IN_CHANNELS)
+        cond_static = torch.randn(2, COND_STATIC_DIM)
+        forcing_seq = torch.randn(2, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        with torch.no_grad():
+            out_zeros = m_zeros(spatial, cond_static, forcing_seq)
+            out_rep = m_rep(spatial, cond_static, forcing_seq)
+        assert out_rep.shape == out_zeros.shape == (2, 11, 11, 1)
+        assert not torch.allclose(out_zeros, out_rep)
+
+    def test_cin_exclude_padding_changes_output(self):
+        common = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+            cond_static_dim=COND_STATIC_DIM,
+            temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+        )
+        m_off = FNO2d(**common)
+        m_on = FNO2d(**common, cin_exclude_padding=True)
+        m_on.load_state_dict(m_off.state_dict())
+        m_off.eval()
+        m_on.eval()
+
+        spatial = torch.randn(2, 11, 11, SPATIAL_IN_CHANNELS)
+        cond_static = torch.randn(2, COND_STATIC_DIM)
+        forcing_seq = torch.randn(2, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
+        with torch.no_grad():
+            out_off = m_off(spatial, cond_static, forcing_seq)
+            out_on = m_on(spatial, cond_static, forcing_seq)
+        assert not torch.allclose(out_off, out_on)
+
+    def test_invalid_padding_mode_raises(self):
+        import pytest
+        with pytest.raises(ValueError):
+            FNO2d(
+                modes1=2, modes2=2, width=8,
+                in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+                cond_static_dim=COND_STATIC_DIM,
+                temporal_token_dim=TEMPORAL_TOKEN_DIM,
+                temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+                padding_mode="banana",
+            )
 
     def test_cond_mlp_input_width_encoder_on(self):
         """With the temporal encoder on, the CIN MLP consumes

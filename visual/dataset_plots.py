@@ -554,6 +554,8 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         use_forcing_time_aug=dims.use_forcing_time_aug,
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
+        padding_mode=model_cfg.get("padding_mode", "zeros"),
+        cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
     )
     model.load_state_dict(ckpt["model_state"])
     model.eval()
