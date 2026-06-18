@@ -1,0 +1,6 @@
+# @package search_space
+params:
+  # Physics-informed FV-residual weight. The minimal staged sweep (plan Stage 2)
+  # uses a few values chosen after a one-off physics-vs-data gradient-magnitude
+  # check, not a broad search.
+  training.physics.lambda_physics: tag(log, interval(1e-3, 1.0))

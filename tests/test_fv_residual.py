@@ -1,0 +1,282 @@
+import numpy as np
+import torch
+import pytest
+
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+from src.physics.fv_residual import (
+    build_face_conductances,
+    build_cn_geom,
+    interior_cn_residual,
+)
+
+"""
+Stage 1 correctness gates for `src/physics/fv_residual.py`.
+
+Two independent checks:
+  1. `build_face_conductances` / `build_cn_geom` reproduce the solver's
+     `G_x`/`G_y`/`dx`/`dy` and `r_w/r_e/r_s/r_n` bit-for-bit (incl. the
+     interface x-face) for the `forcing` geometry.
+  2. The interior CN residual on consecutive ground-truth `save_stride=1`
+     snapshots is at the solver's linear-solve floor (~0) in float64, and the
+     float32 evaluation is characterized (a looser, documented floor) so the
+     live training residual is judged against the right number.
+"""
+
+
+def _build_forcing_solver(dt: float = 0.005, t_final: float = 0.3):
+    """The core `forcing` geometry: two slabs k=2/k=1, interface at x=0.5,
+    scalar R_c, Nx=Ny=100. Mirrors `fv_solver_2d.py.__main__`. The default
+    windowed-sin left flux is active, but it only touches the i=0 row, which the
+    interior residual excludes."""
+    layers = [
+        Layer2D(x_left=0.0, x_right=0.5, rho=1, cp=1, k=2),
+        Layer2D(x_left=0.5, x_right=1.0, rho=1, cp=1, k=1),
+    ]
+    sim = FVSolver2D(
+        a=0.0, b=1.0, c=0.0, d=1.0,
+        Nx=100, Ny=100,
+        layers=layers,
+        interface_R=[0.5],
+        lam_target=0.5,
+        dt=dt,
+        flux_f=2.0, flux_A=50.0,
+        t_on=0.0, t_off=0.2,
+        t_final=t_final, phase=0.0,
+    )
+    return sim
+
+
+def test_face_conductances_match_solver():
+    sim = _build_forcing_solver()
+    G_x, G_y, dx, dy = build_face_conductances(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dtype=torch.float64,
+    )
+    np.testing.assert_allclose(G_x.numpy(), sim.G_x, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(G_y.numpy(), sim.G_y, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(dx.numpy(), sim.dx, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(dy.numpy(), sim.dy, rtol=0, atol=1e-12)
+
+
+def test_interface_face_conductance_value():
+    """The interface x-face (slot 49 for Nx=100, h_L=h_R=h/2) must equal the
+    series resistance 1/(h_L/k_L + R_c + h_R/k_R), not a single-layer k/h."""
+    sim = _build_forcing_solver()
+    G_x, _, _, _ = build_face_conductances(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dtype=torch.float64,
+    )
+    h = float(sim.grid_x[1] - sim.grid_x[0])
+    face_idx = int(np.floor((0.5 - 0.0) / h))
+    expected = 1.0 / ((h / 2.0) / 2.0 + 0.5 + (h / 2.0) / 1.0)
+    np.testing.assert_allclose(G_x.numpy()[face_idx, :], expected,
+                               rtol=0, atol=1e-12)
+
+
+def test_cn_coefficients_match_solver():
+    sim = _build_forcing_solver()
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, dtype=torch.float64,
+    )
+    np.testing.assert_allclose(geom.r_w.numpy(), sim.r_w, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(geom.r_e.numpy(), sim.r_e, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(geom.r_s.numpy(), sim.r_s, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(geom.r_n.numpy(), sim.r_n, rtol=0, atol=1e-12)
+
+
+def test_interior_residual_zero_on_truth_float64():
+    """The interior CN residual on consecutive solver snapshots must be at the
+    direct-solve floor. `splu` is essentially exact, so float64 residuals sit
+    near machine precision relative to the field scale (~300 K)."""
+    sim = _build_forcing_solver()
+    T0 = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, dtype=torch.float64,
+    )
+
+    # Sample several consecutive pairs spanning the forced ramp where interior
+    # gradients are nontrivial.
+    max_abs = 0.0
+    for n in (1, 5, 10, 20, 40):
+        T_n = torch.as_tensor(T_hist[n], dtype=torch.float64)
+        T_np1 = torch.as_tensor(T_hist[n + 1], dtype=torch.float64)
+        res, mask = interior_cn_residual(T_n, T_np1, geom)
+        max_abs = max(max_abs, float(res.abs().max()))
+
+    # Field scale ~300 K; direct-solve residual should be many orders below.
+    assert max_abs < 1e-7, f"float64 interior residual floor too high: {max_abs:.3e}"
+
+
+def test_interior_residual_float32_noise_floor():
+    """Characterize (not gate hard) the float32 floor. `res` divides the small
+    one-step change by dt=0.005 and differences fluxes, so float32 snapshots
+    amplify ~7-digit cancellation; the live float32 training residual must be
+    judged against this elevated floor, not the float64 one."""
+    sim = _build_forcing_solver()
+    T0 = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+    geom32 = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, dtype=torch.float32,
+    )
+
+    max_abs = 0.0
+    for n in (1, 5, 10, 20, 40):
+        T_n = torch.as_tensor(T_hist[n].astype(np.float32), dtype=torch.float32)
+        T_np1 = torch.as_tensor(T_hist[n + 1].astype(np.float32), dtype=torch.float32)
+        res, _ = interior_cn_residual(T_n, T_np1, geom32)
+        max_abs = max(max_abs, float(res.abs().max()))
+
+    # Float32 floor is far above float64 but still small vs the field scale.
+    # This is a documented characterization bound, not a tight gate.
+    assert max_abs < 1e-1, f"float32 interior residual floor unexpectedly high: {max_abs:.3e}"
+    # Sanity: float32 floor is strictly worse than float64 (cancellation), so it
+    # should be well above machine-zero — guards against a silently-zeroed mask.
+    assert max_abs > 1e-6, f"float32 floor suspiciously low (mask zeroed?): {max_abs:.3e}"
+
+
+def test_interior_residual_batched_and_grad():
+    """Residual accepts a batch dim, is differentiable wrt the prediction, and
+    zeros every non-interior cell (boundary/Dirichlet rows)."""
+    sim = _build_forcing_solver()
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, dtype=torch.float64,
+    )
+    Nx, Ny = sim.Nx, sim.Ny
+    T_n = torch.zeros((2, Nx, Ny), dtype=torch.float64)
+    T_np1 = torch.randn((2, Nx, Ny), dtype=torch.float64, requires_grad=True)
+
+    res, mask = interior_cn_residual(T_n, T_np1, geom)
+    assert res.shape == (2, Nx, Ny)
+
+    # Boundary rows/cols are masked out.
+    assert torch.all(res[:, 0, :] == 0)
+    assert torch.all(res[:, -1, :] == 0)
+    assert torch.all(res[:, :, 0] == 0)
+    assert torch.all(res[:, :, -1] == 0)
+    assert bool(mask[1:-1, 1:-1].all()) and not bool(mask[0, 0])
+
+    loss = (res ** 2).mean()
+    loss.backward()
+    assert T_np1.grad is not None
+    assert torch.isfinite(T_np1.grad).all()
+    # Gradient is nonzero only on cells coupled to the interior.
+    assert float(T_np1.grad.abs().sum()) > 0.0
+
+
+# --- no-op / RNG guard ------------------------------------------------------
+#
+# The `lambda_physics=0` contract is a TRUE no-op: when the physics path is
+# disabled, `train_one_epoch` must NOT draw a physics batch or run the residual
+# forward, so the global RNG (and therefore the data stream) is byte-identical to
+# a data-only run. These tests gate that the branch is SKIPPED, not merely
+# weighted by zero — a "weighted by zero" implementation would still forward the
+# model on the physics batch and advance the RNG, which the positive control
+# below detects.
+
+
+class _DropoutModel(torch.nn.Module):
+    """Tiny stand-in whose forward consumes the global RNG (via dropout) so an
+    extra (erroneous) physics forward is observable in the post-epoch RNG state.
+    Output is the input snapshot (channel 0) plus a zero-weighted dropout term —
+    deterministic value, but each forward draws from the RNG."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1))
+        self.drop = torch.nn.Dropout(0.5)
+
+    def forward(self, x_spatial, cond_static, forcing_seq=None):
+        base = x_spatial[..., 0:1]
+        return base + self.w * self.drop(torch.ones_like(base))
+
+
+def _data_loss(y_pred, y_batch, iface_x):
+    return ((y_pred - y_batch) ** 2).mean()
+
+
+def _make_batches(n_batches=3, B=4, Nx=6, Ny=6, seed=7):
+    rng = np.random.default_rng(seed)
+    batches = []
+    for _ in range(n_batches):
+        spatial = torch.as_tensor(
+            rng.standard_normal((B, Nx, Ny, 1)), dtype=torch.float32
+        )
+        cond_static = torch.as_tensor(
+            rng.uniform(0.0, 1.0, (B, 3)), dtype=torch.float32
+        )
+        Y = torch.as_tensor(
+            rng.standard_normal((B, Nx, Ny, 1)), dtype=torch.float32
+        )
+        batches.append({"spatial": spatial, "cond_static": cond_static, "Y": Y})
+    return batches
+
+
+def _run_epoch(physics_loader, lambda_physics, geom_cfg, epoch_seed=1234):
+    from src.operators.train import train_one_epoch
+
+    torch.manual_seed(0)
+    model = _DropoutModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    batches = _make_batches()
+
+    torch.manual_seed(epoch_seed)
+    metrics = train_one_epoch(
+        model=model, train_loader=batches, optimizer=optimizer,
+        loss_fn=_data_loss, device=torch.device("cpu"),
+        physics_loader=physics_loader, physics_geom_cfg=geom_cfg,
+        lambda_data=1.0, lambda_physics=lambda_physics,
+    )
+    return metrics, torch.get_rng_state()
+
+
+def test_physics_lambda_zero_is_true_noop():
+    """`lambda_physics=0` with a physics loader PRESENT reproduces the data-only
+    run exactly — identical metrics and identical post-epoch RNG state — proving
+    the physics branch is skipped, not run-then-zeroed."""
+    physics_loader = _make_batches(seed=99)  # present but must be untouched
+    geom_cfg = {
+        "x_grid": np.linspace(0.0, 1.0, 6), "y_grid": np.linspace(0.0, 1.0, 6),
+        "k_left": 2.0, "k_right": 1.0, "interface_x": 0.5, "dt": 0.005,
+        "sigma_global": 1.0, "rc_range": (0.05, 1.0), "rc_index": 2,
+    }
+
+    base_metrics, base_rng = _run_epoch(None, 0.0, None)
+    noop_metrics, noop_rng = _run_epoch(physics_loader, 0.0, geom_cfg)
+
+    assert torch.equal(base_rng, noop_rng), "physics branch perturbed the RNG at lambda=0"
+    for k in base_metrics:
+        assert base_metrics[k] == noop_metrics[k], f"metric {k} changed at lambda=0"
+    assert noop_metrics["physics_loss"] == 0.0
+
+
+def test_physics_lambda_positive_fires_branch():
+    """Positive control: with `lambda_physics>0` the physics forward runs, drawing
+    an extra dropout sample, so the post-epoch RNG state MUST differ from the
+    no-op run and a finite physics_loss is recorded. Guards against a no-op test
+    that would pass even if the branch were dead."""
+    physics_loader = _make_batches(seed=99)
+    geom_cfg = {
+        "x_grid": np.linspace(0.0, 1.0, 6), "y_grid": np.linspace(0.0, 1.0, 6),
+        "k_left": 2.0, "k_right": 1.0, "interface_x": 0.5, "dt": 0.005,
+        "sigma_global": 1.0, "rc_range": (0.05, 1.0), "rc_index": 2,
+    }
+
+    _, base_rng = _run_epoch(None, 0.0, None)
+    on_metrics, on_rng = _run_epoch(physics_loader, 0.5, geom_cfg)
+
+    assert not torch.equal(base_rng, on_rng), "enabled physics branch did not advance the RNG"
+    assert np.isfinite(on_metrics["physics_loss"])
+    assert on_metrics["physics_loss"] > 0.0
