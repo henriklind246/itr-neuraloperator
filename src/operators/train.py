@@ -19,6 +19,7 @@ from torch.optim import Adam, AdamW
 from data.dataset import (
     TEMPORAL_SAMPLES,
     SnapshotPairDataset,
+    collate_fn,
     compute_global_stats,
     create_dataloaders,
     load_ramp_seconds,
@@ -35,6 +36,7 @@ from src.operators.losses import (
     SpatiallyWeightedMSE,
     build_interface_band,
     build_interface_mask,
+    full_bc_physics_loss,
     get_batch_interface_x,
     interface_flanking_nodes,
     interface_flanking_nodes_per_sample,
@@ -44,7 +46,8 @@ from src.operators.losses import (
     physics_residual_loss,
     tail_stats,
 )
-from src.physics.fv_residual import build_cn_geom_batched
+from src.operators.rollout import build_rollout_item_from_base, _q_callable_for_boundary
+from src.physics.fv_residual import FullBCData, build_cn_geom_batched
 from src.operators.utils import resolve_device
 
 from omegaconf import OmegaConf
@@ -684,7 +687,6 @@ def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, ba
     OOD-scaled inputs and the residual's ``sigma_global`` rescale is wrong.
     """
     from torch.utils.data import DataLoader
-    from data.dataset import collate_fn
 
     data_dir = phys_cfg.get("data_dir") or None
     if data_dir is not None:
@@ -746,6 +748,162 @@ def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, ba
     return loader, geom_cfg
 
 
+class CollocationSampler:
+    """Draws W2 collocation batches from the held-out (validation) sims.
+
+    Each item is a base state ``T(t_s)`` (a real saved snapshot of a held-out
+    sim — the under-supervised cross-sim distribution the residual is meant to
+    constrain) plus a model query at lead ``L`` (``t = t_s + L``) and at
+    ``t + dt``. Forwarding the model at both times yields two fields one solver
+    step ``dt`` apart, which the ``full_bc`` CN residual couples. The left-edge
+    flux ``q_L`` and right-edge Dirichlet target are reconstructed analytically
+    at the collocation times so the boundary closures are exact.
+
+    Uses its OWN ``np.random.Generator`` so enabling the physics term does not
+    perturb the global torch/numpy RNG stream (the data loader's shuffling and
+    the no-op guarantee are untouched).
+    """
+
+    def __init__(self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed):
+        self.ds = ds
+        self.spec = spec
+        self.geom_cfg = geom_cfg
+        self.batch_size = int(batch_size)
+        self.dt = float(dt)
+        self.t_final = float(ds.t_final)
+        self.sim_ids = np.asarray(ds.sim_ids)
+        self.rng = np.random.default_rng(rng_seed)
+
+    def sample_batch(self, max_lead: float):
+        """Sample one collocation batch. Leads are drawn in ``[dt, max_lead]``
+        from base snapshots whose ``t_s + max_lead + dt`` stays within the
+        forcing time support ``t_final``. Raises if no base snapshot supports
+        the requested ``max_lead`` (rather than silently extrapolating the
+        forcing past its support) and hard-asserts each ``t + dt`` is in range.
+        """
+        ds = self.ds
+        dt = self.dt
+        tol = 1e-9
+        max_lead = max(float(max_lead), dt)
+        valid_s = [
+            int(s) for s in ds.t_indices
+            if float(ds.t_grid[s]) + max_lead + dt <= self.t_final + tol
+        ]
+        if not valid_s:
+            raise ValueError(
+                f"No base snapshot supports collocation max_lead={max_lead} + "
+                f"dt={dt} within t_final={self.t_final}; lower collocation_lead_max."
+            )
+
+        items_t, items_tdt = [], []
+        R_c_list, qLn_list, qLnp1_list = [], [], []
+        for _ in range(self.batch_size):
+            sid = int(self.rng.choice(self.sim_ids))
+            s = int(self.rng.choice(valid_s))
+            lead = float(self.rng.uniform(dt, max_lead)) if max_lead > dt else dt
+            t_s = float(ds.t_grid[s])
+            t = t_s + lead
+            t_dt = t + dt
+            if t_dt > self.t_final + tol:
+                raise AssertionError(
+                    f"collocation time t+dt={t_dt} exceeds forcing support "
+                    f"t_final={self.t_final}"
+                )
+
+            base_item = ds.problem.build_item(ds, sid, s, s)
+            current = base_item["spatial"][..., 0]
+            item_t = build_rollout_item_from_base(
+                base_item, ds, self.spec, sid, current, t_s, t
+            )
+            item_tdt = build_rollout_item_from_base(
+                base_item, ds, self.spec, sid, current, t_s, t_dt
+            )
+
+            params = ds.sim_params[sid]
+            a_fn = _q_callable_for_boundary(ds, sid, params)
+            s_y = ds.s_y_profiles[sid]
+            qLn = (float(a_fn(t)) * s_y).astype(np.float32)
+            qLnp1 = (float(a_fn(t_dt)) * s_y).astype(np.float32)
+
+            items_t.append({k: torch.from_numpy(v) for k, v in item_t.items()})
+            items_tdt.append({k: torch.from_numpy(v) for k, v in item_tdt.items()})
+            R_c_list.append(float(params["R_c"]))
+            qLn_list.append(qLn)
+            qLnp1_list.append(qLnp1)
+
+        batch_t = collate_fn(items_t)
+        batch_tdt = collate_fn(items_tdt)
+        R_c = torch.tensor(R_c_list, dtype=torch.float32)
+        qL_n = torch.from_numpy(np.stack(qLn_list))
+        qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
+        return batch_t, batch_tdt, R_c, qL_n, qL_np1
+
+
+def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_global,
+                               *, batch_size, rng_seed):
+    """Build the W2 collocation sampler over the held-out (validation) sims.
+
+    ``forcing``-only: two-slab ``k=2/k=1`` interface at ``x=0.5``, scalar
+    ``R_c``, constant right-edge ``T_right = 300 K`` (the Dirichlet target,
+    normalized with the training stats). The physics step ``dt`` is the
+    dedicated collocation residual step (``physics.dt``, default 0.005), which
+    may differ from the saved data spacing.
+    """
+    dt = float(phys_cfg.get("dt", 0.005))
+    T_right = 300.0
+    geom_cfg = {
+        "x_grid": np.asarray(ds.x_grid, dtype=float),
+        "y_grid": np.asarray(ds.y_grid, dtype=float),
+        "k_left": 2.0,
+        "k_right": 1.0,
+        "interface_x": float(phys_cfg.get("interface_x", 0.5)),
+        "dt": dt,
+        "sigma_global": float(sigma_global),
+        "T_right_tilde": (T_right - float(mu_global)) / float(sigma_global),
+    }
+    pbs = phys_cfg.get("physics_batch_size") or batch_size
+    return CollocationSampler(
+        ds, spec, geom_cfg, batch_size=pbs, dt=dt, rng_seed=rng_seed
+    )
+
+
+def _collocation_batch_loss(model, sampler, max_lead, region_weights, device):
+    """Forward the model at the collocation pair ``(t, t+dt)`` and return the
+    region-partitioned ``full_bc`` physics loss dict plus the batch size.
+
+    Both fields are model outputs from the same base input, so the right-edge
+    Dirichlet closure is anchored at BOTH times (``dirichlet_both_ends``).
+    """
+    batch_t, batch_tdt, R_c, qL_n, qL_np1 = sampler.sample_batch(max_lead)
+
+    def _fwd(b):
+        spatial = b["spatial"].to(device)
+        cond = b["cond_static"].to(device)
+        fseq = b["forcing_seq"].to(device) if "forcing_seq" in b else None
+        return model(spatial, cond, fseq)
+
+    yt = _fwd(batch_t)
+    ytdt = _fwd(batch_tdt)
+
+    geom = build_cn_geom_batched(
+        sampler.geom_cfg["x_grid"], sampler.geom_cfg["y_grid"],
+        sampler.geom_cfg["k_left"], sampler.geom_cfg["k_right"],
+        sampler.geom_cfg["interface_x"], R_c.to(device),
+        sampler.geom_cfg["dt"], sigma_global=sampler.geom_cfg["sigma_global"],
+        device=device, dtype=yt.dtype,
+    )
+    bc = FullBCData(
+        T_right_tilde=sampler.geom_cfg["T_right_tilde"],
+        qL_n=qL_n.to(device=device, dtype=yt.dtype),
+        qL_np1=qL_np1.to(device=device, dtype=yt.dtype),
+    )
+    out = full_bc_physics_loss(
+        yt, ytdt, geom, bc,
+        region_weights=region_weights, dirichlet_both_ends=True,
+    )
+    return out, R_c.shape[0]
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -761,6 +919,9 @@ def train_one_epoch(
     sigma_global: float = 1.0,
     physics_loader=None,
     physics_geom_cfg=None,
+    physics_collocation=None,
+    collocation_max_lead=None,
+    physics_region_weights=None,
     lambda_data: float = 1.0,
     lambda_physics: float = 0.0,
 ) -> dict[str, float]:
@@ -805,10 +966,20 @@ def train_one_epoch(
 
     # Physics-residual regularizer. Disabled => the branch below is skipped
     # entirely (no loader build, no batch draw, no residual), so the data stream
-    # and RNG order are byte-identical to a data-only run.
-    phys_enabled = physics_loader is not None and lambda_physics > 0.0
-    phys_iter = iter(physics_loader) if phys_enabled else None
+    # and RNG order are byte-identical to a data-only run. Two mutually-exclusive
+    # sources: a W1 one-step ``physics_loader`` (interior residual) or a W2
+    # ``physics_collocation`` sampler (full_bc residual on model-pair outputs).
+    phys_collocation = physics_collocation is not None and lambda_physics > 0.0
+    phys_onestep = physics_loader is not None and lambda_physics > 0.0
+    phys_enabled = phys_onestep or phys_collocation
+    phys_iter = iter(physics_loader) if phys_onestep else None
     phys_loss_sum = 0.0
+    phys_weighted_sum = 0.0
+    phys_allcell_sum = 0.0
+    phys_region_sums = {
+        "interior": 0.0, "left_neumann": 0.0,
+        "right_dirichlet": 0.0, "topbot_adiabatic": 0.0,
+    }
     n_phys = 0
 
     for batch in train_loader:
@@ -823,7 +994,20 @@ def train_one_epoch(
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond_static, forcing_seq)
         loss = loss_fn(y_pred, y_batch, iface_x)
-        if phys_enabled:
+        if phys_collocation:
+            out, p_b = _collocation_batch_loss(
+                model, physics_collocation, collocation_max_lead,
+                physics_region_weights, device,
+            )
+            p_loss = out["physics_loss_weighted"]
+            (lambda_data * loss + lambda_physics * p_loss).backward()
+            phys_loss_sum += p_loss.item() * p_b
+            phys_weighted_sum += out["physics_loss_weighted"].item() * p_b
+            phys_allcell_sum += out["physics_loss_allcell_mean"].item() * p_b
+            for _r in phys_region_sums:
+                phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
+            n_phys += p_b
+        elif phys_onestep:
             p_loss, p_b, phys_iter = _physics_batch_loss(
                 model, physics_loader, phys_iter, physics_geom_cfg, device
             )
@@ -886,7 +1070,10 @@ def train_one_epoch(
             [loss_sum, mse_sum, target_sq_sum, iface_mse_sum, iface_target_sq_sum,
              float(n_samples), float(n_iface_voxels),
              nrmse_sum, rmse_K_sum, node_jump_rmse_K_sum, node_jump_nrmse_sum,
-             gnrmse_sum, node_jump_gnrmse_sum, phys_loss_sum, float(n_phys)],
+             gnrmse_sum, node_jump_gnrmse_sum, phys_loss_sum, float(n_phys),
+             phys_weighted_sum, phys_allcell_sum,
+             phys_region_sums["interior"], phys_region_sums["left_neumann"],
+             phys_region_sums["right_dirichlet"], phys_region_sums["topbot_adiabatic"]],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -905,6 +1092,12 @@ def train_one_epoch(
         node_jump_gnrmse_sum = t[12].item()
         phys_loss_sum = t[13].item()
         n_phys = int(t[14].item())
+        phys_weighted_sum = t[15].item()
+        phys_allcell_sum = t[16].item()
+        phys_region_sums["interior"] = t[17].item()
+        phys_region_sums["left_neumann"] = t[18].item()
+        phys_region_sums["right_dirichlet"] = t[19].item()
+        phys_region_sums["topbot_adiabatic"] = t[20].item()
 
         m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
@@ -929,6 +1122,14 @@ def train_one_epoch(
         "node_jump_nrmse": (node_jump_nrmse_sum / denom) * 100.0,
         "node_jump_gnrmse_pct": (node_jump_gnrmse_sum / denom) * 100.0,
         "physics_loss": phys_loss_sum / max(n_phys, 1),
+        # Per-region full_bc diagnostics (populated by the Stage-2 collocation
+        # path; the interior W1 path leaves them at 0.0).
+        "physics_loss_weighted": phys_weighted_sum / max(n_phys, 1),
+        "physics_loss_allcell_mean": phys_allcell_sum / max(n_phys, 1),
+        "phys_interior_mse": phys_region_sums["interior"] / max(n_phys, 1),
+        "phys_left_neumann_mse": phys_region_sums["left_neumann"] / max(n_phys, 1),
+        "phys_right_dirichlet_mse": phys_region_sums["right_dirichlet"] / max(n_phys, 1),
+        "phys_topbot_adiabatic_mse": phys_region_sums["topbot_adiabatic"] / max(n_phys, 1),
     }
 
 
@@ -1446,15 +1647,41 @@ def run_one_seed(
 
     use_per_sample_interface = bool(loss_cfg.get("per_sample_interface_x", False))
 
-    # Physics-residual regularizer (W1). Build the dedicated one-step loader +
-    # geometry config ONLY when active; lambda_physics=0 is a TRUE no-op (nothing
-    # below is constructed, so the data stream and RNG are untouched).
+    # Physics-residual regularizer. Build the physics supply ONLY when active;
+    # lambda_physics=0 is a TRUE no-op (nothing below is constructed, so the data
+    # stream and RNG are untouched). Two modes:
+    #   W1 (mode=one_step): dedicated consecutive-pair loader + interior residual.
+    #   W2 (mode=collocation): a sampler over the HELD-OUT (validation) sims that
+    #     forwards the model at (t, t+dt) and enforces the full_bc residual on its
+    #     own outputs at long-lead/OOD horizons (the cross-sim under-supervised
+    #     distribution). The lead curriculum ramps the max collocation lead.
     phys_cfg = config["training"].get("physics", {})
     lambda_physics = float(phys_cfg.get("lambda_physics", 0.0))
     lambda_data = float(phys_cfg.get("lambda_data", 1.0))
+    phys_mode = str(phys_cfg.get("mode", "one_step"))
     physics_loader = None
     physics_geom_cfg = None
-    if lambda_physics > 0.0:
+    physics_collocation = None
+    physics_region_weights = None
+    collocation_lead_start = float(phys_cfg.get("collocation_lead_start", 0.01))
+    collocation_lead_max = float(phys_cfg.get("collocation_lead_max", 0.01))
+    collocation_lead_warmup = int(phys_cfg.get("collocation_lead_warmup_epochs", 0))
+    if lambda_physics > 0.0 and phys_mode == "collocation":
+        physics_region_weights = phys_cfg.get("full_bc_region_weights", None)
+        physics_collocation = _build_collocation_sampler(
+            config, phys_cfg, validation_set.dataset, spec,
+            mu_global, sigma_global,
+            batch_size=config["training"]["batch_size"], rng_seed=seed,
+        )
+        if is_main:
+            print(
+                f"Physics regularizer ON (W2 collocation): lambda_data={lambda_data}, "
+                f"lambda_physics={lambda_physics}, residual=full_bc, "
+                f"lead_start={collocation_lead_start}, lead_max={collocation_lead_max}, "
+                f"lead_warmup={collocation_lead_warmup}",
+                flush=True,
+            )
+    elif lambda_physics > 0.0:
         physics_loader, physics_geom_cfg = _build_physics_loader(
             config, phys_cfg, spec, mu_global, sigma_global,
             batch_size=config["training"]["batch_size"],
@@ -1480,7 +1707,11 @@ def run_one_seed(
     csv_path = run_path / "train_metrics.csv"
     val_pairs_path = run_path / "val_pairs.csv"
     fieldnames = [
-        "epoch", "train_loss", "train_physics_loss", "train_rel_l2", "train_iface_rel_l2",
+        "epoch", "train_loss", "train_physics_loss",
+        "train_physics_loss_weighted", "train_physics_loss_allcell_mean",
+        "train_phys_interior_mse", "train_phys_left_neumann_mse",
+        "train_phys_right_dirichlet_mse", "train_phys_topbot_adiabatic_mse",
+        "train_rel_l2", "train_iface_rel_l2",
         "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
         "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
         "val_rel_l2", "val_iface_rel_l2",
@@ -1541,6 +1772,19 @@ def run_one_seed(
 
         lr = optimizer.param_groups[0]["lr"]
 
+        # W2 collocation-lead curriculum: ramp the max lead from start to max over
+        # `collocation_lead_warmup` epochs (an optimization-stability device — do
+        # not slam a strong residual onto garbage long-lead outputs early). Inert
+        # when collocation is off.
+        if collocation_lead_warmup > 0:
+            cfrac = min(1.0, (epoch + 1) / collocation_lead_warmup)
+        else:
+            cfrac = 1.0
+        collocation_max_lead = (
+            collocation_lead_start
+            + cfrac * (collocation_lead_max - collocation_lead_start)
+        )
+
         train_metrics = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
@@ -1550,6 +1794,9 @@ def run_one_seed(
             sigma_global=sigma_global,
             physics_loader=physics_loader,
             physics_geom_cfg=physics_geom_cfg,
+            physics_collocation=physics_collocation,
+            collocation_max_lead=collocation_max_lead,
+            physics_region_weights=physics_region_weights,
             lambda_data=lambda_data,
             lambda_physics=lambda_physics,
         )
@@ -1689,6 +1936,12 @@ def run_one_seed(
                     "epoch": epoch,
                     "train_loss": float(train_loss),
                     "train_physics_loss": float(train_metrics["physics_loss"]),
+                    "train_physics_loss_weighted": float(train_metrics["physics_loss_weighted"]),
+                    "train_physics_loss_allcell_mean": float(train_metrics["physics_loss_allcell_mean"]),
+                    "train_phys_interior_mse": float(train_metrics["phys_interior_mse"]),
+                    "train_phys_left_neumann_mse": float(train_metrics["phys_left_neumann_mse"]),
+                    "train_phys_right_dirichlet_mse": float(train_metrics["phys_right_dirichlet_mse"]),
+                    "train_phys_topbot_adiabatic_mse": float(train_metrics["phys_topbot_adiabatic_mse"]),
                     "train_rel_l2": float(train_rel_l2),
                     "train_iface_rel_l2": float(train_iface_rel_l2),
                     "train_nrmse": float(train_metrics["nrmse"]),

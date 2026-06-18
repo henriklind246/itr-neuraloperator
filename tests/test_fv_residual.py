@@ -7,7 +7,10 @@ from src.physics.fv_residual import (
     build_face_conductances,
     build_cn_geom,
     interior_cn_residual,
+    full_bc_cn_residual,
+    FullBCData,
 )
+from src.operators.losses import full_bc_physics_loss
 
 """
 Stage 1 correctness gates for `src/physics/fv_residual.py`.
@@ -176,6 +179,149 @@ def test_interior_residual_batched_and_grad():
     assert float(T_np1.grad.abs().sum()) > 0.0
 
 
+# --- Stage 2: full-BC residual ---------------------------------------------
+#
+# The full-BC residual adds the solver's three boundary closures (right
+# Dirichlet, top/bottom adiabatic, left time-dependent Neumann forcing) so it is
+# ~0 across EVERY region on consecutive ground-truth snapshots — including the
+# forced left row. The gate uses the sim's real `q_left`/`T_right`, so a missing
+# or wrong Neumann reconstruction surfaces as a nonzero left-row residual rather
+# than passing silently. Evaluated in float64 on raw (sigma_global=1) fields.
+
+
+def _full_bc_data_for_step(sim, n: int, dtype=torch.float64) -> FullBCData:
+    """Build `FullBCData` for the consecutive pair (snapshot n -> n+1) from the
+    solver's own `q_left`/`T_right`, mirroring `cn_step`'s callable branch
+    (`rhs[0]+=dt*(q(tn)+q(tn+dt))/(rho_cp_left*h)`; `rhs[Nx-1]=T_right(tn+dt)`).
+    Raw physical fields => sigma_global=1, so T_right_tilde = T_right itself."""
+    tn = float(sim.t[n])
+    tnp1 = float(sim.t[n + 1])
+    qL_n = torch.as_tensor(sim.q_left(tn), dtype=dtype)
+    qL_np1 = torch.as_tensor(sim.q_left(tnp1), dtype=dtype)
+    T_right_tilde = torch.as_tensor(float(sim.T_right(tnp1)), dtype=dtype)
+    return FullBCData(T_right_tilde=T_right_tilde, qL_n=qL_n, qL_np1=qL_np1)
+
+
+def test_full_bc_residual_zero_on_truth_float64():
+    """`full_bc_cn_residual` on consecutive solver snapshots is at the
+    direct-solve floor in EVERY region (interior, top/bottom adiabatic, left
+    Neumann, right Dirichlet), using the sim's real forced left flux."""
+    sim = _build_forcing_solver()
+    T0 = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+
+    region_max = {}
+    for n in (1, 5, 10, 20, 40):
+        T_n = torch.as_tensor(T_hist[n], dtype=torch.float64)
+        T_np1 = torch.as_tensor(T_hist[n + 1], dtype=torch.float64)
+        bc = _full_bc_data_for_step(sim, n)
+        parts = full_bc_cn_residual(T_n, T_np1, geom, bc)
+        for name, vec in parts.items():
+            region_max[name] = max(region_max.get(name, 0.0),
+                                   float(vec.abs().max()))
+
+    for name, m in region_max.items():
+        assert m < 1e-7, f"full_bc region {name} residual floor too high: {m:.3e}"
+
+
+def test_full_bc_region_mse_zero_on_truth():
+    """The loss reducer's per-region MSEs and the weighted/all-cell aggregates
+    are all at the float64 floor on truth — the Stage-2 well-posedness gate as
+    the training path will compute it."""
+    sim = _build_forcing_solver()
+    T0 = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+
+    n = 10
+    T_n = torch.as_tensor(T_hist[n], dtype=torch.float64)
+    T_np1 = torch.as_tensor(T_hist[n + 1], dtype=torch.float64)
+    bc = _full_bc_data_for_step(sim, n)
+    out = full_bc_physics_loss(T_n, T_np1, geom, bc)
+
+    for key in ("phys_interior_mse", "phys_left_neumann_mse",
+                "phys_right_dirichlet_mse", "phys_topbot_adiabatic_mse",
+                "physics_loss_weighted", "physics_loss_allcell_mean"):
+        assert float(out[key]) < 1e-13, f"{key} too high on truth: {float(out[key]):.3e}"
+
+
+def test_full_bc_left_neumann_required_on_forcing():
+    """Negative control: dropping the left flux (assuming q_L=0) must blow up the
+    left-Neumann region while the other regions stay at the floor — i.e. the
+    Neumann reconstruction is REQUIRED on `forcing`, not optional."""
+    sim = _build_forcing_solver()
+    T0 = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+
+    n = 10  # forcing window is t_on=0..t_off=0.2, so the ramp is active here
+    T_n = torch.as_tensor(T_hist[n], dtype=torch.float64)
+    T_np1 = torch.as_tensor(T_hist[n + 1], dtype=torch.float64)
+
+    bc_real = _full_bc_data_for_step(sim, n)
+    zero = torch.zeros_like(bc_real.qL_n)
+    bc_zero = FullBCData(T_right_tilde=bc_real.T_right_tilde, qL_n=zero, qL_np1=zero)
+
+    real = full_bc_physics_loss(T_n, T_np1, geom, bc_real)
+    dropped = full_bc_physics_loss(T_n, T_np1, geom, bc_zero)
+
+    # Only the left row should change; it must move far above the float64 floor.
+    assert float(dropped["phys_left_neumann_mse"]) > 1e-6
+    assert float(dropped["phys_left_neumann_mse"]) > 1e6 * float(real["phys_left_neumann_mse"])
+    assert float(dropped["phys_interior_mse"]) == float(real["phys_interior_mse"])
+    assert float(dropped["phys_right_dirichlet_mse"]) == float(real["phys_right_dirichlet_mse"])
+
+
+def test_full_bc_shape_grad_and_both_ends():
+    """Full-BC residual accepts a batch, is differentiable wrt the prediction,
+    partitions the grid exactly, and exposes the both-ends Dirichlet term."""
+    sim = _build_forcing_solver()
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    Nx, Ny = sim.Nx, sim.Ny
+    B = 3
+    T_n = torch.zeros((B, Nx, Ny), dtype=torch.float64)
+    T_np1 = torch.randn((B, Nx, Ny), dtype=torch.float64, requires_grad=True)
+    bc = FullBCData(
+        T_right_tilde=torch.zeros((B, Ny), dtype=torch.float64),
+        qL_n=torch.zeros((B, Ny), dtype=torch.float64),
+        qL_np1=torch.zeros((B, Ny), dtype=torch.float64),
+    )
+
+    parts = full_bc_cn_residual(T_n, T_np1, geom, bc, dirichlet_both_ends=True)
+    # Region cell counts partition the full grid (single-end Dirichlet).
+    n_cells = (parts["interior"].numel() + parts["left_neumann"].numel()
+               + parts["right_dirichlet"].numel() + parts["topbot_adiabatic"].numel())
+    assert n_cells == B * Nx * Ny
+    assert "right_dirichlet_n" in parts
+    assert parts["right_dirichlet_n"].numel() == B * Ny
+
+    out = full_bc_physics_loss(T_n, T_np1, geom, bc, dirichlet_both_ends=True)
+    loss = out["physics_loss_weighted"]
+    loss.backward()
+    assert T_np1.grad is not None and torch.isfinite(T_np1.grad).all()
+    assert float(T_np1.grad.abs().sum()) > 0.0
+
+
 # --- no-op / RNG guard ------------------------------------------------------
 #
 # The `lambda_physics=0` contract is a TRUE no-op: when the physics path is
@@ -280,3 +426,63 @@ def test_physics_lambda_positive_fires_branch():
     assert not torch.equal(base_rng, on_rng), "enabled physics branch did not advance the RNG"
     assert np.isfinite(on_metrics["physics_loss"])
     assert on_metrics["physics_loss"] > 0.0
+
+
+# --- W2 collocation sampler: forcing-support hard assertion -----------------
+#
+# The left-Neumann closure needs q_L(y, t) and q_L(y, t+dt) at the COLLOCATION
+# times, so no sampled collocation time may exceed the forcing time support
+# (t_final). The sampler must raise rather than silently extrapolate the forcing
+# past its support — otherwise the left-row residual becomes silently wrong.
+
+
+class _StubDS:
+    """Minimal `ds` exposing only what `CollocationSampler.sample_batch` touches
+    before any item is built: the saved-snapshot index set, the time grid, the
+    final time, and the sim ids. The out-of-support filter (`valid_s`) runs first
+    and raises, so the heavier item-building machinery is never reached."""
+
+    def __init__(self, t_grid, t_indices, t_final, sim_ids):
+        self.t_grid = np.asarray(t_grid, dtype=float)
+        self.t_indices = list(t_indices)
+        self.t_final = float(t_final)
+        self.sim_ids = np.asarray(sim_ids)
+
+
+def _stub_sampler(max_t_final=0.3, n_saved=31, dt=0.005):
+    from src.operators.train import CollocationSampler
+
+    t_grid = np.linspace(0.0, max_t_final, n_saved)
+    ds = _StubDS(
+        t_grid=t_grid, t_indices=range(n_saved),
+        t_final=max_t_final, sim_ids=np.array([0, 1, 2]),
+    )
+    geom_cfg = {  # unused before the support filter raises
+        "x_grid": np.linspace(0.0, 1.0, 6), "y_grid": np.linspace(0.0, 1.0, 6),
+        "k_left": 2.0, "k_right": 1.0, "interface_x": 0.5, "dt": dt,
+        "sigma_global": 1.0, "T_right_tilde": 0.0,
+    }
+    return CollocationSampler(
+        ds, spec=None, geom_cfg=geom_cfg, batch_size=4, dt=dt, rng_seed=0
+    )
+
+
+def test_collocation_sampler_raises_out_of_support():
+    """An OOD max_lead that pushes t + max_lead + dt past t_final for EVERY base
+    snapshot must raise (no base supports it), not silently extrapolate q_L."""
+    sampler = _stub_sampler(max_t_final=0.3, dt=0.005)
+    # 0.0 (earliest base) + 0.5 + 0.005 = 0.505 > 0.3 for every snapshot.
+    with pytest.raises(ValueError, match="collocation_lead_max"):
+        sampler.sample_batch(max_lead=0.5)
+
+
+def test_collocation_sampler_support_boundary():
+    """Just past the support raises; the filter is the gate. A max_lead whose
+    earliest-base reach exceeds t_final (but is < the whole-grid extent) still
+    raises because the latest valid base must satisfy t_s + max_lead + dt <=
+    t_final, and here even t_s=0 fails."""
+    sampler = _stub_sampler(max_t_final=0.3, dt=0.005)
+    # t_final - dt = 0.295 is the largest lead any base at t_s=0 could support;
+    # anything strictly larger leaves no valid base.
+    with pytest.raises(ValueError):
+        sampler.sample_batch(max_lead=0.296)

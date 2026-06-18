@@ -236,6 +236,74 @@ def physics_residual_loss(
     return res.pow(2).sum() / denom
 
 
+_FULL_BC_REGIONS = ("interior", "left_neumann", "right_dirichlet", "topbot_adiabatic")
+
+
+def full_bc_physics_loss(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom,
+    bc,
+    region_weights: dict | None = None,
+    dirichlet_both_ends: bool = False,
+) -> dict:
+    """Region-partitioned full-BC physics loss for the Stage-2 ``full_bc`` path.
+
+    Computes the per-region mean-squared residual from
+    ``fv_residual.full_bc_cn_residual`` and returns a flat dict:
+
+      - ``phys_interior_mse``, ``phys_left_neumann_mse``,
+        ``phys_right_dirichlet_mse``, ``phys_topbot_adiabatic_mse`` — the
+        per-region diagnostics (mean over that region's cells, all four already
+        commensurate normalized per-step temperature errors).
+      - ``physics_loss_weighted`` — the gradient signal
+        ``sum_region w_region * region_mse`` with ``region_weights`` (default all
+        1.0, i.e. each REGION contributes equally, deliberately up-weighting the
+        few-celled boundary rows relative to a global all-cell mean).
+      - ``physics_loss_allcell_mean`` — the plain all-cell ``mean(r^2)`` over the
+        four-region partition (each cell once; unaffected by the weights), for
+        comparison against the raw residual behavior.
+
+    With ``dirichlet_both_ends`` the right-Dirichlet MSE averages the violation
+    at both model-output times (``T_n`` and ``T_np1``); ``physics_loss_allcell_mean``
+    still uses the single ``T_np1`` partition so it stays a true per-cell mean.
+    """
+    from src.physics.fv_residual import full_bc_cn_residual
+
+    if T_n.dim() == 4:
+        T_n = T_n[..., 0]
+        T_np1 = T_np1[..., 0]
+
+    parts = full_bc_cn_residual(
+        T_n, T_np1, geom, bc, dirichlet_both_ends=dirichlet_both_ends
+    )
+
+    region_mse = {name: parts[name].pow(2).mean() for name in _FULL_BC_REGIONS}
+    if dirichlet_both_ends:
+        region_mse["right_dirichlet"] = 0.5 * (
+            parts["right_dirichlet"].pow(2).mean()
+            + parts["right_dirichlet_n"].pow(2).mean()
+        )
+
+    weights = {name: 1.0 for name in _FULL_BC_REGIONS}
+    if region_weights:
+        for name, w in region_weights.items():
+            if name in weights:
+                weights[name] = float(w)
+
+    weighted = sum(weights[name] * region_mse[name] for name in _FULL_BC_REGIONS)
+    allcell = torch.cat([parts[name] for name in _FULL_BC_REGIONS]).pow(2).mean()
+
+    return {
+        "physics_loss_weighted": weighted,
+        "physics_loss_allcell_mean": allcell,
+        "phys_interior_mse": region_mse["interior"],
+        "phys_left_neumann_mse": region_mse["left_neumann"],
+        "phys_right_dirichlet_mse": region_mse["right_dirichlet"],
+        "phys_topbot_adiabatic_mse": region_mse["topbot_adiabatic"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Unified metric suite (per-sample, normalization-invariant headline + jump +
 # Kelvin + tails). Shared by train.py (train_one_epoch / validate) and

@@ -26,9 +26,16 @@ The interface / contact-resistance physics enters through the interface x-face
 conductance `G_x = 1/(h_L/k_L + R_c[j] + h_R/k_R)`, so the residual encodes the
 temperature-jump condition with no jump-specific term.
 
-`full_bc_cn_residual` (boundary closures + left time-dependent Neumann forcing)
-and the optional volumetric `source_term` are Stage 2 / Stage 3 and intentionally
-not implemented here.
+`full_bc_cn_residual` (Stage 2) extends the cell balance to every cell and adds
+the solver's three boundary closures (`fv_solver_2d.py:671-682`): the right
+Dirichlet column (`T^{n+1}_{Nx-1} = T_right`), the top/bottom adiabatic rows
+(zero external face flux, which the r-coefficients already encode), and the left
+time-dependent Neumann forcing (CN-averaged `0.5*(q_L(t)+q_L(t+dt))`). Every
+region's residual is a normalized per-step temperature error (the balance rows
+inherit the capacity folded into the r-coefficients; the algebraic Dirichlet row
+is a normalized-temperature mismatch), so the four regions are commensurate and
+can be summed/weighted directly. The optional volumetric `source_term` (Stage 3)
+is intentionally not implemented here.
 """
 
 
@@ -53,6 +60,7 @@ class FVGeom:
     interior_mask: torch.Tensor  # (Nx, Ny) bool
     dt: float
     sigma_global: float
+    hx: float                    # base grid spacing (left-Neumann flux uses h=hx)
 
     @property
     def Nx(self) -> int:
@@ -169,11 +177,12 @@ def build_cn_geom(x_grid, y_grid, k_left: float, k_right: float,
     interior_mask = torch.zeros((Nx, Ny), dtype=torch.bool, device=device)
     interior_mask[1:Nx - 1, 1:Ny - 1] = True
 
+    hx = float(np.asarray(x_grid, dtype=float)[1] - np.asarray(x_grid, dtype=float)[0])
     return FVGeom(
         G_x=G_x, G_y=G_y, dx=dx, dy=dy, rho_cp=rho_cp,
         r_w=r_w, r_e=r_e, r_s=r_s, r_n=r_n,
         interior_mask=interior_mask, dt=float(dt),
-        sigma_global=float(sigma_global),
+        sigma_global=float(sigma_global), hx=hx,
     )
 
 
@@ -237,7 +246,7 @@ def build_cn_geom_batched(x_grid, y_grid, k_left: float, k_right: float,
         G_x=G_x, G_y=G_y, dx=dx, dy=dy, rho_cp=rho_cp,
         r_w=r_w, r_e=r_e, r_s=r_s, r_n=r_n,
         interior_mask=interior_mask, dt=float(dt),
-        sigma_global=float(sigma_global),
+        sigma_global=float(sigma_global), hx=float(hx),
     )
 
 
@@ -293,3 +302,107 @@ def interior_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
         mask = mask & extra_mask.to(mask.device, torch.bool)
     res = res * mask[None].to(res.dtype)
     return res, mask
+
+
+@dataclass
+class FullBCData:
+    """Boundary data for `full_bc_cn_residual`, all in the SAME space as the
+    fields passed to the residual (normalized when the model outputs are
+    normalized).
+
+    `T_right_tilde` is the (normalized) right-edge Dirichlet target
+    `(T_right - mu_global) / sigma_global`; scalar or broadcastable to `(B, Ny)`.
+    `qL_n` / `qL_np1` are the PHYSICAL left-edge fluxes `q_L(y, t_n)` and
+    `q_L(y, t_n + dt)`, broadcastable to `(B, Ny)`; the residual divides them by
+    `sigma_global` to land in normalized-temperature units.
+    """
+    T_right_tilde: torch.Tensor
+    qL_n: torch.Tensor
+    qL_np1: torch.Tensor
+
+
+def _cn_laplacian_full(T: torch.Tensor, geom: FVGeom) -> torch.Tensor:
+    """Full-grid CN flux-balance operator `(B, Nx, Ny)`. Identical form to
+    `_cn_laplacian` but over every cell: at boundary cells the missing-face
+    r-coefficient is zero (mirroring `_build_local_cn_coefficients`), so the
+    out-of-domain neighbor placeholder never contributes. The Dirichlet row
+    `i = Nx-1` has all r-coefficients zero and is handled algebraically by
+    `full_bc_cn_residual`, not by this operator."""
+    Tw = torch.zeros_like(T)
+    Tw[:, 1:, :] = T[:, :-1, :]
+    Te = torch.zeros_like(T)
+    Te[:, :-1, :] = T[:, 1:, :]
+    Ts = torch.zeros_like(T)
+    Ts[:, :, 1:] = T[:, :, :-1]
+    Tn = torch.zeros_like(T)
+    Tn[:, :, :-1] = T[:, :, 1:]
+
+    return (geom.r_w * (Tw - T) + geom.r_e * (Te - T)
+            + geom.r_s * (Ts - T) + geom.r_n * (Tn - T))
+
+
+def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
+                        geom: FVGeom, bc: FullBCData,
+                        dirichlet_both_ends: bool = False) -> dict:
+    """Full-boundary CN residual, partitioned into the solver's four regions.
+
+    `T_n`, `T_np1` are normalized temperature fields one solver step `dt` apart,
+    shape `(B, Nx, Ny)` (a missing batch dim is added). Returns a dict of 1-D
+    residual vectors (flattened over batch and the region's cells), each a
+    normalized per-step temperature error:
+
+      - ``interior``          : CN cell balance, `i in [1,Nx-2], j in [1,Ny-2]`.
+      - ``topbot_adiabatic``  : CN cell balance on rows `j in {0,Ny-1}` for
+                                `i in [1,Nx-2]` (zero top/bottom face flux baked
+                                into the r-coefficients).
+      - ``left_neumann``      : CN cell balance on row `i=0` minus the normalized
+                                CN-averaged left flux `dt*(qL_n+qL_np1) /
+                                (rho_cp_left * hx * sigma_global)`.
+      - ``right_dirichlet``   : algebraic `T_np1[Nx-1,:] - T_right_tilde`.
+
+    The cell-balance regions reuse the solver's r-coefficients (dt, CN 1/2, and
+    cell capacity folded in), so they are nondimensional per-step temperature
+    residuals; the Dirichlet row is a normalized-temperature mismatch on the same
+    footing. With ``dirichlet_both_ends`` the dict also carries
+    ``right_dirichlet_n`` = `T_n[Nx-1,:] - T_right_tilde` so the W2 collocation
+    loss can anchor the right edge at BOTH model-output times (in W1 `T_n` is
+    truth, so only the `T_np1` end is needed).
+    """
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    if T_n.shape != T_np1.shape:
+        raise ValueError(
+            f"T_n shape {tuple(T_n.shape)} != T_np1 shape {tuple(T_np1.shape)}"
+        )
+
+    Nx, Ny = geom.Nx, geom.Ny
+
+    # CN cell balance on every active row (i = 0..Nx-2). The Dirichlet row
+    # i = Nx-1 carries zero r-coefficients here; it is overwritten algebraically.
+    bal = ((T_np1 - T_n)
+           - (_cn_laplacian_full(T_np1, geom) + _cn_laplacian_full(T_n, geom)))
+
+    # Left Neumann row i=0: subtract the normalized CN-averaged left flux.
+    rho_cp_left = geom.rho_cp[0, :]                          # (Ny,)
+    flux = bc.qL_n + bc.qL_np1                               # (B,Ny) after bcast
+    f_norm = geom.dt * flux / (rho_cp_left[None, :] * geom.hx * geom.sigma_global)
+    left_res = bal[:, 0, :] - f_norm                        # (B, Ny)
+
+    # Right Dirichlet column i=Nx-1 (algebraic).
+    right_res = T_np1[:, Nx - 1, :] - bc.T_right_tilde       # (B, Ny)
+
+    interior_res = bal[:, 1:Nx - 1, 1:Ny - 1]               # (B, Nx-2, Ny-2)
+    topbot_res = torch.cat(
+        (bal[:, 1:Nx - 1, 0], bal[:, 1:Nx - 1, Ny - 1]), dim=1
+    )                                                       # (B, 2*(Nx-2))
+
+    out = {
+        "interior": interior_res.reshape(-1),
+        "topbot_adiabatic": topbot_res.reshape(-1),
+        "left_neumann": left_res.reshape(-1),
+        "right_dirichlet": right_res.reshape(-1),
+    }
+    if dirichlet_both_ends:
+        out["right_dirichlet_n"] = (T_n[:, Nx - 1, :] - bc.T_right_tilde).reshape(-1)
+    return out
