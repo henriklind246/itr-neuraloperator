@@ -761,7 +761,10 @@ class CollocationSampler:
 
     Uses its OWN ``np.random.Generator`` so enabling the physics term does not
     perturb the global torch/numpy RNG stream (the data loader's shuffling and
-    the no-op guarantee are untouched).
+    the no-op guarantee are untouched). Under DDP the caller passes a
+    rank-offset ``rng_seed`` so each rank draws a disjoint collocation batch
+    (the DDP-averaged physics gradient then covers world_size x distinct
+    samples; see ``run_one_seed``).
     """
 
     def __init__(self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed):
@@ -1619,6 +1622,16 @@ def run_one_seed(
             device_ids=[dist_info.local_rank] if torch.cuda.is_available() else None,
             output_device=dist_info.local_rank if torch.cuda.is_available() else None,
             find_unused_parameters=False,
+            # The collocation physics path forwards the wrapped model three times
+            # per step (data + collocation t + collocation t+dt) before a single
+            # combined backward, so each parameter's grad-ready hook fires more
+            # than once. With the default reducer (one firing per param expected)
+            # the per-bucket all_reduce ordering can diverge across ranks and
+            # deadlock NCCL. static_graph records the autograd order on the first
+            # iteration and supports multi-forward / params reused across graphs.
+            # Valid here because the used-parameter set is fixed per run (forward
+            # branches are config/shape-driven, not data-value-driven).
+            static_graph=True,
         )
         fno_unwrapped = fno.module
     else:
@@ -1670,10 +1683,19 @@ def run_one_seed(
     collocation_lead_warmup = int(phys_cfg.get("collocation_lead_warmup_epochs", 0))
     if lambda_physics > 0.0 and phys_mode == "collocation":
         physics_region_weights = phys_cfg.get("full_bc_region_weights", None)
+        # Decorrelate the collocation stream per rank: every rank already spends
+        # the collocation forward/backward compute, so drawing the SAME batch on
+        # each rank (rng_seed=seed) would make DDP average identical gradients —
+        # the extra ranks buy nothing. Offsetting by rank gives each rank a
+        # disjoint draw, so the DDP-averaged physics gradient is computed over an
+        # effective physics_batch_size * world_size distinct collocation samples
+        # at no extra cost. Control flow is unchanged (same per-rank forward/
+        # backward/collective sequence), so this does not affect DDP lockstep.
         physics_collocation = _build_collocation_sampler(
             config, phys_cfg, validation_set.dataset, spec,
             mu_global, sigma_global,
-            batch_size=config["training"]["batch_size"], rng_seed=seed,
+            batch_size=config["training"]["batch_size"],
+            rng_seed=seed + dist_info.rank,
         )
         if is_main:
             print(

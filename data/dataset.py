@@ -604,8 +604,10 @@ def create_dataloaders(
     - `batch_size` is divided across ranks: per-GPU batch = `batch_size // world_size`.
       The total effective batch matches single-GPU baseline.
     - Train uses `CurriculumDistributedSampler` (curriculum-safe).
-    - Val loader is built **only on rank 0** (returned as `None` on other ranks).
-      Validation runs single-process and the result is broadcast.
+    - Val loader is built on **every rank**. Validation execution stays
+      rank-0-only (the caller gates `validate()` on `is_main` and broadcasts the
+      result), but the W2 collocation sampler reads `validation_set.dataset` on
+      all ranks, so a `None` val loader on rank>0 crashes the DDP physics path.
     - Test loader is unchanged (eval is single-GPU and decoupled from training).
     """
     if world_size > 1:
@@ -701,18 +703,20 @@ def create_dataloaders(
             collate_fn=collate_fn,
         )
 
-        if rank == 0:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=per_gpu_bs,
-                shuffle=False,
-                pin_memory=pin,
-                num_workers=workers,
-                persistent_workers=persistent,
-                collate_fn=collate_fn,
-            )
-        else:
-            val_loader = None
+        # Built on every rank: validation runs rank-0-only, but the W2
+        # collocation sampler draws from `val_loader.dataset` on all ranks.
+        # A None loader on rank>0 would crash setup and hang the surviving
+        # ranks at the next collective. Workers spawn lazily on first
+        # iteration, which non-main ranks never trigger, so this is cheap.
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=per_gpu_bs,
+            shuffle=False,
+            pin_memory=pin,
+            num_workers=workers,
+            persistent_workers=persistent,
+            collate_fn=collate_fn,
+        )
     else:
         train_loader = DataLoader(
             train_dataset,
