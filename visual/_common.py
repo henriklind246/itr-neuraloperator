@@ -18,6 +18,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "multilayer_evolution":      "physics",
     "heat_flux_profile":         "physics",
     "bc_verification":           "physics",
+    "itr_temperature_jump_sweep": "physics",
     # group: mms
     "mms_convergence":           "mms",
     "mms_order_estimation":      "mms",

@@ -103,7 +103,11 @@ def main():
     individual = args.plots
 
     # ---- PHYSICS GROUP ----
-    physics_plot_names = _plots_for_group("physics")
+    # itr_temperature_jump_sweep builds its own per-benchmark solvers, so it is
+    # excluded from the shared demo-solver gate and dispatched standalone below.
+    physics_plot_names = [
+        p for p in _plots_for_group("physics") if p != "itr_temperature_jump_sweep"
+    ]
     need_physics = any(_should_run(p, groups, individual) for p in physics_plot_names)
 
     if need_physics:
@@ -137,6 +141,13 @@ def main():
         if _should_run("bc_verification", groups, individual):
             print("--- bc_verification ---")
             physics_plots.plot_bc_verification(solver, T_hist, save_path=physics_dir / "bc_verification.png")
+
+    # ---- PHYSICS (self-contained ITR sweep; builds its own solvers) ----
+    if _should_run("itr_temperature_jump_sweep", groups, individual):
+        print("=== itr_temperature_jump_sweep ===")
+        physics_plots.plot_itr_temperature_jump_sweep(
+            save_path=out_dir / "physics" / "itr_temperature_jump_sweep.png"
+        )
 
     # ---- MMS GROUP ----
     mms_plot_names = _plots_for_group("mms")
