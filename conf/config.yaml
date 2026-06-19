@@ -44,7 +44,7 @@ training:
   batch_size: 1024
   n_snapshots: 20
   n_snapshots_test: 40
-  curriculum_warmup: 35
+  curriculum_warmup: 25
   epochs: 101
   learning_rate: 0.002
   weight_decay: 3.0e-5
