@@ -153,6 +153,10 @@ class TestPlotRegistry:
         assert _common.PLOT_REGISTRY["bc_verification"] == "physics"
         assert _common.PLOT_REGISTRY["sweep_hyperparams"] == "sweep"
 
+    def test_itr_temperature_jump_sweep_registered(self):
+        assert _common.PLOT_REGISTRY["itr_temperature_jump_sweep"] == "physics"
+        assert "itr_temperature_jump_sweep" in _common._plots_for_group("physics")
+
     def test_tail_error_plot_names_registered(self):
         for name in [
             "forcing_tail_errors",
@@ -164,6 +168,74 @@ class TestPlotRegistry:
     def test_rollout_plot_name_registered(self):
         assert _common.PLOT_REGISTRY["rollout_partition_error"] == "rollout"
         assert "rollout" in _common.GROUPS
+
+
+class TestItrTemperatureJumpSweep:
+    def test_forcing_smoke(self, tmp_path):
+        result = physics_plots.plot_itr_temperature_jump_sweep(
+            benchmarks=("forcing",),
+            Nx=20, Ny=20, t_final=0.1,
+            scalar_rc_values=(0.10, 0.70),
+            requested_times=(0.05, 0.10),
+            save_path=tmp_path / "itr_temperature_jump_sweep.png",
+        )
+        assert result["png"].exists()
+        assert result["csv"].exists()
+        records = result["records"]
+        # 2 R_c values x 2 requested times.
+        assert len(records) == 4
+        for row in records:
+            assert row["benchmark"] == "forcing"
+            assert row["itr_kind"] == "scalar_Rc"
+            assert np.isfinite(row["mean_abs_jump_K"])
+            assert np.isfinite(row["rms_jump_K"])
+            assert np.isfinite(row["peak_abs_jump_K"])
+            assert row["mean_abs_jump_K"] >= 0.0
+
+    def test_source_itr_metadata(self, tmp_path):
+        result = physics_plots.plot_itr_temperature_jump_sweep(
+            benchmarks=("source_itr",),
+            Nx=20, Ny=20, t_final=0.1,
+            rc_peak_values=(0.05, 1.00),
+            requested_times=(0.05, 0.10),
+            save_path=tmp_path / "itr_temperature_jump_sweep.png",
+        )
+        records = result["records"]
+        assert len(records) == 4
+        for row in records:
+            assert np.isfinite(row["mean_abs_jump_K"])
+            assert row["itr_kind"] == "Rc_peak"
+            assert row["R_c_base"] == 0.05
+            assert row["R_c_peak"] == row["itr_value"]
+            assert row["R_c_amp"] == pytest.approx(row["R_c_peak"] - 0.05)
+
+        # The R_c_peak == 0.05 endpoint is the "no void excess" baseline.
+        base_rows = [r for r in records if r["itr_value"] == 0.05]
+        assert base_rows
+        for row in base_rows:
+            assert row["R_c_amp"] == pytest.approx(0.0)
+
+    def test_forcing_jump_grows_with_resistance(self, tmp_path):
+        # Physical sanity, scoped to the canonical forcing case at the final
+        # requested time only: contact-jump magnitude is larger-or-comparable as
+        # R_c grows. source/source_itr/interfaces trends are intentionally not
+        # asserted (patch placement and local R_c(y) can break monotonicity).
+        rc_values = (0.05, 1.00)
+        final_time = 0.10
+        result = physics_plots.plot_itr_temperature_jump_sweep(
+            benchmarks=("forcing",),
+            Nx=24, Ny=24, t_final=0.1,
+            scalar_rc_values=rc_values,
+            requested_times=(final_time,),
+            save_path=tmp_path / "itr_temperature_jump_sweep.png",
+        )
+        by_rc = {
+            row["R_c"]: row["mean_abs_jump_K"]
+            for row in result["records"]
+            if row["time_requested"] == final_time
+        }
+        tol = 1e-6
+        assert by_rc[1.00] >= by_rc[0.05] - tol
 
 
 def _write_rollout_report(path, num_substeps, global_norm):

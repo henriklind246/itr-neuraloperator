@@ -540,6 +540,22 @@ class TestCreateDataloaders:
         assert val_loader.dataset.noise_std == 0.0
         assert test_loader.dataset.noise_std == 0.0
 
+    def test_ddp_val_loader_built_on_nonzero_rank(self, synthetic_trajectories, synthetic_sim_params):
+        """Under DDP the val loader must exist on every rank: the W2 collocation
+        sampler reads `val_loader.dataset` on all ranks, so a None loader on
+        rank>0 crashes the physics path during setup and hangs the job."""
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        train_ids, val_ids, test_ids = split_sim_ids(20, 0.7, 0.15, seed=0)
+        for rank in (0, 1):
+            _, val_loader, _ = create_dataloaders(
+                trajectories, x_grid, y_grid, t_grid, train_ids, val_ids, test_ids,
+                batch_size=4, sim_params=synthetic_sim_params,
+                mu_global=_SYNTH_MU, sigma_global=_SYNTH_SIGMA,
+                n_snapshots=6, world_size=2, rank=rank, sampler_seed=0,
+            )
+            assert val_loader is not None, f"val_loader is None on rank={rank}"
+            assert set(val_loader.dataset.sim_ids.tolist()) == set(val_ids.tolist())
+
     def test_noise_augmentation_changes_source(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_ids = np.arange(5)

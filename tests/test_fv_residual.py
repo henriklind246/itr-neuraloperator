@@ -486,3 +486,74 @@ def test_collocation_sampler_support_boundary():
     # anything strictly larger leaves no valid base.
     with pytest.raises(ValueError):
         sampler.sample_batch(max_lead=0.296)
+
+
+def test_collocation_rank_offset_seed_draws_disjoint_batches(monkeypatch):
+    """Under DDP each rank passes ``rng_seed = seed + rank`` (Option 1), so the
+    per-rank collocation draws — (sim id, base snapshot, lead) — diverge. Same
+    seed reproduces the draw sequence exactly (determinism / no-op guarantee);
+    a rank-offset seed yields a different sequence. That decorrelation is what
+    lets the DDP-averaged physics gradient cover ``world_size x`` distinct
+    collocation samples instead of averaging identical per-rank gradients.
+
+    The heavy item builders are stubbed so the test exercises only the sampler's
+    RNG-driven selection (the part that the per-rank seed controls).
+    """
+    import src.operators.train as train_mod
+    from src.operators.train import CollocationSampler
+
+    n_saved = 31
+    t_final = 0.3
+    t_grid = np.linspace(0.0, t_final, n_saved)
+
+    class _DS:
+        def __init__(self):
+            self.t_grid = t_grid
+            self.t_indices = list(range(n_saved))
+            self.t_final = t_final
+            self.sim_ids = np.array([0, 1, 2, 3, 4])
+            self.sim_params = {i: {"R_c": 0.1} for i in self.sim_ids}
+            self.s_y_profiles = {
+                i: np.ones(4, dtype=np.float32) for i in self.sim_ids
+            }
+            self.problem = self
+
+        def build_item(self, ds, sid, s, s2):
+            return {"spatial": np.zeros((4, 4, 1), dtype=np.float32)}
+
+    draws = []
+
+    def _fake_build_rollout(base_item, ds, spec, sid, current, t_s, t):
+        draws.append((int(sid), round(float(t), 9)))
+        return {"x": np.zeros(1, dtype=np.float32)}
+
+    monkeypatch.setattr(
+        train_mod, "build_rollout_item_from_base", _fake_build_rollout
+    )
+    monkeypatch.setattr(
+        train_mod, "_q_callable_for_boundary",
+        lambda ds, sid, params: (lambda t: 1.0),
+    )
+    monkeypatch.setattr(train_mod, "collate_fn", lambda items: items)
+
+    geom_cfg = {
+        "x_grid": np.linspace(0.0, 1.0, 4), "y_grid": np.linspace(0.0, 1.0, 4),
+        "k_left": 2.0, "k_right": 1.0, "interface_x": 0.5, "dt": 0.005,
+        "sigma_global": 1.0, "T_right_tilde": 0.0,
+    }
+
+    def run(seed):
+        draws.clear()
+        sampler = CollocationSampler(
+            _DS(), spec=None, geom_cfg=geom_cfg,
+            batch_size=4, dt=0.005, rng_seed=seed,
+        )
+        sampler.sample_batch(max_lead=0.05)
+        return list(draws)
+
+    rank0 = run(seed=42)
+    rank0_again = run(seed=42)
+    rank1 = run(seed=43)
+
+    assert rank0 == rank0_again, "same rng_seed must reproduce the draw sequence"
+    assert rank0 != rank1, "rank-offset rng_seed must decorrelate the draws"
