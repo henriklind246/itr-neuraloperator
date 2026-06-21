@@ -47,6 +47,7 @@ from src.operators.losses import (
     tail_stats,
 )
 from src.operators.rollout import build_rollout_item_from_base, _q_callable_for_boundary
+from src.physics.boundary_forcing import integrate_temporal_ramped_signed
 from src.physics.fv_residual import FullBCData, build_cn_geom_batched
 from src.operators.utils import resolve_device
 
@@ -710,6 +711,32 @@ def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, ba
     sim_params = np.load(sim_params_path, allow_pickle=True)
     solver_dt = load_solver_dt(t_path)
     ramp_seconds = load_ramp_seconds(t_path)
+
+    # The one-step (W1) CN residual couples CONSECUTIVE saved snapshots and
+    # assumes they are exactly one residual step `dt` apart. If the physics set
+    # was saved with `save_stride > 1` its snapshot spacing is `stride * dt`, so
+    # the residual would be evaluated against a wrong `dt` and silently mistrain.
+    # Validate the saved spacing against the residual dt instead of trusting it.
+    geom_dt = float(phys_cfg.get("dt", solver_dt))
+    tg_arr = np.asarray(tg, dtype=float)
+    if tg_arr.size >= 2:
+        spacings = np.diff(tg_arr)
+        grid_dt = float(spacings[0])
+        if not np.allclose(spacings, grid_dt, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                "physics one-step loader requires a uniformly-spaced t_grid; "
+                f"got non-uniform spacings (min={float(spacings.min())}, "
+                f"max={float(spacings.max())}) from {t_path}."
+            )
+        if not np.isclose(grid_dt, geom_dt, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                f"physics one-step loader snapshot spacing {grid_dt} != residual "
+                f"dt {geom_dt}: the one-step CN residual assumes consecutive "
+                "snapshots are exactly one solver step apart. Point "
+                "physics.data_dir at a save_stride=1 dataset, or set physics.dt "
+                "to the snapshot spacing."
+            )
+
     train_ids, _, _ = split_sim_ids(
         num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0
     )
@@ -740,7 +767,7 @@ def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, ba
         "k_left": 2.0,
         "k_right": 1.0,
         "interface_x": float(phys_cfg.get("interface_x", 0.5)),
-        "dt": float(phys_cfg.get("dt", solver_dt)),
+        "dt": geom_dt,
         "sigma_global": float(sigma_global),
         "rc_range": (0.05, 1.0),
         "rc_index": 2,
@@ -799,7 +826,7 @@ class CollocationSampler:
             )
 
         items_t, items_tdt = [], []
-        R_c_list, qLn_list, qLnp1_list = [], [], []
+        R_c_list, qLn_list, qLnp1_list, qLint_list = [], [], [], []
         for _ in range(self.batch_size):
             sid = int(self.rng.choice(self.sim_ids))
             s = int(self.rng.choice(valid_s))
@@ -827,19 +854,29 @@ class CollocationSampler:
             s_y = ds.s_y_profiles[sid]
             qLn = (float(a_fn(t)) * s_y).astype(np.float32)
             qLnp1 = (float(a_fn(t_dt)) * s_y).astype(np.float32)
+            # Exact step integral of the separable flux, matching the solver's
+            # `q_left_integral` injection (boundary_forcing.build_qL_integral):
+            # the ramped temporal integral times the spatial profile s(y).
+            a_int = integrate_temporal_ramped_signed(
+                params["temporal_family"], params["temporal_params"],
+                t, t_dt, float(ds.ramp_seconds),
+            )
+            qLint = (float(a_int) * s_y).astype(np.float32)
 
             items_t.append({k: torch.from_numpy(v) for k, v in item_t.items()})
             items_tdt.append({k: torch.from_numpy(v) for k, v in item_tdt.items()})
             R_c_list.append(float(params["R_c"]))
             qLn_list.append(qLn)
             qLnp1_list.append(qLnp1)
+            qLint_list.append(qLint)
 
         batch_t = collate_fn(items_t)
         batch_tdt = collate_fn(items_tdt)
         R_c = torch.tensor(R_c_list, dtype=torch.float32)
         qL_n = torch.from_numpy(np.stack(qLn_list))
         qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
-        return batch_t, batch_tdt, R_c, qL_n, qL_np1
+        qL_int = torch.from_numpy(np.stack(qLint_list))
+        return batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int
 
 
 def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_global,
@@ -877,7 +914,7 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device):
     Both fields are model outputs from the same base input, so the right-edge
     Dirichlet closure is anchored at BOTH times (``dirichlet_both_ends``).
     """
-    batch_t, batch_tdt, R_c, qL_n, qL_np1 = sampler.sample_batch(max_lead)
+    batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int = sampler.sample_batch(max_lead)
 
     def _fwd(b):
         spatial = b["spatial"].to(device)
@@ -899,6 +936,7 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device):
         T_right_tilde=sampler.geom_cfg["T_right_tilde"],
         qL_n=qL_n.to(device=device, dtype=yt.dtype),
         qL_np1=qL_np1.to(device=device, dtype=yt.dtype),
+        qL_int=qL_int.to(device=device, dtype=yt.dtype),
     )
     out = full_bc_physics_loss(
         yt, ytdt, geom, bc,
@@ -1154,10 +1192,18 @@ _CHECKPOINT_METRIC_KEYS = {
 def _selection_metric_value(val_metrics: dict[str, float], checkpoint_metric: str) -> float:
     """Resolve the scalar used for checkpoint selection from the val metric dict.
 
-    Unknown names fall back to the legacy ``rel_l2`` headline so a typo never
-    silently picks an arbitrary metric.
+    Raises ``ValueError`` on an unrecognized ``checkpoint_metric`` rather than
+    silently falling back to ``rel_l2``: a typo (``val_nrsme``) would otherwise
+    select on a different objective than the one the user configured, with no
+    signal in the logs.
     """
-    key = _CHECKPOINT_METRIC_KEYS.get(checkpoint_metric, "rel_l2")
+    if checkpoint_metric not in _CHECKPOINT_METRIC_KEYS:
+        valid = ", ".join(sorted(_CHECKPOINT_METRIC_KEYS))
+        raise ValueError(
+            f"unknown training.checkpoint_metric {checkpoint_metric!r}; "
+            f"expected one of: {valid}."
+        )
+    key = _CHECKPOINT_METRIC_KEYS[checkpoint_metric]
     return float(val_metrics[key])
 
 
@@ -1724,6 +1770,12 @@ def run_one_seed(
     validate_every = config["training"]["validate_every"]
     patience = config["training"]["patience"]
     checkpoint_metric = config["training"].get("checkpoint_metric", "val_rel_l2")
+    if checkpoint_metric not in _CHECKPOINT_METRIC_KEYS:
+        valid = ", ".join(sorted(_CHECKPOINT_METRIC_KEYS))
+        raise ValueError(
+            f"unknown training.checkpoint_metric {checkpoint_metric!r}; "
+            f"expected one of: {valid}."
+        )
 
     best_path = run_path / "fno2d_best.pt"
 

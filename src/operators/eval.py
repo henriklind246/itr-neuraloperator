@@ -201,8 +201,13 @@ def evaluate(
 
     with torch.no_grad():
         model.eval()
-        rel_l2_norm = 0.0
-        rel_l2_phys = 0.0
+        # Global sum-of-squares accumulators so rel_l2 matches the train/val
+        # convention sqrt(sum_sq_err / sum_sq_true); averaging per-batch ratios
+        # mis-weights unequal batch sizes and is a different statistic.
+        sse_norm = 0.0
+        sst_norm = 0.0
+        sse_phys = 0.0
+        sst_phys = 0.0
         iface_rel_l2_norm = 0.0
         iface_rel_l2_phys = 0.0
         boundary_rel_l2_norm = 0.0
@@ -227,16 +232,16 @@ def evaluate(
             y_pred = model(x_spatial, cond_static, forcing_seq)
 
             # Normalized-space metric (same convention as train/val_rel_l2)
-            batch_rel_l2_norm = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
-            rel_l2_norm += batch_rel_l2_norm.item()
+            sse_norm += torch.sum((y_pred - y_batch) ** 2).item()
+            sst_norm += torch.sum(y_batch ** 2).item()
 
             # Physical-space metric (denormalized to Kelvin)
             mu_s = T_stats[:, 0]
             sigma_s = T_stats[:, 1]
             y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
             y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
-            batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
-            rel_l2_phys += batch_rel_l2_phys.item()
+            sse_phys += torch.sum((y_pred_phys - y_true_phys) ** 2).item()
+            sst_phys += torch.sum(y_true_phys ** 2).item()
 
             # --- Unified per-sample metrics (nRMSE is normalization-invariant;
             # Kelvin metrics scale by the per-sample sigma). ---
@@ -281,8 +286,8 @@ def evaluate(
                 boundary_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, boundary_mask)
 
         n_batches = len(test_loader)
-        rel_l2_norm /= n_batches
-        rel_l2_phys /= n_batches
+        rel_l2_norm = (sse_norm / sst_norm) ** 0.5 * 100 if sst_norm > 0 else 0.0
+        rel_l2_phys = (sse_phys / sst_phys) ** 0.5 * 100 if sst_phys > 0 else 0.0
         iface_rel_l2_norm /= n_batches
         iface_rel_l2_phys /= n_batches
         boundary_rel_l2_norm /= n_batches
@@ -351,8 +356,13 @@ def _evaluate_rollout(
 
     with torch.no_grad():
         model.eval()
-        rel_l2_norm = 0.0
-        rel_l2_phys = 0.0
+        # Global sum-of-squares accumulators (rel_l2 convention matches train/val
+        # and the single-step eval path); per-item ratio averaging is a different
+        # statistic that over-weights small-signal items.
+        sse_norm = 0.0
+        sst_norm = 0.0
+        sse_phys = 0.0
+        sst_phys = 0.0
         iface_rel_l2_norm = 0.0
         iface_rel_l2_phys = 0.0
         boundary_rel_l2_norm = 0.0
@@ -375,15 +385,15 @@ def _evaluate_rollout(
                 device=device,
             )
 
-            batch_rel_l2_norm = (torch.mean((y_pred - y_batch) ** 2) / torch.mean(y_batch ** 2)) ** 0.5 * 100
-            rel_l2_norm += batch_rel_l2_norm.item()
+            sse_norm += torch.sum((y_pred - y_batch) ** 2).item()
+            sst_norm += torch.sum(y_batch ** 2).item()
 
             mu_s = T_stats[:, 0]
             sigma_s = T_stats[:, 1]
             y_pred_phys = y_pred * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
             y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
-            batch_rel_l2_phys = (torch.mean((y_pred_phys - y_true_phys) ** 2) / torch.mean(y_true_phys ** 2)) ** 0.5 * 100
-            rel_l2_phys += batch_rel_l2_phys.item()
+            sse_phys += torch.sum((y_pred_phys - y_true_phys) ** 2).item()
+            sst_phys += torch.sum(y_true_phys ** 2).item()
 
             iface_x = get_batch_interface_x(
                 item_batch, device, use_per_sample_interface=use_per_sample_interface
@@ -402,8 +412,8 @@ def _evaluate_rollout(
                 boundary_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, boundary_mask)
 
         n_items = len(dataset)
-        rel_l2_norm /= n_items
-        rel_l2_phys /= n_items
+        rel_l2_norm = (sse_norm / sst_norm) ** 0.5 * 100 if sst_norm > 0 else 0.0
+        rel_l2_phys = (sse_phys / sst_phys) ** 0.5 * 100 if sst_phys > 0 else 0.0
         iface_rel_l2_norm /= n_items
         iface_rel_l2_phys /= n_items
         boundary_rel_l2_norm /= n_items
@@ -529,26 +539,28 @@ def eval_all_seeds(
                 "test_iface_rel_l2": float(metrics["iface_rel_l2_phys"]),
                 "test_boundary_rel_l2_norm": float(metrics["boundary_rel_l2_norm"]),
                 "test_boundary_rel_l2": float(metrics["boundary_rel_l2_phys"]),
-                "test_nrmse": float(metrics.get("nrmse", 0.0)),
-                "test_nrmse_p50": float(metrics.get("nrmse_p50", 0.0)),
-                "test_nrmse_iqr": float(metrics.get("nrmse_iqr", 0.0)),
-                "test_nrmse_p90": float(metrics.get("nrmse_p90", 0.0)),
-                "test_nrmse_p99": float(metrics.get("nrmse_p99", 0.0)),
-                "test_nrmse_max": float(metrics.get("nrmse_max", 0.0)),
-                "test_rmse_K": float(metrics.get("rmse_K", 0.0)),
-                "test_rmse_K_p90": float(metrics.get("rmse_K_p90", 0.0)),
-                "test_rmse_K_p99": float(metrics.get("rmse_K_p99", 0.0)),
-                "test_rmse_K_max": float(metrics.get("rmse_K_max", 0.0)),
-                "test_gnrmse_pct": float(metrics.get("gnrmse_pct", 0.0)),
-                "test_gnrmse_pct_p99": float(metrics.get("gnrmse_pct_p99", 0.0)),
-                "test_max_err_K": float(metrics.get("max_err_K", 0.0)),
-                "test_node_jump_rmse_K": float(metrics.get("node_jump_rmse_K", 0.0)),
-                "test_node_jump_nrmse": float(metrics.get("node_jump_nrmse", 0.0)),
-                "test_node_jump_nrmse_p90": float(metrics.get("node_jump_nrmse_p90", 0.0)),
-                "test_node_jump_nrmse_p99": float(metrics.get("node_jump_nrmse_p99", 0.0)),
-                "test_node_jump_nrmse_max": float(metrics.get("node_jump_nrmse_max", 0.0)),
-                "test_node_jump_gnrmse_pct": float(metrics.get("node_jump_gnrmse_pct", 0.0)),
-                "test_node_jump_gnrmse_pct_p99": float(metrics.get("node_jump_gnrmse_pct_p99", 0.0)),
+                # NaN (not 0.0) for metrics absent from the rollout path: a
+                # silent 0.0 reads as a perfect surrogate in seed_report.json.
+                "test_nrmse": float(metrics.get("nrmse", float("nan"))),
+                "test_nrmse_p50": float(metrics.get("nrmse_p50", float("nan"))),
+                "test_nrmse_iqr": float(metrics.get("nrmse_iqr", float("nan"))),
+                "test_nrmse_p90": float(metrics.get("nrmse_p90", float("nan"))),
+                "test_nrmse_p99": float(metrics.get("nrmse_p99", float("nan"))),
+                "test_nrmse_max": float(metrics.get("nrmse_max", float("nan"))),
+                "test_rmse_K": float(metrics.get("rmse_K", float("nan"))),
+                "test_rmse_K_p90": float(metrics.get("rmse_K_p90", float("nan"))),
+                "test_rmse_K_p99": float(metrics.get("rmse_K_p99", float("nan"))),
+                "test_rmse_K_max": float(metrics.get("rmse_K_max", float("nan"))),
+                "test_gnrmse_pct": float(metrics.get("gnrmse_pct", float("nan"))),
+                "test_gnrmse_pct_p99": float(metrics.get("gnrmse_pct_p99", float("nan"))),
+                "test_max_err_K": float(metrics.get("max_err_K", float("nan"))),
+                "test_node_jump_rmse_K": float(metrics.get("node_jump_rmse_K", float("nan"))),
+                "test_node_jump_nrmse": float(metrics.get("node_jump_nrmse", float("nan"))),
+                "test_node_jump_nrmse_p90": float(metrics.get("node_jump_nrmse_p90", float("nan"))),
+                "test_node_jump_nrmse_p99": float(metrics.get("node_jump_nrmse_p99", float("nan"))),
+                "test_node_jump_nrmse_max": float(metrics.get("node_jump_nrmse_max", float("nan"))),
+                "test_node_jump_gnrmse_pct": float(metrics.get("node_jump_gnrmse_pct", float("nan"))),
+                "test_node_jump_gnrmse_pct_p99": float(metrics.get("node_jump_gnrmse_pct_p99", float("nan"))),
                 "rollout_enabled": bool(rollout_options.enabled),
                 "rollout_num_substeps": int(rollout_options.num_substeps),
                 "rollout_partition": rollout_options.partition,

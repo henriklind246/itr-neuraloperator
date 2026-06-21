@@ -1150,26 +1150,30 @@ def _theta_profile(
 ) -> torch.Tensor:
     """``theta_from_unconstrained(u)`` with physical coord ``fixed_index`` pinned.
 
-    The dependent ``R_amp`` ceiling is honored: pinning ``R_base`` (index 0)
-    recomputes ``R_amp`` against the pinned base, and pinning ``R_amp`` (index 1)
-    leaves ``R_base`` free. The pinned coordinate's ``u`` entry is ignored, so
-    the optimizer effectively re-fits the other three.
+    The dependent ``R_amp`` ceiling is honored in both directions: pinning
+    ``R_base`` (index 0) recomputes the free ``R_amp`` against the pinned base,
+    and pinning ``R_amp`` (index 1) caps the free ``R_base`` at
+    ``min(base_hi, R_PEAK_MAX - R_amp)`` so ``R_base + R_amp <= R_PEAK_MAX``
+    always holds and the FNO is never queried outside ``R_c(y) in [RC_MIN,
+    R_PEAK_MAX]``. The pinned coordinate's ``u`` entry is ignored, so the
+    optimizer effectively re-fits the other three.
     """
     base_lo, base_hi = RC_VOID_RANGES["R_base"]
     y0_lo, y0_hi = RC_VOID_RANGES["y0"]
     sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
     s = torch.sigmoid(u)
 
-    R_base = (
-        torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-        if fixed_index == 0
-        else base_lo + (base_hi - base_lo) * s[..., 0]
-    )
-    R_amp = (
-        torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-        if fixed_index == 1
-        else s[..., 1] * (R_PEAK_MAX - R_base)
-    )
+    if fixed_index == 1:
+        R_amp = torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
+        base_ceiling = min(base_hi, R_PEAK_MAX - float(fixed_value))
+        R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
+    else:
+        R_base = (
+            torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
+            if fixed_index == 0
+            else base_lo + (base_hi - base_lo) * s[..., 0]
+        )
+        R_amp = s[..., 1] * (R_PEAK_MAX - R_base)
     y0 = (
         torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
         if fixed_index == 2

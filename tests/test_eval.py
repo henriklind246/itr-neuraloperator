@@ -194,6 +194,40 @@ class TestEvaluateNRMSEInvariance:
         assert a["nrmse"] == pytest.approx(b["nrmse"], rel=1e-5)
         assert a["node_jump_nrmse"] == pytest.approx(b["node_jump_nrmse"], rel=1e-5)
 
+    def test_rel_l2_norm_independent_of_batch_size(self, eval_setup):
+        """Global sum-of-squares rel_l2 is invariant to batch chunking.
+
+        n=8 with batch_size=3 yields uneven batches (3, 3, 2); the old
+        mean-of-per-batch-ratios convention would disagree with a single batch.
+        """
+        model, _, device = eval_setup
+        model.eval()
+        uneven = evaluate(model, _fixed_eval_loader(1.0, batch_size=3), device)
+        single = evaluate(model, _fixed_eval_loader(1.0, batch_size=8), device)
+        assert uneven["rel_l2_norm"] == pytest.approx(single["rel_l2_norm"], rel=1e-5)
+        assert uneven["rel_l2_phys"] == pytest.approx(single["rel_l2_phys"], rel=1e-5)
+
+    def test_rel_l2_norm_matches_global_formula(self, eval_setup):
+        """evaluate's rel_l2_norm equals sqrt(sum_sq_err/sum_sq_true)*100."""
+        model, _, device = eval_setup
+        model.eval()
+        loader = _fixed_eval_loader(1.0, batch_size=3)
+        result = evaluate(model, loader, device)
+        sse = 0.0
+        sst = 0.0
+        with torch.no_grad():
+            for batch in loader:
+                yp = model(
+                    batch["spatial"].to(device),
+                    batch["cond_static"].to(device),
+                    batch["forcing_seq"].to(device),
+                )
+                yb = batch["Y"].to(device)
+                sse += torch.sum((yp - yb) ** 2).item()
+                sst += torch.sum(yb ** 2).item()
+        expected = (sse / sst) ** 0.5 * 100
+        assert result["rel_l2_norm"] == pytest.approx(expected, rel=1e-5)
+
 
 # ===================== evaluate per-sample interface =====================
 

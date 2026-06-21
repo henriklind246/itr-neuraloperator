@@ -322,6 +322,101 @@ def test_full_bc_shape_grad_and_both_ends():
     assert float(T_np1.grad.abs().sum()) > 0.0
 
 
+def _build_pulse_train_solver(dt: float = 0.005, t_final: float = 0.3, Ny: int = 100):
+    """A `forcing`-geometry solver driven by a single rectangular pulse that
+    lives strictly inside one solver step. The solver injects the EXACT step
+    integral of the flux (`q_left_integral_fn`), so a residual that reconstructs
+    the left flux from the step ENDPOINTS misses the pulse entirely — the
+    discriminating case for the exact-vs-trapezoid left Neumann closure."""
+    from src.physics.boundary_forcing import (
+        ramped_temporal,
+        integrate_temporal_ramped_signed,
+    )
+
+    layers = [
+        Layer2D(x_left=0.0, x_right=0.5, rho=1, cp=1, k=2),
+        Layer2D(x_left=0.5, x_right=1.0, rho=1, cp=1, k=1),
+    ]
+    fam = "pulse_train"
+    # Pulse [0.051, 0.053) is interior to step n=10 ([0.050, 0.055)).
+    tparams = {"A_list": [200.0], "t_list": [0.051], "dt_list": [0.002]}
+    t_ramp = 0.0
+    a_fn = ramped_temporal(fam, tparams, t_ramp)
+
+    def q_left_fn(t):
+        return float(a_fn(t)) * np.ones(Ny)
+
+    def q_left_integral_fn(t_lo, t_hi):
+        val = integrate_temporal_ramped_signed(fam, tparams, t_lo, t_hi, t_ramp)
+        return float(val) * np.ones(Ny)
+
+    sim = FVSolver2D(
+        a=0.0, b=1.0, c=0.0, d=1.0,
+        Nx=Ny, Ny=Ny,
+        layers=layers,
+        interface_R=[0.5],
+        lam_target=0.5,
+        dt=dt,
+        flux_f=2.0, flux_A=50.0,
+        t_on=0.0, t_off=0.2,
+        t_final=t_final, phase=0.0,
+        q_left_fn=q_left_fn,
+        q_left_integral_fn=q_left_integral_fn,
+    )
+    return sim
+
+
+def test_full_bc_left_neumann_exact_integral_required_for_pulse():
+    """Regression for the exact-integral left Neumann closure. When the solver
+    injects the EXACT step flux integral (its `q_left_integral` path), the
+    residual must use `2*qL_int`, not the trapezoid of the step endpoints. On a
+    pulse that lives strictly inside one step the endpoints are both zero, so the
+    trapezoid closure silently drops the forcing and the left row blows up, while
+    the `qL_int` closure stays at the float64 solve floor."""
+    sim = _build_pulse_train_solver()
+    T0 = np.full((sim.Nx, sim.Ny), sim.T_right(0.0), dtype=np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+
+    n = 10
+    tn = float(sim.t[n])
+    tnp1 = float(sim.t[n + 1])
+    T_n = torch.as_tensor(T_hist[n], dtype=torch.float64)
+    T_np1 = torch.as_tensor(T_hist[n + 1], dtype=torch.float64)
+
+    qL_n = torch.as_tensor(sim.q_left(tn), dtype=torch.float64)
+    qL_np1 = torch.as_tensor(sim.q_left(tnp1), dtype=torch.float64)
+    qL_int = torch.as_tensor(sim.q_left_integral(tn, tnp1), dtype=torch.float64)
+    T_right_tilde = torch.as_tensor(float(sim.T_right(tnp1)), dtype=torch.float64)
+
+    # The discriminating setup: endpoints miss the interior pulse, the exact
+    # integral does not.
+    assert float(qL_n.abs().max()) == 0.0
+    assert float(qL_np1.abs().max()) == 0.0
+    assert float(qL_int.abs().max()) > 0.0
+
+    bc_exact = FullBCData(
+        T_right_tilde=T_right_tilde, qL_n=qL_n, qL_np1=qL_np1, qL_int=qL_int
+    )
+    bc_trap = FullBCData(T_right_tilde=T_right_tilde, qL_n=qL_n, qL_np1=qL_np1)
+
+    exact = full_bc_cn_residual(T_n, T_np1, geom, bc_exact)
+    trap = full_bc_cn_residual(T_n, T_np1, geom, bc_trap)
+
+    # Exact integral matches the solver's RHS injection -> left row at the floor.
+    assert float(exact["left_neumann"].abs().max()) < 1e-7
+    # Trapezoid endpoints drop the interior pulse -> left row badly wrong.
+    assert float(trap["left_neumann"].abs().max()) > 1e-3
+    # The fix only touches the left row; every other region is byte-identical.
+    for name in ("interior", "topbot_adiabatic", "right_dirichlet"):
+        assert float((exact[name] - trap[name]).abs().max()) == 0.0
+
+
 # --- no-op / RNG guard ------------------------------------------------------
 #
 # The `lambda_physics=0` contract is a TRUE no-op: when the physics path is
@@ -512,7 +607,15 @@ def test_collocation_rank_offset_seed_draws_disjoint_batches(monkeypatch):
             self.t_indices = list(range(n_saved))
             self.t_final = t_final
             self.sim_ids = np.array([0, 1, 2, 3, 4])
-            self.sim_params = {i: {"R_c": 0.1} for i in self.sim_ids}
+            self.ramp_seconds = 0.0
+            self.sim_params = {
+                i: {
+                    "R_c": 0.1,
+                    "temporal_family": "sin",
+                    "temporal_params": {},
+                }
+                for i in self.sim_ids
+            }
             self.s_y_profiles = {
                 i: np.ones(4, dtype=np.float32) for i in self.sim_ids
             }
@@ -533,6 +636,10 @@ def test_collocation_rank_offset_seed_draws_disjoint_batches(monkeypatch):
     monkeypatch.setattr(
         train_mod, "_q_callable_for_boundary",
         lambda ds, sid, params: (lambda t: 1.0),
+    )
+    monkeypatch.setattr(
+        train_mod, "integrate_temporal_ramped_signed",
+        lambda *a, **k: 0.0,
     )
     monkeypatch.setattr(train_mod, "collate_fn", lambda items: items)
 

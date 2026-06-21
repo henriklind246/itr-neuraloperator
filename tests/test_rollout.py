@@ -1,3 +1,6 @@
+import math
+import types
+
 import numpy as np
 import pytest
 import torch
@@ -7,6 +10,7 @@ from problems import forcing as forcing_problem
 from problems import interfaces as interfaces_problem
 from problems import source as source_problem
 from problems.registry import get_problem
+from src.operators.eval import evaluate
 from src.operators.rollout import (
     RolloutOptions,
     build_homogeneous_rollout_times,
@@ -208,3 +212,39 @@ class TestPredictAutoregressive:
             )
 
         torch.testing.assert_close(rollout, direct)
+
+
+class TestRolloutEvalMetricContract:
+    def test_rollout_evaluate_omits_unified_metrics(
+        self, synthetic_trajectories, synthetic_sim_params, small_fno2d
+    ):
+        """The rollout path returns only the rel/iface/boundary keys.
+
+        eval_all_seeds relies on this contract: the unified per-sample metrics
+        (nrmse, rmse_K, ...) are simply not computed under rollout, so a consumer
+        must treat them as missing (NaN), never as a real 0.0 score.
+        """
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem("forcing", "temporal_encoder")
+        ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, spec)
+        loader = types.SimpleNamespace(dataset=ds)
+        small_fno2d.eval()
+
+        metrics = evaluate(
+            small_fno2d,
+            loader,
+            torch.device("cpu"),
+            rollout_options=RolloutOptions(enabled=True, num_substeps=2),
+            x_grid=x_grid,
+        )
+
+        for present in (
+            "rel_l2_norm", "rel_l2_phys",
+            "iface_rel_l2_norm", "iface_rel_l2_phys",
+            "boundary_rel_l2_norm", "boundary_rel_l2_phys",
+        ):
+            assert present in metrics
+        for absent in ("nrmse", "rmse_K", "gnrmse_pct", "max_err_K", "node_jump_nrmse"):
+            assert absent not in metrics
+        # The eval_all_seeds default surfaces the gap as NaN, not a fake 0.0.
+        assert math.isnan(float(metrics.get("nrmse", float("nan"))))

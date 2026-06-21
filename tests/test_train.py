@@ -15,6 +15,8 @@ from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 
 from src.operators.train import (
     _per_pair_rel_l2_percent,
+    _build_physics_loader,
+    _selection_metric_value,
     load_config,
     set_seed,
     train_one_epoch,
@@ -29,6 +31,7 @@ from src.operators.train import (
     run_one_seed,
     run_config_seeds,
 )
+import src.operators.train as train_mod
 
 # Active default = forcing benchmark, temporal_encoder representation:
 # 4 spatial channels [T_tilde, x, y, s_y], 11 static cond dims, (128, 2) tokens.
@@ -973,6 +976,25 @@ class TestRunOneSeedResume:
         assert float(chosen["val_nrmse"]) == pytest.approx(best_val_nrmse, rel=1e-6)
         assert result["best_val"] == pytest.approx(best_val_nrmse, rel=1e-6)
 
+    def test_selection_metric_value_rejects_unknown_metric(self):
+        """A typo'd checkpoint_metric raises instead of silently using rel_l2."""
+        val_metrics = {"rel_l2": 1.0, "nrmse": 2.0, "node_jump_nrmse": 3.0}
+        with pytest.raises(ValueError, match="unknown training.checkpoint_metric"):
+            _selection_metric_value(val_metrics, "val_nrsme")
+        # Known metrics still resolve to the mapped key.
+        assert _selection_metric_value(val_metrics, "val_nrmse") == 2.0
+        assert _selection_metric_value(val_metrics, "val_rel_l2") == 1.0
+
+    def test_run_one_seed_rejects_unknown_checkpoint_metric(self, tmp_path, seed_config):
+        """run_one_seed fails fast (before training) on a bad checkpoint_metric."""
+        cfg = copy.deepcopy(seed_config)
+        cfg["training"]["checkpoint_metric"] = "val_bogus"
+        run_dir = tmp_path / "seed0_bogus"
+        with pytest.raises(ValueError, match="unknown training.checkpoint_metric"):
+            run_one_seed(cfg, seed=0, run_dir=run_dir)
+        # Fail-fast: no checkpoint should have been written.
+        assert not (run_dir / "fno2d_best.pt").exists()
+
     def test_fresh_run_writes_no_diagnostics_csv(self, tmp_path, seed_config):
         """diagnostics.csv must not be written; val_pairs.csv must still be.
 
@@ -1297,3 +1319,109 @@ class TestRunConfigSeeds:
         summary = run_config_seeds(seed_config, base_run_dir=run_dir, seeds=None)
         # config has seeds: [0, 1]
         assert summary["num_seeds"] == 2
+
+
+# ===================== W1 physics loader: snapshot-spacing guard =============
+#
+# The one-step (W1) CN residual couples CONSECUTIVE saved snapshots and assumes
+# they are exactly one residual step `dt` apart. A `save_stride>1` physics set
+# has spacing `stride*dt`, so the residual would silently mistrain. The loader
+# must reject the mismatch instead of trusting `physics.dt`.
+
+class TestPhysicsLoaderSpacingGuard:
+    def _write_dataset(self, tmp_path, *, t_grid, solver_dt,
+                       n_sims=3, Nx=6, Ny=6):
+        Nt = len(t_grid)
+        np.save(tmp_path / "trajectories.npy",
+                np.zeros((n_sims, Nt, Nx, Ny), dtype=np.float32))
+        np.save(tmp_path / "x_grid.npy", np.linspace(0.0, 1.0, Nx))
+        np.save(tmp_path / "y_grid.npy", np.linspace(0.0, 1.0, Ny))
+        np.save(tmp_path / "t_grid.npy", np.asarray(t_grid, dtype=float))
+        np.save(tmp_path / "dt.npy", np.array(float(solver_dt)))
+        np.save(tmp_path / "sim_params.npy",
+                np.array([{} for _ in range(n_sims)], dtype=object))
+        return {
+            "trajectories.npy": str(tmp_path / "trajectories.npy"),
+            "x_grid_path": str(tmp_path / "x_grid.npy"),
+            "y_grid_path": str(tmp_path / "y_grid.npy"),
+            "t_grid_path": str(tmp_path / "t_grid.npy"),
+            "sim_params_path": str(tmp_path / "sim_params.npy"),
+        }
+
+    def _config(self, data_paths):
+        return {"data": data_paths, "model": {"parameters": {}}}
+
+    def test_rejects_save_stride_mismatch(self, tmp_path):
+        # spacing 0.01 (e.g. save_stride=2) but residual dt defaults to 0.005.
+        data_paths = self._write_dataset(
+            tmp_path, t_grid=[0.0, 0.01, 0.02, 0.03, 0.04], solver_dt=0.005
+        )
+        with pytest.raises(ValueError, match="snapshot spacing"):
+            _build_physics_loader(
+                self._config(data_paths), phys_cfg={}, spec=None,
+                mu_global=300.0, sigma_global=1.0,
+                batch_size=2, num_workers=0,
+            )
+
+    def test_rejects_nonuniform_t_grid(self, tmp_path):
+        data_paths = self._write_dataset(
+            tmp_path, t_grid=[0.0, 0.005, 0.01, 0.02, 0.03], solver_dt=0.005
+        )
+        with pytest.raises(ValueError, match="uniformly-spaced"):
+            _build_physics_loader(
+                self._config(data_paths), phys_cfg={}, spec=None,
+                mu_global=300.0, sigma_global=1.0,
+                batch_size=2, num_workers=0,
+            )
+
+    def test_accepts_matched_spacing(self, tmp_path, monkeypatch):
+        # spacing == solver dt: the loader proceeds; downstream dataset/loader
+        # construction is stubbed so the test isolates the spacing guard.
+        data_paths = self._write_dataset(
+            tmp_path, t_grid=[0.0, 0.005, 0.01, 0.015, 0.02], solver_dt=0.005
+        )
+        monkeypatch.setattr(
+            train_mod, "split_sim_ids",
+            lambda **k: (np.array([0, 1, 2]), np.array([]), np.array([])),
+        )
+        monkeypatch.setattr(
+            train_mod, "SnapshotPairDataset", lambda **k: object()
+        )
+        monkeypatch.setattr(
+            train_mod, "one_step_physics_view", lambda ds: ds
+        )
+        import torch.utils.data as _tud
+        monkeypatch.setattr(_tud, "DataLoader", lambda *a, **k: "LOADER")
+
+        loader, geom_cfg = _build_physics_loader(
+            self._config(data_paths), phys_cfg={}, spec=None,
+            mu_global=300.0, sigma_global=1.0,
+            batch_size=2, num_workers=0,
+        )
+        assert loader == "LOADER"
+        assert geom_cfg["dt"] == pytest.approx(0.005)
+
+    def test_physics_dt_override_resolves_stride(self, tmp_path, monkeypatch):
+        # Opting in via physics.dt = snapshot spacing makes the loader consistent.
+        data_paths = self._write_dataset(
+            tmp_path, t_grid=[0.0, 0.01, 0.02, 0.03, 0.04], solver_dt=0.005
+        )
+        monkeypatch.setattr(
+            train_mod, "split_sim_ids",
+            lambda **k: (np.array([0, 1, 2]), np.array([]), np.array([])),
+        )
+        monkeypatch.setattr(
+            train_mod, "SnapshotPairDataset", lambda **k: object()
+        )
+        monkeypatch.setattr(
+            train_mod, "one_step_physics_view", lambda ds: ds
+        )
+        import torch.utils.data as _tud
+        monkeypatch.setattr(_tud, "DataLoader", lambda *a, **k: "LOADER")
+
+        loader, geom_cfg = _build_physics_loader(
+            self._config(data_paths), phys_cfg={"dt": 0.01}, spec=None,
+            mu_global=300.0, sigma_global=1.0,
+            batch_size=2, num_workers=0,
+        )
+        assert geom_cfg["dt"] == pytest.approx(0.01)

@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from dataclasses import dataclass
+from typing import Optional
 
 """
 Differentiable torch mirror of the Crank-Nicolson FV solver's discrete cell
@@ -315,10 +316,18 @@ class FullBCData:
     `qL_n` / `qL_np1` are the PHYSICAL left-edge fluxes `q_L(y, t_n)` and
     `q_L(y, t_n + dt)`, broadcastable to `(B, Ny)`; the residual divides them by
     `sigma_global` to land in normalized-temperature units.
+
+    `qL_int`, when provided, is the PHYSICAL exact time integral of the left flux
+    over the step `int_{t_n}^{t_n+dt} q_L(y, t) dt`, broadcastable to `(B, Ny)`.
+    The solver injects this exact integral (not the trapezoid endpoint average)
+    into its RHS, so when it is available the residual uses it directly and the
+    `qL_n`/`qL_np1` endpoints are ignored for the left-Neumann row. When `None`
+    the residual falls back to the CN trapezoid `dt*(qL_n+qL_np1)/2`.
     """
     T_right_tilde: torch.Tensor
     qL_n: torch.Tensor
     qL_np1: torch.Tensor
+    qL_int: Optional[torch.Tensor] = None
 
 
 def _cn_laplacian_full(T: torch.Tensor, geom: FVGeom) -> torch.Tensor:
@@ -356,7 +365,10 @@ def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
                                 `i in [1,Nx-2]` (zero top/bottom face flux baked
                                 into the r-coefficients).
       - ``left_neumann``      : CN cell balance on row `i=0` minus the normalized
-                                CN-averaged left flux `dt*(qL_n+qL_np1) /
+                                left flux. With `bc.qL_int` set this is the exact
+                                step integral `2*qL_int / (rho_cp_left * hx *
+                                sigma_global)` (the solver's exact path); without
+                                it, the CN trapezoid `dt*(qL_n+qL_np1) /
                                 (rho_cp_left * hx * sigma_global)`.
       - ``right_dirichlet``   : algebraic `T_np1[Nx-1,:] - T_right_tilde`.
 
@@ -383,10 +395,17 @@ def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
     bal = ((T_np1 - T_n)
            - (_cn_laplacian_full(T_np1, geom) + _cn_laplacian_full(T_n, geom)))
 
-    # Left Neumann row i=0: subtract the normalized CN-averaged left flux.
+    # Left Neumann row i=0: subtract the normalized left-flux forcing, mirroring
+    # the solver's RHS injection (`fv_solver_2d.py` left-Neumann block). When the
+    # exact step integral is supplied use `2*qL_int` (the solver's exact path);
+    # otherwise fall back to the CN trapezoid `dt*(qL_n+qL_np1)`.
     rho_cp_left = geom.rho_cp[0, :]                          # (Ny,)
-    flux = bc.qL_n + bc.qL_np1                               # (B,Ny) after bcast
-    f_norm = geom.dt * flux / (rho_cp_left[None, :] * geom.hx * geom.sigma_global)
+    denom = rho_cp_left[None, :] * geom.hx * geom.sigma_global
+    if bc.qL_int is not None:
+        f_norm = 2.0 * bc.qL_int / denom                    # (B,Ny) after bcast
+    else:
+        flux = bc.qL_n + bc.qL_np1                          # (B,Ny) after bcast
+        f_norm = geom.dt * flux / denom
     left_res = bal[:, 0, :] - f_norm                        # (B, Ny)
 
     # Right Dirichlet column i=Nx-1 (algebraic).

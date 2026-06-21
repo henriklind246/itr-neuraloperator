@@ -801,6 +801,24 @@ def test_theta_profile_pins_coord_and_respects_amp_ceiling(fixed_index):
     assert R_amp >= -1e-6 and (R_base + R_amp) <= R_PEAK_MAX + 1e-4
 
 
+def test_theta_profile_high_pinned_amp_caps_free_base():
+    # Pinning R_amp near its ceiling must shrink the free R_base box so the peak
+    # R_base + R_amp never exceeds R_PEAK_MAX. A large positive u0 (sigmoid -> 1)
+    # would map R_base to base_hi=1.0 without the cap, giving 1.0 + 2.8 = 3.8.
+    pinned_amp = 2.8
+    u = torch.tensor([20.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    theta = inv._theta_profile(u, fixed_index=1, fixed_value=pinned_amp)
+    R_base, R_amp = float(theta[0]), float(theta[1])
+    assert R_amp == pytest.approx(pinned_amp)
+    base_ceiling = R_PEAK_MAX - pinned_amp  # 0.2
+    assert R_base == pytest.approx(base_ceiling, abs=1e-6)
+    assert (R_base + R_amp) <= R_PEAK_MAX + 1e-9
+    # Lower edge of the shrunk box still reaches base_lo at u0 -> -inf.
+    u_lo = torch.tensor([-20.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    theta_lo = inv._theta_profile(u_lo, fixed_index=1, fixed_value=pinned_amp)
+    assert float(theta_lo[0]) == pytest.approx(RC_VOID_RANGES["R_base"][0], abs=1e-6)
+
+
 def test_profile_likelihood_summary_columns_present():
     model = _tiny_source_itr_model().eval()
     obs = _fake_observation_set()
