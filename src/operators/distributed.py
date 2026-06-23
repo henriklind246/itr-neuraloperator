@@ -8,6 +8,7 @@ existing single-GPU code paths are unchanged.
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import dataclass
 from datetime import timedelta
@@ -63,16 +64,31 @@ def init_distributed() -> DistInfo:
         rank = int(rank_env) if rank_env is not None else 0
         local_rank = int(local_rank_env) if local_rank_env is not None else 0
 
+        # Bind this rank to its GPU BEFORE creating the process group. Doing it
+        # afterwards (or not passing device_id below) leaves NCCL without an
+        # established rank->GPU mapping, so it defers communicator creation to
+        # the first collective — DDP's _sync_module_states BROADCAST — and
+        # guesses the device ("using GPU X as device used by this process is
+        # currently unknown"). That lazy bootstrap can stall the first broadcast
+        # and trip the watchdog before epoch 0.
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
         if not dist.is_initialized():
             backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(
+            init_kwargs = dict(
                 backend=backend,
                 init_method="env://",
                 timeout=_resolve_timeout(),
             )
-
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
+            # Pass device_id when the installed PyTorch supports it so the NCCL
+            # communicator is built at init (a controlled rendezvous point)
+            # instead of lazily at the first DDP broadcast.
+            if torch.cuda.is_available() and (
+                "device_id" in inspect.signature(dist.init_process_group).parameters
+            ):
+                init_kwargs["device_id"] = torch.device(f"cuda:{local_rank}")
+            dist.init_process_group(**init_kwargs)
 
         _DIST_INFO = DistInfo(
             rank=rank,
