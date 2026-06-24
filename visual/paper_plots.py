@@ -16,6 +16,7 @@ are rendered in normalized space so the residual matches the reported metric.
 """
 
 import csv as _csv
+import textwrap
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -51,12 +52,69 @@ TEMPORAL_ORDER = ("sin", "exp", "pulse_train", "exp_train")
 SPATIAL_ORDER = ("uniform", "patch", "gaussian", "triangle")
 REGIME_ORDER = ("left", "near", "right")
 
+# Colorblind-safe (Okabe-Ito) palette shared across paper figures so a benchmark
+# keeps the same color everywhere. The two generalization series use distinct
+# hues from the same palette.
+_BENCHMARK_COLORS = {
+    "forcing": "#0072B2",     # blue
+    "source": "#E69F00",      # orange
+    "interfaces": "#009E73",  # bluish green
+    "source_itr": "#CC79A7",  # reddish purple
+}
+_SAME_SIM_COLOR = "#0072B2"   # blue
+_UNSEEN_COLOR = "#D55E00"     # vermillion
+
 FORCING_ACTIVE_T_MAX = 0.20  # target time t_j below which boundary forcing is active
+
+# Curated prose for the benchmark-overview table figure. ``ProblemSpec`` exposes
+# only ``name`` + structured ``ProblemDims`` (no description), so the descriptive
+# cells live here. Keyed by benchmark; column order is ``_BENCHMARK_OVERVIEW_COLS``.
+# Kept to the four paper benchmarks deliberately (not all of ``REGISTRY``).
+_BENCHMARK_OVERVIEW_COLS = (
+    "geometry / source",
+    "varied parameters",
+    "ITR parameterization",
+    "prediction task",
+    "main stress test",
+)
+_BENCHMARK_OVERVIEW_ROWS: dict[str, dict[str, str]] = {
+    "forcing": {
+        "geometry / source": "two slabs, interface fixed at x=0.5; separable left-flux forcing q_L(y,t)=a(t)·s(y)",
+        "varied parameters": "4 temporal families × 4 spatial profiles; scalar R_c; uniform 300 K IC",
+        "ITR parameterization": "scalar R_c (uniform interface resistance)",
+        "prediction task": "next-snapshot temperature field given forcing history",
+        "main stress test": "pulse-like forcing, long leads, unseen forcing combinations",
+    },
+    "source": {
+        "geometry / source": "two slabs, interface fixed at x=0.5; internal volumetric chip-heating patch",
+        "varied parameters": "patch (x_h, y_h, A, w_h, h_h), stratified regime; scalar R_c; uniform 300 K IC",
+        "ITR parameterization": "scalar R_c (uniform interface resistance)",
+        "prediction task": "next-snapshot field given internal source channels",
+        "main stress test": "near-interface patches and high-amplitude heating",
+    },
+    "source_itr": {
+        "geometry / source": "two slabs, interface fixed at x=0.5; same internal patch as source",
+        "varied parameters": "source patch/A/IC stream + Gaussian void profile",
+        "ITR parameterization": "spatially-varying R_c(y) Gaussian void (R_c_base, R_c_amp, R_c_y0, R_c_sigma)",
+        "prediction task": "next-snapshot field with delamination / air-gap interface",
+        "main stress test": "severe voids (max R_c_amp) over the interface zone",
+    },
+    "interfaces": {
+        "geometry / source": "two slabs; interface location x_I sampled per sim; fixed sin/uniform forcing",
+        "varied parameters": "interface_x ∈ [0.2, 0.8]; scalar R_c; varying initial conditions",
+        "ITR parameterization": "scalar R_c (uniform), per-sample interface location",
+        "prediction task": "next-snapshot field with a moving interface position",
+        "main stress test": "off-center interfaces (max |x_I − 0.5|)",
+    },
+}
 
 _INT_COLS = ("sim_id", "s", "j")
 _FLOAT_COLS = (
     "t_s", "t_bar", "R_c", "x_h", "y_h", "A", "freq",
+    "R_c_amp", "R_c_y0", "R_c_sigma",
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
+    "nrmse_pct", "rmse_K", "gnrmse_pct",
+    "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
 )
 _STR_COLS = ("benchmark", "temporal_family", "spatial_family", "regime")
 
@@ -510,6 +568,31 @@ def plot_source_test_error_summary(records, save_path=None, panel6="lead_time"):
         return _save_figure(fig, save_path, "paper", "source_test_error_summary")
 
 
+def plot_source_itr_test_error_summary(records, save_path=None):
+    """source_itr per-sample error summary (2x3), void-severity focused.
+
+    Top row mirrors the source summary (global + interface-band histograms,
+    error by patch regime). Bottom row swaps the patch-geometry panels for the
+    Gaussian-void resistance parameters: depth ``R_c_amp``, width ``R_c_sigma``,
+    and location ``R_c_y0``. These columns are NaN for non-source_itr records;
+    the binning helpers drop non-finite values, so the panels stay empty in that
+    case rather than erroring.
+    """
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(13.5, 8))
+        _hist(axes[0, 0], records["rel_l2_pct"], "rel-L2 (%)", "Global error")
+        _hist(axes[0, 1], records["iface_rel_l2_pct"], "interface rel-L2 (%)", "Interface-band error")
+        _box_by_category(axes[0, 2], records, "regime", REGIME_ORDER,
+                         "rel_l2_pct", "regime", "Error by patch regime")
+        _binned_line(axes[1, 0], records["R_c_amp"], records["rel_l2_pct"], 8,
+                     "void depth R_c_amp", "Error vs void depth")
+        _binned_line(axes[1, 1], records["R_c_sigma"], records["rel_l2_pct"], 8,
+                     "void width R_c_sigma", "Error vs void width")
+        _binned_line(axes[1, 2], records["R_c_y0"], records["rel_l2_pct"], 8,
+                     "void center R_c_y0", "Error vs void location")
+        return _save_figure(fig, save_path, "paper", "source_itr_test_error_summary")
+
+
 def plot_interfaces_test_error_summary(records, save_path=None):
     """Interfaces benchmark per-sample error summary (2x3).
 
@@ -595,6 +678,31 @@ def plot_source_prediction_truth_residual(model, ds, records, save_path=None):
                             patch=patch, row_label=_row_label(ds, records, row),
                             col_titles=(r == 0))
         return _save_figure(fig, save_path, "paper", "source_prediction_truth_residual")
+
+
+def plot_source_itr_prediction_truth_residual(model, ds, records, save_path=None):
+    """source_itr truth/prediction/residual, one row per patch regime.
+
+    Within each regime the most severe void (largest ``R_c_amp``) case is chosen
+    via ``_selected_source_rows(..., prefer_void=True)`` so the residual panels
+    show where the spatially-varying interface resistance stresses the model.
+    """
+    selected = _selected_source_rows(records, ds, prefer_void=True)
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(3, 3, figsize=(12.5, 11.5))
+        for r, (_regime, row) in enumerate(selected):
+            sid, s, j = (int(records[k][row]) for k in ("sim_id", "s", "j"))
+            params = ds.sim_params[sid]
+            patch = (
+                float(params["x_h"]), float(params["y_h"]),
+                float(params["w_h"]), float(params["h_h"]),
+            )
+            Y_true, Y_pred = _predict_norm_fields(model, ds, sid, s, j)
+            _render_tpr_row(axes[r], ds.x_grid, ds.y_grid, Y_true, Y_pred,
+                            interface_positions=[float(params.get("interface_x", 0.5))],
+                            patch=patch, row_label=_row_label(ds, records, row),
+                            col_titles=(r == 0))
+        return _save_figure(fig, save_path, "paper", "source_itr_prediction_truth_residual")
 
 
 def plot_interfaces_prediction_truth_residual(model, ds, records, save_path=None):
@@ -1083,47 +1191,50 @@ def plot_interfaces_interface_jump_profiles(model, ds, records, config, dt, save
 # ============================================================
 
 def plot_all_benchmarks_error_summary(records_by_benchmark, save_path=None):
-    """Cross-benchmark error spread (1x3): global, interface-band, tail."""
+    """Cross-benchmark *typical + ordinary-high* error (2x2 metric grid).
+
+    Each panel is one metric with benchmarks along the x-axis: bars are the
+    **median** (typical performance), an overlaid marker is **p90** (ordinary
+    high). Rare-failure statistics (p99, max, tail amplification) deliberately
+    live in ``plot_all_benchmarks_tail_errors`` instead — this figure and the
+    tail figure must not share statistics. Physical-Kelvin panels (``*_K``) and
+    normalized-percent panels (``*_pct``) keep separate y-axes by construction.
+    """
     names = list(records_by_benchmark.keys())
+    panels = (
+        ("rmse_K", "RMSE (K)", "Field error magnitude"),
+        ("node_jump_rmse_K", "node-jump RMSE (K)", "Interface-jump error magnitude"),
+        ("gnrmse_pct", "gNRMSE (%)", "Scale-normalized field difficulty"),
+        ("node_jump_gnrmse_pct", "node-jump gNRMSE (%)", "Scale-normalized interface difficulty"),
+    )
     with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
-
-        global_data = [_finite(records_by_benchmark[n]["rel_l2_pct"]) for n in names]
-        iface_data = [_finite(records_by_benchmark[n]["iface_rel_l2_pct"]) for n in names]
-        gd = [(d if d.size else np.array([np.nan])) for d in global_data]
-        idd = [(d if d.size else np.array([np.nan])) for d in iface_data]
-        axes[0].boxplot(gd, tick_labels=names, showfliers=False)
-        axes[0].set_ylabel("rel-L2 (%)")
-        axes[0].set_title("Global error by benchmark")
-        axes[1].boxplot(idd, tick_labels=names, showfliers=False)
-        axes[1].set_ylabel("interface rel-L2 (%)")
-        axes[1].set_title("Interface-band error by benchmark")
-
-        x = np.arange(len(names))
-        p90 = [float(np.percentile(d, 90)) if d.size else np.nan for d in global_data]
-        p99 = [float(np.percentile(d, 99)) if d.size else np.nan for d in global_data]
-        axes[2].bar(x - 0.2, p90, width=0.4, label="p90", color="C0")
-        axes[2].bar(x + 0.2, p99, width=0.4, label="p99", color="C3")
-        axes[2].set_xticks(x)
-        axes[2].set_xticklabels(names)
-        axes[2].set_ylabel("rel-L2 (%)")
-        axes[2].set_title("Tail error by benchmark")
-        axes[2].legend()
-        for ax in axes:
-            ax.tick_params(axis="x", rotation=20)
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        for ax, (col, ylabel, title) in zip(axes.ravel(), panels):
+            stats_by_name = {
+                n: _tail_stats(records_by_benchmark[n].get(col, np.array([np.nan])))
+                for n in names
+            }
+            _grouped_tail_bars(
+                ax, names, stats_by_name,
+                bar_stat="median", marker_stats=("p90",),
+                ylabel=ylabel, title=title,
+            )
+        fig.suptitle("Cross-benchmark error summary — median (bar) + p90 (marker)")
         return _save_figure(fig, save_path, "paper", "all_benchmarks_error_summary")
 
 
 def plot_all_benchmarks_prediction_truth_residual(forcing_ctx, source_ctx,
-                                                  interfaces_ctx, save_path=None):
-    """One representative case per benchmark (3x3).
+                                                  interfaces_ctx, source_itr_ctx,
+                                                  save_path=None):
+    """One representative case per benchmark (4x3).
 
     Each ``*_ctx`` is ``(model, ds, records)``. Row 1 is the forcing hard case
     (max global error), row 2 the source near-interface case, row 3 the
-    interfaces off-center case (max ``|x_I − 0.5|``).
+    interfaces off-center case (max ``|x_I − 0.5|``), row 4 the source_itr
+    near-interface most-severe-void case (max ``R_c_amp``).
     """
     with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(3, 3, figsize=(12.5, 11.5))
+        fig, axes = plt.subplots(4, 3, figsize=(12.5, 15.3))
 
         f_model, f_ds, f_rec = forcing_ctx
         err = f_rec["rel_l2_pct"]
@@ -1160,6 +1271,20 @@ def plot_all_benchmarks_prediction_truth_residual(forcing_ctx, source_ctx,
             _render_tpr_row(axes[2], i_ds.x_grid, i_ds.y_grid, Y_true, Y_pred,
                             interface_positions=[x_I_val],
                             row_label="interfaces: " + _row_label(i_ds, i_rec, row))
+
+        si_model, si_ds, si_rec = source_itr_ctx
+        selected = _selected_source_rows(si_rec, si_ds, prefer_void=True)
+        near_rows = [row for regime, row in selected if regime == "near"]
+        row = near_rows[0] if near_rows else (selected[0][1] if selected else -1)
+        if row >= 0:
+            sid, s, j = (int(si_rec[k][row]) for k in ("sim_id", "s", "j"))
+            params = si_ds.sim_params[sid]
+            patch = (float(params["x_h"]), float(params["y_h"]),
+                     float(params["w_h"]), float(params["h_h"]))
+            Y_true, Y_pred = _predict_norm_fields(si_model, si_ds, sid, s, j)
+            _render_tpr_row(axes[3], si_ds.x_grid, si_ds.y_grid, Y_true, Y_pred,
+                            interface_positions=[float(params.get("interface_x", 0.5))],
+                            patch=patch, row_label="source_itr: " + _row_label(si_ds, si_rec, row))
         return _save_figure(fig, save_path, "paper", "all_benchmarks_prediction_truth_residual")
 
 
@@ -1217,6 +1342,7 @@ def _aggregate_benchmark_jump(ctx, n_sims: int = 24, n_targets: int = _JUMP_N_TA
 
 
 def plot_all_benchmarks_interface_jump(forcing_ctx, source_ctx, interfaces_ctx,
+                                       source_itr_ctx,
                                        save_path=None, n_sims: int = 24, seed: int = 0):
     """Combined cross-benchmark contact-jump synthesis (1x3), honest per-panel lanes.
 
@@ -1233,9 +1359,9 @@ def plot_all_benchmarks_interface_jump(forcing_ctx, source_ctx, interfaces_ctx,
       This equals the node-to-node jump rel-L2 per case (R_c*G cancels) — the honest
       "which benchmark is hardest to learn" panel.
     """
-    names = ("forcing", "source", "interfaces")
-    ctxs = (forcing_ctx, source_ctx, interfaces_ctx)
-    colors = {"forcing": "C0", "source": "C1", "interfaces": "C2"}
+    names = ("forcing", "source", "interfaces", "source_itr")
+    ctxs = (forcing_ctx, source_ctx, interfaces_ctx, source_itr_ctx)
+    colors = _BENCHMARK_COLORS
     aggs = {name: _aggregate_benchmark_jump(ctx, n_sims=n_sims, seed=seed)
             for name, ctx in zip(names, ctxs)}
 
@@ -1331,6 +1457,105 @@ def _tail_stats(values: np.ndarray) -> dict[str, float]:
         "p99": float(p99),
         "max": float(np.max(v)),
     }
+
+
+def _tail_amp(stats: dict[str, float]) -> float:
+    """Dimensionless tail-amplification ratio ``p99 / median``.
+
+    NaN when the median is non-finite or numerically ~0 so the ratio never
+    explodes. Never stored in the CSV; only annotated on the tail figure.
+    """
+    median = stats.get("median", np.nan)
+    p99 = stats.get("p99", np.nan)
+    if np.isfinite(median) and median > 1e-12 and np.isfinite(p99):
+        return float(p99 / median)
+    return np.nan
+
+
+# Marker style per stat: (matplotlib marker, color). Used by _grouped_tail_bars.
+_TAIL_MARKER_STYLE = {
+    "mean": ("o", "0.25"),
+    "median": ("o", "0.15"),
+    "p90": ("o", "#0072B2"),
+    "p99": ("s", "#D55E00"),
+    "max": ("D", "0.1"),
+}
+
+
+def _grouped_tail_bars(ax, names, stats_by_name, *, bar_stat, ylabel, title,
+                       marker_stats=(), annotate_n=False, hollow_stats=(),
+                       annotate_tail_amp=False):
+    """One-metric grouped bar panel with benchmarks along the x-axis.
+
+    ``stats_by_name`` maps each benchmark name to a stats dict (the output of
+    ``_tail_stats``, optionally carrying a derived ``tail_amp``). ``bar_stat`` is
+    drawn as soft-filled bars in the benchmark's shared palette color; each of
+    ``marker_stats`` is overlaid as a point marker (those in ``hollow_stats`` are
+    drawn open to de-emphasize n-dependent stats such as ``max``).
+
+    A benchmark whose ``bar_stat`` is non-finite **keeps its x-axis slot and tick
+    label**, draws no bar or marker, and is annotated ``n/a`` so category order is
+    identical across panels. ``annotate_n`` writes the finite sample count per
+    benchmark; ``annotate_tail_amp`` writes the dimensionless ``tail_amp`` ratio
+    as a text label (e.g. ``×2.7``) — it is never plotted on the unit y-axis.
+    """
+    x = np.arange(len(names))
+    bar_vals = [float(stats_by_name[n].get(bar_stat, np.nan)) for n in names]
+
+    for xi, name, val in zip(x, names, bar_vals):
+        if np.isfinite(val):
+            ax.bar(xi, val, width=0.62, color=_BENCHMARK_COLORS.get(name, "0.5"),
+                   alpha=0.85, edgecolor="0.25", linewidth=0.8, zorder=2)
+
+    for stat in marker_stats:
+        ys = [float(stats_by_name[n].get(stat, np.nan)) for n in names]
+        marker, color = _TAIL_MARKER_STYLE.get(stat, ("o", "k"))
+        hollow = stat in hollow_stats
+        ax.plot(x, ys, linestyle="none", marker=marker, ms=6, zorder=3,
+                mfc="none" if hollow else color, mec=color, mew=1.3,
+                label=f"{stat} (n-dependent)" if hollow else stat)
+
+    # Per-benchmark top of plotted content, for stacking text annotations.
+    def _top(name):
+        vals = [float(stats_by_name[name].get(bar_stat, np.nan))]
+        vals += [float(stats_by_name[name].get(s, np.nan)) for s in marker_stats]
+        finite = [v for v in vals if np.isfinite(v)]
+        return max(finite) if finite else np.nan
+
+    tops = [_top(n) for n in names]
+    finite_tops = [t for t in tops if np.isfinite(t)]
+    span = max(finite_tops) if finite_tops else 1.0
+    pad = 0.02 * span if span > 0 else 0.02
+
+    for xi, name, top in zip(x, names, tops):
+        base = (top if np.isfinite(top) else 0.0) + pad
+        if not np.isfinite(bar_vals[names.index(name)]):
+            ax.text(xi, base, "n/a", ha="center", va="bottom", fontsize=8, color="0.5")
+            continue
+        line = 0
+        if annotate_tail_amp:
+            amp = float(stats_by_name[name].get("tail_amp", np.nan))
+            label = f"×{amp:.1f}" if np.isfinite(amp) else "×n/a"
+            ax.annotate(label, (xi, base), xytext=(0, 2 + 11 * line),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=7, color="0.2")
+            line += 1
+        if annotate_n:
+            n_val = int(stats_by_name[name].get("n", 0))
+            ax.annotate(f"n={n_val}", (xi, base), xytext=(0, 2 + 11 * line),
+                        textcoords="offset points", ha="center", va="bottom",
+                        fontsize=6.5, color="0.45")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.margins(y=0.18)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    if marker_stats:
+        ax.legend(fontsize=7, loc="upper left")
+    return ax
 
 
 def _quantile_bin_strata(values: np.ndarray, n_bins: int = 4,
@@ -1561,3 +1786,310 @@ def plot_benchmark_tail_errors(records: dict[str, np.ndarray], save_path=None):
                     ax.legend(fontsize=7)
         fig.suptitle(f"{benchmark or 'benchmark'}: tail errors (p90/p99/max) by stratum")
         return _save_figure(fig, save_path, "paper", f"{benchmark or 'benchmark'}_tail_errors")
+
+
+def plot_all_benchmarks_tail_errors(records_by_benchmark, save_path=None):
+    """Cross-benchmark *rare-failure* reliability (1x3 metric grid).
+
+    Each panel is one scale-normalized, cross-benchmark-comparable metric with
+    benchmarks along the x-axis: bars are **p99** (rare-but-recurring failure),
+    an overlaid hollow marker is **max** (drawn open because it is n-dependent
+    and not a headline statistic). The dimensionless **tail amplification**
+    ``p99 / median`` is written above each benchmark as a text label (e.g.
+    ``×2.7``); the finite sample count ``n`` is annotated so max reliability is
+    judgeable. This figure deliberately owns no median/p90 — those typical and
+    ordinary-high statistics live in ``plot_all_benchmarks_error_summary`` and
+    the two figures must not share statistics.
+    """
+    names = list(records_by_benchmark.keys())
+    panels = (
+        ("gnrmse_pct", "gNRMSE (%)", "Field tail (scale-normalized)"),
+        ("iface_rel_l2_pct", "interface rel-L2 (%)", "Interface-region tail"),
+        ("node_jump_gnrmse_pct", "node-jump gNRMSE (%)", "Interface-jump tail"),
+    )
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.6))
+        for ax, (col, ylabel, title) in zip(np.atleast_1d(axes), panels):
+            stats_by_name = {}
+            for n in names:
+                stats = _tail_stats(records_by_benchmark[n].get(col, np.array([np.nan])))
+                stats["tail_amp"] = _tail_amp(stats)
+                stats_by_name[n] = stats
+            _grouped_tail_bars(
+                ax, names, stats_by_name,
+                bar_stat="p99", marker_stats=("max",), hollow_stats=("max",),
+                ylabel=ylabel, title=title,
+                annotate_n=True, annotate_tail_amp=True,
+            )
+        fig.suptitle("Cross-benchmark tail reliability — p99 (bar) + max (hollow) + tail amp (×p99/median)")
+        return _save_figure(fig, save_path, "paper", "all_benchmarks_tail_errors")
+
+
+def plot_benchmark_overview(save_path=None):
+    """Benchmark overview table figure (what each task tests).
+
+    A pure ``matplotlib`` table built from the curated ``_BENCHMARK_OVERVIEW_ROWS``
+    constant — it reads no model or CSV, so it always renders. Rows are the four
+    paper benchmarks; columns are ``_BENCHMARK_OVERVIEW_COLS``. Cells are
+    ``textwrap``-wrapped and row heights scale with the wrapped line count so no
+    text overflows. Each benchmark's row header uses its shared palette color.
+    """
+    benchmarks = list(_BENCHMARK_OVERVIEW_ROWS.keys())
+    col_labels = ["benchmark", *_BENCHMARK_OVERVIEW_COLS]
+    wrap_widths = {
+        "benchmark": 12,
+        "geometry / source": 30,
+        "varied parameters": 28,
+        "ITR parameterization": 26,
+        "prediction task": 24,
+        "main stress test": 24,
+    }
+
+    cell_text: list[list[str]] = []
+    row_line_counts: list[int] = []
+    for bm in benchmarks:
+        row = [bm]
+        for col in _BENCHMARK_OVERVIEW_COLS:
+            row.append(_BENCHMARK_OVERVIEW_ROWS[bm][col])
+        wrapped = [
+            "\n".join(textwrap.wrap(text, width=wrap_widths[label]) or [""])
+            for label, text in zip(col_labels, row)
+        ]
+        cell_text.append(wrapped)
+        row_line_counts.append(max(c.count("\n") + 1 for c in wrapped))
+
+    total_lines = sum(row_line_counts) + len(col_labels)  # + header band
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(15, 0.6 + 0.34 * total_lines))
+        ax.axis("off")
+        col_widths = [0.11, 0.24, 0.21, 0.17, 0.14, 0.13]
+        table = ax.table(
+            cellText=cell_text,
+            colLabels=col_labels,
+            colWidths=col_widths,
+            cellLoc="left",
+            loc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8.5)
+
+        for (r, c), cell in table.get_celld().items():
+            cell.set_edgecolor("0.8")
+            cell.set_linewidth(0.6)
+            if r == 0:  # header band
+                cell.set_facecolor("0.92")
+                cell.set_text_props(fontweight="bold")
+            else:
+                line_count = row_line_counts[r - 1]
+                cell.set_height(0.04 * (line_count + 0.8))
+                if c == 0:
+                    bm = benchmarks[r - 1]
+                    cell.set_facecolor(_BENCHMARK_COLORS.get(bm, "0.95"))
+                    cell.set_text_props(color="white", fontweight="bold")
+                elif r % 2 == 0:
+                    cell.set_facecolor("0.975")
+        ax.set_title("Benchmark overview — what each task tests", fontweight="bold", pad=12)
+        return _save_figure(fig, save_path, "paper", "benchmark_overview", layout="none")
+
+
+# ============================================================
+# GENERALIZATION (same-sim held-out vs unseen-sim)
+# ============================================================
+
+def _assert_single_benchmark(records: dict[str, np.ndarray], benchmark: str) -> None:
+    """Raise unless every stored ``benchmark`` value equals ``benchmark``.
+
+    The ``benchmark`` kwarg is authoritative and never inferred from a path. If
+    the records carry a ``benchmark`` column, a record set spanning more than one
+    benchmark, or one whose stored value disagrees with the passed kwarg, is a
+    mislabeled/swapped file and raises. Records without the column are accepted
+    (the kwarg stands alone).
+    """
+    if "benchmark" not in records:
+        return
+    uniq = sorted({str(v) for v in records["benchmark"] if str(v) != ""})
+    if not uniq:
+        return
+    if len(uniq) > 1:
+        raise ValueError(
+            f"generalization records span multiple benchmarks {uniq}; "
+            f"pass a single-benchmark record set matching benchmark='{benchmark}'"
+        )
+    if uniq[0] != str(benchmark):
+        raise ValueError(
+            f"stored benchmark '{uniq[0]}' does not match requested "
+            f"benchmark='{benchmark}'"
+        )
+
+
+def _compute_shared_lead_bin_edges(same_sim_records: dict[str, np.ndarray],
+                                   unseen_records: dict[str, np.ndarray],
+                                   *, n_lead_bins: int = 4) -> dict:
+    """Quantile lead-time (``t_bar``) bin edges shared by every metric panel.
+
+    Edges are quantiles of finite ``t_bar`` over the **union** of both record
+    sets, computed independently of any metric so both panels and both series
+    share identical physical lead-time edges. Tied quantiles are de-duplicated
+    (``np.unique``); when ties collapse bins the effective bin count drops and is
+    reported in ``n_effective_bins``. Raises only when a set has zero finite
+    ``t_bar`` (empty input) or the union has fewer than two distinct ``t_bar``
+    values (no meaningful lead-time axis).
+    """
+    same_t = _finite(same_sim_records.get("t_bar", np.array([])))
+    unseen_t = _finite(unseen_records.get("t_bar", np.array([])))
+    if same_t.size == 0 or unseen_t.size == 0:
+        raise ValueError(
+            "generalization needs finite t_bar in both record sets; got "
+            f"same_sim={same_t.size}, unseen={unseen_t.size}"
+        )
+    union_t = np.concatenate([same_t, unseen_t])
+    if np.unique(union_t).size < 2:
+        raise ValueError(
+            "fewer than two distinct t_bar values across the union; no lead-time "
+            "axis to bin"
+        )
+    qs = np.linspace(0.0, 1.0, n_lead_bins + 1)
+    edges = np.unique(np.quantile(union_t, qs))
+    return {"lead_bin_edges": edges, "n_effective_bins": int(edges.size - 1)}
+
+
+def _lead_bin_masks(t_bar: np.ndarray, edges: np.ndarray) -> list[np.ndarray]:
+    """Full-length masks for each lead-time bin (final bin right-inclusive)."""
+    arr = np.asarray(t_bar, dtype=np.float64)
+    finite = np.isfinite(arr)
+    masks: list[np.ndarray] = []
+    for k in range(edges.size - 1):
+        lo, hi = edges[k], edges[k + 1]
+        if k == edges.size - 2:
+            masks.append(finite & (arr >= lo) & (arr <= hi))
+        else:
+            masks.append(finite & (arr >= lo) & (arr < hi))
+    return masks
+
+
+def _compute_generalization_by_lead_bin(same_sim_records: dict[str, np.ndarray],
+                                        unseen_records: dict[str, np.ndarray],
+                                        *, benchmark: str, metric: str,
+                                        lead_bin_edges: np.ndarray) -> dict:
+    """Per-lead-bin median + IQR of ``metric`` for both record sets.
+
+    ``lead_bin_edges`` are the shared edges from ``_compute_shared_lead_bin_edges``
+    so every metric panel uses identical physical lead-time bins; only the per-bin
+    counts differ between metrics/groups. Both record sets are asserted to carry
+    the passed ``benchmark`` (never inferred). Empty bins yield count 0 and NaN
+    statistics rather than raising. Precondition (enforced upstream, not here):
+    ``same_sim`` is held-out time pairs of seen sims; ``unseen`` is disjoint sim
+    identities.
+    """
+    _assert_single_benchmark(same_sim_records, benchmark)
+    _assert_single_benchmark(unseen_records, benchmark)
+
+    def _series(records: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        t_bar = records.get("t_bar", np.array([]))
+        n = int(np.asarray(t_bar).shape[0])
+        vals = np.asarray(records.get(metric, np.full(n, np.nan)), dtype=np.float64)
+        if vals.shape[0] != n:
+            vals = np.full(n, np.nan)
+        masks = _lead_bin_masks(t_bar, lead_bin_edges)
+        counts, median, q25, q75 = [], [], [], []
+        for m in masks:
+            v = vals[m]
+            v = v[np.isfinite(v)]
+            counts.append(int(v.size))
+            if v.size:
+                median.append(float(np.median(v)))
+                q25.append(float(np.quantile(v, 0.25)))
+                q75.append(float(np.quantile(v, 0.75)))
+            else:
+                median.append(np.nan)
+                q25.append(np.nan)
+                q75.append(np.nan)
+        return {
+            "counts": np.array(counts, dtype=np.int64),
+            "median": np.array(median, dtype=np.float64),
+            "q25": np.array(q25, dtype=np.float64),
+            "q75": np.array(q75, dtype=np.float64),
+        }
+
+    same = _series(same_sim_records)
+    unseen = _series(unseen_records)
+    return {
+        "same_sim_counts": same["counts"],
+        "unseen_counts": unseen["counts"],
+        "same_sim_median": same["median"],
+        "same_sim_q25": same["q25"],
+        "same_sim_q75": same["q75"],
+        "unseen_median": unseen["median"],
+        "unseen_q25": unseen["q25"],
+        "unseen_q75": unseen["q75"],
+    }
+
+
+def plot_generalization_same_vs_unseen(same_sim_records, unseen_records, *,
+                                       benchmark,
+                                       metrics=("rmse_K", "node_jump_gnrmse_pct"),
+                                       n_lead_bins=4, save_path=None):
+    """Same-sim held-out vs unseen-sim generalization gap vs lead time.
+
+    One panel per metric, lead-time bins on the x-axis, same-sim and unseen as two
+    distinctly-colored series (median line + IQR band). A single lead-time binning
+    is computed once over the union and reused for every panel so the physical
+    edges are identical across metrics. ``benchmark`` is required and validated
+    against each record set's stored ``benchmark`` column. When both sets carry
+    ``sim_id``, an accidental swap is caught by a disjointness guard. Returns the
+    saved figure ``Path`` (or ``None`` if skipped), matching the package's plot
+    API; per-bin metadata is exposed via the private compute helpers, not here.
+    """
+    if "sim_id" in same_sim_records and "sim_id" in unseen_records:
+        same_ids = {int(v) for v in same_sim_records["sim_id"]}
+        unseen_ids = {int(v) for v in unseen_records["sim_id"]}
+        if same_ids and unseen_ids and not same_ids.isdisjoint(unseen_ids):
+            raise ValueError(
+                "same-sim and unseen-sim record sets share sim_ids "
+                f"{sorted(same_ids & unseen_ids)[:5]}...; the unseen set must hold "
+                "disjoint simulation identities"
+            )
+
+    edges_info = _compute_shared_lead_bin_edges(
+        same_sim_records, unseen_records, n_lead_bins=n_lead_bins
+    )
+    edges = edges_info["lead_bin_edges"]
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(1, len(metrics), figsize=(6.0 * len(metrics), 4.6),
+                                 squeeze=False)
+        first_stats = None
+        for ax, metric in zip(axes[0], metrics):
+            stats = _compute_generalization_by_lead_bin(
+                same_sim_records, unseen_records,
+                benchmark=benchmark, metric=metric, lead_bin_edges=edges,
+            )
+            if first_stats is None:
+                first_stats = stats
+            for label, color, key in (
+                ("same-sim (held-out time)", _SAME_SIM_COLOR, "same_sim"),
+                ("unseen-sim", _UNSEEN_COLOR, "unseen"),
+            ):
+                med = stats[f"{key}_median"]
+                q25 = stats[f"{key}_q25"]
+                q75 = stats[f"{key}_q75"]
+                ax.fill_between(centers, q25, q75, color=color, alpha=0.18, linewidth=0)
+                ax.plot(centers, med, marker="o", ms=5, color=color, label=label)
+            ax.set_xlabel("lead time t̄ (bin center)")
+            ax.set_ylabel(metric)
+            ax.set_title(metric)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            ax.legend(fontsize=7, loc="upper left")
+
+        edge_str = ", ".join(f"{e:.3g}" for e in edges)
+        same_counts = "/".join(str(int(c)) for c in first_stats["same_sim_counts"])
+        unseen_counts = "/".join(str(int(c)) for c in first_stats["unseen_counts"])
+        fig.suptitle(
+            f"{benchmark}: same-sim vs unseen-sim by lead time "
+            f"(median + IQR)\nt̄ edges [{edge_str}]  ·  "
+            f"n same={same_counts}  n unseen={unseen_counts}",
+            fontsize=9,
+        )
+        return _save_figure(fig, save_path, "paper", "generalization_same_vs_unseen")

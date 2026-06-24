@@ -88,6 +88,14 @@ def main():
                         help="Path to source test_records.csv (combined paper figures)")
     parser.add_argument("--records-interfaces", type=str, default=None,
                         help="Path to interfaces test_records.csv (combined paper figures)")
+    parser.add_argument("--records-source-itr", type=str, default=None,
+                        help="Path to source_itr test_records.csv (combined paper figures)")
+    parser.add_argument("--records-same-sim", type=str, default=None,
+                        help="Path to same-sim held-out test_records.csv (generalization figure)")
+    parser.add_argument("--records-unseen", type=str, default=None,
+                        help="Path to unseen-sim test_records.csv (generalization figure)")
+    parser.add_argument("--generalization-benchmark", type=str, default=None,
+                        help="Benchmark name for the generalization figure (required kwarg)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
                         choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout"],
@@ -806,6 +814,13 @@ def main():
         print("=== PAPER GROUP ===")
         paper_dir = out_dir / "paper"
 
+        # benchmark_overview reads no model or CSV, so it always renders.
+        if _should_run("benchmark_overview", groups, individual):
+            print("--- benchmark_overview ---")
+            paper_dir.mkdir(parents=True, exist_ok=True)
+            paper_plots.plot_benchmark_overview(
+                save_path=paper_dir / "benchmark_overview.png")
+
         active_records = None
         records_path = args.records or args.csv
         if records_path:
@@ -814,6 +829,7 @@ def main():
         summary_plots = {
             "forcing_test_error_summary": paper_plots.plot_forcing_test_error_summary,
             "source_test_error_summary": paper_plots.plot_source_test_error_summary,
+            "source_itr_test_error_summary": paper_plots.plot_source_itr_test_error_summary,
             "interfaces_test_error_summary": paper_plots.plot_interfaces_test_error_summary,
         }
         for name, fn in summary_plots.items():
@@ -855,6 +871,7 @@ def main():
         prediction_plots = {
             "forcing_prediction_truth_residual": paper_plots.plot_forcing_prediction_truth_residual,
             "source_prediction_truth_residual": paper_plots.plot_source_prediction_truth_residual,
+            "source_itr_prediction_truth_residual": paper_plots.plot_source_itr_prediction_truth_residual,
             "interfaces_prediction_truth_residual": paper_plots.plot_interfaces_prediction_truth_residual,
         }
         temperature_profile_plots = {
@@ -931,6 +948,7 @@ def main():
             "forcing": args.records_forcing,
             "source": args.records_source,
             "interfaces": args.records_interfaces,
+            "source_itr": args.records_source_itr,
         }
         supplied = {name: path for name, path in csv_map.items() if path}
         combined_records = {
@@ -938,13 +956,24 @@ def main():
         }
 
         if _should_run("all_benchmarks_error_summary", groups, individual):
-            if all(csv_map.values()):
+            if len(combined_records) >= 2:
                 print("--- all_benchmarks_error_summary ---")
                 paper_plots.plot_all_benchmarks_error_summary(
                     combined_records, save_path=paper_dir / "all_benchmarks_error_summary.png")
             else:
                 _print_skip("all_benchmarks_error_summary",
-                            "need --records-forcing, --records-source, --records-interfaces")
+                            "need at least two of --records-forcing, --records-source, "
+                            "--records-interfaces, --records-source-itr")
+
+        if _should_run("all_benchmarks_tail_errors", groups, individual):
+            if len(combined_records) >= 2:
+                print("--- all_benchmarks_tail_errors ---")
+                paper_plots.plot_all_benchmarks_tail_errors(
+                    combined_records, save_path=paper_dir / "all_benchmarks_tail_errors.png")
+            else:
+                _print_skip("all_benchmarks_tail_errors",
+                            "need at least two of --records-forcing, --records-source, "
+                            "--records-interfaces, --records-source-itr")
 
         # In combined mode, write one tail_summary.csv covering whichever
         # benchmark CSVs were supplied, regardless of which plots were requested.
@@ -957,15 +986,39 @@ def main():
         if _should_run("all_benchmarks_prediction_truth_residual", groups, individual):
             _print_skip(
                 "all_benchmarks_prediction_truth_residual",
-                "render programmatically: needs a (checkpoint, trajectories, params, records) bundle per benchmark",
+                "render programmatically: needs a (checkpoint, trajectories, params, records) bundle "
+                "per benchmark (forcing, source, interfaces, source_itr)",
             )
 
         if _should_run("all_benchmarks_interface_jump", groups, individual):
             _print_skip(
                 "all_benchmarks_interface_jump",
                 "render programmatically via paper_plots.plot_all_benchmarks_interface_jump: "
-                "needs a (model, ds, records, config, dt) context per benchmark",
+                "needs a (model, ds, records, config, dt) context per benchmark "
+                "(forcing, source, interfaces, source_itr)",
             )
+
+        if _should_run("generalization_same_vs_unseen", groups, individual):
+            same_path = args.records_same_sim
+            unseen_path = args.records_unseen
+            if same_path and unseen_path and args.generalization_benchmark:
+                print("--- generalization_same_vs_unseen ---")
+                paper_dir.mkdir(parents=True, exist_ok=True)
+                paper_plots.plot_generalization_same_vs_unseen(
+                    paper_plots._load_test_records(same_path),
+                    paper_plots._load_test_records(unseen_path),
+                    benchmark=args.generalization_benchmark,
+                    save_path=paper_dir / "generalization_same_vs_unseen.png")
+            else:
+                missing = [
+                    flag for flag, val in (
+                        ("--records-same-sim", same_path),
+                        ("--records-unseen", unseen_path),
+                        ("--generalization-benchmark", args.generalization_benchmark),
+                    ) if not val
+                ]
+                _print_skip("generalization_same_vs_unseen",
+                            "need " + ", ".join(missing))
 
     # ---- SWEEP GROUP ----
     sweep_plot_names = _plots_for_group("sweep")

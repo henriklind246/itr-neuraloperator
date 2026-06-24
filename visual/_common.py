@@ -88,6 +88,8 @@ PLOT_REGISTRY: dict[str, str] = {
     "forcing_interface_jump_profiles":          "paper",
     "source_test_error_summary":                "paper",
     "source_prediction_truth_residual":         "paper",
+    "source_itr_test_error_summary":            "paper",
+    "source_itr_prediction_truth_residual":     "paper",
     "source_temperature_profiles":              "paper",
     "source_interface_jump_profiles":           "paper",
     "source_itr_temperature_profiles":          "paper",
@@ -105,6 +107,9 @@ PLOT_REGISTRY: dict[str, str] = {
     "forcing_tail_errors":                      "paper",
     "source_tail_errors":                       "paper",
     "interfaces_tail_errors":                   "paper",
+    "all_benchmarks_tail_errors":               "paper",
+    "benchmark_overview":                       "paper",
+    "generalization_same_vs_unseen":            "paper",
     # group: rollout
     "rollout_partition_error":                  "rollout",
 }
