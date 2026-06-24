@@ -2,6 +2,7 @@ import csv
 import inspect
 import json
 from math import comb
+from pathlib import Path
 
 import matplotlib
 import numpy as np
@@ -9,6 +10,8 @@ import pytest
 import torch
 
 matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
 
 from data.dataset import split_sim_ids
 from src.operators.eval import TEST_RECORD_FIELDS
@@ -82,6 +85,8 @@ class TestPlotRegistry:
             "source_interface_jump_profiles",
             "source_itr_interface_jump_profiles",
             "interfaces_interface_jump_profiles",
+            "source_itr_test_error_summary",
+            "source_itr_prediction_truth_residual",
         ]:
             assert _common.PLOT_REGISTRY[name] == "paper"
 
@@ -164,6 +169,15 @@ class TestPlotRegistry:
             "interfaces_tail_errors",
         ]:
             assert _common.PLOT_REGISTRY[name] == "paper"
+
+    def test_consolidated_paper_plot_names_registered(self):
+        for name in [
+            "benchmark_overview",
+            "all_benchmarks_tail_errors",
+            "generalization_same_vs_unseen",
+        ]:
+            assert _common.PLOT_REGISTRY[name] == "paper"
+            assert name in _common._plots_for_group("paper")
 
     def test_rollout_plot_name_registered(self):
         assert _common.PLOT_REGISTRY["rollout_partition_error"] == "rollout"
@@ -1068,6 +1082,22 @@ def _write_records_csv(path, rows):
             writer.writerow({k: row.get(k, "") for k in TEST_RECORD_FIELDS})
 
 
+def _rich_metric_cells(rng):
+    """The six physical-K / scale-normalized metrics eval writes per record row.
+
+    Kept together so every benchmark fixture emits the same rich-metric columns the
+    paper loader (`_FLOAT_COLS`) now reads; blanks would otherwise load as NaN.
+    """
+    return {
+        "rmse_K": float(rng.uniform(0.5, 12.0)),
+        "gnrmse_pct": float(rng.uniform(0.5, 10.0)),
+        "nrmse_pct": float(rng.uniform(0.5, 10.0)),
+        "node_jump_rmse_K": float(rng.uniform(0.2, 6.0)),
+        "node_jump_nrmse_pct": float(rng.uniform(0.5, 14.0)),
+        "node_jump_gnrmse_pct": float(rng.uniform(0.5, 14.0)),
+    }
+
+
 def _forcing_record_rows():
     """One row per temporal x spatial family combo (covers every box/heatmap cell)."""
     rng = np.random.default_rng(0)
@@ -1083,6 +1113,7 @@ def _forcing_record_rows():
                 "x_I": 0.5,
                 "rel_l2_pct": float(rng.uniform(0.5, 8.0)),
                 "iface_rel_l2_pct": float(rng.uniform(0.5, 12.0)),
+                **_rich_metric_cells(rng),
             })
     return rows
 
@@ -1103,6 +1134,7 @@ def _source_record_rows():
             "x_I": 0.5,
             "rel_l2_pct": float(rng.uniform(0.5, 8.0)),
             "iface_rel_l2_pct": float(rng.uniform(0.5, 12.0)),
+            **_rich_metric_cells(rng),
         })
     return rows
 
@@ -1121,6 +1153,7 @@ def _interfaces_record_rows():
             "x_I": x_I,
             "rel_l2_pct": float(rng.uniform(0.5, 8.0)),
             "iface_rel_l2_pct": float(rng.uniform(0.5, 12.0)),
+            **_rich_metric_cells(rng),
         })
     return rows
 
@@ -1142,10 +1175,14 @@ def source_records(tmp_path):
 @pytest.fixture
 def source_itr_records(tmp_path):
     path = tmp_path / "source_itr_records.csv"
+    rng = np.random.default_rng(7)
     rows = []
     for row in _source_record_rows():
         updated = dict(row)
         updated["benchmark"] = "source_itr"
+        updated["R_c_amp"] = float(rng.uniform(0.0, 2.95))
+        updated["R_c_y0"] = float(rng.uniform(0.1, 0.9))
+        updated["R_c_sigma"] = float(rng.uniform(0.05, 0.2))
         rows.append(updated)
     _write_records_csv(path, rows)
     return paper_plots._load_test_records(path)
@@ -1159,6 +1196,47 @@ def interfaces_records(tmp_path):
 
 
 class TestPaperRecordLoading:
+    def test_void_columns_in_schema(self):
+        for col in ("R_c_amp", "R_c_y0", "R_c_sigma"):
+            assert col in TEST_RECORD_FIELDS
+            assert col in paper_plots._FLOAT_COLS
+
+    def test_void_columns_load_for_source_itr(self, source_itr_records):
+        for col in ("R_c_amp", "R_c_y0", "R_c_sigma"):
+            assert np.all(np.isfinite(source_itr_records[col]))
+
+    def test_void_columns_blank_for_source(self, source_records):
+        # Source rows omit void params -> NaN, so void panels stay empty.
+        for col in ("R_c_amp", "R_c_y0", "R_c_sigma"):
+            assert np.all(np.isnan(source_records[col]))
+
+    _RICH_METRIC_COLS = (
+        "rmse_K", "gnrmse_pct", "nrmse_pct",
+        "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
+    )
+
+    def test_rich_metrics_in_float_cols(self):
+        for col in self._RICH_METRIC_COLS:
+            assert col in TEST_RECORD_FIELDS
+            assert col in paper_plots._FLOAT_COLS
+
+    def test_rich_metrics_load_finite_when_present(self, forcing_records, interfaces_records):
+        for records in (forcing_records, interfaces_records):
+            for col in self._RICH_METRIC_COLS:
+                assert np.all(np.isfinite(records[col]))
+
+    def test_rich_metrics_blank_become_nan(self, tmp_path):
+        # A row that omits the rich metric columns loads them as NaN, never 0.
+        path = tmp_path / "thin_records.csv"
+        _write_records_csv(path, [{
+            "sim_id": 0, "s": 1, "j": 8, "t_s": 0.02, "t_bar": 0.1,
+            "R_c": 0.5, "benchmark": "forcing", "x_I": 0.5,
+            "rel_l2_pct": 2.0, "iface_rel_l2_pct": 3.0,
+        }])
+        thin = paper_plots._load_test_records(path)
+        for col in self._RICH_METRIC_COLS:
+            assert np.all(np.isnan(thin[col]))
+
     def test_blank_floats_become_nan(self, forcing_records):
         # Forcing rows leave x_h/A blank -> NaN; rel_l2_pct is always present.
         assert np.all(np.isnan(forcing_records["x_h"]))
@@ -1201,13 +1279,19 @@ class TestPaperSummaryPlots:
         paper_plots.plot_interfaces_test_error_summary(interfaces_records, save_path=out_path)
         assert out_path.exists()
 
+    def test_source_itr_summary_smoke(self, tmp_path, source_itr_records):
+        out_path = tmp_path / "source_itr_test_error_summary.png"
+        paper_plots.plot_source_itr_test_error_summary(source_itr_records, save_path=out_path)
+        assert out_path.exists()
+
     def test_all_benchmarks_summary_smoke(
-        self, tmp_path, forcing_records, source_records, interfaces_records
+        self, tmp_path, forcing_records, source_records, interfaces_records,
+        source_itr_records,
     ):
         out_path = tmp_path / "all_benchmarks_test_error_summary.png"
         paper_plots.plot_all_benchmarks_error_summary(
             {"forcing": forcing_records, "source": source_records,
-             "interfaces": interfaces_records},
+             "interfaces": interfaces_records, "source_itr": source_itr_records},
             save_path=out_path,
         )
         assert out_path.exists()
@@ -1230,6 +1314,66 @@ class TestTailErrorStats:
         assert stats["n"] == 0
         for key in ("mean", "median", "p90", "p99", "max"):
             assert np.isnan(stats[key])
+
+    def test_tail_stats_ignores_nans_and_counts_finite(self):
+        # Mixed finite/NaN: n is the finite count, stats use only finite entries.
+        v = np.array([1.0, np.nan, 3.0, np.nan, 5.0])
+        stats = paper_plots._tail_stats(v)
+        assert stats["n"] == 3
+        assert stats["median"] == pytest.approx(3.0)
+        assert stats["max"] == pytest.approx(5.0)
+
+    def test_tail_stats_unequal_sample_counts(self):
+        # Two benchmarks with different finite counts both report n correctly.
+        a = paper_plots._tail_stats(np.linspace(0.0, 1.0, 10))
+        b = paper_plots._tail_stats(np.linspace(0.0, 1.0, 25))
+        assert a["n"] == 10
+        assert b["n"] == 25
+
+    def test_tail_amp_zero_median_is_nan(self):
+        stats = {"median": 0.0, "p99": 4.0}
+        assert np.isnan(paper_plots._tail_amp(stats))
+
+    def test_tail_amp_positive_median_is_finite_ratio(self):
+        stats = {"median": 2.0, "p99": 5.0}
+        assert paper_plots._tail_amp(stats) == pytest.approx(2.5)
+
+    def test_tail_amp_nonfinite_inputs_are_nan(self):
+        assert np.isnan(paper_plots._tail_amp({"median": np.nan, "p99": 4.0}))
+        assert np.isnan(paper_plots._tail_amp({"median": 2.0, "p99": np.nan}))
+
+    def test_grouped_tail_bars_all_nan_metric_no_crash(self):
+        # A benchmark whose metric is all-NaN keeps its slot and annotates n/a;
+        # the panel must render without raising.
+        fig, ax = plt.subplots()
+        names = ["forcing", "source"]
+        stats_by_name = {
+            "forcing": {**paper_plots._tail_stats(np.linspace(1.0, 9.0, 9)),
+                        "tail_amp": 1.4},
+            "source": {**paper_plots._tail_stats(np.array([np.nan, np.nan])),
+                       "tail_amp": np.nan},
+        }
+        paper_plots._grouped_tail_bars(
+            ax, names, stats_by_name,
+            bar_stat="p99", marker_stats=("max",), hollow_stats=("max",),
+            ylabel="m", title="t", annotate_n=True, annotate_tail_amp=True,
+        )
+        ticklabels = [t.get_text() for t in ax.get_xticklabels()]
+        assert ticklabels == names
+        plt.close(fig)
+
+    def test_all_benchmarks_tail_errors_smoke(
+        self, tmp_path, forcing_records, source_records, interfaces_records,
+        source_itr_records,
+    ):
+        out_path = tmp_path / "all_benchmarks_tail_errors.png"
+        result = paper_plots.plot_all_benchmarks_tail_errors(
+            {"forcing": forcing_records, "source": source_records,
+             "interfaces": interfaces_records, "source_itr": source_itr_records},
+            save_path=out_path,
+        )
+        assert out_path.exists()
+        assert result == out_path
 
     def test_forcing_tail_errors_smoke(self, tmp_path, forcing_records):
         out_path = tmp_path / "forcing_tail_errors.png"
@@ -1380,6 +1524,27 @@ class TestPaperPredictionPlots:
         out_path = tmp_path / "source_prediction_truth_residual.png"
         paper_plots.plot_source_prediction_truth_residual(
             model, ds, source_records, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_source_itr_prediction_smoke(
+        self,
+        tmp_path,
+        synthetic_trajectories,
+        synthetic_source_sim_params,
+        plot_config,
+        source_itr_records,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        model = _small_source_itr_model()
+        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "bins"}}
+        sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
+        ds = paper_plots._records_dataset(
+            model, trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
+        )
+        out_path = tmp_path / "source_itr_prediction_truth_residual.png"
+        paper_plots.plot_source_itr_prediction_truth_residual(
+            model, ds, source_itr_records, save_path=out_path
         )
         assert out_path.exists()
 
@@ -1644,3 +1809,158 @@ class TestWriteTestRecords:
         records = paper_plots._load_test_records(out_path)
         assert np.all(records["benchmark"] == "forcing")
         assert np.all(np.isfinite(records["rel_l2_pct"]))
+
+
+class TestBenchmarkOverview:
+    def test_overview_rows_exactly_four_benchmarks(self):
+        # The curated set is the four paper benchmarks, not all of REGISTRY (which
+        # may later acquire utility/MMS problems with no paper figure).
+        assert set(paper_plots._BENCHMARK_OVERVIEW_ROWS) == {
+            "forcing", "source", "source_itr", "interfaces"
+        }
+
+    def test_benchmark_overview_smoke(self, tmp_path):
+        out_path = tmp_path / "benchmark_overview.png"
+        result = paper_plots.plot_benchmark_overview(save_path=out_path)
+        assert out_path.exists()
+        assert result == out_path
+
+
+def _gen_records(t_bar, *, benchmark="forcing", sim_ids=None, seed=0,
+                 metrics=("rmse_K", "node_jump_gnrmse_pct")):
+    """Build a loaded-records-style dict for the generalization helpers."""
+    t_bar = np.asarray(t_bar, dtype=np.float64)
+    n = int(t_bar.size)
+    rng = np.random.default_rng(seed)
+    rec = {
+        "_n": np.int64(n),
+        "t_bar": t_bar,
+        "benchmark": np.array([benchmark] * n, dtype=object),
+    }
+    for m in metrics:
+        rec[m] = rng.uniform(1.0, 5.0, n)
+    if sim_ids is not None:
+        rec["sim_id"] = np.asarray(sim_ids)
+    return rec
+
+
+class TestGeneralizationHelpers:
+    def test_shared_edges_drive_both_metric_panels(self):
+        same = _gen_records(np.linspace(0.0, 0.30, 12), seed=1)
+        unseen = _gen_records(np.linspace(0.05, 0.35, 12), seed=2)
+        info = paper_plots._compute_shared_lead_bin_edges(same, unseen, n_lead_bins=4)
+        edges = info["lead_bin_edges"]
+
+        union = np.concatenate([same["t_bar"], unseen["t_bar"]])
+        expected = np.unique(np.quantile(union, np.linspace(0.0, 1.0, 5)))
+        assert np.allclose(edges, expected)
+        assert info["n_effective_bins"] == edges.size - 1
+
+        # One binning shared across metrics: identical edges -> identical per-bin
+        # counts for two fully-present metrics.
+        s1 = paper_plots._compute_generalization_by_lead_bin(
+            same, unseen, benchmark="forcing", metric="rmse_K", lead_bin_edges=edges)
+        s2 = paper_plots._compute_generalization_by_lead_bin(
+            same, unseen, benchmark="forcing", metric="node_jump_gnrmse_pct",
+            lead_bin_edges=edges)
+        assert np.array_equal(s1["same_sim_counts"], s2["same_sim_counts"])
+        assert np.array_equal(s1["unseen_counts"], s2["unseen_counts"])
+
+    def test_tied_quantiles_collapse_bins(self):
+        tied = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+        info = paper_plots._compute_shared_lead_bin_edges(
+            _gen_records(tied, seed=3), _gen_records(tied, seed=4), n_lead_bins=4)
+        assert info["n_effective_bins"] < 4
+        assert info["lead_bin_edges"].size == info["n_effective_bins"] + 1
+
+    def test_fewer_than_two_distinct_tbar_raises(self):
+        const = np.full(6, 0.2)
+        with pytest.raises(ValueError, match="two distinct t_bar"):
+            paper_plots._compute_shared_lead_bin_edges(
+                _gen_records(const, seed=5), _gen_records(const, seed=6))
+
+    def test_empty_record_set_raises(self):
+        ok = _gen_records(np.linspace(0.0, 0.3, 8), seed=7)
+        empty = _gen_records(np.array([]), seed=8)
+        with pytest.raises(ValueError, match="finite t_bar"):
+            paper_plots._compute_shared_lead_bin_edges(ok, empty)
+
+    def test_empty_bin_yields_zero_count_and_nan(self):
+        # Same-sim t_bar all in [0, 1); hand-made edges put bins 2,3 empty.
+        same = _gen_records(np.linspace(0.0, 0.9, 10), seed=9)
+        unseen = _gen_records(np.linspace(0.0, 2.9, 10), seed=10)
+        edges = np.array([0.0, 1.0, 2.0, 3.0])
+        stats = paper_plots._compute_generalization_by_lead_bin(
+            same, unseen, benchmark="forcing", metric="rmse_K", lead_bin_edges=edges)
+        assert stats["same_sim_counts"][1] == 0
+        assert np.isnan(stats["same_sim_median"][1])
+
+    def test_benchmark_mismatch_raises(self):
+        same = _gen_records(np.linspace(0.0, 0.3, 6), benchmark="source", seed=11)
+        unseen = _gen_records(np.linspace(0.0, 0.3, 6), benchmark="forcing", seed=12)
+        edges = np.array([0.0, 0.15, 0.3])
+        with pytest.raises(ValueError, match="does not match requested"):
+            paper_plots._compute_generalization_by_lead_bin(
+                same, unseen, benchmark="forcing", metric="rmse_K", lead_bin_edges=edges)
+
+    def test_record_set_spanning_multiple_benchmarks_raises(self):
+        mixed = _gen_records(np.linspace(0.0, 0.3, 6), seed=13)
+        mixed["benchmark"] = np.array(
+            ["forcing", "source", "forcing", "source", "forcing", "source"], dtype=object)
+        with pytest.raises(ValueError, match="span multiple benchmarks"):
+            paper_plots._assert_single_benchmark(mixed, "forcing")
+
+    def test_missing_benchmark_column_is_accepted(self):
+        rec = _gen_records(np.linspace(0.0, 0.3, 6), seed=14)
+        del rec["benchmark"]
+        # No column -> kwarg stands alone, no raise.
+        paper_plots._assert_single_benchmark(rec, "forcing")
+
+
+class TestGeneralizationFigure:
+    def test_returns_path_not_tuple(self, tmp_path):
+        same = _gen_records(np.linspace(0.0, 0.30, 14), sim_ids=range(14), seed=20)
+        unseen = _gen_records(np.linspace(0.05, 0.35, 14),
+                              sim_ids=range(100, 114), seed=21)
+        out_path = tmp_path / "generalization_same_vs_unseen.png"
+        result = paper_plots.plot_generalization_same_vs_unseen(
+            same, unseen, benchmark="forcing", save_path=out_path)
+        assert isinstance(result, Path)
+        assert out_path.exists()
+
+    def test_sim_id_overlap_raises(self, tmp_path):
+        same = _gen_records(np.linspace(0.0, 0.3, 10), sim_ids=range(10), seed=22)
+        unseen = _gen_records(np.linspace(0.05, 0.35, 10), sim_ids=range(5, 15), seed=23)
+        with pytest.raises(ValueError, match="share sim_ids"):
+            paper_plots.plot_generalization_same_vs_unseen(
+                same, unseen, benchmark="forcing",
+                save_path=tmp_path / "gen.png")
+
+    def test_sim_id_absent_skips_guard(self, tmp_path):
+        # No sim_id column on either set -> disjointness guard skipped, renders.
+        same = _gen_records(np.linspace(0.0, 0.30, 12), seed=24)
+        unseen = _gen_records(np.linspace(0.05, 0.35, 12), seed=25)
+        out_path = tmp_path / "gen_no_simid.png"
+        result = paper_plots.plot_generalization_same_vs_unseen(
+            same, unseen, benchmark="forcing", save_path=out_path)
+        assert result == out_path
+        assert out_path.exists()
+
+
+class TestGeneralizationCLI:
+    def test_single_records_flag_prints_skip(self, tmp_path, monkeypatch, capsys):
+        import sys
+
+        from visual import cli
+
+        argv = [
+            "cli.py", "--plots", "generalization_same_vs_unseen",
+            "--out", str(tmp_path),
+            "--records-same-sim", str(tmp_path / "same.csv"),
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        cli.main()
+        out = capsys.readouterr().out
+        assert "Skipping generalization_same_vs_unseen" in out
+        assert "--records-unseen" in out
+        assert "--generalization-benchmark" in out

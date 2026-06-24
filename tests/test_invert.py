@@ -28,7 +28,8 @@ from src.physics.internal_source import (
     R_PEAK_MAX,
     make_rc_void_profile,
 )
-from scripts import invert_source_itr as inv
+from scripts import invert as inv
+from scripts.inverse_adapters import ForcingAdapter, InverseAdapter, SourceItrAdapter
 
 
 # A handful of physical thetas spanning the box, including the dependent-ceiling
@@ -891,3 +892,290 @@ def test_run_mcmc_accept_rate_and_summary_columns():
         assert f"mcmc_{nm}_mean" in flat
         assert flat[f"mcmc_{nm}_ci_low"] <= flat[f"mcmc_{nm}_ci_high"]
     assert isinstance(flat["mcmc_excess_covered"], bool)
+
+
+# ---------------------------------------------------------------------------
+# ForcingAdapter: scalar R_c inverse path.
+# ---------------------------------------------------------------------------
+
+def _tiny_forcing_model():
+    from src.operators.fno2d import FNO2d
+    from problems.forcing import COND_STATIC_DIM, FORCING_TEMPORAL_TOKEN_DIM
+    from problems.forcing import SPATIAL_CHANNELS_TEMPORAL
+
+    class CondToBeta(torch.nn.Module):
+        def forward(self, cond_full):
+            out = torch.zeros(
+                cond_full.shape[0], 1, 2, 1,
+                dtype=cond_full.dtype, device=cond_full.device,
+            )
+            out[:, 0, 0, 0] = 1.0
+            out[:, 0, 1, 0] = 5.0 * cond_full[:, 2]
+            return out
+
+    model = FNO2d(
+        modes1=1, modes2=1, width=1,
+        in_channels=SPATIAL_CHANNELS_TEMPORAL, out_channels=1, n_layers=1,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+        temporal_hidden=8, forcing_embed_dim=4, forcing_spatial_dim=1,
+        use_temporal_encoder=True, use_forcing_time_aug=True,
+        s_y_channel=3,
+    )
+    model.padding = 0
+    model.cond_mlp = CondToBeta()
+    with torch.no_grad():
+        model.linear_p.weight.zero_()
+        model.linear_p.bias.zero_()
+        for layer in model.spectral_layers:
+            layer.weights1.zero_()
+            layer.weights2.zero_()
+        for layer in model.conv_layers:
+            layer.weight.zero_()
+            layer.bias.zero_()
+        model.linear_q.weight.zero_()
+        model.linear_q.bias.zero_()
+        model.linear_q.weight[0, 0] = 1.0
+        model.output_layer.weight.zero_()
+        model.output_layer.bias.zero_()
+        model.output_layer.weight[0, 0] = 1.0
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model.eval()
+
+
+def _fake_forcing_observation_set(Nx=8, Ny=8, N=2, M=128):
+    spatial = torch.zeros(N, Nx, Ny, 4)
+    spatial[..., 1] = torch.linspace(0, 1, Nx)[None, :, None]
+    spatial[..., 2] = torch.linspace(0, 1, Ny)[None, None, :]
+    spatial[..., 3] = 1.0
+    cond = torch.zeros(N, 11)
+    cond[:, 0] = torch.linspace(0.25, 0.75, N)
+    forcing_seq = torch.zeros(N, M, 2)
+    forcing_seq[..., 0] = torch.linspace(0, 1, M)
+    targets = torch.zeros(N, Nx, Ny, 1)
+    y_grid = torch.linspace(0, 1, Ny)
+    return inv.ObservationSet(
+        sid=0, time_indices=list(range(N)),
+        spatial=spatial, cond=cond, forcing_seq=forcing_seq,
+        targets=targets, y_grid=y_grid, Nx=Nx,
+        theta_true=torch.tensor([0.65]),
+    )
+
+
+def _tiny_forcing_dataset(Nx=10, Ny=10):
+    from data.dataset import SnapshotPairDataset
+    from problems.registry import get_problem
+    from src.physics.fv_solver_1d import build_time_grid
+
+    spec = get_problem("forcing", "temporal_encoder")
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    x_grid = np.linspace(a, b, Nx)
+    y_grid = np.linspace(c, d, Ny)
+    X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
+    dt, t_grid = build_time_grid(0.03, 0.01, explicit_dt=True)
+    grids = {"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid}
+    time_cfg = dict(
+        num_sims=1, dt=dt, t_final=float(t_grid[-1]), lhs_seed=0,
+        t_on=0.0, t_off=0.2, phase=0.0, tukey_alpha=0.5,
+        T_right=300.0, b=b, ic_families=None,
+    )
+    sim_params = spec.sample_sim_params(
+        rng=np.random.default_rng(0),
+        rng_profile=np.random.default_rng(1),
+        grids=grids,
+        time_cfg=time_cfg,
+    )
+    trajectories = np.broadcast_to(
+        np.asarray(sim_params[0]["T0"], dtype=np.float32)[None, None, :, :],
+        (1, len(t_grid), Nx, Ny),
+    ).copy()
+    ds = SnapshotPairDataset(
+        trajectories=trajectories,
+        sim_params=np.array(sim_params, dtype=object),
+        t_grid=np.asarray(t_grid, dtype=np.float32),
+        x_grid=x_grid.astype(np.float32),
+        y_grid=y_grid.astype(np.float32),
+        sim_ids=np.array([0]),
+        mu_global=300.0,
+        sigma_global=1.0,
+        problem=spec,
+        dt=float(dt),
+        ramp_seconds=2.0 * float(dt),
+    )
+    ds._split_ids = {"train": np.array([0]), "val": np.array([], dtype=int),
+                     "test": np.array([0])}
+    return ds
+
+
+def test_forcing_adapter_reparameterization_roundtrip_logdet_and_shape():
+    adapter = ForcingAdapter()
+    u = torch.tensor([[-2.0], [0.0], [1.5]], dtype=torch.float64)
+    theta = adapter.theta_from_unconstrained(u)
+    back = adapter.unconstrained_from_theta(theta)
+    np.testing.assert_allclose(back.numpy(), u.numpy(), rtol=0, atol=1e-8)
+
+    u1 = torch.tensor([0.4], dtype=torch.float64)
+    J = torch.autograd.functional.jacobian(
+        lambda v: adapter.theta_from_unconstrained(v), u1
+    )
+    ref = torch.linalg.slogdet(J)[1]
+    got = adapter.theta_logabsdet_du(u1)
+    assert float(got) == pytest.approx(float(ref), rel=1e-6, abs=1e-8)
+
+    theta1 = adapter.theta_from_unconstrained(torch.tensor([0.0], dtype=torch.float32))
+    assert theta1.shape == (1,)
+    assert theta1.dtype == torch.float32
+
+
+def test_forcing_adapter_unconstrained_from_theta_clamps_near_bounds():
+    from problems.forcing import RC_RANGE
+
+    adapter = ForcingAdapter()
+    bounds = torch.tensor([[RC_RANGE[0]], [RC_RANGE[1]]], dtype=torch.float32)
+    u = adapter.unconstrained_from_theta(bounds)
+    assert u.shape == (2, 1)
+    assert torch.all(torch.isfinite(u))
+    theta = adapter.theta_from_unconstrained(u)
+    assert torch.all(theta[:, 0] >= RC_RANGE[0])
+    assert torch.all(theta[:, 0] <= RC_RANGE[1])
+
+
+@pytest.mark.parametrize("R_c", [0.05, 0.42, 1.0])
+def test_forcing_adapter_cond_injection_matches_build_cond_vector(R_c):
+    from problems.forcing import build_cond_vector
+
+    adapter = ForcingAdapter()
+    cond = build_cond_vector(
+        t_bar_norm=0.3,
+        t_s_norm=0.0,
+        R_c=R_c,
+        spatial_family="uniform",
+        spatial_params={},
+    )
+    got = adapter.cond_slice_from_theta(
+        torch.tensor([R_c], dtype=torch.float64)
+    ).numpy()
+    np.testing.assert_allclose(got, cond[2:3], rtol=0, atol=1e-6)
+
+
+def test_forcing_adapter_no_spatial_channel_and_sim_param_copy():
+    adapter = ForcingAdapter()
+    params = {
+        "R_c": 0.3,
+        "temporal_family": "sin",
+        "temporal_params": {"A": 100.0, "f": 2.0},
+        "spatial_family": "uniform",
+        "spatial_params": {},
+    }
+    updated = adapter.inject_theta_into_sim_params(params, torch.tensor([0.7]))
+    assert updated is not params
+    assert updated["R_c"] == pytest.approx(0.7)
+    assert params["R_c"] == pytest.approx(0.3)
+    assert adapter.spatial_channel_index() is None
+    assert adapter.spatial_channel_from_theta(torch.tensor([0.7]), torch.linspace(0, 1, 4), 4) is None
+
+
+def test_forcing_adapter_build_fv_solver_roundtrip():
+    adapter = ForcingAdapter()
+    ds = _tiny_forcing_dataset()
+    params = dict(ds.sim_params[0])
+    solver = adapter.build_fv_solver(ds, params, torch.tensor([0.7]))
+    t, _x, _y, T_hist = solver.solve(T0=params["T0"], store_trajectory=True)
+    assert len(t) == len(ds.t_grid)
+    assert np.asarray(T_hist).shape == (len(ds.t_grid), ds.Nx, ds.Ny)
+    assert params["R_c"] != pytest.approx(0.7)
+
+
+def test_forcing_adapter_scalar_recovery_through_cin_conditioning():
+    adapter = ForcingAdapter()
+    model = _tiny_forcing_model()
+    obs = _fake_forcing_observation_set()
+    theta_star = torch.tensor([0.72])
+    with torch.no_grad():
+        obs.targets = inv.predict_fullfield(model, obs, theta_star, adapter).detach()
+
+    cfg = inv.InversionConfig(
+        n_starts=3, adam_steps=120, adam_lr=0.08, lbfgs_steps=25,
+        seed=4, start_sampling="lhs",
+    )
+    result = inv.invert_sim(model, obs, cfg, adapter)
+    assert result.loss < 1e-7
+    assert abs(float(result.theta_hat[0]) - float(theta_star[0])) < 2e-2
+
+
+def test_forcing_adapter_one_dimensional_uq_smoke():
+    adapter = ForcingAdapter()
+    model = _tiny_forcing_model()
+    obs = _fake_forcing_observation_set(Nx=6, Ny=6, N=1)
+    theta_hat = torch.tensor([0.6])
+    with torch.no_grad():
+        obs.targets = inv.predict_fullfield(model, obs, theta_hat, adapter).detach()
+
+    J = inv.observation_jacobian(model, obs, theta_hat, adapter)
+    assert J.shape == (obs.Nx * obs.spatial.shape[2], 1)
+
+    prof = inv.profile_likelihood(
+        model, obs, theta_hat, sigma_eff2=0.05,
+        param_index=0, n_grid=5, span=0.2, level=0.9,
+        adam_steps=2, lbfgs_steps=1, adapter=adapter,
+    )
+    flat_prof = inv.profile_summary(prof, obs, adapter)
+    assert flat_prof["profile_param"] == "R_c"
+    assert "profile_R_c_ci_low" in flat_prof
+
+    spec = inv.laplace_spectrum(model, obs, theta_hat, 0.05, adapter)
+    flat_lap = inv.laplace_summary(spec, adapter)
+    assert "laplace_least_dir_R_c" in flat_lap
+
+    mc = inv.run_mcmc(
+        model, obs, theta_hat, sigma_eff2=0.05,
+        n_samples=20, burn=5, step_size=0.05, level=0.9,
+        seed=5, adapter=adapter,
+    )
+    assert mc.theta_samples.shape == (20, 1)
+    flat_mc = inv.mcmc_summary(mc, obs, adapter)
+    assert "mcmc_R_c_mean" in flat_mc
+
+    cfg = inv.InversionConfig(n_starts=1, adam_steps=5, lbfgs_steps=1, seed=0)
+    result = inv.invert_sim(model, obs, cfg, adapter)
+    assert result.theta_hat.shape == (1,)
+
+
+def test_inverse_adapter_dispatch_and_validation(tiny_fv_dataset):
+    from types import SimpleNamespace
+    from problems.registry import get_problem
+
+    assert isinstance(
+        InverseAdapter.from_config({"benchmark": {"name": "source_itr"}}),
+        SourceItrAdapter,
+    )
+    assert isinstance(
+        InverseAdapter.from_config({"benchmark": {"name": "forcing"}}),
+        ForcingAdapter,
+    )
+    with pytest.raises(ValueError, match="Unsupported inverse benchmark"):
+        InverseAdapter.from_config({"benchmark": {"name": "source"}})
+
+    forcing_adapter = ForcingAdapter()
+    forcing_ds = _tiny_forcing_dataset()
+    forcing_adapter.validate_dataset(forcing_ds)
+    source_ds, _, _ = tiny_fv_dataset
+    with pytest.raises(ValueError, match="expected dataset benchmark 'forcing'"):
+        forcing_adapter.validate_dataset(source_ds)
+
+    model = _tiny_forcing_model()
+    dims = get_problem("forcing", "temporal_encoder").dims
+    loaded = SimpleNamespace(
+        model=model,
+        dims=dims,
+        config={"benchmark": {"name": "forcing", "representation": "temporal_encoder"}},
+    )
+    forcing_adapter.validate_model(loaded)
+    bad_loaded = SimpleNamespace(
+        model=model,
+        dims=SimpleNamespace(**{**dims.__dict__, "cond_static_dim": 99}),
+        config={"benchmark": {"name": "forcing", "representation": "temporal_encoder"}},
+    )
+    with pytest.raises(ValueError, match="cond_static_dim"):
+        forcing_adapter.validate_model(bad_loaded)
