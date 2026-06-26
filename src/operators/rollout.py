@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from problems import diffusion as diffusion_problem
 from problems import forcing as forcing_problem
 from problems import interfaces as interfaces_problem
 from problems import source as source_problem
@@ -268,6 +269,30 @@ def _build_source_rollout_item(
     return out
 
 
+def _build_diffusion_rollout_item(
+    out: dict[str, np.ndarray],
+    ds,
+    problem,
+    sid: int,
+    current: np.ndarray,
+    t_lo: float,
+    t_hi: float,
+) -> dict[str, np.ndarray]:
+    spatial = out["spatial"]
+    spatial[..., 0] = current
+    # Channels 1-3 (x_norm, y_norm, s_y_const) are static; leave them intact.
+    t_bar_norm = (float(t_hi) - float(t_lo)) / float(ds.t_final)
+    t_s_norm = float(t_lo) / float(ds.t_final)
+    out["cond_static"] = np.array([t_bar_norm, t_s_norm], dtype=np.float32)
+    t_samples, a_m = diffusion_problem._sample_a(
+        lambda t: 0.0, t_lo, t_hi, ds.temporal_samples
+    )
+    out["forcing_seq"] = diffusion_problem._forcing_seq_2tok_from_samples(
+        t_samples, a_m, A_amp_ref=diffusion_problem.A_AMP_REF,
+    )
+    return out
+
+
 def build_rollout_item_from_base(
     base_item: dict[str, np.ndarray],
     dataset,
@@ -298,6 +323,8 @@ def build_rollout_item_from_base(
         return _build_interfaces_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     if problem.name == "source":
         return _build_source_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
+    if problem.name == "diffusion":
+        return _build_diffusion_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     raise ValueError(f"Unsupported benchmark for rollout: {problem.name!r}")
 
 

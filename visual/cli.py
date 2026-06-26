@@ -14,6 +14,7 @@ from visual._common import _plots_for_group, _print_skip, _should_run
 from visual import (
     dataset_plots,
     forcing_plots,
+    inverse_plots,
     mms_plots,
     paper_plots,
     physics_plots,
@@ -22,6 +23,28 @@ from visual import (
     sweep_plots,
     training_plots,
 )
+
+
+def _parse_benchmark_path_tokens(tokens, flag):
+    """Parse ``benchmark=path`` CLI tokens into a dict (validates the form)."""
+    if not tokens:
+        return {}
+    parsed = {}
+    for tok in tokens:
+        if "=" not in tok:
+            raise ValueError(
+                f"{flag} expects benchmark=path tokens; got {tok!r}")
+        bm, path = tok.split("=", 1)
+        bm, path = bm.strip(), path.strip()
+        if not bm or not path:
+            raise ValueError(
+                f"{flag} expects benchmark=path tokens; got {tok!r}")
+        if bm not in inverse_plots._SPECS:
+            raise ValueError(
+                f"{flag}: unknown benchmark {bm!r} "
+                f"(expected one of {sorted(inverse_plots._SPECS)})")
+        parsed[bm] = path
+    return parsed
 
 
 def main():
@@ -96,9 +119,17 @@ def main():
                         help="Path to unseen-sim test_records.csv (generalization figure)")
     parser.add_argument("--generalization-benchmark", type=str, default=None,
                         help="Benchmark name for the generalization figure (required kwarg)")
+    parser.add_argument("--inverse-csv", type=str, nargs="+", default=None,
+                        help="Inverse-problem summary CSV(s) as benchmark=path tokens "
+                             "(e.g. --inverse-csv forcing=a.csv source_itr=b.csv)")
+    parser.add_argument("--inverse-artifacts", type=str, nargs="+", default=None,
+                        help="Inverse-problem NPZ artifact dir(s) as benchmark=path tokens "
+                             "(e.g. --inverse-artifacts forcing=dirA source_itr=dirB)")
+    parser.add_argument("--benchmark", type=str, nargs="+", default=None,
+                        help="Restrict inverse figures to these benchmark(s)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
-                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout"],
+                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout", "inverse"],
                         help="Which plot group(s) to generate (default: all)")
     parser.add_argument("--plots", type=str, nargs="+", default=None,
                         help="Individual plot names to generate (overrides --group)")
@@ -1081,6 +1112,51 @@ def main():
             )
         else:
             _print_skip("rollout_partition_error", "need --rollout-run-root")
+
+    # ---- INVERSE GROUP ----
+    inverse_plot_names = _plots_for_group("inverse")
+    need_inverse = any(_should_run(p, groups, individual) for p in inverse_plot_names)
+
+    if need_inverse:
+        print("=== INVERSE GROUP ===")
+        inverse_dir = out_dir / "inverse"
+
+        # benchmark=path tokens so a forcing spec can never pair with a
+        # source_itr CSV/artifact dir.
+        csv_by_bench = _parse_benchmark_path_tokens(args.inverse_csv, "--inverse-csv")
+        art_by_bench = _parse_benchmark_path_tokens(
+            args.inverse_artifacts, "--inverse-artifacts")
+
+        bench_filter = set(args.benchmark) if args.benchmark else None
+        fn_by_kind = {
+            "parameter_recovery": inverse_plots.plot_parameter_recovery,
+            "identifiability": inverse_plots.plot_identifiability,
+            "surrogate_fidelity": inverse_plots.plot_surrogate_fidelity,
+            "uncertainty": inverse_plots.plot_uncertainty,
+        }
+        # artifact_dir is only consumed by these two (Figs 2 & 4).
+        takes_artifacts = {"identifiability", "uncertainty"}
+
+        for benchmark in sorted(inverse_plots._SPECS):
+            if bench_filter is not None and benchmark not in bench_filter:
+                continue
+            spec = inverse_plots.spec_for(benchmark)
+            csv_path = csv_by_bench.get(benchmark)
+            art_dir = art_by_bench.get(benchmark)
+            for kind, fn in fn_by_kind.items():
+                name = f"{benchmark}_{kind}"
+                if not _should_run(name, groups, individual):
+                    continue
+                if csv_path is None:
+                    _print_skip(name, f"need --inverse-csv {benchmark}=<path>")
+                    continue
+                print(f"--- {name} ---")
+                save_path = inverse_dir / f"{name}.png"
+                if kind in takes_artifacts:
+                    fn(csv_path, spec, artifact_dir=art_dir,
+                       save_path=save_path, name=name)
+                else:
+                    fn(csv_path, spec, save_path=save_path, name=name)
 
     print(f"\nAll requested plots saved to: {out_dir}")
 

@@ -794,7 +794,7 @@ class CollocationSampler:
     samples; see ``run_one_seed``).
     """
 
-    def __init__(self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed):
+    def __init__(self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed, base_plan=None):
         self.ds = ds
         self.spec = spec
         self.geom_cfg = geom_cfg
@@ -803,6 +803,10 @@ class CollocationSampler:
         self.t_final = float(ds.t_final)
         self.sim_ids = np.asarray(ds.sim_ids)
         self.rng = np.random.default_rng(rng_seed)
+        # When non-None, the benchmark pins the base snapshot and draws on-grid
+        # conditioning pairs through the spec's collocation hooks instead of the
+        # built-in (forcing) random-source / uniform-lead / analytic-closure path.
+        self.base_plan = base_plan
 
     def sample_batch(self, max_lead: float):
         """Sample one collocation batch. Leads are drawn in ``[dt, max_lead]``
@@ -811,6 +815,9 @@ class CollocationSampler:
         the requested ``max_lead`` (rather than silently extrapolating the
         forcing past its support) and hard-asserts each ``t + dt`` is in range.
         """
+        if self.base_plan is not None:
+            return self._sample_batch_on_grid(max_lead)
+
         ds = self.ds
         dt = self.dt
         tol = 1e-9
@@ -878,41 +885,146 @@ class CollocationSampler:
         qL_int = torch.from_numpy(np.stack(qLint_list))
         return batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int
 
+    def _sample_batch_on_grid(self, max_lead: float):
+        """Base-plan collocation: pin the base snapshot, draw consecutive on-grid
+        conditioning pairs ``(t_s + n*dt, t_s + (n+1)*dt)``, and read the boundary
+        closure from the spec hook. Both forwards share the same base state.
+
+        The second prediction is capped at ``max_lead``: ``n`` is drawn in
+        ``[0, n_max]`` with ``n_max = min(floor(max_lead/dt) - 1, len(t_grid) - 2)``
+        so ``t_grid[n+1]`` always exists.
+        """
+        ds = self.ds
+        dt = self.dt
+        bp = self.base_plan
+        s = int(bp.get("base_snapshot_index", 0))
+        t_s = float(ds.t_grid[s])
+        t_grid = np.asarray(ds.t_grid, dtype=float)
+        n_max = max(0, min(int(math.floor(float(max_lead) / dt)) - 1, len(t_grid) - 2))
+
+        items_t, items_tdt = [], []
+        R_c_list, qLn_list, qLnp1_list, qLint_list = [], [], [], []
+        for _ in range(self.batch_size):
+            sid = int(self.rng.choice(self.sim_ids))
+            n = int(self.rng.integers(0, n_max + 1))
+            t = t_s + n * dt
+            t_dt = t + dt
+
+            base_item = ds.problem.build_item(ds, sid, s, s)
+            current = base_item["spatial"][..., 0]
+            item_t = build_rollout_item_from_base(
+                base_item, ds, self.spec, sid, current, t_s, t
+            )
+            item_tdt = build_rollout_item_from_base(
+                base_item, ds, self.spec, sid, current, t_s, t_dt
+            )
+
+            params = ds.sim_params[sid]
+            R_c_val, qLn, qLnp1, qLint = self.spec.collocation_closure(
+                ds, sid, params, t, t_dt
+            )
+
+            items_t.append({k: torch.from_numpy(v) for k, v in item_t.items()})
+            items_tdt.append({k: torch.from_numpy(v) for k, v in item_tdt.items()})
+            R_c_list.append(float(R_c_val))
+            qLn_list.append(np.asarray(qLn, dtype=np.float32))
+            qLnp1_list.append(np.asarray(qLnp1, dtype=np.float32))
+            qLint_list.append(np.asarray(qLint, dtype=np.float32))
+
+        batch_t = collate_fn(items_t)
+        batch_tdt = collate_fn(items_tdt)
+        R_c = torch.tensor(R_c_list, dtype=torch.float32)
+        qL_n = torch.from_numpy(np.stack(qLn_list))
+        qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
+        qL_int = torch.from_numpy(np.stack(qLint_list))
+        return batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int
+
+    def sample_anchor_batch(self):
+        """IC-anchor batch: the model conditioned at ``(t_s, t_s)`` must reproduce
+        the base state ``T(t_s)``. Pins the same base snapshot as the residual
+        pair (``base_snapshot_index``); the zero-duration conditioning is NaN-safe
+        (the token grid is ``linspace``-based and ``t_bar`` only multiplies).
+        Returns the collated anchor batch and the per-item target field ``T(t_s)``.
+        Only valid when a ``base_plan`` is present.
+        """
+        ds = self.ds
+        bp = self.base_plan or {}
+        s = int(bp.get("base_snapshot_index", 0))
+        t_s = float(ds.t_grid[s])
+
+        items, targets = [], []
+        for _ in range(self.batch_size):
+            sid = int(self.rng.choice(self.sim_ids))
+            base_item = ds.problem.build_item(ds, sid, s, s)
+            current = base_item["spatial"][..., 0]
+            item = build_rollout_item_from_base(
+                base_item, ds, self.spec, sid, current, t_s, t_s
+            )
+            items.append({k: torch.from_numpy(v) for k, v in item.items()})
+            targets.append(current[..., None].astype(np.float32))
+
+        batch = collate_fn(items)
+        target = torch.from_numpy(np.stack(targets))
+        return batch, target
+
 
 def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_global,
                                *, batch_size, rng_seed):
     """Build the W2 collocation sampler over the held-out (validation) sims.
 
-    ``forcing``-only: two-slab ``k=2/k=1`` interface at ``x=0.5``, scalar
-    ``R_c``, constant right-edge ``T_right = 300 K`` (the Dirichlet target,
-    normalized with the training stats). The physics step ``dt`` is the
-    dedicated collocation residual step (``physics.dt``, default 0.005), which
-    may differ from the saved data spacing.
+    Geometry, the per-item boundary closure, and the base-snapshot plan are
+    routed through the benchmark's ``ProblemSpec`` collocation hooks. When a hook
+    returns ``None`` the built-in (``forcing``) default is used: two-slab
+    ``k=2/k=1`` interface at ``x=0.5``, scalar ``R_c``, constant right-edge
+    ``T_right = 300 K`` (the Dirichlet target, normalized with the training
+    stats), with the physics step ``dt`` taken from ``physics.dt`` (default
+    0.005). A benchmark that opts into ``on_grid_pairs`` pins ``dt`` to the FV
+    grid spacing so geometry, sampler, and residual all share one ``dt``.
     """
-    dt = float(phys_cfg.get("dt", 0.005))
-    T_right = 300.0
-    geom_cfg = {
-        "x_grid": np.asarray(ds.x_grid, dtype=float),
-        "y_grid": np.asarray(ds.y_grid, dtype=float),
-        "k_left": 2.0,
-        "k_right": 1.0,
-        "interface_x": float(phys_cfg.get("interface_x", 0.5)),
-        "dt": dt,
-        "sigma_global": float(sigma_global),
-        "T_right_tilde": (T_right - float(mu_global)) / float(sigma_global),
-    }
+    base_plan = spec.collocation_base_plan(ds, float(phys_cfg.get("dt", 0.005)))
+    if base_plan is not None and base_plan.get("on_grid_pairs", False):
+        t_grid = np.asarray(ds.t_grid, dtype=float)
+        diffs = np.diff(t_grid)
+        if diffs.size == 0 or not np.allclose(diffs, diffs[0], rtol=1e-6, atol=1e-12):
+            raise ValueError(
+                "collocation_base_plan requested on_grid_pairs but the dataset "
+                "t_grid spacing is non-uniform; cannot pin dt to the FV grid step."
+            )
+        dt = float(diffs[0])
+    else:
+        dt = float(phys_cfg.get("dt", 0.005))
+
+    geom_cfg = spec.collocation_geom_cfg(ds, phys_cfg, mu_global, sigma_global, dt)
+    if geom_cfg is None:
+        T_right = 300.0
+        geom_cfg = {
+            "x_grid": np.asarray(ds.x_grid, dtype=float),
+            "y_grid": np.asarray(ds.y_grid, dtype=float),
+            "k_left": 2.0,
+            "k_right": 1.0,
+            "interface_x": float(phys_cfg.get("interface_x", 0.5)),
+            "dt": dt,
+            "sigma_global": float(sigma_global),
+            "T_right_tilde": (T_right - float(mu_global)) / float(sigma_global),
+        }
     pbs = phys_cfg.get("physics_batch_size") or batch_size
     return CollocationSampler(
-        ds, spec, geom_cfg, batch_size=pbs, dt=dt, rng_seed=rng_seed
+        ds, spec, geom_cfg, batch_size=pbs, dt=dt, rng_seed=rng_seed,
+        base_plan=base_plan,
     )
 
 
-def _collocation_batch_loss(model, sampler, max_lead, region_weights, device):
+def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
+                            lambda_ic=0.0):
     """Forward the model at the collocation pair ``(t, t+dt)`` and return the
-    region-partitioned ``full_bc`` physics loss dict plus the batch size.
+    region-partitioned ``full_bc`` physics loss dict, the batch size, and the
+    optional IC-anchor loss.
 
     Both fields are model outputs from the same base input, so the right-edge
-    Dirichlet closure is anchored at BOTH times (``dirichlet_both_ends``).
+    Dirichlet closure is anchored at BOTH times (``dirichlet_both_ends``). When
+    ``lambda_ic > 0`` an IC-anchor batch is drawn from the same base snapshot and
+    ``ic_loss = MSE(model(anchor), T(t_s))`` is returned; otherwise ``ic_loss``
+    is ``None``.
     """
     batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int = sampler.sample_batch(max_lead)
 
@@ -942,7 +1054,15 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device):
         yt, ytdt, geom, bc,
         region_weights=region_weights, dirichlet_both_ends=True,
     )
-    return out, R_c.shape[0]
+
+    ic_loss = None
+    if lambda_ic > 0.0:
+        batch_anchor, target = sampler.sample_anchor_batch()
+        y_anchor = _fwd(batch_anchor)
+        target = target.to(device=device, dtype=y_anchor.dtype)
+        ic_loss = torch.mean((y_anchor - target) ** 2)
+
+    return out, R_c.shape[0], ic_loss
 
 
 def train_one_epoch(
@@ -965,6 +1085,7 @@ def train_one_epoch(
     physics_region_weights=None,
     lambda_data: float = 1.0,
     lambda_physics: float = 0.0,
+    lambda_ic: float = 0.0,
 ) -> dict[str, float]:
     """Train one epoch and return a dict of epoch metrics.
 
@@ -1010,9 +1131,22 @@ def train_one_epoch(
     # and RNG order are byte-identical to a data-only run. Two mutually-exclusive
     # sources: a W1 one-step ``physics_loader`` (interior residual) or a W2
     # ``physics_collocation`` sampler (full_bc residual on model-pair outputs).
-    phys_collocation = physics_collocation is not None and lambda_physics > 0.0
+    phys_collocation = physics_collocation is not None and (
+        lambda_physics > 0.0 or lambda_ic > 0.0
+    )
     phys_onestep = physics_loader is not None and lambda_physics > 0.0
     phys_enabled = phys_onestep or phys_collocation
+
+    # Fail-fast on a configuration with no active loss term: a data-only run with
+    # lambda_data=0 and no live physics/anchor objective would silently optimize
+    # nothing. The lambda_ic=0 physics-only negative control (lambda_physics>0)
+    # and the anchor-only debug run (lambda_ic>0, lambda_physics=0) stay legal.
+    if lambda_data == 0.0 and not phys_collocation and not phys_onestep:
+        raise ValueError(
+            "no active loss term: set at least one of lambda_data/lambda_physics/"
+            "lambda_ic > 0 (physics terms also require a built physics supply)."
+        )
+
     phys_iter = iter(physics_loader) if phys_onestep else None
     phys_loss_sum = 0.0
     phys_weighted_sum = 0.0
@@ -1022,8 +1156,41 @@ def train_one_epoch(
         "right_dirichlet": 0.0, "topbot_adiabatic": 0.0,
     }
     n_phys = 0
+    ic_sum = 0.0
+    n_ic = 0
 
-    for batch in train_loader:
+    # Physics-only mode (lambda_data == 0): iterate collocation batches for the
+    # same number of optimizer steps as a data epoch. ``train_loader`` is never
+    # ``iter()``-ed (only ``__len__`` is read), so the data path cannot leak in;
+    # the optimization mechanics match the data path exactly.
+    physics_only = lambda_data == 0.0 and phys_collocation
+    if physics_only:
+        for _ in range(len(train_loader)):
+            optimizer.zero_grad()
+            out, p_b, ic = _collocation_batch_loss(
+                model, physics_collocation, collocation_max_lead,
+                physics_region_weights, device, lambda_ic=lambda_ic,
+            )
+            p_loss = out["physics_loss_weighted"]
+            total = lambda_physics * p_loss
+            if ic is not None:
+                total = total + lambda_ic * ic
+            total.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            optimizer.step()
+            phys_loss_sum += p_loss.item() * p_b
+            phys_weighted_sum += out["physics_loss_weighted"].item() * p_b
+            phys_allcell_sum += out["physics_loss_allcell_mean"].item() * p_b
+            for _r in phys_region_sums:
+                phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
+            n_phys += p_b
+            if ic is not None:
+                ic_sum += ic.item() * p_b
+                n_ic += p_b
+
+    data_iterable = [] if physics_only else train_loader
+    for batch in data_iterable:
         x_spatial = batch["spatial"].to(device)
         cond_static = batch["cond_static"].to(device)
         forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
@@ -1036,18 +1203,24 @@ def train_one_epoch(
         y_pred = model(x_spatial, cond_static, forcing_seq)
         loss = loss_fn(y_pred, y_batch, iface_x)
         if phys_collocation:
-            out, p_b = _collocation_batch_loss(
+            out, p_b, ic = _collocation_batch_loss(
                 model, physics_collocation, collocation_max_lead,
-                physics_region_weights, device,
+                physics_region_weights, device, lambda_ic=lambda_ic,
             )
             p_loss = out["physics_loss_weighted"]
-            (lambda_data * loss + lambda_physics * p_loss).backward()
+            total = lambda_data * loss + lambda_physics * p_loss
+            if ic is not None:
+                total = total + lambda_ic * ic
+            total.backward()
             phys_loss_sum += p_loss.item() * p_b
             phys_weighted_sum += out["physics_loss_weighted"].item() * p_b
             phys_allcell_sum += out["physics_loss_allcell_mean"].item() * p_b
             for _r in phys_region_sums:
                 phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
             n_phys += p_b
+            if ic is not None:
+                ic_sum += ic.item() * p_b
+                n_ic += p_b
         elif phys_onestep:
             p_loss, p_b, phys_iter = _physics_batch_loss(
                 model, physics_loader, phys_iter, physics_geom_cfg, device
@@ -1114,7 +1287,8 @@ def train_one_epoch(
              gnrmse_sum, node_jump_gnrmse_sum, phys_loss_sum, float(n_phys),
              phys_weighted_sum, phys_allcell_sum,
              phys_region_sums["interior"], phys_region_sums["left_neumann"],
-             phys_region_sums["right_dirichlet"], phys_region_sums["topbot_adiabatic"]],
+             phys_region_sums["right_dirichlet"], phys_region_sums["topbot_adiabatic"],
+             ic_sum, float(n_ic)],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -1139,6 +1313,8 @@ def train_one_epoch(
         phys_region_sums["left_neumann"] = t[18].item()
         phys_region_sums["right_dirichlet"] = t[19].item()
         phys_region_sums["topbot_adiabatic"] = t[20].item()
+        ic_sum = t[21].item()
+        n_ic = int(t[22].item())
 
         m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
@@ -1171,6 +1347,7 @@ def train_one_epoch(
         "phys_left_neumann_mse": phys_region_sums["left_neumann"] / max(n_phys, 1),
         "phys_right_dirichlet_mse": phys_region_sums["right_dirichlet"] / max(n_phys, 1),
         "phys_topbot_adiabatic_mse": phys_region_sums["topbot_adiabatic"] / max(n_phys, 1),
+        "ic_loss": ic_sum / max(n_ic, 1),
     }
 
 
@@ -1719,7 +1896,9 @@ def run_one_seed(
     phys_cfg = config["training"].get("physics", {})
     lambda_physics = float(phys_cfg.get("lambda_physics", 0.0))
     lambda_data = float(phys_cfg.get("lambda_data", 1.0))
+    lambda_ic = float(phys_cfg.get("lambda_ic", 0.0))
     phys_mode = str(phys_cfg.get("mode", "one_step"))
+    collocation_source = str(phys_cfg.get("collocation_source", "train"))
     physics_loader = None
     physics_geom_cfg = None
     physics_collocation = None
@@ -1727,8 +1906,22 @@ def run_one_seed(
     collocation_lead_start = float(phys_cfg.get("collocation_lead_start", 0.01))
     collocation_lead_max = float(phys_cfg.get("collocation_lead_max", 0.01))
     collocation_lead_warmup = int(phys_cfg.get("collocation_lead_warmup_epochs", 0))
-    if lambda_physics > 0.0 and phys_mode == "collocation":
+    if phys_mode == "collocation" and (lambda_physics > 0.0 or lambda_ic > 0.0):
         physics_region_weights = phys_cfg.get("full_bc_region_weights", None)
+        # Source the collocation sims from TRAIN by default so the held-out
+        # validation sims stay an honest cross-sim metric; "val" is an explicit
+        # transductive-debug option (forcing pins it to keep its W2 source). Each
+        # split is an independent SnapshotPairDataset whose sim_ids are already
+        # restricted to that split, so the swap alone confines sampling.
+        if collocation_source == "train":
+            colloc_ds = training_set.dataset
+        elif collocation_source == "val":
+            colloc_ds = validation_set.dataset
+        else:
+            raise ValueError(
+                f"unknown training.physics.collocation_source {collocation_source!r}; "
+                f"expected 'train' or 'val'."
+            )
         # Decorrelate the collocation stream per rank: every rank already spends
         # the collocation forward/backward compute, so drawing the SAME batch on
         # each rank (rng_seed=seed) would make DDP average identical gradients —
@@ -1738,15 +1931,20 @@ def run_one_seed(
         # at no extra cost. Control flow is unchanged (same per-rank forward/
         # backward/collective sequence), so this does not affect DDP lockstep.
         physics_collocation = _build_collocation_sampler(
-            config, phys_cfg, validation_set.dataset, spec,
+            config, phys_cfg, colloc_ds, spec,
             mu_global, sigma_global,
             batch_size=config["training"]["batch_size"],
             rng_seed=seed + dist_info.rank,
         )
+        # The sampler must only ever draw from its source split's sims.
+        assert set(np.asarray(physics_collocation.sim_ids).tolist()).issubset(
+            set(np.asarray(colloc_ds.sim_ids).tolist())
+        )
         if is_main:
             print(
                 f"Physics regularizer ON (W2 collocation): lambda_data={lambda_data}, "
-                f"lambda_physics={lambda_physics}, residual=full_bc, "
+                f"lambda_physics={lambda_physics}, lambda_ic={lambda_ic}, "
+                f"residual=full_bc, source={collocation_source}, "
                 f"lead_start={collocation_lead_start}, lead_max={collocation_lead_max}, "
                 f"lead_warmup={collocation_lead_warmup}",
                 flush=True,
@@ -1783,7 +1981,7 @@ def run_one_seed(
     csv_path = run_path / "train_metrics.csv"
     val_pairs_path = run_path / "val_pairs.csv"
     fieldnames = [
-        "epoch", "train_loss", "train_physics_loss",
+        "epoch", "train_loss", "train_physics_loss", "train_ic_loss",
         "train_physics_loss_weighted", "train_physics_loss_allcell_mean",
         "train_phys_interior_mse", "train_phys_left_neumann_mse",
         "train_phys_right_dirichlet_mse", "train_phys_topbot_adiabatic_mse",
@@ -1875,6 +2073,7 @@ def run_one_seed(
             physics_region_weights=physics_region_weights,
             lambda_data=lambda_data,
             lambda_physics=lambda_physics,
+            lambda_ic=lambda_ic,
         )
         train_loss = train_metrics["loss"]
         train_rel_l2 = train_metrics["rel_l2"]
@@ -2012,6 +2211,7 @@ def run_one_seed(
                     "epoch": epoch,
                     "train_loss": float(train_loss),
                     "train_physics_loss": float(train_metrics["physics_loss"]),
+                    "train_ic_loss": float(train_metrics["ic_loss"]),
                     "train_physics_loss_weighted": float(train_metrics["physics_loss_weighted"]),
                     "train_physics_loss_allcell_mean": float(train_metrics["physics_loss_allcell_mean"]),
                     "train_phys_interior_mse": float(train_metrics["phys_interior_mse"]),

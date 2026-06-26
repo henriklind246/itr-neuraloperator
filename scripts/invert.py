@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
 import sys
 from dataclasses import dataclass, field
@@ -1166,10 +1167,72 @@ def laplace_summary(
 
 @dataclass
 class MCMCResult:
-    theta_samples: np.ndarray   # (S, 4) physical
+    theta_samples: np.ndarray   # (S, theta_dim) physical
     excess_int: np.ndarray      # (S,) integrated severity per sample
     accept_rate: float
     level: float
+    # Description of the chain actually generated (so artifacts are self-contained
+    # rather than relying on external arg state). thin is 1: the sampler keeps
+    # every post-burn draw.
+    burn: int = 0
+    n_samples: int = 0
+    seed: int = 0
+    step_size: float = 0.0
+    thin: int = 1
+    initial_theta: Optional[np.ndarray] = None   # (theta_dim,) physical start
+    # Mixing diagnostics (Geyer initial-monotone), computed post-chain.
+    ess_per_param: Optional[np.ndarray] = None   # (theta_dim,)
+    iat_per_param: Optional[np.ndarray] = None   # (theta_dim,)
+    ess_excess: float = float("nan")
+    iat_excess: float = float("nan")
+
+
+def _autocovariance(x: np.ndarray, max_lag: int) -> np.ndarray:
+    """Biased autocovariance of a 1D series for lags 0..max_lag (FFT-based)."""
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    xc = x - x.mean()
+    fft_len = int(2 ** np.ceil(np.log2(2 * n - 1))) if n > 1 else 1
+    f = np.fft.rfft(xc, n=fft_len)
+    acov = np.fft.irfft(f * np.conjugate(f), n=fft_len)[: max_lag + 1] / n
+    return acov
+
+
+def geyer_ess_iat(x: np.ndarray) -> tuple[float, float]:
+    """Effective sample size and integrated autocorr time of a single chain.
+
+    Uses Geyer's initial monotone sequence estimator: pair adjacent
+    autocorrelations ``Gamma_k = rho(2k) + rho(2k+1)`` (theoretically positive),
+    truncate at the first non-positive pair (initial positive sequence), then
+    enforce a non-increasing envelope (initial monotone sequence). The IAT is
+    ``tau = -1 + 2*sum_k Gamma_k`` and ``ESS = N / tau``. This is robust to the
+    noise tail that breaks a naive full-chain autocorrelation sum.
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    if n < 2:
+        return float(n), 1.0
+    acov = _autocovariance(x, n - 1)
+    gamma0 = acov[0]
+    if not np.isfinite(gamma0) or gamma0 <= 0.0:
+        return float(n), 1.0
+    rho = acov / gamma0
+    max_k = (n - 1) // 2
+    gamma_pairs = np.array(
+        [rho[2 * k] + rho[2 * k + 1] for k in range(max_k)], dtype=np.float64
+    )
+    m = 0
+    while m < gamma_pairs.size and gamma_pairs[m] > 0.0:
+        m += 1
+    if m == 0:
+        return float(n), 1.0
+    gamma_pairs = gamma_pairs[:m]
+    for k in range(1, gamma_pairs.size):
+        if gamma_pairs[k] > gamma_pairs[k - 1]:
+            gamma_pairs[k] = gamma_pairs[k - 1]
+    tau = max(1.0, -1.0 + 2.0 * float(gamma_pairs.sum()))
+    ess = min(float(n), n / tau)
+    return ess, tau
 
 
 def run_mcmc(
@@ -1183,6 +1246,7 @@ def run_mcmc(
     step_size: float = 0.05,
     level: float = 0.95,
     seed: int = 0,
+    theta_init: Optional[torch.Tensor] = None,
     adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
 ) -> MCMCResult:
     """Random-walk Metropolis in ``u`` with a uniform-theta prior.
@@ -1193,10 +1257,16 @@ def run_mcmc(
     constraints are respected automatically and the boundary at ``R_amp ~ 0`` is
     handled honestly (no Gaussian-around-MAP assumption). Captures the
     non-Gaussian, boundary-coupled posterior the Laplace diagnostic flags.
+
+    The chain starts at ``theta_init`` when supplied (physical theta), else at
+    ``theta_hat`` (the MAP). A dispersed ``theta_init`` is required for an honest
+    multi-chain split-R-hat: identical MAP starts with different seeds can mask
+    poor exploration of the ridge.
     """
     device = obs.spatial.device
     rng = np.random.default_rng(int(seed))
-    u = adapter.unconstrained_from_theta(theta_hat.detach().cpu()).to(device)
+    start_theta = theta_hat if theta_init is None else theta_init
+    u = adapter.unconstrained_from_theta(start_theta.detach().cpu()).to(device)
 
     def log_target(u_t: torch.Tensor) -> float:
         with torch.no_grad():
@@ -1226,11 +1296,33 @@ def run_mcmc(
             for s in theta_samples
         ]
     )
+
+    if theta_samples.size:
+        ess_per_param = np.empty(theta_samples.shape[1], dtype=np.float64)
+        iat_per_param = np.empty(theta_samples.shape[1], dtype=np.float64)
+        for j in range(theta_samples.shape[1]):
+            ess_per_param[j], iat_per_param[j] = geyer_ess_iat(theta_samples[:, j])
+        ess_excess, iat_excess = geyer_ess_iat(excess)
+    else:
+        ess_per_param = np.zeros(adapter.theta_dim, dtype=np.float64)
+        iat_per_param = np.full(adapter.theta_dim, np.nan, dtype=np.float64)
+        ess_excess, iat_excess = 0.0, float("nan")
+
     return MCMCResult(
         theta_samples=theta_samples,
         excess_int=excess,
         accept_rate=n_acc / max(1, total),
         level=level,
+        burn=int(burn),
+        n_samples=int(n_samples),
+        seed=int(seed),
+        step_size=float(step_size),
+        thin=1,
+        initial_theta=start_theta.detach().cpu().numpy().astype(np.float64),
+        ess_per_param=ess_per_param,
+        iat_per_param=iat_per_param,
+        ess_excess=float(ess_excess),
+        iat_excess=float(iat_excess),
     )
 
 
@@ -1241,6 +1333,153 @@ def mcmc_summary(
 ) -> dict:
     """Posterior summaries from an MCMC run, led by the severity interval."""
     return adapter.mcmc_summary(res, obs)
+
+
+# ---------------------------------------------------------------------------
+# Per-sim artifact dump: raw profile curves, MCMC samples, and the observation
+# Jacobian only ever exist as locals in main()'s loop; the CSV keeps one summary
+# row per sim. Figs 2 & 4 of the inverse-results section need the raw arrays, so
+# (opt-in via --artifact-dir) we write one self-describing NPZ per sim.
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_SCHEMA_VERSION = 1
+
+
+def _dataset_fingerprint(ds: SnapshotPairDataset) -> str:
+    """Stable short hash of the corpus shape + the test-split ids.
+
+    Hard evidence against train/test leakage: pins which sims the inversion used
+    to a given dataset shape and split, persisted in every artifact.
+    """
+    h = hashlib.sha256()
+    h.update(np.asarray(ds.trajectories.shape, dtype=np.int64).tobytes())
+    test_ids = np.asarray(ds._split_ids.get("test", []), dtype=np.int64)
+    h.update(test_ids.tobytes())
+    return h.hexdigest()[:16]
+
+
+def _split_name_for(ds: SnapshotPairDataset, sid: int) -> str:
+    """Which split ``sid`` falls in (``test`` for held-out inversion targets)."""
+    for name, ids in ds._split_ids.items():
+        if int(sid) in {int(i) for i in ids}:
+            return name
+    return "unknown"
+
+
+def _write_sim_artifact(
+    artifact_dir: str,
+    sid: int,
+    adapter: InverseAdapter,
+    *,
+    obs: ObservationSet,
+    result,
+    report: Optional[dict],
+    J: Optional[torch.Tensor],
+    fv_res: Optional[FVRefineResult],
+    prof: Optional[ProfileResult],
+    mc: Optional[MCMCResult],
+    sigma_eff2: Optional[float],
+    c_fno: Optional[float],
+    noise_std: float,
+    ci_level: float,
+    dataset_path: str,
+    dataset_fingerprint: str,
+    split_seed: int,
+    split_name: str,
+) -> str:
+    """Write one ``sim_{sid:05d}.npz`` with the raw inverse-problem arrays.
+
+    Only the schema metadata is always present; every stage block is included
+    only when its source object exists (the stage was run). The persisted
+    Jacobian and SVD diagnostics are the *raw physical* quantities plus
+    ``param_scales`` so the plot layer can rebuild the normalized-coordinate SVD
+    (``J_scaled = J . diag(param_scales)``) itself rather than trusting a
+    pre-baked coordinate choice.
+    """
+    os.makedirs(artifact_dir, exist_ok=True)
+    theta_dim = adapter.theta_dim
+
+    theta_hat = np.asarray(result.theta_hat.detach().cpu().numpy(), dtype=np.float64)
+    if obs.theta_true is not None:
+        theta_true = np.asarray(obs.theta_true.detach().cpu().numpy(), dtype=np.float64)
+    else:
+        theta_true = np.full(theta_dim, np.nan, dtype=np.float64)
+    theta_bounds = np.asarray(
+        [adapter.profile_bounds(i) for i in range(theta_dim)], dtype=np.float64
+    )
+
+    payload: dict = {
+        "artifact_schema_version": np.int64(_ARTIFACT_SCHEMA_VERSION),
+        "benchmark": np.str_(adapter.benchmark),
+        "sim_id": np.int64(int(sid)),
+        "param_names": np.asarray(list(adapter.param_names), dtype=object),
+        "theta_hat": theta_hat,
+        "theta_true": theta_true,
+        "theta_bounds": theta_bounds,
+        "param_scales": np.asarray(adapter.param_scales, dtype=np.float64),
+        "noise_std": np.float64(noise_std),
+        "ci_level": np.float64(ci_level),
+        "profile_threshold": np.float64(
+            _CHI2_HALF_THRESH.get(round(float(ci_level), 2), float("nan"))
+        ),
+        "dataset_path": np.str_(dataset_path),
+        "dataset_fingerprint": np.str_(dataset_fingerprint),
+        "split_seed": np.int64(int(split_seed)),
+        "split_name": np.str_(split_name),
+    }
+
+    if report is not None:
+        payload["singular_values"] = np.asarray(report["singular_values"], dtype=np.float64)
+        payload["right_vectors"] = np.asarray(report["right_vectors"], dtype=np.float64)
+        payload["param_sensitivity"] = np.asarray(report["param_sensitivity"], dtype=np.float64)
+        payload["least_identified_dir"] = np.asarray(report["least_identified_dir"], dtype=np.float64)
+        payload["cond_number"] = np.float64(report["cond_number"])
+        align = report.get("ramp_sigma_alignment", float("nan"))
+        if np.isfinite(align):
+            payload["ramp_sigma_alignment"] = np.float64(align)
+
+    if J is not None:
+        payload["observation_jacobian"] = np.asarray(J.detach().cpu().numpy(), dtype=np.float64)
+
+    if fv_res is not None:
+        payload["fno_resid"] = np.float64(fv_res.fno_resid)
+        payload["fv_resid"] = np.float64(fv_res.fv_resid)
+        payload["fno_vs_fv_resid"] = np.float64(fv_res.fno_vs_fv_resid)
+
+    if prof is not None:
+        payload["profile_grid"] = np.asarray(prof.grid, dtype=np.float64)
+        payload["profile_nll"] = np.asarray(prof.nll, dtype=np.float64)
+        payload["profile_excess_int"] = np.asarray(prof.excess_int, dtype=np.float64)
+        payload["profile_nll_min"] = np.float64(prof.nll_min)
+        payload["profile_param_index"] = np.int64(prof.param_index)
+        payload["profile_param_name"] = np.str_(prof.param_name)
+
+    if mc is not None:
+        payload["mcmc_theta_samples"] = np.asarray(mc.theta_samples, dtype=np.float64)
+        payload["mcmc_excess_int"] = np.asarray(mc.excess_int, dtype=np.float64)
+        payload["mcmc_accept_rate"] = np.float64(mc.accept_rate)
+        payload["mcmc_burn"] = np.int64(mc.burn)
+        payload["mcmc_n_samples"] = np.int64(mc.n_samples)
+        payload["mcmc_seed"] = np.int64(mc.seed)
+        payload["mcmc_step_size"] = np.float64(mc.step_size)
+        payload["mcmc_thin"] = np.int64(mc.thin)
+        if mc.initial_theta is not None:
+            payload["mcmc_initial_theta"] = np.asarray(mc.initial_theta, dtype=np.float64)
+        if mc.ess_per_param is not None:
+            payload["mcmc_ess_per_param"] = np.asarray(mc.ess_per_param, dtype=np.float64)
+        if mc.iat_per_param is not None:
+            payload["mcmc_iat_per_param"] = np.asarray(mc.iat_per_param, dtype=np.float64)
+        payload["mcmc_ess_excess"] = np.float64(mc.ess_excess)
+        payload["mcmc_iat_excess"] = np.float64(mc.iat_excess)
+
+    if sigma_eff2 is not None:
+        payload["sigma_eff2"] = np.float64(sigma_eff2)
+    if c_fno is not None:
+        payload["c_fno"] = np.float64(c_fno)
+
+    path = os.path.join(artifact_dir, f"sim_{int(sid):05d}.npz")
+    np.savez_compressed(path, **payload)
+    return path
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1312,6 +1551,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--mcmc-burn", type=int, default=500)
     ap.add_argument("--mcmc-step", type=float, default=0.05,
                     help="RW-Metropolis proposal std in u-space (default 0.05)")
+    ap.add_argument("--artifact-dir", default=None,
+                    help="If set, write one self-describing sim_<id>.npz per sim "
+                         "(raw profile curves, MCMC samples, Jacobian + split "
+                         "provenance) for the inverse-results figures")
     args = ap.parse_args(argv)
 
     loaded = load_checkpoint(args.checkpoint, device=args.device)
@@ -1344,8 +1587,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     do_fv = args.fv_refine or args.fv_polish
     fv_base_kwargs = adapter.fv_base_kwargs(ds) if do_fv else None
 
+    dataset_fingerprint = _dataset_fingerprint(ds) if args.artifact_dir else ""
+
     rows = []
     for sid in sim_ids:
+        # None-init the per-sim stage locals so artifact writing never hits an
+        # unbound local when a stage was skipped for this sim.
+        report = J = fv_res = prof = mc = sigma_eff2 = c_fno = None
         obs = build_observation_set(
             ds, int(sid), time_indices, device=args.device,
             adapter=adapter,
@@ -1417,6 +1665,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                         seed=args.seed + int(sid), adapter=adapter,
                     )
                     summary.update(mcmc_summary(mc, obs, adapter))
+        if args.artifact_dir:
+            # The only added compute: a single raw-physical Jacobian recompute
+            # when both --sensitivity and --artifact-dir are set (the plot layer
+            # scales it by param_scales for the normalized-coordinate SVD).
+            if args.sensitivity:
+                J = observation_jacobian(loaded.model, obs, theta_hat, adapter)
+            _write_sim_artifact(
+                args.artifact_dir, int(sid), adapter,
+                obs=obs, result=result, report=report, J=J,
+                fv_res=fv_res, prof=prof, mc=mc,
+                sigma_eff2=sigma_eff2, c_fno=c_fno,
+                noise_std=args.noise_std, ci_level=args.uq_level,
+                dataset_path=args.data_dir,
+                dataset_fingerprint=dataset_fingerprint,
+                split_seed=0,
+                split_name=_split_name_for(ds, int(sid)),
+            )
         rows.append(summary)
         param_parts = []
         for i, name in enumerate(adapter.param_names):

@@ -208,6 +208,20 @@ class InverseAdapter(ABC):
     def profile_bounds(self, param_index: int) -> tuple[float, float]:
         ...
 
+    @property
+    def param_scales(self) -> np.ndarray:
+        """Physical range (hi - lo) per parameter, the normalized-SVD scaling.
+
+        Derived from ``profile_bounds`` (the source of truth) so the artifact
+        records the exact coordinate system used to build
+        ``J_scaled = J . diag(param_scales)`` for unit-invariant identifiability.
+        """
+        scales = [
+            float(self.profile_bounds(i)[1] - self.profile_bounds(i)[0])
+            for i in range(self.theta_dim)
+        ]
+        return np.asarray(scales, dtype=np.float64)
+
     @abstractmethod
     def theta_profile(
         self, u: torch.Tensor, fixed_index: int, fixed_value: float
