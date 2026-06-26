@@ -1,0 +1,29 @@
+# @package _global_
+# Diffusion benchmark: pure relaxation of a per-sim sampled initial condition
+# toward the right Dirichlet wall (300 K). Single homogeneous slab, zero left
+# Neumann flux, adiabatic top/bottom, no interface, no contact resistance. Only
+# the temporal_encoder representation is supported. All representation-determined
+# tensor dims are resolved by the ProblemSpec, not declared here.
+#
+# This is the debug surface for the W2 collocation + full_bc physics path and the
+# physics-only training mode. Because T == 300 satisfies the homogeneous PDE and
+# every BC, a residual-only objective is degenerate; set training.physics.lambda_ic
+# > 0 (e.g. 1.0) on the CLI for ANY physics/anchor run to anchor model(T_0, t=0).
+
+benchmark:
+  name: diffusion
+
+training:
+  loss:
+    # Homogeneous slab has no interface; interface_weight = 1.0 -> plain MSE and a
+    # 2-dim T_stats keeps the no-interface loss path clean (no per-sample band).
+    interface_weight: 1.0
+    per_sample_interface_x: false
+  physics:
+    mode: collocation
+    # Train the collocation sampler on training sims so val_rel_l2 stays honest.
+    collocation_source: train
+    # OFF by default so a data-only smoke run stays pure data (the phys_collocation
+    # gate is mode==collocation and (lambda_physics>0 or lambda_ic>0)). Set =1.0 on
+    # the CLI for any physics/anchor run to break the constant-300 degeneracy.
+    lambda_ic: 0.0
