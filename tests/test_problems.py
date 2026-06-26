@@ -3,6 +3,7 @@ import pytest
 
 from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
+from problems.diffusion import DiffusionProblem
 from problems.forcing import FORCING_TEMPORAL_SAMPLES, ForcingProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
@@ -46,6 +47,11 @@ CONTRACTS = {
     ("interfaces", "bins"): dict(
         in_ch=22, cond=4, has_fseq=False, token=2, t_stats=3,
         encoder=False, s_y=5, aug=False,
+    ),
+    # diffusion supports only temporal_encoder (bins raises in __init__).
+    ("diffusion", "temporal_encoder"): dict(
+        in_ch=4, cond=2, has_fseq=True, token=2, t_stats=2,
+        encoder=True, s_y=3, aug=True,
     ),
 }
 
@@ -135,6 +141,14 @@ class TestRegistry:
 
     def test_source_itr_registered(self):
         assert isinstance(get_problem("source_itr"), SourceItrProblem)
+
+    def test_diffusion_registered(self):
+        assert isinstance(get_problem("diffusion"), DiffusionProblem)
+
+    def test_diffusion_rejects_bins(self):
+        # diffusion supports only temporal_encoder; bins must raise in __init__.
+        with pytest.raises(ValueError, match="temporal_encoder"):
+            get_problem("diffusion", "bins")
 
     def test_unknown_raises(self):
         with pytest.raises(KeyError, match="Unknown benchmark"):

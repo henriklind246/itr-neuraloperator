@@ -352,6 +352,7 @@ class TestValidate:
             "R_c_amp",
             "R_c_y0",
             "R_c_sigma",
+            "ic_family",
         }
         assert {int(row["epoch"]) for row in rows} == {7}
         # The fixture is a forcing-style dataset, so only forcing's extra
@@ -369,6 +370,7 @@ class TestValidate:
                 "R_c_amp",
                 "R_c_y0",
                 "R_c_sigma",
+                "ic_family",
             ):
                 assert row[empty_col] == ""
 

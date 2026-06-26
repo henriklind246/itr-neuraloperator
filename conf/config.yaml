@@ -96,6 +96,15 @@ training:
   physics:
     lambda_data: 1.0
     lambda_physics: 0.0
+    # IC/anchor loss weight pinning model(T_0, t=0) ~ T_0. Default OFF. REQUIRED
+    # (> 0) for any diffusion physics/anchor run to break the constant-300
+    # degeneracy: T == 300 satisfies the homogeneous PDE and every BC, so a
+    # residual-only objective collapses to that field and ignores the IC.
+    lambda_ic: 0.0
+    # Source split for the W2 collocation sampler. "train" keeps val_rel_l2 an
+    # honest held-out metric; "val" (transductive) is an explicit debug option.
+    # forcing pins "val" in its benchmark group to keep its W2 path unchanged.
+    collocation_source: train
     residual: interior          # interior | full_bc (full_bc is Stage 2)
     mode: one_step              # one_step (W1) | collocation (W2)
     dt: 0.005                   # one solver step (save_stride=1 spacing)

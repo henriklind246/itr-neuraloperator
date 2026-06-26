@@ -1179,3 +1179,163 @@ def test_inverse_adapter_dispatch_and_validation(tiny_fv_dataset):
     )
     with pytest.raises(ValueError, match="cond_static_dim"):
         forcing_adapter.validate_model(bad_loaded)
+
+
+# ---------------------------------------------------------------------------
+# MCMC chain metadata + mixing diagnostics (the extended MCMCResult).
+# ---------------------------------------------------------------------------
+
+def test_run_mcmc_carries_chain_metadata_and_mixing_diagnostics():
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5
+    theta_hat = obs.theta_true.to(torch.float32)
+    res = inv.run_mcmc(
+        model, obs, theta_hat, sigma_eff2=0.1,
+        n_samples=40, burn=10, step_size=0.1, level=0.9, seed=3,
+    )
+    # The chain describes itself: the args that produced it are persisted.
+    assert res.burn == 10
+    assert res.n_samples == 40
+    assert res.seed == 3
+    assert res.step_size == pytest.approx(0.1)
+    assert res.thin == 1
+    assert res.initial_theta is not None
+    assert res.initial_theta.shape == (4,)
+    # Default start is the MAP (theta_hat) when theta_init is omitted.
+    assert np.allclose(res.initial_theta, theta_hat.numpy(), atol=1e-5)
+    # Geyer mixing diagnostics land per-parameter and for the lead deliverable.
+    assert res.ess_per_param is not None and res.ess_per_param.shape == (4,)
+    assert res.iat_per_param is not None and res.iat_per_param.shape == (4,)
+    assert np.all(np.isfinite(res.ess_per_param))
+    assert np.all(res.ess_per_param > 0.0)
+    assert np.all(res.ess_per_param <= 40.0 + 1e-6)
+    assert np.isfinite(res.ess_excess) and res.ess_excess > 0.0
+    assert np.isfinite(res.iat_excess) and res.iat_excess >= 1.0
+
+
+def test_run_mcmc_theta_init_starts_from_supplied_point():
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5
+    theta_hat = obs.theta_true.to(torch.float32)
+    # A dispersed start distinct from the MAP; a tiny step keeps the chain local.
+    start = torch.tensor([0.6, 0.4, 0.3, 0.15])
+    res = inv.run_mcmc(
+        model, obs, theta_hat, sigma_eff2=0.1,
+        n_samples=12, burn=0, step_size=1e-3, level=0.9, seed=1,
+        theta_init=start,
+    )
+    assert res.initial_theta is not None
+    assert np.allclose(res.initial_theta, start.numpy(), atol=1e-5)
+    # With a tiny proposal scale the post-burn samples stay near the start.
+    assert np.allclose(res.theta_samples[0], start.numpy(), atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# Per-sim NPZ artifact dump (--artifact-dir): keys/shapes for both benchmarks.
+# ---------------------------------------------------------------------------
+
+def test_artifact_dir_writes_expected_npz_keys_source_itr(tmp_path):
+    from types import SimpleNamespace
+
+    adapter = SourceItrAdapter()
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5
+    theta_hat = obs.theta_true.to(torch.float32)
+
+    report = inv.sensitivity_report(model, obs, theta_hat, adapter)
+    J = inv.observation_jacobian(model, obs, theta_hat, adapter)
+    mc = inv.run_mcmc(
+        model, obs, theta_hat, sigma_eff2=0.1,
+        n_samples=30, burn=5, step_size=0.05, level=0.95, seed=0,
+        adapter=adapter,
+    )
+    result = SimpleNamespace(theta_hat=theta_hat)
+
+    path = inv._write_sim_artifact(
+        str(tmp_path), 7, adapter,
+        obs=obs, result=result, report=report, J=J,
+        fv_res=None, prof=None, mc=mc, sigma_eff2=0.1, c_fno=0.01,
+        noise_std=0.01, ci_level=0.95,
+        dataset_path="data/sourceitr_smoke", dataset_fingerprint="abc123",
+        split_seed=0, split_name="test",
+    )
+    from pathlib import Path
+    assert Path(path).name == "sim_00007.npz"
+
+    d = np.load(path, allow_pickle=True)
+    # Schema metadata (always present).
+    for key in (
+        "artifact_schema_version", "benchmark", "sim_id", "param_names",
+        "theta_hat", "theta_true", "theta_bounds", "param_scales",
+        "noise_std", "ci_level", "profile_threshold",
+        "dataset_path", "dataset_fingerprint", "split_seed", "split_name",
+    ):
+        assert key in d, f"missing schema key {key}"
+    assert str(d["benchmark"]) == "source_itr"
+    assert int(d["sim_id"]) == 7
+    assert d["theta_hat"].shape == (4,)
+    assert d["theta_true"].shape == (4,)
+    assert d["theta_bounds"].shape == (4, 2)
+    assert d["param_scales"].shape == (4,)
+    assert str(d["dataset_path"]) == "data/sourceitr_smoke"
+    assert str(d["split_name"]) == "test"
+    # Sensitivity block: source_itr persists the (4,4) right vectors + alignment.
+    assert d["right_vectors"].shape == (4, 4)
+    assert d["singular_values"].shape == (4,)
+    assert "ramp_sigma_alignment" in d
+    assert d["observation_jacobian"].shape[1] == 4
+    # MCMC block: chain + mixing diagnostics.
+    assert d["mcmc_theta_samples"].shape == (30, 4)
+    assert d["mcmc_excess_int"].shape == (30,)
+    assert int(d["mcmc_burn"]) == 5
+    assert int(d["mcmc_n_samples"]) == 30
+    assert "mcmc_ess_per_param" in d and d["mcmc_ess_per_param"].shape == (4,)
+    assert "mcmc_iat_per_param" in d and d["mcmc_iat_per_param"].shape == (4,)
+    assert "mcmc_ess_excess" in d and "mcmc_iat_excess" in d
+    assert "mcmc_initial_theta" in d and d["mcmc_initial_theta"].shape == (4,)
+    # Inflation scalars mirror the UQ columns.
+    assert float(d["sigma_eff2"]) == pytest.approx(0.1)
+    assert float(d["c_fno"]) == pytest.approx(0.01)
+
+
+def test_artifact_dir_writes_expected_npz_keys_forcing(tmp_path):
+    from types import SimpleNamespace
+
+    adapter = ForcingAdapter()
+    model = _tiny_forcing_model()
+    obs = _fake_forcing_observation_set()
+    theta_hat = obs.theta_true.to(torch.float32)
+    with torch.no_grad():
+        obs.targets = inv.predict_fullfield(model, obs, theta_hat, adapter).detach()
+
+    report = inv.sensitivity_report(model, obs, theta_hat, adapter)
+    J = inv.observation_jacobian(model, obs, theta_hat, adapter)
+    result = SimpleNamespace(theta_hat=theta_hat)
+
+    path = inv._write_sim_artifact(
+        str(tmp_path), 3, adapter,
+        obs=obs, result=result, report=report, J=J,
+        fv_res=None, prof=None, mc=None, sigma_eff2=None, c_fno=None,
+        noise_std=0.0, ci_level=0.95,
+        dataset_path="data/forcing_inv", dataset_fingerprint="def456",
+        split_seed=0, split_name="test",
+    )
+    from pathlib import Path
+    assert Path(path).name == "sim_00003.npz"
+
+    d = np.load(path, allow_pickle=True)
+    assert str(d["benchmark"]) == "forcing"
+    # Scalar R_c: width-1 theta and a degenerate (1,1) SVD.
+    assert d["theta_hat"].shape == (1,)
+    assert d["theta_bounds"].shape == (1, 2)
+    assert d["param_scales"].shape == (1,)
+    assert d["right_vectors"].shape == (1, 1)
+    assert d["observation_jacobian"].shape[1] == 1
+    # One parameter: no (R_amp, sigma) ridge alignment and no MCMC block.
+    assert "ramp_sigma_alignment" not in d
+    assert "mcmc_theta_samples" not in d
+    assert "sigma_eff2" not in d
+    assert "c_fno" not in d

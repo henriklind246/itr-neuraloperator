@@ -132,3 +132,38 @@ class ProblemSpec(ABC):
     def plot_label(self, params: dict) -> str:
         """Short human-readable label for a sim, used by visual modules."""
         return self.name
+
+    # ---- optional collocation hooks (W2 physics path; default off) ----
+
+    def collocation_geom_cfg(
+        self, ds, phys_cfg: dict, mu_global: float, sigma_global: float, dt: float,
+    ) -> dict[str, Any] | None:
+        """Geometry/closure config for the full_bc collocation residual.
+
+        Return a dict consumed by the training loop's collocation sampler
+        (``x_grid``, ``y_grid``, ``k_left``, ``k_right``, ``interface_x``,
+        ``dt``, ``sigma_global``, ``T_right_tilde``). The default ``None`` makes
+        the training loop fall back to its built-in (forcing) geometry block, so
+        benchmarks that do not opt in keep the existing behavior unchanged.
+        """
+        return None
+
+    def collocation_closure(
+        self, ds, sid: int, params: dict, t: float, t_dt: float,
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Per-item boundary closure for a collocation pair.
+
+        Return ``(R_c, qL_n, qL_np1, qL_int)`` for the two collocation times, or
+        ``None`` to use the training loop's built-in (forcing) closure.
+        """
+        return None
+
+    def collocation_base_plan(self, ds, dt: float) -> dict[str, Any] | None:
+        """Plan describing how collocation pairs are drawn.
+
+        Return e.g. ``{"base_snapshot_index": 0, "on_grid_pairs": True}`` to pin
+        the source snapshot and draw consecutive on-grid conditioning times, or
+        ``None`` to use the training loop's built-in (random source / uniform
+        lead) sampling.
+        """
+        return None

@@ -15,3 +15,7 @@ training:
     interface_weight: 10.0
     # Interface fixed at x = 0.5; use the static weight band/metric.
     per_sample_interface_x: false
+  physics:
+    # Pin the legacy transductive W2 source so forcing's collocation path stays
+    # byte-identical to before the diffusion benchmark added the `train` default.
+    collocation_source: val

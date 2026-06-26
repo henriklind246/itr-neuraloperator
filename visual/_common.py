@@ -112,9 +112,18 @@ PLOT_REGISTRY: dict[str, str] = {
     "generalization_same_vs_unseen":            "paper",
     # group: rollout
     "rollout_partition_error":                  "rollout",
+    # group: inverse
+    "forcing_parameter_recovery":               "inverse",
+    "forcing_identifiability":                  "inverse",
+    "forcing_surrogate_fidelity":               "inverse",
+    "forcing_uncertainty":                      "inverse",
+    "source_itr_parameter_recovery":            "inverse",
+    "source_itr_identifiability":               "inverse",
+    "source_itr_surrogate_fidelity":            "inverse",
+    "source_itr_uncertainty":                   "inverse",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout"}
+GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout", "inverse"}
 
 PLOT_STYLE = {
     "font.size": 10,
