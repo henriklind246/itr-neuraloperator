@@ -718,17 +718,20 @@ def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, ba
     # the residual would be evaluated against a wrong `dt` and silently mistrain.
     # Validate the saved spacing against the residual dt instead of trusting it.
     geom_dt = float(phys_cfg.get("dt", solver_dt))
-    tg_arr = np.asarray(tg, dtype=float)
+    # t_grid is persisted as float32; a uniform grid jitters by the float32
+    # quantum (~3e-8 at t=0.3). Compare to the mean spacing with a tolerance
+    # that absorbs that yet still catches a real save_stride mismatch.
+    tg_arr = np.asarray(tg, dtype=np.float64)
     if tg_arr.size >= 2:
         spacings = np.diff(tg_arr)
-        grid_dt = float(spacings[0])
-        if not np.allclose(spacings, grid_dt, rtol=0.0, atol=1e-9):
+        grid_dt = float(spacings.mean())
+        if not np.allclose(spacings, grid_dt, rtol=1e-3, atol=1e-9):
             raise ValueError(
                 "physics one-step loader requires a uniformly-spaced t_grid; "
                 f"got non-uniform spacings (min={float(spacings.min())}, "
                 f"max={float(spacings.max())}) from {t_path}."
             )
-        if not np.isclose(grid_dt, geom_dt, rtol=0.0, atol=1e-9):
+        if not np.isclose(grid_dt, geom_dt, rtol=1e-3, atol=1e-9):
             raise ValueError(
                 f"physics one-step loader snapshot spacing {grid_dt} != residual "
                 f"dt {geom_dt}: the one-step CN residual assumes consecutive "
@@ -983,14 +986,22 @@ def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_glob
     """
     base_plan = spec.collocation_base_plan(ds, float(phys_cfg.get("dt", 0.005)))
     if base_plan is not None and base_plan.get("on_grid_pairs", False):
-        t_grid = np.asarray(ds.t_grid, dtype=float)
+        # t_grid is persisted as float32, so a genuinely uniform grid jitters by
+        # the float32 quantum near t_final (~3e-8 at t=0.3). Compare to the mean
+        # spacing with a tolerance that tolerates that quantization yet still
+        # rejects a real save_stride mismatch (e.g. 0.01 vs 0.02).
+        t_grid = np.asarray(ds.t_grid, dtype=np.float64)
         diffs = np.diff(t_grid)
-        if diffs.size == 0 or not np.allclose(diffs, diffs[0], rtol=1e-6, atol=1e-12):
+        dt_mean = float(diffs.mean()) if diffs.size else 0.0
+        if diffs.size == 0 or not np.allclose(diffs, dt_mean, rtol=1e-3, atol=1e-9):
+            mn = float(diffs.min()) if diffs.size else float("nan")
+            mx = float(diffs.max()) if diffs.size else float("nan")
             raise ValueError(
                 "collocation_base_plan requested on_grid_pairs but the dataset "
-                "t_grid spacing is non-uniform; cannot pin dt to the FV grid step."
+                "t_grid spacing is non-uniform; cannot pin dt to the FV grid "
+                f"step (min={mn}, max={mx}, mean={dt_mean})."
             )
-        dt = float(diffs[0])
+        dt = dt_mean
     else:
         dt = float(phys_cfg.get("dt", 0.005))
 

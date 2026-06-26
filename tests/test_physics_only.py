@@ -403,3 +403,60 @@ def test_zero_duration_anchor_item_is_finite():
     for key in ("spatial", "cond_static", "forcing_seq"):
         assert np.isfinite(rolled[key]).all(), f"rolled {key} not finite at t_s == t_j"
     assert rolled["cond_static"][0] == 0.0
+
+
+# --- 10. on_grid dt pinning tolerates float32 jitter, rejects real non-uniform -
+
+
+class _GridDS:
+    """Minimal dataset stub exposing the attributes `_build_collocation_sampler`
+    and `CollocationSampler.__init__` read, parameterized by an arbitrary t_grid
+    so the on-grid dt-pinning check can be exercised directly."""
+
+    def __init__(self, t_grid):
+        self.t_grid = np.asarray(t_grid)
+        self.t_final = float(self.t_grid[-1])
+        self.x_grid = np.linspace(0.0, 1.0, 4)
+        self.y_grid = np.linspace(0.0, 1.0, 5)
+        self.Ny = 5
+        self.sim_ids = np.array([0, 1, 2])
+        self.sim_params = {i: {} for i in range(3)}
+        self.problem = None
+
+
+def test_on_grid_dt_pinning_tolerates_float32_jitter():
+    """A genuinely uniform grid saved as float32 jitters by the float32 quantum
+    near t_final; the on-grid dt-pinning must accept it and pin dt to the mean
+    spacing rather than raising 'non-uniform'."""
+    import src.operators.train as train_mod
+
+    spec = DiffusionProblem()
+    # 31 snapshots at 0.01 spacing up to t_final = 0.30, round-tripped through
+    # float32 so consecutive diffs jitter by ~1e-8 (the storage quantum).
+    t_grid = (np.arange(31, dtype=np.float64) * 0.01).astype(np.float32)
+    diffs = np.diff(t_grid.astype(np.float64))
+    assert diffs.max() - diffs.min() > 0.0, "float32 round-trip did not jitter"
+    assert diffs.max() - diffs.min() < 1e-6, "jitter unexpectedly large"
+
+    ds = _GridDS(t_grid)
+    sampler = train_mod._build_collocation_sampler(
+        {}, {"dt": 0.005}, ds, spec, 300.0, 10.0, batch_size=4, rng_seed=0,
+    )
+    assert abs(sampler.dt - 0.01) < 1e-6
+
+
+def test_on_grid_dt_pinning_rejects_real_nonuniform():
+    """A grid with a real save_stride doubling partway through is rejected so a
+    genuinely non-uniform t_grid cannot be silently pinned to a wrong dt."""
+    import src.operators.train as train_mod
+
+    spec = DiffusionProblem()
+    t_grid = np.concatenate([
+        np.arange(0, 0.10, 0.01),          # spacing 0.01
+        np.arange(0.10, 0.30 + 0.02, 0.02),  # spacing 0.02
+    ]).astype(np.float32)
+    ds = _GridDS(t_grid)
+    with pytest.raises(ValueError, match="non-uniform"):
+        train_mod._build_collocation_sampler(
+            {}, {"dt": 0.005}, ds, spec, 300.0, 10.0, batch_size=4, rng_seed=0,
+        )
