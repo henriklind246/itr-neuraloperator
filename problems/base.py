@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -42,6 +42,62 @@ class ProblemDims:
     use_temporal_encoder: bool
     s_y_channel: int = 3
     use_forcing_time_aug: bool = False
+
+
+OODKind = Literal["simulation_parameter", "evaluation_parameter", "compound"]
+
+
+@dataclass(frozen=True)
+class OODAxis:
+    """Declares one out-of-distribution sweep axis for a benchmark.
+
+    An axis names a single controlled shift away from the training distribution.
+    ``kind`` decides whether a swept value needs a new simulation or only a new
+    evaluation query on an existing trajectory:
+
+    - ``simulation_parameter``: one sim per ``(axis, value, repeat)`` cell; the
+      value enters ``apply_ood_value`` and overrides a single sim-param field.
+    - ``evaluation_parameter``: the value is a *target time*, not a sim param.
+      One extended trajectory is generated per repeat (solved to the max target)
+      and the eval stage expands it into target-time buckets. ``field`` is None.
+    - ``compound``: one sim per cell, but more than one physical factor moves
+      together (``family_transfer``, ``rc_severity``); CRN pairing is verified by
+      the shared-latent fingerprint, not by byte-equal params.
+
+    ``id_reference`` leads the value list so every sweep includes an exactly
+    paired in-distribution anchor produced inside the same CRN sweep.
+    ``dataset_t_final`` is the solver/trajectory horizon to solve to (0.30
+    normally; 0.45 for the time axis). ``time_norm_horizon`` is the trained
+    normalization horizon the model-input builders scale temporal features by
+    (0.30), so a target past it yields lead/time features > 1.0 (the headline
+    time-OOD signal). ``trained_range`` is the family's saved sampler range used
+    to classify each realized value's 4-level ``distribution_class``;
+    ``pinned_family`` is the temporal/spatial family this axis fixes so the swept
+    field is meaningful. ``resolution_kind`` tags how the swept feature stresses
+    the FV discretization (Step 6 resolution accounting).
+    """
+
+    name: str
+    kind: OODKind
+    id_reference: tuple[Any, ...]
+    ood_values: tuple[Any, ...]
+    field: str | None = None
+    pinned_family: str | None = None
+    trained_range: tuple[float, float] | None = None
+    dataset_t_final: float = 0.30
+    time_norm_horizon: float = 0.30
+    resolution_kind: str = "none"
+    compound: bool = False
+    notes: str = ""
+
+    def sweep_values(self) -> tuple[Any, ...]:
+        """Full ordered value list: ID reference value(s) first, then OOD values.
+
+        Sims are generated in this order (``repeat``-major) so a given repeat's
+        shared-latent background is reused across every value, and the leading
+        in-distribution reference gives an exactly-paired baseline.
+        """
+        return tuple(self.id_reference) + tuple(self.ood_values)
 
 
 class ProblemSpec(ABC):
@@ -165,5 +221,79 @@ class ProblemSpec(ABC):
         the source snapshot and draw consecutive on-grid conditioning times, or
         ``None`` to use the training loop's built-in (random source / uniform
         lead) sampling.
+        """
+        return None
+
+    # ---- optional OOD hooks (W3 out-of-distribution path; default off) ----
+
+    def ood_axes(self) -> dict[str, OODAxis]:
+        """Out-of-distribution sweep axes this benchmark supports.
+
+        Default is empty so non-OOD benchmarks and the standard generation/eval
+        paths are untouched. Benchmarks that opt in return a mapping from axis
+        name to its :class:`OODAxis` and implement :meth:`draw_latents` and
+        :meth:`apply_ood_value`.
+        """
+        return {}
+
+    def draw_latents(
+        self,
+        rng: np.random.Generator,
+        rng_profile: np.random.Generator,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        axis: OODAxis,
+    ) -> dict[str, Any]:
+        """Draw ONE shared-latent bundle for a single CRN repeat of ``axis``.
+
+        Called once per ``repeat`` by the OOD generator (seeded by the repeat
+        index). The returned bundle holds the *background* random draw shared by
+        every swept value at this repeat: unit quantiles / standard normals for
+        the parameters an axis maps through a family's inverse CDF, plus any
+        non-swept physical fields (IC, ``T0``, the non-swept family draws) that
+        every value reuses verbatim. It must NOT bake in the swept field --
+        :meth:`apply_ood_value` injects that from the explicit value.
+
+        Storing quantiles (not realized params) lets compound axes map the SAME
+        background through different families' inverse CDFs, giving reproducible
+        CRN coupling across otherwise-unrelated parameterizations.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares OOD axes but does not implement "
+            "draw_latents()."
+        )
+
+    def apply_ood_value(
+        self, latents: dict[str, Any], axis: OODAxis, value: Any,
+    ) -> dict[str, Any]:
+        """Map a shared-latent bundle + one swept ``value`` into a sim-param dict.
+
+        Returns a single ``sim_params`` entry (same schema as
+        :meth:`sample_sim_params` rows, passing :meth:`validate_schema` and
+        :meth:`configure_solver`). The ``latents`` bundle is reused for every
+        value of a repeat, so for ordinary axes every non-swept field is
+        byte-identical across values and only the swept field changes; for
+        compound axes the shared quantiles map through each value's families.
+
+        When snapping/clipping/truncation can change another quantity (interface
+        face-alignment, patch clipping at a boundary, void-profile truncation),
+        the returned dict also records the realized geometry under
+        ``*_actual``/``realized_*`` keys so the generator's sidecar can audit
+        requested-vs-realized values.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares OOD axes but does not implement "
+            "apply_ood_value()."
+        )
+
+    def resolution_scale(self, axis: OODAxis, params: dict) -> float | None:
+        """Physical extent of the swept feature, for resolution accounting.
+
+        Units follow ``axis.resolution_kind``: seconds for ``temporal_*`` (a
+        sinusoid period, exponential timescale, or minimum pulse width) and
+        domain length for ``spatial_*`` (a Gaussian sigma, triangle half-width,
+        or patch extent). Read from the realized ``params`` so sampling/snapping
+        is reflected. ``None`` (the default) when the axis does not stress the
+        FV discretization, so the generator records no cells/steps for it.
         """
         return None

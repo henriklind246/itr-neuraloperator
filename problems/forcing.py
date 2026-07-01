@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, ProblemSpec, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
 from src.physics.boundary_forcing import (
+    DT_PULSE_FRAC_HI,
+    DT_PULSE_FRAC_LO,
     GAUSS_SIGMA_RANGE,
     PATCH_W_RANGE,
+    PULSE_AMP_RANGE,
+    SIN_FREQ_RANGE,
+    SPATIAL_FAMILIES,
+    TEMPORAL_FAMILIES,
     TRIANGLE_ELL_RANGE,
     TEMPORAL_SAMPLERS,
     SPATIAL_BUILDERS,
@@ -151,6 +158,49 @@ def _generate_lhs_R_c(num_sims: int, seed: int = 0) -> np.ndarray:
     samples_scaled = lower_bounds + samples_unit * (upper_bounds - lower_bounds)
     samples_scaled = samples_scaled.astype(np.float32)
     return samples_scaled[:, 0]
+
+
+# ----- OOD CRN helpers (pulse_count exceeds NP_MAX, so it needs a pool) -----
+
+def _draw_pulse_pool(rng: np.random.Generator, dt: float, t_final: float,
+                     n_pulses: int) -> dict:
+    """Draw an unsorted pool of ``n_pulses`` in-distribution pulses.
+
+    ``pulse_count`` sweeps ``Np`` past ``NP_MAX``, so a single pool is drawn once
+    per CRN repeat and the first ``Np`` pulses are taken for each swept value,
+    yielding nested paired pulse trains across the sweep. Per-pulse draws reuse
+    the ``sample_pulse_train_params`` formulas (amplitude, log-uniform width,
+    uniform start).
+    """
+    dt_lo = DT_PULSE_FRAC_LO * dt
+    dt_hi = DT_PULSE_FRAC_HI * t_final
+    A_pool, t_pool, dt_pool = [], [], []
+    for _ in range(int(n_pulses)):
+        A_pool.append(float(rng.uniform(*PULSE_AMP_RANGE)))
+        u = rng.uniform(0.0, 1.0)
+        dtn = float(dt_lo * (dt_hi / dt_lo) ** u)
+        dt_pool.append(dtn)
+        t_pool.append(float(rng.uniform(0.0, t_final - dtn)))
+    return {"A_pool": A_pool, "t_pool": t_pool, "dt_pool": dt_pool}
+
+
+def _slice_pulse_pool(pool: dict, Np: int) -> dict:
+    """Take the first ``Np`` pulses from a pool and sort them by start time.
+
+    Mirrors ``sample_pulse_train_params``'s output schema so the result passes
+    straight into ``build_qL``.
+    """
+    Np = int(Np)
+    A = pool["A_pool"][:Np]
+    t = pool["t_pool"][:Np]
+    dtn = pool["dt_pool"][:Np]
+    order = np.argsort(t)
+    return {
+        "Np": Np,
+        "A_list": [float(A[i]) for i in order],
+        "t_list": [float(t[i]) for i in order],
+        "dt_list": [float(dtn[i]) for i in order],
+    }
 
 
 class ForcingProblem(ProblemSpec):
@@ -331,8 +381,11 @@ class ForcingProblem(ProblemSpec):
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
         t_bar = t_j_val - t_s_val
-        t_bar_norm = t_bar / ds.t_final
-        t_s_norm = t_s_val / ds.t_final
+        # Temporal model-input features scale by the trained normalization horizon
+        # (defaults to t_final for non-OOD sets); a target past the trained
+        # horizon therefore yields t_bar_norm / t_s_norm > 1.0.
+        t_bar_norm = t_bar / ds.time_norm_horizon
+        t_s_norm = t_s_val / ds.time_norm_horizon
 
         s_y = ds.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
@@ -422,3 +475,201 @@ class ForcingProblem(ProblemSpec):
             if A is not None and f is not None:
                 return f"{spatial}/rectified sin A={A:.0f} f={f:.1f}"
         return f"{spatial}/{temporal}"
+
+    # ---- OOD hooks ----
+
+    def ood_axes(self) -> dict[str, OODAxis]:
+        # ID-reference values are the trained sampler-range mids (geometric mid
+        # for log-uniform families: f, exp tau, gaussian sigma; arithmetic mid
+        # otherwise). exp tau range = (TAU_FRAC_LO*dt, TAU_EXP_FRAC_HI*t_final)
+        # = (0.025, 0.15) at the dataset dt=0.005, t_final=0.30; the generator
+        # re-validates id_reference/trained_range against the trained config.
+        return {
+            "rc": OODAxis(
+                name="rc", kind="simulation_parameter", field="R_c",
+                id_reference=(0.5,), ood_values=(0.0, 0.01, 0.025, 1.25, 1.5, 2.0),
+                trained_range=RC_RANGE, resolution_kind="none",
+            ),
+            "sin_freq": OODAxis(
+                name="sin_freq", kind="simulation_parameter", field="f",
+                pinned_family="sin", id_reference=(4.472135955,),
+                ood_values=(0.5, 25.0, 40.0), trained_range=SIN_FREQ_RANGE,
+                resolution_kind="temporal_period",
+            ),
+            "sin_amp": OODAxis(
+                name="sin_amp", kind="simulation_parameter", field="A",
+                pinned_family="sin", id_reference=(175.0,),
+                ood_values=(25.0, 325.0, 350.0), trained_range=SIN_AMP_RANGE,
+                resolution_kind="none",
+            ),
+            "pulse_count": OODAxis(
+                name="pulse_count", kind="simulation_parameter", field="Np",
+                pinned_family="pulse_train", id_reference=(3,),
+                ood_values=(5, 6), trained_range=(1.0, 4.0),
+                resolution_kind="temporal_pulse",
+            ),
+            "fast_timescale": OODAxis(
+                name="fast_timescale", kind="simulation_parameter", field="tau",
+                pinned_family="exp", id_reference=(0.061237243,),
+                ood_values=(0.02, 0.015, 0.01), trained_range=(0.025, 0.15),
+                resolution_kind="temporal_timescale",
+            ),
+            "slow_decay": OODAxis(
+                name="slow_decay", kind="simulation_parameter", field="tau",
+                pinned_family="exp", id_reference=(0.061237243,),
+                ood_values=(0.20, 0.25, 0.30), trained_range=(0.025, 0.15),
+                resolution_kind="none",
+            ),
+            "patch_width": OODAxis(
+                name="patch_width", kind="simulation_parameter", field="w",
+                pinned_family="patch", id_reference=(0.35,),
+                ood_values=(0.05, 0.75), trained_range=PATCH_W_RANGE,
+                resolution_kind="spatial_patch_edge",
+            ),
+            "gaussian_sigma_y": OODAxis(
+                name="gaussian_sigma_y", kind="simulation_parameter",
+                field="sigma_y", pinned_family="gaussian",
+                id_reference=(0.077459667,), ood_values=(0.015, 0.30),
+                trained_range=GAUSS_SIGMA_RANGE,
+                resolution_kind="spatial_gaussian_sigma",
+            ),
+            "triangle_ell": OODAxis(
+                name="triangle_ell", kind="simulation_parameter", field="ell",
+                pinned_family="triangle", id_reference=(0.20,),
+                ood_values=(0.025, 0.50), trained_range=TRIANGLE_ELL_RANGE,
+                resolution_kind="spatial_triangle",
+            ),
+        }
+
+    def draw_latents(
+        self,
+        rng: np.random.Generator,
+        rng_profile: np.random.Generator,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        axis: OODAxis,
+    ) -> dict[str, Any]:
+        X = grids["X"]
+        y_grid = grids.get("y_grid")
+        if y_grid is None:
+            Y = grids["Y"]
+            c, d = float(np.min(Y)), float(np.max(Y))
+        else:
+            c, d = float(y_grid[0]), float(y_grid[-1])
+        dt = float(time_cfg["dt"])
+        t_final = float(time_cfg["t_final"])
+        window = dict(
+            t_on=float(time_cfg.get("t_on", 0.0)),
+            t_off=float(time_cfg.get("t_off", 0.2)),
+            phase=float(time_cfg.get("phase", 0.0)),
+            tukey_alpha=float(time_cfg.get("tukey_alpha", 0.5)),
+        )
+
+        # Shared in-distribution background reused verbatim for every non-swept
+        # field. For a temporal axis the background spatial draw is the shared
+        # non-swept field (and vice versa); the pinned modality below supplies
+        # the family the axis sweeps within.
+        bg_temporal_family = sample_temporal_family(rng_profile)
+        bg_temporal_params = TEMPORAL_SAMPLERS[bg_temporal_family](
+            rng_profile, dt=dt, t_final=t_final, **window
+        )
+        bg_spatial_family = sample_spatial_family(rng_profile)
+        bg_spatial_params = SPATIAL_SAMPLERS[bg_spatial_family](rng_profile, c=c, d=d)
+
+        latents: dict[str, Any] = {
+            "R_c": float(rng.uniform(*RC_RANGE)),
+            "T0": np.full(X.shape, 300.0, dtype=np.float32),
+            "ic_family": "uniform_2d",
+            "ic_params": {"T0_offset": 0.0},
+            "temporal_family": bg_temporal_family,
+            "temporal_params": bg_temporal_params,
+            "spatial_family": bg_spatial_family,
+            "spatial_params": bg_spatial_params,
+            "_y_bounds": (c, d),
+            "_span": d - c,
+        }
+
+        pinned = axis.pinned_family
+        if pinned in TEMPORAL_FAMILIES:
+            if pinned == "pulse_train":
+                n_pool = max(int(v) for v in axis.sweep_values())
+                latents["pulse_pool"] = _draw_pulse_pool(
+                    rng_profile, dt=dt, t_final=t_final, n_pulses=n_pool
+                )
+            else:
+                latents["pinned_temporal_params"] = TEMPORAL_SAMPLERS[pinned](
+                    rng_profile, dt=dt, t_final=t_final, **window
+                )
+        elif pinned in SPATIAL_FAMILIES:
+            latents["pinned_spatial_params"] = SPATIAL_SAMPLERS[pinned](
+                rng_profile, c=c, d=d
+            )
+        return latents
+
+    def apply_ood_value(
+        self, latents: dict[str, Any], axis: OODAxis, value: Any,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "R_c": float(latents["R_c"]),
+            "T0": latents["T0"],
+            "ic_family": latents["ic_family"],
+            "ic_params": copy.deepcopy(latents["ic_params"]),
+            "temporal_family": latents["temporal_family"],
+            "temporal_params": copy.deepcopy(latents["temporal_params"]),
+            "spatial_family": latents["spatial_family"],
+            "spatial_params": copy.deepcopy(latents["spatial_params"]),
+        }
+
+        if axis.name == "rc":
+            params["R_c"] = float(value)
+            return params
+
+        pinned = axis.pinned_family
+        if pinned in TEMPORAL_FAMILIES:
+            params["temporal_family"] = pinned
+            if pinned == "pulse_train":
+                params["temporal_params"] = _slice_pulse_pool(
+                    latents["pulse_pool"], int(value)
+                )
+            else:
+                tp = copy.deepcopy(latents["pinned_temporal_params"])
+                tp[axis.field] = float(value)
+                params["temporal_params"] = tp
+            return params
+
+        if pinned in SPATIAL_FAMILIES:
+            params["spatial_family"] = pinned
+            sp = copy.deepcopy(latents["pinned_spatial_params"])
+            span = float(latents["_span"])
+            phys = float(value) * span
+            sp[axis.field] = phys
+            params["spatial_params"] = sp
+            if pinned == "patch":
+                c, d = latents["_y_bounds"]
+                y_c = float(sp["y_c"])
+                lo = max(float(c), y_c - 0.5 * phys)
+                hi = min(float(d), y_c + 0.5 * phys)
+                params["_ood_realized"] = {
+                    "patch_w_requested": phys,
+                    "patch_w_actual": hi - lo,
+                    "patch_y_lo_actual": lo,
+                    "patch_y_hi_actual": hi,
+                    "patch_centroid_actual": 0.5 * (lo + hi),
+                }
+            return params
+
+        raise ValueError(
+            f"Unhandled OOD axis {axis.name!r} for benchmark {self.name!r}."
+        )
+
+    def resolution_scale(self, axis: OODAxis, params: dict) -> float | None:
+        kind = axis.resolution_kind
+        if kind == "temporal_period":
+            return 1.0 / float(params["temporal_params"]["f"])
+        if kind == "temporal_timescale":
+            return float(params["temporal_params"]["tau"])
+        if kind == "temporal_pulse":
+            return float(min(params["temporal_params"]["dt_list"]))
+        if kind in ("spatial_patch_edge", "spatial_gaussian_sigma", "spatial_triangle"):
+            return float(params["spatial_params"][axis.field])
+        return None

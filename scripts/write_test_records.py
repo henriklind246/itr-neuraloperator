@@ -44,6 +44,38 @@ def main() -> int:
             "Omit to use checkpoint/config defaults; values greater than 1 enable rollout."
         ),
     )
+    parser.add_argument(
+        "--eval-all-sims",
+        action="store_true",
+        help=(
+            "Record every simulation in the (redirected) dataset instead of the "
+            "15%% held-out test slice. Use for OOD datasets so all sims get rows."
+        ),
+    )
+    parser.add_argument(
+        "--time-norm-horizon",
+        type=float,
+        default=None,
+        help=(
+            "Trained normalization horizon (e.g. 0.30) for temporal model-input "
+            "features ONLY; the physical horizon stays the dataset's t_final."
+        ),
+    )
+    parser.add_argument(
+        "--target-times",
+        default=None,
+        help=(
+            "Comma-separated target times for the OOD time pair protocols "
+            "(e.g. 0.25,0.30,0.35,0.40,0.45)."
+        ),
+    )
+    parser.add_argument(
+        "--protocol",
+        action="append",
+        default=None,
+        choices=["fixed_initial", "anchored_from_horizon", "ood_local_fixed_lead"],
+        help="OOD time pair protocol(s); repeatable.",
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root).expanduser()
@@ -57,6 +89,10 @@ def main() -> int:
     if args.rollout_num_substeps is not None:
         rollout_enabled = args.rollout_num_substeps > 1
 
+    target_times = None
+    if args.target_times is not None:
+        target_times = [float(t) for t in args.target_times.split(",") if t.strip()]
+
     write_test_records(
         str(run_root),
         seed=args.seed,
@@ -64,6 +100,10 @@ def main() -> int:
         data_dir=args.data_dir,
         rollout_enabled=rollout_enabled,
         rollout_num_substeps=args.rollout_num_substeps,
+        eval_all_sims=args.eval_all_sims,
+        time_norm_horizon=args.time_norm_horizon,
+        target_times=target_times,
+        protocols=args.protocol,
     )
     return 0
 

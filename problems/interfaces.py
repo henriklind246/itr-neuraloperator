@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, ProblemSpec, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
 from problems.forcing import (
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
@@ -50,6 +50,12 @@ S_Y_CHANNEL = 5
 LHS_PARAM_RANGES = {"R_c": RC_RANGE, "interface_x": INTERFACE_X_RANGE}
 _NODE_TOL_FRAC = 1e-3
 _NODE_JITTER_FRAC = 0.25
+
+# In-distribution generation pins sin/uniform forcing. The family_transfer OOD
+# axis is the one place that drives the other trained families, so the schema
+# guard admits these (and only these) families rather than a single value.
+ALLOWED_TEMPORAL_FAMILIES = ("sin", "exp")
+ALLOWED_SPATIAL_FAMILIES = ("uniform", "patch")
 
 
 # ----- conditioning -----
@@ -311,8 +317,8 @@ class InterfacesProblem(ProblemSpec):
 
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
-        t_bar_norm = (t_j_val - t_s_val) / ds.t_final
-        t_s_norm = t_s_val / ds.t_final
+        t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
+        t_s_norm = t_s_val / ds.time_norm_horizon
 
         s_y = ds.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
@@ -391,18 +397,217 @@ class InterfacesProblem(ProblemSpec):
                     f"sim_params[{int(sid)}] missing keys {missing} for benchmark "
                     f"{self.name!r}."
                 )
-            if entry["temporal_family"] != "sin":
+            if entry["temporal_family"] not in ALLOWED_TEMPORAL_FAMILIES:
                 raise ValueError(
                     f"sim_params[{int(sid)}] has temporal_family="
                     f"{entry['temporal_family']!r}; benchmark {self.name!r} "
-                    "requires sin-only forcing."
+                    f"admits only {ALLOWED_TEMPORAL_FAMILIES}."
                 )
-            if entry["spatial_family"] != "uniform":
+            if entry["spatial_family"] not in ALLOWED_SPATIAL_FAMILIES:
                 raise ValueError(
                     f"sim_params[{int(sid)}] has spatial_family="
                     f"{entry['spatial_family']!r}; benchmark {self.name!r} "
-                    "requires uniform-only spatial forcing."
+                    f"admits only {ALLOWED_SPATIAL_FAMILIES}."
                 )
+
+    # ---- OOD hooks ----
+
+    def ood_axes(self) -> dict[str, OODAxis]:
+        return {
+            "rc": OODAxis(
+                name="rc", kind="simulation_parameter", field="R_c",
+                id_reference=(0.5,), ood_values=(0.0, 0.01, 0.025, 1.25, 1.5, 2.0),
+                trained_range=RC_RANGE, resolution_kind="none",
+                notes="scalar interface resistance; same sweep as the forcing "
+                "benchmark. The interface location and forcing stay fixed at the "
+                "trained sin/uniform background; only R_c is swept.",
+            ),
+            "interface_x": OODAxis(
+                name="interface_x",
+                kind="simulation_parameter",
+                id_reference=(0.5,),
+                ood_values=(0.1, 0.9),
+                field="interface_x",
+                trained_range=(float(INTERFACE_X_RANGE[0]), float(INTERFACE_X_RANGE[1])),
+                resolution_kind="none",
+                notes=(
+                    "Interface fraction in [0,1]; converted to a physical "
+                    "position and face-aligned via _jitter_off_node. The "
+                    "requested fraction and the snapped physical value are "
+                    "recorded under _ood_realized."
+                ),
+            ),
+            "family_transfer": OODAxis(
+                name="family_transfer",
+                kind="compound",
+                id_reference=(("sin", "uniform"),),
+                ood_values=(
+                    ("exp", "uniform"),
+                    ("sin", "patch"),
+                    ("exp", "patch"),
+                ),
+                field="forcing_family",
+                pinned_family="sin/uniform",
+                compound=True,
+                resolution_kind="none",
+                notes=(
+                    "Full 2x2 temporal x spatial family grid against the "
+                    "trained sin/uniform forcing. Non-family background (R_c, "
+                    "interface_x, IC) is shared per repeat; CRN pairing is on "
+                    "the shared-latent fingerprint, not byte-equal params."
+                ),
+            ),
+        }
+
+    def draw_latents(
+        self,
+        rng: np.random.Generator,
+        rng_profile: np.random.Generator,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        axis: OODAxis,
+    ) -> dict[str, Any]:
+        X = grids["X"]
+        Y = grids["Y"]
+        x_grid = grids["x_grid"]
+        y_grid = grids["y_grid"]
+        Nx, Ny = X.shape[0], X.shape[1]
+        a = float(x_grid[0])
+        b = float(x_grid[-1])
+        c = float(y_grid[0])
+        d = float(y_grid[-1])
+
+        dt = float(time_cfg["dt"])
+        t_final = float(time_cfg["t_final"])
+        b_temp = float(time_cfg.get("b", 1.0))
+        T_right = float(time_cfg.get("T_right", 300.0))
+        temporal_window = dict(
+            t_on=float(time_cfg.get("t_on", 0.0)),
+            t_off=float(time_cfg.get("t_off", 0.2)),
+            phase=float(time_cfg.get("phase", 0.0)),
+            tukey_alpha=float(time_cfg.get("tukey_alpha", 0.5)),
+        )
+
+        # Shared background reused by every swept value of this repeat.
+        R_c = float(rng.uniform(*RC_RANGE))
+        ic_family = sample_ic_family(rng)
+        ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+        T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
+
+        x_lo, x_hi = INTERFACE_X_RANGE
+        interface_frac_bg = float(rng.uniform(x_lo, x_hi))
+        interface_x_bg = float(
+            _jitter_off_node(
+                np.array([a + interface_frac_bg * (b - a)], dtype=np.float64),
+                a=a, b=b, Nx=Nx,
+            )[0]
+        )
+
+        # One per-repeat seed; family_transfer re-seeds from it so each family
+        # samples from the same background stream (CRN coupling on the seed).
+        profile_seed = int(rng_profile.integers(0, 2**31 - 1))
+        fixed_temporal = TEMPORAL_SAMPLERS["sin"](
+            np.random.default_rng(profile_seed),
+            dt=dt, t_final=t_final, **temporal_window,
+        )
+        fixed_spatial = SPATIAL_SAMPLERS["uniform"](
+            np.random.default_rng(profile_seed), c=c, d=d,
+        )
+
+        return {
+            "domain": (a, b, c, d),
+            "Nx": Nx,
+            "Ny": Ny,
+            "dt": dt,
+            "t_final": t_final,
+            "temporal_window": temporal_window,
+            "R_c": R_c,
+            "interface_x_bg": interface_x_bg,
+            "T0": T0,
+            "ic_family": ic_family,
+            "ic_params": ic_params,
+            "profile_seed": profile_seed,
+            "fixed_temporal": fixed_temporal,
+            "fixed_spatial": fixed_spatial,
+        }
+
+    def apply_ood_value(
+        self, latents: dict[str, Any], axis: OODAxis, value: Any,
+    ) -> dict[str, Any]:
+        a, b, c, d = latents["domain"]
+        Nx = latents["Nx"]
+        dt = latents["dt"]
+        t_final = latents["t_final"]
+        temporal_window = latents["temporal_window"]
+
+        params: dict[str, Any] = {
+            "R_c": float(latents["R_c"]),
+            "interface_x": float(latents["interface_x_bg"]),
+            "T0": latents["T0"],
+            "ic_family": latents["ic_family"],
+            "ic_params": latents["ic_params"],
+            "temporal_family": "sin",
+            "temporal_params": latents["fixed_temporal"],
+            "spatial_family": "uniform",
+            "spatial_params": latents["fixed_spatial"],
+        }
+
+        if axis.name == "rc":
+            params["R_c"] = float(value)
+            params["_ood_realized"] = {"requested": float(value)}
+            return params
+
+        if axis.name == "interface_x":
+            frac = float(value)
+            interface_x_req = a + frac * (b - a)
+            interface_x_actual = float(
+                _jitter_off_node(
+                    np.array([interface_x_req], dtype=np.float64),
+                    a=a, b=b, Nx=Nx,
+                )[0]
+            )
+            params["interface_x"] = interface_x_actual
+            params["_ood_realized"] = {
+                "requested": frac,
+                "interface_x_requested": float(interface_x_req),
+                "interface_x_actual": interface_x_actual,
+            }
+            return params
+
+        if axis.name == "family_transfer":
+            temporal_family, spatial_family = value
+            if temporal_family not in ALLOWED_TEMPORAL_FAMILIES:
+                raise ValueError(
+                    f"family_transfer temporal_family={temporal_family!r} not in "
+                    f"{ALLOWED_TEMPORAL_FAMILIES}."
+                )
+            if spatial_family not in ALLOWED_SPATIAL_FAMILIES:
+                raise ValueError(
+                    f"family_transfer spatial_family={spatial_family!r} not in "
+                    f"{ALLOWED_SPATIAL_FAMILIES}."
+                )
+            seed = latents["profile_seed"]
+            temporal_params = TEMPORAL_SAMPLERS[temporal_family](
+                np.random.default_rng(seed),
+                dt=dt, t_final=t_final, **temporal_window,
+            )
+            spatial_params = SPATIAL_SAMPLERS[spatial_family](
+                np.random.default_rng(seed), c=c, d=d,
+            )
+            params["temporal_family"] = temporal_family
+            params["temporal_params"] = temporal_params
+            params["spatial_family"] = spatial_family
+            params["spatial_params"] = spatial_params
+            params["_ood_realized"] = {
+                "requested": f"{temporal_family}+{spatial_family}",
+                "temporal_family": temporal_family,
+                "spatial_family": spatial_family,
+            }
+            return params
+
+        raise ValueError(
+            f"Unknown OOD axis {axis.name!r} for benchmark {self.name!r}."
+        )
 
     def plot_label(self, params: dict) -> str:
         interface_x = params.get("interface_x")

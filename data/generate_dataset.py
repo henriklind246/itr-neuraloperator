@@ -92,26 +92,28 @@ def build_sim_params(a: float, b: float, c: float, d: float, X: np.ndarray, Y: n
     return sim_params
 
 
-def generate_sim_data(
-    num_sims: int = 2000,
-    save_stride: int = 2,
-    save_dir: Path | str | None = None,
-    benchmark: str | None = None,
+def build_base_setup(
+    num_sims: int,
+    save_stride: int,
     nx: int = 100,
     ny: int = 100,
-    ic_families: list[str] | None = None,
+    t_final: float = 0.3,
+    dt: float = 0.005,
     ramp_seconds: float | None = None,
-) -> None:
-    benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
-    spec = get_problem(benchmark)
+    lhs_seed: int = 0,
+    ic_families: list[str] | None = None,
+) -> dict:
+    """Build the fixed geometry/time scaffolding shared by every simulation.
 
-    rng = np.random.default_rng(0)
-    rng_profile = np.random.default_rng(1)
-
+    Returns a bundle with the ``grids`` and ``time_cfg`` consumed by
+    ``sample_sim_params``/``draw_latents``, the ``base_kwargs`` passed to
+    ``configure_solver``, plus the resolved ``dt``, ``t_ramp``, and
+    ``Nt_saved`` needed to size and save trajectories. ``t_final``/``dt`` are
+    parameters (not hardcoded) so the OOD generator can solve to an extended
+    horizon, but the defaults reproduce the standard dataset exactly.
+    """
     a, b, c, d = 0.0, 1.0, 0.0, 1.0
     Nx, Ny = nx, ny
-    dt = 0.005
-    t_final = 0.3
 
     # Physical startup-ramp width applied to q_L so q_L(0)=0. Resolve once here
     # (CLI override else dt-derived default) and persist the resolved value with
@@ -128,7 +130,6 @@ def generate_sim_data(
     X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
 
     dt, t_grid_template = build_time_grid(t_final, dt, explicit_dt=True)
-    Nt = len(t_grid_template)
     Nt_saved = len(t_grid_template[::save_stride])
 
     x_mid = 0.5 * (a + b)
@@ -139,7 +140,7 @@ def generate_sim_data(
 
     grids = {"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid}
     time_cfg = dict(
-        num_sims=num_sims, dt=dt, t_final=t_final, lhs_seed=0,
+        num_sims=num_sims, dt=dt, t_final=t_final, lhs_seed=lhs_seed,
         t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
         T_right=300.0, b=b, ic_families=ic_families,
     )
@@ -150,31 +151,63 @@ def generate_sim_data(
         dt=dt, tukey_alpha=tukey_alpha, y_grid=y_grid, X=X, Y=Y,
         ramp_seconds=t_ramp,
     )
+    return {
+        "grids": grids,
+        "time_cfg": time_cfg,
+        "base_kwargs": base_kwargs,
+        "dt": dt,
+        "t_ramp": t_ramp,
+        "Nt_saved": Nt_saved,
+        "Nx": Nx,
+        "Ny": Ny,
+    }
 
-    print(f"Benchmark: {benchmark}", flush=True)
-    print("Building simulation parameters.", flush=True)
 
-    sim_params = spec.sample_sim_params(
-        rng=rng, rng_profile=rng_profile, grids=grids, time_cfg=time_cfg,
-    )
+def run_solves(
+    spec,
+    sim_params: list[dict],
+    base_kwargs: dict,
+    save_stride: int,
+    Nt_saved: int,
+    Nx: int,
+    Ny: int,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Solve every ``sim_params`` entry and stack decimated trajectories.
 
+    Returns ``(trajectories, t, x, y)`` where ``trajectories`` is
+    ``(num_sims, Nt_saved, Nx, Ny)`` float32 and ``t/x/y`` come from the solver
+    (identical across sims since the grid is shared).
+    """
+    num_sims = len(sim_params)
     trajectories = np.zeros((num_sims, Nt_saved, Nx, Ny), dtype=np.float32)
-
-    # generate all simulations with varying parameters from simulation parameters
+    t = x = y = None
     for i, params in enumerate(sim_params):
         sim = spec.configure_solver(params, base_kwargs)
-
         t, x, y, T_hist = sim.solve(T0=params["T0"], store_trajectory=True)
-
         trajectories[i] = T_hist[::save_stride].astype(np.float32)
+        if verbose:
+            print(f"Finished simulation {i}", flush=True)
+    return trajectories, t, x, y
 
-        print(f"Finished simulation {i}", flush=True)
 
+def save_dataset(
+    save_path: Path | str,
+    x: np.ndarray,
+    y: np.ndarray,
+    t: np.ndarray,
+    save_stride: int,
+    dt: float,
+    t_ramp: float,
+    trajectories: np.ndarray,
+    sim_params: list[dict],
+) -> Path:
+    """Write the standard dataset .npy files and return the save directory."""
     x_grid = x.astype(np.float32)
     y_grid = y.astype(np.float32)
     t_grid = t[::save_stride].astype(np.float32)
 
-    save_path = Path(save_dir) if save_dir is not None else DATA_DIR
+    save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
     np.save(save_path / "x_grid.npy", x_grid)
@@ -190,6 +223,48 @@ def generate_sim_data(
     np.save(save_path / "trajectories.npy", trajectories)
     np.save(save_path / "sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
     print("Saved to:", save_path, x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape, flush=True)
+    return save_path
+
+
+def generate_sim_data(
+    num_sims: int = 2000,
+    save_stride: int = 2,
+    save_dir: Path | str | None = None,
+    benchmark: str | None = None,
+    nx: int = 100,
+    ny: int = 100,
+    ic_families: list[str] | None = None,
+    ramp_seconds: float | None = None,
+) -> None:
+    benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
+    spec = get_problem(benchmark)
+
+    rng = np.random.default_rng(0)
+    rng_profile = np.random.default_rng(1)
+
+    setup = build_base_setup(
+        num_sims=num_sims, save_stride=save_stride, nx=nx, ny=ny,
+        ramp_seconds=ramp_seconds, lhs_seed=0, ic_families=ic_families,
+    )
+
+    print(f"Benchmark: {benchmark}", flush=True)
+    print("Building simulation parameters.", flush=True)
+
+    sim_params = spec.sample_sim_params(
+        rng=rng, rng_profile=rng_profile,
+        grids=setup["grids"], time_cfg=setup["time_cfg"],
+    )
+
+    trajectories, t, x, y = run_solves(
+        spec, sim_params, setup["base_kwargs"], save_stride,
+        setup["Nt_saved"], setup["Nx"], setup["Ny"],
+    )
+
+    save_path = Path(save_dir) if save_dir is not None else DATA_DIR
+    save_dataset(
+        save_path, x, y, t, save_stride, setup["dt"], setup["t_ramp"],
+        trajectories, sim_params,
+    )
 
 def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
     parser = argparse.ArgumentParser(description="Generate FNO training data.")

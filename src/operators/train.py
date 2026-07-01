@@ -797,7 +797,11 @@ class CollocationSampler:
     samples; see ``run_one_seed``).
     """
 
-    def __init__(self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed, base_plan=None):
+    def __init__(
+        self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed, base_plan=None,
+        anchored_first_step=False, early_oversample=False, early_band_steps=5,
+        early_mix=None,
+    ):
         self.ds = ds
         self.spec = spec
         self.geom_cfg = geom_cfg
@@ -810,6 +814,20 @@ class CollocationSampler:
         # conditioning pairs through the spec's collocation hooks instead of the
         # built-in (forcing) random-source / uniform-lead / analytic-closure path.
         self.base_plan = base_plan
+        # ---- causal anchored physics-only knobs (on-grid path only) ----
+        self.anchored_first_step = bool(anchored_first_step)
+        self.early_oversample = bool(early_oversample)
+        self.early_band_steps = int(early_band_steps)
+        self.early_mix = dict(early_mix) if early_mix is not None else {
+            "anchor": 0.4, "early": 0.4, "rest": 0.2,
+        }
+        # Side-channel consumed by _collocation_batch_loss: after an anchored
+        # on-grid draw this holds (mask (B,), T0_exact (B,Nx,Ny)) torch tensors
+        # marking the n==0 rows whose T_n must be overridden with the exact IC;
+        # None on any non-anchored / generic draw. Reset at the top of every
+        # sample_batch / _sample_batch_on_grid call so a stale anchor from a
+        # prior batch can never be reused.
+        self._last_anchor = None
 
     def sample_batch(self, max_lead: float):
         """Sample one collocation batch. Leads are drawn in ``[dt, max_lead]``
@@ -821,6 +839,8 @@ class CollocationSampler:
         if self.base_plan is not None:
             return self._sample_batch_on_grid(max_lead)
 
+        # Generic (forcing) path never anchors; clear any stale side-channel.
+        self._last_anchor = None
         ds = self.ds
         dt = self.dt
         tol = 1e-9
@@ -888,6 +908,43 @@ class CollocationSampler:
         qL_int = torch.from_numpy(np.stack(qLint_list))
         return batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int
 
+    def _early_buckets(self, n_max: int):
+        """Return the (label, lo, hi) inclusive integer ranges over ``[0, n_max]``
+        for the early-time oversampling mixture, dropping empty buckets. Uses the
+        TARGET-time convention: a pair ``n->n+1`` has target ``(n+1)*dt``, so the
+        band ``early_band_steps`` (a target bound) maps to start indices:
+        anchor = {0}, early = {1..min(band-1, n_max)}, rest = {band..n_max}.
+        """
+        band = self.early_band_steps
+        buckets = [("anchor", 0, 0)]
+        early_hi = min(band - 1, n_max)
+        if early_hi >= 1:
+            buckets.append(("early", 1, early_hi))
+        if band <= n_max:
+            buckets.append(("rest", band, n_max))
+        return buckets
+
+    def _draw_n_on_grid(self, n_max: int) -> int:
+        """Draw a start index ``n`` in ``[0, n_max]``. With early oversampling,
+        sample a bucket from ``early_mix`` (renormalized over non-empty buckets)
+        then a uniform ``n`` within it; otherwise uniform over ``[0, n_max]``.
+        """
+        if not self.early_oversample:
+            return int(self.rng.integers(0, n_max + 1))
+        buckets = self._early_buckets(n_max)
+        weights = np.array(
+            [max(float(self.early_mix.get(label, 0.0)), 0.0) for label, _, _ in buckets],
+            dtype=float,
+        )
+        total = weights.sum()
+        if total <= 0.0:  # degenerate mix -> fall back to uniform over buckets
+            weights = np.ones(len(buckets), dtype=float)
+            total = weights.sum()
+        weights = weights / total
+        bi = int(self.rng.choice(len(buckets), p=weights))
+        _, lo, hi = buckets[bi]
+        return int(self.rng.integers(lo, hi + 1))
+
     def _sample_batch_on_grid(self, max_lead: float):
         """Base-plan collocation: pin the base snapshot, draw consecutive on-grid
         conditioning pairs ``(t_s + n*dt, t_s + (n+1)*dt)``, and read the boundary
@@ -895,8 +952,18 @@ class CollocationSampler:
 
         The second prediction is capped at ``max_lead``: ``n`` is drawn in
         ``[0, n_max]`` with ``n_max = min(floor(max_lead/dt) - 1, len(t_grid) - 2)``
-        so ``t_grid[n+1]`` always exists.
+        so ``t_grid[n+1]`` always exists (the ``- 1`` is the target-time off-by-one:
+        a pair ``n->n+1`` has target ``(n+1)*dt``, so a window through
+        ``max_lead`` admits start indices up to ``round(max_lead/dt) - 1``).
+
+        When ``early_oversample`` the draw uses the 3-bucket mixture; when
+        ``anchored_first_step`` the ``n==0`` rows are flagged in
+        ``self._last_anchor`` so the batch loss can hard-inject the exact IC as
+        ``T_n`` on those rows.
         """
+        # Side-channel hygiene: clear before (re)building so a raised exception or
+        # a non-anchored draw never leaves a stale mask behind.
+        self._last_anchor = None
         ds = self.ds
         dt = self.dt
         bp = self.base_plan
@@ -907,9 +974,10 @@ class CollocationSampler:
 
         items_t, items_tdt = [], []
         R_c_list, qLn_list, qLnp1_list, qLint_list = [], [], [], []
+        anchor_flags, T0_list = [], []
         for _ in range(self.batch_size):
             sid = int(self.rng.choice(self.sim_ids))
-            n = int(self.rng.integers(0, n_max + 1))
+            n = self._draw_n_on_grid(n_max)
             t = t_s + n * dt
             t_dt = t + dt
 
@@ -933,6 +1001,8 @@ class CollocationSampler:
             qLn_list.append(np.asarray(qLn, dtype=np.float32))
             qLnp1_list.append(np.asarray(qLnp1, dtype=np.float32))
             qLint_list.append(np.asarray(qLint, dtype=np.float32))
+            anchor_flags.append(bool(self.anchored_first_step and n == 0))
+            T0_list.append(np.asarray(current, dtype=np.float32))
 
         batch_t = collate_fn(items_t)
         batch_tdt = collate_fn(items_tdt)
@@ -940,6 +1010,10 @@ class CollocationSampler:
         qL_n = torch.from_numpy(np.stack(qLn_list))
         qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
         qL_int = torch.from_numpy(np.stack(qLint_list))
+        if self.anchored_first_step:
+            mask = torch.tensor(anchor_flags, dtype=torch.bool)
+            T0_exact = torch.from_numpy(np.stack(T0_list))
+            self._last_anchor = (mask, T0_exact)
         return batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int
 
     def sample_anchor_batch(self):
@@ -969,6 +1043,51 @@ class CollocationSampler:
         batch = collate_fn(items)
         target = torch.from_numpy(np.stack(targets))
         return batch, target
+
+
+def _resolve_causal_stages(cc_cfg, dt: float, t_final: float) -> list[dict]:
+    """Resolve the fixed staged causal curriculum into ``[{epochs, max_lead}]``.
+
+    Each stage carries a cumulative-relative ``epochs`` count (``-1`` = the
+    remainder) and exactly one of ``max_lead_steps`` (int * dt) or
+    ``max_lead_frac`` (fraction of t_final); both express the max TARGET time of
+    the sampled window. Raises if a stage specifies neither or both.
+    """
+    stages = list(cc_cfg.get("stages", []) or [])
+    resolved: list[dict] = []
+    for st in stages:
+        ep = int(st.get("epochs", -1))
+        steps = st.get("max_lead_steps", None)
+        frac = st.get("max_lead_frac", None)
+        if (steps is None) == (frac is None):
+            raise ValueError(
+                "each causal_curriculum stage needs exactly one of "
+                f"max_lead_steps / max_lead_frac; got steps={steps}, frac={frac}."
+            )
+        if steps is not None:
+            lead = float(int(steps)) * float(dt)
+        else:
+            lead = float(frac) * float(t_final)
+        resolved.append({"epochs": ep, "max_lead": lead})
+    if not resolved:
+        raise ValueError("causal_curriculum.enabled but no stages were provided.")
+    return resolved
+
+
+def _causal_max_lead(resolved: list[dict], epoch: int) -> float:
+    """Pick the max lead (target time) for a 0-indexed ``epoch`` from the resolved
+    cumulative stage schedule. A stage with ``epochs < 0`` is the remainder and
+    applies to every epoch at or beyond its start.
+    """
+    cum = 0
+    for st in resolved:
+        ep = int(st["epochs"])
+        if ep < 0:
+            return float(st["max_lead"])
+        cum += ep
+        if epoch < cum:
+            return float(st["max_lead"])
+    return float(resolved[-1]["max_lead"])
 
 
 def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_global,
@@ -1019,9 +1138,20 @@ def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_glob
             "T_right_tilde": (T_right - float(mu_global)) / float(sigma_global),
         }
     pbs = phys_cfg.get("physics_batch_size") or batch_size
+    # The anchor/oversample knobs are only meaningful for the on-grid pair path;
+    # leave them off for the generic (forcing) sampler so that path is unchanged.
+    on_grid = bool(base_plan is not None and base_plan.get("on_grid_pairs", False))
+    anchored = bool(on_grid and phys_cfg.get("anchored_first_step", False))
+    early_os = bool(on_grid and phys_cfg.get("early_time_oversample", False))
+    early_band = int(phys_cfg.get("early_band_steps", 5))
+    early_mix = phys_cfg.get("early_mix", None)
+    if early_mix is not None:
+        early_mix = dict(early_mix)
     return CollocationSampler(
         ds, spec, geom_cfg, batch_size=pbs, dt=dt, rng_seed=rng_seed,
         base_plan=base_plan,
+        anchored_first_step=anchored, early_oversample=early_os,
+        early_band_steps=early_band, early_mix=early_mix,
     )
 
 
@@ -1048,23 +1178,81 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
     yt = _fwd(batch_t)
     ytdt = _fwd(batch_tdt)
 
-    geom = build_cn_geom_batched(
-        sampler.geom_cfg["x_grid"], sampler.geom_cfg["y_grid"],
-        sampler.geom_cfg["k_left"], sampler.geom_cfg["k_right"],
-        sampler.geom_cfg["interface_x"], R_c.to(device),
-        sampler.geom_cfg["dt"], sigma_global=sampler.geom_cfg["sigma_global"],
-        device=device, dtype=yt.dtype,
-    )
-    bc = FullBCData(
-        T_right_tilde=sampler.geom_cfg["T_right_tilde"],
-        qL_n=qL_n.to(device=device, dtype=yt.dtype),
-        qL_np1=qL_np1.to(device=device, dtype=yt.dtype),
-        qL_int=qL_int.to(device=device, dtype=yt.dtype),
-    )
+    # ---- anchored first step: hard-inject the exact IC as T_n on n==0 rows ----
+    # The side-channel is reset to None at the start of every sample_batch call,
+    # so a stale mask can never be reused; getattr keeps the forcing path and the
+    # test stubs (which have no _last_anchor) working.
+    anchor = getattr(sampler, "_last_anchor", None)
+    anchor_mask = None
+    if anchor is not None:
+        mask, T0_exact = anchor
+        if int(mask.shape[0]) != int(yt.shape[0]):
+            raise RuntimeError(
+                f"Anchor metadata batch dim {int(mask.shape[0])} does not match "
+                f"collocation batch dim {int(yt.shape[0])}."
+            )
+        anchor_mask = mask.to(yt.device)
+        m = anchor_mask.view(-1, 1, 1, 1)
+        T0 = T0_exact.to(device=yt.device, dtype=yt.dtype)[..., None]
+        # detach: gradient flows only through model(0->dt) on anchored rows.
+        yt = torch.where(m, T0.detach(), yt)
+
+    def _build_geom_bc(idx=None):
+        rc = R_c if idx is None else R_c[idx]
+        qn = qL_n if idx is None else qL_n[idx]
+        qnp1 = qL_np1 if idx is None else qL_np1[idx]
+        qint = qL_int if idx is None else qL_int[idx]
+        geom = build_cn_geom_batched(
+            sampler.geom_cfg["x_grid"], sampler.geom_cfg["y_grid"],
+            sampler.geom_cfg["k_left"], sampler.geom_cfg["k_right"],
+            sampler.geom_cfg["interface_x"], rc.to(device),
+            sampler.geom_cfg["dt"], sigma_global=sampler.geom_cfg["sigma_global"],
+            device=device, dtype=yt.dtype,
+        )
+        bc = FullBCData(
+            T_right_tilde=sampler.geom_cfg["T_right_tilde"],
+            qL_n=qn.to(device=device, dtype=yt.dtype),
+            qL_np1=qnp1.to(device=device, dtype=yt.dtype),
+            qL_int=qint.to(device=device, dtype=yt.dtype),
+        )
+        return geom, bc
+
+    geom, bc = _build_geom_bc()
     out = full_bc_physics_loss(
         yt, ytdt, geom, bc,
         region_weights=region_weights, dirichlet_both_ends=True,
     )
+
+    # ---- split anchored vs non-anchored weighted residual (diagnostic only) ----
+    # The total physics loss can fall on easy late steady-state pairs while the
+    # T0 -> T_hat(dt) residual stays poor, so log the two subsets separately. The
+    # subset weighted residual is recomputed under no_grad on masked rows (the
+    # residual is flattened over batch+cells, so it cannot be split post-hoc).
+    B = int(yt.shape[0])
+    n_anchor = 0
+    anchor_weighted = None
+    nonanchor_weighted = None
+    if anchor_mask is not None:
+        with torch.no_grad():
+            n_anchor = int(anchor_mask.sum().item())
+            if n_anchor > 0:
+                idx_a = torch.nonzero(anchor_mask, as_tuple=False).view(-1)
+                g_a, bc_a = _build_geom_bc(idx_a.cpu())
+                anchor_weighted = full_bc_physics_loss(
+                    yt[idx_a], ytdt[idx_a], g_a, bc_a,
+                    region_weights=region_weights, dirichlet_both_ends=True,
+                )["physics_loss_weighted"].item()
+            if n_anchor < B:
+                idx_n = torch.nonzero(~anchor_mask, as_tuple=False).view(-1)
+                g_n, bc_n = _build_geom_bc(idx_n.cpu())
+                nonanchor_weighted = full_bc_physics_loss(
+                    yt[idx_n], ytdt[idx_n], g_n, bc_n,
+                    region_weights=region_weights, dirichlet_both_ends=True,
+                )["physics_loss_weighted"].item()
+    out["_anchor_weighted"] = anchor_weighted
+    out["_nonanchor_weighted"] = nonanchor_weighted
+    out["_anchor_count"] = n_anchor
+    out["_nonanchor_count"] = B - n_anchor
 
     ic_loss = None
     if lambda_ic > 0.0:
@@ -1169,6 +1357,24 @@ def train_one_epoch(
     n_phys = 0
     ic_sum = 0.0
     n_ic = 0
+    # Anchored vs non-anchored weighted-residual split (on-grid anchored path).
+    phys_anchor_sum = 0.0
+    phys_nonanchor_sum = 0.0
+    n_anchor = 0
+    n_nonanchor = 0
+
+    def _accum_phys_split(out):
+        nonlocal phys_anchor_sum, phys_nonanchor_sum, n_anchor, n_nonanchor
+        aw = out.get("_anchor_weighted")
+        nw = out.get("_nonanchor_weighted")
+        ac = int(out.get("_anchor_count", 0))
+        nc = int(out.get("_nonanchor_count", 0))
+        if aw is not None and ac > 0:
+            phys_anchor_sum += aw * ac
+            n_anchor += ac
+        if nw is not None and nc > 0:
+            phys_nonanchor_sum += nw * nc
+            n_nonanchor += nc
 
     # Physics-only mode (lambda_data == 0): iterate collocation batches for the
     # same number of optimizer steps as a data epoch. ``train_loader`` is never
@@ -1196,6 +1402,7 @@ def train_one_epoch(
             for _r in phys_region_sums:
                 phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
             n_phys += p_b
+            _accum_phys_split(out)
             if ic is not None:
                 ic_sum += ic.item() * p_b
                 n_ic += p_b
@@ -1229,6 +1436,7 @@ def train_one_epoch(
             for _r in phys_region_sums:
                 phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
             n_phys += p_b
+            _accum_phys_split(out)
             if ic is not None:
                 ic_sum += ic.item() * p_b
                 n_ic += p_b
@@ -1299,7 +1507,8 @@ def train_one_epoch(
              phys_weighted_sum, phys_allcell_sum,
              phys_region_sums["interior"], phys_region_sums["left_neumann"],
              phys_region_sums["right_dirichlet"], phys_region_sums["topbot_adiabatic"],
-             ic_sum, float(n_ic)],
+             ic_sum, float(n_ic),
+             phys_anchor_sum, phys_nonanchor_sum, float(n_anchor), float(n_nonanchor)],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -1326,6 +1535,10 @@ def train_one_epoch(
         phys_region_sums["topbot_adiabatic"] = t[20].item()
         ic_sum = t[21].item()
         n_ic = int(t[22].item())
+        phys_anchor_sum = t[23].item()
+        phys_nonanchor_sum = t[24].item()
+        n_anchor = int(t[25].item())
+        n_nonanchor = int(t[26].item())
 
         m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
@@ -1359,6 +1572,12 @@ def train_one_epoch(
         "phys_right_dirichlet_mse": phys_region_sums["right_dirichlet"] / max(n_phys, 1),
         "phys_topbot_adiabatic_mse": phys_region_sums["topbot_adiabatic"] / max(n_phys, 1),
         "ic_loss": ic_sum / max(n_ic, 1),
+        # Anchored vs non-anchored weighted-residual split (0 when not anchoring).
+        # anchor_loss is the primary training-time signal that the T0 -> T_hat(dt)
+        # residual is actually decreasing (not masked by easy late-step pairs).
+        "train_physics_anchor_loss": phys_anchor_sum / max(n_anchor, 1),
+        "train_physics_nonanchor_loss": phys_nonanchor_sum / max(n_nonanchor, 1),
+        "train_anchor_fraction": n_anchor / max(n_phys, 1),
     }
 
 
@@ -1917,6 +2136,9 @@ def run_one_seed(
     collocation_lead_start = float(phys_cfg.get("collocation_lead_start", 0.01))
     collocation_lead_max = float(phys_cfg.get("collocation_lead_max", 0.01))
     collocation_lead_warmup = int(phys_cfg.get("collocation_lead_warmup_epochs", 0))
+    cc_cfg = phys_cfg.get("causal_curriculum", None) or {}
+    causal_curriculum_enabled = bool(cc_cfg.get("enabled", False))
+    causal_stages = None  # resolved after the sampler pins dt/t_final
     if phys_mode == "collocation" and (lambda_physics > 0.0 or lambda_ic > 0.0):
         physics_region_weights = phys_cfg.get("full_bc_region_weights", None)
         # Source the collocation sims from TRAIN by default so the held-out
@@ -1951,13 +2173,20 @@ def run_one_seed(
         assert set(np.asarray(physics_collocation.sim_ids).tolist()).issubset(
             set(np.asarray(colloc_ds.sim_ids).tolist())
         )
+        if causal_curriculum_enabled:
+            causal_stages = _resolve_causal_stages(
+                cc_cfg, float(physics_collocation.dt), float(colloc_ds.t_final)
+            )
         if is_main:
             print(
                 f"Physics regularizer ON (W2 collocation): lambda_data={lambda_data}, "
                 f"lambda_physics={lambda_physics}, lambda_ic={lambda_ic}, "
                 f"residual=full_bc, source={collocation_source}, "
                 f"lead_start={collocation_lead_start}, lead_max={collocation_lead_max}, "
-                f"lead_warmup={collocation_lead_warmup}",
+                f"lead_warmup={collocation_lead_warmup}, "
+                f"anchored_first_step={bool(physics_collocation.anchored_first_step)}, "
+                f"early_oversample={bool(physics_collocation.early_oversample)}, "
+                f"causal_curriculum={causal_stages if causal_curriculum_enabled else 'off'}",
                 flush=True,
             )
     elif lambda_physics > 0.0:
@@ -1996,6 +2225,8 @@ def run_one_seed(
         "train_physics_loss_weighted", "train_physics_loss_allcell_mean",
         "train_phys_interior_mse", "train_phys_left_neumann_mse",
         "train_phys_right_dirichlet_mse", "train_phys_topbot_adiabatic_mse",
+        "train_physics_anchor_loss", "train_physics_nonanchor_loss",
+        "train_anchor_fraction",
         "train_rel_l2", "train_iface_rel_l2",
         "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
         "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
@@ -2057,18 +2288,24 @@ def run_one_seed(
 
         lr = optimizer.param_groups[0]["lr"]
 
-        # W2 collocation-lead curriculum: ramp the max lead from start to max over
-        # `collocation_lead_warmup` epochs (an optimization-stability device — do
-        # not slam a strong residual onto garbage long-lead outputs early). Inert
-        # when collocation is off.
-        if collocation_lead_warmup > 0:
-            cfrac = min(1.0, (epoch + 1) / collocation_lead_warmup)
+        # W2 collocation-lead curriculum. Two mutually-exclusive schedules:
+        #  - staged causal curriculum (diffusion): fixed stages expand the max
+        #    TARGET time of the sampled window (epoch is 0-indexed; final stage
+        #    with epochs=-1 covers the remainder). Keeps the 0->dt anchor bucket
+        #    active in every stage (its weight lives in early_mix).
+        #  - else the legacy linear ramp from start to max over lead_warmup epochs
+        #    (an optimization-stability device). Inert when collocation is off.
+        if causal_curriculum_enabled and causal_stages is not None:
+            collocation_max_lead = _causal_max_lead(causal_stages, epoch)
         else:
-            cfrac = 1.0
-        collocation_max_lead = (
-            collocation_lead_start
-            + cfrac * (collocation_lead_max - collocation_lead_start)
-        )
+            if collocation_lead_warmup > 0:
+                cfrac = min(1.0, (epoch + 1) / collocation_lead_warmup)
+            else:
+                cfrac = 1.0
+            collocation_max_lead = (
+                collocation_lead_start
+                + cfrac * (collocation_lead_max - collocation_lead_start)
+            )
 
         train_metrics = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
@@ -2229,6 +2466,9 @@ def run_one_seed(
                     "train_phys_left_neumann_mse": float(train_metrics["phys_left_neumann_mse"]),
                     "train_phys_right_dirichlet_mse": float(train_metrics["phys_right_dirichlet_mse"]),
                     "train_phys_topbot_adiabatic_mse": float(train_metrics["phys_topbot_adiabatic_mse"]),
+                    "train_physics_anchor_loss": float(train_metrics["train_physics_anchor_loss"]),
+                    "train_physics_nonanchor_loss": float(train_metrics["train_physics_nonanchor_loss"]),
+                    "train_anchor_fraction": float(train_metrics["train_anchor_fraction"]),
                     "train_rel_l2": float(train_rel_l2),
                     "train_iface_rel_l2": float(train_iface_rel_l2),
                     "train_nrmse": float(train_metrics["nrmse"]),

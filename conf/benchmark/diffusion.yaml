@@ -27,3 +27,16 @@ training:
     # gate is mode==collocation and (lambda_physics>0 or lambda_ic>0)). Set =1.0 on
     # the CLI for any physics/anchor run to break the constant-300 degeneracy.
     lambda_ic: 0.0
+    # ---- causal anchored physics-only training (diffusion collapse fix) ----
+    # These three flags are the structural fix for the constant-300 collapse.
+    # anchored_first_step feeds the exact IC as T_n on the (0->dt) pair so the
+    # only residual-zeroing solution is genuine one-step diffusion of T_0;
+    # early_time_oversample concentrates draws on the first few steps; and the
+    # causal_curriculum grows the sampled-time window in fixed stages. The soft
+    # IC anchor (lambda_ic > 0) is STILL required for any physics run here (set
+    # on the CLI) and is complementary: it pins the isolated model(0->0) query to
+    # T_0 while anchored_first_step connects T_0 to the first future prediction.
+    anchored_first_step: true
+    early_time_oversample: true
+    causal_curriculum:
+      enabled: true

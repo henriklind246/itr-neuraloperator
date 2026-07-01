@@ -285,6 +285,7 @@ class SnapshotPairDataset(Dataset):
         noise_std: float = 0.0,
         dt: float | None = None,
         t_final: float | None = None,
+        time_norm_horizon: float | None = None,
         ramp_seconds: float | None = None,
         temporal_samples: int = TEMPORAL_SAMPLES,
         problem: ProblemSpec | None = None,
@@ -308,6 +309,17 @@ class SnapshotPairDataset(Dataset):
         # consumes a(t) directly through TEMPORAL_BUILDERS, not via dt/tau.
         self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
         self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
+
+        # Trained normalization horizon for temporal model-input features ONLY.
+        # Defaults to the physical horizon so non-OOD behavior is identical; an
+        # OOD time-extrapolation set passes the trained horizon (e.g. 0.30) while
+        # t_final stays the true extended horizon (0.45), so a target past 0.30
+        # yields lead/time features > 1.0. This NEVER drives pair construction,
+        # validity filters, or forcing generation -- those keep reading t_final.
+        self.time_norm_horizon = (
+            float(time_norm_horizon) if time_norm_horizon is not None
+            else self.t_final
+        )
 
         # Physical startup-ramp width for q_L(0)=0. Read from the dataset's stored
         # value when available so the model's forcing conditioning uses the exact
@@ -444,6 +456,145 @@ def long_lead_pairs(dataset: SnapshotPairDataset) -> list[tuple[int, int, int]]:
         for (sim, s, j) in dataset._pairs
         if int(s) == s_first and int(j) == j_last
     ]
+
+
+# ---- OOD time pair protocols -------------------------------------------------
+
+# Names accepted by `build_protocol_pairs`. Each protocol pins a SINGLE
+# source-state definition so a protocol curve never mixes two prediction tasks
+# (aggregation in scripts/inspect_ood.py never pools across differing
+# source_time_actual / lead_time_actual).
+PROTOCOLS = ("fixed_initial", "anchored_from_horizon", "ood_local_fixed_lead")
+
+# Default fixed lead (in physical time units) for `ood_local_fixed_lead`.
+OOD_LOCAL_LEAD = 0.05
+
+
+def _match_snapshot(t_indices: np.ndarray, t_grid: np.ndarray, requested: float,
+                    atol: float) -> tuple[int, float]:
+    """Return the (snapshot index, actual time) in `t_indices` whose `t_grid`
+    value is nearest `requested`, or raise if none lies within `atol`.
+
+    Records both requested and actual at the call site so a snapshot stride that
+    misses a pinned anchor (e.g. exactly 0.30) is caught rather than silently
+    shifting the anchor to a neighbouring snapshot.
+    """
+    times = t_grid[t_indices]
+    k = int(np.argmin(np.abs(times - requested)))
+    actual = float(times[k])
+    if abs(actual - requested) > atol:
+        raise ValueError(
+            f"no snapshot within atol={atol:g} of requested time {requested:g}; "
+            f"nearest is {actual:g}. Check the save stride / target_times."
+        )
+    return int(t_indices[k]), actual
+
+
+def build_protocol_pairs(
+    dataset: SnapshotPairDataset,
+    protocols: list[str],
+    target_times: list[float],
+    *,
+    horizon: float | None = None,
+    local_lead: float = OOD_LOCAL_LEAD,
+    atol: float | None = None,
+) -> list[dict]:
+    """Build OOD time-extrapolation pairs tagged by protocol.
+
+    Generalizes `long_lead_pairs` into the three protocols from the OOD plan,
+    each emitted for every test sim and tagged with its `protocol`,
+    `source_time_*`, `target_time_*`, and `lead_time_actual`:
+
+    - ``fixed_initial``        : source t_s = 0.0, target across all `target_times`
+      (the only protocol that evaluates ID-reference targets).
+    - ``anchored_from_horizon``: source t_s = `horizon`, target over OOD targets
+      (`target_times` strictly above `horizon`).
+    - ``ood_local_fixed_lead`` : source t_s > `horizon`, target t_s + `local_lead`
+      (fixed lead), one pair per eligible source snapshot.
+
+    Times are matched to snapshots by tolerance (`atol`, default a quarter of the
+    snapshot spacing); both requested and realized times are recorded.
+    """
+    horizon = float(dataset.time_norm_horizon if horizon is None else horizon)
+    t_grid = np.asarray(dataset.t_grid)
+    t_indices = np.asarray(dataset.t_indices)
+    if atol is None:
+        times = t_grid[t_indices]
+        spacing = float(np.min(np.diff(times))) if len(times) > 1 else 1.0
+        atol = 0.25 * spacing
+
+    out: list[dict] = []
+    for name in protocols:
+        if name not in PROTOCOLS:
+            raise ValueError(f"unknown protocol {name!r}; expected one of {PROTOCOLS}.")
+
+        if name == "fixed_initial":
+            s_idx, s_act = _match_snapshot(t_indices, t_grid, 0.0, atol)
+            targets = list(target_times)
+        elif name == "anchored_from_horizon":
+            s_idx, s_act = _match_snapshot(t_indices, t_grid, horizon, atol)
+            targets = [t for t in target_times if t > horizon + atol]
+        else:  # ood_local_fixed_lead
+            targets = None  # source-driven; handled below
+
+        if name in ("fixed_initial", "anchored_from_horizon"):
+            for t_req in targets:
+                j_idx, t_act = _match_snapshot(t_indices, t_grid, t_req, atol)
+                if j_idx <= s_idx:
+                    continue
+                lead = t_act - s_act
+                for sim in dataset.sim_ids:
+                    out.append({
+                        "sim_id": int(sim), "s_idx": s_idx, "j_idx": j_idx,
+                        "protocol": name,
+                        "source_time_requested": float(0.0 if name == "fixed_initial" else horizon),
+                        "source_time_actual": s_act,
+                        "target_time_requested": float(t_req),
+                        "target_time_actual": t_act,
+                        "lead_time_actual": float(lead),
+                    })
+        else:
+            times = t_grid[t_indices]
+            for k, t_s in enumerate(times):
+                if t_s <= horizon + atol:
+                    continue
+                t_req = float(t_s) + local_lead
+                try:
+                    j_idx, t_act = _match_snapshot(t_indices, t_grid, t_req, atol)
+                except ValueError:
+                    continue
+                s_idx = int(t_indices[k])
+                if j_idx <= s_idx:
+                    continue
+                lead = t_act - float(t_s)
+                for sim in dataset.sim_ids:
+                    out.append({
+                        "sim_id": int(sim), "s_idx": s_idx, "j_idx": j_idx,
+                        "protocol": name,
+                        "source_time_requested": float(t_s),
+                        "source_time_actual": float(t_s),
+                        "target_time_requested": t_req,
+                        "target_time_actual": t_act,
+                        "lead_time_actual": float(lead),
+                    })
+    return out
+
+
+def apply_protocol_pairs(dataset: SnapshotPairDataset, tagged: list[dict]) -> None:
+    """Install tagged protocol pairs onto `dataset`, replacing `_pairs`.
+
+    Stores the parallel tag list as `dataset._pair_tags` (read by
+    `write_test_records`), keeps `_pairs`/`_lead_times`/`_active_len` consistent
+    with the existing pair machinery, and disables curriculum slicing.
+    """
+    if not tagged:
+        raise ValueError("apply_protocol_pairs: empty pair list.")
+    dataset._pairs = [(t["sim_id"], t["s_idx"], t["j_idx"]) for t in tagged]
+    dataset._lead_times = np.array(
+        [t["lead_time_actual"] for t in tagged], dtype=np.float32
+    )
+    dataset._pair_tags = list(tagged)
+    dataset._active_len = len(dataset._pairs)
 
 
 def one_step_physics_view(dataset: SnapshotPairDataset) -> SnapshotPairDataset:
@@ -591,6 +742,7 @@ def create_dataloaders(
     num_workers: int | None = None,
     dt: float | None = None,
     t_final: float | None = None,
+    time_norm_horizon: float | None = None,
     ramp_seconds: float | None = None,
     temporal_samples: int = TEMPORAL_SAMPLES,
     world_size: int = 1,
@@ -638,6 +790,7 @@ def create_dataloaders(
         noise_std=noise_std,
         dt=dt,
         t_final=t_final,
+        time_norm_horizon=time_norm_horizon,
         ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,
@@ -655,6 +808,7 @@ def create_dataloaders(
         n_snapshots=n_snapshots,
         dt=dt,
         t_final=t_final,
+        time_norm_horizon=time_norm_horizon,
         ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,
@@ -672,6 +826,7 @@ def create_dataloaders(
         n_snapshots=n_test,
         dt=dt,
         t_final=t_final,
+        time_norm_horizon=time_norm_horizon,
         ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims, empty_forcing_seq
 from problems.forcing import (
     FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
@@ -13,8 +14,10 @@ from problems.forcing import (
 )
 from problems.source import (
     SourceProblem,
+    _classify_regime,
     _lhs_unit,
     _patch_center_ranges,
+    _validate_patch_bounds,
 )
 from src.physics.internal_source import (
     RC_MIN,
@@ -107,6 +110,27 @@ def build_cond_vector_itr(
         ],
         dtype=np.float32,
     )
+
+
+def _void_unit_severity(y0: float, sigma: float, y_grid: np.ndarray) -> float:
+    """Integrated unit void shape int exp(-((y - y0)/sigma)^2) dy over `y_grid`.
+
+    Trapezoidal on the actual cell-center grid so the integral matches the
+    discretization the solver sees (a tiny sigma is honestly under-integrated at
+    coarse Ny rather than evaluated against an idealized continuum). The result
+    is strictly positive for sigma > 0, so it is a safe denominator when solving
+    R_amp to hold integrated severity fixed.
+    """
+    y = np.asarray(y_grid, dtype=np.float64)
+    shape = np.exp(-(((y - float(y0)) / float(sigma)) ** 2))
+    return float(np.trapz(shape, y))
+
+
+def _void_severity(
+    R_amp: float, y0: float, sigma: float, y_grid: np.ndarray,
+) -> float:
+    """Integrated void conductance deficit R_amp * int exp(...) dy on `y_grid`."""
+    return float(R_amp) * _void_unit_severity(y0, sigma, y_grid)
 
 
 class SourceItrProblem(SourceProblem):
@@ -287,8 +311,8 @@ class SourceItrProblem(SourceProblem):
 
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
-        t_bar_norm = (t_j_val - t_s_val) / ds.t_final
-        t_s_norm = t_s_val / ds.t_final
+        t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
+        t_s_norm = t_s_val / ds.time_norm_horizon
 
         S_h = self._patch_mask(ds, sid)
         Rc_channel = self._rc_channel(ds, params)
@@ -384,3 +408,188 @@ class SourceItrProblem(SourceProblem):
                     f"sim_params[{int(sid)}] still contains legacy keys "
                     f"{present_legacy}; regenerate with benchmark {self.name!r}."
                 )
+
+    # ---- OOD hooks (W3 out-of-distribution path) ----
+
+    def ood_axes(self) -> dict[str, OODAxis]:
+        base_lo, base_hi = RC_VOID_RANGES["R_base"]
+        amp_lo, amp_hi = RC_VOID_RANGES["R_amp"]
+        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
+        return {
+            "rc_base": OODAxis(
+                name="rc_base",
+                kind="simulation_parameter",
+                id_reference=(0.5,),
+                ood_values=(0.1, 1.25, 1.5, 2.0),
+                field="R_c_base",
+                trained_range=(base_lo, base_hi),
+                notes="void floor R_base; reject < RC_MIN (log-normalized R_c(y) "
+                "channel hits log(0)); R_amp held at the shared background value.",
+            ),
+            "rc_amp": OODAxis(
+                name="rc_amp",
+                kind="simulation_parameter",
+                id_reference=(0.5 * (amp_lo + amp_hi),),
+                ood_values=(0.0, 3.5, 4.0),
+                field="R_c_amp",
+                trained_range=(amp_lo, amp_hi),
+                notes="void depth R_amp; R_base/y0/sigma held at background. "
+                "R_amp=0 is the flat-profile limiting case.",
+            ),
+            "rc_sigma": OODAxis(
+                name="rc_sigma",
+                kind="simulation_parameter",
+                id_reference=(0.5 * (sig_lo + sig_hi),),
+                ood_values=(0.02, 0.30),
+                field="R_c_sigma",
+                trained_range=(sig_lo, sig_hi),
+                resolution_kind="spatial_gaussian_sigma",
+                notes="pure void width study: R_amp re-solved to hold integrated "
+                "severity fixed across sigma; record realized_severity.",
+            ),
+            "rc_y0": OODAxis(
+                name="rc_y0",
+                kind="simulation_parameter",
+                id_reference=(0.5,),
+                ood_values=(0.0, 0.05, 0.95, 1.0),
+                field="R_c_y0",
+                trained_range=(y0_lo, y0_hi),
+                notes="pure void location study: R_amp re-solved to hold "
+                "integrated severity fixed across y0 (edge truncation "
+                "compensated); record realized_severity.",
+            ),
+            "rc_severity": OODAxis(
+                name="rc_severity",
+                kind="compound",
+                id_reference=(0.5,),
+                ood_values=(0.1, 1.0, 1.5),
+                field="R_c_amp",
+                trained_range=(0.0, 1.0),
+                compound=True,
+                notes="severity-fraction of the no-clip headroom "
+                "(R_amp = value * (R_PEAK_MAX - R_base)); value > 1.0 drives the "
+                "profile peak past R_PEAK_MAX (extreme). CRN paired on latents.",
+            ),
+        }
+
+    def draw_latents(
+        self,
+        rng: np.random.Generator,
+        rng_profile: np.random.Generator,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        axis: OODAxis,
+    ) -> dict[str, Any]:
+        # Reuse the parent's patch / amplitude / IC background unchanged (the
+        # void axes never move the patch, so the parent takes its default-patch
+        # branch). Then draw the shared void background from the same IC stream.
+        latents = super().draw_latents(rng, rng_profile, grids, time_cfg, axis)
+
+        base_lo, base_hi = RC_VOID_RANGES["R_base"]
+        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
+
+        u_base = float(rng.uniform(0.0, 1.0))
+        u_amp = float(rng.uniform(0.0, 1.0))
+        u_y0 = float(rng.uniform(0.0, 1.0))
+        u_sigma = float(rng.uniform(0.0, 1.0))
+
+        R_base_bg = base_lo + u_base * (base_hi - base_lo)
+        y0_bg = y0_lo + u_y0 * (y0_hi - y0_lo)
+        sigma_bg = sig_lo + u_sigma * (sig_hi - sig_lo)
+        # Dependent amp bound, identical to sample_sim_params, so the background
+        # void is in-distribution by construction.
+        R_amp_bg = u_amp * (R_PEAK_MAX - R_base_bg)
+
+        latents["y_grid"] = np.asarray(grids["y_grid"], dtype=np.float64)
+        latents["R_base_bg"] = float(R_base_bg)
+        latents["R_amp_bg"] = float(R_amp_bg)
+        latents["y0_bg"] = float(y0_bg)
+        latents["sigma_bg"] = float(sigma_bg)
+        return latents
+
+    def apply_ood_value(
+        self, latents: dict[str, Any], axis: OODAxis, value: Any,
+    ) -> dict[str, Any]:
+        y_grid = latents["y_grid"]
+        R_base_bg = float(latents["R_base_bg"])
+        R_amp_bg = float(latents["R_amp_bg"])
+        y0_bg = float(latents["y0_bg"])
+        sigma_bg = float(latents["sigma_bg"])
+
+        # Default the void to the shared background; each axis overrides exactly
+        # its swept field (severity-preserving axes also re-solve R_amp).
+        R_base, R_amp, y0, sigma = R_base_bg, R_amp_bg, y0_bg, sigma_bg
+
+        if axis.name == "rc_base":
+            if float(value) < RC_MIN:
+                raise ValueError(
+                    f"rc_base value {value} < RC_MIN ({RC_MIN}); the log-normalized "
+                    f"R_c(y) channel is undefined at zero floor. Perfect contact is "
+                    f"a separately labeled limiting-case experiment."
+                )
+            R_base = float(value)
+        elif axis.name == "rc_amp":
+            R_amp = float(value)
+        elif axis.name == "rc_sigma":
+            sigma_ref = float(axis.id_reference[0])
+            S_ref = _void_severity(R_amp_bg, y0_bg, sigma_ref, y_grid)
+            sigma = float(value)
+            R_amp = S_ref / _void_unit_severity(y0_bg, sigma, y_grid)
+        elif axis.name == "rc_y0":
+            y0_ref = float(axis.id_reference[0])
+            S_ref = _void_severity(R_amp_bg, y0_ref, sigma_bg, y_grid)
+            y0 = float(value)
+            R_amp = S_ref / _void_unit_severity(y0, sigma_bg, y_grid)
+        elif axis.name == "rc_severity":
+            R_amp = float(value) * (R_PEAK_MAX - R_base_bg)
+        else:
+            raise ValueError(
+                f"Unknown OOD axis {axis.name!r} for benchmark {self.name!r}."
+            )
+
+        a, b, c, d = latents["domain"]
+        interface_x = float(latents["interface_x"])
+        x_h = float(latents["x_h"])
+        y_h = float(latents["y_h"])
+        w_h = float(latents["w_h_default"])
+        h_h = float(latents["h_h_default"])
+        t_off = float(latents["t_off_default"])
+        _validate_patch_bounds(
+            x_h=x_h, y_h=y_h, w_h=w_h, h_h=h_h, a=a, b=b, c=c, d=d,
+        )
+        regime = _classify_regime(x_h, interface_x, w_h)
+
+        params = {
+            "R_c": float(R_base),
+            "interface_x": interface_x,
+            "x_h": x_h,
+            "y_h": y_h,
+            "w_h": w_h,
+            "h_h": h_h,
+            "A": float(latents["A"]),
+            "t_off": t_off,
+            "regime": regime,
+            "R_c_base": float(R_base),
+            "R_c_amp": float(R_amp),
+            "R_c_y0": float(y0),
+            "R_c_sigma": float(sigma),
+            "T0": np.array(latents["T0"], dtype=np.float32),
+            "ic_family": latents["ic_family"],
+            "ic_params": copy.deepcopy(latents["ic_params"]),
+        }
+        params["_ood_realized"] = {
+            "requested": float(value),
+            "R_c_base": float(R_base),
+            "R_c_amp": float(R_amp),
+            "R_c_y0": float(y0),
+            "R_c_sigma": float(sigma),
+            "realized_severity": _void_severity(R_amp, y0, sigma, y_grid),
+        }
+        return params
+
+    def resolution_scale(self, axis: OODAxis, params: dict) -> float | None:
+        if axis.resolution_kind == "spatial_gaussian_sigma":
+            return float(params["R_c_sigma"])
+        return None

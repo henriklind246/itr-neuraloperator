@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import numpy as np
 
-from problems.base import ProblemDims, ProblemSpec, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
 from problems.forcing import (
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
@@ -426,8 +427,8 @@ class SourceProblem(ProblemSpec):
 
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
-        t_bar_norm = (t_j_val - t_s_val) / ds.t_final
-        t_s_norm = t_s_val / ds.t_final
+        t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
+        t_s_norm = t_s_val / ds.time_norm_horizon
 
         S_h = self._patch_mask(ds, sid)
         spatial_base = np.stack(
@@ -526,3 +527,160 @@ class SourceProblem(ProblemSpec):
             bits.append(f"A={A:.0f}")
         bits.append(regime)
         return " ".join(bits)
+
+    # ---- OOD hooks (W3 out-of-distribution path) ----
+
+    def ood_axes(self) -> dict[str, OODAxis]:
+        return {
+            "rc": OODAxis(
+                name="rc", kind="simulation_parameter", field="R_c",
+                id_reference=(0.5,), ood_values=(0.0, 0.01, 0.025, 1.25, 1.5, 2.0),
+                trained_range=RC_RANGE, resolution_kind="none",
+                notes="scalar interface resistance; same sweep as the forcing "
+                "benchmark. 0.0 is the limiting (perfect-contact) case; values "
+                "above RC_RANGE[1]=1.0 are out-of-distribution.",
+            ),
+            "patch_size": OODAxis(
+                name="patch_size",
+                kind="simulation_parameter",
+                id_reference=(PATCH_W,),
+                ood_values=(0.2,),
+                field="w_h",
+                trained_range=(PATCH_W, PATCH_W),
+                resolution_kind="spatial_patch_edge",
+                notes="square patch domain-fraction; overrides the fixed "
+                "PATCH_W=PATCH_H=0.1 (w_h=value*Lx, h_h=value*Ly)",
+            ),
+            "t_off": OODAxis(
+                name="t_off",
+                kind="simulation_parameter",
+                id_reference=(0.225,),
+                ood_values=(0.075, 0.15, 0.30),
+                field="t_off",
+                trained_range=(0.225, 0.225),
+                notes="heating cutoff in physical seconds; trained value is "
+                "T_OFF_FRAC * t_final = 0.75 * 0.30 = 0.225",
+            ),
+        }
+
+    def draw_latents(
+        self,
+        rng: np.random.Generator,
+        rng_profile: np.random.Generator,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        axis: OODAxis,
+    ) -> dict[str, Any]:
+        x_grid = grids["x_grid"]
+        y_grid = grids["y_grid"]
+        X = grids["X"]
+        a, b = float(x_grid[0]), float(x_grid[-1])
+        c, d = float(y_grid[0]), float(y_grid[-1])
+        Lx, Ly = b - a, d - c
+        interface_x = _scale_fraction(INTERFACE_X, a, b)
+        t_final = float(time_cfg["t_final"])
+
+        w_h_default = PATCH_W * Lx
+        h_h_default = PATCH_H * Ly
+        t_off_default = T_OFF_FRAC * t_final
+
+        # Bound the shared centroid draw by the LARGEST patch in the sweep so the
+        # patch stays in-domain for every value and the centroid is byte-identical
+        # across the sweep (only the swept patch extent / regime changes).
+        if axis.name == "patch_size":
+            max_frac = max(float(v) for v in axis.sweep_values())
+            w_h_bound = max_frac * Lx
+            h_h_bound = max_frac * Ly
+        else:
+            w_h_bound = w_h_default
+            h_h_bound = h_h_default
+
+        (cx_lo, cx_hi), (cy_lo, cy_hi) = _patch_center_ranges(
+            a, b, c, d, w_h_bound, h_h_bound
+        )
+        u_xh = float(rng.uniform(0.0, 1.0))
+        u_yh = float(rng.uniform(0.0, 1.0))
+        x_h = float(cx_lo + u_xh * (cx_hi - cx_lo))
+        y_h = float(cy_lo + u_yh * (cy_hi - cy_lo))
+
+        R_c = float(rng.uniform(*RC_RANGE))
+        A_min, A_max = _patch_a_range()
+        A = float(np.exp(rng.uniform(float(np.log(A_min)), float(np.log(A_max)))))
+
+        return {
+            "domain": (a, b, c, d),
+            "interface_x": interface_x,
+            "R_c": R_c,
+            "A": A,
+            "x_h": x_h,
+            "y_h": y_h,
+            "w_h_default": w_h_default,
+            "h_h_default": h_h_default,
+            "t_off_default": t_off_default,
+            "T0": np.full(X.shape, 300.0, dtype=np.float32),
+            "ic_family": "uniform_2d",
+            "ic_params": {"T0_offset": 0.0},
+        }
+
+    def apply_ood_value(
+        self, latents: dict[str, Any], axis: OODAxis, value: Any,
+    ) -> dict[str, Any]:
+        a, b, c, d = latents["domain"]
+        Lx, Ly = b - a, d - c
+        interface_x = float(latents["interface_x"])
+        x_h = float(latents["x_h"])
+        y_h = float(latents["y_h"])
+
+        R_c = float(latents["R_c"])
+        if axis.name == "patch_size":
+            w_h = float(value) * Lx
+            h_h = float(value) * Ly
+            t_off = float(latents["t_off_default"])
+        elif axis.name == "t_off":
+            w_h = float(latents["w_h_default"])
+            h_h = float(latents["h_h_default"])
+            t_off = float(value)
+        elif axis.name == "rc":
+            w_h = float(latents["w_h_default"])
+            h_h = float(latents["h_h_default"])
+            t_off = float(latents["t_off_default"])
+            R_c = float(value)
+        else:
+            raise ValueError(
+                f"Unknown OOD axis {axis.name!r} for benchmark {self.name!r}."
+            )
+
+        _validate_patch_bounds(
+            x_h=x_h, y_h=y_h, w_h=w_h, h_h=h_h, a=a, b=b, c=c, d=d,
+        )
+        regime = _classify_regime(x_h, interface_x, w_h)
+
+        params = {
+            "R_c": R_c,
+            "interface_x": interface_x,
+            "x_h": x_h,
+            "y_h": y_h,
+            "w_h": w_h,
+            "h_h": h_h,
+            "A": float(latents["A"]),
+            "t_off": t_off,
+            "regime": regime,
+            "T0": np.array(latents["T0"], dtype=np.float32),
+            "ic_family": latents["ic_family"],
+            "ic_params": copy.deepcopy(latents["ic_params"]),
+        }
+        params["_ood_realized"] = {
+            "requested": float(value),
+            "w_h": w_h,
+            "h_h": h_h,
+            "x_h": x_h,
+            "y_h": y_h,
+            "x_extent": (x_h - 0.5 * w_h, x_h + 0.5 * w_h),
+            "y_extent": (y_h - 0.5 * h_h, y_h + 0.5 * h_h),
+        }
+        return params
+
+    def resolution_scale(self, axis: OODAxis, params: dict) -> float | None:
+        if axis.resolution_kind == "spatial_patch_edge":
+            return float(params["w_h"])
+        return None

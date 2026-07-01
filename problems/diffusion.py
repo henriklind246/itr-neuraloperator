@@ -152,8 +152,8 @@ class DiffusionProblem(ProblemSpec):
 
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
-        t_bar_norm = (t_j_val - t_s_val) / ds.t_final
-        t_s_norm = t_s_val / ds.t_final
+        t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
+        t_s_norm = t_s_val / ds.time_norm_horizon
 
         ones = np.ones((ds.Nx, ds.Ny), dtype=np.float32)
         spatial = np.stack(

@@ -2,6 +2,8 @@ import torch
 from data.dataset import (
     TEMPORAL_SAMPLES,
     T_EPS,
+    apply_protocol_pairs,
+    build_protocol_pairs,
     compute_global_stats,
     create_dataloaders,
     load_ramp_seconds,
@@ -77,7 +79,16 @@ class _RamTestTrajectories:
         return self._cache[int(key)]
 
 
-def build_test_loader(config, mu_global=None, sigma_global=None, long_lead_only=False):
+def build_test_loader(
+    config,
+    mu_global=None,
+    sigma_global=None,
+    long_lead_only=False,
+    eval_all_sims=False,
+    time_norm_horizon=None,
+    target_times=None,
+    protocols=None,
+):
     import numpy as np
 
     trajectories, x_grid, y_grid, t_grid = load_sim_data(
@@ -91,6 +102,11 @@ def build_test_loader(config, mu_global=None, sigma_global=None, long_lead_only=
     ramp_seconds = load_ramp_seconds(config["data"]["t_grid_path"])
 
     train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
+
+    # OOD: evaluate every simulation in the (redirected) dataset, not the 15%
+    # held-out slice. mu/sigma still come from the trained checkpoint's stats.
+    if eval_all_sims:
+        test_ids = np.arange(int(trajectories.shape[0]))
 
     # Use provided global stats or recompute from training set
     if mu_global is None or sigma_global is None:
@@ -106,15 +122,26 @@ def build_test_loader(config, mu_global=None, sigma_global=None, long_lead_only=
         n_snapshots=10,
         n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
         dt=solver_dt,
+        time_norm_horizon=time_norm_horizon,
         ramp_seconds=ramp_seconds,
         num_workers=0,
         temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
         problem=problem_from_config(config),
     )
 
+    # OOD time protocols take precedence over long_lead_only: install the tagged
+    # fixed_initial / anchored_from_horizon / ood_local_fixed_lead pairs.
+    if protocols:
+        test_ds = testing_set.dataset
+        if target_times is None:
+            raise ValueError("protocols set but target_times is None.")
+        tagged = build_protocol_pairs(
+            test_ds, list(protocols), list(target_times),
+        )
+        apply_protocol_pairs(test_ds, tagged)
     # Restrict to full-span pairs (source t=0 -> target t_final) so eval measures
     # only the hardest, maximum-lead prediction (one pair per test sim).
-    if long_lead_only:
+    elif long_lead_only:
         test_ds = testing_set.dataset
         pairs = long_lead_pairs(test_ds)
         if not pairs:
@@ -440,6 +467,10 @@ def eval_all_seeds(
     rollout_num_substeps: int | None = None,
     rollout_partition: str | None = None,
     long_lead_only: bool = False,
+    eval_all_sims: bool = False,
+    time_norm_horizon: float | None = None,
+    target_times: list[float] | None = None,
+    protocols: list[str] | None = None,
 ):
     run_root = Path(run_root)
     results = []
@@ -482,6 +513,10 @@ def eval_all_seeds(
             mu_global=ckpt.get("mu_global"),
             sigma_global=ckpt.get("sigma_global"),
             long_lead_only=long_lead_only,
+            eval_all_sims=eval_all_sims,
+            time_norm_horizon=time_norm_horizon,
+            target_times=target_times,
+            protocols=protocols,
         )
 
         loss_cfg = config.get("training", {}).get("loss", {})
@@ -565,6 +600,11 @@ def eval_all_seeds(
                 "rollout_num_substeps": int(rollout_options.num_substeps),
                 "rollout_partition": rollout_options.partition,
                 "long_lead_only": bool(long_lead_only),
+                "eval_all_sims": bool(eval_all_sims),
+                "time_norm_horizon": (
+                    float(time_norm_horizon) if time_norm_horizon is not None else None
+                ),
+                "protocols": list(protocols) if protocols else None,
                 "ckpt": str(ckpt_path),
             }
         )
@@ -719,7 +759,61 @@ TEST_RECORD_FIELDS = [
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
     "nrmse_pct", "rmse_K", "gnrmse_pct",
     "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
+    # OOD identity (joined from ood_metadata.jsonl by sim_id; in-distribution
+    # defaults when the sidecar is absent).
+    "ood_axis", "ood_value", "ood_repeat", "latents_hash", "distribution_class",
+    # Time-pair protocol tagging (from dataset._pair_tags; empty without protocols).
+    "protocol",
+    "source_time_requested", "source_time_actual", "lead_time_actual",
+    "target_time_requested", "target_time_actual",
+    "dataset_t_final", "time_norm_horizon",
+    # Pooled sufficient statistics (physical K^2) so the aggregator reconstructs
+    # RMSE_sim and pooled rel-L2 without re-reading trajectories.
+    "sse_K2", "num_error_cells",
+    "interface_sse_K2", "num_interface_cells",
+    "target_sse_K2", "interface_target_sse_K2",
 ]
+
+# In-distribution defaults for the OOD identity columns when no sidecar exists.
+_OOD_RECORD_DEFAULT = {
+    "ood_axis": "",
+    "ood_value": "",
+    "ood_repeat": "",
+    "latents_hash": "",
+    "distribution_class": "in_distribution",
+}
+
+
+def _load_ood_sidecar(data_dir: Path | None) -> dict[int, dict]:
+    """Return {sim_id: ood record} from ``ood_metadata.jsonl`` under `data_dir`.
+
+    Absent file (legacy datasets) yields an empty map, so the caller falls back
+    to the in-distribution defaults and existing eval behavior is unchanged.
+    """
+    if data_dir is None:
+        return {}
+    path = Path(data_dir) / "ood_metadata.jsonl"
+    if not path.exists():
+        return {}
+    out: dict[int, dict] = {}
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            out[int(rec["sim_id"])] = rec
+    return out
+
+
+def _classify_time_target(target_actual: float, horizon: float) -> str:
+    """4-level class for an evaluation-time target vs the trained horizon."""
+    atol = 1e-9
+    if abs(target_actual - horizon) <= atol:
+        return "boundary"
+    if target_actual < horizon:
+        return "in_distribution"
+    return "out_of_distribution"
 
 
 def _select_seed_checkpoint(run_root: Path, seed=None):
@@ -773,6 +867,10 @@ def write_test_records(
     rollout_enabled: bool | None = None,
     rollout_num_substeps: int | None = None,
     rollout_partition: str | None = None,
+    eval_all_sims: bool = False,
+    time_norm_horizon: float | None = None,
+    target_times: list[float] | None = None,
+    protocols: list[str] | None = None,
 ) -> Path:
     """Write one per-(sim_id, s, j) test-pair record row for paper figures.
 
@@ -805,12 +903,26 @@ def write_test_records(
         config["data"]["t_grid_path"] = str(data_dir_path / "t_grid.npy")
         config["data"]["sim_params_path"] = str(data_dir_path / "sim_params.npy")
 
+    # OOD identity sidecar lives beside the trajectories (data_dir override or the
+    # checkpoint-baked dataset). Absent file -> in-distribution defaults below.
+    sidecar_dir = Path(data_dir) if data_dir is not None else Path(
+        config["data"]["trajectories.npy"]
+    ).parent
+    ood_sidecar = _load_ood_sidecar(sidecar_dir)
+
     test_loader, x_grid, y_grid, _num_sims = build_test_loader(
         config,
         mu_global=ckpt.get("mu_global"),
         sigma_global=ckpt.get("sigma_global"),
+        eval_all_sims=eval_all_sims,
+        time_norm_horizon=time_norm_horizon,
+        target_times=target_times,
+        protocols=protocols,
     )
     dataset = test_loader.dataset
+    pair_tags = getattr(dataset, "_pair_tags", None)
+    ds_t_final = float(dataset.t_final)
+    ds_norm_horizon = float(getattr(dataset, "time_norm_horizon", dataset.t_final))
     problem = problem_from_config(config)
     benchmark = problem.name
     dims = problem.dims
@@ -890,7 +1002,23 @@ def write_test_records(
 
             params = dataset.sim_params[sim_id]
             interface_x = float(params.get("interface_x", 0.5))
-            iface_rel_l2 = compute_interface_rel_l2(y_pred, y_true, _mask_for(interface_x))
+            iface_mask = _mask_for(interface_x)
+            iface_rel_l2 = compute_interface_rel_l2(y_pred, y_true, iface_mask)
+
+            # Pooled sufficient statistics in physical K^2. y_* are normalized, so
+            # multiplying both the error and target sums by sigma^2 keeps the
+            # pooled rel-L2 ratio identical to the normalized-space rel_l2_pct
+            # (sigma^2 cancels) while rmse_K pools coherently.
+            sigma_sq = sigma_global * sigma_global
+            diff = y_pred - y_true
+            sse_K2 = float(torch.sum(diff ** 2).item()) * sigma_sq
+            num_error_cells = int(y_true.numel())
+            target_sse_K2 = float(torch.sum(y_true ** 2).item()) * sigma_sq
+            pred_iface = y_pred[:, iface_mask, :]
+            true_iface = y_true[:, iface_mask, :]
+            interface_sse_K2 = float(torch.sum((pred_iface - true_iface) ** 2).item()) * sigma_sq
+            num_interface_cells = int(true_iface.numel())
+            interface_target_sse_K2 = float(torch.sum(true_iface ** 2).item()) * sigma_sq
 
             rms_i = per_sample_sq_rms(y_pred, y_true)
             nrmse_pct = float(per_sample_nrmse(y_pred, y_true).item()) * 100.0
@@ -907,6 +1035,54 @@ def write_test_records(
             t_s_val = float(dataset.t_grid[s])
             t_j_val = float(dataset.t_grid[j])
             A, freq = _amp_freq_from_params(params)
+
+            # OOD identity: sidecar record joined by sim_id, in-distribution
+            # defaults otherwise.
+            rec = ood_sidecar.get(sim_id)
+            if rec is None:
+                ood_axis = _OOD_RECORD_DEFAULT["ood_axis"]
+                ood_value = _OOD_RECORD_DEFAULT["ood_value"]
+                ood_repeat = _OOD_RECORD_DEFAULT["ood_repeat"]
+                latents_hash = _OOD_RECORD_DEFAULT["latents_hash"]
+                distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
+                rec_t_final = ds_t_final
+                rec_norm_horizon = ds_norm_horizon
+            else:
+                ood_axis = rec.get("ood_axis", "")
+                ood_value = rec.get("ood_value")
+                ood_value = "" if ood_value is None else ood_value
+                ood_repeat = rec.get("ood_repeat", "")
+                latents_hash = rec.get("latents_hash", "")
+                distribution_class = rec.get("distribution_class")
+                rec_t_final = float(rec.get("dataset_t_final", ds_t_final))
+                rec_norm_horizon = float(rec.get("time_norm_horizon", ds_norm_horizon))
+
+            # Protocol tag (set by apply_protocol_pairs); empty without protocols.
+            tag = pair_tags[idx] if pair_tags is not None else None
+            if tag is None:
+                protocol = ""
+                src_time_req = ""
+                src_time_act = ""
+                lead_time_act = ""
+                tgt_time_req = ""
+                tgt_time_act = ""
+            else:
+                protocol = tag["protocol"]
+                src_time_req = float(tag["source_time_requested"])
+                src_time_act = float(tag["source_time_actual"])
+                lead_time_act = float(tag["lead_time_actual"])
+                tgt_time_req = float(tag["target_time_requested"])
+                tgt_time_act = float(tag["target_time_actual"])
+                # Evaluation-time axis: the sidecar leaves ood_value null per sim;
+                # the realized target time is the OOD value, classified vs horizon.
+                if ood_value == "" and rec is not None:
+                    ood_value = tgt_time_act
+                if distribution_class is None:
+                    distribution_class = _classify_time_target(
+                        tgt_time_act, rec_norm_horizon
+                    )
+            if distribution_class is None:
+                distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
 
             rows.append({
                 "sim_id": sim_id,
@@ -935,6 +1111,25 @@ def write_test_records(
                 "node_jump_rmse_K": node_jump_rmse_K,
                 "node_jump_nrmse_pct": node_jump_nrmse_pct,
                 "node_jump_gnrmse_pct": node_jump_gnrmse_pct,
+                "ood_axis": ood_axis,
+                "ood_value": ood_value,
+                "ood_repeat": ood_repeat,
+                "latents_hash": latents_hash,
+                "distribution_class": distribution_class,
+                "protocol": protocol,
+                "source_time_requested": src_time_req,
+                "source_time_actual": src_time_act,
+                "lead_time_actual": lead_time_act,
+                "target_time_requested": tgt_time_req,
+                "target_time_actual": tgt_time_act,
+                "dataset_t_final": rec_t_final,
+                "time_norm_horizon": rec_norm_horizon,
+                "sse_K2": sse_K2,
+                "num_error_cells": num_error_cells,
+                "interface_sse_K2": interface_sse_K2,
+                "num_interface_cells": num_interface_cells,
+                "target_sse_K2": target_sse_K2,
+                "interface_target_sse_K2": interface_target_sse_K2,
             })
 
     rows.sort(key=lambda r: (r["sim_id"], r["s"], r["j"]))
