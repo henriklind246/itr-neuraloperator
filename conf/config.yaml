@@ -121,6 +121,43 @@ training:
     collocation_lead_start: 0.01
     collocation_lead_max: 0.01
     collocation_lead_warmup_epochs: 0
+    # ---- causal anchored physics-only knobs (diffusion collapse fix) ----
+    # All default OFF so forcing/source/interfaces on-grid and generic
+    # collocation paths stay byte-identical. Enabled only in the diffusion
+    # benchmark group. Semantics use TARGET time: a collocation pair n->n+1 has
+    # target (n+1)*dt, so a window "through max_target" maps to start indices
+    # n in [0, max_start_step] with max_start_step = round(max_target/dt) - 1.
+    #
+    # anchored_first_step: on the (0->dt) pair, replace the model's T_n with the
+    # EXACT normalized IC field (detached) so the residual can only be zeroed by
+    # a genuine one-step diffusion of T_0 (breaks the constant-300 collapse).
+    anchored_first_step: false
+    # early_time_oversample: draw n from a 3-bucket mixture over [0, n_max]
+    # instead of uniform, concentrating draws on the first few steps.
+    early_time_oversample: false
+    # early_band_steps: TARGET-time bound of the "first few steps" band in units
+    # of dt. The early bucket covers targets 2*dt..early_band_steps*dt, i.e.
+    # start indices n in {1..early_band_steps-1}.
+    early_band_steps: 5
+    # early_mix: bucket weights for the mixture (anchor={0}, early={1..band-1},
+    # rest={band..n_max}); renormalized over non-empty buckets.
+    early_mix:
+      anchor: 0.4
+      early: 0.4
+      rest: 0.2
+    # causal_curriculum: fixed staged expansion of the sampled-time window.
+    # Each stage has `epochs` (cumulative; final -1 = remainder) and exactly one
+    # of `max_lead_steps` (int * dt) or `max_lead_frac` (fraction of t_final),
+    # both expressing the max TARGET time of the window.
+    causal_curriculum:
+      enabled: false
+      stages:
+        - epochs: 20
+          max_lead_steps: 5
+        - epochs: 20
+          max_lead_frac: 0.25
+        - epochs: -1
+          max_lead_frac: 1.0
     # full_bc per-region weights (default region-equal: each REGION contributes
     # equally, deliberately giving the few-celled boundary rows more influence
     # than a global mean(r_ij^2) would). Used only when residual=full_bc.
