@@ -1,0 +1,22 @@
+# OOD suite descriptor for the time-extrapolation axis (interfaces benchmark).
+#
+# See conf/ood/forcing_time.yaml for the schema. The `time` axis is fully
+# benchmark-generic: the generator calls the benchmark's own
+# `sample_sim_params` to draw ONE in-distribution trajectory per repeat solved
+# to dataset_t_final (varying IC and interface_x as trained), then the eval
+# stage expands it into target-time buckets. The dataset keeps the true physical
+# horizon (0.45); the trained normalization horizon (0.30) is threaded ONLY into
+# the temporal model-input features, so any target past 0.30 yields lead/time
+# features > 1.0. Run against the same trained run_root as the in-distribution
+# checkpoint.
+
+benchmark: interfaces
+representation: temporal_encoder
+repeats: 4
+
+axes:
+  - name: time
+    dataset_t_final: 0.45
+    time_norm_horizon: 0.30
+    target_times: [0.25, 0.30, 0.35, 0.40, 0.45]
+    protocols: [fixed_initial, anchored_from_horizon, ood_local_fixed_lead]

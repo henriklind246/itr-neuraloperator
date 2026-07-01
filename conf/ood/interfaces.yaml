@@ -1,0 +1,13 @@
+# OOD suite descriptor for the `interfaces` benchmark (swept interface_x).
+# See conf/ood/forcing.yaml for the schema. Axes default to the sweeps declared
+# in problems/interfaces.py: ood_axes. `family_transfer` is a compound axis; its
+# CRN pairing is verified by the per-repeat latents_hash, not byte-equal params.
+
+benchmark: interfaces
+representation: temporal_encoder
+repeats: 4
+
+axes:
+  - name: rc                # scalar interface R_c; same sweep as forcing (0.0..2.0)
+  - name: interface_x       # trained [0.2, 0.8]; 0.1/0.9 are out-of-distribution
+  - name: family_transfer   # sin/uniform -> {exp/uniform, sin/patch, exp/patch}

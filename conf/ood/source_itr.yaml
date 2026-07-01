@@ -1,0 +1,17 @@
+# OOD suite descriptor for the `source_itr` benchmark (Gaussian-void interface
+# resistance R_c(y)). See conf/ood/forcing.yaml for the schema. Values default to
+# the axis declaration in problems/source_itr.py: ood_axes. rc_base rejects any
+# value < RC_MIN (log-normalized R_c(y) channel); rc_severity is a compound axis
+# whose CRN pairing is verified by latents_hash, not byte-equal params.
+
+benchmark: source_itr
+representation: temporal_encoder
+repeats: 4
+
+axes:
+  - name: rc_base
+  - name: rc_amp
+  - name: rc_sigma
+    refine: {nx: 200, ny: 200, dt_factor: 1}   # sigma=0.02 -> ~2 cells/sigma
+  - name: rc_y0
+  - name: rc_severity

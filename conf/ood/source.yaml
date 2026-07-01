@@ -1,0 +1,12 @@
+# OOD suite descriptor for the `source` benchmark (internal volumetric patch).
+# See conf/ood/forcing.yaml for the schema. Axes default to the sweeps declared
+# in problems/source.py: ood_axes.
+
+benchmark: source
+representation: temporal_encoder
+repeats: 4
+
+axes:
+  - name: rc              # scalar interface R_c; same sweep as forcing (0.0..2.0)
+  - name: patch_size      # override fixed w_h=h_h=0.1 -> 0.2 (~10 cells, ok)
+  - name: t_off           # source switch-off time; outside the trained 0.225

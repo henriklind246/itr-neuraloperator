@@ -1,0 +1,28 @@
+# OOD suite descriptor for the `forcing` benchmark.
+#
+# Consumed by scripts/run_ood_suite.py (plain yaml.safe_load, NOT a Hydra config
+# group). Each axis is generated into its own dataset dir, evaluated all-sims
+# against a trained run, and aggregated by scripts/inspect_ood.py. Values default
+# to the axis's declared sweep (problems/forcing.py: ood_axes); list them here
+# only to override. `refine` opts an axis into the convergence pass: regenerate
+# the SAME CRN params on the refined grid (dt_factor halves dt and doubles the
+# saved stride internally) and report the solver self-difference.
+
+benchmark: forcing
+representation: temporal_encoder
+repeats: 4
+
+axes:
+  - name: rc
+  - name: sin_freq
+    refine: {nx: 200, ny: 200, dt_factor: 2}   # f=40 -> ~5 steps/period
+  - name: sin_amp
+  - name: pulse_count
+  - name: fast_timescale
+    refine: {nx: 200, ny: 200, dt_factor: 2}   # tau=0.01 -> ~2 steps
+  - name: slow_decay
+  - name: patch_width
+  - name: gaussian_sigma_y
+    refine: {nx: 200, ny: 200, dt_factor: 1}   # sigma=0.015 -> ~1.5 cells/sigma
+  - name: triangle_ell
+    refine: {nx: 200, ny: 200, dt_factor: 1}   # ell=0.025 -> ~2.5 cells
