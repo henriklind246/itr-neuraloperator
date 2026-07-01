@@ -328,15 +328,35 @@ class TestInterfacesSchema:
         ds = interfaces_dataset
         get_problem("interfaces").validate_schema(ds.sim_params, ds.sim_ids)
 
-    def test_rejects_non_sin(self):
+    def test_admits_family_transfer_families(self):
+        # The family_transfer OOD axis drives exp/patch, so the schema now
+        # admits the {sin,exp} x {uniform,patch} grid (not sin/uniform only).
         spec = get_problem("interfaces")
-        bad = np.array([{
+        for tf, sf in [("sin", "uniform"), ("exp", "uniform"),
+                       ("sin", "patch"), ("exp", "patch")]:
+            ok = np.array([{
+                "R_c": 0.5, "interface_x": 0.5,
+                "temporal_family": tf, "temporal_params": {},
+                "spatial_family": sf, "spatial_params": {},
+            }], dtype=object)
+            spec.validate_schema(ok, np.array([0]))
+
+    def test_rejects_out_of_set_families(self):
+        spec = get_problem("interfaces")
+        bad_temporal = np.array([{
             "R_c": 0.5, "interface_x": 0.5,
-            "temporal_family": "exp", "temporal_params": {},
+            "temporal_family": "pulse_train", "temporal_params": {},
             "spatial_family": "uniform", "spatial_params": {},
         }], dtype=object)
-        with pytest.raises(ValueError, match="sin-only"):
-            spec.validate_schema(bad, np.array([0]))
+        with pytest.raises(ValueError, match="admits only"):
+            spec.validate_schema(bad_temporal, np.array([0]))
+        bad_spatial = np.array([{
+            "R_c": 0.5, "interface_x": 0.5,
+            "temporal_family": "sin", "temporal_params": {},
+            "spatial_family": "gaussian", "spatial_params": {},
+        }], dtype=object)
+        with pytest.raises(ValueError, match="admits only"):
+            spec.validate_schema(bad_spatial, np.array([0]))
 
     def test_rejects_missing_interface_x(self):
         spec = get_problem("interfaces")
@@ -951,3 +971,66 @@ class TestValPairRow:
         from problems.base import ProblemSpec
 
         assert ProblemSpec.val_pair_fields == ()
+
+
+# OOD-axis contract: the exact set of axes each benchmark declares plus each
+# axis's kind. Mirrors the plan's OOD axis catalog; the per-axis coherence test
+# below enforces the shared invariants (CRN-paired sweep ordering, kind/compound
+# agreement, evaluation-parameter axes carry no sim field).
+OOD_AXIS_CONTRACTS = {
+    "forcing": {
+        "rc": "simulation_parameter",
+        "sin_freq": "simulation_parameter",
+        "sin_amp": "simulation_parameter",
+        "pulse_count": "simulation_parameter",
+        "fast_timescale": "simulation_parameter",
+        "slow_decay": "simulation_parameter",
+        "patch_width": "simulation_parameter",
+        "gaussian_sigma_y": "simulation_parameter",
+        "triangle_ell": "simulation_parameter",
+    },
+    "source": {
+        "rc": "simulation_parameter",
+        "patch_size": "simulation_parameter",
+        "t_off": "simulation_parameter",
+    },
+    "source_itr": {
+        "rc_base": "simulation_parameter",
+        "rc_amp": "simulation_parameter",
+        "rc_sigma": "simulation_parameter",
+        "rc_y0": "simulation_parameter",
+        "rc_severity": "compound",
+    },
+    "interfaces": {
+        "rc": "simulation_parameter",
+        "interface_x": "simulation_parameter",
+        "family_transfer": "compound",
+    },
+    "diffusion": {},
+}
+
+
+class TestOODAxisContract:
+    @pytest.mark.parametrize("benchmark", sorted(OOD_AXIS_CONTRACTS))
+    def test_declared_axes_match_contract(self, benchmark):
+        spec = get_problem(benchmark, "temporal_encoder")
+        axes = spec.ood_axes()
+        expected = OOD_AXIS_CONTRACTS[benchmark]
+        assert set(axes) == set(expected)
+        for name, kind in expected.items():
+            assert axes[name].kind == kind
+
+    @pytest.mark.parametrize("benchmark", sorted(OOD_AXIS_CONTRACTS))
+    def test_axis_invariants(self, benchmark):
+        spec = get_problem(benchmark, "temporal_encoder")
+        for name, axis in spec.ood_axes().items():
+            assert axis.name == name
+            # `compound` flag and `kind` must agree.
+            assert axis.compound == (axis.kind == "compound")
+            # Sweep leads with the in-distribution reference(s).
+            assert axis.sweep_values()[: len(axis.id_reference)] == tuple(axis.id_reference)
+            assert len(axis.ood_values) >= 1
+            if axis.kind == "evaluation_parameter":
+                # The time axis carries no sim-param field.
+                assert axis.field is None
+            assert 0.0 < axis.time_norm_horizon <= axis.dataset_t_final

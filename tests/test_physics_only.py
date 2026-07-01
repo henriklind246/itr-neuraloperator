@@ -369,6 +369,7 @@ class _StubDiffDS:
         self.Nx, self.Ny = Nx, Ny
         self.t_grid = np.arange(n_t, dtype=float) * dt
         self.t_final = float(self.t_grid[-1])
+        self.time_norm_horizon = self.t_final
         self.noise_std = 0.0
         self.mu_global = 300.0
         self.sigma_global = 10.0
@@ -460,3 +461,285 @@ def test_on_grid_dt_pinning_rejects_real_nonuniform():
         train_mod._build_collocation_sampler(
             {}, {"dt": 0.005}, ds, spec, 300.0, 10.0, batch_size=4, rng_seed=0,
         )
+
+
+# --- 11. causal anchored physics-only training (constant-300 collapse fix) ---
+#
+# These gate the structural fix for the diffusion collapse: (a) the anchored
+# first step (feed the EXACT IC as T_n so only genuine one-step diffusion zeros
+# the residual), (b) the collapse the anchor penalizes, and (c) the early-time
+# oversampling mixture / anchor side-channel. All residual math is float64 with
+# the direct-solve floor convention from `test_full_bc_residual_zero_on_...`.
+
+
+def _homogeneous_ic_hist_geom(dt=0.005, t_final=0.1, Nx=40, Ny=40):
+    """Homogeneous force-free sim seeded with a non-uniform Gaussian IC, its FV
+    trajectory, and the matching float64 CN geom. Reused by the anchored-first-
+    step floor test and the collapse test so the collapse residual is compared
+    against the SAME solver-state floor (not an absolute number)."""
+    sim = _build_homogeneous_solver(dt=dt, t_final=t_final, Nx=Nx, Ny=Ny)
+    X, Y = np.meshgrid(sim.grid_x, sim.grid_y, indexing="ij")
+    T0 = (300.0 + 40.0 * np.exp(-((X - 0.4) ** 2 + (Y - 0.5) ** 2) / 0.02)).astype(np.float64)
+    _, _, _, T_hist = sim.solve(T0=T0, store_trajectory=True)
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=K_SLAB, k_right=K_SLAB, interface_x=0.5, R_c=0.0,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    return sim, T0, T_hist, geom
+
+
+def _solver_state_bc(sim, n):
+    """FullBCData for the (n -> n+1) solver step (raw K, sigma_global == 1)."""
+    tnp1 = float(sim.t[n + 1])
+    return FullBCData(
+        T_right_tilde=torch.as_tensor(float(sim.T_right(tnp1)), dtype=torch.float64),
+        qL_n=torch.as_tensor(sim.q_left(float(sim.t[n])), dtype=torch.float64),
+        qL_np1=torch.as_tensor(sim.q_left(tnp1), dtype=torch.float64),
+    )
+
+
+def test_anchored_first_step_solver_state_residual_zero():
+    """The anchored first step target: feeding the EXACT IC (T_hist[0]) as T_n and
+    the true one-step FV evolution (T_hist[1]) as T_np1 gives a full_bc residual at
+    the direct-solve floor in EVERY region. This is the n==0 solver-state residual
+    the hard IC injection reproduces — the only residual-zeroing T_np1 is genuine
+    one-step diffusion of T_0, not the constant-300 collapse."""
+    sim, _, T_hist, geom = _homogeneous_ic_hist_geom()
+    T_n = torch.as_tensor(T_hist[0], dtype=torch.float64)
+    T_np1 = torch.as_tensor(T_hist[1], dtype=torch.float64)
+    parts = full_bc_cn_residual(T_n, T_np1, geom, _solver_state_bc(sim, 0))
+    for name, vec in parts.items():
+        assert float(vec.abs().max()) < 1e-6, (
+            f"anchored first-step region {name} residual floor too high: "
+            f"{float(vec.abs().max()):.3e}"
+        )
+
+
+def test_steady_state_residual_zero():
+    """The uniform-300 K field (normalized to 0 with mu==300) for BOTH T_n and
+    T_np1, with T_right_tilde == 0 and zero left flux, gives ~0 residual in every
+    region: constant 300 K satisfies the homogeneous PDE and every BC. This is the
+    degeneracy the anchored first step exists to escape (a residual-only objective
+    is minimized here)."""
+    Nx, Ny = 30, 24
+    x_grid = np.linspace(0.0, 1.0, Nx)
+    y_grid = np.linspace(0.0, 1.0, Ny)
+    mu, sigma = 300.0, 10.0
+    geom = build_cn_geom(
+        x_grid, y_grid, k_left=K_SLAB, k_right=K_SLAB, interface_x=0.5, R_c=0.0,
+        dt=0.005, sigma_global=sigma, dtype=torch.float64,
+    )
+    T_flat = torch.full((Nx, Ny), (300.0 - mu) / sigma, dtype=torch.float64)
+    bc = FullBCData(
+        T_right_tilde=torch.as_tensor((300.0 - mu) / sigma, dtype=torch.float64),
+        qL_n=torch.zeros(Ny, dtype=torch.float64),
+        qL_np1=torch.zeros(Ny, dtype=torch.float64),
+    )
+    parts = full_bc_cn_residual(T_flat, T_flat.clone(), geom, bc)
+    for name, vec in parts.items():
+        assert float(vec.abs().max()) < 1e-6, (
+            f"steady-state region {name} residual not ~0: {float(vec.abs().max()):.3e}"
+        )
+
+
+def test_artificial_collapse_residual_large():
+    """The collapse the anchored first step penalizes: T_n == exact non-uniform IC,
+    T_np1 == uniform 300 K. The interior/transient (storage) residual dominates and
+    is orders of magnitude above the solver-state floor, so anchoring T_n to the IC
+    makes the constant-300 jump costly. The right-Dirichlet residual is NOT required
+    to be large: T_np1 == 300 K legitimately satisfies that wall (~0)."""
+    sim, _, T_hist, geom = _homogeneous_ic_hist_geom()
+
+    # Solver-state interior floor (the reference the collapse is compared to).
+    T0 = torch.as_tensor(T_hist[0], dtype=torch.float64)
+    T1 = torch.as_tensor(T_hist[1], dtype=torch.float64)
+    R_solver_interior = float(
+        full_bc_cn_residual(T0, T1, geom, _solver_state_bc(sim, 0))["interior"].abs().max()
+    )
+
+    # Collapse pair: exact IC -> uniform 300 K (sigma_global == 1 => raw K).
+    T_flat300 = torch.full_like(T0, 300.0)
+    bc = FullBCData(
+        T_right_tilde=torch.as_tensor(300.0, dtype=torch.float64),
+        qL_n=torch.zeros(sim.Ny if hasattr(sim, "Ny") else T0.shape[1], dtype=torch.float64),
+        qL_np1=torch.zeros(T0.shape[1], dtype=torch.float64),
+    )
+    parts = full_bc_cn_residual(T0, T_flat300, geom, bc)
+    R_collapse_interior = float(parts["interior"].abs().max())
+
+    # The right Dirichlet end is satisfied by T_np1 == 300 K (both edges ~0).
+    assert float(parts["right_dirichlet"].abs().max()) < 1e-6
+    # The interior storage imbalance dominates and dwarfs the solver-state floor.
+    assert R_collapse_interior > 1e3 * R_solver_interior, (
+        f"collapse interior residual {R_collapse_interior:.3e} not >> solver floor "
+        f"{R_solver_interior:.3e}"
+    )
+
+
+class _MixDS:
+    """On-grid collocation dataset stub. `build_item` returns a per-sim constant
+    IC field (300 + sid) in channel 0 so `T0_exact` is identifiable, and only the
+    RNG-driven start-index draw + anchor side-channel are exercised."""
+
+    def __init__(self, t_grid, Nx=4, Ny=5):
+        self.x_grid = np.linspace(0.0, 1.0, Nx)
+        self.y_grid = np.linspace(0.0, 1.0, Ny)
+        self.Nx, self.Ny = Nx, Ny
+        self.t_grid = np.asarray(t_grid, dtype=float)
+        self.t_final = float(self.t_grid[-1])
+        self.sim_ids = np.array([0, 1, 2])
+        self.sim_params = {i: {} for i in range(3)}
+        self.problem = self
+
+    def build_item(self, ds, sid, s, j):
+        field = np.full((self.Nx, self.Ny), 300.0 + float(sid), dtype=np.float32)
+        return {"spatial": field[..., None]}
+
+
+def test_early_time_mixture_and_anchor_mask(monkeypatch):
+    """The 3-bucket early-time oversampling mixture draws the anchor (n==0) bucket
+    at its RENORMALIZED weight, `_last_anchor` marks exactly the n==0 rows, and
+    `T0_exact` equals the base IC field. Three windows exercise the renormalization:
+    all buckets non-empty (0.4), `rest` empty (0.5), only `anchor` reachable (1.0)."""
+    import src.operators.train as train_mod
+    from src.operators.train import CollocationSampler
+
+    spec = DiffusionProblem()
+    dt = 0.01
+    t_grid = np.arange(12, dtype=float) * dt  # len-2 == 10, enough for n_max up to 9
+
+    calls = []
+
+    def _fake_roll(base_item, ds, spc, sid, current, t_lo, t_hi):
+        calls.append((float(t_hi), int(sid)))
+        return {"x": np.zeros(1, np.float32)}
+
+    monkeypatch.setattr(train_mod, "build_rollout_item_from_base", _fake_roll)
+    monkeypatch.setattr(train_mod, "collate_fn", lambda items: items)
+
+    ds = _MixDS(t_grid)
+    geom_cfg = spec.collocation_geom_cfg(ds, {}, 300.0, 10.0, dt)
+    base_plan = spec.collocation_base_plan(ds, dt)
+    t_s = float(t_grid[0])
+
+    def _run_window(max_lead, n_batches=400, B=16):
+        sampler = CollocationSampler(
+            ds, spec, geom_cfg, batch_size=B, dt=dt, rng_seed=0,
+            base_plan=base_plan, anchored_first_step=True,
+            early_oversample=True, early_band_steps=5,
+            early_mix={"anchor": 0.4, "early": 0.4, "rest": 0.2},
+        )
+        n_anchor_rows, n_total_rows = 0, 0
+        for _ in range(n_batches):
+            calls.clear()
+            sampler.sample_batch(max_lead=max_lead)
+            mask, T0_exact = sampler._last_anchor
+            # item_t (the `t` query) is built before item_tdt, so even-indexed
+            # calls carry t = t_s + n*dt; derive n and the drawn sid per row.
+            even = calls[0::2]
+            t_queries = np.array([c[0] for c in even])
+            sid_queries = [c[1] for c in even]
+            n_vals = np.rint((t_queries - t_s) / dt).astype(int)
+            # mask marks EXACTLY the n==0 rows.
+            assert np.array_equal(mask.numpy(), (n_vals == 0))
+            # T0_exact is the base IC field (300 + sid) for each drawn sim.
+            for i, sid in enumerate(sid_queries):
+                assert torch.allclose(
+                    T0_exact[i],
+                    torch.full((ds.Nx, ds.Ny), 300.0 + float(sid)),
+                )
+            n_anchor_rows += int(mask.sum().item())
+            n_total_rows += int(mask.numel())
+        return n_anchor_rows / n_total_rows
+
+    # Window 1: n_max == 9, all three buckets non-empty -> anchor freq ~ 0.4.
+    assert abs(_run_window(0.105) - 0.4) < 0.04
+    # Window 2: n_max == 4, `rest` empty -> renormalized anchor freq ~ 0.5.
+    assert abs(_run_window(0.055) - 0.5) < 0.04
+    # Window 3: n_max == 0, only the anchor bucket is reachable -> freq == 1.0.
+    assert _run_window(0.015, n_batches=20) == 1.0
+
+
+class _ConstModel(torch.nn.Module):
+    """Emits a constant normalized field (the collapse target). The `0 * w` term
+    keeps a trainable parameter in the graph so the loss is differentiable."""
+
+    def __init__(self, val=0.0):
+        super().__init__()
+        self.val = float(val)
+        self.w = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, spatial, cond_static, forcing_seq=None):
+        base = spatial[..., 0:1]
+        return torch.full_like(base, self.val) + 0.0 * self.w
+
+
+class _AnchorStubColloc:
+    """Fully-anchored on-grid collocation stub: every row is an n==0 anchor whose
+    T_n is the exact non-uniform IC. With a constant-300 K model (val==0 in raw K,
+    sigma_global==1) the residual is the constant-300 collapse when anchoring is on
+    and the trivial steady residual (~0) when off."""
+
+    def __init__(self, B=4, Nx=12, Ny=12, dt=0.01, anchored=True):
+        self.B, self.Nx, self.Ny = B, Nx, Ny
+        xg = np.linspace(0.0, 1.0, Nx)
+        yg = np.linspace(0.0, 1.0, Ny)
+        self.geom_cfg = {
+            "x_grid": xg, "y_grid": yg,
+            "k_left": K_SLAB, "k_right": K_SLAB,
+            "interface_x": float(xg[Nx // 2]),
+            "dt": dt, "sigma_global": 1.0, "T_right_tilde": 0.0,
+        }
+        X, Y = np.meshgrid(xg, yg, indexing="ij")
+        # Non-uniform IC in raw K minus the 300 K wall (sigma==1 => normalized==dev);
+        # the Gaussian bump is centered away from the right edge so its right column
+        # (and thus the right-Dirichlet residual) stays ~0.
+        self.ic = (40.0 * np.exp(-((X - 0.4) ** 2 + (Y - 0.5) ** 2) / 0.02)).astype(np.float32)
+        self.anchored = bool(anchored)
+        self._last_anchor = None
+
+    def _mk_batch(self, field):
+        spatial = np.zeros((self.B, self.Nx, self.Ny, 4), np.float32)
+        spatial[..., 0] = field
+        return {
+            "spatial": torch.from_numpy(spatial),
+            "cond_static": torch.zeros(self.B, 2),
+            "forcing_seq": torch.zeros(self.B, 128, 2),
+        }
+
+    def sample_batch(self, max_lead):
+        self._last_anchor = None
+        ic = np.broadcast_to(self.ic, (self.B, self.Nx, self.Ny)).copy()
+        z = torch.zeros(self.B, self.Ny)
+        batch = (self._mk_batch(ic), self._mk_batch(ic), torch.zeros(self.B),
+                 z, z.clone(), z.clone())
+        if self.anchored:
+            mask = torch.ones(self.B, dtype=torch.bool)
+            self._last_anchor = (mask, torch.from_numpy(ic))
+        return batch
+
+
+def test_anchored_batch_loss_penalizes_collapse():
+    """`_collocation_batch_loss` with a constant-300 K model and a non-uniform IC:
+    anchoring ON hard-injects the exact IC as T_n, so the (IC -> 300 K) collapse
+    fires and `physics_loss_weighted` is large; anchoring OFF leaves both fields at
+    the constant, giving the ~0 steady residual. This is the loss-level confirmation
+    the anchor directly penalizes the observed collapse."""
+    device = torch.device("cpu")
+    model = _ConstModel(val=0.0)
+
+    sampler_on = _AnchorStubColloc(anchored=True)
+    out_on, _, _ = _collocation_batch_loss(model, sampler_on, 0.05, None, device)
+    loss_on = float(out_on["physics_loss_weighted"])
+    # The split diagnostic sees an all-anchor batch.
+    assert out_on["_anchor_count"] == sampler_on.B
+    assert out_on["_nonanchor_count"] == 0
+
+    sampler_off = _AnchorStubColloc(anchored=False)
+    out_off, _, _ = _collocation_batch_loss(model, sampler_off, 0.05, None, device)
+    loss_off = float(out_off["physics_loss_weighted"])
+    assert out_off["_anchor_count"] == 0
+
+    assert loss_off < 1e-8, f"steady (non-anchored) residual not ~0: {loss_off:.3e}"
+    assert loss_on > 1.0, f"anchored collapse residual not large: {loss_on:.3e}"
