@@ -801,6 +801,8 @@ class CollocationSampler:
         self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed, base_plan=None,
         anchored_first_step=False, early_oversample=False, early_band_steps=5,
         early_mix=None,
+        source_time_min=None, source_time_max=None, lead_bins=None,
+        lead_min=None, anchor_lead_time=None, anchor_fraction=0.0,
     ):
         self.ds = ds
         self.spec = spec
@@ -810,6 +812,54 @@ class CollocationSampler:
         self.t_final = float(ds.t_final)
         self.sim_ids = np.asarray(ds.sim_ids)
         self.rng = np.random.default_rng(rng_seed)
+
+        # ---- long-lead OOD generic-path knobs (forcing collocation) ----
+        # All default to the legacy behavior (random source, uniform lead over
+        # [dt, max_lead], no bridge rows), so the generic path is byte-identical
+        # when these are unset.
+        self.source_time_min = (
+            float(source_time_min) if source_time_min is not None else None
+        )
+        self.source_time_max = (
+            float(source_time_max) if source_time_max is not None else None
+        )
+        self.lead_bins = int(lead_bins) if lead_bins else None
+        self.lead_min = float(lead_min) if lead_min is not None else None
+        self.anchor_lead_time = (
+            float(anchor_lead_time) if anchor_lead_time is not None else None
+        )
+        self.anchor_fraction = float(anchor_fraction)
+        # Candidate source snapshots (full-grid indices) restricted to the
+        # configured source-time range; their grid times drive feasibility. Built
+        # only for the generic (forcing) path -- the on-grid path (base_plan set)
+        # draws sources through the spec hooks and never reads t_indices, so its
+        # datasets need not expose one.
+        self._src_pool = None
+        self._src_pool_t = None
+        self._src_pool_t_min = None
+        self._full_t_grid = None
+        if base_plan is None:
+            src_idx = np.asarray(list(ds.t_indices), dtype=int)
+            src_t = np.asarray([float(ds.t_grid[s]) for s in src_idx], dtype=float)
+            keep = np.ones(src_idx.shape, dtype=bool)
+            tol = 1e-9
+            if self.source_time_min is not None:
+                keep &= src_t >= self.source_time_min - tol
+            if self.source_time_max is not None:
+                keep &= src_t <= self.source_time_max + tol
+            self._src_pool = src_idx[keep]
+            self._src_pool_t = src_t[keep]
+            if self._src_pool.size == 0:
+                raise ValueError(
+                    "CollocationSampler: no source snapshot falls in the range "
+                    f"[{self.source_time_min}, {self.source_time_max}]."
+                )
+            self._src_pool_t_min = float(self._src_pool_t.min())
+            # Full grid for bridge-snapshot lookup (nearest index to t_s+anchor).
+            self._full_t_grid = np.asarray(ds.t_grid, dtype=float)
+        # Per-batch record of the leads actually drawn (generic path), for the
+        # collocation lead histogram diagnostic. None until the first draw.
+        self._last_leads = None
         # When non-None, the benchmark pins the base snapshot and draws on-grid
         # conditioning pairs through the spec's collocation hooks instead of the
         # built-in (forcing) random-source / uniform-lead / analytic-closure path.
@@ -830,37 +880,104 @@ class CollocationSampler:
         self._last_anchor = None
 
     def sample_batch(self, max_lead: float):
-        """Sample one collocation batch. Leads are drawn in ``[dt, max_lead]``
-        from base snapshots whose ``t_s + max_lead + dt`` stays within the
-        forcing time support ``t_final``. Raises if no base snapshot supports
-        the requested ``max_lead`` (rather than silently extrapolating the
-        forcing past its support) and hard-asserts each ``t + dt`` is in range.
+        """Sample one collocation batch (generic forcing path).
+
+        Legacy behavior (all long-lead knobs unset): the source snapshot is drawn
+        uniformly from those whose ``t_s + max_lead + dt <= t_final`` and the lead
+        uniformly over ``[dt, max_lead]`` -- byte-identical to before.
+
+        Long-lead OOD knobs layer on three behaviors (defaults preserve legacy):
+        - ``source_time_min/max`` restrict the source pool (``_src_pool``) so
+          collocation is anchored near early sources that can support long leads.
+        - ``lead_min`` raises the non-bridge lead lower bound into the unlabeled
+          band ``tau > tc``; ``lead_bins`` switches from source-first draws to
+          lead-bin-first draws (a lead bin is chosen uniformly, then a feasible
+          source), giving the longest leads equal collocation mass instead of the
+          source-first under-sampling of ``tau ~ t_final``.
+        - ``anchor_lead_time``/``anchor_fraction`` inject *bridge* rows at
+          ``lead = tc``: the residual's first state is later overwritten (in
+          ``_collocation_batch_loss``) with the exact true snapshot nearest
+          ``t_s + tc`` via ``self._last_anchor``, connecting the labeled boundary
+          into the first unlabeled step.
+
+        Hard-asserts each ``t + dt`` stays within the forcing support ``t_final``
+        and records the drawn leads in ``self._last_leads`` for the histogram
+        diagnostic.
         """
         if self.base_plan is not None:
             return self._sample_batch_on_grid(max_lead)
 
-        # Generic (forcing) path never anchors; clear any stale side-channel.
+        # Reset side-channels; only populated below if bridge rows are drawn.
         self._last_anchor = None
         ds = self.ds
         dt = self.dt
         tol = 1e-9
         max_lead = max(float(max_lead), dt)
-        valid_s = [
-            int(s) for s in ds.t_indices
-            if float(ds.t_grid[s]) + max_lead + dt <= self.t_final + tol
-        ]
-        if not valid_s:
+
+        pool_idx = self._src_pool
+        pool_t = self._src_pool_t
+        lead_lo = dt if self.lead_min is None else max(dt, float(self.lead_min))
+        if lead_lo > max_lead + tol:
             raise ValueError(
-                f"No base snapshot supports collocation max_lead={max_lead} + "
-                f"dt={dt} within t_final={self.t_final}; lower collocation_lead_max."
+                f"collocation_lead_min={self.lead_min} exceeds the active max "
+                f"lead {max_lead}; widen collocation_lead_max/warmup."
+            )
+        use_bridge = (
+            self.anchor_lead_time is not None and self.anchor_fraction > 0.0
+        )
+        anchor_lead = float(self.anchor_lead_time) if use_bridge else None
+
+        # Source-first candidates depend only on max_lead -> precompute once so
+        # the legacy (no-knob) path draws exactly as before.
+        sf_cand = pool_idx[pool_t + max_lead + dt <= self.t_final + tol]
+        if not use_bridge and sf_cand.size == 0:
+            raise ValueError(
+                f"No source in range supports collocation max_lead={max_lead} + "
+                f"dt={dt} within t_final={self.t_final}; lower collocation_lead_max "
+                f"or widen collocation_source_time_max."
             )
 
         items_t, items_tdt = [], []
         R_c_list, qLn_list, qLnp1_list, qLint_list = [], [], [], []
+        anchor_flags, T0_list = [], []
+        leads_drawn = []
         for _ in range(self.batch_size):
             sid = int(self.rng.choice(self.sim_ids))
-            s = int(self.rng.choice(valid_s))
-            lead = float(self.rng.uniform(dt, max_lead)) if max_lead > dt else dt
+            is_bridge = bool(
+                use_bridge and self.rng.random() < self.anchor_fraction
+            )
+            if is_bridge:
+                lead = anchor_lead
+                feas = pool_t + lead + dt <= self.t_final + tol
+                cand = pool_idx[feas]
+                if cand.size == 0:
+                    raise ValueError(
+                        f"No source in range supports bridge lead {lead} + dt "
+                        f"within t_final={self.t_final}; lower anchor_lead_time or "
+                        f"widen collocation_source_time_max."
+                    )
+                s = int(self.rng.choice(cand))
+            elif self.lead_bins is not None:
+                # Lead-bin-first: equal mass per lead bin over [lead_lo, max_lead],
+                # then a feasible source for the drawn lead.
+                edges = np.linspace(lead_lo, max_lead, self.lead_bins + 1)
+                bi = int(self.rng.integers(0, self.lead_bins))
+                lead = float(self.rng.uniform(edges[bi], edges[bi + 1]))
+                cand = pool_idx[pool_t + lead + dt <= self.t_final + tol]
+                if cand.size == 0:
+                    raise ValueError(
+                        f"No source in range supports lead={lead} + dt within "
+                        f"t_final={self.t_final}."
+                    )
+                s = int(self.rng.choice(cand))
+            else:
+                # Source-first (legacy shape): source then uniform lead.
+                s = int(self.rng.choice(sf_cand))
+                lead = (
+                    float(self.rng.uniform(lead_lo, max_lead))
+                    if max_lead > lead_lo else lead_lo
+                )
+
             t_s = float(ds.t_grid[s])
             t = t_s + lead
             t_dt = t + dt
@@ -899,6 +1016,20 @@ class CollocationSampler:
             qLn_list.append(qLn)
             qLnp1_list.append(qLnp1)
             qLint_list.append(qLint)
+            leads_drawn.append(float(lead))
+
+            if is_bridge:
+                # Exact normalized true snapshot nearest t = t_s + tc, in the same
+                # (mu_global, sigma_global) space the model outputs. Reuses the
+                # spec's build_item so the normalization matches _sample_batch_on_grid.
+                k = int(np.argmin(np.abs(self._full_t_grid - t)))
+                anchor_item = ds.problem.build_item(ds, sid, k, k)
+                anchor_T0 = anchor_item["spatial"][..., 0]
+                anchor_flags.append(True)
+                T0_list.append(np.asarray(anchor_T0, dtype=np.float32))
+            else:
+                anchor_flags.append(False)
+                T0_list.append(None)
 
         batch_t = collate_fn(items_t)
         batch_tdt = collate_fn(items_tdt)
@@ -906,6 +1037,18 @@ class CollocationSampler:
         qL_n = torch.from_numpy(np.stack(qLn_list))
         qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
         qL_int = torch.from_numpy(np.stack(qLint_list))
+        self._last_leads = np.asarray(leads_drawn, dtype=float)
+        if any(anchor_flags):
+            # Non-bridge rows are zero-filled placeholders shaped like a real
+            # bridge snapshot; the injection (`_collocation_batch_loss`) only
+            # reads the masked (bridge) rows.
+            ref = next(t0 for t0 in T0_list if t0 is not None)
+            zeros = np.zeros_like(ref)
+            mask = torch.tensor(anchor_flags, dtype=torch.bool)
+            T0_exact = torch.from_numpy(
+                np.stack([zeros if t0 is None else t0 for t0 in T0_list])
+            )
+            self._last_anchor = (mask, T0_exact)
         return batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int
 
     def _early_buckets(self, n_max: int):
@@ -1147,11 +1290,21 @@ def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_glob
     early_mix = phys_cfg.get("early_mix", None)
     if early_mix is not None:
         early_mix = dict(early_mix)
+    # Long-lead OOD knobs apply only to the generic (forcing) path; gate them off
+    # for on-grid benchmarks so those samplers stay byte-identical.
+    src_min = None if on_grid else phys_cfg.get("collocation_source_time_min", None)
+    src_max = None if on_grid else phys_cfg.get("collocation_source_time_max", None)
+    lead_bins = None if on_grid else phys_cfg.get("collocation_lead_bins", None)
+    lead_min = None if on_grid else phys_cfg.get("collocation_lead_min", None)
+    anchor_lead = None if on_grid else phys_cfg.get("anchor_lead_time", None)
+    anchor_frac = 0.0 if on_grid else float(phys_cfg.get("anchor_fraction", 0.0))
     return CollocationSampler(
         ds, spec, geom_cfg, batch_size=pbs, dt=dt, rng_seed=rng_seed,
         base_plan=base_plan,
         anchored_first_step=anchored, early_oversample=early_os,
         early_band_steps=early_band, early_mix=early_mix,
+        source_time_min=src_min, source_time_max=src_max, lead_bins=lead_bins,
+        lead_min=lead_min, anchor_lead_time=anchor_lead, anchor_fraction=anchor_frac,
     )
 
 
@@ -1264,6 +1417,87 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
     return out, R_c.shape[0], ic_loss
 
 
+def _flat_grad(model) -> torch.Tensor:
+    """Flatten every parameter's ``.grad`` into one vector (zeros for None)."""
+    parts = []
+    for p in model.parameters():
+        if p.grad is None:
+            parts.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
+        else:
+            parts.append(p.grad.detach().reshape(-1))
+    return torch.cat(parts)
+
+
+def _log_grad_balance(
+    *, model, fixed_batches, physics_collocation, collocation_max_lead,
+    physics_region_weights, loss_fn, device, use_per_sample_interface,
+    lambda_data, lambda_physics, lambda_ic, n_colloc, epoch, phase, csv_path,
+):
+    """Optional diagnostic (``training.physics.log_grad_norms``; default off).
+
+    On a fixed set of data batches and ``n_colloc`` fresh collocation draws,
+    separately backprop ``lambda_data * L_data`` and ``lambda_physics * L_phys``
+    and log ``||grad L_data||``, ``||grad L_phys||``, their ratio, and the cosine
+    ``A = (g_data . g_phys) / (||g_data|| ||g_phys||)``. The norm ratio flags a
+    mis-scaled ``lambda_physics``; the cosine flags directional conflict between
+    the two objectives. Leaves ``model`` grads cleared on exit; never steps the
+    optimizer. Rows append to a sidecar ``grad_balance.csv``.
+    """
+    model.zero_grad(set_to_none=True)
+    data_loss = None
+    for batch in fixed_batches:
+        x_spatial = batch["spatial"].to(device)
+        cond_static = batch["cond_static"].to(device)
+        forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
+        y_batch = batch["Y"].to(device)
+        iface_x = get_batch_interface_x(
+            batch, device, use_per_sample_interface=use_per_sample_interface
+        )
+        y_pred = model(x_spatial, cond_static, forcing_seq)
+        li = loss_fn(y_pred, y_batch, iface_x)
+        data_loss = li if data_loss is None else data_loss + li
+    if data_loss is not None:
+        (lambda_data * data_loss).backward()
+    g_data = _flat_grad(model)
+
+    model.zero_grad(set_to_none=True)
+    phys_loss = None
+    for _ in range(int(n_colloc)):
+        out, _pb, ic = _collocation_batch_loss(
+            model, physics_collocation, collocation_max_lead,
+            physics_region_weights, device, lambda_ic=lambda_ic,
+        )
+        pw = out["physics_loss_weighted"]
+        phys_loss = pw if phys_loss is None else phys_loss + pw
+        if ic is not None:
+            phys_loss = phys_loss + lambda_ic * ic
+    if phys_loss is not None:
+        (lambda_physics * phys_loss).backward()
+    g_phys = _flat_grad(model)
+    model.zero_grad(set_to_none=True)
+
+    nd = float(torch.linalg.vector_norm(g_data))
+    npz = float(torch.linalg.vector_norm(g_phys))
+    denom = nd * npz
+    cos = float(torch.dot(g_data, g_phys) / denom) if denom > 0.0 else float("nan")
+    ratio = (nd / npz) if npz > 0.0 else float("nan")
+
+    header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if header:
+            w.writerow([
+                "epoch", "phase", "grad_norm_data", "grad_norm_phys",
+                "grad_norm_ratio", "grad_cosine",
+            ])
+        w.writerow([epoch, phase, nd, npz, ratio, cos])
+    print(
+        f"[grad-balance] epoch {epoch} ({phase}): "
+        f"||g_data||={nd:.3e} ||g_phys||={npz:.3e} ratio={ratio:.3f} cos={cos:.3f}",
+        flush=True,
+    )
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -1302,6 +1536,13 @@ def train_one_epoch(
         dist_info = get_dist_info()
 
     model.train()
+
+    # --- Fine-tune diagnostics (per-rank; rank 0's values are logged) ---
+    _t_train_start = time.perf_counter()
+    n_model_forwards = 0
+    grad_norm_sum = 0.0
+    n_grad_steps = 0
+    phys_leads_epoch: list[float] = []  # collocation leads actually drawn
 
     loss_sum = 0.0
     mse_sum = 0.0
@@ -1388,13 +1629,20 @@ def train_one_epoch(
                 model, physics_collocation, collocation_max_lead,
                 physics_region_weights, device, lambda_ic=lambda_ic,
             )
+            n_model_forwards += 2  # collocation forwards the model at t and t+dt
+            _ll = getattr(physics_collocation, "_last_leads", None)
+            if _ll is not None:
+                phys_leads_epoch.extend(np.asarray(_ll).ravel().tolist())
             p_loss = out["physics_loss_weighted"]
             total = lambda_physics * p_loss
             if ic is not None:
                 total = total + lambda_ic * ic
             total.backward()
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                if _gn is not None:
+                    grad_norm_sum += float(_gn)
+                    n_grad_steps += 1
             optimizer.step()
             phys_loss_sum += p_loss.item() * p_b
             phys_weighted_sum += out["physics_loss_weighted"].item() * p_b
@@ -1419,12 +1667,17 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond_static, forcing_seq)
+        n_model_forwards += 1
         loss = loss_fn(y_pred, y_batch, iface_x)
         if phys_collocation:
             out, p_b, ic = _collocation_batch_loss(
                 model, physics_collocation, collocation_max_lead,
                 physics_region_weights, device, lambda_ic=lambda_ic,
             )
+            n_model_forwards += 2  # collocation forwards the model at t and t+dt
+            _ll = getattr(physics_collocation, "_last_leads", None)
+            if _ll is not None:
+                phys_leads_epoch.extend(np.asarray(_ll).ravel().tolist())
             p_loss = out["physics_loss_weighted"]
             total = lambda_data * loss + lambda_physics * p_loss
             if ic is not None:
@@ -1444,6 +1697,7 @@ def train_one_epoch(
             p_loss, p_b, phys_iter = _physics_batch_loss(
                 model, physics_loader, phys_iter, physics_geom_cfg, device
             )
+            n_model_forwards += 1  # one-step physics forwards the model once
             (lambda_data * loss + lambda_physics * p_loss).backward()
             phys_loss_sum += p_loss.item() * p_b
             n_phys += p_b
@@ -1451,7 +1705,10 @@ def train_one_epoch(
             loss.backward()
 
         if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            if _gn is not None:
+                grad_norm_sum += float(_gn)
+                n_grad_steps += 1
         optimizer.step()
 
         with torch.no_grad():
@@ -1551,6 +1808,26 @@ def train_one_epoch(
         train_iface_rel_l2 = math.sqrt(iface_mse_sum / max(iface_target_sq_sum, 1e-12)) * 100.0
     else:
         train_iface_rel_l2 = 0.0
+
+    # Item-8 diagnostics (per-rank; rank 0's values are the ones logged). These
+    # default to null/0/"" so a normal run without collocation leaves the new CSV
+    # columns empty rather than fabricating values.
+    epoch_train_s = time.perf_counter() - _t_train_start
+    grad_norm = (grad_norm_sum / n_grad_steps) if n_grad_steps > 0 else None
+    if phys_leads_epoch:
+        # Self-describing fixed-edge histogram over [0, t_final] so the analysis
+        # can slice at any tc without re-binning. t_final comes from the sampler.
+        t_final = float(getattr(physics_collocation, "t_final", 0.0)) if phys_collocation else 0.0
+        if t_final <= 0.0:
+            t_final = float(max(phys_leads_epoch))
+        edges = np.linspace(0.0, t_final, 13)
+        counts, _ = np.histogram(np.asarray(phys_leads_epoch, dtype=float), bins=edges)
+        phys_lead_hist = json.dumps({
+            "edges": [round(float(e), 6) for e in edges],
+            "counts": [int(c) for c in counts],
+        })
+    else:
+        phys_lead_hist = ""
     return {
         "loss": training_loss,
         "rel_l2": train_rel_l2,
@@ -1578,6 +1855,13 @@ def train_one_epoch(
         "train_physics_anchor_loss": phys_anchor_sum / max(n_anchor, 1),
         "train_physics_nonanchor_loss": phys_nonanchor_sum / max(n_nonanchor, 1),
         "train_anchor_fraction": n_anchor / max(n_phys, 1),
+        # Item-8 diagnostics: training-only wall time (excludes validation /
+        # checkpoint / CSV), forward count, mean clipped grad norm, and the
+        # per-epoch collocation-lead histogram (JSON, "" when no collocation).
+        "epoch_train_s": epoch_train_s,
+        "n_model_forwards": int(n_model_forwards),
+        "grad_norm": grad_norm,
+        "phys_lead_hist": phys_lead_hist,
     }
 
 
@@ -1593,6 +1877,10 @@ _CHECKPOINT_METRIC_KEYS = {
     "val_rel_l2": "rel_l2",
     "val_nrmse": "nrmse",
     "val_jump_nrmse": "node_jump_nrmse",
+    # Long-lead OOD selection: minimize post-cutoff (tau > tc) Kelvin RMSE. Only
+    # available when training.lead_cutoff_time is set; selection reads the guard
+    # companion `rmse_K_lead_le_tc` separately.
+    "val_rmse_K_lead_gt_tc": "rmse_K_lead_gt_tc",
 }
 
 
@@ -1671,6 +1959,7 @@ def validate(
     use_per_sample_interface: bool = False,
     interface_x: float = 0.5,
     sigma_global: float = 1.0,
+    lead_cutoff_time: float | None = None,
 ) -> dict[str, float]:
     """Return a metric dict after validation.
 
@@ -1698,6 +1987,7 @@ def validate(
 
         nrmse_all: list[torch.Tensor] = []
         rmse_K_all: list[torch.Tensor] = []
+        rel_l2_all: list[torch.Tensor] = []  # per-pair rel-L2 % (for lead stratification)
         gnrmse_all: list[torch.Tensor] = []  # per-sample normalized RMS (= rms_i)
         node_jump_rmse_K_all: list[torch.Tensor] = []
         node_jump_nrmse_all: list[torch.Tensor] = []
@@ -1775,6 +2065,8 @@ def validate(
                 nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
                 rmse_K_all.append((rms_i * sigma_global).cpu())
                 gnrmse_all.append(rms_i.cpu())
+                if lead_cutoff_time is not None:
+                    rel_l2_all.append(_per_pair_rel_l2_percent(y_pred, y_batch).cpu())
                 max_abs_err = max(
                     max_abs_err, torch.max(torch.abs(y_pred - y_batch)).item()
                 )
@@ -1902,9 +2194,41 @@ def validate(
             node_jump_rmse_K_mean = 0.0
             node_jump_gnrmse_stats = tail_stats(torch.empty(0))
 
+        # --- Lead-stratified aggregates for long-lead OOD selection/logging ---
+        # Split every val pair at the physical prediction lead `tau = t_j - t_s`
+        # into <= tc and > tc populations. rmse_K is the project's stable primary
+        # metric (Kelvin); rel_l2 is the noisy companion. The val loader is
+        # unshuffled and yields dataset._pairs in order, so torch.cat(...) rows
+        # align 1:1 with dataset._pairs (same invariant the val-pairs writer uses).
+        lead_strat: dict[str, float] = {}
+        if lead_cutoff_time is not None and dataset is not None and rmse_K_all:
+            t_grid = np.asarray(dataset.t_grid)
+            leads = np.array(
+                [float(t_grid[j] - t_grid[s]) for (_sid, s, j) in dataset._pairs],
+                dtype=np.float64,
+            )
+            eps = 0.5 * float(getattr(dataset, "dt", 0.0))
+            le = leads <= (float(lead_cutoff_time) + eps)
+            gt = ~le
+            rmse_K_cat = torch.cat(rmse_K_all).numpy()
+            rel_l2_cat = torch.cat(rel_l2_all).numpy() if rel_l2_all else np.full_like(rmse_K_cat, np.nan)
+            n = min(rmse_K_cat.shape[0], leads.shape[0])
+            le, gt, rmse_K_cat, rel_l2_cat = le[:n], gt[:n], rmse_K_cat[:n], rel_l2_cat[:n]
+
+            def _mean(arr: np.ndarray, mask: np.ndarray) -> float:
+                return float(arr[mask].mean()) if mask.any() else float("nan")
+
+            lead_strat = {
+                "rmse_K_lead_le_tc": _mean(rmse_K_cat, le),
+                "rmse_K_lead_gt_tc": _mean(rmse_K_cat, gt),
+                "rel_l2_lead_le_tc": _mean(rel_l2_cat, le),
+                "rel_l2_lead_gt_tc": _mean(rel_l2_cat, gt),
+            }
+
         return {
             "rel_l2": val_loss,
             "iface_rel_l2": val_iface,
+            **lead_strat,
             "nrmse": nrmse_stats["mean"] * 100.0,
             "nrmse_p50": nrmse_stats["p50"] * 100.0,
             "nrmse_iqr": nrmse_stats["iqr"] * 100.0,
@@ -1989,7 +2313,10 @@ def run_one_seed(
         ramp_seconds = load_ramp_seconds(config["data"]["t_grid_path"])
 
         train_ids, val_ids, test_ids = split_sim_ids(num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0)
-        mu_global, sigma_global = compute_global_stats(trajectories, train_ids)
+        norm_max_time = config["data"].get("norm_max_time", None)
+        mu_global, sigma_global = compute_global_stats(
+            trajectories, train_ids, t_grid=t_grid, max_time=norm_max_time,
+        )
 
         num_workers = resolve_num_workers(config, dist_info.world_size)
         training_set, validation_set, _ = create_dataloaders(
@@ -2010,6 +2337,8 @@ def run_one_seed(
             rank=dist_info.rank,
             sampler_seed=seed,
             problem=spec,
+            train_max_target_time=config["data"].get("train_max_target_time", None),
+            train_max_lead_time=config["data"].get("train_max_lead_time", None),
         )
     else:
         training_set = train_loader_override
@@ -2063,6 +2392,36 @@ def run_one_seed(
         best_val_loss = ckpt["best_val"]
         bad_epochs = ckpt.get("bad_epochs", 0)
         start_epoch = ckpt["epoch"] + 1
+
+    # Weights-only warm-start (physics fine-tune). Only when NOT auto-resuming a
+    # full run in this dir: load model weights from an external checkpoint and
+    # leave optimizer/scheduler/epoch/best_val fresh (peak LR = training.
+    # learning_rate, start_epoch = 0). The checkpoint's normalization stats must
+    # equal the recomputed (mu_global, sigma_global) — identical since every run
+    # uses the same train sims and full-trajectory stats — so warm-started weights
+    # see the same normalized fields. _validate_resume_compatibility is
+    # deliberately skipped (epochs/LR/physics differ by design).
+    init_from_checkpoint = config["training"].get("init_from_checkpoint", None)
+    if not resuming and init_from_checkpoint:
+        init_ckpt = torch.load(
+            init_from_checkpoint, map_location="cpu", weights_only=False,
+        )
+        fno.load_state_dict(init_ckpt["model_state"])
+        ck_mu = float(init_ckpt["mu_global"])
+        ck_sigma = float(init_ckpt["sigma_global"])
+        if (abs(ck_mu - float(mu_global)) > 1e-6
+                or abs(ck_sigma - float(sigma_global)) > 1e-6):
+            raise ValueError(
+                "init_from_checkpoint normalization mismatch: checkpoint "
+                f"(mu={ck_mu}, sigma={ck_sigma}) != recomputed "
+                f"(mu={float(mu_global)}, sigma={float(sigma_global)}). Warm-start "
+                "requires identical stats (same train sims, full-trajectory stats)."
+            )
+        if is_main:
+            print(
+                f"Warm-start seed {seed}: loaded weights from "
+                f"{init_from_checkpoint} (optimizer/scheduler/epoch fresh)."
+            )
 
     fno.to(device)
 
@@ -2136,6 +2495,13 @@ def run_one_seed(
     collocation_lead_start = float(phys_cfg.get("collocation_lead_start", 0.01))
     collocation_lead_max = float(phys_cfg.get("collocation_lead_max", 0.01))
     collocation_lead_warmup = int(phys_cfg.get("collocation_lead_warmup_epochs", 0))
+    # Physics-weight ramp: linearly scale lambda_physics from 0 to its full value
+    # over the first `lambda_physics_ramp_epochs` epochs (0 disables the ramp).
+    lambda_physics_ramp_epochs = int(phys_cfg.get("lambda_physics_ramp_epochs", 0))
+    # Optional grad-balance / cosine diagnostic (default off). Sampled at three
+    # checkpoints: fine-tune step 0, just after the ramp completes, near the end.
+    log_grad_norms = bool(phys_cfg.get("log_grad_norms", False))
+    grad_balance_batches: list = []
     cc_cfg = phys_cfg.get("causal_curriculum", None) or {}
     causal_curriculum_enabled = bool(cc_cfg.get("enabled", False))
     causal_stages = None  # resolved after the sampler pins dt/t_final
@@ -2155,19 +2521,25 @@ def run_one_seed(
                 f"unknown training.physics.collocation_source {collocation_source!r}; "
                 f"expected 'train' or 'val'."
             )
-        # Decorrelate the collocation stream per rank: every rank already spends
-        # the collocation forward/backward compute, so drawing the SAME batch on
-        # each rank (rng_seed=seed) would make DDP average identical gradients —
-        # the extra ranks buy nothing. Offsetting by rank gives each rank a
-        # disjoint draw, so the DDP-averaged physics gradient is computed over an
-        # effective physics_batch_size * world_size distinct collocation samples
-        # at no extra cost. Control flow is unchanged (same per-rank forward/
-        # backward/collective sequence), so this does not affect DDP lockstep.
+        # Seed the collocation stream IDENTICALLY on every rank (rng_seed=seed, no
+        # per-rank offset). A previous version offset by rank to decorrelate the
+        # per-rank draws for a larger effective physics batch, but that interacts
+        # fatally with static_graph=True (see the DDP wrap below): with per-rank
+        # RNG the first iteration draws a different collocation batch and anchor
+        # mask on each rank, and the anchored torch.where hard-injection changes
+        # which elements of yt carry gradient. That makes the first-iteration
+        # gradient-readiness order rank-dependent, so static_graph freezes a
+        # DIFFERENT per-bucket all_reduce schedule on each rank and the reducer
+        # deadlocks on mismatched-size ALLREDUCEs (NCCL watchdog abort). An
+        # identical seed guarantees every rank builds the same static graph and
+        # bucket schedule. The DDP-averaged gradient is then over the same
+        # collocation batch on all ranks (no effective-batch gain), which is the
+        # accepted cost of keeping the physics-only DDP path lockstep-safe.
         physics_collocation = _build_collocation_sampler(
             config, phys_cfg, colloc_ds, spec,
             mu_global, sigma_global,
             batch_size=config["training"]["batch_size"],
-            rng_seed=seed + dist_info.rank,
+            rng_seed=seed,
         )
         # The sampler must only ever draw from its source split's sims.
         assert set(np.asarray(physics_collocation.sim_ids).tolist()).issubset(
@@ -2215,6 +2587,19 @@ def run_one_seed(
             f"expected one of: {valid}."
         )
 
+    # Long-lead OOD selection. `lead_cutoff_time` (tc) splits every val pair at
+    # its prediction lead tau=t_j-t_s; `checkpoint_forgetting_ratio` bounds the
+    # allowed pre-cutoff (tau<=tc) RMSE_K regression relative to model A's step-0
+    # reference (`pre_cutoff_ref`, captured below before any optimizer step).
+    lead_cutoff_time = config["training"].get("lead_cutoff_time", None)
+    checkpoint_forgetting_ratio = config["training"].get("checkpoint_forgetting_ratio", None)
+    if checkpoint_metric == "val_rmse_K_lead_gt_tc" and lead_cutoff_time is None:
+        raise ValueError(
+            "training.checkpoint_metric='val_rmse_K_lead_gt_tc' requires "
+            "training.lead_cutoff_time to be set (the tau split point)."
+        )
+    pre_cutoff_ref = None  # rmse_K^A_{tau<=tc}; set by the step-0 reference pass.
+
     best_path = run_path / "fno2d_best.pt"
 
     # --- CSV setup (rank 0 only) ---
@@ -2238,6 +2623,13 @@ def run_one_seed(
         "val_node_jump_rmse_K", "val_node_jump_nrmse",
         "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
         "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
+        # Long-lead OOD stratification (present but empty when lead_cutoff_time
+        # is null). rmse_K_lead_gt_tc is the post-cutoff selection primary.
+        "val_rmse_K_lead_le_tc", "val_rmse_K_lead_gt_tc",
+        "val_rel_l2_lead_le_tc", "val_rel_l2_lead_gt_tc",
+        # Fine-tune diagnostics (empty on non-collocation paths where absent).
+        "train_grad_norm", "epoch_train_s", "epoch_wall_s", "n_model_forwards",
+        "phys_lead_hist",
         "lr", "is_best",
     ]
     csv_file = None
@@ -2273,9 +2665,61 @@ def run_one_seed(
     grad_clip = config["training"].get("grad_clip", None)
     warmup_epochs = config["training"].get("curriculum_warmup", 0)
 
+    # Step-0 reference (Capability 7). For a warm-started fine-tune with a lead
+    # cutoff, run ONE validation pass on the freshly-loaded model A weights BEFORE
+    # any optimizer step, so `pre_cutoff_ref` = rmse_K^A_{tau<=tc} is model A
+    # exactly (not epoch-0-post-step). Logged as epoch -1 so it is auditable. Only
+    # on a fresh warm-start (skip on auto-resume, which already has trained state).
+    if is_main and (not resuming) and init_from_checkpoint and lead_cutoff_time is not None:
+        ref_metrics = validate(
+            model=fno_unwrapped,
+            val_loader=validation_set,
+            device=device,
+            iface_mask=iface_mask,
+            dataset=validation_set.dataset,
+            pair_csv_path=val_pairs_path,
+            val_pairs_max_rows=config["training"].get("val_pairs_max_rows", None),
+            epoch=-1,
+            x_grid_t=loss_fn.x_grid_t,
+            interface_half_width=loss_cfg.get("interface_half_width", 0.05),
+            use_per_sample_interface=use_per_sample_interface,
+            interface_x=loss_cfg.get("interface_x", 0.5),
+            sigma_global=sigma_global,
+            lead_cutoff_time=lead_cutoff_time,
+        )
+        pre_cutoff_ref = float(ref_metrics["rmse_K_lead_le_tc"])
+        print(
+            f"[step-0 ref] pre_cutoff_ref (rmse_K tau<={lead_cutoff_time}) = "
+            f"{pre_cutoff_ref:.4f}K; post-cutoff rmse_K = "
+            f"{ref_metrics['rmse_K_lead_gt_tc']:.4f}K",
+            flush=True,
+        )
+        csv_writer.writerow({
+            "epoch": -1,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "is_best": 0,
+            "val_rel_l2": float(ref_metrics["rel_l2"]),
+            "val_rmse_K": float(ref_metrics["rmse_K"]),
+            "val_rmse_K_lead_le_tc": float(ref_metrics["rmse_K_lead_le_tc"]),
+            "val_rmse_K_lead_gt_tc": float(ref_metrics["rmse_K_lead_gt_tc"]),
+            "val_rel_l2_lead_le_tc": float(ref_metrics["rel_l2_lead_le_tc"]),
+            "val_rel_l2_lead_gt_tc": float(ref_metrics["rel_l2_lead_gt_tc"]),
+        })
+        csv_file.flush()
+
     should_stop = False
 
+    # Freeze ~8 data batches once for the optional grad-balance diagnostic so the
+    # three checkpoints compare gradients on an identical set (not epoch noise).
+    if is_main and log_grad_norms and physics_collocation is not None:
+        for _i, _b in enumerate(training_set):
+            if _i >= 8:
+                break
+            grad_balance_batches.append(_b)
+    grad_balance_path = str(run_path / "grad_balance.csv")
+
     for epoch in range(start_epoch, epochs):
+        _t_epoch_start = time.perf_counter()
         # Lead-time curriculum: progressively expose longer lead times.
         # Deterministic given `frac` -> identical _active_len on every rank.
         if warmup_epochs > 0:
@@ -2307,6 +2751,38 @@ def run_one_seed(
                 + cfrac * (collocation_lead_max - collocation_lead_start)
             )
 
+        # Physics-weight ramp (epoch is 0-indexed; epoch 0 keeps a small nonzero
+        # weight, full weight from `lambda_physics_ramp_epochs`).
+        if lambda_physics_ramp_epochs > 0:
+            lambda_physics_eff = lambda_physics * min(
+                1.0, (epoch + 1) / lambda_physics_ramp_epochs
+            )
+        else:
+            lambda_physics_eff = lambda_physics
+
+        # Grad-balance / cosine at three checkpoints (before this epoch's steps):
+        # fine-tune start, just after the ramp completes, and near the end.
+        if is_main and log_grad_norms and physics_collocation is not None and grad_balance_batches:
+            _gb_phase = None
+            if epoch == start_epoch:
+                _gb_phase = "start"
+            elif lambda_physics_ramp_epochs > 0 and epoch == lambda_physics_ramp_epochs:
+                _gb_phase = "post_ramp"
+            elif epoch == epochs - 1:
+                _gb_phase = "near_end"
+            if _gb_phase is not None:
+                _log_grad_balance(
+                    model=fno_unwrapped, fixed_batches=grad_balance_batches,
+                    physics_collocation=physics_collocation,
+                    collocation_max_lead=collocation_max_lead,
+                    physics_region_weights=physics_region_weights,
+                    loss_fn=loss_fn, device=device,
+                    use_per_sample_interface=use_per_sample_interface,
+                    lambda_data=lambda_data, lambda_physics=lambda_physics_eff,
+                    lambda_ic=lambda_ic, n_colloc=8, epoch=epoch,
+                    phase=_gb_phase, csv_path=grad_balance_path,
+                )
+
         train_metrics = train_one_epoch(
             model=fno, train_loader=training_set, optimizer=optimizer,
             loss_fn=loss_fn, device=device, iface_mask=iface_mask,
@@ -2320,7 +2796,7 @@ def run_one_seed(
             collocation_max_lead=collocation_max_lead,
             physics_region_weights=physics_region_weights,
             lambda_data=lambda_data,
-            lambda_physics=lambda_physics,
+            lambda_physics=lambda_physics_eff,
             lambda_ic=lambda_ic,
         )
         train_loss = train_metrics["loss"]
@@ -2362,6 +2838,7 @@ def run_one_seed(
                     use_per_sample_interface=use_per_sample_interface,
                     interface_x=loss_cfg.get("interface_x", 0.5),
                     sigma_global=sigma_global,
+                    lead_cutoff_time=lead_cutoff_time,
                 )
                 val_loss = val_metrics["rel_l2"]
                 val_iface_rel_l2 = val_metrics["iface_rel_l2"]
@@ -2387,7 +2864,26 @@ def run_one_seed(
 
                 # Checkpoint selection: lower is better for every supported metric.
                 selection_value = _selection_metric_value(val_metrics, checkpoint_metric)
-                if selection_value < best_val_loss:
+                # No-forgetting guard (Capability 7): when selecting on post-cutoff
+                # RMSE_K, only accept an epoch whose pre-cutoff (tau<=tc) RMSE_K
+                # stays within `ratio * pre_cutoff_ref` (model A). Skips the guard
+                # when the ratio or the step-0 reference is unavailable.
+                guard_ok = True
+                if (
+                    checkpoint_metric == "val_rmse_K_lead_gt_tc"
+                    and checkpoint_forgetting_ratio is not None
+                    and pre_cutoff_ref is not None
+                ):
+                    pre_now = float(val_metrics["rmse_K_lead_le_tc"])
+                    guard_ok = pre_now <= float(checkpoint_forgetting_ratio) * pre_cutoff_ref
+                    if not guard_ok:
+                        print(
+                            f"  [forgetting guard] epoch {epoch} rejected: "
+                            f"pre-cutoff rmse_K={pre_now:.4f}K > "
+                            f"{checkpoint_forgetting_ratio}*{pre_cutoff_ref:.4f}K",
+                            flush=True,
+                        )
+                if guard_ok and selection_value < best_val_loss:
                     best_val_loss = selection_value
                     bad_epochs = 0
                     is_best = 1
@@ -2451,8 +2947,21 @@ def run_one_seed(
                 latest_path,
             )
 
+            epoch_wall_s = time.perf_counter() - _t_epoch_start
+
             def _vm(key: str) -> str | float:
                 return "" if val_metrics is None else float(val_metrics[key])
+
+            def _vm_opt(key: str) -> str | float:
+                # Tolerant read for keys only present when lead_cutoff_time is set.
+                if val_metrics is None or key not in val_metrics:
+                    return ""
+                return float(val_metrics[key])
+
+            def _tm_opt(key: str) -> str | float:
+                # Tolerant read for diagnostic train keys absent on non-physics paths.
+                v = train_metrics.get(key, None)
+                return "" if v is None else float(v)
 
             csv_writer.writerow(
                 {
@@ -2500,6 +3009,15 @@ def run_one_seed(
                     "val_node_jump_nrmse_max": _vm("node_jump_nrmse_max"),
                     "val_node_jump_gnrmse_pct": _vm("node_jump_gnrmse_pct"),
                     "val_node_jump_gnrmse_pct_p99": _vm("node_jump_gnrmse_pct_p99"),
+                    "val_rmse_K_lead_le_tc": _vm_opt("rmse_K_lead_le_tc"),
+                    "val_rmse_K_lead_gt_tc": _vm_opt("rmse_K_lead_gt_tc"),
+                    "val_rel_l2_lead_le_tc": _vm_opt("rel_l2_lead_le_tc"),
+                    "val_rel_l2_lead_gt_tc": _vm_opt("rel_l2_lead_gt_tc"),
+                    "train_grad_norm": _tm_opt("grad_norm"),
+                    "epoch_train_s": float(train_metrics.get("epoch_train_s", float("nan"))),
+                    "epoch_wall_s": float(epoch_wall_s),
+                    "n_model_forwards": int(train_metrics.get("n_model_forwards", 0)),
+                    "phys_lead_hist": train_metrics.get("phys_lead_hist", ""),
                     "lr": float(lr),
                     "is_best": int(is_best),
                 }
