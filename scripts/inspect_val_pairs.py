@@ -21,7 +21,14 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+
+# Default number of fixed lead bins for the long-lead RMSE_K stratification. The
+# val split is full for every run in the matrix, so np.linspace(0, max_lead,
+# LEAD_BINS + 1) yields identical edges across A/B/C1/C2/Full — the comparison
+# requirement from the plan (per-bin weighting held identical across runs).
+LEAD_BINS = 12
 
 # Conditioning columns to stratify by, per benchmark. The base set applies to
 # all benchmarks; benchmark extras are appended when present and varying.
@@ -236,8 +243,140 @@ def report_tails(latest: pd.DataFrame, cond_cols: list[str]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# long-lead OOD stratification (lead-binned RMSE_K, slope fit, post-cutoff AUC)
+# --------------------------------------------------------------------------- #
+
+def _fixed_lead_edges(latest: pd.DataFrame, nbins: int) -> np.ndarray | None:
+    """Fixed lead-bin edges over [0, max t_bar]. Identical across runs sharing
+    the same (full) val split, so per-bin comparisons are apples-to-apples."""
+    if not _is_varying_numeric(latest, "t_bar"):
+        return None
+    hi = float(latest["t_bar"].max())
+    if not np.isfinite(hi) or hi <= 0.0:
+        return None
+    return np.linspace(0.0, hi, int(nbins) + 1)
+
+
+def _lead_binned_rmse_k(latest: pd.DataFrame, edges: np.ndarray) -> pd.DataFrame:
+    """Per lead bin: pooled mean RMSE_K, per-sim mean RMSE_K (each sim weighted
+    equally), rel_l2, and pair/sim counts. Centers are the bin midpoints."""
+    cats = pd.cut(latest["t_bar"], bins=edges, include_lowest=True)
+    g = latest.groupby(cats, observed=False)
+    per_sim = (
+        latest.groupby([cats, "sim_id"], observed=False)["rmse_K"].mean()
+        .groupby(level=0, observed=False).mean()
+    )
+    table = pd.DataFrame({
+        "lead_lo": [float(i.left) for i in g.size().index],
+        "lead_hi": [float(i.right) for i in g.size().index],
+        "lead_mid": [float(i.mid) for i in g.size().index],
+        "rmse_K_pooled": g["rmse_K"].mean().to_numpy(),
+        "rmse_K_persim": per_sim.to_numpy(),
+        "rel_l2_pooled": (g["rel_l2"].mean().to_numpy()
+                          if "rel_l2" in latest.columns else np.nan),
+        "n_pairs": g.size().to_numpy(),
+        "n_sims": g["sim_id"].nunique().to_numpy(),
+    })
+    return table
+
+
+def _slope_fit(tau: np.ndarray, err: np.ndarray) -> tuple[float, float]:
+    """Least-squares fit E(tau) = a + b*tau; returns (a, b). NaN if < 2 points."""
+    m = np.isfinite(tau) & np.isfinite(err)
+    if int(m.sum()) < 2:
+        return float("nan"), float("nan")
+    b, a = np.polyfit(tau[m], err[m], 1)
+    return float(a), float(b)
+
+
+def report_lead_binned_rmse_k(
+    latest: pd.DataFrame, lead_cutoff: float | None, nbins: int,
+) -> None:
+    print("\n=== 7. Lead-binned RMSE_K (fixed edges; per-sim + pooled) ===")
+    if "rmse_K" not in latest.columns or not pd.api.types.is_numeric_dtype(latest["rmse_K"]):
+        print("(rmse_K column missing or non-numeric)")
+        return
+    edges = _fixed_lead_edges(latest, nbins)
+    if edges is None:
+        print("(t_bar missing or constant; cannot bin by lead)")
+        return
+    table = _lead_binned_rmse_k(latest, edges)
+    print(f"fixed lead edges over [0, {edges[-1]:.4f}], {nbins} bins")
+    print(table.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+    if lead_cutoff is not None:
+        lead = latest["t_bar"].to_numpy()
+        err = latest["rmse_K"].to_numpy()
+        pre = lead <= float(lead_cutoff)
+        post = ~pre
+        print(f"\n-- split at lead_cutoff tau={lead_cutoff:g} --")
+
+        def _agg(mask: np.ndarray, label: str) -> None:
+            if not mask.any():
+                print(f"  {label}: (no pairs)")
+                return
+            sub = latest.loc[mask]
+            pooled = float(sub["rmse_K"].mean())
+            persim = float(sub.groupby("sim_id")["rmse_K"].mean().mean())
+            print(
+                f"  {label}: rmse_K pooled={pooled:.4f}K per-sim={persim:.4f}K "
+                f"(n_pairs={int(mask.sum())}, n_sims={sub['sim_id'].nunique()})"
+            )
+
+        _agg(pre, "tau<=tc")
+        _agg(post, "tau> tc")
+
+        # Post-cutoff error-curve area (trapezoid over the shared fixed bins).
+        post_tbl = table[table["lead_mid"] > float(lead_cutoff)]
+        finite = post_tbl.dropna(subset=["rmse_K_persim"])
+        if len(finite) >= 2:
+            auc = float(np.trapz(finite["rmse_K_persim"], finite["lead_mid"]))
+            print(f"  post-cutoff AUC (per-sim rmse_K over lead) = {auc:.5f} K*lead")
+        # Fitted slope over the post-cutoff region (per-pair points).
+        a, b = _slope_fit(lead[post], err[post])
+        print(f"  post-cutoff E(tau)=a+b*tau fit: a={a:.4f}K  b={b:.4f}K/lead")
+        a0, b0 = _slope_fit(lead[pre], err[pre])
+        print(f"  pre-cutoff  E(tau)=a+b*tau fit: a={a0:.4f}K  b={b0:.4f}K/lead")
+
+
+# --------------------------------------------------------------------------- #
 # plots
 # --------------------------------------------------------------------------- #
+
+def plot_lead_binned_rmse_k(
+    latest: pd.DataFrame, lead_cutoff: float | None, nbins: int, out: Path,
+) -> None:
+    if "rmse_K" not in latest.columns or not pd.api.types.is_numeric_dtype(latest["rmse_K"]):
+        print("  [skip] 06_lead_binned_rmse_k: rmse_K missing")
+        return
+    edges = _fixed_lead_edges(latest, nbins)
+    if edges is None:
+        print("  [skip] 06_lead_binned_rmse_k: t_bar missing or constant")
+        return
+    table = _lead_binned_rmse_k(latest, edges)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(table["lead_mid"], table["rmse_K_pooled"], marker="o", label="pooled")
+    ax.plot(table["lead_mid"], table["rmse_K_persim"], marker="s", label="per-sim")
+    if lead_cutoff is not None:
+        ax.axvline(float(lead_cutoff), color="k", linestyle="--", alpha=0.6,
+                   label=f"cutoff tau={lead_cutoff:g}")
+        lead = latest["t_bar"].to_numpy()
+        err = latest["rmse_K"].to_numpy()
+        post = lead > float(lead_cutoff)
+        a, b = _slope_fit(lead[post], err[post])
+        if np.isfinite(b):
+            xs = np.array([float(lead_cutoff), float(edges[-1])])
+            ax.plot(xs, a + b * xs, color="crimson", linestyle=":",
+                    label=f"post-cutoff fit b={b:.3f}")
+    ax.set_xlabel("prediction lead tau = t_j - t_s")
+    ax.set_ylabel("RMSE_K")
+    ax.set_title("Lead-binned RMSE_K (long-lead OOD stratification)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out / "06_lead_binned_rmse_k.png", dpi=130)
+    plt.close(fig)
+
 
 def plot_training_curves(df: pd.DataFrame, out: Path) -> None:
     agg = df.groupby("epoch")["rel_l2"].agg(["mean", "median", _quantile(0.9), _quantile(0.99)])
@@ -427,6 +566,19 @@ def main() -> None:
         default=None,
         help="Output directory for plots (default: <repo>/visual/val_pairs/)",
     )
+    parser.add_argument(
+        "--lead-cutoff",
+        type=float,
+        default=None,
+        help="Physical lead cutoff tau=t_j-t_s (e.g. 0.2) for pre/post-cutoff "
+        "RMSE_K, slope fit, and post-cutoff AUC. Omit to skip the split.",
+    )
+    parser.add_argument(
+        "--lead-bins",
+        type=int,
+        default=LEAD_BINS,
+        help=f"Number of fixed lead bins for the RMSE_K curve (default {LEAD_BINS}).",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -452,11 +604,13 @@ def main() -> None:
     report_structure(latest, benchmark)
     report_between_vs_within(latest)
     report_tails(latest, cond_cols)
+    report_lead_binned_rmse_k(latest, args.lead_cutoff, args.lead_bins)
 
     plot_training_curves(df, out)
     plot_regime_stratification(latest, cond_cols, out)
     plot_lead_time(latest, out)
     plot_interface_ratio(latest, out)
+    plot_lead_binned_rmse_k(latest, args.lead_cutoff, args.lead_bins, out)
     plot_structure(latest, benchmark, out)
 
     print(f"\nPlots written to {out}/")

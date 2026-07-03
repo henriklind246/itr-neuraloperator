@@ -289,6 +289,8 @@ class SnapshotPairDataset(Dataset):
         ramp_seconds: float | None = None,
         temporal_samples: int = TEMPORAL_SAMPLES,
         problem: ProblemSpec | None = None,
+        max_target_time: float | None = None,
+        max_lead_time: float | None = None,
     ):
         self.problem = problem if problem is not None else get_problem("forcing")
         self.trajectories = trajectories  # (num_sims, Nt, Nx, Ny)
@@ -309,6 +311,17 @@ class SnapshotPairDataset(Dataset):
         # consumes a(t) directly through TEMPORAL_BUILDERS, not via dt/tau.
         self.t_final = float(t_final) if t_final is not None else float(self.t_grid[-1])
         self.dt = float(dt) if dt is not None else float(self.t_grid[1] - self.t_grid[0])
+
+        # TRAIN-split pair truncation (long-lead OOD adaptation). Both None =
+        # legacy full-pair set. Applied in _build_all_pairs with a +eps tolerance
+        # so a pair landing exactly on the cutoff is kept, not dropped by float
+        # noise. Set only on the train dataset by create_dataloaders.
+        self.max_target_time = (
+            float(max_target_time) if max_target_time is not None else None
+        )
+        self.max_lead_time = (
+            float(max_lead_time) if max_lead_time is not None else None
+        )
 
         # Trained normalization horizon for temporal model-input features ONLY.
         # Defaults to the physical horizon so non-OOD behavior is identical; an
@@ -364,12 +377,26 @@ class SnapshotPairDataset(Dataset):
         self._active_len = len(self._pairs)
 
     def _build_all_pairs(self):
-        """Enumerate all valid (sim_id, s, j) pairs from subsampled time indices."""
+        """Enumerate all valid (sim_id, s, j) pairs from subsampled time indices.
+
+        When ``max_lead_time`` / ``max_target_time`` are set (train-split
+        truncation) a pair is skipped if its lead ``t_j - t_s`` or absolute
+        target ``t_j`` exceeds the cap. The comparison uses a ``+eps = 0.5*dt``
+        tolerance so a pair landing exactly on the cutoff survives float noise
+        (and future dt changes) rather than being dropped.
+        """
+        eps = 0.5 * self.dt
         pairs = []
         for sim_id in self.sim_ids:
             for i, s_idx in enumerate(self.t_indices):
                 for j_idx in self.t_indices[i + 1:]:
                     lead = float(self.t_grid[j_idx] - self.t_grid[s_idx])
+                    if (self.max_lead_time is not None
+                            and lead > self.max_lead_time + eps):
+                        continue
+                    if (self.max_target_time is not None
+                            and float(self.t_grid[j_idx]) > self.max_target_time + eps):
+                        continue
                     pairs.append((int(sim_id), int(s_idx), int(j_idx), lead))
         # Sort by lead time for curriculum slicing
         pairs.sort(key=lambda p: p[3])
@@ -711,12 +738,29 @@ def split_sim_ids(
 def compute_global_stats(
     trajectories: np.ndarray,
     train_ids: np.ndarray,
+    t_grid: np.ndarray | None = None,
+    max_time: float | None = None,
 ) -> tuple[float, float]:
     """Compute global mean/std from training simulations only (avoids data leakage).
+
+    When ``max_time`` (and ``t_grid``) are given, only snapshots with
+    ``t <= max_time`` contribute — the windowed variant for a future absolute-
+    time OOD study where late-time fields must not leak into normalization. The
+    long-lead headline leaves ``max_time=None`` (full-trajectory stats, identical
+    across every run), so this path is byte-identical to before by default.
 
     Returns (mu_global, sigma_global) as Python floats.
     """
     train_data = trajectories[train_ids]  # (N_train, Nt, Nx, Ny)
+    if max_time is not None:
+        if t_grid is None:
+            raise ValueError("compute_global_stats: max_time requires t_grid.")
+        keep = np.asarray(t_grid) <= float(max_time) + 1e-9
+        if not keep.any():
+            raise ValueError(
+                f"compute_global_stats: max_time={max_time} keeps no snapshots."
+            )
+        train_data = train_data[:, keep]
     mu_global = float(train_data.mean())
     sigma_global = float(train_data.std())
     return mu_global, sigma_global
@@ -749,6 +793,8 @@ def create_dataloaders(
     rank: int = 0,
     sampler_seed: int = 0,
     problem: ProblemSpec | None = None,
+    train_max_target_time: float | None = None,
+    train_max_lead_time: float | None = None,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader]:
     """Build train/val/test loaders.
 
@@ -794,6 +840,8 @@ def create_dataloaders(
         ramp_seconds=ramp_seconds,
         temporal_samples=temporal_samples,
         problem=problem,
+        max_target_time=train_max_target_time,
+        max_lead_time=train_max_lead_time,
     )
 
     val_dataset = SnapshotPairDataset(

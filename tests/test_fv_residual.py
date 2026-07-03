@@ -498,7 +498,12 @@ def test_physics_lambda_zero_is_true_noop():
     noop_metrics, noop_rng = _run_epoch(physics_loader, 0.0, geom_cfg)
 
     assert torch.equal(base_rng, noop_rng), "physics branch perturbed the RNG at lambda=0"
+    # Wall-clock timing columns are inherently non-deterministic; compare the
+    # numeric training metrics only.
+    _timing = {"epoch_train_s", "epoch_wall_s"}
     for k in base_metrics:
+        if k in _timing:
+            continue
         assert base_metrics[k] == noop_metrics[k], f"metric {k} changed at lambda=0"
     assert noop_metrics["physics_loss"] == 0.0
 

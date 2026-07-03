@@ -23,6 +23,7 @@ UNIVERSAL_PNGS = {
     "02_regime_stratification.png",
     "03_error_vs_lead_time.png",
     "04_interface_vs_bulk.png",
+    "06_lead_binned_rmse_k.png",
 }
 STRUCTURE_PNG = {
     "forcing": "05_ic_family_heatmap.png",

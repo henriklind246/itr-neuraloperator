@@ -80,8 +80,27 @@ training:
   #   val_rel_l2    (default) normalized-space relative L2 — unchanged baseline
   #   val_nrmse     per-sample nRMSE headline (normalization-invariant)
   #   val_jump_nrmse normalized node-jump error (interface fidelity)
-  # All three are minimized; unknown values fall back to val_rel_l2.
+  #   val_rmse_K_lead_gt_tc  post-cutoff (tau > lead_cutoff_time) RMSE in Kelvin;
+  #                          the long-lead adaptation objective. Requires
+  #                          training.lead_cutoff_time to be set. Honors
+  #                          checkpoint_forgetting_ratio (no-forgetting guard).
+  # All are minimized; unknown values fall back to val_rel_l2.
   checkpoint_metric: "val_rel_l2"
+  # Physical lead threshold tc (seconds) splitting val pairs into tau <= tc /
+  # tau > tc for the pre/post-cutoff diagnostics and the val_rmse_K_lead_gt_tc
+  # checkpoint metric. null disables the split (all pre/post columns stay blank).
+  lead_cutoff_time: null
+  # No-forgetting guard for checkpoint_metric=val_rmse_K_lead_gt_tc: only accept
+  # an epoch whose pre-cutoff RMSE_K (tau <= tc) <= ratio * pre_cutoff_ref, where
+  # pre_cutoff_ref is model A's pre-cutoff RMSE_K captured by the step-0 (pre-
+  # finetune) validation pass. null disables the guard.
+  checkpoint_forgetting_ratio: null
+  # Weights-only warm-start. null = fresh init (or auto-resume of full state from
+  # fno2d_latest.pt in the run dir, which is untouched). When set (and NOT auto-
+  # resuming) load only model_state from this checkpoint; optimizer/scheduler/
+  # epoch/best_val start fresh (peak LR = training.learning_rate). The
+  # checkpoint's (mu_global, sigma_global) must equal the recomputed stats.
+  init_from_checkpoint: null
   seeds: [42]
   # DataLoader workers per rank. `null` derives from SLURM_CPUS_PER_TASK /
   # world_size at runtime; set an int to override.
@@ -96,6 +115,39 @@ training:
   physics:
     lambda_data: 1.0
     lambda_physics: 0.0
+    # Linear physics-weight ramp: effective lambda_physics is scaled by
+    # min(1, epoch / lambda_physics_ramp_epochs). 0 = no ramp (unchanged).
+    lambda_physics_ramp_epochs: 0
+    # Restrict the collocation source snapshot to grid times in
+    # [collocation_source_time_min, collocation_source_time_max]. Both null =
+    # legacy random source (byte-identical). A single pinned source is min==max.
+    # Under a long-lead window the max feasible source is t_final - lead - dt, so
+    # this range and the lead window are feasibility-coupled (see sampling below).
+    collocation_source_time_min: null
+    collocation_source_time_max: null
+    # Lead sampling for the generic (forcing) collocation path:
+    #   null  -> legacy uniform-lead draw over [max(dt, collocation_lead_min),
+    #            cur_max_lead(epoch)] (may under-sample the longest leads).
+    #   int N -> lead-bin-first: draw one of N equal-width bins over the active
+    #            window uniformly, draw a lead inside it, then draw a source
+    #            uniformly from those feasible (t_s + lead + dt <= t_final). Gives
+    #            the hardest leads equal collocation mass, matching validation.
+    collocation_lead_bins: null
+    # Lower bound (seconds) on NON-bridge collocation leads so the residual sits
+    # in the unlabeled band tau > tc. null = legacy dt lower bound.
+    collocation_lead_min: null
+    # Cutoff bridge: trusted state at the last supervised lead. When
+    # anchor_lead_time is set, a fraction (anchor_fraction) of the collocation
+    # batch is drawn as bridge rows enforcing R_FV(T_true(t_s + anchor_lead),
+    # model(t_s + anchor_lead + dt)); the true cutoff snapshot (detached) is
+    # injected as the residual's first state via the existing anchor mechanism.
+    # null / 0.0 = no bridge rows (generic path unchanged).
+    anchor_lead_time: null
+    anchor_fraction: 0.0
+    # Optional grad-balance diagnostic: two extra backwards on a few fixed
+    # batches to log ||grad L_data||, ||grad L_phys|| and their cosine at step 0,
+    # after the physics ramp, and near the end. Default off (not a training cost).
+    log_grad_norms: false
     # IC/anchor loss weight pinning model(T_0, t=0) ~ T_0. Default OFF. REQUIRED
     # (> 0) for any diffusion physics/anchor run to break the constant-300
     # degeneracy: T == 300 satisfies the homogeneous PDE and every BC, so a
@@ -180,6 +232,20 @@ data:
   # the active `benchmark` config group (per-benchmark representation).
   y_shape: "B, Nx, Ny, 1"
   num_sims: 8000
+  # TRAIN-split lead/target truncation (long-lead OOD adaptation). Both null =
+  # legacy full-pair train set (byte-identical). Applied ONLY to the train
+  # dataset; val/test always span every lead so evaluation covers (0, t_final].
+  #   train_max_lead_time:   drop train pairs with lead tau = t_j - t_s > this
+  #                          (headline knob; e.g. 0.2 with t_final = 0.3).
+  #   train_max_target_time: drop train pairs with absolute target t_j > this.
+  # A +eps = 0.5*dt tolerance keeps a pair landing exactly on the cutoff.
+  train_max_target_time: null
+  train_max_lead_time: null
+  # Optional windowed normalization horizon for a future absolute-time variant
+  # (compute_global_stats restricts to snapshots with t <= norm_max_time). null
+  # = full-trajectory stats (used by every long-lead run; no leakage under
+  # lead-holdout since stats never expose the T(t_s) -> T(t_j) mapping).
+  norm_max_time: null
 
 evaluation:
   rollout:
