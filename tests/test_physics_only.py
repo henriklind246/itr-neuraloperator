@@ -175,6 +175,50 @@ def test_ic_loss_zero_when_prediction_matches_T0():
     assert ic_none is None
 
 
+# --- 3b. hard right-Dirichlet output constraint zeros the right_dirichlet MSE -
+
+
+def _hard_bc_fno(t_right_norm, *, seed=0):
+    """A real FNO2d matching the `_StubColloc` batch layout (4 spatial channels,
+    2 cond-static dims, 2-dim forcing tokens) with the hard right-Dirichlet
+    constraint enabled and its wall value set to `t_right_norm`."""
+    from src.operators.fno2d import FNO2d
+
+    torch.manual_seed(seed)
+    return FNO2d(
+        modes1=2, modes2=2, width=8,
+        in_channels=4, out_channels=1, n_layers=2,
+        cond_static_dim=2, temporal_token_dim=2,
+        temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+        hard_right_dirichlet=True, t_right_norm=t_right_norm,
+    )
+
+
+def test_hard_right_dirichlet_zeros_phys_right_dirichlet_mse():
+    """With the hard right-Dirichlet constraint set to the collocation geom's
+    `T_right_tilde`, both collocation forwards pin the right wall to the exact BC
+    value, so the `right_dirichlet` region residual is at the numeric floor
+    (< 1e-12). A model whose wall value is mismatched leaves a real residual, so
+    the gate is not vacuous."""
+    device = torch.device("cpu")
+    sampler = _StubColloc(Nx=11, Ny=11)
+    t_right = float(sampler.geom_cfg["T_right_tilde"])  # 0.0
+
+    matched = _hard_bc_fno(t_right)
+    out, _b, _ic = _collocation_batch_loss(
+        matched, sampler, 0.05, None, device, lambda_ic=0.0
+    )
+    assert float(out["phys_right_dirichlet_mse"]) < 1e-12
+
+    # A mismatched wall value (t_right_tilde + 1) leaves a non-trivial residual.
+    sampler2 = _StubColloc(Nx=11, Ny=11)
+    mismatched = _hard_bc_fno(t_right + 1.0)
+    out2, _b2, _ic2 = _collocation_batch_loss(
+        mismatched, sampler2, 0.05, None, device, lambda_ic=0.0
+    )
+    assert float(out2["phys_right_dirichlet_mse"]) > 1e-6
+
+
 # --- 4/6. physics-only loop: skip-proof + optimization mechanics -------------
 
 
@@ -247,6 +291,114 @@ def test_physics_only_optimization_mechanics(monkeypatch):
 
     assert counts["step"] == n_steps
     assert counts["clip"] == n_steps
+
+
+# --- 4c. IC-anchoring warm-up (Step 5): freeze cadence + IC up-weight --------
+
+
+from src.operators.train import CollocationSampler, _compose_physics_total
+
+
+class _WarmupColloc(_StubColloc):
+    """`_StubColloc` wearing the REAL `CollocationSampler` freeze-cache methods so
+    the warm-up cadence exercises the production caching wrapper (not a re-impl).
+    `_draw_collocation_batch` counts genuine fresh draws; frozen steps reuse the
+    cache and never bump the counter."""
+
+    set_frozen = CollocationSampler.set_frozen
+    enable_freeze_cache = CollocationSampler.enable_freeze_cache
+    reset_freeze_cache = CollocationSampler.reset_freeze_cache
+    sample_batch = CollocationSampler.sample_batch
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._freeze_enabled = False
+        self._frozen = False
+        self._batch_cache = None
+        self._cache_leads = None
+        self._cache_bin_ids = None
+        self._cache_anchor = None
+        self._last_leads = None
+        self._last_lead_bin_ids = None
+        self._last_anchor = None
+        self.draws = 0
+
+    def _draw_collocation_batch(self, max_lead):
+        self.draws += 1
+        return _StubColloc.sample_batch(self, max_lead)
+
+
+def _run_warmup_epoch(sampler, warmup, n_steps, global_step_start=0):
+    model = _IdentityModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    loader = _ExplodingLoader(n_steps)
+    return train_one_epoch(
+        model=model, train_loader=loader, optimizer=optimizer,
+        loss_fn=lambda *a, **k: None, device=torch.device("cpu"),
+        physics_collocation=sampler, collocation_max_lead=0.05,
+        lambda_data=0.0, lambda_physics=1.0, lambda_ic=1.0,
+        warmup=warmup, global_step_start=global_step_start,
+    )
+
+
+def test_warmup_freezes_resample_cadence():
+    """During warm-up the collocation batch is redrawn once per `resample_every`
+    optimizer steps (steps 0, R, 2R, ...); the intervening frozen steps reuse the
+    cache. For 6 steps at resample_every=3 -> fresh draws at gstep 0 and 3 = 2."""
+    sampler = _WarmupColloc()
+    warmup = {"enabled": True, "steps": 100, "resample_every": 3, "ic_multiplier": 5.0}
+    _run_warmup_epoch(sampler, warmup, n_steps=6)
+    assert sampler.draws == 2
+
+
+def test_warmup_reverts_to_per_step_after_steps():
+    """After `warmup.steps` optimizer steps the cadence reverts to a fresh draw
+    every step. With steps=2, resample_every=3 over 6 steps: gstep0 fresh, gstep1
+    frozen (within warm-up), gsteps 2-5 fresh (past warm-up) -> 1 + 4 = 5 draws."""
+    sampler = _WarmupColloc()
+    warmup = {"enabled": True, "steps": 2, "resample_every": 3, "ic_multiplier": 5.0}
+    _run_warmup_epoch(sampler, warmup, n_steps=6)
+    assert sampler.draws == 5
+
+
+def test_warmup_disabled_draws_every_step():
+    """Warm-up off (default) -> the sampler is drawn fresh every optimizer step and
+    the freeze cache is never armed (bit-identical cadence to the pre-Step-5 loop)."""
+    sampler = _WarmupColloc()
+    _run_warmup_epoch(sampler, {"enabled": False}, n_steps=5)
+    assert sampler.draws == 5
+    assert sampler._freeze_enabled is False
+    assert sampler._batch_cache is None
+
+
+def test_warmup_global_step_counter_advances():
+    """`global_optimizer_step` starts at `global_step_start` and advances by exactly
+    one per optimizer step, so run_one_seed can checkpoint/resume the warm-up
+    boundary without reconstructing epoch * steps_per_epoch."""
+    sampler = _WarmupColloc()
+    warmup = {"enabled": True, "steps": 100, "resample_every": 3, "ic_multiplier": 5.0}
+    metrics = _run_warmup_epoch(sampler, warmup, n_steps=4, global_step_start=10)
+    assert int(metrics["global_optimizer_step"]) == 14
+
+
+def test_warmup_ic_multiplier_scales_only_ic_term():
+    """The IC up-weight multiplies the IC coefficient AFTER any GradNorm multiplier
+    (legacy branch: gradnorm=None). Raising `ic_multiplier` from 1 to m scales the
+    IC contribution by m and leaves the physics contribution untouched, so the
+    totals differ by exactly `(m - 1) * lambda_ic * ic`."""
+    device = torch.device("cpu")
+    phys = torch.tensor(0.7)
+    ic = torch.tensor(0.3)
+    out = {"physics_loss_weighted": phys}
+    common = dict(
+        out=out, data_loss=None, ic=ic, causal_weighter=None, gradnorm=None,
+        model_unwrapped=None, dist_info=None,
+        lambda_data=0.0, lambda_physics=1.0, lambda_ic=2.0, region_weights=None,
+    )
+    total1, _, _ = _compose_physics_total(ic_multiplier=1.0, **common)
+    total5, _, _ = _compose_physics_total(ic_multiplier=5.0, **common)
+    # physics part identical; IC part scales 1 -> 5 at lambda_ic=2, ic=0.3.
+    assert abs(float(total5) - float(total1) - (5.0 - 1.0) * 2.0 * 0.3) < 1e-6
 
 
 # --- 5. fail-fast when no loss term is active --------------------------------
@@ -355,6 +507,335 @@ def test_collocation_draws_confined_to_train_ids(monkeypatch):
     assert drawn, "sampler drew no sim ids"
     assert drawn.issubset(set(train_ids.tolist()))
     assert drawn.isdisjoint(set(val_ids.tolist()))
+
+
+# --- 8b. on-grid path records _last_leads (interval midpoints) + bin ids ------
+
+
+def _on_grid_sampler_with_capture(monkeypatch, batch_size=8, dt=0.01, n_t=11,
+                                  bin_spec=None):
+    """Build a real DiffusionProblem on-grid CollocationSampler with the heavy
+    item builders stubbed, capturing the per-row `t` (first of each on-grid pair)
+    so a test can reconstruct the expected interval midpoints independently of
+    the sampler's RNG."""
+    import src.operators.train as train_mod
+    from src.operators.train import CollocationSampler
+
+    spec = DiffusionProblem()
+    t_grid = np.arange(n_t) * dt
+
+    class _DS:
+        def __init__(self):
+            self.x_grid = np.linspace(0.0, 1.0, 4)
+            self.y_grid = np.linspace(0.0, 1.0, 5)
+            self.Ny = 5
+            self.t_grid = t_grid
+            self.t_final = float(t_grid[-1])
+            self.sim_ids = np.array([0, 1, 2, 3, 4])
+            self.sim_params = {int(i): {} for i in range(5)}
+            self.problem = self
+
+        def build_item(self, ds, sid, s, j):
+            return {"spatial": np.zeros((4, 5, 1), dtype=np.float32)}
+
+    ts_calls = []
+
+    def _fake_rollout(base_item, ds, spc, sid, current, t_lo, t_hi):
+        ts_calls.append(round(float(t_hi), 9))
+        return {"x": np.zeros(1, np.float32)}
+
+    monkeypatch.setattr(train_mod, "build_rollout_item_from_base", _fake_rollout)
+    monkeypatch.setattr(train_mod, "collate_fn", lambda items: items)
+
+    ds = _DS()
+    geom_cfg = spec.collocation_geom_cfg(ds, {}, 300.0, 10.0, dt)
+    base_plan = spec.collocation_base_plan(ds, dt)
+    sampler = CollocationSampler(
+        ds, spec, geom_cfg, batch_size=batch_size, dt=dt, rng_seed=0,
+        base_plan=base_plan,
+    )
+    sampler.bin_spec = bin_spec
+    return sampler, ts_calls, dt
+
+
+def test_on_grid_records_last_leads_as_midpoints(monkeypatch):
+    """The on-grid path (diffusion) populates `_last_leads` with the CN interval
+    midpoint `(n + 0.5) * dt` per row in draw order — previously it set neither
+    field (the bug that left `phys_lead_hist` empty for diffusion)."""
+    sampler, ts_calls, dt = _on_grid_sampler_with_capture(monkeypatch)
+    sampler.sample_batch(max_lead=0.05)
+
+    leads = sampler._last_leads
+    assert leads is not None
+    assert leads.shape == (8,)
+    # Each lead is an interval midpoint: leads/dt - 0.5 is a non-negative integer.
+    steps = leads / dt - 0.5
+    np.testing.assert_allclose(steps, np.round(steps), atol=1e-9)
+    assert (steps >= 0).all()
+
+    # Draw order matches the captured `t` (every other rollout call is the pair's
+    # first time `t = n*dt`; base snapshot index 0 -> t_s = 0).
+    t_firsts = np.asarray(ts_calls[0::2], dtype=float)
+    np.testing.assert_allclose(leads, t_firsts + 0.5 * dt, atol=1e-9)
+
+    # With no bin spec attached, bin ids stay None (bit-identical legacy path).
+    assert sampler._last_lead_bin_ids is None
+
+
+def test_on_grid_bin_ids_match_spec(monkeypatch):
+    """With a shared `TemporalBinSpec` attached, `_last_lead_bin_ids` equals
+    `spec.interval_to_bin(_last_leads)` row-for-row."""
+    from src.operators.train import TemporalBinSpec
+
+    dt = 0.01
+    n_t = 11
+    # On-grid midpoint domain: [0.5*dt, t_final - 0.5*dt].
+    spec = TemporalBinSpec(lead_lo=0.5 * dt, lead_hi=(n_t - 1) * dt - 0.5 * dt,
+                           n_bins=5)
+    sampler, _, _ = _on_grid_sampler_with_capture(
+        monkeypatch, dt=dt, n_t=n_t, bin_spec=spec
+    )
+    sampler.sample_batch(max_lead=0.10)
+
+    ids = sampler._last_lead_bin_ids
+    assert ids is not None
+    expected = spec.interval_to_bin(sampler._last_leads)
+    np.testing.assert_array_equal(ids, expected)
+    assert (ids >= 0).all() and (ids < spec.n_bins).all()
+
+
+def test_temporal_bin_spec_edges_and_active():
+    """`TemporalBinSpec` edges/clamp/active-mask behave as specified."""
+    from src.operators.train import TemporalBinSpec
+
+    spec = TemporalBinSpec(lead_lo=0.0, lead_hi=1.0, n_bins=4)
+    np.testing.assert_allclose(spec.bin_edges, [0.0, 0.25, 0.5, 0.75, 1.0])
+    # Clamp at/beyond the edges.
+    assert int(spec.interval_to_bin(-5.0)) == 0
+    assert int(spec.interval_to_bin(5.0)) == 3
+    assert int(spec.interval_to_bin(0.0)) == 0
+    assert int(spec.interval_to_bin(1.0)) == 3
+    # Interior mapping.
+    assert int(spec.interval_to_bin(0.3)) == 1
+    # Active mask: window [0.6, 0.9] overlaps bins 2 (0.5-0.75) and 3 (0.75-1.0).
+    active = spec.active_bins(0.6, 0.9)
+    np.testing.assert_array_equal(active, [False, False, True, True])
+
+
+# --- 8c. Step 1: block-structured on-grid lead stratification ----------------
+
+
+def _stratified_on_grid_sampler(monkeypatch, *, batch_size, dt, n_t, n_bins,
+                                anchored=False):
+    """Build a DiffusionProblem on-grid CollocationSampler with `stratify_leads`
+    on and the shared on-grid `TemporalBinSpec` attached, capturing the per-row
+    `sid` in draw order (via the stubbed `build_item`) so a test can assert the
+    per-bin sim-id multiset. Returns `(sampler, sids)` where `sids` is filled on
+    each `sample_batch` call."""
+    import src.operators.train as train_mod
+    from src.operators.train import CollocationSampler, TemporalBinSpec
+
+    spec = DiffusionProblem()
+    t_grid = np.arange(n_t) * dt
+    sids: list[int] = []
+
+    class _DS:
+        def __init__(self):
+            self.x_grid = np.linspace(0.0, 1.0, 4)
+            self.y_grid = np.linspace(0.0, 1.0, 5)
+            self.Ny = 5
+            self.t_grid = t_grid
+            self.t_final = float(t_grid[-1])
+            self.sim_ids = np.array([0, 1, 2, 3, 4])
+            self.sim_params = {int(i): {} for i in range(5)}
+            self.problem = self
+
+        def build_item(self, ds, sid, s, j):
+            sids.append(int(sid))
+            return {"spatial": np.zeros((4, 5, 1), dtype=np.float32)}
+
+    monkeypatch.setattr(
+        train_mod, "build_rollout_item_from_base",
+        lambda base_item, ds, spc, sid, current, t_lo, t_hi: {
+            "x": np.zeros(1, np.float32)
+        },
+    )
+    monkeypatch.setattr(train_mod, "collate_fn", lambda items: items)
+
+    ds = _DS()
+    geom_cfg = spec.collocation_geom_cfg(ds, {}, 300.0, 10.0, dt)
+    base_plan = spec.collocation_base_plan(ds, dt)
+    sampler = CollocationSampler(
+        ds, spec, geom_cfg, batch_size=batch_size, dt=dt, rng_seed=0,
+        base_plan=base_plan, anchored_first_step=anchored, stratify_leads=True,
+    )
+    # On-grid midpoint domain, exactly as _make_temporal_bin_spec builds it.
+    sampler.bin_spec = TemporalBinSpec(
+        lead_lo=0.5 * dt, lead_hi=float(t_grid[-1]) - 0.5 * dt, n_bins=n_bins,
+    )
+    return sampler, sids
+
+
+def test_stratified_per_chunk_allocation_and_in_chunk(monkeypatch):
+    """B=48, 6 bins, n_max=11 -> 12 CN intervals split into 6 contiguous pairs;
+    every bin is populated by exactly B/6=8 rows whose `n` lies in that bin's
+    2-element chunk."""
+    dt = 0.01
+    # n_t=13 -> t_grid[0..12]; max_lead=0.12 -> n_max=min(12-1, 13-2)=11.
+    sampler, _ = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=dt, n_t=13, n_bins=6,
+    )
+    sampler.sample_batch(max_lead=0.12)
+
+    ids = sampler._last_lead_bin_ids
+    leads = sampler._last_leads
+    assert ids is not None and leads.shape == (48,)
+    # Every bin is populated equally (8 each) and no bin is empty.
+    counts = np.bincount(ids, minlength=6)
+    np.testing.assert_array_equal(counts, np.full(6, 8))
+    # In-chunk: bin b holds exactly the two intervals {2b, 2b+1}.
+    n_vals = np.round(leads / dt - 0.5).astype(int)
+    for b in range(6):
+        drawn = set(n_vals[ids == b].tolist())
+        assert drawn.issubset({2 * b, 2 * b + 1}), (b, drawn)
+
+
+def test_stratified_per_bin_sim_id_multiset_identical(monkeypatch):
+    """Block-structured balance: for a fixed seed every populated bin sees the
+    SAME multiset of sim ids (so a later bin's higher residual reflects longer
+    lead, not a harder set of input functions)."""
+    dt = 0.01
+    sampler, sids = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=dt, n_t=13, n_bins=6,
+    )
+    sampler.sample_batch(max_lead=0.12)
+
+    ids = np.asarray(sampler._last_lead_bin_ids)
+    sid_arr = np.asarray(sids)
+    assert sid_arr.shape == ids.shape
+    active = [b for b in range(6) if (ids == b).any()]
+    ref = sorted(sid_arr[ids == active[0]].tolist())
+    for b in active[1:]:
+        assert sorted(sid_arr[ids == b].tolist()) == ref
+
+
+def test_stratified_bin_ids_match_spec_rowwise(monkeypatch):
+    """With stratification on, `_last_lead_bin_ids` still equals
+    `spec.interval_to_bin(_last_leads)` row-for-row (chunk id == recorded bin)."""
+    sampler, _ = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=0.01, n_t=13, n_bins=6,
+    )
+    sampler.sample_batch(max_lead=0.12)
+    expected = sampler.bin_spec.interval_to_bin(sampler._last_leads)
+    np.testing.assert_array_equal(sampler._last_lead_bin_ids, expected)
+
+
+def test_stratified_same_seed_lockstep(monkeypatch):
+    """Two same-seed stratified samplers draw byte-identical batches (DDP ranks
+    stay in lockstep given the single rng stream)."""
+    a, _ = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=0.01, n_t=13, n_bins=6,
+    )
+    b, _ = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=0.01, n_t=13, n_bins=6,
+    )
+    a.sample_batch(max_lead=0.12)
+    b.sample_batch(max_lead=0.12)
+    np.testing.assert_array_equal(a._last_leads, b._last_leads)
+    np.testing.assert_array_equal(a._last_lead_bin_ids, b._last_lead_bin_ids)
+
+
+def test_stratified_degenerate_n_max_below_n_bins(monkeypatch):
+    """When fewer valid CN intervals than bins exist (short lead window), empty
+    bins are skipped: every drawn row still lands in a populated bin and the
+    batch stays exactly B rows (no crash on the degenerate split)."""
+    dt = 0.01
+    # max_lead=0.03 -> n_max=min(3-1, 13-2)=2 -> intervals n=0,1,2 only.
+    sampler, _ = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=dt, n_t=13, n_bins=6,
+    )
+    sampler.sample_batch(max_lead=0.03)
+
+    ids = np.asarray(sampler._last_lead_bin_ids)
+    assert ids.shape == (48,)
+    # Only the bins covering midpoints {0.005, 0.015, 0.025} are populated.
+    populated = set(ids.tolist())
+    expected_active = set(
+        int(sampler.bin_spec.interval_to_bin((np.arange(3) + 0.5) * dt)[i])
+        for i in range(3)
+    )
+    assert populated == expected_active
+    assert len(populated) < 6  # genuinely degenerate
+
+
+def test_stratified_anchored_marks_exactly_n0(monkeypatch):
+    """`anchored_first_step` composes with stratification: the anchor mask marks
+    exactly the `n==0` rows (bin 0 contains n=0)."""
+    dt = 0.01
+    sampler, _ = _stratified_on_grid_sampler(
+        monkeypatch, batch_size=48, dt=dt, n_t=13, n_bins=6, anchored=True,
+    )
+    sampler.sample_batch(max_lead=0.12)
+    mask, _T0 = sampler._last_anchor
+    n_vals = np.round(sampler._last_leads / dt - 0.5).astype(int)
+    np.testing.assert_array_equal(mask.numpy(), n_vals == 0)
+
+
+# --- 8d. Step 1: _build_collocation_sampler stratify guards ------------------
+
+
+class _GenericSpecStub:
+    """Minimal off-grid ProblemSpec: no base plan (generic/forcing path) and a
+    None geom_cfg so `_build_collocation_sampler` falls back to its two-slab
+    default -- enough to reach the stratify_leads on-grid-only guard."""
+
+    def collocation_base_plan(self, ds, dt):
+        return None
+
+    def collocation_geom_cfg(self, ds, phys_cfg, mu, sigma, dt):
+        return None
+
+
+def _guard_ds(dt=0.01, n_t=13):
+    t_grid = np.arange(n_t) * dt
+
+    class _DS:
+        def __init__(self):
+            self.x_grid = np.linspace(0.0, 1.0, 4)
+            self.y_grid = np.linspace(0.0, 1.0, 5)
+            self.Ny = 5
+            self.t_grid = t_grid
+            self.t_final = float(t_grid[-1])
+            self.sim_ids = np.array([0, 1, 2])
+            self.sim_params = {int(i): {} for i in range(3)}
+            self.problem = self
+
+    return _DS()
+
+
+def test_stratify_on_generic_path_raises(monkeypatch):
+    """`stratify_leads=true` on a benchmark whose base plan is off-grid raises a
+    ValueError pointing at the generic-path coverage knobs."""
+    from src.operators.train import _build_collocation_sampler
+
+    with pytest.raises(ValueError, match="on-grid-only"):
+        _build_collocation_sampler(
+            {}, {"stratify_leads": True, "dt": 0.01}, _guard_ds(),
+            _GenericSpecStub(), 300.0, 10.0, batch_size=8, rng_seed=0,
+        )
+
+
+def test_stratify_early_oversample_mutually_exclusive_raises(monkeypatch):
+    """`stratify_leads` and `early_time_oversample` are mutually exclusive on the
+    on-grid path; enabling both raises ValueError."""
+    from src.operators.train import _build_collocation_sampler
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _build_collocation_sampler(
+            {}, {"stratify_leads": True, "early_time_oversample": True},
+            _guard_ds(), DiffusionProblem(), 300.0, 10.0,
+            batch_size=8, rng_seed=0,
+        )
 
 
 # --- 9. zero-duration anchor item (t_s == t_j) is finite ---------------------

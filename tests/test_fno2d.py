@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from src.operators.fno2d import ConditionalInstanceNorm2d, FNO2d, TemporalForcingEncoder
@@ -329,3 +330,78 @@ class TestFNO2d:
         beta = cin_params[:, :, 1, :]
         assert (gamma - 1.0).abs().mean() < 0.01
         assert beta.abs().mean() < 0.01
+
+
+class TestHardRightDirichlet:
+    @staticmethod
+    def _model(**kw):
+        base = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+            cond_static_dim=COND_STATIC_DIM, temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+        )
+        base.update(kw)
+        return FNO2d(**base)
+
+    @staticmethod
+    def _inputs(b=2, nx=11, ny=11):
+        return (
+            torch.randn(b, nx, ny, SPATIAL_IN_CHANNELS),
+            torch.randn(b, COND_STATIC_DIM),
+            torch.randn(b, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM),
+        )
+
+    def test_right_edge_column_is_exact_constant(self):
+        torch.manual_seed(0)
+        model = self._model(hard_right_dirichlet=True, t_right_norm=-0.7)
+        out = model(*self._inputs())
+        # dim 1 is Nx; the right wall face is T[:, Nx-1, :].
+        edge = out[:, -1, :, :]
+        assert torch.allclose(edge, torch.full_like(edge, -0.7), atol=1e-6)
+
+    def test_disabled_path_bit_identical(self):
+        torch.manual_seed(0)
+        m_off = self._model()
+        torch.manual_seed(0)
+        m_on = self._model(hard_right_dirichlet=True, t_right_norm=0.0)
+        # Same seed -> identical weights; disable buffer must not touch interior.
+        inp = self._inputs()
+        out_off = m_off(*inp)
+        out_on = m_on(*inp)
+        # Interior (all but the right face) must be unchanged by the constraint.
+        assert torch.allclose(out_off[:, :-1], out_on[:, :-1], atol=1e-6)
+
+    def test_backward_reaches_linear_p(self):
+        torch.manual_seed(0)
+        model = self._model(hard_right_dirichlet=True, t_right_norm=0.3)
+        out = model(*self._inputs())
+        out.pow(2).mean().backward()
+        g = model.linear_p.weight.grad
+        assert g is not None and torch.isfinite(g).all() and g.abs().sum() > 0
+
+    def test_buffer_round_trips_through_state_dict(self):
+        model = self._model(hard_right_dirichlet=True, t_right_norm=1.25)
+        sd = model.state_dict()
+        assert "t_right_norm" in sd
+        assert float(sd["t_right_norm"]) == 1.25
+        # Rebuild with a different buffer value, then load: value must be restored.
+        model2 = self._model(hard_right_dirichlet=True, t_right_norm=0.0)
+        model2.load_state_dict(sd)
+        assert float(model2.t_right_norm) == 1.25
+
+    def test_disabled_registers_no_buffer(self):
+        model = self._model()
+        assert "t_right_norm" not in model.state_dict()
+
+    def test_baseline_checkpoint_warm_starts_hard_bc_model(self):
+        # A baseline (no hard BC) state_dict loads into a hard-BC model with
+        # strict=False, with t_right_norm as the only missing key.
+        torch.manual_seed(0)
+        baseline = self._model()
+        torch.manual_seed(0)
+        hard = self._model(hard_right_dirichlet=True, t_right_norm=0.9)
+        missing, unexpected = hard.load_state_dict(baseline.state_dict(), strict=False)
+        assert list(unexpected) == []
+        assert set(missing) == {"t_right_norm"}
+        assert float(hard.t_right_norm) == pytest.approx(0.9)

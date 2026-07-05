@@ -322,6 +322,119 @@ def test_full_bc_shape_grad_and_both_ends():
     assert float(T_np1.grad.abs().sum()) > 0.0
 
 
+def test_full_bc_keep_batch_shapes_and_flatten_equiv():
+    """`keep_batch=True` retains the leading batch dim per region; the flattened
+    default equals `reshape(-1)` of the kept-batch tensors bit-for-bit."""
+    sim = _build_forcing_solver()
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    Nx, Ny = sim.Nx, sim.Ny
+    B = 3
+    torch.manual_seed(0)
+    T_n = torch.randn((B, Nx, Ny), dtype=torch.float64)
+    T_np1 = torch.randn((B, Nx, Ny), dtype=torch.float64)
+    bc = FullBCData(
+        T_right_tilde=torch.randn((B, Ny), dtype=torch.float64),
+        qL_n=torch.randn((B, Ny), dtype=torch.float64),
+        qL_np1=torch.randn((B, Ny), dtype=torch.float64),
+    )
+
+    kept = full_bc_cn_residual(T_n, T_np1, geom, bc,
+                               dirichlet_both_ends=True, keep_batch=True)
+    flat = full_bc_cn_residual(T_n, T_np1, geom, bc, dirichlet_both_ends=True)
+
+    assert kept["interior"].shape == (B, Nx - 2, Ny - 2)
+    assert kept["topbot_adiabatic"].shape == (B, 2 * (Nx - 2))
+    assert kept["left_neumann"].shape == (B, Ny)
+    assert kept["right_dirichlet"].shape == (B, Ny)
+    assert kept["right_dirichlet_n"].shape == (B, Ny)
+
+    for name in kept:
+        assert torch.equal(kept[name].reshape(-1), flat[name]), name
+
+
+def test_full_bc_per_sample_means_match_scalar_regions():
+    """`per_sample=True` per-region `(B,)` means average to the scalar region
+    MSEs, and the scalar keys are numerically identical to the default path."""
+    sim = _build_forcing_solver()
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    Nx, Ny = sim.Nx, sim.Ny
+    B = 4
+    torch.manual_seed(1)
+    T_n = torch.randn((B, Nx, Ny), dtype=torch.float64)
+    T_np1 = torch.randn((B, Nx, Ny), dtype=torch.float64)
+    bc = FullBCData(
+        T_right_tilde=torch.randn((B, Ny), dtype=torch.float64),
+        qL_n=torch.randn((B, Ny), dtype=torch.float64),
+        qL_np1=torch.randn((B, Ny), dtype=torch.float64),
+    )
+
+    base = full_bc_physics_loss(T_n, T_np1, geom, bc)
+    ps = full_bc_physics_loss(T_n, T_np1, geom, bc, per_sample=True)
+
+    region_to_ps = {
+        "phys_interior_mse": "interior_per_sample",
+        "phys_left_neumann_mse": "left_neumann_per_sample",
+        "phys_topbot_adiabatic_mse": "topbot_adiabatic_per_sample",
+        "phys_right_dirichlet_mse": "right_dirichlet_per_sample",
+    }
+    for scalar_key, ps_key in region_to_ps.items():
+        assert ps[ps_key].shape == (B,)
+        # scalar == batch mean of the per-sample tensor.
+        assert torch.allclose(ps[ps_key].mean(), ps[scalar_key], atol=0, rtol=0)
+        # scalar keys identical to the default (flattened) path.
+        assert torch.allclose(ps[scalar_key], base[scalar_key], atol=1e-12)
+
+    for key in ("physics_loss_weighted", "physics_loss_allcell_mean"):
+        assert torch.allclose(ps[key], base[key], atol=1e-12), key
+
+
+def test_full_bc_per_sample_manual_two_rows():
+    """A hand-checked 2-row case: the interior per-sample residual mean for each
+    row equals the mean of that row's own interior cells (rows are independent)."""
+    sim = _build_forcing_solver()
+    geom = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    Nx, Ny = sim.Nx, sim.Ny
+    torch.manual_seed(2)
+    T_n = torch.randn((2, Nx, Ny), dtype=torch.float64)
+    T_np1 = torch.randn((2, Nx, Ny), dtype=torch.float64)
+    bc = FullBCData(
+        T_right_tilde=torch.zeros((2, Ny), dtype=torch.float64),
+        qL_n=torch.zeros((2, Ny), dtype=torch.float64),
+        qL_np1=torch.zeros((2, Ny), dtype=torch.float64),
+    )
+
+    kept = full_bc_cn_residual(T_n, T_np1, geom, bc, keep_batch=True)
+    ps = full_bc_physics_loss(T_n, T_np1, geom, bc, per_sample=True)
+
+    for row in (0, 1):
+        manual = kept["interior"][row].pow(2).mean()
+        assert torch.allclose(ps["interior_per_sample"][row], manual, atol=1e-12)
+
+    # And each row uses only its own data: swapping row order permutes the
+    # per-sample vector identically.
+    kept_swap = full_bc_cn_residual(
+        T_n.flip(0), T_np1.flip(0), geom,
+        FullBCData(T_right_tilde=bc.T_right_tilde, qL_n=bc.qL_n, qL_np1=bc.qL_np1),
+        keep_batch=True,
+    )
+    assert torch.allclose(
+        kept_swap["interior"][0].pow(2).mean(),
+        ps["interior_per_sample"][1], atol=1e-12,
+    )
+
+
 def _build_pulse_train_solver(dt: float = 0.005, t_final: float = 0.3, Ny: int = 100):
     """A `forcing`-geometry solver driven by a single rectangular pulse that
     lives strictly inside one solver step. The solver injects the EXACT step
