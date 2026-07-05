@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from data.dataset import (
 )
 from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
+from src.operators.soap import SOAP
 from src.operators.losses import (
     EPS_JUMP,
     SpatiallyWeightedMSE,
@@ -411,6 +413,23 @@ def resolve_num_workers(config: dict, world_size: int) -> int:
 def build_optimizer(config: dict, params) -> torch.optim.Optimizer:
     training_cfg = config["training"]
     optimizer_name = training_cfg.get("optimizer", "Adam")
+
+    if optimizer_name == "SOAP":
+        soap_cfg = training_cfg.get("soap", None) or {}
+        betas = soap_cfg.get("betas", [0.95, 0.95])
+        return SOAP(
+            params,
+            lr=training_cfg["learning_rate"],
+            weight_decay=training_cfg["weight_decay"],
+            betas=(float(betas[0]), float(betas[1])),
+            shampoo_beta=float(soap_cfg.get("shampoo_beta", 0.95)),
+            eps=float(soap_cfg.get("eps", 1e-8)),
+            precondition_frequency=int(soap_cfg.get("precondition_frequency", 10)),
+            max_precond_dim=int(soap_cfg.get("max_precond_dim", 10000)),
+            merge_dims=bool(soap_cfg.get("merge_dims", False)),
+            precondition_1d=bool(soap_cfg.get("precondition_1d", False)),
+        )
+
     optimizer_map = {
         "Adam": Adam,
         "AdamW": AdamW,
@@ -778,6 +797,397 @@ def _build_physics_loader(config, phys_cfg, spec, mu_global, sigma_global, *, ba
     return loader, geom_cfg
 
 
+@dataclass(frozen=True)
+class TemporalBinSpec:
+    """One shared temporal-bin definition for lead stratification (Step 1) AND
+    causal lead weighting (Step 2), so the two techniques bin identically.
+
+    Built once in ``run_one_seed`` from the built sampler's path-aware lead
+    domain ``[lead_lo, lead_hi]`` (on-grid CN interval-midpoint domain for
+    diffusion, admissible continuous-lead range for the generic forcing path).
+    ``bin_edges`` is ``linspace(lead_lo, lead_hi, n_bins + 1)``. Both the
+    sampler (stratified allocation + ``_last_lead_bin_ids``) and the weighter
+    receive this same object; neither recomputes edges independently.
+    """
+
+    lead_lo: float
+    lead_hi: float
+    n_bins: int
+
+    @property
+    def bin_edges(self) -> np.ndarray:
+        return np.linspace(self.lead_lo, self.lead_hi, self.n_bins + 1)
+
+    def interval_to_bin(self, lead):
+        """Map a lead (scalar or array) to a bin id in ``[0, n_bins-1]``, with the
+        same clamp used by the sampler when it records bin ids and by the weighter
+        when it forms per-bin means. ``clamp(bucketize(lead)-1, 0, n_bins-1)``.
+        """
+        edges = self.bin_edges
+        idx = np.searchsorted(edges, np.asarray(lead, dtype=float), side="right") - 1
+        return np.clip(idx, 0, self.n_bins - 1).astype(int)
+
+    def active_bins(self, current_lead_min: float, current_lead_max: float) -> np.ndarray:
+        """Boolean ``(n_bins,)`` mask of bins that overlap the current lead window
+        ``[current_lead_min, current_lead_max]``: ``(bin_lower < current_lead_max)
+        & (bin_upper > current_lead_min)``.
+        """
+        edges = self.bin_edges
+        lower = edges[:-1]
+        upper = edges[1:]
+        return (lower < current_lead_max) & (upper > current_lead_min)
+
+
+class CausalLeadWeighter:
+    """Residual-adaptive causal weighting of the interior CN residual by lead bin
+    (Step 2 / technique 1 of the PINO recipe).
+
+    Down-weights a lead bin's interior residual until the earlier bins' residuals
+    fall, using ``w_b = exp(-eps * sum_{j<b} L_j)`` over the shared
+    ``TemporalBinSpec`` bins (``L_j`` = current-step or EMA per-bin mean interior
+    residual). Bin 0 always has weight 1; weights are non-increasing in bin id; an
+    empty later bin still inherits the accumulated suppression of the earlier bins
+    (it is not reset to weight 1).
+
+    Two phases keep all state mutation OUT of the loss function and make the DDP
+    collective explicit:
+
+    - ``prepare`` performs the ONLY collective (a SUM all-reduce of the local
+      per-bin residual sums and counts) and returns the detached GLOBAL sums,
+      counts, and causal weights. Called inside ``_collocation_batch_loss`` before
+      the differentiable objective is formed, so ``current`` mode sees this step's
+      global per-bin losses with no one-step lag.
+    - ``commit`` performs NO collective; it folds the already-global stats into the
+      EMA, advances ``_step``, and steps epsilon (only when every ACTIVE bin is
+      populated this step). Called in ``train_one_epoch`` after backward.
+
+    Epsilon grows (``x eps_growth``, capped ``eps_max``) when the last ACTIVE bin's
+    weight exceeds ``last_bin_threshold`` and shrinks (``/eps_growth``, floored
+    ``eps_min``) when the mean active-bin weight drops below ``mean_weight_floor``
+    and ``allow_eps_decrease`` -- both gated on full active-bin coverage so an
+    unreachable bin (restricted lead window / curriculum ramp) can never freeze the
+    schedule.
+    """
+
+    def __init__(
+        self, spec: "TemporalBinSpec", *, eps=1.0, loss_history="current",
+        ema_alpha=0.9, update_every=1, eps_growth=2.0, eps_max=100.0,
+        eps_min=0.01, allow_eps_decrease=True, last_bin_threshold=0.99,
+        mean_weight_floor=0.5,
+    ):
+        if loss_history not in ("current", "ema"):
+            raise ValueError(
+                f"causal_weighting.loss_history must be 'current' or 'ema', "
+                f"got {loss_history!r}."
+            )
+        self.spec = spec
+        self.n_bins = int(spec.n_bins)
+        self.eps = float(eps)
+        self.loss_history = str(loss_history)
+        self.ema_alpha = float(ema_alpha)
+        self.update_every = max(1, int(update_every))
+        self.eps_growth = float(eps_growth)
+        self.eps_max = float(eps_max)
+        self.eps_min = float(eps_min)
+        self.allow_eps_decrease = bool(allow_eps_decrease)
+        self.last_bin_threshold = float(last_bin_threshold)
+        self.mean_weight_floor = float(mean_weight_floor)
+
+        self.ema = np.zeros(self.n_bins, dtype=np.float64)
+        self._ema_initialized = False
+        self._step = 0
+        self._last_global_bin_loss = None
+        self._last_bin_counts = None
+        self._last_weights = np.ones(self.n_bins, dtype=np.float64)
+        self._active_mask = None
+
+    def active_mask(self, max_lead) -> np.ndarray:
+        """Active-bin mask for the current lead window ``[lead_lo, max_lead]``."""
+        return self.spec.active_bins(self.spec.lead_lo, float(max_lead))
+
+    def _current_loss(self, sums, counts) -> np.ndarray:
+        sums = np.asarray(sums, dtype=np.float64).reshape(-1)
+        counts = np.asarray(counts, dtype=np.float64).reshape(-1)
+        return np.where(counts > 0, sums / np.clip(counts, 1.0, None), 0.0)
+
+    def _ema_candidate(self, current_loss, counts) -> np.ndarray:
+        pop = np.asarray(counts, dtype=np.float64).reshape(-1) > 0
+        if not self._ema_initialized:
+            return np.where(pop, current_loss, self.ema)
+        blended = self.ema_alpha * self.ema + (1.0 - self.ema_alpha) * current_loss
+        return np.where(pop, blended, self.ema)
+
+    def _weights_from_loss(self, bin_loss) -> np.ndarray:
+        bin_loss = np.asarray(bin_loss, dtype=np.float64).reshape(-1)
+        # Exclusive cumulative sum: entry b is sum of bins strictly before b, so
+        # bin 0 -> weight exp(0) = 1 and each later bin inherits earlier suppression.
+        excl = np.concatenate([[0.0], np.cumsum(bin_loss)[:-1]])
+        return np.exp(-self.eps * excl)
+
+    def _bin_loss(self, current_loss, counts) -> np.ndarray:
+        if self.loss_history == "ema":
+            return self._ema_candidate(current_loss, counts)
+        return current_loss
+
+    def prepare(self, local_bin_sums, local_bin_counts, active_mask, dist_info):
+        """SUM-all-reduce the local per-bin residual sums/counts (the only
+        collective) and return detached global ``(sums, counts, weights)``.
+
+        ``local_bin_sums`` may be a differentiable tensor; only a DETACHED copy is
+        reduced here, so the backward graph is never touched by the collective.
+        """
+        device = local_bin_sums.device
+        packed = torch.stack([
+            local_bin_sums.detach().to(torch.float64),
+            local_bin_counts.detach().to(device=device, dtype=torch.float64),
+        ])
+        if dist_info is not None and getattr(dist_info, "is_distributed", False):
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        global_sums = packed[0]
+        global_counts = packed[1]
+        self._active_mask = np.asarray(active_mask, dtype=bool).reshape(-1)
+        current = self._current_loss(
+            global_sums.cpu().numpy(), global_counts.cpu().numpy()
+        )
+        weights = self._weights_from_loss(self._bin_loss(current, global_counts.cpu().numpy()))
+        return global_sums, global_counts, weights
+
+    def commit(self, global_bin_sums, global_bin_counts):
+        """Fold the already-global stats into the EMA, advance ``_step``, and step
+        epsilon when active-bin coverage is complete. Performs NO collective."""
+        sums = np.asarray(
+            global_bin_sums.cpu().numpy() if torch.is_tensor(global_bin_sums)
+            else global_bin_sums, dtype=np.float64,
+        ).reshape(-1)
+        counts = np.asarray(
+            global_bin_counts.cpu().numpy() if torch.is_tensor(global_bin_counts)
+            else global_bin_counts, dtype=np.float64,
+        ).reshape(-1)
+        current = self._current_loss(sums, counts)
+        bin_loss = self._bin_loss(current, counts)
+        weights = self._weights_from_loss(bin_loss)  # uses THIS step's eps
+
+        pop = counts > 0
+        if not self._ema_initialized:
+            self.ema = np.where(pop, current, self.ema)
+            if pop.any():
+                self._ema_initialized = True
+        else:
+            blended = self.ema_alpha * self.ema + (1.0 - self.ema_alpha) * current
+            self.ema = np.where(pop, blended, self.ema)
+
+        self._last_global_bin_loss = bin_loss
+        self._last_bin_counts = counts.astype(int)
+        self._last_weights = weights
+        self._step += 1
+
+        active = (
+            self._active_mask if self._active_mask is not None
+            else np.ones(self.n_bins, dtype=bool)
+        )
+        if self._step % self.update_every != 0 or not active.any():
+            return
+        if not bool(np.all(counts[active] > 0)):
+            return  # hold epsilon until every active bin is populated this step
+        active_idx = np.nonzero(active)[0]
+        last_active = int(active_idx[-1])
+        if weights[last_active] > self.last_bin_threshold:
+            self.eps = min(self.eps * self.eps_growth, self.eps_max)
+        elif self.allow_eps_decrease and float(weights[active].mean()) < self.mean_weight_floor:
+            self.eps = max(self.eps / self.eps_growth, self.eps_min)
+
+    def weights(self) -> np.ndarray:
+        return self._last_weights
+
+    def state_dict(self) -> dict:
+        return {
+            "ema": self.ema.tolist(),
+            "eps": float(self.eps),
+            "_step": int(self._step),
+            "_ema_initialized": bool(self._ema_initialized),
+            "last_global_bin_loss": (
+                None if self._last_global_bin_loss is None
+                else np.asarray(self._last_global_bin_loss, dtype=float).tolist()
+            ),
+            "last_bin_counts": (
+                None if self._last_bin_counts is None
+                else np.asarray(self._last_bin_counts, dtype=int).tolist()
+            ),
+            "n_bins": int(self.n_bins),
+            "loss_history": self.loss_history,
+            "ema_alpha": float(self.ema_alpha),
+            "bin_edges": self.spec.bin_edges.tolist(),
+        }
+
+    def load_state_dict(self, state: dict):
+        if int(state["n_bins"]) != self.n_bins:
+            raise ValueError(
+                f"causal_state n_bins {int(state['n_bins'])} != current "
+                f"{self.n_bins}; checkpoint is incompatible with this config."
+            )
+        if str(state["loss_history"]) != self.loss_history:
+            raise ValueError(
+                f"causal_state loss_history {state['loss_history']!r} != current "
+                f"{self.loss_history!r}."
+            )
+        if abs(float(state["ema_alpha"]) - self.ema_alpha) > 1e-12:
+            raise ValueError(
+                f"causal_state ema_alpha {float(state['ema_alpha'])} != current "
+                f"{self.ema_alpha}."
+            )
+        edges = np.asarray(state["bin_edges"], dtype=float)
+        if edges.shape != self.spec.bin_edges.shape or not np.allclose(
+            edges, self.spec.bin_edges
+        ):
+            raise ValueError(
+                "causal_state bin_edges do not match the current TemporalBinSpec; "
+                "the lead domain or n_bins changed between runs."
+            )
+        self.ema = np.asarray(state["ema"], dtype=np.float64)
+        self.eps = float(state["eps"])
+        self._step = int(state["_step"])
+        self._ema_initialized = bool(state["_ema_initialized"])
+        self._last_global_bin_loss = (
+            None if state.get("last_global_bin_loss") is None
+            else np.asarray(state["last_global_bin_loss"], dtype=np.float64)
+        )
+        self._last_bin_counts = (
+            None if state.get("last_bin_counts") is None
+            else np.asarray(state["last_bin_counts"], dtype=int)
+        )
+
+
+class GradNormBalancer:
+    """Per-component GradNorm-style adaptive loss balancing (Step 4 / technique 3).
+
+    Balances the RAW (unscaled) physics/IC/data component losses so no single
+    objective dominates the shared backbone gradient. Every ``update_every`` calls
+    it measures each active term's gradient norm on the CURRENT step's already-built
+    graph via ``torch.autograd.grad(term, unwrapped_params, retain_graph=True,
+    allow_unused=True)`` -- against the UNWRAPPED module params so it never fires the
+    DDP reducer (which only triggers on ``.backward()``) -- then sets
+    ``w_t = mean(g_valid) / g_t`` (EMA-smoothed). The static ``lambda_*`` /
+    region-weight coefficients are applied separately at the compose site, so
+    GradNorm rebalances the raw magnitudes without cancelling those coefficients.
+
+    Per-term rule when measuring ``g_t``:
+      - all grads ``None`` (term disconnected)   -> hold previous multiplier
+      - finite norm == 0                          -> hold previous multiplier
+      - ``0 < norm < eps``                        -> clamp to ``eps``
+      - ``norm > 1/eps``                          -> clamp to ``1/eps``
+      - non-finite norm                           -> hold, bump warning counter
+    ``mean(g)`` is over VALID terms only; held terms keep their prior multiplier.
+    Valid multipliers are renormalized so their mean is ~1 (the bare
+    ``mean(g)/g_t`` does not guarantee this), keeping the overall loss scale stable.
+    """
+
+    def __init__(self, term_names, *, alpha_w=0.9, update_every=10, eps=1.0e-8):
+        self.term_names = list(term_names)
+        self.alpha_w = float(alpha_w)
+        self.update_every = max(1, int(update_every))
+        self.eps = float(eps)
+        self.multipliers = {name: 1.0 for name in self.term_names}
+        self._step = 0
+        self._nonfinite_count = 0
+
+    def multipliers_for(self, names) -> dict:
+        return {name: float(self.multipliers.get(name, 1.0)) for name in names}
+
+    @staticmethod
+    def _grad_norm(term, params):
+        grads = torch.autograd.grad(
+            term, params, retain_graph=True, allow_unused=True,
+        )
+        sq = None
+        for g in grads:
+            if g is None:
+                continue
+            contrib = g.detach().pow(2).sum()
+            sq = contrib if sq is None else sq + contrib
+        if sq is None:
+            return None  # term disconnected from every param this step
+        return sq
+
+    def maybe_update(self, raw_terms, params, *, dist_info=None):
+        """Refresh multipliers from the current graph every ``update_every`` calls.
+
+        ``raw_terms`` maps term name -> the differentiable RAW loss scalar. ``params``
+        is the UNWRAPPED module parameter iterable. Returns the (possibly unchanged)
+        multiplier dict for ``raw_terms``' keys.
+        """
+        names = [n for n in self.term_names if n in raw_terms]
+        do_update = (self._step % self.update_every == 0)
+        self._step += 1
+        if not do_update or not names:
+            return self.multipliers_for(names)
+
+        params = [p for p in params if p.requires_grad]
+        device = params[0].device if params else torch.device("cpu")
+        sq_norms = torch.zeros(len(names), dtype=torch.float64, device=device)
+        held = [False] * len(names)
+        for i, name in enumerate(names):
+            sq = self._grad_norm(raw_terms[name], params)
+            if sq is None:
+                held[i] = True  # disconnected -> hold
+            else:
+                sq_norms[i] = sq.to(torch.float64)
+        if dist_info is not None and getattr(dist_info, "is_distributed", False):
+            # gloo has no AVG; SUM then divide by world_size for a mean sq-norm.
+            dist.all_reduce(sq_norms, op=dist.ReduceOp.SUM)
+            sq_norms = sq_norms / float(getattr(dist_info, "world_size", 1) or 1)
+
+        norms = sq_norms.sqrt().cpu().numpy()
+        hi = 1.0 / self.eps
+        valid, clamped = [], {}
+        for i, name in enumerate(names):
+            g = float(norms[i])
+            if held[i]:
+                continue
+            if not np.isfinite(g):
+                self._nonfinite_count += 1  # hold
+                continue
+            if g == 0.0:
+                continue  # hold
+            clamped[name] = float(np.clip(g, self.eps, hi))
+            valid.append(name)
+
+        if not valid:
+            return self.multipliers_for(names)
+        mean_g = float(np.mean([clamped[n] for n in valid]))
+        target = {n: mean_g / clamped[n] for n in valid}
+        # Renormalize valid multipliers so their mean is ~1 (scale stability).
+        mean_t = float(np.mean([target[n] for n in valid]))
+        if mean_t > 0.0:
+            target = {n: v / mean_t for n, v in target.items()}
+        for name in valid:
+            prev = float(self.multipliers.get(name, 1.0))
+            self.multipliers[name] = (
+                self.alpha_w * prev + (1.0 - self.alpha_w) * target[name]
+            )
+        return self.multipliers_for(names)
+
+    def state_dict(self) -> dict:
+        return {
+            "term_names": list(self.term_names),
+            "multipliers": {k: float(v) for k, v in self.multipliers.items()},
+            "_step": int(self._step),
+        }
+
+    def load_state_dict(self, state: dict):
+        saved = list(state["term_names"])
+        if saved != self.term_names:
+            raise ValueError(
+                f"gradnorm_state term_names {saved} != current {self.term_names}; "
+                "the active loss components changed between runs "
+                "(hard-BC / IC / data / benchmark). Refusing to reassign "
+                "multipliers to the wrong objective."
+            )
+        self.multipliers = {
+            k: float(v) for k, v in dict(state["multipliers"]).items()
+        }
+        self._step = int(state["_step"])
+
+
 class CollocationSampler:
     """Draws W2 collocation batches from the held-out (validation) sims.
 
@@ -800,7 +1210,7 @@ class CollocationSampler:
     def __init__(
         self, ds, spec, geom_cfg, *, batch_size, dt, rng_seed, base_plan=None,
         anchored_first_step=False, early_oversample=False, early_band_steps=5,
-        early_mix=None,
+        early_mix=None, stratify_leads=False,
         source_time_min=None, source_time_max=None, lead_bins=None,
         lead_min=None, anchor_lead_time=None, anchor_fraction=0.0,
     ):
@@ -857,9 +1267,18 @@ class CollocationSampler:
             self._src_pool_t_min = float(self._src_pool_t.min())
             # Full grid for bridge-snapshot lookup (nearest index to t_s+anchor).
             self._full_t_grid = np.asarray(ds.t_grid, dtype=float)
-        # Per-batch record of the leads actually drawn (generic path), for the
-        # collocation lead histogram diagnostic. None until the first draw.
+        # Per-batch record of the leads actually drawn, for the collocation lead
+        # histogram diagnostic. None until the first draw. Both paths populate it
+        # (the on-grid path records the CN interval midpoint per row).
         self._last_leads = None
+        # Per-batch bin ids for the drawn leads, via ``bin_spec.interval_to_bin``.
+        # Stays None (and nothing else changes -> bit-identical) when no
+        # ``TemporalBinSpec`` is attached, i.e. when all Step 1/2 techniques are
+        # off. Consumed by CausalLeadWeighter so it never re-derives bins.
+        self._last_lead_bin_ids = None
+        # Shared temporal-bin definition (attached by run_one_seed). None when the
+        # causal/stratify techniques are all disabled.
+        self.bin_spec = None
         # When non-None, the benchmark pins the base snapshot and draws on-grid
         # conditioning pairs through the spec's collocation hooks instead of the
         # built-in (forcing) random-source / uniform-lead / analytic-closure path.
@@ -868,6 +1287,13 @@ class CollocationSampler:
         self.anchored_first_step = bool(anchored_first_step)
         self.early_oversample = bool(early_oversample)
         self.early_band_steps = int(early_band_steps)
+        # Block-structured lead stratification (on-grid path only). When on, each
+        # batch draws B // n_active base rows and, for every base row, one CN
+        # interval per (populated) shared-``bin_spec`` bin -- so every bin sees the
+        # SAME sim-id / base-snapshot multiset and a later bin's higher residual
+        # reflects longer lead, not a harder set of input functions. Requires an
+        # attached ``bin_spec`` (the shared TemporalBinSpec); raises otherwise.
+        self.stratify_leads = bool(stratify_leads)
         self.early_mix = dict(early_mix) if early_mix is not None else {
             "anchor": 0.4, "early": 0.4, "rest": 0.2,
         }
@@ -878,8 +1304,68 @@ class CollocationSampler:
         # sample_batch / _sample_batch_on_grid call so a stale anchor from a
         # prior batch can never be reused.
         self._last_anchor = None
+        # ---- warm-up freeze cache (IC-anchoring warm-up; default inert) ----
+        # When ``_freeze_enabled`` (set once per epoch by train_one_epoch during
+        # warm-up), each fresh draw is cached with its side-channels so that a
+        # subsequent ``_frozen`` step reuses the SAME input functions and query
+        # coordinates instead of resampling. Both flags stay False when warm-up is
+        # off, so ``sample_batch`` is a pure passthrough (bit-identical) and never
+        # touches the cache. The cache is epoch-local (reset via
+        # ``reset_freeze_cache``); the persistent progress counter lives in
+        # run_one_seed as ``global_optimizer_step``.
+        self._freeze_enabled = False
+        self._frozen = False
+        self._batch_cache = None
+        self._cache_leads = None
+        self._cache_bin_ids = None
+        self._cache_anchor = None
+
+    def set_frozen(self, frozen: bool):
+        """Warm-up per-step control: when ``frozen`` and a cached draw exists, the
+        next ``sample_batch`` reuses it (and its side-channels) instead of drawing
+        fresh. No-op unless ``_freeze_enabled`` (set by ``enable_freeze_cache``)."""
+        self._frozen = bool(frozen) and self._freeze_enabled
+
+    def enable_freeze_cache(self, enabled: bool):
+        """Arm/disarm the warm-up freeze cache for the coming epoch. Always drops
+        any cached batch first, so the cache is epoch-local: a fresh epoch never
+        reuses the previous epoch's frozen draw (deterministic epoch-boundary
+        resume without checkpointing the batch)."""
+        self.reset_freeze_cache()
+        self._freeze_enabled = bool(enabled)
+
+    def reset_freeze_cache(self):
+        """Drop the epoch-local cached batch and un-freeze (epoch boundary reset)."""
+        self._frozen = False
+        self._batch_cache = None
+        self._cache_leads = None
+        self._cache_bin_ids = None
+        self._cache_anchor = None
 
     def sample_batch(self, max_lead: float):
+        """Sample one collocation batch, with an optional warm-up freeze cache.
+
+        Warm-up (Step 5): when ``_frozen`` and a cached draw exists, return the
+        cached tuple and restore the cached side-channels (``_last_leads``,
+        ``_last_lead_bin_ids``, ``_last_anchor``) so consecutive frozen steps see an
+        identical batch. Otherwise draw fresh via ``_draw_collocation_batch`` and,
+        when the cache is armed, store the draw + its side-channels. Both flags are
+        False when warm-up is off -> pure passthrough, bit-identical, no caching.
+        """
+        if self._frozen and self._batch_cache is not None:
+            self._last_leads = self._cache_leads
+            self._last_lead_bin_ids = self._cache_bin_ids
+            self._last_anchor = self._cache_anchor
+            return self._batch_cache
+        result = self._draw_collocation_batch(max_lead)
+        if self._freeze_enabled:
+            self._batch_cache = result
+            self._cache_leads = self._last_leads
+            self._cache_bin_ids = self._last_lead_bin_ids
+            self._cache_anchor = self._last_anchor
+        return result
+
+    def _draw_collocation_batch(self, max_lead: float):
         """Sample one collocation batch (generic forcing path).
 
         Legacy behavior (all long-lead knobs unset): the source snapshot is drawn
@@ -1038,6 +1524,10 @@ class CollocationSampler:
         qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
         qL_int = torch.from_numpy(np.stack(qLint_list))
         self._last_leads = np.asarray(leads_drawn, dtype=float)
+        self._last_lead_bin_ids = (
+            self.bin_spec.interval_to_bin(self._last_leads)
+            if self.bin_spec is not None else None
+        )
         if any(anchor_flags):
             # Non-bridge rows are zero-filled placeholders shaped like a real
             # bridge snapshot; the injection (`_collocation_batch_loss`) only
@@ -1088,6 +1578,43 @@ class CollocationSampler:
         _, lo, hi = buckets[bi]
         return int(self.rng.integers(lo, hi + 1))
 
+    def _stratified_draws_on_grid(self, n_max: int):
+        """Block-structured (sid, n) draws for one batch when ``stratify_leads``.
+
+        Chunks ``[0, n_max]`` by the shared ``bin_spec`` so a chunk id is exactly
+        the bin the row's midpoint lands in (``interval_to_bin``), not a parallel
+        ``linspace`` that could drift from the causal bins. Empty bins (windows
+        with fewer valid intervals than bins, e.g. under a curriculum cap) are
+        skipped. Draws ``B // n_active`` base rows and, per base row, one interval
+        from every populated bin (same sid across bins -> identical per-bin sim-id
+        multiset); the ``B % n_active`` remainder rows fill the earliest populated
+        bins with fresh sids. Single ``self.rng`` stream, so DDP ranks stay in
+        lockstep given their rank-offset seed.
+        """
+        if self.bin_spec is None:
+            raise RuntimeError(
+                "stratify_leads requires an attached TemporalBinSpec (bin_spec); "
+                "run_one_seed attaches it when stratify_leads/causal_weighting is on."
+            )
+        n_bins = int(self.bin_spec.n_bins)
+        all_n = np.arange(n_max + 1)
+        all_bin = np.asarray(self.bin_spec.interval_to_bin((all_n + 0.5) * self.dt))
+        chunks = [all_n[all_bin == b] for b in range(n_bins)]
+        active = [b for b in range(n_bins) if chunks[b].size > 0]
+        n_active = len(active)
+        n_base = self.batch_size // n_active
+        rem = self.batch_size % n_active
+        draws = []
+        for _ in range(n_base):
+            sid = int(self.rng.choice(self.sim_ids))
+            for b in active:
+                draws.append((sid, int(self.rng.choice(chunks[b]))))
+        for j in range(rem):
+            b = active[j]
+            sid = int(self.rng.choice(self.sim_ids))
+            draws.append((sid, int(self.rng.choice(chunks[b]))))
+        return draws
+
     def _sample_batch_on_grid(self, max_lead: float):
         """Base-plan collocation: pin the base snapshot, draw consecutive on-grid
         conditioning pairs ``(t_s + n*dt, t_s + (n+1)*dt)``, and read the boundary
@@ -1115,14 +1642,22 @@ class CollocationSampler:
         t_grid = np.asarray(ds.t_grid, dtype=float)
         n_max = max(0, min(int(math.floor(float(max_lead) / dt)) - 1, len(t_grid) - 2))
 
+        draws = (
+            self._stratified_draws_on_grid(n_max) if self.stratify_leads
+            else [
+                (int(self.rng.choice(self.sim_ids)), self._draw_n_on_grid(n_max))
+                for _ in range(self.batch_size)
+            ]
+        )
+
         items_t, items_tdt = [], []
         R_c_list, qLn_list, qLnp1_list, qLint_list = [], [], [], []
         anchor_flags, T0_list = [], []
-        for _ in range(self.batch_size):
-            sid = int(self.rng.choice(self.sim_ids))
-            n = self._draw_n_on_grid(n_max)
+        lead_mid_list = []
+        for sid, n in draws:
             t = t_s + n * dt
             t_dt = t + dt
+            lead_mid_list.append((n + 0.5) * dt)
 
             base_item = ds.problem.build_item(ds, sid, s, s)
             current = base_item["spatial"][..., 0]
@@ -1153,6 +1688,15 @@ class CollocationSampler:
         qL_n = torch.from_numpy(np.stack(qLn_list))
         qL_np1 = torch.from_numpy(np.stack(qLnp1_list))
         qL_int = torch.from_numpy(np.stack(qLint_list))
+        # Record the per-row CN interval-midpoint lead (t_n + t_{n+1})/2 = (n+0.5)*dt
+        # in draw order (this path previously set neither field -- the pre-existing
+        # bug that left phys_lead_hist empty for diffusion runs). Bin ids follow
+        # from the shared TemporalBinSpec when one is attached.
+        self._last_leads = np.asarray(lead_mid_list, dtype=float)
+        self._last_lead_bin_ids = (
+            self.bin_spec.interval_to_bin(self._last_leads)
+            if self.bin_spec is not None else None
+        )
         if self.anchored_first_step:
             mask = torch.tensor(anchor_flags, dtype=torch.bool)
             T0_exact = torch.from_numpy(np.stack(T0_list))
@@ -1287,6 +1831,23 @@ def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_glob
     anchored = bool(on_grid and phys_cfg.get("anchored_first_step", False))
     early_os = bool(on_grid and phys_cfg.get("early_time_oversample", False))
     early_band = int(phys_cfg.get("early_band_steps", 5))
+    # Block-structured lead stratification is on-grid-only. Fail loudly on the
+    # generic (forcing) path rather than silently no-op'ing a misconfigured sweep;
+    # forcing gets long-lead coverage from its own generic-path knobs.
+    stratify_req = bool(phys_cfg.get("stratify_leads", False))
+    if stratify_req and not on_grid:
+        raise ValueError(
+            "stratify_leads is on-grid-only (needs a benchmark whose "
+            "collocation_base_plan yields on_grid_pairs=True). For generic/forcing "
+            "collocation coverage use collocation_lead_bins / collocation_lead_min / "
+            "anchor_lead_time / anchor_fraction instead."
+        )
+    if stratify_req and early_os:
+        raise ValueError(
+            "stratify_leads and early_time_oversample are mutually exclusive "
+            "temporal-coverage mechanisms; intended diffusion usage is "
+            "early_time_oversample=false stratify_leads=true."
+        )
     early_mix = phys_cfg.get("early_mix", None)
     if early_mix is not None:
         early_mix = dict(early_mix)
@@ -1303,13 +1864,43 @@ def _build_collocation_sampler(config, phys_cfg, ds, spec, mu_global, sigma_glob
         base_plan=base_plan,
         anchored_first_step=anchored, early_oversample=early_os,
         early_band_steps=early_band, early_mix=early_mix,
+        stratify_leads=stratify_req,
         source_time_min=src_min, source_time_max=src_max, lead_bins=lead_bins,
         lead_min=lead_min, anchor_lead_time=anchor_lead, anchor_fraction=anchor_frac,
     )
 
 
+def _make_temporal_bin_spec(sampler, phys_cfg, n_bins):
+    """Build the one shared ``TemporalBinSpec`` (Step 0) for a built sampler.
+
+    Path-aware lead domain so the same object bins the on-grid (diffusion) CN
+    interval midpoints and the generic (forcing) continuous leads:
+    - on-grid: ``[0.5*dt, t_final - 0.5*dt]`` -- exactly the span of the valid
+      interval midpoints ``(n + 0.5)*dt`` over the full window.
+    - generic: ``[collocation_lead_min or dt, collocation_lead_max or t_final]``.
+    Attached to BOTH the sampler (stratified allocation + ``_last_lead_bin_ids``)
+    and the ``CausalLeadWeighter`` so techniques 1 and 2 never drift apart.
+    """
+    dt = float(sampler.dt)
+    t_final = float(sampler.t_final)
+    on_grid = bool(
+        sampler.base_plan is not None
+        and sampler.base_plan.get("on_grid_pairs", False)
+    )
+    if on_grid:
+        lead_lo = 0.5 * dt
+        lead_hi = t_final - 0.5 * dt
+    else:
+        lead_min = phys_cfg.get("collocation_lead_min", None)
+        lead_lo = float(lead_min) if lead_min is not None else dt
+        lead_max = phys_cfg.get("collocation_lead_max", None)
+        lead_hi = float(lead_max) if lead_max is not None else t_final
+    return TemporalBinSpec(lead_lo=lead_lo, lead_hi=lead_hi, n_bins=int(n_bins))
+
+
 def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
-                            lambda_ic=0.0):
+                            lambda_ic=0.0, causal_weighter=None, dist_info=None,
+                            world_size=1):
     """Forward the model at the collocation pair ``(t, t+dt)`` and return the
     region-partitioned ``full_bc`` physics loss dict, the batch size, and the
     optional IC-anchor loss.
@@ -1319,6 +1910,15 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
     ``lambda_ic > 0`` an IC-anchor batch is drawn from the same base snapshot and
     ``ic_loss = MSE(model(anchor), T(t_s))`` is returned; otherwise ``ic_loss``
     is ``None``.
+
+    When ``causal_weighter`` is set the residual is computed per-sample, the
+    interior residual is binned by lead (``sampler._last_lead_bin_ids``), and the
+    weighter's ``prepare`` phase SUM-all-reduces the per-bin sums/counts (the only
+    collective) so a DDP-safe differentiable causal interior objective can be
+    formed from LOCAL differentiable sums divided by GLOBAL detached counts. The
+    weighter is NOT mutated here (safe for eval / grad-accum / retries); the
+    caller ``commit``s the EMA/epsilon after backward using the detached global
+    stats returned in ``out``.
     """
     batch_t, batch_tdt, R_c, qL_n, qL_np1, qL_int = sampler.sample_batch(max_lead)
 
@@ -1374,6 +1974,7 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
     out = full_bc_physics_loss(
         yt, ytdt, geom, bc,
         region_weights=region_weights, dirichlet_both_ends=True,
+        per_sample=causal_weighter is not None,
     )
 
     # ---- split anchored vs non-anchored weighted residual (diagnostic only) ----
@@ -1406,6 +2007,69 @@ def _collocation_batch_loss(model, sampler, max_lead, region_weights, device,
     out["_nonanchor_weighted"] = nonanchor_weighted
     out["_anchor_count"] = n_anchor
     out["_nonanchor_count"] = B - n_anchor
+
+    # ---- residual-adaptive causal lead weighting of the interior residual ----
+    # Bin the per-sample interior residual by lead, form the DDP-safe differentiable
+    # causal interior objective, and swap it for the plain interior term in a
+    # ``_causal_total`` that mirrors ``physics_loss_weighted`` (same region weights,
+    # BC/IC terms untouched). The weighter is not mutated here; the detached global
+    # bin stats are returned so the caller can ``commit`` after backward.
+    if causal_weighter is not None:
+        bin_ids = getattr(sampler, "_last_lead_bin_ids", None)
+        if bin_ids is None:
+            raise RuntimeError(
+                "causal weighting requires sampler._last_lead_bin_ids; attach a "
+                "TemporalBinSpec to the collocation sampler (run_one_seed does this "
+                "when causal_weighting.enabled)."
+            )
+        n_bins = int(causal_weighter.n_bins)
+        idx = torch.as_tensor(np.asarray(bin_ids), device=device, dtype=torch.long)
+        per_int = out["interior_per_sample"]  # (B,) differentiable
+        local_bin_sums = torch.zeros(
+            n_bins, device=device, dtype=per_int.dtype
+        ).index_add(0, idx, per_int)
+        local_bin_counts = torch.bincount(idx, minlength=n_bins).to(
+            device=device, dtype=per_int.dtype
+        )
+        active_np = causal_weighter.active_mask(max_lead)
+        global_sums, global_counts, weights_np = causal_weighter.prepare(
+            local_bin_sums, local_bin_counts, active_np, dist_info
+        )
+        cw = torch.as_tensor(weights_np, device=device, dtype=per_int.dtype)
+        gc = global_counts.to(device=device, dtype=per_int.dtype)
+        am = torch.as_tensor(active_np, device=device, dtype=torch.bool)
+        active_pop = am & (gc > 0)
+        if bool(active_pop.any()):
+            # LOCAL differentiable sums / GLOBAL detached counts * world_size so the
+            # DDP gradient average reproduces the exact global per-bin mean even if
+            # per-rank counts differ; == mean of bin means when all weights are 1.
+            causal_interior = (
+                cw[active_pop]
+                * float(world_size)
+                * local_bin_sums[active_pop]
+                / gc[active_pop].clamp_min(1.0)
+            ).sum() / active_pop.sum()
+        else:
+            causal_interior = out["phys_interior_mse"]
+
+        rw = {n: 1.0 for n in (
+            "interior", "left_neumann", "right_dirichlet", "topbot_adiabatic"
+        )}
+        if region_weights:
+            for _k, _v in region_weights.items():
+                if _k in rw:
+                    rw[_k] = float(_v)
+        causal_total = (
+            rw["interior"] * causal_interior
+            + rw["left_neumann"] * out["phys_left_neumann_mse"]
+            + rw["right_dirichlet"] * out["phys_right_dirichlet_mse"]
+            + rw["topbot_adiabatic"] * out["phys_topbot_adiabatic_mse"]
+        )
+        out["_causal_interior"] = causal_interior
+        out["_causal_total"] = causal_total
+        out["causal_bin_sums"] = global_sums.detach().cpu()
+        out["causal_bin_counts"] = global_counts.detach().cpu()
+        out["causal_weights_global"] = cw.detach().cpu()
 
     ic_loss = None
     if lambda_ic > 0.0:
@@ -1442,6 +2106,12 @@ def _log_grad_balance(
     mis-scaled ``lambda_physics``; the cosine flags directional conflict between
     the two objectives. Leaves ``model`` grads cleared on exit; never steps the
     optimizer. Rows append to a sidecar ``grad_balance.csv``.
+
+    WARNING (pre-existing, out of scope): this draws ``n_colloc`` EXTRA collocation
+    batches from the shared sampler, advancing its RNG on rank 0 only. Under DDP
+    that desyncs the lockstep collocation stream across ranks. Do NOT reuse this
+    pattern for GradNorm -- ``GradNormBalancer`` measures on the current step's
+    already-built graph via ``autograd.grad`` and never draws new batches.
     """
     model.zero_grad(set_to_none=True)
     data_loss = None
@@ -1498,6 +2168,111 @@ def _log_grad_balance(
     )
 
 
+def _phase_now(sync_cuda=False):
+    """Monotonic timestamp for per-phase timing; optionally CUDA-synchronize first
+    so the measured span reflects finished device work rather than launch latency."""
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _physics_static_coeffs(
+    region_weights, lambda_data, lambda_physics, lambda_ic,
+    *, has_data, has_ic, ic_multiplier=1.0,
+):
+    """Static (non-GradNorm) coefficient for each raw component, defined in ONE
+    place so the compose site's legacy and GradNorm branches share it.
+
+    ``right_bc`` is 0 when its region weight is 0 (e.g. the hard right-Dirichlet BC
+    turns the ``right_dirichlet`` region into a should-be-~0 diagnostic).
+    """
+    rw = region_weights or {}
+    coeffs = {
+        "interior": lambda_physics * float(rw.get("interior", 1.0)),
+        "left_bc": lambda_physics * float(rw.get("left_neumann", 1.0)),
+        "adiabatic_bc": lambda_physics * float(rw.get("topbot_adiabatic", 1.0)),
+        "right_bc": lambda_physics * float(rw.get("right_dirichlet", 1.0)),
+    }
+    if has_ic:
+        coeffs["ic"] = lambda_ic * float(ic_multiplier)
+    if has_data:
+        coeffs["data"] = lambda_data
+    return coeffs
+
+
+# Deterministic order for the GradNorm term vector / active-term filtering.
+_PHYSICS_TERM_ORDER = ("interior", "left_bc", "adiabatic_bc", "right_bc", "ic", "data")
+
+
+def _active_physics_terms(coeffs):
+    """Term names with a strictly positive static coefficient, in canonical order."""
+    return [n for n in _PHYSICS_TERM_ORDER if float(coeffs.get(n, 0.0)) > 0.0]
+
+
+def _compose_physics_total(
+    *, out, data_loss, ic, causal_weighter, gradnorm, model_unwrapped, dist_info,
+    lambda_data, lambda_physics, lambda_ic, region_weights, ic_multiplier=1.0,
+    sync_cuda=False,
+):
+    """The SINGLE site that forms the optimized physics/BC/IC(/data) total.
+
+    Returns ``(total, gradnorm_mults_or_None, gradnorm_ms)``.
+
+    When ``gradnorm is None`` this reproduces the EXACT legacy expression (so the
+    default path is bit-identical). When set, it expands to ``sum(c_t * m_t * L_t)``
+    over the active raw components, where ``c_t`` is the static coefficient and
+    ``m_t`` the GradNorm multiplier (both 1 -> the plain statically-weighted sum).
+    """
+    has_data = data_loss is not None
+    has_ic = ic is not None
+    if gradnorm is None:
+        grad_phys = (
+            out["_causal_total"] if causal_weighter is not None
+            else out["physics_loss_weighted"]
+        )
+        total = lambda_physics * grad_phys
+        if has_data:
+            total = lambda_data * data_loss + total
+        if has_ic:
+            total = total + (lambda_ic * float(ic_multiplier)) * ic
+        return total, None, 0.0
+
+    coeffs = _physics_static_coeffs(
+        region_weights, lambda_data, lambda_physics, lambda_ic,
+        has_data=has_data, has_ic=has_ic, ic_multiplier=ic_multiplier,
+    )
+    interior_L = (
+        out["_causal_interior"] if causal_weighter is not None
+        else out["phys_interior_mse"]
+    )
+    raw = {
+        "interior": interior_L,
+        "left_bc": out["phys_left_neumann_mse"],
+        "adiabatic_bc": out["phys_topbot_adiabatic_mse"],
+        "right_bc": out["phys_right_dirichlet_mse"],
+    }
+    if has_ic:
+        raw["ic"] = ic
+    if has_data:
+        raw["data"] = data_loss
+    active = _active_physics_terms(coeffs)
+    raw = {n: raw[n] for n in active if n in raw}
+
+    t0 = _phase_now(sync_cuda)
+    mults = gradnorm.maybe_update(
+        raw, list(model_unwrapped.parameters()), dist_info=dist_info,
+    )
+    gradnorm_ms = (_phase_now(sync_cuda) - t0) * 1000.0
+
+    total = None
+    for name in active:
+        if name not in raw:
+            continue
+        term = coeffs[name] * float(mults.get(name, 1.0)) * raw[name]
+        total = term if total is None else total + term
+    return total, mults, gradnorm_ms
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -1519,6 +2294,11 @@ def train_one_epoch(
     lambda_data: float = 1.0,
     lambda_physics: float = 0.0,
     lambda_ic: float = 0.0,
+    causal_weighter=None,
+    gradnorm=None,
+    model_unwrapped=None,
+    warmup=None,
+    global_step_start: int = 0,
 ) -> dict[str, float]:
     """Train one epoch and return a dict of epoch metrics.
 
@@ -1587,6 +2367,40 @@ def train_one_epoch(
             "lambda_ic > 0 (physics terms also require a built physics supply)."
         )
 
+    # ---- IC-anchoring warm-up schedule (Step 5; default inert) ----
+    # For the first ``warmup.steps`` optimizer steps, resample collocation only
+    # every ``resample_every`` steps (freeze the sampler in between) and boost the
+    # IC coefficient by ``ic_multiplier`` -- applied AFTER the GradNorm multiplier
+    # (folded into c_ic at the compose site), so GradNorm cannot normalize it out.
+    # Progress is the persistent ``global_optimizer_step`` counter (checkpointed by
+    # run_one_seed), not epoch*steps_per_epoch, so the boundary survives a resized
+    # dataset / different world size on resume. The epoch-local freeze cache is
+    # (re)armed here and dropped when warm-up is off, so the disabled path is
+    # bit-identical.
+    _wu = warmup or {}
+    warmup_on = (
+        bool(_wu.get("enabled", False)) and phys_collocation
+        and hasattr(physics_collocation, "set_frozen")
+    )
+    _wu_steps = int(_wu.get("steps", 0))
+    _wu_resample_every = max(1, int(_wu.get("resample_every", 1)))
+    _wu_ic_multiplier = float(_wu.get("ic_multiplier", 1.0))
+    global_step = int(global_step_start)
+    if physics_collocation is not None and hasattr(
+        physics_collocation, "enable_freeze_cache"
+    ):
+        physics_collocation.enable_freeze_cache(warmup_on)
+
+    def _apply_warmup(gstep):
+        """Set the sampler freeze for this optimizer step and return the IC
+        multiplier (1.0 outside warm-up). Called before the collocation draw."""
+        if not warmup_on or gstep >= _wu_steps:
+            if warmup_on:
+                physics_collocation.set_frozen(False)
+            return 1.0
+        physics_collocation.set_frozen(gstep % _wu_resample_every != 0)
+        return _wu_ic_multiplier
+
     phys_iter = iter(physics_loader) if phys_onestep else None
     phys_loss_sum = 0.0
     phys_weighted_sum = 0.0
@@ -1598,6 +2412,26 @@ def train_one_epoch(
     n_phys = 0
     ic_sum = 0.0
     n_ic = 0
+    # Causal-weighting bookkeeping (last committed weights/epsilon; JSON-logged).
+    causal_weights_last = None
+    causal_eps_last = None
+    # Causally-weighted interior objective (rank-0 diagnostic; "" when causal off).
+    # Distinct from the unweighted phys_region_sums["interior"] so a run can
+    # compare the weighted training signal against the raw interior residual.
+    phys_causal_interior_sum = 0.0
+    n_causal_interior = 0
+    # GradNorm bookkeeping (last multipliers; JSON-logged) + per-phase timing sums.
+    gradnorm_weights_last = None
+    if model_unwrapped is None:
+        model_unwrapped = model.module if hasattr(model, "module") else model
+    _sync_timing = torch.cuda.is_available()
+    if _sync_timing:
+        torch.cuda.reset_peak_memory_stats(device)
+    tm_step_sum = 0.0
+    tm_gradnorm_sum = 0.0
+    tm_backward_sum = 0.0
+    tm_optstep_sum = 0.0
+    n_tm = 0
     # Anchored vs non-anchored weighted-residual split (on-grid anchored path).
     phys_anchor_sum = 0.0
     phys_nonanchor_sum = 0.0
@@ -1624,36 +2458,67 @@ def train_one_epoch(
     physics_only = lambda_data == 0.0 and phys_collocation
     if physics_only:
         for _ in range(len(train_loader)):
+            _ic_mult = _apply_warmup(global_step)
+            _t_step0 = _phase_now(_sync_timing)
             optimizer.zero_grad()
             out, p_b, ic = _collocation_batch_loss(
                 model, physics_collocation, collocation_max_lead,
                 physics_region_weights, device, lambda_ic=lambda_ic,
+                causal_weighter=causal_weighter, dist_info=dist_info,
+                world_size=dist_info.world_size,
             )
             n_model_forwards += 2  # collocation forwards the model at t and t+dt
             _ll = getattr(physics_collocation, "_last_leads", None)
             if _ll is not None:
                 phys_leads_epoch.extend(np.asarray(_ll).ravel().tolist())
             p_loss = out["physics_loss_weighted"]
-            total = lambda_physics * p_loss
-            if ic is not None:
-                total = total + lambda_ic * ic
+            # ``p_loss`` stays the unweighted diagnostic for the logging
+            # accumulators below; the optimized total comes from the single
+            # compose site (causal interior + GradNorm multipliers when active).
+            total, gn_mults, gn_ms = _compose_physics_total(
+                out=out, data_loss=None, ic=ic, causal_weighter=causal_weighter,
+                gradnorm=gradnorm, model_unwrapped=model_unwrapped,
+                dist_info=dist_info, lambda_data=lambda_data,
+                lambda_physics=lambda_physics, lambda_ic=lambda_ic,
+                region_weights=physics_region_weights,
+                ic_multiplier=_ic_mult, sync_cuda=_sync_timing,
+            )
+            if gn_mults is not None:
+                gradnorm_weights_last = gn_mults
+            _t_bwd0 = _phase_now(_sync_timing)
             total.backward()
+            tm_backward_sum += (_phase_now(_sync_timing) - _t_bwd0) * 1000.0
             if grad_clip is not None:
                 _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 if _gn is not None:
                     grad_norm_sum += float(_gn)
                     n_grad_steps += 1
+            _t_opt0 = _phase_now(_sync_timing)
             optimizer.step()
+            tm_optstep_sum += (_phase_now(_sync_timing) - _t_opt0) * 1000.0
+            if causal_weighter is not None:
+                causal_weighter.commit(
+                    out["causal_bin_sums"], out["causal_bin_counts"]
+                )
+                causal_weights_last = causal_weighter.weights().tolist()
+                causal_eps_last = float(causal_weighter.eps)
+            tm_gradnorm_sum += gn_ms
+            tm_step_sum += (_phase_now(_sync_timing) - _t_step0) * 1000.0
+            n_tm += 1
             phys_loss_sum += p_loss.item() * p_b
             phys_weighted_sum += out["physics_loss_weighted"].item() * p_b
             phys_allcell_sum += out["physics_loss_allcell_mean"].item() * p_b
             for _r in phys_region_sums:
                 phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
+            if "_causal_interior" in out:
+                phys_causal_interior_sum += out["_causal_interior"].item() * p_b
+                n_causal_interior += p_b
             n_phys += p_b
             _accum_phys_split(out)
             if ic is not None:
                 ic_sum += ic.item() * p_b
                 n_ic += p_b
+            global_step += 1
 
     data_iterable = [] if physics_only else train_loader
     for batch in data_iterable:
@@ -1665,29 +2530,51 @@ def train_one_epoch(
             batch, device, use_per_sample_interface=use_per_sample_interface
         )
 
+        _t_step0 = _phase_now(_sync_timing) if phys_collocation else 0.0
         optimizer.zero_grad()
         y_pred = model(x_spatial, cond_static, forcing_seq)
         n_model_forwards += 1
         loss = loss_fn(y_pred, y_batch, iface_x)
+        causal_commit_stats = None  # set below when causal weighting is active
+        _step_gn_ms = 0.0
+        _ic_mult = _apply_warmup(global_step) if phys_collocation else 1.0
         if phys_collocation:
             out, p_b, ic = _collocation_batch_loss(
                 model, physics_collocation, collocation_max_lead,
                 physics_region_weights, device, lambda_ic=lambda_ic,
+                causal_weighter=causal_weighter, dist_info=dist_info,
+                world_size=dist_info.world_size,
             )
+            if causal_weighter is not None:
+                causal_commit_stats = (
+                    out["causal_bin_sums"], out["causal_bin_counts"]
+                )
             n_model_forwards += 2  # collocation forwards the model at t and t+dt
             _ll = getattr(physics_collocation, "_last_leads", None)
             if _ll is not None:
                 phys_leads_epoch.extend(np.asarray(_ll).ravel().tolist())
             p_loss = out["physics_loss_weighted"]
-            total = lambda_data * loss + lambda_physics * p_loss
-            if ic is not None:
-                total = total + lambda_ic * ic
+            total, gn_mults, _step_gn_ms = _compose_physics_total(
+                out=out, data_loss=loss, ic=ic, causal_weighter=causal_weighter,
+                gradnorm=gradnorm, model_unwrapped=model_unwrapped,
+                dist_info=dist_info, lambda_data=lambda_data,
+                lambda_physics=lambda_physics, lambda_ic=lambda_ic,
+                region_weights=physics_region_weights,
+                ic_multiplier=_ic_mult, sync_cuda=_sync_timing,
+            )
+            if gn_mults is not None:
+                gradnorm_weights_last = gn_mults
+            _t_bwd0 = _phase_now(_sync_timing)
             total.backward()
+            tm_backward_sum += (_phase_now(_sync_timing) - _t_bwd0) * 1000.0
             phys_loss_sum += p_loss.item() * p_b
             phys_weighted_sum += out["physics_loss_weighted"].item() * p_b
             phys_allcell_sum += out["physics_loss_allcell_mean"].item() * p_b
             for _r in phys_region_sums:
                 phys_region_sums[_r] += out[f"phys_{_r}_mse"].item() * p_b
+            if "_causal_interior" in out:
+                phys_causal_interior_sum += out["_causal_interior"].item() * p_b
+                n_causal_interior += p_b
             n_phys += p_b
             _accum_phys_split(out)
             if ic is not None:
@@ -1709,7 +2596,19 @@ def train_one_epoch(
             if _gn is not None:
                 grad_norm_sum += float(_gn)
                 n_grad_steps += 1
+        _t_opt0 = _phase_now(_sync_timing) if phys_collocation else 0.0
         optimizer.step()
+        if phys_collocation:
+            tm_optstep_sum += (_phase_now(_sync_timing) - _t_opt0) * 1000.0
+        if causal_commit_stats is not None:
+            causal_weighter.commit(*causal_commit_stats)
+            causal_weights_last = causal_weighter.weights().tolist()
+            causal_eps_last = float(causal_weighter.eps)
+        if phys_collocation:
+            tm_gradnorm_sum += _step_gn_ms
+            tm_step_sum += (_phase_now(_sync_timing) - _t_step0) * 1000.0
+            n_tm += 1
+        global_step += 1
 
         with torch.no_grad():
             b = x_spatial.shape[0]
@@ -1862,6 +2761,38 @@ def train_one_epoch(
         "n_model_forwards": int(n_model_forwards),
         "grad_norm": grad_norm,
         "phys_lead_hist": phys_lead_hist,
+        # Causal weighting (Step 2): last committed per-bin weights (JSON) and
+        # epsilon. "" / None when causal weighting is off (CSV columns land in
+        # Step 7 but the keys are harmless extras today).
+        "causal_weights": (
+            json.dumps([round(float(w), 6) for w in causal_weights_last])
+            if causal_weights_last is not None else ""
+        ),
+        "causal_eps": causal_eps_last,
+        "train_physics_causal_interior": (
+            phys_causal_interior_sum / n_causal_interior
+            if n_causal_interior > 0 else None
+        ),
+        # Peak CUDA memory for this epoch (MB; None on CPU). Records SOAP's
+        # preconditioner-state footprint for the Step-8 matched-memory comparison.
+        "opt_peak_mem_mb": (
+            torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
+            if torch.cuda.is_available() else None
+        ),
+        # GradNorm (Step 4): last multipliers (JSON, "" when off) and per-phase
+        # timing means (ms; 0 when the collocation/GradNorm path never ran). These
+        # are per-rank rank-0 diagnostics, not reduced across ranks.
+        "gradnorm_weights": (
+            json.dumps({k: round(float(v), 6) for k, v in gradnorm_weights_last.items()})
+            if gradnorm_weights_last is not None else ""
+        ),
+        "train_step_ms": (tm_step_sum / n_tm) if n_tm > 0 else 0.0,
+        "gradnorm_ms": (tm_gradnorm_sum / n_tm) if n_tm > 0 else 0.0,
+        "backward_ms": (tm_backward_sum / n_tm) if n_tm > 0 else 0.0,
+        "optimizer_step_ms": (tm_optstep_sum / n_tm) if n_tm > 0 else 0.0,
+        # Warm-up (Step 5): persistent optimizer-step counter after this epoch, so
+        # run_one_seed can checkpoint it and resume the warm-up boundary exactly.
+        "global_optimizer_step": int(global_step),
     }
 
 
@@ -2357,6 +3288,9 @@ def run_one_seed(
 
     model_cfg = config["model"]["parameters"]
     dims = spec.dims
+    hard_rd = bool(model_cfg.get("hard_right_dirichlet", False))
+    t_right_K = float(model_cfg.get("hard_right_dirichlet_t_right", 300.0))
+    t_right_norm = (t_right_K - float(mu_global)) / float(sigma_global) if hard_rd else 0.0
     fno = FNO2d(
         modes1=model_cfg["modes1"],
         modes2=model_cfg["modes2"],
@@ -2378,12 +3312,18 @@ def run_one_seed(
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
+        hard_right_dirichlet=hard_rd,
+        t_right_norm=t_right_norm,
     )
 
     # --- Resume state ---
     start_epoch = 0
     best_val_loss = float("inf")
     bad_epochs = 0
+    # Persistent optimizer-step counter driving the IC-anchoring warm-up boundary
+    # (Step 5). Checkpointed and restored so the boundary survives resume exactly,
+    # unlike reconstructing epoch * steps_per_epoch.
+    global_optimizer_step = 0
 
     if resuming:
         ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
@@ -2392,6 +3332,7 @@ def run_one_seed(
         best_val_loss = ckpt["best_val"]
         bad_epochs = ckpt.get("bad_epochs", 0)
         start_epoch = ckpt["epoch"] + 1
+        global_optimizer_step = int(ckpt.get("global_optimizer_step", 0))
 
     # Weights-only warm-start (physics fine-tune). Only when NOT auto-resuming a
     # full run in this dir: load model weights from an external checkpoint and
@@ -2406,7 +3347,18 @@ def run_one_seed(
         init_ckpt = torch.load(
             init_from_checkpoint, map_location="cpu", weights_only=False,
         )
-        fno.load_state_dict(init_ckpt["model_state"])
+        # A baseline checkpoint (no hard BC) can warm-start a hard-BC fine-tune:
+        # the only tolerated missing key is the t_right_norm buffer, which keeps
+        # its build-time value. Any other missing/unexpected key is an error.
+        missing, unexpected = fno.load_state_dict(
+            init_ckpt["model_state"], strict=False
+        )
+        if set(missing) - {"t_right_norm"} or unexpected:
+            raise RuntimeError(
+                "init_from_checkpoint state_dict mismatch: "
+                f"missing={list(missing)}, unexpected={list(unexpected)} "
+                "(only a missing t_right_norm buffer is allowed)."
+            )
         ck_mu = float(init_ckpt["mu_global"])
         ck_sigma = float(init_ckpt["sigma_global"])
         if (abs(ck_mu - float(mu_global)) > 1e-6
@@ -2492,6 +3444,11 @@ def run_one_seed(
     physics_geom_cfg = None
     physics_collocation = None
     physics_region_weights = None
+    causal_weighter = None  # built below when causal_weighting.enabled (Step 2)
+    gradnorm = None  # built below when training.gradnorm.enabled (Step 4)
+    # IC-anchoring warm-up config (Step 5). Passed to train_one_epoch unconditionally;
+    # inert (bit-identical) unless warmup.enabled is set.
+    warmup_cfg = phys_cfg.get("warmup", None) or {}
     collocation_lead_start = float(phys_cfg.get("collocation_lead_start", 0.01))
     collocation_lead_max = float(phys_cfg.get("collocation_lead_max", 0.01))
     collocation_lead_warmup = int(phys_cfg.get("collocation_lead_warmup_epochs", 0))
@@ -2545,6 +3502,81 @@ def run_one_seed(
         assert set(np.asarray(physics_collocation.sim_ids).tolist()).issubset(
             set(np.asarray(colloc_ds.sim_ids).tolist())
         )
+        # Hard right-Dirichlet buffer and the collocation residual's right-wall
+        # target must agree, else the exact BC and the physics residual pull
+        # toward different temperatures.
+        if hard_rd:
+            geom_t_right = float(physics_collocation.geom_cfg["T_right_tilde"])
+            if abs(t_right_norm - geom_t_right) > 1e-6:
+                raise ValueError(
+                    "hard_right_dirichlet t_right_norm "
+                    f"({t_right_norm:.6f}) != collocation geom T_right_tilde "
+                    f"({geom_t_right:.6f}); set model.parameters."
+                    "hard_right_dirichlet_t_right to the collocation right-wall "
+                    "temperature."
+                )
+        # Shared temporal bins for stratification (Step 1) and causal weighting
+        # (Step 2): one object built from the sampler's path-aware lead domain and
+        # attached to the sampler so both techniques bin identically. Built only
+        # when a bin-consuming technique is on -> spec stays None (bit-identical)
+        # otherwise. stratify_bins defaults to causal_weighting.n_bins so the two
+        # techniques cannot drift apart.
+        causal_cfg = phys_cfg.get("causal_weighting", {}) or {}
+        stratify_leads_on = bool(phys_cfg.get("stratify_leads", False))
+        causal_on = bool(causal_cfg.get("enabled", False))
+        if stratify_leads_on or causal_on:
+            causal_n_bins = int(causal_cfg.get("n_bins", 12))
+            stratify_bins = phys_cfg.get("stratify_bins", None)
+            spec_n_bins = (
+                int(stratify_bins) if stratify_bins is not None else causal_n_bins
+            )
+            physics_collocation.bin_spec = _make_temporal_bin_spec(
+                physics_collocation, phys_cfg, spec_n_bins
+            )
+        # Causal lead weighter (Step 2): consumes the SAME attached bin_spec so its
+        # bins are byte-identical to the stratification bins. Built only when
+        # causal_weighting.enabled; None otherwise (bit-identical). On resume the
+        # committed EMA/epsilon/step are restored with a config-shape check.
+        if causal_on:
+            causal_weighter = CausalLeadWeighter(
+                physics_collocation.bin_spec,
+                eps=float(causal_cfg.get("eps", 1.0)),
+                loss_history=str(causal_cfg.get("loss_history", "current")),
+                ema_alpha=float(causal_cfg.get("ema_alpha", 0.9)),
+                update_every=int(causal_cfg.get("update_every", 1)),
+                eps_growth=float(causal_cfg.get("eps_growth", 2.0)),
+                eps_max=float(causal_cfg.get("eps_max", 100.0)),
+                eps_min=float(causal_cfg.get("eps_min", 0.01)),
+                allow_eps_decrease=bool(causal_cfg.get("allow_eps_decrease", True)),
+                last_bin_threshold=float(causal_cfg.get("last_bin_threshold", 0.99)),
+                mean_weight_floor=float(causal_cfg.get("mean_weight_floor", 0.5)),
+            )
+            if resuming and ckpt.get("causal_state") is not None:
+                causal_weighter.load_state_dict(ckpt["causal_state"])
+        # GradNorm balancer (Step 4): balances the RAW per-component physics
+        # losses (interior + BC regions + IC + optional data) via w_t =
+        # mean(g)/g_t. Active terms are those with a positive static coefficient,
+        # so forcing (live non-zero left-Neumann flux) balances left_bc while
+        # diffusion (zero left flux) does not. Built only when
+        # training.gradnorm.enabled; None otherwise (bit-identical). The
+        # term_names resume-guard catches cross-benchmark checkpoint reuse.
+        gradnorm_cfg = config["training"].get("gradnorm", {}) or {}
+        if bool(gradnorm_cfg.get("enabled", False)):
+            gn_coeffs = _physics_static_coeffs(
+                physics_region_weights,
+                lambda_data, lambda_physics, lambda_ic,
+                has_data=(lambda_data > 0.0),
+                has_ic=(lambda_ic > 0.0),
+            )
+            gn_terms = _active_physics_terms(gn_coeffs)
+            gradnorm = GradNormBalancer(
+                gn_terms,
+                alpha_w=float(gradnorm_cfg.get("alpha_w", 0.9)),
+                update_every=int(gradnorm_cfg.get("update_every", 10)),
+                eps=float(gradnorm_cfg.get("eps", 1.0e-8)),
+            )
+            if resuming and ckpt.get("gradnorm_state") is not None:
+                gradnorm.load_state_dict(ckpt["gradnorm_state"])
         if causal_curriculum_enabled:
             causal_stages = _resolve_causal_stages(
                 cc_cfg, float(physics_collocation.dt), float(colloc_ds.t_final)
@@ -2630,6 +3662,11 @@ def run_one_seed(
         # Fine-tune diagnostics (empty on non-collocation paths where absent).
         "train_grad_norm", "epoch_train_s", "epoch_wall_s", "n_model_forwards",
         "phys_lead_hist",
+        # PINO fine-tune diagnostics (Steps 2/4/5/6). Empty/zero when the
+        # corresponding knob is off, so baseline runs stay comparable.
+        "train_physics_causal_interior", "causal_weights", "causal_eps",
+        "gradnorm_weights", "opt_peak_mem_mb",
+        "train_step_ms", "gradnorm_ms", "backward_ms", "optimizer_step_ms",
         "lr", "is_best",
     ]
     csv_file = None
@@ -2798,7 +3835,13 @@ def run_one_seed(
             lambda_data=lambda_data,
             lambda_physics=lambda_physics_eff,
             lambda_ic=lambda_ic,
+            causal_weighter=causal_weighter,
+            gradnorm=gradnorm,
+            model_unwrapped=fno_unwrapped,
+            warmup=warmup_cfg,
+            global_step_start=global_optimizer_step,
         )
+        global_optimizer_step = int(train_metrics["global_optimizer_step"])
         train_loss = train_metrics["loss"]
         train_rel_l2 = train_metrics["rel_l2"]
         train_iface_rel_l2 = train_metrics["iface_rel_l2"]
@@ -2899,6 +3942,15 @@ def run_one_seed(
                             "bad_epochs": bad_epochs,
                             "mu_global": mu_global,
                             "sigma_global": sigma_global,
+                            "causal_state": (
+                                causal_weighter.state_dict()
+                                if causal_weighter is not None else None
+                            ),
+                            "gradnorm_state": (
+                                gradnorm.state_dict()
+                                if gradnorm is not None else None
+                            ),
+                            "global_optimizer_step": int(global_optimizer_step),
                         },
                         best_path,
                     )
@@ -2943,6 +3995,15 @@ def run_one_seed(
                     "bad_epochs": bad_epochs,
                     "mu_global": mu_global,
                     "sigma_global": sigma_global,
+                    "causal_state": (
+                        causal_weighter.state_dict()
+                        if causal_weighter is not None else None
+                    ),
+                    "gradnorm_state": (
+                        gradnorm.state_dict()
+                        if gradnorm is not None else None
+                    ),
+                    "global_optimizer_step": int(global_optimizer_step),
                 },
                 latest_path,
             )
@@ -3018,6 +4079,15 @@ def run_one_seed(
                     "epoch_wall_s": float(epoch_wall_s),
                     "n_model_forwards": int(train_metrics.get("n_model_forwards", 0)),
                     "phys_lead_hist": train_metrics.get("phys_lead_hist", ""),
+                    "train_physics_causal_interior": _tm_opt("train_physics_causal_interior"),
+                    "causal_weights": train_metrics.get("causal_weights", ""),
+                    "causal_eps": _tm_opt("causal_eps"),
+                    "gradnorm_weights": train_metrics.get("gradnorm_weights", ""),
+                    "opt_peak_mem_mb": _tm_opt("opt_peak_mem_mb"),
+                    "train_step_ms": _tm_opt("train_step_ms"),
+                    "gradnorm_ms": _tm_opt("gradnorm_ms"),
+                    "backward_ms": _tm_opt("backward_ms"),
+                    "optimizer_step_ms": _tm_opt("optimizer_step_ms"),
                     "lr": float(lr),
                     "is_best": int(is_best),
                 }

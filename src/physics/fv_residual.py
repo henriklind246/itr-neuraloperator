@@ -352,7 +352,8 @@ def _cn_laplacian_full(T: torch.Tensor, geom: FVGeom) -> torch.Tensor:
 
 def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
                         geom: FVGeom, bc: FullBCData,
-                        dirichlet_both_ends: bool = False) -> dict:
+                        dirichlet_both_ends: bool = False,
+                        keep_batch: bool = False) -> dict:
     """Full-boundary CN residual, partitioned into the solver's four regions.
 
     `T_n`, `T_np1` are normalized temperature fields one solver step `dt` apart,
@@ -379,6 +380,12 @@ def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
     ``right_dirichlet_n`` = `T_n[Nx-1,:] - T_right_tilde` so the W2 collocation
     loss can anchor the right edge at BOTH model-output times (in W1 `T_n` is
     truth, so only the `T_np1` end is needed).
+
+    With ``keep_batch`` the four (five) regions retain their leading batch dim
+    instead of being flattened, so callers can reduce per-sample:
+    ``interior (B, Nx-2, Ny-2)``, ``topbot_adiabatic (B, 2*(Nx-2))``,
+    ``left_neumann (B, Ny)``, ``right_dirichlet (B, Ny)`` (+ ``right_dirichlet_n
+    (B, Ny)``). The flattened default is ``reshape(-1)`` of these.
     """
     if T_n.dim() == 2:
         T_n = T_n[None]
@@ -416,12 +423,27 @@ def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
         (bal[:, 1:Nx - 1, 0], bal[:, 1:Nx - 1, Ny - 1]), dim=1
     )                                                       # (B, 2*(Nx-2))
 
+    right_dirichlet_n = None
+    if dirichlet_both_ends:
+        right_dirichlet_n = T_n[:, Nx - 1, :] - bc.T_right_tilde   # (B, Ny)
+
+    if keep_batch:
+        out = {
+            "interior": interior_res,
+            "topbot_adiabatic": topbot_res,
+            "left_neumann": left_res,
+            "right_dirichlet": right_res,
+        }
+        if right_dirichlet_n is not None:
+            out["right_dirichlet_n"] = right_dirichlet_n
+        return out
+
     out = {
         "interior": interior_res.reshape(-1),
         "topbot_adiabatic": topbot_res.reshape(-1),
         "left_neumann": left_res.reshape(-1),
         "right_dirichlet": right_res.reshape(-1),
     }
-    if dirichlet_both_ends:
-        out["right_dirichlet_n"] = (T_n[:, Nx - 1, :] - bc.T_right_tilde).reshape(-1)
+    if right_dirichlet_n is not None:
+        out["right_dirichlet_n"] = right_dirichlet_n.reshape(-1)
     return out

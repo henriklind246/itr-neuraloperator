@@ -246,6 +246,7 @@ def full_bc_physics_loss(
     bc,
     region_weights: dict | None = None,
     dirichlet_both_ends: bool = False,
+    per_sample: bool = False,
 ) -> dict:
     """Region-partitioned full-BC physics loss for the Stage-2 ``full_bc`` path.
 
@@ -267,6 +268,14 @@ def full_bc_physics_loss(
     With ``dirichlet_both_ends`` the right-Dirichlet MSE averages the violation
     at both model-output times (``T_n`` and ``T_np1``); ``physics_loss_allcell_mean``
     still uses the single ``T_np1`` partition so it stays a true per-cell mean.
+
+    With ``per_sample`` the residual is kept batch-shaped and the dict also
+    carries the per-region per-sample means (each ``(B,)``):
+    ``interior_per_sample``, ``left_neumann_per_sample``,
+    ``topbot_adiabatic_per_sample``, ``right_dirichlet_per_sample`` (the
+    right-Dirichlet averages the ``n``/``np1`` halves under
+    ``dirichlet_both_ends``). The scalar keys are the batch means of these, so
+    they are numerically identical to the flattened default.
     """
     from src.physics.fv_residual import full_bc_cn_residual
 
@@ -274,16 +283,56 @@ def full_bc_physics_loss(
         T_n = T_n[..., 0]
         T_np1 = T_np1[..., 0]
 
+    if not per_sample:
+        parts = full_bc_cn_residual(
+            T_n, T_np1, geom, bc, dirichlet_both_ends=dirichlet_both_ends
+        )
+
+        region_mse = {name: parts[name].pow(2).mean() for name in _FULL_BC_REGIONS}
+        if dirichlet_both_ends:
+            region_mse["right_dirichlet"] = 0.5 * (
+                parts["right_dirichlet"].pow(2).mean()
+                + parts["right_dirichlet_n"].pow(2).mean()
+            )
+
+        weights = {name: 1.0 for name in _FULL_BC_REGIONS}
+        if region_weights:
+            for name, w in region_weights.items():
+                if name in weights:
+                    weights[name] = float(w)
+
+        weighted = sum(weights[name] * region_mse[name] for name in _FULL_BC_REGIONS)
+        allcell = torch.cat([parts[name] for name in _FULL_BC_REGIONS]).pow(2).mean()
+
+        return {
+            "physics_loss_weighted": weighted,
+            "physics_loss_allcell_mean": allcell,
+            "phys_interior_mse": region_mse["interior"],
+            "phys_left_neumann_mse": region_mse["left_neumann"],
+            "phys_right_dirichlet_mse": region_mse["right_dirichlet"],
+            "phys_topbot_adiabatic_mse": region_mse["topbot_adiabatic"],
+        }
+
     parts = full_bc_cn_residual(
-        T_n, T_np1, geom, bc, dirichlet_both_ends=dirichlet_both_ends
+        T_n, T_np1, geom, bc,
+        dirichlet_both_ends=dirichlet_both_ends, keep_batch=True,
     )
 
-    region_mse = {name: parts[name].pow(2).mean() for name in _FULL_BC_REGIONS}
+    # Per-region per-sample MSE (mean over the region's cells; leading batch dim
+    # kept). Region tensors are (B, ...); reduce every non-batch dim.
+    def _ps(t: torch.Tensor) -> torch.Tensor:
+        return t.pow(2).flatten(1).mean(dim=1)
+
+    per = {
+        "interior": _ps(parts["interior"]),
+        "left_neumann": _ps(parts["left_neumann"]),
+        "topbot_adiabatic": _ps(parts["topbot_adiabatic"]),
+        "right_dirichlet": _ps(parts["right_dirichlet"]),
+    }
     if dirichlet_both_ends:
-        region_mse["right_dirichlet"] = 0.5 * (
-            parts["right_dirichlet"].pow(2).mean()
-            + parts["right_dirichlet_n"].pow(2).mean()
-        )
+        per["right_dirichlet"] = 0.5 * (per["right_dirichlet"] + _ps(parts["right_dirichlet_n"]))
+
+    region_mse = {name: per[name].mean() for name in _FULL_BC_REGIONS}
 
     weights = {name: 1.0 for name in _FULL_BC_REGIONS}
     if region_weights:
@@ -292,7 +341,9 @@ def full_bc_physics_loss(
                 weights[name] = float(w)
 
     weighted = sum(weights[name] * region_mse[name] for name in _FULL_BC_REGIONS)
-    allcell = torch.cat([parts[name] for name in _FULL_BC_REGIONS]).pow(2).mean()
+    allcell = torch.cat(
+        [parts[name].flatten() for name in _FULL_BC_REGIONS]
+    ).pow(2).mean()
 
     return {
         "physics_loss_weighted": weighted,
@@ -301,6 +352,10 @@ def full_bc_physics_loss(
         "phys_left_neumann_mse": region_mse["left_neumann"],
         "phys_right_dirichlet_mse": region_mse["right_dirichlet"],
         "phys_topbot_adiabatic_mse": region_mse["topbot_adiabatic"],
+        "interior_per_sample": per["interior"],
+        "left_neumann_per_sample": per["left_neumann"],
+        "topbot_adiabatic_per_sample": per["topbot_adiabatic"],
+        "right_dirichlet_per_sample": per["right_dirichlet"],
     }
 
 

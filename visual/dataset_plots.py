@@ -556,6 +556,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
+        hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
     )
     model.load_state_dict(ckpt["model_state"])
     model.eval()

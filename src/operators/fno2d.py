@@ -246,6 +246,8 @@ class FNO2d(nn.Module):
         padding_reference_resolution: int | None = None,
         padding_mode: str = "zeros",
         cin_exclude_padding: bool = False,
+        hard_right_dirichlet: bool = False,
+        t_right_norm: float = 0.0,
     ):
         super().__init__()
         self.modes1 = modes1
@@ -270,6 +272,17 @@ class FNO2d(nn.Module):
             )
         self.padding_mode = padding_mode
         self.cin_exclude_padding = cin_exclude_padding
+
+        # Hard right-Dirichlet output constraint: overwrite the right wall face
+        # T[:, Nx-1, :] with the (normalized) fixed boundary temperature so the
+        # BC holds exactly rather than only in the soft physics loss. The buffer
+        # is persistent (round-trips through checkpoints and applies at eval);
+        # when disabled no buffer is registered so old checkpoints load strictly.
+        self.hard_right_dirichlet = hard_right_dirichlet
+        if hard_right_dirichlet:
+            self.register_buffer(
+                "t_right_norm", torch.tensor(float(t_right_norm), dtype=torch.float32)
+            )
 
         # Spatial-forcing channels (s_y * z_a) are only injected when the temporal
         # branch is active; with the encoder off the lift sees in_channels alone.
@@ -407,4 +420,14 @@ class FNO2d(nn.Module):
         x = x.permute(0, 2, 3, 1)            # (B, Nx, Ny, width)
         x = self.drop(self.activation(self.linear_q(x)))  # (B, Nx, Ny, 128)
         x = self.output_layer(x)           # (B, Nx, Ny, out_channels)
+
+        if self.hard_right_dirichlet:
+            # Replace the right wall face T[:, Nx-1, :] (dim 1 = Nx) with the
+            # constant boundary value. Differentiable, no in-place: the constant
+            # column carries zero gradient, so the soft right_dirichlet residual
+            # becomes an exact-zero diagnostic.
+            edge = self.t_right_norm.to(x.dtype).expand(
+                x.shape[0], 1, x.shape[2], x.shape[3]
+            )
+            x = torch.cat([x[:, :-1], edge], dim=1)
         return x

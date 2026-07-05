@@ -98,6 +98,7 @@ def _build_model(config: dict, model_state, device):
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
+        hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
     )
     fno.load_state_dict(model_state)
     fno.to(device)

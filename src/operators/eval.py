@@ -548,6 +548,7 @@ def eval_all_seeds(
             padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
             padding_mode=model_cfg.get("padding_mode", "zeros"),
             cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
+            hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
         )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
@@ -947,6 +948,7 @@ def write_test_records(
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
+        hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
     )
     fno.load_state_dict(ckpt["model_state"])
     fno.to(device)
