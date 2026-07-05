@@ -38,6 +38,8 @@ model:
     padding_reference_resolution: 100  # scale FNO pad cells with grid resolution; set = training grid (null = fixed pad=8)
     padding_mode: replicate       # boundary extension for the FNO domain pad: zeros|replicate|reflect
     cin_exclude_padding: true     # compute CIN instance stats over the unpadded region only
+    hard_right_dirichlet: false   # overwrite right wall face with the fixed BC temperature (exact BC)
+    hard_right_dirichlet_t_right: 300.0  # right-wall Dirichlet value in Kelvin (normalized at build time)
 
 training:
   device: "auto"
@@ -64,6 +66,19 @@ training:
     step_size: 50
     gamma: 0.5
   optimizer: "AdamW"
+  # SOAP optimizer knobs (Vyas et al. 2024; used only when optimizer: "SOAP").
+  # lr / weight_decay come from training.learning_rate / training.weight_decay.
+  # Spectral weights are 5-D real tensors; per-dimension preconditioners handle
+  # them (all dims << max_precond_dim). precondition_1d: false -> 1-D biases use
+  # the Adam-style fallback. Needs a separate LR sweep (conf/search_space/soap.yaml).
+  soap:
+    betas: [0.95, 0.95]
+    shampoo_beta: 0.95
+    eps: 1.0e-8
+    precondition_frequency: 10
+    max_precond_dim: 10000
+    merge_dims: false
+    precondition_1d: false
   # training.loss.{interface_x, interface_half_width, interface_weight,
   # per_sample_interface_x} are owned by the active `benchmark` config group
   # (per-benchmark loss region). per_sample_interface_x defaults to false in code
@@ -107,6 +122,19 @@ training:
   num_workers: null
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
+  # GradNorm-style adaptive balancing of the RAW per-component physics losses
+  # (interior CN residual, left-Neumann, top/bottom adiabatic, right-Dirichlet,
+  # IC, optional data). Each active term (positive static coefficient) gets a
+  # multiplier w_t = mean(g)/g_t from its own gradient norm on the current step's
+  # graph, EMA-smoothed by alpha_w and refreshed every update_every optimizer
+  # steps. enabled: false is a TRUE no-op (multipliers stay 1.0, total is
+  # bit-identical to the plain statically-weighted sum). Applies to both the
+  # diffusion and forcing collocation physics-only regimes.
+  gradnorm:
+    enabled: false
+    alpha_w: 0.9
+    update_every: 10
+    eps: 1.0e-8
   # Physics-informed FV-residual regularizer. The combined objective is
   #   L = lambda_data * L_data + lambda_physics * L_phys.
   # lambda_physics: 0.0 is a TRUE no-op: train.py must skip building the physics
@@ -197,6 +225,59 @@ training:
       anchor: 0.4
       early: 0.4
       rest: 0.2
+    # stratify_leads: on-grid-only block-structured lead coverage. Each batch
+    # draws B // n_active base rows and, per base row, one CN interval from every
+    # populated shared bin, so every bin sees the SAME sim-id/base-snapshot
+    # multiset (a later bin's higher residual reflects lead, not harder inputs).
+    # Mutually exclusive with early_time_oversample; raises on the generic/forcing
+    # path (use collocation_lead_bins there). Intended diffusion recipe:
+    # early_time_oversample=false stratify_leads=true.
+    stratify_leads: false
+    # stratify_bins: number of stratification bins. null inherits
+    # causal_weighting.n_bins so stratification and causal weighting share one
+    # TemporalBinSpec and never drift apart.
+    stratify_bins: null
+    # causal_weighting: residual-adaptive causal lead weighting of the INTERIOR
+    # CN residual only (the BC/IC objectives stay separate). Weights per lead bin
+    # are exp(-eps * exclusive_cumsum(bin_interior_loss)) so a late bin is
+    # down-weighted until the earlier bins' residuals fall. Shares the Step-1
+    # TemporalBinSpec (n_bins here also feeds stratify_bins when that is null).
+    # Default OFF -> the collocation path is byte-identical. Works on both the
+    # on-grid (diffusion) and generic (forcing) collocation paths.
+    #   loss_history: current (paper-faithful, this step's global per-bin loss)
+    #                 | ema (ablation, EMA of per-bin loss with ema_alpha).
+    #   update_every: optimizer-step cadence for the epsilon schedule.
+    #   eps grows (x eps_growth, capped eps_max) when the last ACTIVE bin's weight
+    #     exceeds last_bin_threshold; shrinks (/eps_growth, floored eps_min) when
+    #     the mean active-bin weight drops below mean_weight_floor and
+    #     allow_eps_decrease; both gated on every active bin being populated.
+    causal_weighting:
+      enabled: false
+      n_bins: 12
+      eps: 1.0
+      loss_history: current
+      ema_alpha: 0.9
+      update_every: 1
+      eps_growth: 2.0
+      eps_max: 100.0
+      eps_min: 0.01
+      allow_eps_decrease: true
+      last_bin_threshold: 0.99
+      mean_weight_floor: 0.5
+    # warmup: IC-anchoring warm-up (PINO paper). For the first `steps` optimizer
+    # steps, slow collocation resampling to every `resample_every` steps (freeze
+    # both the drawn input functions and the query coordinates) and up-weight the
+    # IC loss by `ic_multiplier` ON TOP OF the GradNorm weights, so the net first
+    # learns a rough solution structure / anchors t=0 before the full per-step
+    # stochasticity resumes. Progress tracked by a persistent global_optimizer_step
+    # counter (checkpointed), not epoch*steps_per_epoch. Default OFF -> the
+    # collocation path is byte-identical (no cache, IC multiplier 1). Paper ranges:
+    # steps 50-2000, resample_every 50-100, ic_multiplier 2-10.
+    warmup:
+      enabled: false
+      steps: 500
+      resample_every: 50
+      ic_multiplier: 5.0
     # causal_curriculum: fixed staged expansion of the sampled-time window.
     # Each stage has `epochs` (cumulative; final -1 = remainder) and exactly one
     # of `max_lead_steps` (int * dt) or `max_lead_frac` (fraction of t_final),

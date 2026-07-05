@@ -1,0 +1,6 @@
+# @package search_space
+params:
+  # SOAP learning-rate sweep. Applied only with training.optimizer=SOAP so it
+  # never sweeps the AdamW learning rate (reusing the AdamW LR unchanged is not a
+  # fair optimizer comparison).
+  training.learning_rate: tag(log, interval(1e-4, 5e-3))

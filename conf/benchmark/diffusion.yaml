@@ -40,3 +40,22 @@ training:
     early_time_oversample: true
     causal_curriculum:
       enabled: true
+
+# ---- intended PINO soft-causal recipe (Steps 1-6; documentation only) ----
+# The residual-adaptive causal weighter (Step 2) replaces the hard curriculum
+# with a soft per-bin suppression, so the recommended long-lead recipe REPLACES
+# the staged window above rather than composing with it. Set on the CLI (these
+# are NOT default flips so baseline diffusion runs stay bit-identical):
+#
+#   training.physics.causal_curriculum.enabled=false     # open full lead window
+#   training.physics.collocation_lead_start=<t_final>    # from data/.../t_grid.npy
+#   training.physics.collocation_lead_max=<t_final>
+#   training.physics.early_time_oversample=false         # mutually exclusive with
+#   training.physics.stratify_leads=true                 #   stratify_leads
+#   training.physics.causal_weighting.enabled=true
+#   training.gradnorm.enabled=true                        # optional (+GradNorm)
+#   model.parameters.hard_right_dirichlet=true           # optional (+hard BC)
+#   training.optimizer=SOAP                               # optional (+SOAP)
+#
+# lambda_ic > 0 is still required for any physics run (constant-300 degeneracy).
+# stratify_leads is on-grid-only; on forcing use collocation_lead_bins instead.
