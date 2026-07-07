@@ -41,6 +41,28 @@ model:
     hard_right_dirichlet: false   # overwrite right wall face with the fixed BC temperature (exact BC)
     hard_right_dirichlet_t_right: 300.0  # right-wall Dirichlet value in Kelvin (normalized at build time)
 
+  # ---- CViT (PINO path) ----
+  # Read ONLY by scripts/run_train_pino.py / src.operators.train_pino; the FNO
+  # path never touches model.cvit, so these keys are additive and inert for it.
+  # patch_size must divide the data grid (100 -> 10 or 20). fourier_freq is a
+  # real hyperparameter (spectral bias of the coordinate embedding), not an
+  # implementation detail. hard_right_dirichlet_t_right (Kelvin) is normalized
+  # with the training (mu, sigma) at build time.
+  cvit:
+    in_ch: 1
+    out_dim: 1
+    emb_dim: 256
+    dec_emb_dim: null            # null -> equals emb_dim
+    patch_size: 10
+    depth_enc: 4
+    depth_dec: 2
+    num_heads: 8
+    mlp_ratio: 2.0
+    fourier_freq: 1.0
+    activation: gelu
+    hard_right_dirichlet: true
+    hard_right_dirichlet_t_right: 300.0
+
 training:
   device: "auto"
   batch_size: 1024
@@ -120,6 +142,22 @@ training:
   # DataLoader workers per rank. `null` derives from SLURM_CPUS_PER_TASK /
   # world_size at runtime; set an int to override.
   num_workers: null
+  # ---- PINO (physics-only) training ----
+  # Read ONLY by src.operators.train_pino; inert for the FNO path. Loss is
+  #   L = lambda_r*mean(r^2) + lambda_ic*mean(ic^2) + lambda_bc*mean(neumann^2).
+  # n_r/n_ic/n_bc are collocation counts per step; sim_batch sims per step.
+  # chunk_r splits the interior residual into gradient-accumulation chunks to cap
+  # peak double-backward memory (0/null = no chunking).
+  pino:
+    lambda_r: 1.0
+    lambda_ic: 1.0
+    lambda_bc: 1.0
+    n_r: 4096
+    n_ic: 1024
+    n_bc: 512
+    sim_batch: 16
+    chunk_r: 0
+    alpha: 1.0
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
   # GradNorm-style adaptive balancing of the RAW per-component physics losses
