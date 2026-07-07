@@ -20,7 +20,12 @@ import math
 import numpy as np
 import torch
 
-from src.operators.train_pino import _curriculum_weights, run_one_seed_pino
+from src.operators.train_pino import (
+    _causal_residual_loss,
+    _causal_weights,
+    _curriculum_weights,
+    run_one_seed_pino,
+)
 
 
 def _write_synthetic_diffusion(tmp_path, num_sims=16, Nt=6, Nx=20, Ny=20):
@@ -98,6 +103,11 @@ def _rows(run_dir):
         return list(csv.DictReader(f))
 
 
+def _named_rows(run_dir, name):
+    with (run_dir / name).open("r", newline="") as f:
+        return list(csv.DictReader(f))
+
+
 def test_e2e_runs_logs_and_checkpoints(tmp_path):
     _write_synthetic_diffusion(tmp_path)
     cfg = _config(tmp_path)
@@ -159,6 +169,58 @@ def test_curriculum_weights_disabled_is_noop():
         assert _curriculum_weights(0, 0.5, 2.0, 3.0, cfg) == (0.5, 2.0, 3.0)
 
 
+def test_curriculum_weights_ic_heavy_schedule():
+    # IC-heavy: residual/BC stay ON (small) through warm-up; then lambda_ic decays
+    # to lambda_ic_final while r/bc ramp to their targets. lambda_* = (1, 100, 1).
+    cfg = {
+        "enabled": True, "mode": "ic_heavy",
+        "warmup_epochs": 2, "warmup_lambda_r": 0.1, "warmup_lambda_bc": 1.0,
+        "decay_epochs": 2, "lambda_ic_final": 1.0,
+    }
+    # phase 1 (warm-up): residual/BC never zero, IC at the heavy weight.
+    assert _curriculum_weights(0, 1.0, 100.0, 1.0, cfg) == (0.1, 100.0, 1.0)
+    assert _curriculum_weights(1, 1.0, 100.0, 1.0, cfg) == (0.1, 100.0, 1.0)
+    # phase 2 (decay, s=0 then s=0.5): IC relaxes 100 -> 1, r ramps 0.1 -> 1.
+    assert _curriculum_weights(2, 1.0, 100.0, 1.0, cfg) == (0.1, 100.0, 1.0)
+    w_r, w_ic, w_bc = _curriculum_weights(3, 1.0, 100.0, 1.0, cfg)  # s=0.5
+    assert w_r == 0.55 and w_ic == 50.5 and w_bc == 1.0
+    # phase 3 (clamped s=1): full targets with lambda_ic_final.
+    assert _curriculum_weights(4, 1.0, 100.0, 1.0, cfg) == (1.0, 1.0, 1.0)
+    assert _curriculum_weights(9, 1.0, 100.0, 1.0, cfg) == (1.0, 1.0, 1.0)
+
+
+# --------- causal residual weighting ---------
+
+def test_causal_weights_downweight_later_bins():
+    # Increasing per-bin losses -> monotonically decreasing causal weights; the
+    # first bin is always weight 1 (no prior loss). w_i = exp(-eps*sum_{j<i} L_j).
+    bin_mean = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    w = _causal_weights(bin_mean, eps_causal=1.0)
+    assert float(w[0]) == 1.0
+    assert torch.all(w[1:] < w[:-1])
+    # eps=0 disables the mask (all ones).
+    w0 = _causal_weights(bin_mean, eps_causal=0.0)
+    assert torch.allclose(w0, torch.ones_like(w0))
+
+
+def test_causal_residual_loss_masks_late_violation():
+    # r is (B, n_r, 1) (dim 0 = sim minibatch, averaged out); t_r is (1, n_r, 1).
+    # Causal weighting only masks a late bin when the EARLIER bins still carry
+    # substantial loss (large cumulative prefix). With O(1) early residuals and a
+    # huge late residual, the late bin is suppressed and the reported loss tracks
+    # the (small) early bins rather than the unweighted mean.
+    t_final, n_bins = 1.0, 4
+    t_r = torch.tensor([0.1, 0.4, 0.9]).view(1, -1, 1)
+    r = torch.tensor([1.0, 1.0, 10.0]).view(1, -1, 1)
+    loss, bin_mean = _causal_residual_loss(r, t_r, t_final, n_bins, eps_causal=5.0)
+    plain = (r ** 2).mean()
+    assert float(loss) < float(plain)
+    assert float(loss) < 2.0  # dominated by the early O(1) bins, not the 100 outlier
+    # the late bin's raw residual is still visible in the (detached) diagnostic.
+    assert bin_mean.shape == (n_bins,)
+    assert float(bin_mean[-1]) > float(bin_mean[0])
+
+
 def test_e2e_curriculum_ic_first(tmp_path):
     _write_synthetic_diffusion(tmp_path)
     cfg = _config(tmp_path)
@@ -210,3 +272,55 @@ def test_e2e_gradnorm_enabled(tmp_path):
     assert set(gn["multipliers"]) == {"r", "ic", "bc"}
     for v in gn["multipliers"].values():
         assert math.isfinite(float(v)) and float(v) > 0.0
+
+
+# --------- dense IC + causal weighting + ic_heavy warm-up (staged pipeline) ---------
+
+def test_e2e_staged_pipeline_and_diagnostics(tmp_path):
+    _write_synthetic_diffusion(tmp_path)
+    cfg = _config(tmp_path)
+    cfg["training"]["epochs"] = 4
+    cfg["training"]["validate_every"] = 1
+    cfg["training"]["pino"]["dense_ic"] = True
+    cfg["training"]["pino"]["resample_every"] = 2
+    cfg["training"]["pino"]["curriculum"] = {
+        "enabled": True, "mode": "ic_heavy",
+        "warmup_epochs": 1, "warmup_lambda_r": 0.1, "warmup_lambda_bc": 1.0,
+        "decay_epochs": 2, "lambda_ic_final": 1.0,
+    }
+    cfg["training"]["pino"]["lambda_ic"] = 100.0
+    cfg["training"]["pino"]["causal"] = {
+        "enabled": True, "n_bins": 4, "eps_causal": 1.0,
+    }
+    run_dir = tmp_path / "run_staged"
+
+    run_one_seed_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 4
+
+    # ic_heavy warm-up: residual/BC stay ON (never zero), IC is the heavy weight.
+    assert float(rows[0]["w_r"]) == 0.1
+    assert float(rows[0]["w_ic"]) == 100.0
+    assert float(rows[0]["w_bc"]) == 1.0
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc"):
+            assert math.isfinite(float(r[col]))
+    # grad-norm diagnostics logged on every (validate_every=1) epoch.
+    for r in rows:
+        for col in ("grad_norm_r", "grad_norm_ic", "grad_norm_bc"):
+            assert r[col] not in ("", None)
+            assert math.isfinite(float(r[col]))
+
+    # per-time diagnostics written to their own CSVs, one row per val epoch.
+    relt = _named_rows(run_dir, "rel_l2_per_time.csv")
+    assert len(relt) == 4
+    assert "t0" in relt[0] and "t5" in relt[0]  # Nt = 6
+    for row in relt:
+        for k, v in row.items():
+            assert math.isfinite(float(v))
+    resbin = _named_rows(run_dir, "residual_per_time_bin.csv")
+    assert len(resbin) == 4
+    assert set(f"bin{b}" for b in range(4)).issubset(resbin[0].keys())
+    for row in resbin:
+        for k, v in row.items():
+            assert math.isfinite(float(v))

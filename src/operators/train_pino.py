@@ -57,6 +57,7 @@ def sample_collocation(
     y_grid: torch.Tensor,
     device: torch.device,
     generator: torch.Generator | None = None,
+    dense_ic: bool = False,
 ) -> dict[str, Any]:
     """Free space-time collocation for one training step (shared across sims).
 
@@ -66,6 +67,11 @@ def sample_collocation(
     IC points are drawn on native grid NODES (as index pairs) so per-sim IC
     targets can be read from the trajectories exactly, with no interpolation.
     The right wall (x=1) is omitted — it is enforced by the hard ansatz.
+
+    ``dense_ic`` replaces the ``n_ic`` random IC nodes with EVERY grid node
+    (``Nx*Ny`` points, no RNG draw): the constant field is the physics attractor
+    for this benchmark, so a dense per-sim IC anchor is the primary stabilizer.
+    The default (``False``) keeps the legacy random-node draw byte-identical.
     """
     # interior: x, y ~ U(0,1); t ~ U(0, t_final)
     x_r = _leaf((1, n_r, 1), device, generator)
@@ -75,12 +81,18 @@ def sample_collocation(
     # IC: grid-node indices -> exact coords + a t=0 column
     Nx = int(x_grid.numel())
     Ny = int(y_grid.numel())
-    ix = torch.randint(0, Nx, (n_ic,), device=device, generator=generator)
-    iy = torch.randint(0, Ny, (n_ic,), device=device, generator=generator)
-    ic_x = x_grid[ix].view(1, n_ic, 1)
-    ic_y = y_grid[iy].view(1, n_ic, 1)
-    ic_coords = torch.cat([ic_x, ic_y], dim=-1)  # (1, n_ic, 2)
-    ic_t = torch.zeros((1, n_ic, 1), device=device)
+    if dense_ic:
+        # Every node, row-major (ix varies slowest) -> exact full-grid anchor.
+        ix = torch.arange(Nx, device=device).repeat_interleave(Ny)
+        iy = torch.arange(Ny, device=device).repeat(Nx)
+    else:
+        ix = torch.randint(0, Nx, (n_ic,), device=device, generator=generator)
+        iy = torch.randint(0, Ny, (n_ic,), device=device, generator=generator)
+    n_ic_eff = int(ix.numel())
+    ic_x = x_grid[ix].view(1, n_ic_eff, 1)
+    ic_y = y_grid[iy].view(1, n_ic_eff, 1)
+    ic_coords = torch.cat([ic_x, ic_y], dim=-1)  # (1, n_ic_eff, 2)
+    ic_t = torch.zeros((1, n_ic_eff, 1), device=device)
 
     # walls: free coordinate ~ U(0,1); the pinned coordinate is fixed. All three
     # kept as separate leaves so neumann_residual differentiates unambiguously.
@@ -172,6 +184,62 @@ def _ic_targets(
     return torch.from_numpy(vals).unsqueeze(-1).to(device)
 
 
+# --------- causal residual weighting + time-bin diagnostics ---------
+
+def _time_bin_index(t: torch.Tensor, t_final: float, n_bins: int) -> torch.Tensor:
+    """Long bin index in [0, n_bins-1] for times t in [0, t_final]."""
+    frac = t / max(float(t_final), 1e-12)
+    idx = (frac * n_bins).long()
+    return idx.clamp_(0, n_bins - 1)
+
+
+def _bin_residual(
+    r: torch.Tensor, t_r: torch.Tensor, t_final: float, n_bins: int
+) -> torch.Tensor:
+    """Detached per-time-bin mean squared residual, (n_bins,); empty bins -> 0."""
+    sq = (r ** 2).mean(dim=0).reshape(-1).detach()
+    idx = _time_bin_index(t_r.reshape(-1).detach(), t_final, n_bins)
+    bin_sum = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
+    bin_cnt = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
+    bin_sum = bin_sum.index_add(0, idx, sq)
+    bin_cnt = bin_cnt.index_add(0, idx, torch.ones_like(sq))
+    return bin_sum / bin_cnt.clamp_min(1.0)
+
+
+def _causal_weights(bin_mean: torch.Tensor, eps_causal: float) -> torch.Tensor:
+    """Causal weights w_i = exp(-eps * sum_{j<i} L_j) from detached bin losses.
+
+    Later time bins are only penalized once the earlier bins are resolved
+    (Wang, Sankaran & Perdikaris 2022; Chen et al. arXiv:2606.06164): a small
+    time-averaged residual that nonetheless violates the causal time evolution is
+    the failure mode this counteracts.
+    """
+    cum_prev = torch.cumsum(bin_mean, 0) - bin_mean
+    return torch.exp(-float(eps_causal) * cum_prev)
+
+
+def _causal_residual_loss(
+    r: torch.Tensor, t_r: torch.Tensor, t_final: float, n_bins: int, eps_causal: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causally weighted interior residual loss + detached per-bin residual.
+
+    Bins the interior residual by query time, forms a differentiable per-bin mean
+    squared residual, and returns a weighted mean over occupied bins with causal
+    weights (detached, so they act as a mask, not an extra gradient path).
+    """
+    sq = (r ** 2).mean(dim=0).reshape(-1)  # (n_r,) differentiable
+    idx = _time_bin_index(t_r.reshape(-1).detach(), t_final, n_bins)
+    bin_sum = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
+    bin_cnt = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
+    bin_sum = bin_sum.index_add(0, idx, sq)
+    bin_cnt = bin_cnt.index_add(0, idx, torch.ones_like(sq))
+    bin_mean = bin_sum / bin_cnt.clamp_min(1.0)  # (n_bins,) differentiable
+    w = _causal_weights(bin_mean.detach(), eps_causal) * (bin_cnt > 0)
+    denom = w.sum().clamp_min(1e-12)
+    loss = (w * bin_mean).sum() / denom
+    return loss, bin_mean.detach()
+
+
 # --------- loss ---------
 
 def pino_losses(
@@ -180,10 +248,30 @@ def pino_losses(
     batch: dict[str, Any],
     ic_target: torch.Tensor,
     alpha: float,
+    *,
+    causal_cfg: dict | None = None,
+    t_final: float | None = None,
+    res_bins: int = 0,
 ) -> dict[str, torch.Tensor]:
+    """Raw physics/IC/BC losses. ``causal_cfg.enabled`` swaps the plain
+    ``mean(r^2)`` interior term for a causally time-weighted one (needs
+    ``t_final``); ``res_bins > 0`` also returns a detached ``res_bins`` per-time
+    residual vector for diagnostics. Both default off -> legacy behavior.
+    """
     x_r, y_r, t_r = batch["interior"]
     r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha)
-    loss_r = (r ** 2).mean()
+    causal_on = bool(causal_cfg and causal_cfg.get("enabled", False))
+    bin_mean = None
+    if causal_on:
+        if t_final is None:
+            raise ValueError("causal residual weighting requires t_final")
+        loss_r, bin_mean = _causal_residual_loss(
+            r, t_r, float(t_final),
+            int(causal_cfg.get("n_bins", 16)),
+            float(causal_cfg.get("eps_causal", 1.0)),
+        )
+    else:
+        loss_r = (r ** 2).mean()
 
     ic = ic_residual(model, u, batch["ic"]["coords"], batch["ic"]["t"], ic_target)
     loss_ic = (ic ** 2).mean()
@@ -195,7 +283,13 @@ def pino_losses(
         bc_sq = bc_sq + (nb ** 2).mean()
     loss_bc = bc_sq / len(WALLS)
 
-    return {"r": loss_r, "ic": loss_ic, "bc": loss_bc}
+    out = {"r": loss_r, "ic": loss_ic, "bc": loss_bc}
+    if res_bins:
+        if bin_mean is not None and bin_mean.numel() == res_bins:
+            out["res_bins"] = bin_mean
+        else:
+            out["res_bins"] = _bin_residual(r, t_r, float(t_final), int(res_bins))
+    return out
 
 
 # --------- loss weighting (curriculum + GradNorm) ---------
@@ -210,12 +304,35 @@ def _curriculum_weights(
     """Static per-term weights for this epoch under the IC-first curriculum.
 
     Returns the base ``lambda_*`` unchanged when the curriculum is disabled.
-    Otherwise: an IC-only phase (``w_r = w_bc = 0``) for ``ic_only_epochs`` steps,
-    then a linear ramp of the residual/BC weights up to their ``lambda_*`` targets
-    over ``ramp_epochs`` steps, then full weights. The IC weight is always active.
+
+    ``mode="ic_only"`` (default, legacy): an IC-only phase (``w_r = w_bc = 0``)
+    for ``ic_only_epochs`` steps, then a linear ramp of the residual/BC weights up
+    to their ``lambda_*`` targets over ``ramp_epochs`` steps, then full weights.
+
+    ``mode="ic_heavy"``: the residual/BC stay ON through the warm-up (Chen et al.
+    arXiv:2606.06164 — the residual must see the IC-anchored field from ``t=0`` to
+    propagate it forward, so zeroing it re-opens the constant-field basin). For
+    ``warmup_epochs`` steps the weights are ``(warmup_lambda_r, lambda_ic,
+    warmup_lambda_bc)``; then over ``decay_epochs`` the IC weight linearly relaxes
+    ``lambda_ic -> lambda_ic_final`` while the residual/BC weights ramp
+    ``warmup_lambda_* -> lambda_*``. The IC weight is always active.
     """
     if not cfg or not cfg.get("enabled", False):
         return lam_r, lam_ic, lam_bc
+    mode = str(cfg.get("mode", "ic_only"))
+    if mode == "ic_heavy":
+        warm = int(cfg.get("warmup_epochs", 0))
+        wr0 = float(cfg.get("warmup_lambda_r", lam_r))
+        wbc0 = float(cfg.get("warmup_lambda_bc", lam_bc))
+        decay = max(1, int(cfg.get("decay_epochs", 1)))
+        ic_final = float(cfg.get("lambda_ic_final", lam_ic))
+        if epoch < warm:
+            return wr0, lam_ic, wbc0
+        s = min(1.0, (epoch - warm) / decay)
+        w_ic = lam_ic + s * (ic_final - lam_ic)
+        w_r = wr0 + s * (lam_r - wr0)
+        w_bc = wbc0 + s * (lam_bc - wbc0)
+        return w_r, w_ic, w_bc
     ic_only = int(cfg.get("ic_only_epochs", 0))
     ramp = max(1, int(cfg.get("ramp_epochs", 1)))
     if epoch < ic_only:
@@ -244,6 +361,25 @@ def build_gradnorm(config: dict, lam_r: float, lam_ic: float, lam_bc: float):
     )
 
 
+def _term_grad_norms(terms: dict[str, torch.Tensor], params) -> dict[str, float]:
+    """L2 gradient norm of each raw loss term w.r.t. ``params`` on the live graph.
+
+    Diagnostic only: exposes which objective dominates the shared backbone
+    gradient (the quantity GradNorm balances). Uses ``retain_graph=True`` so the
+    caller's subsequent ``loss.backward()`` still runs; call BEFORE that backward.
+    """
+    params = [p for p in params if p.requires_grad]
+    out: dict[str, float] = {}
+    for name, term in terms.items():
+        grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+        sq = torch.zeros((), device=params[0].device) if params else torch.zeros(())
+        for g in grads:
+            if g is not None:
+                sq = sq + g.detach().pow(2).sum()
+        out[name] = float(torch.sqrt(sq))
+    return out
+
+
 # --------- validation ---------
 
 @torch.no_grad()
@@ -253,11 +389,14 @@ def validate_rel_l2(
     ids: np.ndarray,
     device: torch.device,
     query_batch: int = 8,
+    return_per_time: bool = False,
 ) -> dict[str, float]:
     """Grid-query rel-L2 (normalized) + Kelvin RMSE over held-out sims.
 
     Queries the model on the full (x_grid, y_grid) mesh at every saved t_grid
-    time and compares to the stored trajectories.
+    time and compares to the stored trajectories. ``return_per_time=True`` adds a
+    ``per_time`` key: the normalized rel-L2 at each saved time (length Nt), which
+    exposes whether the model fits t=0 but drifts as the trajectory decays.
     """
     x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
     y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
@@ -272,6 +411,8 @@ def validate_rel_l2(
     sq_ref = 0.0
     se_K = 0.0
     n_pts = 0
+    sq_err_t = np.zeros(Nt, dtype=np.float64)
+    sq_ref_t = np.zeros(Nt, dtype=np.float64)
     ids = np.asarray(ids)
     with torch.no_grad():
         for start in range(0, len(ids), query_batch):
@@ -292,10 +433,18 @@ def validate_rel_l2(
             pred_K = pred * sigma + mu
             se_K += ((pred_K - truth_t) ** 2).sum().item()
             n_pts += truth_t.numel()
+            if return_per_time:
+                err_bt = ((pred - truth_norm) ** 2).sum(dim=(0, 2, 3))
+                ref_bt = (truth_norm ** 2).sum(dim=(0, 2, 3))
+                sq_err_t += err_bt.detach().cpu().numpy().astype(np.float64)
+                sq_ref_t += ref_bt.detach().cpu().numpy().astype(np.float64)
 
     rel_l2 = float(np.sqrt(sq_err / max(sq_ref, 1e-30)))
     rmse_K = float(np.sqrt(se_K / max(n_pts, 1)))
-    return {"val_rel_l2": rel_l2, "val_rmse_K": rmse_K}
+    out = {"val_rel_l2": rel_l2, "val_rmse_K": rmse_K}
+    if return_per_time:
+        out["per_time"] = np.sqrt(sq_err_t / np.maximum(sq_ref_t, 1e-30))
+    return out
 
 
 # --------- single-seed training ---------
@@ -317,6 +466,10 @@ def build_cvit(config: dict, mu: float, sigma: float, grid_size: tuple[int, int]
         num_heads=int(c.get("num_heads", 8)),
         mlp_ratio=float(c.get("mlp_ratio", 2.0)),
         fourier_freq=float(c.get("fourier_freq", 1.0)),
+        fourier_freq_t=(
+            None if c.get("fourier_freq_t", None) is None
+            else float(c["fourier_freq_t"])
+        ),
         activation=str(c.get("activation", "gelu")),
         hard_right_dirichlet=hard_rd,
         t_right_tilde=t_right_tilde,
@@ -348,6 +501,15 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     sim_batch = int(pino["sim_batch"])
     alpha = float(pino.get("alpha", 1.0))
 
+    dense_ic = bool(pino.get("dense_ic", False))
+    resample_every = max(1, int(pino.get("resample_every", 1)))
+    causal_cfg = pino.get("causal", {}) or {}
+    causal_on = bool(causal_cfg.get("enabled", False))
+    res_n_bins = (
+        int(causal_cfg.get("n_bins", 16)) if causal_on
+        else int(pino.get("diag_time_bins", 16))
+    )
+
     curr_cfg = pino.get("curriculum", {}) or {}
     gradnorm = build_gradnorm(config, lam_r, lam_ic, lam_bc)
 
@@ -365,44 +527,87 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     metrics_path = run_dir / "train_metrics.csv"
     fieldnames = [
         "epoch", "loss", "loss_r", "loss_ic", "loss_bc",
-        "w_r", "w_ic", "w_bc", "val_rel_l2", "val_rmse_K",
+        "w_r", "w_ic", "w_bc", "grad_norm_r", "grad_norm_ic", "grad_norm_bc",
+        "val_rel_l2", "val_rmse_K",
     ]
     with open(metrics_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    # Per-time diagnostics (written on validation epochs only): rel-L2 at each
+    # saved time exposes IC-fit-but-trajectory-drift; per-time-bin residual shows
+    # whether the residual is uniformly small or concentrated at late times.
+    t_grid = np.asarray(data["t_grid"])
+    Nt = int(t_grid.shape[0])
+    relt_path = run_dir / "rel_l2_per_time.csv"
+    relt_fields = ["epoch"] + [f"t{k}" for k in range(Nt)]
+    with open(relt_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=relt_fields).writeheader()
+    resbin_path = run_dir / "residual_per_time_bin.csv"
+    resbin_fields = ["epoch"] + [f"bin{b}" for b in range(res_n_bins)]
+    with open(resbin_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=resbin_fields).writeheader()
 
     best_val = float("inf")
     history: list[dict[str, float]] = []
 
     curr_on = bool(curr_cfg.get("enabled", False))
-    curr_desc = (
-        f"ic_only={int(curr_cfg.get('ic_only_epochs', 0))} "
-        f"ramp={int(curr_cfg.get('ramp_epochs', 1))}"
-        if curr_on else "off"
-    )
+    if curr_on and str(curr_cfg.get("mode", "ic_only")) == "ic_heavy":
+        curr_desc = (
+            f"ic_heavy warm={int(curr_cfg.get('warmup_epochs', 0))} "
+            f"decay={int(curr_cfg.get('decay_epochs', 1))} "
+            f"ic:{lam_ic}->{float(curr_cfg.get('lambda_ic_final', lam_ic))}"
+        )
+    elif curr_on:
+        curr_desc = (
+            f"ic_only={int(curr_cfg.get('ic_only_epochs', 0))} "
+            f"ramp={int(curr_cfg.get('ramp_epochs', 1))}"
+        )
+    else:
+        curr_desc = "off"
     gn_desc = (
         f"on(terms={gradnorm.term_names})" if gradnorm is not None else "off"
+    )
+    causal_desc = (
+        f"on(n_bins={res_n_bins},eps={float(causal_cfg.get('eps_causal', 1.0))})"
+        if causal_on else "off"
     )
     print(
         f"[pino] seed={seed} device={device} epochs={epochs} "
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
         f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} | "
         f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} sim_batch={sim_batch} alpha={alpha} | "
-        f"curriculum={curr_desc} gradnorm={gn_desc}",
+        f"dense_ic={dense_ic} resample_every={resample_every} | "
+        f"curriculum={curr_desc} gradnorm={gn_desc} causal={causal_desc}",
         flush=True,
     )
 
+    coll = None
     for epoch in range(epochs):
         model.train()
         batch_ids = rng.choice(train_ids, size=min(sim_batch, len(train_ids)), replace=False)
         u = build_ic_batch(data["trajectories"], batch_ids, mu, sigma, device)
 
-        coll = sample_collocation(n_r, n_ic, n_bc, t_final, x_grid_t, y_grid_t, device, gen)
+        # Slower warm-up resampling: redraw the interior/wall collocation only
+        # every ``resample_every`` steps. Per-step resampling can keep the IC loss
+        # from converging (Chen et al.); reusing the collocation set lets the
+        # anchor settle. IC targets are re-read every step (the sim minibatch
+        # rotates); resample_every=1 restores per-step sampling (legacy).
+        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+        if coll is None or (epoch % resample_every == 0):
+            coll = sample_collocation(
+                n_r, n_ic, n_bc, t_final, x_grid_t, y_grid_t, device, gen,
+                dense_ic=dense_ic,
+            )
         ic_target = _ic_targets(
             data["trajectories"], batch_ids, coll["ic"]["ix"], coll["ic"]["iy"], mu, sigma, device,
         )
 
         optimizer.zero_grad(set_to_none=True)
-        losses = pino_losses(model, u, coll, ic_target, alpha)
+        losses = pino_losses(
+            model, u, coll, ic_target, alpha,
+            causal_cfg=causal_cfg, t_final=t_final,
+            res_bins=(res_n_bins if do_val else 0),
+        )
 
         # Static per-term weights for this epoch (IC-first curriculum or plain
         # lambda_*), then GradNorm multipliers on the RAW magnitudes. Only terms
@@ -418,6 +623,14 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         else:
             mults = {}
         w_eff = {k: w[k] * float(mults.get(k, 1.0)) for k in ("r", "ic", "bc")}
+
+        # Per-term gradient norms (diagnostic; val epochs only to bound the extra
+        # backward passes). Measured on the live graph before the combined backward.
+        gnorms: dict[str, float] = {}
+        if do_val:
+            active_terms = {k: losses[k] for k in ("r", "ic", "bc") if w[k] > 0.0}
+            if active_terms:
+                gnorms = _term_grad_norms(active_terms, model.parameters())
 
         loss = (
             w_eff["r"] * losses["r"]
@@ -438,6 +651,9 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             "w_r": w_eff["r"],
             "w_ic": w_eff["ic"],
             "w_bc": w_eff["bc"],
+            "grad_norm_r": gnorms.get("r", ""),
+            "grad_norm_ic": gnorms.get("ic", ""),
+            "grad_norm_bc": gnorms.get("bc", ""),
             "val_rel_l2": "",
             "val_rmse_K": "",
         }
@@ -450,12 +666,28 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             flush=True,
         )
 
-        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
         if do_val:
             model.eval()
-            val = validate_rel_l2(model, data, data["val_ids"], device)
+            val = validate_rel_l2(
+                model, data, data["val_ids"], device, return_per_time=True,
+            )
             row["val_rel_l2"] = val["val_rel_l2"]
             row["val_rmse_K"] = val["val_rmse_K"]
+
+            # per-time rel-L2 + per-time-bin residual diagnostics
+            with open(relt_path, "a", newline="") as f:
+                rr = {"epoch": epoch}
+                rr.update({f"t{k}": float(val["per_time"][k]) for k in range(Nt)})
+                csv.DictWriter(f, fieldnames=relt_fields).writerow(rr)
+            if "res_bins" in losses:
+                rb = losses["res_bins"].detach().cpu().numpy()
+                with open(resbin_path, "a", newline="") as f:
+                    rr = {"epoch": epoch}
+                    rr.update({f"bin{b}": float(rb[b]) for b in range(res_n_bins)})
+                    csv.DictWriter(f, fieldnames=resbin_fields).writerow(rr)
+            if gnorms:
+                gn_txt = " ".join(f"{k}={gnorms[k]:.3e}" for k in ("r", "ic", "bc") if k in gnorms)
+                print(f"  grad_norms: {gn_txt}", flush=True)
             is_best = val["val_rel_l2"] < best_val
             if is_best:
                 best_val = val["val_rel_l2"]
@@ -509,6 +741,10 @@ __all__ = [
     "build_ic_batch",
     "pino_losses",
     "_curriculum_weights",
+    "_causal_weights",
+    "_causal_residual_loss",
+    "_bin_residual",
+    "_term_grad_norms",
     "build_gradnorm",
     "validate_rel_l2",
     "build_cvit",

@@ -58,7 +58,10 @@ model:
     depth_dec: 2
     num_heads: 8
     mlp_ratio: 2.0
-    fourier_freq: 1.0
+    fourier_freq: 1.0            # spatial (x, y in [0,1]) Fourier feature scale
+    fourier_freq_t: null         # temporal (t in [0,t_final]) scale; null -> fourier_freq.
+                                 # On the diffusion window t_final=0.3, freq 1.0 makes
+                                 # fourier_t near-constant (time-blind decoder); ~5-10 fixes it.
     activation: gelu
     hard_right_dirichlet: true
     hard_right_dirichlet_t_right: 300.0
@@ -158,20 +161,56 @@ training:
     sim_batch: 16
     chunk_r: 0
     alpha: 1.0
+    # dense_ic anchors the IC loss on EVERY grid node (Nx*Ny points, no RNG draw)
+    # instead of n_ic random nodes -- the primary stabilizer for this benchmark,
+    # whose physics attractor is the constant field (Chen et al. arXiv:2606.06164).
+    # false keeps the legacy n_ic random-node draw byte-identical.
+    dense_ic: false
+    # resample_every redraws the interior/wall collocation only every N steps
+    # (IC targets are re-read every step as the sim minibatch rotates). Slower
+    # resampling lets the IC anchor settle during warm-up; 1 = per-step (legacy).
+    resample_every: 1
+    # diag_time_bins is the number of query-time bins for the residual-per-time-bin
+    # diagnostic when causal weighting is off (causal.n_bins is used when it is on).
+    diag_time_bins: 16
     # IC-first curriculum for the diffusion physics-only objective. The constant
     # field T == T_right satisfies the PDE and every zero-Neumann wall, so a
     # residual-dominated start collapses to it before the IC anchor can fit the
     # per-sim initial fields (loss_r/loss_bc -> 0, loss_ic stuck, val ~ 100%).
-    # This staged schedule fits the IC first, then ramps the residual/BC weights
-    # in so the now-nontrivial field is propagated forward under the PDE.
+    #
+    # mode="ic_only" (legacy): fit the IC first with the residual/BC OFF, then ramp
+    # them in.
     #   phase 1 (epoch < ic_only_epochs):  w_r = w_bc = 0, only lambda_ic active.
     #   phase 2 (ramp_epochs):             w_r, w_bc scale linearly 0 -> lambda_*.
     #   phase 3:                           all three at their lambda_* targets.
+    #
+    # mode="ic_heavy" (Chen et al.): keep the residual/BC ON but small through a
+    # warm-up with a large lambda_ic, then decay lambda_ic while ramping the
+    # residual/BC to their targets. The residual must see the IC-anchored field
+    # from t=0 to propagate it, so it is never zeroed.
+    #   phase 1 (epoch < warmup_epochs):   (warmup_lambda_r, lambda_ic, warmup_lambda_bc).
+    #   phase 2 (decay_epochs):            lambda_ic -> lambda_ic_final; r/bc -> lambda_*.
+    #   phase 3:                           (lambda_r, lambda_ic_final, lambda_bc).
     # enabled: false is a TRUE no-op (weights stay at the static lambda_* values).
     curriculum:
       enabled: false
+      mode: ic_only
       ic_only_epochs: 0
       ramp_epochs: 1
+      warmup_epochs: 0
+      warmup_lambda_r: 0.1
+      warmup_lambda_bc: 1.0
+      decay_epochs: 1
+      lambda_ic_final: 1.0
+    # Causal residual weighting (Wang, Sankaran & Perdikaris 2022; Chen et al.):
+    # bin the interior residual by query time and weight bin i by
+    # exp(-eps_causal * sum_{j<i} L_j) so a later time is penalized only once the
+    # earlier bins are resolved. Detached weights act as a mask. enabled: false is
+    # a TRUE no-op (plain mean(r^2)).
+    causal:
+      enabled: false
+      n_bins: 16
+      eps_causal: 1.0
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
   # GradNorm-style adaptive balancing of the RAW per-component physics losses

@@ -305,12 +305,19 @@ class CViTDecoder(nn.Module):
         fourier_freq: float,
         activation: str,
         head_layers: int = 2,
+        fourier_freq_t: float | None = None,
     ):
         super().__init__()
         self.depth = depth
         self.dec_emb_dim = dec_emb_dim
+        # Spatial (x, y in [0, 1]) and temporal (t in [0, t_final]) coordinates
+        # live on different ranges, so their Fourier feature scales are decoupled.
+        # ``fourier_freq_t`` defaults to ``fourier_freq`` when unset; on the
+        # diffusion window t_final=0.3 the shared value 1.0 makes fourier_t nearly
+        # constant across the trajectory (near time-blind decoder), so raise it.
+        freq_t = float(fourier_freq if fourier_freq_t is None else fourier_freq_t)
         self.fourier_x = FourierEmbed(2, dec_emb_dim, fourier_freq)
-        self.fourier_t = FourierEmbed(1, dec_emb_dim, fourier_freq)
+        self.fourier_t = FourierEmbed(1, dec_emb_dim, freq_t)
         # Time-FiLM: t-embedding -> per-block (scale, shift). Last layer zero-init
         # so at init the decoder starts from an unmodulated (identity) query.
         self.time_film = MLP(
@@ -374,6 +381,7 @@ class CViT(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 2.0,
         fourier_freq: float = 1.0,
+        fourier_freq_t: float | None = None,
         activation: str = "gelu",
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
@@ -399,6 +407,7 @@ class CViT(nn.Module):
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             fourier_freq=fourier_freq,
+            fourier_freq_t=fourier_freq_t,
             activation=activation,
         )
         self.register_buffer(

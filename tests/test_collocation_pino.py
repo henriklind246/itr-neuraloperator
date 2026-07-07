@@ -53,3 +53,24 @@ def test_walls_pinned():
         assert tw.requires_grad
     # right wall (x=1) is enforced by the ansatz, not sampled
     assert "right" not in walls
+
+
+def test_dense_ic_covers_every_grid_node():
+    Nx, Ny = 10, 12
+    x_grid = torch.linspace(0.0, 1.0, Nx)
+    y_grid = torch.linspace(0.0, 1.0, Ny)
+    gen = torch.Generator().manual_seed(0)
+    coll = sample_collocation(
+        100, 50, 40, 0.3, x_grid, y_grid, torch.device("cpu"), gen, dense_ic=True,
+    )
+    ic = coll["ic"]
+    # n_ic is ignored: the IC anchor is the full Nx*Ny grid, at t=0.
+    assert ic["coords"].shape == (1, Nx * Ny, 2)
+    assert torch.all(ic["t"] == 0.0)
+    # every (ix, iy) node appears exactly once
+    pairs = set(zip(ic["ix"].tolist(), ic["iy"].tolist()))
+    assert len(pairs) == Nx * Ny
+    assert pairs == {(i, j) for i in range(Nx) for j in range(Ny)}
+    # coords equal the grid nodes at those indices
+    assert torch.allclose(ic["coords"][0, :, 0], x_grid[ic["ix"]])
+    assert torch.allclose(ic["coords"][0, :, 1], y_grid[ic["iy"]])
