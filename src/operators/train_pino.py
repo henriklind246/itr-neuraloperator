@@ -17,6 +17,7 @@ from data.dataset import (
 from problems.diffusion import T_RIGHT
 from src.operators.cvit import CViT
 from src.operators.train import (
+    GradNormBalancer,
     build_optimizer,
     build_scheduler,
     load_config,
@@ -197,6 +198,52 @@ def pino_losses(
     return {"r": loss_r, "ic": loss_ic, "bc": loss_bc}
 
 
+# --------- loss weighting (curriculum + GradNorm) ---------
+
+def _curriculum_weights(
+    epoch: int,
+    lam_r: float,
+    lam_ic: float,
+    lam_bc: float,
+    cfg: dict | None,
+) -> tuple[float, float, float]:
+    """Static per-term weights for this epoch under the IC-first curriculum.
+
+    Returns the base ``lambda_*`` unchanged when the curriculum is disabled.
+    Otherwise: an IC-only phase (``w_r = w_bc = 0``) for ``ic_only_epochs`` steps,
+    then a linear ramp of the residual/BC weights up to their ``lambda_*`` targets
+    over ``ramp_epochs`` steps, then full weights. The IC weight is always active.
+    """
+    if not cfg or not cfg.get("enabled", False):
+        return lam_r, lam_ic, lam_bc
+    ic_only = int(cfg.get("ic_only_epochs", 0))
+    ramp = max(1, int(cfg.get("ramp_epochs", 1)))
+    if epoch < ic_only:
+        return 0.0, lam_ic, 0.0
+    s = min(1.0, (epoch - ic_only) / ramp)
+    return s * lam_r, lam_ic, s * lam_bc
+
+
+def build_gradnorm(config: dict, lam_r: float, lam_ic: float, lam_bc: float):
+    """GradNormBalancer over the active PINO terms, or None when disabled.
+
+    Reuses the FNO path's balancer (inverse gradient-norm multipliers, EMA
+    smoothed). Term set is the base terms with a positive static ``lambda_*`` (an
+    IC-first curriculum may zero ``r``/``bc`` for early epochs, but those terms
+    still come online during the ramp, so they belong in ``term_names``).
+    """
+    gn_cfg = config["training"].get("gradnorm", {}) or {}
+    if not bool(gn_cfg.get("enabled", False)):
+        return None
+    terms = [n for n, w in (("r", lam_r), ("ic", lam_ic), ("bc", lam_bc)) if w > 0.0]
+    return GradNormBalancer(
+        terms,
+        alpha_w=float(gn_cfg.get("alpha_w", 0.9)),
+        update_every=int(gn_cfg.get("update_every", 10)),
+        eps=float(gn_cfg.get("eps", 1.0e-8)),
+    )
+
+
 # --------- validation ---------
 
 @torch.no_grad()
@@ -301,6 +348,9 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     sim_batch = int(pino["sim_batch"])
     alpha = float(pino.get("alpha", 1.0))
 
+    curr_cfg = pino.get("curriculum", {}) or {}
+    gradnorm = build_gradnorm(config, lam_r, lam_ic, lam_bc)
+
     epochs = int(config["training"]["epochs"])
     validate_every = int(config["training"].get("validate_every", 10))
 
@@ -313,18 +363,31 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     train_ids = np.asarray(data["train_ids"])
 
     metrics_path = run_dir / "train_metrics.csv"
-    fieldnames = ["epoch", "loss", "loss_r", "loss_ic", "loss_bc", "val_rel_l2", "val_rmse_K"]
+    fieldnames = [
+        "epoch", "loss", "loss_r", "loss_ic", "loss_bc",
+        "w_r", "w_ic", "w_bc", "val_rel_l2", "val_rmse_K",
+    ]
     with open(metrics_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
     best_val = float("inf")
     history: list[dict[str, float]] = []
 
+    curr_on = bool(curr_cfg.get("enabled", False))
+    curr_desc = (
+        f"ic_only={int(curr_cfg.get('ic_only_epochs', 0))} "
+        f"ramp={int(curr_cfg.get('ramp_epochs', 1))}"
+        if curr_on else "off"
+    )
+    gn_desc = (
+        f"on(terms={gradnorm.term_names})" if gradnorm is not None else "off"
+    )
     print(
         f"[pino] seed={seed} device={device} epochs={epochs} "
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
         f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} | "
-        f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} sim_batch={sim_batch} alpha={alpha}",
+        f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} sim_batch={sim_batch} alpha={alpha} | "
+        f"curriculum={curr_desc} gradnorm={gn_desc}",
         flush=True,
     )
 
@@ -340,7 +403,27 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
 
         optimizer.zero_grad(set_to_none=True)
         losses = pino_losses(model, u, coll, ic_target, alpha)
-        loss = lam_r * losses["r"] + lam_ic * losses["ic"] + lam_bc * losses["bc"]
+
+        # Static per-term weights for this epoch (IC-first curriculum or plain
+        # lambda_*), then GradNorm multipliers on the RAW magnitudes. Only terms
+        # with a positive static weight are measured; a zero-weighted term (IC-only
+        # phase) is neither balanced nor added to the total.
+        w = {"r": 0.0, "ic": 0.0, "bc": 0.0}
+        w["r"], w["ic"], w["bc"] = _curriculum_weights(
+            epoch, lam_r, lam_ic, lam_bc, curr_cfg,
+        )
+        if gradnorm is not None:
+            active = {k: losses[k] for k in ("r", "ic", "bc") if w[k] > 0.0}
+            mults = gradnorm.maybe_update(active, model.parameters())
+        else:
+            mults = {}
+        w_eff = {k: w[k] * float(mults.get(k, 1.0)) for k in ("r", "ic", "bc")}
+
+        loss = (
+            w_eff["r"] * losses["r"]
+            + w_eff["ic"] * losses["ic"]
+            + w_eff["bc"] * losses["bc"]
+        )
         loss.backward()
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
@@ -352,6 +435,9 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             "loss_r": float(losses["r"].detach().cpu()),
             "loss_ic": float(losses["ic"].detach().cpu()),
             "loss_bc": float(losses["bc"].detach().cpu()),
+            "w_r": w_eff["r"],
+            "w_ic": w_eff["ic"],
+            "w_bc": w_eff["bc"],
             "val_rel_l2": "",
             "val_rmse_K": "",
         }
@@ -359,6 +445,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         print(
             f"Epoch {epoch}: loss={row['loss']:.6f} "
             f"(r={row['loss_r']:.6f}, ic={row['loss_ic']:.6f}, bc={row['loss_bc']:.6f}) "
+            f"w=({w_eff['r']:.3g},{w_eff['ic']:.3g},{w_eff['bc']:.3g}) "
             f"lr={lr:.2e}",
             flush=True,
         )
@@ -380,6 +467,9 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
                         "config": config,
                         "epoch": epoch,
                         "best_val": best_val,
+                        "gradnorm_state": (
+                            gradnorm.state_dict() if gradnorm is not None else None
+                        ),
                     },
                     run_dir / "cvit_best.pt",
                 )
@@ -418,6 +508,8 @@ __all__ = [
     "load_diffusion_data",
     "build_ic_batch",
     "pino_losses",
+    "_curriculum_weights",
+    "build_gradnorm",
     "validate_rel_l2",
     "build_cvit",
     "run_one_seed_pino",

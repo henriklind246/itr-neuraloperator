@@ -158,6 +158,20 @@ training:
     sim_batch: 16
     chunk_r: 0
     alpha: 1.0
+    # IC-first curriculum for the diffusion physics-only objective. The constant
+    # field T == T_right satisfies the PDE and every zero-Neumann wall, so a
+    # residual-dominated start collapses to it before the IC anchor can fit the
+    # per-sim initial fields (loss_r/loss_bc -> 0, loss_ic stuck, val ~ 100%).
+    # This staged schedule fits the IC first, then ramps the residual/BC weights
+    # in so the now-nontrivial field is propagated forward under the PDE.
+    #   phase 1 (epoch < ic_only_epochs):  w_r = w_bc = 0, only lambda_ic active.
+    #   phase 2 (ramp_epochs):             w_r, w_bc scale linearly 0 -> lambda_*.
+    #   phase 3:                           all three at their lambda_* targets.
+    # enabled: false is a TRUE no-op (weights stay at the static lambda_* values).
+    curriculum:
+      enabled: false
+      ic_only_epochs: 0
+      ramp_epochs: 1
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
   # GradNorm-style adaptive balancing of the RAW per-component physics losses

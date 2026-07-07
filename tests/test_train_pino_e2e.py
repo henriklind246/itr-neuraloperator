@@ -20,7 +20,7 @@ import math
 import numpy as np
 import torch
 
-from src.operators.train_pino import run_one_seed_pino
+from src.operators.train_pino import _curriculum_weights, run_one_seed_pino
 
 
 def _write_synthetic_diffusion(tmp_path, num_sims=16, Nt=6, Nx=20, Ny=20):
@@ -131,3 +131,82 @@ def test_e2e_runs_logs_and_checkpoints(tmp_path):
     assert summary["epochs"] == 2
     final = json.loads((run_dir / "final_metrics.json").read_text())
     assert final["seed"] == 0
+
+    # ---- default path: static weights, no gradnorm state ----
+    for r in rows:
+        assert float(r["w_r"]) == 1.0
+        assert float(r["w_ic"]) == 1.0
+        assert float(r["w_bc"]) == 1.0
+    assert ckpt.get("gradnorm_state") is None
+
+
+# --------- IC-first curriculum ---------
+
+def test_curriculum_weights_schedule():
+    cfg = {"enabled": True, "ic_only_epochs": 1, "ramp_epochs": 2}
+    # phase 1: IC-only.
+    assert _curriculum_weights(0, 1.0, 1.0, 1.0, cfg) == (0.0, 1.0, 0.0)
+    # phase 2: ramp start (s=0) then linear.
+    assert _curriculum_weights(1, 1.0, 1.0, 1.0, cfg) == (0.0, 1.0, 0.0)
+    assert _curriculum_weights(2, 2.0, 1.0, 4.0, cfg) == (1.0, 1.0, 2.0)  # s=0.5
+    # phase 3: full weights, clamped at s=1.
+    assert _curriculum_weights(3, 2.0, 1.0, 4.0, cfg) == (2.0, 1.0, 4.0)
+    assert _curriculum_weights(9, 2.0, 1.0, 4.0, cfg) == (2.0, 1.0, 4.0)
+
+
+def test_curriculum_weights_disabled_is_noop():
+    for cfg in ({}, None, {"enabled": False, "ic_only_epochs": 5}):
+        assert _curriculum_weights(0, 0.5, 2.0, 3.0, cfg) == (0.5, 2.0, 3.0)
+
+
+def test_e2e_curriculum_ic_first(tmp_path):
+    _write_synthetic_diffusion(tmp_path)
+    cfg = _config(tmp_path)
+    cfg["training"]["epochs"] = 4
+    cfg["training"]["pino"]["curriculum"] = {
+        "enabled": True, "ic_only_epochs": 1, "ramp_epochs": 2,
+    }
+    run_dir = tmp_path / "run_curr"
+
+    run_one_seed_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 4
+
+    # IC-only epoch: residual/BC weights are zero, IC weight active.
+    assert float(rows[0]["w_r"]) == 0.0
+    assert float(rows[0]["w_bc"]) == 0.0
+    assert float(rows[0]["w_ic"]) == 1.0
+    # Ramp midpoint (epoch 2, s=0.5) and full weight (epoch 3).
+    assert float(rows[2]["w_r"]) == 0.5
+    assert float(rows[3]["w_r"]) == 1.0
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc"):
+            assert math.isfinite(float(r[col]))
+
+
+# --------- GradNorm balancing ---------
+
+def test_e2e_gradnorm_enabled(tmp_path):
+    _write_synthetic_diffusion(tmp_path)
+    cfg = _config(tmp_path)
+    cfg["training"]["epochs"] = 3
+    cfg["training"]["gradnorm"] = {
+        "enabled": True, "alpha_w": 0.5, "update_every": 1, "eps": 1e-8,
+    }
+    run_dir = tmp_path / "run_gn"
+
+    run_one_seed_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 3
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc", "w_r", "w_ic", "w_bc"):
+            assert math.isfinite(float(r[col]))
+
+    # GradNorm state is persisted with all three active terms.
+    ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
+    gn = ckpt.get("gradnorm_state")
+    assert gn is not None
+    assert set(gn["term_names"]) == {"r", "ic", "bc"}
+    assert set(gn["multipliers"]) == {"r", "ic", "bc"}
+    for v in gn["multipliers"].values():
+        assert math.isfinite(float(v)) and float(v) > 0.0
