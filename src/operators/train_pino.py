@@ -226,24 +226,25 @@ def validate_rel_l2(
     se_K = 0.0
     n_pts = 0
     ids = np.asarray(ids)
-    for start in range(0, len(ids), query_batch):
-        chunk = ids[start:start + query_batch]
-        u = build_ic_batch(data["trajectories"], chunk, mu, sigma, device)
-        B = u.shape[0]
-        coords = mesh.expand(B, -1, -1)
-        pred = torch.empty((B, Nt, Nx, Ny), device=device)
-        for k in range(Nt):
-            tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
-            out = model(u, coords, tk)              # (B, Nx*Ny, 1)
-            pred[:, k] = out[..., 0].view(B, Nx, Ny)
-        truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)  # (B,Nt,Nx,Ny)
-        truth_t = torch.from_numpy(truth).to(device)
-        truth_norm = (truth_t - mu) / (sigma + 1e-8)
-        sq_err += ((pred - truth_norm) ** 2).sum().item()
-        sq_ref += (truth_norm ** 2).sum().item()
-        pred_K = pred * sigma + mu
-        se_K += ((pred_K - truth_t) ** 2).sum().item()
-        n_pts += truth_t.numel()
+    with torch.no_grad():
+        for start in range(0, len(ids), query_batch):
+            chunk = ids[start:start + query_batch]
+            u = build_ic_batch(data["trajectories"], chunk, mu, sigma, device)
+            B = u.shape[0]
+            coords = mesh.expand(B, -1, -1)
+            pred = torch.empty((B, Nt, Nx, Ny), device=device)
+            for k in range(Nt):
+                tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
+                out = model(u, coords, tk)              # (B, Nx*Ny, 1)
+                pred[:, k] = out[..., 0].view(B, Nx, Ny)
+            truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)  # (B,Nt,Nx,Ny)
+            truth_t = torch.from_numpy(truth).to(device)
+            truth_norm = (truth_t - mu) / (sigma + 1e-8)
+            sq_err += ((pred - truth_norm) ** 2).sum().item()
+            sq_ref += (truth_norm ** 2).sum().item()
+            pred_K = pred * sigma + mu
+            se_K += ((pred_K - truth_t) ** 2).sum().item()
+            n_pts += truth_t.numel()
 
     rel_l2 = float(np.sqrt(sq_err / max(sq_ref, 1e-30)))
     rmse_K = float(np.sqrt(se_K / max(n_pts, 1)))
@@ -319,6 +320,14 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     best_val = float("inf")
     history: list[dict[str, float]] = []
 
+    print(
+        f"[pino] seed={seed} device={device} epochs={epochs} "
+        f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
+        f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} | "
+        f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} sim_batch={sim_batch} alpha={alpha}",
+        flush=True,
+    )
+
     for epoch in range(epochs):
         model.train()
         batch_ids = rng.choice(train_ids, size=min(sim_batch, len(train_ids)), replace=False)
@@ -333,6 +342,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         losses = pino_losses(model, u, coll, ic_target, alpha)
         loss = lam_r * losses["r"] + lam_ic * losses["ic"] + lam_bc * losses["bc"]
         loss.backward()
+        lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
         scheduler.step()
 
@@ -346,13 +356,21 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             "val_rmse_K": "",
         }
 
+        print(
+            f"Epoch {epoch}: loss={row['loss']:.6f} "
+            f"(r={row['loss_r']:.6f}, ic={row['loss_ic']:.6f}, bc={row['loss_bc']:.6f}) "
+            f"lr={lr:.2e}",
+            flush=True,
+        )
+
         do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
         if do_val:
             model.eval()
             val = validate_rel_l2(model, data, data["val_ids"], device)
             row["val_rel_l2"] = val["val_rel_l2"]
             row["val_rmse_K"] = val["val_rmse_K"]
-            if val["val_rel_l2"] < best_val:
+            is_best = val["val_rel_l2"] < best_val
+            if is_best:
                 best_val = val["val_rel_l2"]
                 torch.save(
                     {
@@ -365,6 +383,14 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
                     },
                     run_dir / "cvit_best.pt",
                 )
+            print(
+                f"Validation for epoch {epoch}: "
+                f"val_rel_l2={val['val_rel_l2'] * 100:.4f}% "
+                f"val_rmse_K={val['val_rmse_K']:.4f}K "
+                f"(best={best_val * 100:.4f}%)"
+                + ("  [new best -> cvit_best.pt]" if is_best else ""),
+                flush=True,
+            )
 
         history.append({k: (v if v != "" else None) for k, v in row.items()})
         with open(metrics_path, "a", newline="") as f:
