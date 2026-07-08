@@ -161,6 +161,14 @@ training:
     sim_batch: 16
     chunk_r: 0
     alpha: 1.0
+    # ic_loss selects the IC term norm. "mse" (legacy) is the raw normalized MSE
+    # mean(ic^2), which goes numerically small on a near-300 K field even when the
+    # relative error in the thermal signal is large (t0 rel-L2 ~0.75 seeds the whole
+    # trajectory). "rel" is the per-sim relative L2 vs the constant-300 K deviation,
+    # sum_i ic^2 / (sum_i (ic_target - t_right_tilde)^2 + ic_eps), targeting the same
+    # signal the validation rel-L2 measures. ic_eps guards the denominator.
+    ic_loss: mse
+    ic_eps: 1.0e-6
     # dense_ic anchors the IC loss on EVERY grid node (Nx*Ny points, no RNG draw)
     # instead of n_ic random nodes -- the primary stabilizer for this benchmark,
     # whose physics attractor is the constant field (Chen et al. arXiv:2606.06164).

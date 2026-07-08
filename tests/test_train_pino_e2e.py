@@ -24,6 +24,7 @@ from src.operators.train_pino import (
     _causal_residual_loss,
     _causal_weights,
     _curriculum_weights,
+    _ic_loss,
     run_one_seed_pino,
 )
 
@@ -324,3 +325,86 @@ def test_e2e_staged_pipeline_and_diagnostics(tmp_path):
     for row in resbin:
         for k, v in row.items():
             assert math.isfinite(float(v))
+
+
+# --------- relative IC loss ---------
+
+def test_ic_loss_mse_is_mean_square():
+    # Legacy path: mode="mse" is exactly mean(ic**2), independent of the target.
+    ic = torch.tensor([[[0.1], [0.2], [0.3]]])          # (1, 3, 1)
+    ic_target = torch.tensor([[[5.0], [-4.0], [2.0]]])
+    got = _ic_loss(ic, ic_target, mode="mse")
+    assert torch.allclose(got, (ic ** 2).mean())
+
+
+def test_ic_loss_rel_is_squared_relative_ratio():
+    # rel: sum_i ic**2 / (sum_i (ic_target - t_right_tilde)**2 + eps). With
+    # t_right_tilde=0 and ic = 0.1 * ic_target, the ratio is 0.1**2 = 0.01.
+    ic_target = torch.tensor([[[2.0], [-3.0], [1.5]]])   # (1, 3, 1)
+    ic = 0.1 * ic_target
+    got = _ic_loss(ic, ic_target, mode="rel", t_right_tilde=0.0, eps=0.0)
+    assert torch.allclose(got, torch.tensor(0.01), atol=1e-6)
+
+
+def test_ic_loss_rel_is_per_sim_amplitude_invariant():
+    # Two sims, same 10% relative IC error but different amplitudes; per-sim
+    # normalization makes each ratio 0.01, so the mean is 0.01 (a raw MSE would be
+    # dominated by the larger-amplitude sim).
+    ic_target = torch.tensor([
+        [[1.0], [1.0]],       # small-amplitude sim
+        [[100.0], [100.0]],   # large-amplitude sim
+    ])                                                   # (2, 2, 1)
+    ic = 0.1 * ic_target
+    got = _ic_loss(ic, ic_target, mode="rel", t_right_tilde=0.0, eps=0.0)
+    assert torch.allclose(got, torch.tensor(0.01), atol=1e-6)
+
+
+def test_ic_loss_rel_uses_deviation_from_t_right():
+    # The denominator measures the IC as a deviation from the constant field
+    # t_right_tilde, so an IC equal to t_right_tilde has ~zero energy and the eps
+    # guard keeps the ratio finite.
+    t_right = 2.5
+    ic_target = torch.full((1, 4, 1), t_right)
+    ic = torch.full((1, 4, 1), 0.3)
+    got = _ic_loss(ic, ic_target, mode="rel", t_right_tilde=t_right, eps=1.0e-6)
+    assert math.isfinite(float(got))
+    # num = 4 * 0.09 = 0.36; den = 0 + 1e-6 -> large but finite ratio.
+    assert float(got) > 1.0
+
+
+def test_e2e_ic_loss_rel_runs_and_reports_bands(tmp_path):
+    _write_synthetic_diffusion(tmp_path)
+    cfg = _config(tmp_path)
+    cfg["training"]["epochs"] = 2
+    cfg["training"]["validate_every"] = 1
+    cfg["training"]["pino"]["ic_loss"] = "rel"
+    cfg["training"]["pino"]["ic_eps"] = 1.0e-6
+    run_dir = tmp_path / "run_ic_rel"
+
+    run_one_seed_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+
+    band_cols = [
+        f"{stem}_{band}"
+        for stem in ("rel_l2", "rel_dev", "rmse_K")
+        for band in ("early", "mid", "late")
+    ]
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc"):
+            assert math.isfinite(float(r[col]))
+        # new honest-metric columns populated on every (validate_every=1) epoch
+        assert r["val_t0_rel_l2"] not in ("", None)
+        assert math.isfinite(float(r["val_t0_rel_l2"]))
+        for col in band_cols:
+            assert col in r and r[col] not in ("", None)
+            assert math.isfinite(float(r[col]))
+
+    # companion per-time CSVs for rel-dev and RMSE_K, one row per val epoch, Nt=6.
+    for name in ("rel_l2_dev_per_time.csv", "rmse_K_per_time.csv"):
+        prt = _named_rows(run_dir, name)
+        assert len(prt) == 2
+        assert "t0" in prt[0] and "t5" in prt[0]
+        for row in prt:
+            for _, v in row.items():
+                assert math.isfinite(float(v))

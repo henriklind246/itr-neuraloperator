@@ -242,6 +242,37 @@ def _causal_residual_loss(
 
 # --------- loss ---------
 
+def _ic_loss(
+    ic: torch.Tensor,
+    ic_target: torch.Tensor,
+    *,
+    mode: str = "mse",
+    t_right_tilde: float = 0.0,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """IC term from the raw IC residual ``ic = T_hat_norm(0) - ic_target``.
+
+    ``mode="mse"`` (legacy): plain ``mean(ic**2)`` -- a raw normalized MSE that
+    goes numerically small on a near-300 K field even when the *relative* error
+    in the nonconstant thermal signal is large (t0 rel-L2 ~0.75 on diffusion, the
+    IC that seeds the whole trajectory).
+
+    ``mode="rel"``: per-sim relative L2,
+    ``mean_b[ sum_i ic**2 / (sum_i (ic_target - t_right_tilde)**2 + eps) ]``. The
+    denominator is the IC's energy measured as a *deviation from the constant
+    300 K field* (``t_right_tilde = (300 - mu)/sigma``), so the loss targets
+    relative error in the signal validation rel-L2 measures, not absolute Kelvin
+    MSE. Per-sim (dim-0) so it is invariant to each trajectory's IC amplitude;
+    for a single sim it reduces to one ratio.
+    """
+    if mode == "rel":
+        num = (ic ** 2).sum(dim=(1, 2))                    # (B,)
+        dev = ic_target - t_right_tilde
+        den = (dev ** 2).sum(dim=(1, 2)) + eps             # (B,)
+        return (num / den).mean()
+    return (ic ** 2).mean()
+
+
 def pino_losses(
     model: CViT,
     u: torch.Tensor,
@@ -252,11 +283,16 @@ def pino_losses(
     causal_cfg: dict | None = None,
     t_final: float | None = None,
     res_bins: int = 0,
+    ic_loss: str = "mse",
+    t_right_tilde: float = 0.0,
+    ic_eps: float = 1.0e-6,
 ) -> dict[str, torch.Tensor]:
     """Raw physics/IC/BC losses. ``causal_cfg.enabled`` swaps the plain
     ``mean(r^2)`` interior term for a causally time-weighted one (needs
     ``t_final``); ``res_bins > 0`` also returns a detached ``res_bins`` per-time
-    residual vector for diagnostics. Both default off -> legacy behavior.
+    residual vector for diagnostics. ``ic_loss="rel"`` (with ``t_right_tilde``)
+    swaps the raw IC MSE for the per-sim relative IC L2 (see ``_ic_loss``). All
+    default off -> legacy behavior.
     """
     x_r, y_r, t_r = batch["interior"]
     r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha)
@@ -274,7 +310,9 @@ def pino_losses(
         loss_r = (r ** 2).mean()
 
     ic = ic_residual(model, u, batch["ic"]["coords"], batch["ic"]["t"], ic_target)
-    loss_ic = (ic ** 2).mean()
+    loss_ic = _ic_loss(
+        ic, ic_target, mode=ic_loss, t_right_tilde=t_right_tilde, eps=ic_eps,
+    )
 
     bc_sq = 0.0
     for w in WALLS:
@@ -394,14 +432,24 @@ def validate_rel_l2(
     """Grid-query rel-L2 (normalized) + Kelvin RMSE over held-out sims.
 
     Queries the model on the full (x_grid, y_grid) mesh at every saved t_grid
-    time and compares to the stored trajectories. ``return_per_time=True`` adds a
-    ``per_time`` key: the normalized rel-L2 at each saved time (length Nt), which
-    exposes whether the model fits t=0 but drifts as the trajectory decays.
+    time and compares to the stored trajectories. ``return_per_time=True`` adds
+    honest per-time / banded diagnostics for a near-uniform late-time field where
+    the plain normalized rel-L2 denominator collapses toward the constant-300 K
+    reference:
+      - ``per_time``        normalized rel-L2 at each saved time (length Nt),
+      - ``per_time_rmse_K`` Kelvin RMSE at each saved time,
+      - ``per_time_rel_dev`` rel-L2 measured on the deviation (T - 300 K); sigma
+        cancels so this equals the Kelvin rel-L2 on ``T - T_RIGHT``,
+      - ``t0_rel_l2``       the t=0 rel-L2 (the IC pass/fail gate),
+      - band scalars ``rel_l2_{early,mid,late}``, ``rmse_K_{early,mid,late}``,
+        ``rel_dev_{early,mid,late}`` over t<=0.05 / 0.05<t<=0.15 / t>0.15.
+    ``t_right_tilde = (T_RIGHT - mu)/sigma`` is the normalized constant-300 field.
     """
     x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
     y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
-    t_grid = data["t_grid"]
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
     mu, sigma = data["mu_global"], data["sigma_global"]
+    t_right_tilde = (T_RIGHT - mu) / (sigma + 1e-8)
     Nx, Ny, Nt = x_grid.numel(), y_grid.numel(), len(t_grid)
 
     gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
@@ -413,6 +461,9 @@ def validate_rel_l2(
     n_pts = 0
     sq_err_t = np.zeros(Nt, dtype=np.float64)
     sq_ref_t = np.zeros(Nt, dtype=np.float64)
+    dev_ref_t = np.zeros(Nt, dtype=np.float64)
+    se_K_t = np.zeros(Nt, dtype=np.float64)
+    n_pts_t = np.zeros(Nt, dtype=np.float64)
     ids = np.asarray(ids)
     with torch.no_grad():
         for start in range(0, len(ids), query_batch):
@@ -436,14 +487,45 @@ def validate_rel_l2(
             if return_per_time:
                 err_bt = ((pred - truth_norm) ** 2).sum(dim=(0, 2, 3))
                 ref_bt = (truth_norm ** 2).sum(dim=(0, 2, 3))
+                dev_bt = ((truth_norm - t_right_tilde) ** 2).sum(dim=(0, 2, 3))
+                seK_bt = ((pred_K - truth_t) ** 2).sum(dim=(0, 2, 3))
                 sq_err_t += err_bt.detach().cpu().numpy().astype(np.float64)
                 sq_ref_t += ref_bt.detach().cpu().numpy().astype(np.float64)
+                dev_ref_t += dev_bt.detach().cpu().numpy().astype(np.float64)
+                se_K_t += seK_bt.detach().cpu().numpy().astype(np.float64)
+                n_pts_t += float(B * Nx * Ny)
 
     rel_l2 = float(np.sqrt(sq_err / max(sq_ref, 1e-30)))
     rmse_K = float(np.sqrt(se_K / max(n_pts, 1)))
     out = {"val_rel_l2": rel_l2, "val_rmse_K": rmse_K}
     if return_per_time:
-        out["per_time"] = np.sqrt(sq_err_t / np.maximum(sq_ref_t, 1e-30))
+        per_time = np.sqrt(sq_err_t / np.maximum(sq_ref_t, 1e-30))
+        per_time_rel_dev = np.sqrt(sq_err_t / np.maximum(dev_ref_t, 1e-30))
+        per_time_rmse_K = np.sqrt(se_K_t / np.maximum(n_pts_t, 1.0))
+        out["per_time"] = per_time
+        out["per_time_rel_dev"] = per_time_rel_dev
+        out["per_time_rmse_K"] = per_time_rmse_K
+        out["t0_rel_l2"] = float(per_time[0])
+        bands = {
+            "early": t_grid <= 0.05,
+            "mid": (t_grid > 0.05) & (t_grid <= 0.15),
+            "late": t_grid > 0.15,
+        }
+        for name, mask in bands.items():
+            if not mask.any():
+                out[f"rel_l2_{name}"] = float("nan")
+                out[f"rel_dev_{name}"] = float("nan")
+                out[f"rmse_K_{name}"] = float("nan")
+                continue
+            out[f"rel_l2_{name}"] = float(
+                np.sqrt(sq_err_t[mask].sum() / max(sq_ref_t[mask].sum(), 1e-30))
+            )
+            out[f"rel_dev_{name}"] = float(
+                np.sqrt(sq_err_t[mask].sum() / max(dev_ref_t[mask].sum(), 1e-30))
+            )
+            out[f"rmse_K_{name}"] = float(
+                np.sqrt(se_K_t[mask].sum() / max(n_pts_t[mask].sum(), 1.0))
+            )
     return out
 
 
@@ -501,6 +583,13 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     sim_batch = int(pino["sim_batch"])
     alpha = float(pino.get("alpha", 1.0))
 
+    # IC term norm: "mse" (raw normalized MSE, legacy) or "rel" (per-sim relative
+    # L2 vs the constant-300 K deviation). The relative form makes the IC anchor
+    # target the same signal the validation rel-L2 measures on a near-300 K field.
+    ic_loss = str(pino.get("ic_loss", "mse"))
+    ic_eps = float(pino.get("ic_eps", 1.0e-6))
+    t_right_tilde_ic = (T_RIGHT - mu) / (sigma + 1e-8)
+
     dense_ic = bool(pino.get("dense_ic", False))
     resample_every = max(1, int(pino.get("resample_every", 1)))
     causal_cfg = pino.get("causal", {}) or {}
@@ -525,22 +614,38 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     train_ids = np.asarray(data["train_ids"])
 
     metrics_path = run_dir / "train_metrics.csv"
+    # Banded / t0 columns give an honest read on a near-300 K late field where the
+    # plain normalized rel-L2 denominator collapses: val_t0_rel_l2 is the IC gate,
+    # rel_dev_* is rel-L2 on (T-300 K), rmse_K_* is the Kelvin band error.
+    band_cols = [
+        f"{stem}_{band}"
+        for stem in ("rel_l2", "rel_dev", "rmse_K")
+        for band in ("early", "mid", "late")
+    ]
     fieldnames = [
         "epoch", "loss", "loss_r", "loss_ic", "loss_bc",
         "w_r", "w_ic", "w_bc", "grad_norm_r", "grad_norm_ic", "grad_norm_bc",
-        "val_rel_l2", "val_rmse_K",
-    ]
+        "val_rel_l2", "val_rmse_K", "val_t0_rel_l2",
+    ] + band_cols
     with open(metrics_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
     # Per-time diagnostics (written on validation epochs only): rel-L2 at each
     # saved time exposes IC-fit-but-trajectory-drift; per-time-bin residual shows
-    # whether the residual is uniformly small or concentrated at late times.
+    # whether the residual is uniformly small or concentrated at late times. The
+    # rel-dev (rel-L2 on T-300 K) and RMSE_K per-time CSVs are the metric-honest
+    # companions for the near-uniform late field.
     t_grid = np.asarray(data["t_grid"])
     Nt = int(t_grid.shape[0])
     relt_path = run_dir / "rel_l2_per_time.csv"
     relt_fields = ["epoch"] + [f"t{k}" for k in range(Nt)]
     with open(relt_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=relt_fields).writeheader()
+    reldevt_path = run_dir / "rel_l2_dev_per_time.csv"
+    with open(reldevt_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=relt_fields).writeheader()
+    rmseKt_path = run_dir / "rmse_K_per_time.csv"
+    with open(rmseKt_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=relt_fields).writeheader()
     resbin_path = run_dir / "residual_per_time_bin.csv"
     resbin_fields = ["epoch"] + [f"bin{b}" for b in range(res_n_bins)]
@@ -576,7 +681,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
         f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} | "
         f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} sim_batch={sim_batch} alpha={alpha} | "
-        f"dense_ic={dense_ic} resample_every={resample_every} | "
+        f"ic_loss={ic_loss} dense_ic={dense_ic} resample_every={resample_every} | "
         f"curriculum={curr_desc} gradnorm={gn_desc} causal={causal_desc}",
         flush=True,
     )
@@ -607,6 +712,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             model, u, coll, ic_target, alpha,
             causal_cfg=causal_cfg, t_final=t_final,
             res_bins=(res_n_bins if do_val else 0),
+            ic_loss=ic_loss, t_right_tilde=t_right_tilde_ic, ic_eps=ic_eps,
         )
 
         # Static per-term weights for this epoch (IC-first curriculum or plain
@@ -656,6 +762,8 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             "grad_norm_bc": gnorms.get("bc", ""),
             "val_rel_l2": "",
             "val_rmse_K": "",
+            "val_t0_rel_l2": "",
+            **{c: "" for c in band_cols},
         }
 
         print(
@@ -673,11 +781,23 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             )
             row["val_rel_l2"] = val["val_rel_l2"]
             row["val_rmse_K"] = val["val_rmse_K"]
+            row["val_t0_rel_l2"] = val["t0_rel_l2"]
+            for c in band_cols:
+                row[c] = val[c]
 
-            # per-time rel-L2 + per-time-bin residual diagnostics
+            # per-time rel-L2 (normalized), rel-L2 on (T-300 K), RMSE_K, and
+            # per-time-bin residual diagnostics
             with open(relt_path, "a", newline="") as f:
                 rr = {"epoch": epoch}
                 rr.update({f"t{k}": float(val["per_time"][k]) for k in range(Nt)})
+                csv.DictWriter(f, fieldnames=relt_fields).writerow(rr)
+            with open(reldevt_path, "a", newline="") as f:
+                rr = {"epoch": epoch}
+                rr.update({f"t{k}": float(val["per_time_rel_dev"][k]) for k in range(Nt)})
+                csv.DictWriter(f, fieldnames=relt_fields).writerow(rr)
+            with open(rmseKt_path, "a", newline="") as f:
+                rr = {"epoch": epoch}
+                rr.update({f"t{k}": float(val["per_time_rmse_K"][k]) for k in range(Nt)})
                 csv.DictWriter(f, fieldnames=relt_fields).writerow(rr)
             if "res_bins" in losses:
                 rb = losses["res_bins"].detach().cpu().numpy()
@@ -713,6 +833,16 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
                 + ("  [new best -> cvit_best.pt]" if is_best else ""),
                 flush=True,
             )
+            print(
+                f"  t0_rel_l2={val['t0_rel_l2'] * 100:.2f}%  "
+                f"rel_l2[e/m/l]={val['rel_l2_early'] * 100:.1f}/"
+                f"{val['rel_l2_mid'] * 100:.1f}/{val['rel_l2_late'] * 100:.1f}%  "
+                f"rel_dev[e/m/l]={val['rel_dev_early'] * 100:.1f}/"
+                f"{val['rel_dev_mid'] * 100:.1f}/{val['rel_dev_late'] * 100:.1f}%  "
+                f"rmse_K[e/m/l]={val['rmse_K_early']:.3f}/"
+                f"{val['rmse_K_mid']:.3f}/{val['rmse_K_late']:.3f}K",
+                flush=True,
+            )
 
         history.append({k: (v if v != "" else None) for k, v in row.items()})
         with open(metrics_path, "a", newline="") as f:
@@ -740,6 +870,7 @@ __all__ = [
     "load_diffusion_data",
     "build_ic_batch",
     "pino_losses",
+    "_ic_loss",
     "_curriculum_weights",
     "_causal_weights",
     "_causal_residual_loss",
