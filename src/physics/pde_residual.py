@@ -91,6 +91,38 @@ def neumann_residual(
     raise ValueError(f"Unknown wall {wall!r}; expected 'left', 'top', or 'bottom'.")
 
 
+def forcing_neumann_residual(
+    model,
+    u: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    t: torch.Tensor,
+    q_L: torch.Tensor,
+    sigma: float,
+    k: float = 1.0,
+) -> torch.Tensor:
+    """Inhomogeneous left-wall (x=0) Neumann residual; shape (B, Nq, 1).
+
+    The FV solver injects ``q_L`` as the INWARD heat flux at x=0, i.e. the
+    physical wall condition is ``-k dT/dx|_{x=0} = q_L`` (see fv_solver_2d). With
+    the global normalization ``T = mu + sigma * T_tilde`` (the model outputs
+    ``T_tilde``), that becomes
+
+        dT_tilde/dx|_{x=0} + q_L(y, t) / (k * sigma) = 0,
+
+    so this returns ``T_tilde_x + q_L / (k * sigma)``. ``k = 1`` for the single
+    homogeneous slab (K_SLAB), which keeps the interior operator alpha = 1.
+
+    ``q_L`` is a PRECOMPUTED constant tensor (B, Nq, 1) aligned to the left-wall
+    collocation points ``(y, t)``; autograd only needs dT/dx, never a graph
+    through ``q_L``. Queries are in physical units (x in [0, 1]) so no coordinate
+    rescale enters ``T_tilde_x``.
+    """
+    T = model_xyt(model, u, x, y, t)
+    T_x = _grad(T, x, create_graph=True)
+    return T_x + q_L / (float(k) * float(sigma))
+
+
 def ic_residual(
     model,
     u: torch.Tensor,

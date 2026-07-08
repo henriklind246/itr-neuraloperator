@@ -577,6 +577,55 @@ def build_qL_integral(temporal_family: str, temporal_params: dict,
 
     return q_left_integral, s_vec
 
+
+def reconstruct_qL(temporal_family: str, temporal_params: dict,
+                   spatial_family: str, spatial_params: dict,
+                   t_ramp: float = 0.0):
+    """Single-source q_L(y, t) reconstruction over the same builders as build_qL.
+
+    Returns ``(q_image, q_at)``, two evaluators for the separable inward flux
+    ``q_L(y, t) = ramp(t) * a(t) * s(y)`` built from the exact same
+    ``ramped_temporal`` / ``SPATIAL_BUILDERS`` primitives as ``build_qL``, so the
+    forcing image fed to the ForcingCViT encoder and the ``q_L`` used in the
+    left-wall PINO residual are guaranteed to agree.
+
+    - ``q_image(y_grid, t_axis) -> (Ny, Nt)``: outer product for the encoder
+      space-time image (rows = left-wall y-nodes, cols = time samples).
+    - ``q_at(y_pts, t_pts) -> (N,)``: elementwise q_L at matched collocation
+      points ``y_pts[i], t_pts[i]`` (``s`` evaluated at ARBITRARY y, not just a
+      grid node).
+
+    ``a(t)`` is evaluated per scalar t because the exp / pulse_train / exp_train
+    temporal builders are scalar closures.
+    """
+    a_fn = ramped_temporal(temporal_family, temporal_params, t_ramp)
+    s_builder = SPATIAL_BUILDERS[spatial_family]
+
+    def _s_at(y):
+        return np.asarray(
+            s_builder(np.asarray(y, dtype=float), **spatial_params), dtype=float
+        )
+
+    def _a_over(t):
+        t_arr = np.asarray(t, dtype=float).ravel()
+        return np.array([float(a_fn(float(tn))) for tn in t_arr], dtype=float)
+
+    def q_image(y_grid, t_axis):
+        s = _s_at(y_grid)          # (Ny,)
+        a = _a_over(t_axis)        # (Nt,)
+        return np.outer(s, a)      # (Ny, Nt)
+
+    def q_at(y_pts, t_pts):
+        y_pts = np.asarray(y_pts, dtype=float).ravel()
+        t_pts = np.asarray(t_pts, dtype=float).ravel()
+        if y_pts.shape != t_pts.shape:
+            raise ValueError(
+                f"q_at expects matched y_pts/t_pts; got {y_pts.shape} vs {t_pts.shape}."
+            )
+        return _s_at(y_pts) * _a_over(t_pts)
+
+    return q_image, q_at
+
 # --------- PARAMETER ENCODING ----------
 
 def encode_spatial_params(spatial_family: str, spatial_params: dict) -> np.ndarray:

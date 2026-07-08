@@ -10,12 +10,16 @@ import torch
 
 from data.dataset import (
     compute_global_stats,
+    load_ramp_seconds,
     load_sim_data,
+    load_solver_dt,
     problem_from_config,
     split_sim_ids,
 )
 from problems.diffusion import T_RIGHT
-from src.operators.cvit import CViT
+from problems.diffusion_forcing import K_SLAB
+from problems.forcing import A_AMP_REF
+from src.operators.cvit import CViT, ForcingCViT
 from src.operators.train import (
     GradNormBalancer,
     build_optimizer,
@@ -24,8 +28,17 @@ from src.operators.train import (
     set_seed,
 )
 from src.operators.utils import resolve_device
+from src.physics.boundary_forcing import (
+    SPATIAL_SAMPLERS,
+    TEMPORAL_SAMPLERS,
+    default_ramp_seconds,
+    reconstruct_qL,
+    sample_spatial_family,
+    sample_temporal_family,
+)
 from src.physics.pde_residual import (
     diffusion_residual,
+    forcing_neumann_residual,
     ic_residual,
     neumann_residual,
 )
@@ -48,6 +61,27 @@ def _leaf(shape, device, generator, scale: float = 1.0) -> torch.Tensor:
     return t.requires_grad_(True)
 
 
+def _lhs_unit(n: int, dim: int, device, generator) -> torch.Tensor:
+    """Latin-hypercube sample in the unit cube; (n, dim) in [0, 1).
+
+    Each column is a stratified permutation of ``n`` equal bins with a uniform
+    jitter inside the bin, so the marginal coverage of every axis is uniform for
+    any ``n`` (broad per-iteration domain coverage; Chen et al. arXiv:2606.06164).
+    Columns are permuted independently so the joint sample decorrelates.
+    """
+    cols = []
+    for _ in range(dim):
+        perm = torch.randperm(n, device=device, generator=generator).to(torch.float32)
+        jitter = torch.rand(n, device=device, generator=generator)
+        cols.append((perm + jitter) / float(n))
+    return torch.stack(cols, dim=-1)
+
+
+def _lhs_leaf(col: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Shape an LHS column (n,) into a (1, n, 1) leaf with requires_grad."""
+    return (col.reshape(1, -1, 1) * scale).detach().requires_grad_(True)
+
+
 def sample_collocation(
     n_r: int,
     n_ic: int,
@@ -58,6 +92,7 @@ def sample_collocation(
     device: torch.device,
     generator: torch.Generator | None = None,
     dense_ic: bool = False,
+    sampler: str = "uniform",
 ) -> dict[str, Any]:
     """Free space-time collocation for one training step (shared across sims).
 
@@ -73,10 +108,19 @@ def sample_collocation(
     for this benchmark, so a dense per-sim IC anchor is the primary stabilizer.
     The default (``False``) keeps the legacy random-node draw byte-identical.
     """
-    # interior: x, y ~ U(0,1); t ~ U(0, t_final)
-    x_r = _leaf((1, n_r, 1), device, generator)
-    y_r = _leaf((1, n_r, 1), device, generator)
-    t_r = _leaf((1, n_r, 1), device, generator, scale=t_final)
+    lhs = sampler == "lhs"
+
+    # interior: x, y ~ U(0,1); t ~ U(0, t_final). LHS stratifies the (x, y, t)
+    # cube jointly for broader per-iteration coverage.
+    if lhs:
+        cube = _lhs_unit(n_r, 3, device, generator)
+        x_r = _lhs_leaf(cube[:, 0])
+        y_r = _lhs_leaf(cube[:, 1])
+        t_r = _lhs_leaf(cube[:, 2], scale=t_final)
+    else:
+        x_r = _leaf((1, n_r, 1), device, generator)
+        y_r = _leaf((1, n_r, 1), device, generator)
+        t_r = _leaf((1, n_r, 1), device, generator, scale=t_final)
 
     # IC: grid-node indices -> exact coords + a t=0 column
     Nx = int(x_grid.numel())
@@ -97,8 +141,13 @@ def sample_collocation(
     # walls: free coordinate ~ U(0,1); the pinned coordinate is fixed. All three
     # kept as separate leaves so neumann_residual differentiates unambiguously.
     def _wall(pin: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        free = _leaf((1, n_bc, 1), device, generator)
-        tw = _leaf((1, n_bc, 1), device, generator, scale=t_final)
+        if lhs:
+            wc = _lhs_unit(n_bc, 2, device, generator)
+            free = _lhs_leaf(wc[:, 0])
+            tw = _lhs_leaf(wc[:, 1], scale=t_final)
+        else:
+            free = _leaf((1, n_bc, 1), device, generator)
+            tw = _leaf((1, n_bc, 1), device, generator, scale=t_final)
         if pin == "left":       # x = 0
             xw = torch.zeros((1, n_bc, 1), device=device, requires_grad=True)
             return xw, free, tw
@@ -182,6 +231,100 @@ def _ic_targets(
     vals = vals[:, ix_np, iy_np]  # (B, n_ic)
     vals = (vals - mu) / (sigma + 1e-8)
     return torch.from_numpy(vals).unsqueeze(-1).to(device)
+
+
+# --------- online forcing sampling (physics-only, no saved sim_params) ---------
+
+def sample_forcing_params(
+    rng: np.random.Generator,
+    n: int,
+    dt: float,
+    t_final: float,
+    *,
+    c: float = 0.0,
+    d: float = 1.0,
+    temporal_window: dict | None = None,
+) -> list[dict]:
+    """Draw ``n`` fresh separable-forcing parameter sets ``q_L = a(t)*s(y)``.
+
+    Uses the exact ProblemSpec samplers (``sample_temporal_family`` /
+    ``sample_spatial_family`` + ``TEMPORAL_SAMPLERS`` / ``SPATIAL_SAMPLERS``) so
+    the online training distribution matches the FV validation set. No
+    ``sim_params.npy`` is read: physics-only training is not tied to a finite
+    saved set (Chen et al. arXiv:2606.06164). ``c, d`` bound the y-domain the
+    spatial profile lives on; ``temporal_window`` supplies the sin on/off window.
+    """
+    tw = temporal_window or {}
+    win = dict(
+        t_on=float(tw.get("t_on", 0.0)),
+        t_off=float(tw.get("t_off", 0.2)),
+        phase=float(tw.get("phase", 0.0)),
+        tukey_alpha=float(tw.get("tukey_alpha", 0.5)),
+    )
+    out: list[dict] = []
+    for _ in range(int(n)):
+        tf = sample_temporal_family(rng)
+        tp = TEMPORAL_SAMPLERS[tf](rng, dt=dt, t_final=t_final, **win)
+        sf = sample_spatial_family(rng)
+        sp = SPATIAL_SAMPLERS[sf](rng, c=c, d=d)
+        out.append({
+            "temporal_family": tf, "temporal_params": tp,
+            "spatial_family": sf, "spatial_params": sp,
+        })
+    return out
+
+
+def build_forcing_image(
+    params: list[dict],
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    a_ref: float,
+    device: torch.device,
+    t_ramp: float,
+) -> torch.Tensor:
+    """Encoder input: the forcing rendered as a space-time image; (B, 1, Ny, Nt).
+
+    ``u_enc(y, t) = q_L(y, t) / a_ref`` with ``q_L`` reconstructed by the SAME
+    ``reconstruct_qL`` helper the left-wall residual uses, so the encoder image
+    and the residual forcing can never diverge. Axes are (rows = y, cols = t).
+    """
+    B = len(params)
+    Ny, Nt = int(y_img.shape[0]), int(t_img.shape[0])
+    img = np.empty((B, 1, Ny, Nt), dtype=np.float32)
+    for b, p in enumerate(params):
+        q_image, _ = reconstruct_qL(
+            p["temporal_family"], p["temporal_params"],
+            p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
+        )
+        img[b, 0] = np.asarray(q_image(y_img, t_img), dtype=np.float32) / float(a_ref)
+    return torch.from_numpy(img).to(device)
+
+
+def left_wall_qL(
+    params: list[dict],
+    y_pts: torch.Tensor,
+    t_pts: torch.Tensor,
+    device: torch.device,
+    t_ramp: float,
+) -> torch.Tensor:
+    """Precomputed inward flux ``q_L(y_w, t_w)`` at the left-wall points; (B, N, 1).
+
+    ``y_pts`` / ``t_pts`` are the shared left-wall collocation leaves (any shape
+    with ``N`` elements); ``q_L`` is evaluated per sim via the shared
+    ``reconstruct_qL`` ``q_at`` at exactly those points. Returned detached (the
+    residual only needs autograd through ``dT/dx``, never through ``q_L``).
+    """
+    yv = y_pts.detach().reshape(-1).cpu().numpy()
+    tv = t_pts.detach().reshape(-1).cpu().numpy()
+    B, N = len(params), int(yv.shape[0])
+    q = np.empty((B, N), dtype=np.float32)
+    for b, p in enumerate(params):
+        _, q_at = reconstruct_qL(
+            p["temporal_family"], p["temporal_params"],
+            p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
+        )
+        q[b] = np.asarray(q_at(yv, tv), dtype=np.float32)
+    return torch.from_numpy(q).unsqueeze(-1).to(device)
 
 
 # --------- causal residual weighting + time-bin diagnostics ---------
@@ -299,6 +442,9 @@ def pino_losses(
     ic_den: torch.Tensor | None = None,
     compute_r: bool = True,
     compute_bc: bool = True,
+    left_qL: torch.Tensor | None = None,
+    sigma: float = 1.0,
+    k_slab: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Raw physics/IC/BC losses. ``causal_cfg.enabled`` swaps the plain
     ``mean(r^2)`` interior term for a causally time-weighted one (needs
@@ -336,17 +482,28 @@ def pino_losses(
         den=ic_den,
     )
 
+    loss_bc_left = u.new_zeros(())
     if compute_bc:
         bc_sq = 0.0
         for w in WALLS:
             xw, yw, tw = batch["walls"][w]
-            nb = neumann_residual(model, u, xw, yw, tw, w)
-            bc_sq = bc_sq + (nb ** 2).mean()
+            if w == "left" and left_qL is not None:
+                # Inhomogeneous forcing residual dT_tilde/dx + q_L/(k*sigma); the
+                # left wall is now the actual forcing signal (top/bottom stay
+                # homogeneous adiabatic). q_L is a precomputed constant tensor.
+                nb = forcing_neumann_residual(
+                    model, u, xw, yw, tw, left_qL, sigma, k=k_slab,
+                )
+                loss_bc_left = (nb ** 2).mean()
+                bc_sq = bc_sq + loss_bc_left
+            else:
+                nb = neumann_residual(model, u, xw, yw, tw, w)
+                bc_sq = bc_sq + (nb ** 2).mean()
         loss_bc = bc_sq / len(WALLS)
     else:
         loss_bc = u.new_zeros(())
 
-    out = {"r": loss_r, "ic": loss_ic, "bc": loss_bc}
+    out = {"r": loss_r, "ic": loss_ic, "bc": loss_bc, "bc_left": loss_bc_left}
     if res_bins and r is not None:
         if bin_mean is not None and bin_mean.numel() == res_bins:
             out["res_bins"] = bin_mean
@@ -554,14 +711,127 @@ def validate_rel_l2(
     return out
 
 
+@torch.no_grad()
+def validate_forcing_gnrmse(
+    model: CViT,
+    data: dict[str, Any],
+    ids: np.ndarray,
+    sim_params: np.ndarray,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    a_ref: float,
+    t_ramp: float,
+    device: torch.device,
+    query_batch: int = 8,
+) -> dict[str, float]:
+    """Deviation-field globally-normalized RMSE over held-out forcing sims.
+
+    The single-slab forcing field sits on a fixed 300 K baseline, so a raw
+    rel-L2 denominator is dominated by that baseline (a constant-300 prediction
+    scores deceptively well) and a per-sim normalized denominator explodes on
+    weak forcings. This judges on the deviation field ``T - T_RIGHT`` with the
+    FROZEN global ``sigma``:
+
+        gnrmse = sqrt(mean_pts[(T_pred - T_true) ** 2]) / sigma_global
+
+    (``T_RIGHT`` cancels in the deviation error, so this is ``rmse_K / sigma``),
+    which is amplitude-fair. Per-sim results are stratified by forcing-amplitude
+    tercile and by ``temporal_family`` so weak-forcing and pulse-family failures
+    stay visible rather than averaged away. ``sim_params`` are the per-sim
+    forcing records; each sim's encoder image is reconstructed by the SAME
+    ``build_forcing_image`` / ``reconstruct_qL`` path the trainer uses.
+    """
+    x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
+    y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    Nx, Ny, Nt = x_grid.numel(), y_grid.numel(), len(t_grid)
+
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+
+    ids = np.asarray(ids)
+    per_sim_rmse: list[float] = []
+    per_sim_amp: list[float] = []
+    per_sim_fam: list[str] = []
+    for start in range(0, len(ids), query_batch):
+        chunk = ids[start:start + query_batch]
+        params = [dict(sim_params[int(i)]) for i in chunk]
+        u = build_forcing_image(params, y_img, t_img, a_ref, device, t_ramp)
+        B = u.shape[0]
+        coords = mesh.expand(B, -1, -1)
+        pred = torch.empty((B, Nt, Nx, Ny), device=device)
+        for k in range(Nt):
+            tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
+            out = model(u, coords, tk)
+            pred[:, k] = out[..., 0].view(B, Nx, Ny)
+        pred_K = pred * sigma + mu
+        truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)
+        truth_t = torch.from_numpy(truth).to(device)
+        se = ((pred_K - truth_t) ** 2).sum(dim=(1, 2, 3))  # (B,)
+        rmse = torch.sqrt(se / float(Nt * Nx * Ny)).detach().cpu().numpy()
+        for b, p in enumerate(params):
+            per_sim_rmse.append(float(rmse[b]))
+            q_image, _ = reconstruct_qL(
+                p["temporal_family"], p["temporal_params"],
+                p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
+            )
+            per_sim_amp.append(float(np.max(np.abs(q_image(y_img, t_img)))))
+            per_sim_fam.append(str(p.get("temporal_family", "")))
+
+    rmse_arr = np.asarray(per_sim_rmse, dtype=np.float64)
+    amp_arr = np.asarray(per_sim_amp, dtype=np.float64)
+    fam_arr = np.asarray(per_sim_fam)
+    gnrmse = rmse_arr / (float(sigma) + 1e-8)
+
+    out = {
+        "val_gnrmse": float(gnrmse.mean()),
+        "val_rmse_K": float(rmse_arr.mean()),
+    }
+    if len(amp_arr) >= 3:
+        q1, q2 = np.quantile(amp_arr, [1.0 / 3.0, 2.0 / 3.0])
+        strata = {
+            "amp_low": amp_arr <= q1,
+            "amp_mid": (amp_arr > q1) & (amp_arr <= q2),
+            "amp_high": amp_arr > q2,
+        }
+        for name, mask in strata.items():
+            out[f"gnrmse_{name}"] = (
+                float(gnrmse[mask].mean()) if mask.any() else float("nan")
+            )
+    for fam in np.unique(fam_arr):
+        out[f"gnrmse_fam_{fam}"] = float(gnrmse[fam_arr == fam].mean())
+    return out
+
+
 # --------- single-seed training ---------
 
-def build_cvit(config: dict, mu: float, sigma: float, grid_size: tuple[int, int]) -> CViT:
-    c = config["model"]["cvit"]
+def build_cvit(
+    config: dict,
+    mu: float,
+    sigma: float,
+    grid_size: tuple[int, int],
+    t_final: float = 1.0,
+    variant: str = "cvit",
+) -> CViT:
+    """Construct the PINO surrogate. ``variant="cvit"`` (default) builds the
+    diffusion :class:`CViT` conditioned on the IC field over ``grid_size =
+    (Nx, Ny)``. ``variant="forcing"`` builds a :class:`ForcingCViT` whose encoder
+    ingests the forcing space-time image over ``grid_size = (Ny_img, Nt_img)``;
+    it reads ``model.forcing_cvit`` when present, falling back to ``model.cvit``.
+    """
+    if variant == "forcing":
+        c = {**config["model"]["cvit"], **config["model"].get("forcing_cvit", {})}
+    else:
+        c = config["model"]["cvit"]
     t_right_K = float(c.get("hard_right_dirichlet_t_right", T_RIGHT))
     hard_rd = bool(c.get("hard_right_dirichlet", True))
     t_right_tilde = (t_right_K - mu) / (sigma + 1e-8) if hard_rd else 0.0
-    return CViT(
+    # Decoder time normalization horizon. Default to the data-derived t_final so
+    # the temporal Fourier features live on [0, 1]; a config override wins.
+    t_norm = float(c.get("t_final", None) if c.get("t_final", None) is not None else t_final)
+    cls = ForcingCViT if variant == "forcing" else CViT
+    return cls(
         in_ch=int(c.get("in_ch", 1)),
         out_dim=int(c.get("out_dim", 1)),
         emb_dim=int(c.get("emb_dim", 256)),
@@ -580,6 +850,7 @@ def build_cvit(config: dict, mu: float, sigma: float, grid_size: tuple[int, int]
         activation=str(c.get("activation", "gelu")),
         hard_right_dirichlet=hard_rd,
         t_right_tilde=t_right_tilde,
+        t_final=t_norm,
     )
 
 
@@ -594,7 +865,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     Nx, Ny = int(data["x_grid"].shape[0]), int(data["y_grid"].shape[0])
     t_final = float(data["t_grid"][-1])
 
-    model = build_cvit(config, mu, sigma, grid_size=(Nx, Ny)).to(device)
+    model = build_cvit(config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final).to(device)
     optimizer = build_optimizer(config, model.parameters())
     scheduler = build_scheduler(config, optimizer)
 
@@ -916,19 +1187,276 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
+    """Physics-only training of a :class:`ForcingCViT` on the single-slab forcing
+    benchmark. Run-0 recipe: static Adam weights, ONLINE forcing sampling, LHS
+    collocation, inhomogeneous left-wall Neumann forcing, and a fixed 300 K IC
+    anchor. No GradNorm / causal / SOAP (layer those in later, one per run).
+
+    The encoder conditions on the forcing rendered as a ``(Ny_img, Nt_img)``
+    space-time image. Each step samples FRESH forcing params and FRESH
+    collocation, so training is not tied to a finite saved set (Chen et al.
+    arXiv:2606.06164). Saved FV trajectories + ``sim_params`` are used for
+    VALIDATION only, judged by the deviation-field gnRMSE with a frozen global
+    ``sigma`` (see :func:`validate_forcing_gnrmse`).
+    """
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    device = resolve_device(config["training"].get("device", "auto"))
+    data = load_diffusion_data(config)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    Nx, Ny = int(data["x_grid"].shape[0]), int(data["y_grid"].shape[0])
+    t_final = float(data["t_grid"][-1])
+    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
+    c_dom, d_dom = float(y_grid_np[0]), float(y_grid_np[-1])
+
+    # Saved FV forcing records are VALIDATION-only. sim_params.npy lives beside
+    # trajectories.npy (same directory the data generator writes to).
+    sp_path = Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy"
+    sim_params = np.load(str(sp_path), allow_pickle=True)
+
+    pino = config["training"]["pino"]
+    fcfg = pino.get("forcing", {}) or {}
+    # `null` in YAML resolves to a dynamic default here (Ny/A_AMP_REF/t_final are
+    # not knowable statically), so coalesce None rather than trusting .get's
+    # absent-key fallback.
+    a_ref = float(fcfg.get("a_ref") if fcfg.get("a_ref") is not None else A_AMP_REF)
+    ny_img = int(fcfg.get("ny_img") if fcfg.get("ny_img") is not None else Ny)
+    nt_img = int(fcfg.get("nt_img") if fcfg.get("nt_img") is not None else 128)
+    # Forcing image axes: rows = left-wall y-nodes, cols = time over [0, t_final].
+    y_img = np.linspace(c_dom, d_dom, ny_img, dtype=np.float64)
+    t_img = np.linspace(0.0, t_final, nt_img, dtype=np.float64)
+
+    # Frozen startup ramp: pin an ABSOLUTE constant shared by the online training
+    # q_L AND the FV-baked validation q_L so early-time forcing matches exactly.
+    # Config override wins; else reuse the ramp stored with the dataset; else fall
+    # back to the dt-derived default.
+    ramp_cfg = fcfg.get("ramp_seconds", None)
+    if ramp_cfg is not None:
+        t_ramp = float(ramp_cfg)
+    else:
+        t_ramp = load_ramp_seconds(config["data"]["t_grid_path"])
+        if t_ramp is None:
+            dt = load_solver_dt(config["data"]["t_grid_path"])
+            t_ramp = default_ramp_seconds(dt if dt is not None else t_final / 100.0)
+
+    temporal_window = dict(
+        t_on=float(fcfg.get("t_on", 0.0)),
+        t_off=float(fcfg.get("t_off", 0.2)),
+        phase=float(fcfg.get("phase", 0.0)),
+        tukey_alpha=float(fcfg.get("tukey_alpha", 0.5)),
+    )
+    dt_sample = (
+        float(fcfg["dt_sample"])
+        if fcfg.get("dt_sample") is not None
+        else t_final / max(nt_img - 1, 1)
+    )
+    sampler = str(fcfg.get("collocation") or "lhs")
+
+    model = build_cvit(
+        config, mu, sigma, grid_size=(ny_img, nt_img), t_final=t_final,
+        variant="forcing",
+    ).to(device)
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+
+    lam_r = float(pino["lambda_r"])
+    lam_ic = float(pino["lambda_ic"])
+    lam_bc = float(pino["lambda_bc"])
+    n_r = int(pino["n_r"])
+    n_ic = int(pino["n_ic"])
+    n_bc = int(pino["n_bc"])
+    sim_batch = int(pino["sim_batch"])
+    alpha = float(pino.get("alpha", 1.0))
+    # Fixed uniform 300 K IC in normalized space (mu ~ 300 -> ~0).
+    t_right_tilde_ic = (T_RIGHT - mu) / (sigma + 1e-8)
+
+    # Warm-up (5b): hold the forcing batch + collocation fixed and upweight the IC
+    # anchor for the first ``warmup.epochs`` steps so the fixed T=300 solution is
+    # learned before the PDE/BC residuals dominate. Run-0 defaults are inert.
+    wcfg = fcfg.get("warmup", {}) or {}
+    warmup_epochs = int(wcfg.get("epochs", 0))
+    warmup_ic_mult = float(wcfg.get("ic_mult", 1.0))
+    warmup_resample_every = max(1, int(wcfg.get("resample_every", 1)))
+
+    epochs = int(config["training"]["epochs"])
+    validate_every = int(config["training"].get("validate_every", 10))
+
+    x_grid_t = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
+    y_grid_t = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+
+    metrics_path = run_dir / "train_metrics.csv"
+    # loss_bc_left is logged as its OWN column: the left wall is the forcing
+    # signal and must be watchable independently of the homogeneous top/bottom.
+    fieldnames = [
+        "epoch", "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
+        "w_r", "w_ic", "w_bc",
+        "val_gnrmse", "val_rmse_K",
+        "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
+    ]
+    with open(metrics_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
+
+    print(
+        f"[pino-forcing] seed={seed} device={device} epochs={epochs} "
+        f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
+        f"img=({ny_img}x{nt_img}) a_ref={a_ref} t_ramp={t_ramp:.4g} "
+        f"sampler={sampler} | lambda_r={lam_r} lambda_ic={lam_ic} "
+        f"lambda_bc={lam_bc} | n_r={n_r} n_ic={n_ic} n_bc={n_bc} "
+        f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} | "
+        f"warmup(epochs={warmup_epochs},ic_mult={warmup_ic_mult},"
+        f"resample_every={warmup_resample_every})",
+        flush=True,
+    )
+
+    best_val = float("inf")
+    history: list[dict[str, float]] = []
+    coll = None
+    params_batch: list[dict] | None = None
+    for epoch in range(epochs):
+        model.train()
+        warming = epoch < warmup_epochs
+        re = warmup_resample_every if warming else 1
+        # Online resampling: fresh forcing batch + fresh collocation. During
+        # warm-up they are held for ``re`` steps to let the IC anchor settle.
+        if params_batch is None or (epoch % re == 0):
+            params_batch = sample_forcing_params(
+                rng, sim_batch, dt_sample, t_final,
+                c=c_dom, d=d_dom, temporal_window=temporal_window,
+            )
+            coll = sample_collocation(
+                n_r, n_ic, n_bc, t_final, x_grid_t, y_grid_t, device, gen,
+                sampler=sampler,
+            )
+
+        u = build_forcing_image(params_batch, y_img, t_img, a_ref, device, t_ramp)
+        B = u.shape[0]
+        ic_target = torch.full(
+            (B, coll["ic"]["coords"].shape[1], 1), float(t_right_tilde_ic),
+            device=device,
+        )
+        _, yw_left, tw_left = coll["walls"]["left"]
+        left_qL = left_wall_qL(params_batch, yw_left, tw_left, device, t_ramp)
+
+        optimizer.zero_grad(set_to_none=True)
+        losses = pino_losses(
+            model, u, coll, ic_target, alpha,
+            t_final=t_final, ic_loss="mse", t_right_tilde=t_right_tilde_ic,
+            left_qL=left_qL, sigma=float(sigma), k_slab=K_SLAB,
+        )
+        w_ic = lam_ic * (warmup_ic_mult if warming else 1.0)
+        loss = lam_r * losses["r"] + w_ic * losses["ic"] + lam_bc * losses["bc"]
+        loss.backward()
+        lr = float(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+
+        row: dict[str, Any] = {
+            "epoch": epoch,
+            "loss": float(loss.detach().cpu()),
+            "loss_r": float(losses["r"].detach().cpu()),
+            "loss_ic": float(losses["ic"].detach().cpu()),
+            "loss_bc": float(losses["bc"].detach().cpu()),
+            "loss_bc_left": float(losses["bc_left"].detach().cpu()),
+            "w_r": lam_r, "w_ic": w_ic, "w_bc": lam_bc,
+            "val_gnrmse": "", "val_rmse_K": "",
+            "gnrmse_amp_low": "", "gnrmse_amp_mid": "", "gnrmse_amp_high": "",
+        }
+        print(
+            f"Epoch {epoch}: loss={row['loss']:.6f} "
+            f"(r={row['loss_r']:.6f}, ic={row['loss_ic']:.6f}, "
+            f"bc={row['loss_bc']:.6f}, bc_left={row['loss_bc_left']:.6f}) "
+            f"lr={lr:.2e}" + ("  [warmup]" if warming else ""),
+            flush=True,
+        )
+
+        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+        if do_val:
+            model.eval()
+            val = validate_forcing_gnrmse(
+                model, data, data["val_ids"], sim_params,
+                y_img, t_img, a_ref, t_ramp, device,
+            )
+            row["val_gnrmse"] = val["val_gnrmse"]
+            row["val_rmse_K"] = val["val_rmse_K"]
+            for c in ("gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high"):
+                row[c] = val.get(c, "")
+            is_best = val["val_gnrmse"] < best_val
+            if is_best:
+                best_val = val["val_gnrmse"]
+                torch.save(
+                    {
+                        "model_state": model.state_dict(),
+                        "mu_global": mu, "sigma_global": sigma,
+                        "config": config, "epoch": epoch, "best_val": best_val,
+                        "forcing_image": {
+                            "ny_img": ny_img, "nt_img": nt_img,
+                            "a_ref": a_ref, "t_ramp": t_ramp,
+                            "c_dom": c_dom, "d_dom": d_dom, "t_final": t_final,
+                        },
+                    },
+                    run_dir / "cvit_best.pt",
+                )
+            fam_txt = " ".join(
+                f"{k.split('gnrmse_fam_')[1]}={v * 100:.2f}%"
+                for k, v in val.items() if k.startswith("gnrmse_fam_")
+            )
+            print(
+                f"Validation for epoch {epoch}: "
+                f"val_gnrmse={val['val_gnrmse'] * 100:.4f}% "
+                f"val_rmse_K={val['val_rmse_K']:.4f}K (best={best_val * 100:.4f}%)"
+                + ("  [new best -> cvit_best.pt]" if is_best else ""),
+                flush=True,
+            )
+            print(
+                f"  gnrmse[amp low/mid/high]="
+                f"{val.get('gnrmse_amp_low', float('nan')) * 100:.2f}/"
+                f"{val.get('gnrmse_amp_mid', float('nan')) * 100:.2f}/"
+                f"{val.get('gnrmse_amp_high', float('nan')) * 100:.2f}%  "
+                f"fam[{fam_txt}]",
+                flush=True,
+            )
+
+        history.append({k: (v if v != "" else None) for k, v in row.items()})
+        with open(metrics_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerow(row)
+
+    summary = {"seed": seed, "best_val_gnrmse": best_val, "epochs": epochs}
+    with open(run_dir / "final_metrics.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+
 def run_config_seeds_pino(
     config: dict, base_run_dir: Path, seeds: list[int]
 ) -> dict[str, Any]:
     base_run_dir = Path(base_run_dir)
+    # Dispatch on the benchmark: the single-slab forcing benchmark trains a
+    # ForcingCViT physics-only on an online-sampled forcing image; every other
+    # benchmark uses the IC-conditioned diffusion CViT path.
+    bench = str(config.get("benchmark", {}).get("name", "diffusion"))
+    runner = (
+        run_one_seed_forcing_pino if bench == "diffusion_forcing"
+        else run_one_seed_pino
+    )
     results = {}
     for seed in seeds:
         seed_dir = base_run_dir / f"seed{seed}"
-        results[str(seed)] = run_one_seed_pino(config, int(seed), seed_dir)
+        results[str(seed)] = runner(config, int(seed), seed_dir)
     return {"run_dir": str(base_run_dir), "seeds": results}
 
 
 __all__ = [
     "sample_collocation",
+    "sample_forcing_params",
+    "build_forcing_image",
+    "left_wall_qL",
     "load_diffusion_data",
     "build_ic_batch",
     "pino_losses",
@@ -940,7 +1468,9 @@ __all__ = [
     "_term_grad_norms",
     "build_gradnorm",
     "validate_rel_l2",
+    "validate_forcing_gnrmse",
     "build_cvit",
     "run_one_seed_pino",
+    "run_one_seed_forcing_pino",
     "run_config_seeds_pino",
 ]
