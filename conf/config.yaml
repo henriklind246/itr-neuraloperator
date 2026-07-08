@@ -59,12 +59,27 @@ model:
     num_heads: 8
     mlp_ratio: 2.0
     fourier_freq: 1.0            # spatial (x, y in [0,1]) Fourier feature scale
-    fourier_freq_t: null         # temporal (t in [0,t_final]) scale; null -> fourier_freq.
-                                 # On the diffusion window t_final=0.3, freq 1.0 makes
-                                 # fourier_t near-constant (time-blind decoder); ~5-10 fixes it.
+    fourier_freq_t: null         # temporal Fourier scale; null -> fourier_freq. Decoder
+                                 # time is normalized to [0,1] via t_final (below), so the
+                                 # shared freq is no longer time-blind on a short window.
+    t_final: null                # decoder time-normalization horizon; null -> data t_grid[-1].
+                                 # t is divided by this INSIDE forward (in-graph), so the PDE
+                                 # residual still differentiates the physical time leaf exactly.
     activation: gelu
     hard_right_dirichlet: true
     hard_right_dirichlet_t_right: 300.0
+
+  # ---- ForcingCViT (single-slab forcing PINO path) ----
+  # Read ONLY by train_pino.run_one_seed_forcing_pino (benchmark=diffusion_forcing).
+  # These keys OVERRIDE model.cvit for the forcing surrogate; anything omitted
+  # falls back to model.cvit above. The encoder input is the forcing space-time
+  # image (axes y x t), NOT a spatial field, so patch_size must divide BOTH the
+  # image height (training.pino.forcing.ny_img) and width (nt_img), which are
+  # generally different from the data grid size. The decoder/coords/hard-right-
+  # Dirichlet behavior is identical to cvit.
+  forcing_cvit:
+    in_ch: 1
+    patch_size: 8
 
 training:
   device: "auto"
@@ -229,6 +244,47 @@ training:
       enabled: false
       n_bins: 16
       eps_causal: 1.0
+    # ---- Forcing PINO path (benchmark=diffusion_forcing) ----
+    # Read ONLY by train_pino.run_one_seed_forcing_pino; inert for the diffusion
+    # collocation path. The encoder input is the left-wall forcing space-time
+    # image q_L(y, t) / a_ref sampled on a (ny_img, nt_img) grid (rows = y-nodes,
+    # cols = a time axis over [0, t_final]). Both ny_img and nt_img MUST be
+    # divisible by model.forcing_cvit.patch_size or the PatchEmbed2d conv drops a
+    # border strip. nt_img is the Nyquist knob: it must resolve the sharpest
+    # sampled pulse (pulse_train), else two distinct forcings alias to the same
+    # encoder image while the residual punishes them differently (noisy loss
+    # floor). null => runner falls back (ny_img->Ny, nt_img->128, a_ref->A_AMP_REF).
+    forcing:
+      ny_img: null
+      nt_img: 128
+      a_ref: null
+      # Interior/wall collocation sampler for the online free-sampling path.
+      # "lhs" (paper-faithful, default) stratifies per-axis coverage each step;
+      # "sobol" and "uniform" are alternatives.
+      collocation: lhs
+      # ramp_seconds pins the startup smoothstep so q_L(0)=0 identically for the
+      # online training forcing AND the FV validation trajectories. null => resolve
+      # from the FV data (ramp_seconds.npy, else 2*dt) so training matches the
+      # baked-in validation ramp; a mismatch creates a systematic early-time gap.
+      ramp_seconds: null
+      # dt_sample bounds the temporal-family sampler's pulse widths on the online
+      # path (no FV dt exists here). null => t_final / 100.
+      dt_sample: null
+      # Temporal on/off window + Tukey taper for the online forcing sampler; must
+      # match the data-generation window so online sims share the validation
+      # forcing distribution.
+      t_on: 0.0
+      t_off: 0.2
+      phase: 0.0
+      tukey_alpha: 0.5
+      # Warm-up (paper-faithful stabilization): hold the sampled forcing batch and
+      # collocation fixed for resample_every steps and multiply the IC loss by
+      # ic_mult for the first `epochs` epochs so the constant-300 K anchor settles
+      # before PDE/BC residuals dominate. Run-0 defaults are inert (epochs=0).
+      warmup:
+        epochs: 0
+        ic_mult: 1.0
+        resample_every: 1
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
   # GradNorm-style adaptive balancing of the RAW per-component physics losses
