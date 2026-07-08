@@ -53,6 +53,11 @@ CONTRACTS = {
         in_ch=4, cond=2, has_fseq=True, token=2, t_stats=2,
         encoder=True, s_y=3, aug=True,
     ),
+    # diffusion_forcing: single slab, forcing-driven; temporal_encoder only.
+    ("diffusion_forcing", "temporal_encoder"): dict(
+        in_ch=4, cond=2, has_fseq=True, token=2, t_stats=2,
+        encoder=True, s_y=3, aug=True,
+    ),
 }
 
 

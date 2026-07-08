@@ -1,6 +1,7 @@
 import torch
 
-from src.operators.cvit import CViT
+from src.operators.cvit import CViT, ForcingCViT
+from src.physics.pde_residual import forcing_neumann_residual
 
 
 def _tiny(**kw):
@@ -11,6 +12,17 @@ def _tiny(**kw):
     )
     base.update(kw)
     return CViT(**base)
+
+
+def _tiny_forcing(**kw):
+    # grid_size is (Ny, Nt): the forcing space-time image resolution.
+    base = dict(
+        in_ch=1, out_dim=1, emb_dim=32, patch_size=4, grid_size=(16, 20),
+        depth_enc=2, depth_dec=2, num_heads=4, mlp_ratio=2.0, fourier_freq=1.0,
+        hard_right_dirichlet=True, t_right_tilde=0.0,
+    )
+    base.update(kw)
+    return ForcingCViT(**base)
 
 
 def test_forward_shape():
@@ -95,6 +107,56 @@ def test_higher_fourier_freq_t_increases_time_sensitivity():
     assert d_hi > 2.0 * d_lo
 
 
+def test_t_final_normalizes_decoder_time_in_graph():
+    # t is divided by t_final INSIDE forward, so a model with t_final=0.3 queried
+    # at physical t must equal an unnormalized model (t_final=1.0) queried at the
+    # pre-divided t/0.3. Same seed -> identical weights, isolating the scaling.
+    torch.manual_seed(0)
+    m_norm = _tiny(t_final=0.3)
+    torch.manual_seed(0)
+    m_ref = _tiny(t_final=1.0)
+    u = torch.randn(2, 1, 20, 20)
+    coords = torch.rand(2, 16, 2)
+    t = torch.rand(2, 16, 1) * 0.3
+    with torch.no_grad():
+        out_norm = m_norm(u, coords, t)
+        out_ref = m_ref(u, coords, t / 0.3)
+    assert torch.allclose(out_norm, out_ref, atol=1e-6)
+
+
+def test_t_final_default_is_noop():
+    # Default t_final=1.0 divides by one: output must match an explicit-1.0 model.
+    torch.manual_seed(0)
+    m_default = _tiny()
+    torch.manual_seed(0)
+    m_one = _tiny(t_final=1.0)
+    u = torch.randn(1, 1, 20, 20)
+    coords = torch.rand(1, 8, 2)
+    t = torch.rand(1, 8, 1) * 0.3
+    with torch.no_grad():
+        assert torch.allclose(m_default(u, coords, t), m_one(u, coords, t), atol=0)
+
+
+def test_t_final_scales_physical_time_derivative():
+    # Normalizing in-graph means autograd's dT/dt picks up the 1/t_final chain
+    # factor: the physical T_t of the t_final=0.3 model is (1/0.3)x that of the
+    # unnormalized model evaluated at the matching normalized time.
+    torch.manual_seed(0)
+    m_norm = _tiny(t_final=0.3)
+    torch.manual_seed(0)
+    m_ref = _tiny(t_final=1.0)
+    u = torch.randn(2, 1, 20, 20)
+    coords = torch.rand(2, 8, 2)
+    t_phys = (torch.rand(2, 8, 1) * 0.3).requires_grad_(True)
+    T = m_norm(u, coords, t_phys)
+    (T_t_norm,) = torch.autograd.grad(T.sum(), t_phys)
+
+    t_ref = (t_phys.detach() / 0.3).requires_grad_(True)
+    T2 = m_ref(u, coords, t_ref)
+    (T_t_ref,) = torch.autograd.grad(T2.sum(), t_ref)
+    assert torch.allclose(T_t_norm, T_t_ref / 0.3, atol=1e-5)
+
+
 def test_double_backward_through_decoder():
     m = _tiny()
     u = torch.randn(2, 1, 20, 20)
@@ -107,3 +169,43 @@ def test_double_backward_through_decoder():
     (T_xx,) = torch.autograd.grad(T_x.sum(), x)
     assert T_xx.shape == (2, 8, 1)
     assert torch.isfinite(T_xx).all()
+
+
+def test_forcing_forward_shape():
+    # Encoder input is the forcing space-time image u:(B, 1, Ny, Nt).
+    m = _tiny_forcing()
+    u = torch.randn(3, 1, 16, 20)
+    coords = torch.rand(1, 64, 2)
+    t = torch.rand(1, 64, 1) * 0.3
+    out = m(u, coords, t)
+    assert out.shape == (3, 64, 1)
+
+
+def test_forcing_hard_dirichlet_exact():
+    # The right wall (x=1) is pinned by the inherited hard-Dirichlet ansatz.
+    m = _tiny_forcing(t_right_tilde=0.7)
+    u = torch.randn(2, 1, 16, 20)
+    coords = torch.rand(2, 32, 2)
+    coords[..., 0] = 1.0
+    t = torch.rand(2, 32, 1) * 0.3
+    out = m(u, coords, t)
+    assert torch.allclose(out, torch.full_like(out, 0.7), atol=1e-5)
+
+
+def test_forcing_double_backward_left_neumann():
+    # The left-wall forcing residual dT_tilde/dx + q_L/(k*sigma) must be twice
+    # differentiable: grad w.r.t. x (first order) and w.r.t. the model params
+    # (second order, through the loss) both finite.
+    m = _tiny_forcing()
+    u = torch.randn(2, 1, 16, 20)
+    x = torch.zeros(2, 8, 1, requires_grad=True)  # left wall x=0
+    y = torch.rand(2, 8, 1, requires_grad=True)
+    t = (torch.rand(2, 8, 1) * 0.3).requires_grad_(True)
+    q_L = torch.rand(2, 8, 1)  # precomputed constant inward flux
+    r = forcing_neumann_residual(m, u, x, y, t, q_L=q_L, sigma=5.0, k=1.0)
+    assert r.shape == (2, 8, 1)
+    loss = r.pow(2).mean()
+    loss.backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    assert grads, "no parameter received a gradient"
+    assert all(torch.isfinite(g).all() for g in grads)
