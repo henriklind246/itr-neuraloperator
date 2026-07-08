@@ -169,6 +169,16 @@ training:
     # signal the validation rel-L2 measures. ic_eps guards the denominator.
     ic_loss: mse
     ic_eps: 1.0e-6
+    # ic_denom (only used when ic_loss=rel) selects the relative denominator.
+    # "sampled" (legacy) sums (ic_target - t_right_tilde)^2 over the per-step
+    # sampled IC nodes -- collapses when nodes land in the near-flat interior,
+    # exploding the ratio and corrupting SOAP's second moment (observed loss_ic
+    # spikes >2000). "full_grid" uses a FIXED per-sim signal norm
+    # D_sim = mean_{x,y}[(T0_tilde - t_right_tilde)^2] precomputed on the whole
+    # grid and floored at ic_denom_floor_frac * median(D_sim over train sims), so
+    # the ratio is bounded, amplitude-invariant, and n_ic-independent.
+    ic_denom: sampled
+    ic_denom_floor_frac: 0.01
     # dense_ic anchors the IC loss on EVERY grid node (Nx*Ny points, no RNG draw)
     # instead of n_ic random nodes -- the primary stabilizer for this benchmark,
     # whose physics attractor is the constant field (Chen et al. arXiv:2606.06164).

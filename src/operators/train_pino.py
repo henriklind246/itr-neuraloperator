@@ -249,6 +249,7 @@ def _ic_loss(
     mode: str = "mse",
     t_right_tilde: float = 0.0,
     eps: float = 1.0e-6,
+    den: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """IC term from the raw IC residual ``ic = T_hat_norm(0) - ic_target``.
 
@@ -257,15 +258,24 @@ def _ic_loss(
     in the nonconstant thermal signal is large (t0 rel-L2 ~0.75 on diffusion, the
     IC that seeds the whole trajectory).
 
-    ``mode="rel"``: per-sim relative L2,
-    ``mean_b[ sum_i ic**2 / (sum_i (ic_target - t_right_tilde)**2 + eps) ]``. The
-    denominator is the IC's energy measured as a *deviation from the constant
-    300 K field* (``t_right_tilde = (300 - mu)/sigma``), so the loss targets
-    relative error in the signal validation rel-L2 measures, not absolute Kelvin
-    MSE. Per-sim (dim-0) so it is invariant to each trajectory's IC amplitude;
-    for a single sim it reduces to one ratio.
+    ``mode="rel"`` with ``den=None`` (legacy sampled): per-sim relative L2 with a
+    *sampled* denominator ``sum_i (ic_target_i - t_right_tilde)**2``. This is the
+    unstable form -- when the sampled IC nodes land in near-flat regions the
+    denominator collapses and the ratio explodes, corrupting SOAP's second-moment
+    preconditioner (observed loss_ic spikes to >2000).
+
+    ``mode="rel"`` with ``den`` provided (stabilized full-grid): the denominator
+    is a *fixed per-sim signal norm* precomputed on the whole grid,
+    ``D_sim = mean_{x,y}[(T0_tilde - t_right_tilde)**2]`` (already floored by the
+    caller). The numerator is the per-point mean squared IC residual over the
+    sampled nodes, so numerator and denominator are both per-point mean-squares
+    (dimensionally consistent regardless of ``n_ic``) and the ratio is bounded by
+    the floor. ``den`` has shape ``(B,)``.
     """
     if mode == "rel":
+        if den is not None:
+            num = (ic ** 2).mean(dim=(1, 2))               # (B,) per-point MS
+            return (num / den).mean()
         num = (ic ** 2).sum(dim=(1, 2))                    # (B,)
         dev = ic_target - t_right_tilde
         den = (dev ** 2).sum(dim=(1, 2)) + eps             # (B,)
@@ -286,43 +296,58 @@ def pino_losses(
     ic_loss: str = "mse",
     t_right_tilde: float = 0.0,
     ic_eps: float = 1.0e-6,
+    ic_den: torch.Tensor | None = None,
+    compute_r: bool = True,
+    compute_bc: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Raw physics/IC/BC losses. ``causal_cfg.enabled`` swaps the plain
     ``mean(r^2)`` interior term for a causally time-weighted one (needs
     ``t_final``); ``res_bins > 0`` also returns a detached ``res_bins`` per-time
     residual vector for diagnostics. ``ic_loss="rel"`` (with ``t_right_tilde``)
-    swaps the raw IC MSE for the per-sim relative IC L2 (see ``_ic_loss``). All
-    default off -> legacy behavior.
+    swaps the raw IC MSE for the per-sim relative IC L2 (see ``_ic_loss``);
+    passing ``ic_den`` (shape ``(B,)``) selects the stabilized fixed full-grid
+    denominator path. ``compute_r=False`` / ``compute_bc=False`` skip the
+    (expensive, double-backward) residual / BC autodiff entirely and return a
+    zero placeholder -- used for the IC-only diagnostic. All default off/on ->
+    legacy behavior.
     """
-    x_r, y_r, t_r = batch["interior"]
-    r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha)
-    causal_on = bool(causal_cfg and causal_cfg.get("enabled", False))
     bin_mean = None
-    if causal_on:
-        if t_final is None:
-            raise ValueError("causal residual weighting requires t_final")
-        loss_r, bin_mean = _causal_residual_loss(
-            r, t_r, float(t_final),
-            int(causal_cfg.get("n_bins", 16)),
-            float(causal_cfg.get("eps_causal", 1.0)),
-        )
+    r = None
+    if compute_r:
+        x_r, y_r, t_r = batch["interior"]
+        r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha)
+        causal_on = bool(causal_cfg and causal_cfg.get("enabled", False))
+        if causal_on:
+            if t_final is None:
+                raise ValueError("causal residual weighting requires t_final")
+            loss_r, bin_mean = _causal_residual_loss(
+                r, t_r, float(t_final),
+                int(causal_cfg.get("n_bins", 16)),
+                float(causal_cfg.get("eps_causal", 1.0)),
+            )
+        else:
+            loss_r = (r ** 2).mean()
     else:
-        loss_r = (r ** 2).mean()
+        loss_r = u.new_zeros(())
 
     ic = ic_residual(model, u, batch["ic"]["coords"], batch["ic"]["t"], ic_target)
     loss_ic = _ic_loss(
         ic, ic_target, mode=ic_loss, t_right_tilde=t_right_tilde, eps=ic_eps,
+        den=ic_den,
     )
 
-    bc_sq = 0.0
-    for w in WALLS:
-        xw, yw, tw = batch["walls"][w]
-        nb = neumann_residual(model, u, xw, yw, tw, w)
-        bc_sq = bc_sq + (nb ** 2).mean()
-    loss_bc = bc_sq / len(WALLS)
+    if compute_bc:
+        bc_sq = 0.0
+        for w in WALLS:
+            xw, yw, tw = batch["walls"][w]
+            nb = neumann_residual(model, u, xw, yw, tw, w)
+            bc_sq = bc_sq + (nb ** 2).mean()
+        loss_bc = bc_sq / len(WALLS)
+    else:
+        loss_bc = u.new_zeros(())
 
     out = {"r": loss_r, "ic": loss_ic, "bc": loss_bc}
-    if res_bins:
+    if res_bins and r is not None:
         if bin_mean is not None and bin_mean.numel() == res_bins:
             out["res_bins"] = bin_mean
         else:
@@ -590,6 +615,27 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     ic_eps = float(pino.get("ic_eps", 1.0e-6))
     t_right_tilde_ic = (T_RIGHT - mu) / (sigma + 1e-8)
 
+    # Relative-IC denominator source. "sampled" (legacy): per-step sum over the
+    # sampled IC nodes -- collapses when nodes land in the near-flat interior,
+    # blowing the ratio up and corrupting the optimizer's second moment.
+    # "full_grid": a FIXED per-sim signal norm D_sim = mean_{x,y}[(T0_tilde -
+    # t_right_tilde)**2] precomputed on the whole grid and floored at a fraction
+    # of the train-set median, so the ratio is bounded and amplitude-invariant.
+    ic_denom = str(pino.get("ic_denom", "sampled"))
+    ic_denom_floor_frac = float(pino.get("ic_denom_floor_frac", 0.01))
+    d_sim_all: torch.Tensor | None = None
+    ic_floor = 0.0
+    if ic_loss == "rel" and ic_denom == "full_grid":
+        T0_tilde = (
+            np.asarray(data["trajectories"][:, 0, :, :], dtype=np.float64) - mu
+        ) / (sigma + 1e-8)
+        dev0 = T0_tilde - float(t_right_tilde_ic)
+        d_np = (dev0 ** 2).reshape(dev0.shape[0], -1).mean(axis=1)   # (S,)
+        _train_ids = np.asarray(data["train_ids"])
+        ic_floor = ic_denom_floor_frac * float(np.median(d_np[_train_ids]))
+        d_np = np.maximum(d_np, ic_floor)
+        d_sim_all = torch.as_tensor(d_np, dtype=torch.float32, device=device)
+
     dense_ic = bool(pino.get("dense_ic", False))
     resample_every = max(1, int(pino.get("resample_every", 1)))
     causal_cfg = pino.get("causal", {}) or {}
@@ -601,6 +647,14 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
 
     curr_cfg = pino.get("curriculum", {}) or {}
     gradnorm = build_gradnorm(config, lam_r, lam_ic, lam_bc)
+
+    # IC-only fast path: when a term can never carry weight (static lambda 0 and
+    # no curriculum that could ramp it up), skip its autodiff entirely. Dropping
+    # the residual removes the double-backward that dominates step cost, so the
+    # IC-only diagnostic runs at interactive speed.
+    _curr_on_flags = bool(curr_cfg.get("enabled", False))
+    compute_r = _curr_on_flags or lam_r > 0.0
+    compute_bc = _curr_on_flags or lam_bc > 0.0
 
     epochs = int(config["training"]["epochs"])
     validate_every = int(config["training"].get("validate_every", 10))
@@ -681,7 +735,10 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
         f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} | "
         f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} sim_batch={sim_batch} alpha={alpha} | "
-        f"ic_loss={ic_loss} dense_ic={dense_ic} resample_every={resample_every} | "
+        f"ic_loss={ic_loss} ic_denom={ic_denom}"
+        + (f"(floor={ic_floor:.3e})" if d_sim_all is not None else "")
+        + f" dense_ic={dense_ic} resample_every={resample_every} | "
+        f"compute_r={compute_r} compute_bc={compute_bc} | "
         f"curriculum={curr_desc} gradnorm={gn_desc} causal={causal_desc}",
         flush=True,
     )
@@ -707,12 +764,17 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             data["trajectories"], batch_ids, coll["ic"]["ix"], coll["ic"]["iy"], mu, sigma, device,
         )
 
+        ic_den = None
+        if d_sim_all is not None:
+            ic_den = d_sim_all[torch.as_tensor(batch_ids, device=device)]
+
         optimizer.zero_grad(set_to_none=True)
         losses = pino_losses(
             model, u, coll, ic_target, alpha,
             causal_cfg=causal_cfg, t_final=t_final,
             res_bins=(res_n_bins if do_val else 0),
             ic_loss=ic_loss, t_right_tilde=t_right_tilde_ic, ic_eps=ic_eps,
+            ic_den=ic_den, compute_r=compute_r, compute_bc=compute_bc,
         )
 
         # Static per-term weights for this epoch (IC-first curriculum or plain

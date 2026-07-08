@@ -372,6 +372,99 @@ def test_ic_loss_rel_uses_deviation_from_t_right():
     assert float(got) > 1.0
 
 
+def test_ic_loss_rel_fullgrid_denom_is_per_point_mean_ratio():
+    # Stabilized path: passing an explicit per-sim denominator makes the numerator
+    # a per-point MEAN square (not a sum), so the loss is mean(ic**2)/den. ic=0.1
+    # everywhere, den=1.0 -> 0.01. The sampled ic_target is ignored on this path.
+    ic = torch.full((1, 4, 1), 0.1)
+    ic_target = torch.zeros((1, 4, 1))
+    den = torch.tensor([1.0])
+    got = _ic_loss(ic, ic_target, mode="rel", den=den)
+    assert torch.allclose(got, torch.tensor(0.01), atol=1e-6)
+
+
+def test_ic_loss_rel_fullgrid_denom_is_n_ic_independent():
+    # The whole point of the mean-based numerator: the loss is invariant to how
+    # many collocation nodes were sampled. The legacy sum-based sampled path would
+    # scale linearly with the node count.
+    den = torch.tensor([2.0])
+    ic4 = torch.full((1, 4, 1), 0.3)
+    ic8 = torch.full((1, 8, 1), 0.3)
+    g4 = _ic_loss(ic4, torch.zeros_like(ic4), mode="rel", den=den)
+    g8 = _ic_loss(ic8, torch.zeros_like(ic8), mode="rel", den=den)
+    assert torch.allclose(g4, g8, atol=1e-6)
+    assert torch.allclose(g4, torch.tensor(0.045), atol=1e-6)   # 0.09 / 2.0
+
+
+def test_ic_loss_rel_fullgrid_denom_bounded_by_floor():
+    # A floored (larger) denominator caps the ratio: the near-flat-sim explosion
+    # the sampled path suffers cannot happen once den >= floor.
+    ic = torch.full((1, 4, 1), 0.5)
+    tgt = torch.zeros_like(ic)
+    unfloored = _ic_loss(ic, tgt, mode="rel", den=torch.tensor([1.0e-4]))
+    floored = _ic_loss(ic, tgt, mode="rel", den=torch.tensor([1.0]))
+    assert float(floored) < float(unfloored)
+    assert math.isfinite(float(floored))
+
+
+def test_e2e_ic_only_raw_mse_skips_residual(tmp_path):
+    # IC-only diagnostic A: lambda_r=0, lambda_bc=0, dense IC, AdamW flat LR.
+    # compute_r/compute_bc are off, so loss_r/loss_bc are exact zeros and no
+    # residual double-backward runs.
+    _write_synthetic_diffusion(tmp_path)
+    cfg = _config(tmp_path)
+    cfg["training"]["epochs"] = 2
+    cfg["training"]["validate_every"] = 1
+    cfg["training"]["optimizer"] = "AdamW"
+    cfg["training"]["learning_rate"] = 3.0e-4
+    cfg["training"]["scheduler"] = {"type": "StepLR", "step_size": 1, "gamma": 1.0}
+    cfg["training"]["pino"]["lambda_r"] = 0.0
+    cfg["training"]["pino"]["lambda_bc"] = 0.0
+    cfg["training"]["pino"]["ic_loss"] = "mse"
+    cfg["training"]["pino"]["dense_ic"] = True
+    run_dir = tmp_path / "run_ic_mse"
+
+    run_one_seed_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+    for r in rows:
+        assert float(r["loss_r"]) == 0.0
+        assert float(r["loss_bc"]) == 0.0
+        assert math.isfinite(float(r["loss_ic"]))
+        assert float(r["loss_ic"]) > 0.0
+
+
+def test_e2e_ic_only_fullgrid_rel_is_stable(tmp_path):
+    # IC-only diagnostic B: stabilized relative loss with the fixed full-grid
+    # per-sim denominator. Asserts the loss stays finite/bounded (no sampled-denom
+    # explosion) and the residual is skipped.
+    _write_synthetic_diffusion(tmp_path)
+    cfg = _config(tmp_path)
+    cfg["training"]["epochs"] = 2
+    cfg["training"]["validate_every"] = 1
+    cfg["training"]["optimizer"] = "AdamW"
+    cfg["training"]["learning_rate"] = 3.0e-4
+    cfg["training"]["scheduler"] = {"type": "StepLR", "step_size": 1, "gamma": 1.0}
+    cfg["training"]["pino"]["lambda_r"] = 0.0
+    cfg["training"]["pino"]["lambda_bc"] = 0.0
+    cfg["training"]["pino"]["ic_loss"] = "rel"
+    cfg["training"]["pino"]["ic_denom"] = "full_grid"
+    cfg["training"]["pino"]["ic_denom_floor_frac"] = 0.01
+    cfg["training"]["pino"]["dense_ic"] = True
+    run_dir = tmp_path / "run_ic_rel_fg"
+
+    run_one_seed_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+    for r in rows:
+        assert float(r["loss_r"]) == 0.0
+        assert float(r["loss_bc"]) == 0.0
+        assert math.isfinite(float(r["loss_ic"]))
+        # A relative IC loss on a per-sim-normalized denominator starts O(1); the
+        # floor guarantees it cannot blow past a small multiple of that.
+        assert float(r["loss_ic"]) < 100.0
+
+
 def test_e2e_ic_loss_rel_runs_and_reports_bands(tmp_path):
     _write_synthetic_diffusion(tmp_path)
     cfg = _config(tmp_path)
