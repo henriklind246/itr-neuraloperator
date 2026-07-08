@@ -385,6 +385,7 @@ class CViT(nn.Module):
         activation: str = "gelu",
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
+        t_final: float = 1.0,
     ):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
@@ -413,6 +414,18 @@ class CViT(nn.Module):
         self.register_buffer(
             "t_right_tilde", torch.tensor(float(t_right_tilde), dtype=torch.float32)
         )
+        # Decoder time is normalized to [0, 1] by dividing the physical query time
+        # by t_final *inside* forward. This keeps the temporal Fourier features on
+        # the same [0, 1] range as the spatial ones (so a shared fourier_freq is
+        # not near time-blind on a small window like t_final=0.3). The division is
+        # in-graph, so the PDE residual — which differentiates w.r.t. the physical
+        # time leaf — stays exact: autograd's chain rule folds in the 1/t_final
+        # factor to yield the true physical T_t. (Rescaling the collocation leaf
+        # itself instead would drop that factor and corrupt the residual.) Default
+        # 1.0 is a no-op, preserving legacy behavior.
+        self.register_buffer(
+            "t_norm", torch.tensor(float(t_final), dtype=torch.float32)
+        )
 
     def forward(
         self, u: torch.Tensor, coords: torch.Tensor, t: torch.Tensor
@@ -425,8 +438,78 @@ class CViT(nn.Module):
         if t.shape[0] == 1 and B > 1:
             t = t.expand(B, -1, -1)
         tokens = self.encoder(u)
-        raw = self.decoder(tokens, coords, t)
+        raw = self.decoder(tokens, coords, t / self.t_norm)
         if self.hard_right_dirichlet:
             x = coords[..., 0:1]
             return self.t_right_tilde + (1.0 - x) * raw
         return raw
+
+
+class ForcingCViT(CViT):
+    """CViT whose encoder ingests the boundary forcing as a space-time image.
+
+    Identical architecture to :class:`CViT` (patch-embed encoder + Fourier /
+    time-FiLM cross-attention decoder + hard right-Dirichlet ansatz), reused
+    verbatim; the ONLY difference is the meaning of the encoder input ``u``.
+
+    For the single-slab, forcing-driven benchmark the initial condition is a
+    fixed uniform 300 K field, so it carries no per-sim information; the per-sim
+    signal is the inhomogeneous left-wall Neumann flux ``q_L(y, t) = a(t)*s(y)``.
+    The encoder is therefore conditioned on ``q_L`` rendered as a **boundary
+    space-time image**, NOT a 2D spatial (x, y) field:
+
+        u: (B, 1, Ny, Nt)   with axes (rows = left-wall y-nodes, cols = time)
+                            and a single channel ``u_enc(y, t) = q_L(y, t)/A_ref``.
+
+    ``grid_size`` here is ``(Ny, Nt)`` (y-resolution x time-resolution of that
+    image), so the patch grid is ``(Ny/patch, Nt/patch)``. Do NOT feed a
+    temperature or geometry field: the second image axis is time, not x.
+
+    A single input channel is deliberate — the scientific question is whether the
+    forcing function image alone suffices; extra channels (``a(t)``, ``s(y)``,
+    family one-hots) are only added if the 1-channel version demonstrably fails.
+
+    ``forward(u, coords, t)`` is inherited unchanged, so ``pde_residual.model_xyt``
+    and the PINO trainer call it exactly like ``CViT``.
+    """
+
+    def __init__(
+        self,
+        in_ch: int = 1,
+        out_dim: int = 1,
+        emb_dim: int = 256,
+        dec_emb_dim: int | None = None,
+        patch_size: int = 10,
+        grid_size: tuple[int, int] = (100, 100),
+        depth_enc: int = 4,
+        depth_dec: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+        fourier_freq: float = 1.0,
+        fourier_freq_t: float | None = None,
+        activation: str = "gelu",
+        hard_right_dirichlet: bool = True,
+        t_right_tilde: float = 0.0,
+        t_final: float = 1.0,
+    ):
+        # grid_size is the (Ny, Nt) forcing-image resolution; every block,
+        # including the double-backward-safe explicit-attention encoder and the
+        # Conv2d PatchEmbed2d (no fused SDPA), is reused from CViT unchanged.
+        super().__init__(
+            in_ch=in_ch,
+            out_dim=out_dim,
+            emb_dim=emb_dim,
+            dec_emb_dim=dec_emb_dim,
+            patch_size=patch_size,
+            grid_size=grid_size,
+            depth_enc=depth_enc,
+            depth_dec=depth_dec,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            fourier_freq=fourier_freq,
+            fourier_freq_t=fourier_freq_t,
+            activation=activation,
+            hard_right_dirichlet=hard_right_dirichlet,
+            t_right_tilde=t_right_tilde,
+            t_final=t_final,
+        )
