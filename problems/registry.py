@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from problems.base import ProblemSpec
 from problems.diffusion import DiffusionProblem
+from problems.diffusion_forcing import DiffusionForcingProblem
 from problems.forcing import ForcingProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
@@ -10,6 +11,7 @@ from problems.source_itr import SourceItrProblem
 # Benchmarks register here as constructors taking a representation string.
 REGISTRY: dict[str, type[ProblemSpec]] = {
     "diffusion": DiffusionProblem,
+    "diffusion_forcing": DiffusionForcingProblem,
     "forcing": ForcingProblem,
     "interfaces": InterfacesProblem,
     "source": SourceProblem,

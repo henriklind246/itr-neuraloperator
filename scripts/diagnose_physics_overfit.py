@@ -231,7 +231,7 @@ def main() -> int:
     y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
 
     fq_t = config["model"]["cvit"].get("fourier_freq_t", None)
-    model = build_cvit(config, mu, sigma, grid_size=(Nx, Ny)).to(device)
+    model = build_cvit(config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final).to(device)
     optimizer = build_optimizer(config, model.parameters())
     scheduler = build_scheduler(config, optimizer)
 
