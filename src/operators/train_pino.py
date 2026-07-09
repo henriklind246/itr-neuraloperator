@@ -767,10 +767,12 @@ def validate_forcing_gnrmse(
     # g*(x-1), g = -q_L(y,t)/(k*sigma). It is dropped when q_left is None, so the
     # eval MUST feed q_L at every query point or it scores an insulated wall
     # (T_x(0)=raw_x(0)~0) and looks catastrophically wrong regardless of family.
-    # g depends on (y, t) only, so the per-point y column and the slice time
-    # reconstruct q_L via the SAME path (left_wall_qL) the left-wall residual uses.
+    # g depends on (y, t) only, so q_L over the full (y-column x t_grid) grid is
+    # reconstructed ONCE per chunk (same reconstruct_qL path as the residual) and
+    # indexed per slice, rather than rebuilt inside the time loop.
     use_left_flux = bool(getattr(model, "hard_left_flux", False))
-    mesh_y = mesh[0, :, 1].contiguous()
+    mesh_y_np = mesh[0, :, 1].contiguous().cpu().numpy().astype(np.float64)
+    M = mesh_y_np.shape[0]
 
     ids = np.asarray(ids)
     per_sim_rmse: list[float] = []
@@ -782,13 +784,24 @@ def validate_forcing_gnrmse(
         u = build_forcing_image(params, y_img, t_img, a_ref, device, t_ramp)
         B = u.shape[0]
         coords = mesh.expand(B, -1, -1)
+        q_all = None
+        if use_left_flux:
+            # (B, Nt, M): q_L at every mesh point for every slice time, one
+            # reconstruct_qL per sim. yy/tt are the pointwise (slice-major) grid.
+            yy = np.broadcast_to(mesh_y_np[None, :], (Nt, M)).reshape(-1)
+            tt = np.repeat(t_grid, M)
+            q_np = np.empty((B, Nt, M), dtype=np.float32)
+            for b, p in enumerate(params):
+                _, q_at = reconstruct_qL(
+                    p["temporal_family"], p["temporal_params"],
+                    p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
+                )
+                q_np[b] = np.asarray(q_at(yy, tt), dtype=np.float32).reshape(Nt, M)
+            q_all = torch.from_numpy(q_np).unsqueeze(-1).to(device)  # (B,Nt,M,1)
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
         for k in range(Nt):
             tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
-            q_left = None
-            if use_left_flux:
-                t_pts = torch.full_like(mesh_y, float(t_grid[k]))
-                q_left = left_wall_qL(params, mesh_y, t_pts, device, t_ramp)
+            q_left = q_all[:, k] if use_left_flux else None
             out = model(u, coords, tk, q_left=q_left)
             pred[:, k] = out[..., 0].view(B, Nx, Ny)
         pred_K = pred * sigma + mu

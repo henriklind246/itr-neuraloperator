@@ -86,7 +86,11 @@ nvidia-smi
 # lambda_ic > 0 is REQUIRED on diffusion (T == 300 satisfies the PDE + every BC,
 # so a residual-only objective is degenerate -- the IC anchor breaks it).
 cd "$PROJECT_DIR"
-python scripts/run_train_pino.py \
+# Stream stdout live: SLURM redirects to a file (not a TTY), so Python
+# block-buffers stdout and the pre-training setup phase (imports, data load,
+# model build) would otherwise show nothing until the buffer fills.
+export PYTHONUNBUFFERED=1
+python -u scripts/run_train_pino.py \
     training.optimizer=SOAP \
     training.pino.lambda_ic=1.0 \
     "$@"
