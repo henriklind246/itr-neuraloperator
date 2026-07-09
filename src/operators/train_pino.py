@@ -841,6 +841,70 @@ def validate_forcing_gnrmse(
     return out
 
 
+def forcing_data_loss(
+    model: CViT,
+    sim_params: np.ndarray,
+    trajectories: np.ndarray,
+    ids: np.ndarray,
+    *,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    a_ref: float,
+    t_ramp: float,
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    t_grid: np.ndarray,
+    mu: float,
+    sigma: float,
+    n_sims: int,
+    n_pts: int,
+    device: torch.device,
+    rng: np.random.Generator,
+    gen: torch.Generator,
+) -> torch.Tensor:
+    """Supervised interior-field MSE against the saved FV forcing trajectories.
+
+    Lever #1 for the diffusion_forcing gap. The pure-physics forcing objective
+    couples ``q_L`` to the trainable field ONLY through the single soft left-wall
+    Neumann residual, which competes with the flat-``T=300 K`` basin that
+    minimizes every other term (interior residual, IC, homogeneous walls). This
+    draws ``n_sims`` saved TRAIN sims, reconstructs each encoder image with the
+    SAME :func:`build_forcing_image` path the physics batch uses, and matches
+    ``model(u, x, y, t)`` to the FV field at ``n_pts`` grid nodes shared across
+    the sim batch (normalized-space MSE). It is a plain value penalty -- no
+    autodiff through the output -- so it directly pins the field level the
+    derivative BC cannot, giving the reference benchmarks' value-supervised
+    conditioning. Intended for the soft path (``hard_left_flux=false``); the
+    ansatz's analytic forcing term is not needed, so ``q_left`` is left ``None``.
+    """
+    ids = np.asarray(ids)
+    k = min(int(n_sims), int(len(ids)))
+    chunk = rng.choice(ids, size=k, replace=False)
+    params = [dict(sim_params[int(i)]) for i in chunk]
+    u = build_forcing_image(params, y_img, t_img, a_ref, device, t_ramp)
+    B = u.shape[0]
+    Nx, Ny, Nt = int(x_grid.numel()), int(y_grid.numel()), int(len(t_grid))
+
+    it = torch.randint(0, Nt, (n_pts,), device=device, generator=gen)
+    ix = torch.randint(0, Nx, (n_pts,), device=device, generator=gen)
+    iy = torch.randint(0, Ny, (n_pts,), device=device, generator=gen)
+    coords = torch.stack([x_grid[ix], y_grid[iy]], dim=-1).view(1, n_pts, 2)
+    coords = coords.expand(B, -1, -1)
+    it_np = it.detach().cpu().numpy()
+    ix_np = ix.detach().cpu().numpy()
+    iy_np = iy.detach().cpu().numpy()
+    t_np = np.asarray(t_grid, dtype=np.float32)[it_np]
+    t = torch.from_numpy(t_np).to(device).view(1, n_pts, 1).expand(B, -1, -1)
+
+    traj = np.asarray(trajectories[np.asarray(chunk)], dtype=np.float32)  # (B,Nt,Nx,Ny)
+    truth = traj[:, it_np, ix_np, iy_np]  # (B, n_pts)
+    truth = (truth - float(mu)) / (float(sigma) + 1e-8)
+    truth_t = torch.from_numpy(truth).to(device).unsqueeze(-1)  # (B, n_pts, 1)
+
+    pred = model(u, coords, t)  # (B, n_pts, 1)
+    return ((pred - truth_t) ** 2).mean()
+
+
 # --------- single-seed training ---------
 
 def build_cvit(
@@ -1315,6 +1379,12 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     # homogeneous top/bottom walls stay on lam_bc via the bc_hom bucket.
     lam_bc_left_cfg = pino.get("lambda_bc_left", None)
     lam_bc_left = None if lam_bc_left_cfg is None else float(lam_bc_left_cfg)
+    # Lever #1: optional supervised interior-field data term drawn from the saved
+    # TRAIN forcing sims. 0.0 (default) = pure physics (off).
+    lam_data = float(pino.get("lambda_data", 0.0))
+    n_data_sims = int(pino.get("n_data_sims", 8))
+    n_data_pts = int(pino.get("n_data_pts", 1024))
+    t_grid_np = np.asarray(data["t_grid"], dtype=np.float64)
     n_r = int(pino["n_r"])
     n_ic = int(pino["n_ic"])
     n_bc = int(pino["n_bc"])
@@ -1346,7 +1416,8 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     # signal and must be watchable independently of the homogeneous top/bottom.
     fieldnames = [
         "epoch", "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
-        "w_r", "w_ic", "w_bc", "w_bc_left",
+        "loss_data",
+        "w_r", "w_ic", "w_bc", "w_bc_left", "w_data",
         "val_gnrmse", "val_rmse_K",
         "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
     ]
@@ -1359,6 +1430,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         f"img=({ny_img}x{nt_img}) a_ref={a_ref} t_ramp={t_ramp:.4g} "
         f"sampler={sampler} | lambda_r={lam_r} lambda_ic={lam_ic} "
         f"lambda_bc={lam_bc} lambda_bc_left={lam_bc_left} "
+        f"lambda_data={lam_data} (n_data_sims={n_data_sims},n_data_pts={n_data_pts}) "
         f"hard_left_flux={bool(getattr(model, 'hard_left_flux', False))} | "
         f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} "
         f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} | "
@@ -1419,6 +1491,16 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
                 + lam_bc * losses["bc_hom"]
                 + lam_bc_left * losses["bc_left"]
             )
+        loss_data = None
+        if lam_data > 0.0:
+            loss_data = forcing_data_loss(
+                model, sim_params, data["trajectories"], data["train_ids"],
+                y_img=y_img, t_img=t_img, a_ref=a_ref, t_ramp=t_ramp,
+                x_grid=x_grid_t, y_grid=y_grid_t, t_grid=t_grid_np,
+                mu=mu, sigma=sigma, n_sims=n_data_sims, n_pts=n_data_pts,
+                device=device, rng=rng, gen=gen,
+            )
+            loss = loss + lam_data * loss_data
         loss.backward()
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
@@ -1431,14 +1513,22 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             "loss_ic": float(losses["ic"].detach().cpu()),
             "loss_bc": float(losses["bc"].detach().cpu()),
             "loss_bc_left": float(losses["bc_left"].detach().cpu()),
+            "loss_data": (
+                float(loss_data.detach().cpu()) if loss_data is not None else ""
+            ),
             "w_r": lam_r, "w_ic": w_ic, "w_bc": w_bc, "w_bc_left": w_bc_left,
+            "w_data": lam_data,
             "val_gnrmse": "", "val_rmse_K": "",
             "gnrmse_amp_low": "", "gnrmse_amp_mid": "", "gnrmse_amp_high": "",
         }
+        data_txt = (
+            f", data={row['loss_data']:.6f}" if loss_data is not None else ""
+        )
         print(
             f"Epoch {epoch}: loss={row['loss']:.6f} "
             f"(r={row['loss_r']:.6f}, ic={row['loss_ic']:.6f}, "
-            f"bc={row['loss_bc']:.6f}, bc_left={row['loss_bc_left']:.6f}) "
+            f"bc={row['loss_bc']:.6f}, bc_left={row['loss_bc_left']:.6f}"
+            f"{data_txt}) "
             f"lr={lr:.2e}" + ("  [warmup]" if warming else ""),
             flush=True,
         )

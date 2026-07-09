@@ -182,6 +182,18 @@ training:
     # pulled out and weighted by lambda_bc_left while the homogeneous top/bottom
     # stay on lambda_bc, removing that dilution.
     lambda_bc_left: null
+    # ---- Lever #1: interior data supervision (forcing PINO only) ----
+    # Optional supervised MSE matching model(u, x, y, t) to the saved FV forcing
+    # trajectories at n_data_pts grid nodes over n_data_sims saved TRAIN sims.
+    # 0.0 (default) = pure physics (off). The pure-physics forcing objective
+    # couples q_L to the field ONLY through the soft left-wall Neumann residual,
+    # which competes with the flat-300 K basin that minimizes every other term;
+    # this value penalty pins the field level the derivative BC cannot, matching
+    # the reference benchmarks' value-supervised conditioning. Intended with
+    # hard_left_flux=false (the soft path); q_left is left None in the data term.
+    lambda_data: 0.0
+    n_data_sims: 8
+    n_data_pts: 1024
     n_r: 4096
     n_ic: 1024
     n_bc: 512

@@ -3,6 +3,7 @@ import torch
 
 from src.operators.cvit import ForcingCViT
 from src.operators.train_pino import (
+    forcing_data_loss,
     left_wall_qL,
     pino_losses,
     sample_collocation,
@@ -73,6 +74,76 @@ def test_lifting_makes_bc_left_forcing_independent_in_losses():
     l1 = pino_losses(model, u, coll, ic_target, left_qL=q_L, **kw)
     l2 = pino_losses(model, u, coll, ic_target, left_qL=q_L + 0.5, **kw)
     assert torch.allclose(l1["bc_left"], l2["bc_left"], atol=1e-5)
+
+
+def test_soft_left_bc_is_forcing_dependent_in_losses():
+    # Complement to the lifting test: with hard_left_flux OFF the left wall is a
+    # genuine soft Neumann penalty (dT_tilde/dx|_0 + q_L/(k*sigma))^2 on the raw
+    # field, so bc_left MUST move when q_L is scaled. This forcing->field coupling
+    # is exactly what the lifting cancels; the diffusion_forcing benchmark depends
+    # on it, so a broken re-enable of the ansatz must fail here.
+    sigma, k = 5.0, 1.0
+    model, u, coll, ic_target, q_L = _setup(batch=2, hard_left_flux=False)
+    kw = dict(alpha=1.0, t_final=0.3, sigma=sigma, k_slab=k)
+    l1 = pino_losses(model, u, coll, ic_target, left_qL=q_L, **kw)
+    l2 = pino_losses(model, u, coll, ic_target, left_qL=q_L + 0.5, **kw)
+    assert not torch.allclose(l1["bc_left"], l2["bc_left"], atol=1e-5)
+
+
+def _data_setup(n_sims: int = 4, Nt: int = 8, Nx: int = 10, Ny: int = 12):
+    torch.manual_seed(0)
+    model = _tiny_forcing()
+    rng = np.random.default_rng(0)
+    params = sample_forcing_params(rng, n_sims, dt=0.003, t_final=0.3)
+    sim_params = np.array(params, dtype=object)
+    # Saved FV field on the (Nt, Nx, Ny) grid; a deviation off the 300 K baseline.
+    trajectories = (300.0 + rng.standard_normal((n_sims, Nt, Nx, Ny)) * 5.0).astype(
+        np.float32
+    )
+    kw = dict(
+        y_img=np.linspace(0.0, 1.0, 16),
+        t_img=np.linspace(0.0, 0.3, 20),
+        a_ref=300.0,
+        t_ramp=0.003,
+        x_grid=torch.linspace(0.0, 1.0, Nx),
+        y_grid=torch.linspace(0.0, 1.0, Ny),
+        t_grid=np.linspace(0.0, 0.3, Nt),
+        mu=300.0,
+        sigma=5.0,
+        n_sims=3,
+        n_pts=50,
+        device=torch.device("cpu"),
+    )
+    return model, sim_params, trajectories, np.arange(n_sims), kw
+
+
+def test_forcing_data_loss_is_differentiable_and_truth_dependent():
+    # Lever #1: the supervised data term must be a finite, positive, grad-enabled
+    # scalar that actually depends on the FV truth (so it can pin the field level
+    # the soft Neumann BC cannot). A fresh generator each call isolates the change
+    # to the truth, not the sampled nodes.
+    model, sim_params, traj, ids, kw = _data_setup()
+
+    def _loss(trajectories):
+        return forcing_data_loss(
+            model, sim_params, trajectories, ids,
+            rng=np.random.default_rng(0),
+            gen=torch.Generator().manual_seed(0),
+            **kw,
+        )
+
+    loss = _loss(traj)
+    assert loss.shape == ()
+    assert torch.isfinite(loss) and float(loss) > 0.0
+    assert loss.requires_grad
+    loss.backward()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in model.parameters()
+    )
+    # Shifting the FV truth by a constant must change the value MSE.
+    shifted = _loss(traj + 25.0)
+    assert not torch.allclose(loss.detach(), shifted.detach(), atol=1e-6)
 
 
 class _SpyModel(torch.nn.Module):
