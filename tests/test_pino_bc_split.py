@@ -1,7 +1,14 @@
+import numpy as np
 import torch
 
 from src.operators.cvit import ForcingCViT
-from src.operators.train_pino import pino_losses, sample_collocation
+from src.operators.train_pino import (
+    left_wall_qL,
+    pino_losses,
+    sample_collocation,
+    sample_forcing_params,
+    validate_forcing_gnrmse,
+)
 
 
 def _tiny_forcing(**kw):
@@ -66,3 +73,71 @@ def test_lifting_makes_bc_left_forcing_independent_in_losses():
     l1 = pino_losses(model, u, coll, ic_target, left_qL=q_L, **kw)
     l2 = pino_losses(model, u, coll, ic_target, left_qL=q_L + 0.5, **kw)
     assert torch.allclose(l1["bc_left"], l2["bc_left"], atol=1e-5)
+
+
+class _SpyModel(torch.nn.Module):
+    """Records the ``q_left`` each forward receives; returns a zero field."""
+
+    def __init__(self, hard_left_flux: bool):
+        super().__init__()
+        self.hard_left_flux = hard_left_flux
+        self.seen: list = []
+
+    def forward(self, u, coords, t, q_left=None):
+        self.seen.append(q_left)
+        return torch.zeros(u.shape[0], coords.shape[1], 1)
+
+
+def _val_data(Nx=6, Ny=5, Nt=4, n_sims=3):
+    x_grid = np.linspace(0.0, 1.0, Nx).astype(np.float32)
+    y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
+    t_grid = np.linspace(0.0, 0.3, Nt).astype(np.float32)
+    data = {
+        "x_grid": x_grid, "y_grid": y_grid, "t_grid": t_grid,
+        "mu_global": 300.0, "sigma_global": 5.0,
+        "trajectories": np.zeros((n_sims, Nt, Nx, Ny), dtype=np.float32),
+    }
+    rng = np.random.default_rng(0)
+    records = sample_forcing_params(rng, n_sims, dt=0.3 / (Nt - 1), t_final=0.3)
+    sim_params = np.array(records, dtype=object)
+    return data, sim_params, np.arange(n_sims)
+
+
+def test_validation_feeds_q_left_when_hard_left_flux():
+    # Regression: with hard_left_flux the eval MUST pass q_L into the ansatz.
+    # A None q_left drops the analytic g*(x-1) forcing term and scores an
+    # insulated wall, which looks catastrophic across every forcing family.
+    data, sim_params, ids = _val_data()
+    y_img = data["y_grid"].copy()
+    t_img = data["t_grid"].copy()
+    model = _SpyModel(hard_left_flux=True)
+    validate_forcing_gnrmse(
+        model, data, ids, sim_params, y_img, t_img,
+        a_ref=300.0, t_ramp=0.02, device=torch.device("cpu"),
+    )
+    assert model.seen, "model was never queried"
+    assert all(q is not None for q in model.seen)
+    Nx, Ny = data["x_grid"].size, data["y_grid"].size
+    for q in model.seen:
+        assert q.shape == (len(ids), Nx * Ny, 1)
+
+    # The passed q_L must equal the shared reconstruction at the mesh y for the
+    # first slice time (t_grid[0]); this ties eval to the training residual path.
+    gx, gy = np.meshgrid(data["x_grid"], data["y_grid"], indexing="ij")
+    mesh_y = torch.as_tensor(gy.reshape(-1), dtype=torch.float32)
+    params = [dict(sim_params[int(i)]) for i in ids]
+    t_pts = torch.full_like(mesh_y, float(data["t_grid"][0]))
+    expected0 = left_wall_qL(params, mesh_y, t_pts, torch.device("cpu"), 0.02)
+    assert torch.allclose(model.seen[0], expected0, atol=1e-5)
+
+
+def test_validation_omits_q_left_when_flux_off():
+    # The cheap legacy path is preserved: hard_left_flux=False never builds q_L.
+    data, sim_params, ids = _val_data()
+    model = _SpyModel(hard_left_flux=False)
+    validate_forcing_gnrmse(
+        model, data, ids, sim_params, data["y_grid"].copy(),
+        data["t_grid"].copy(), a_ref=300.0, t_ramp=0.02,
+        device=torch.device("cpu"),
+    )
+    assert model.seen and all(q is None for q in model.seen)

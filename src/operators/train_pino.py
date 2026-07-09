@@ -763,6 +763,14 @@ def validate_forcing_gnrmse(
 
     gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
     mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+    # For hard_left_flux the ansatz carries the forcing via the analytic term
+    # g*(x-1), g = -q_L(y,t)/(k*sigma). It is dropped when q_left is None, so the
+    # eval MUST feed q_L at every query point or it scores an insulated wall
+    # (T_x(0)=raw_x(0)~0) and looks catastrophically wrong regardless of family.
+    # g depends on (y, t) only, so the per-point y column and the slice time
+    # reconstruct q_L via the SAME path (left_wall_qL) the left-wall residual uses.
+    use_left_flux = bool(getattr(model, "hard_left_flux", False))
+    mesh_y = mesh[0, :, 1].contiguous()
 
     ids = np.asarray(ids)
     per_sim_rmse: list[float] = []
@@ -777,7 +785,11 @@ def validate_forcing_gnrmse(
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
         for k in range(Nt):
             tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
-            out = model(u, coords, tk)
+            q_left = None
+            if use_left_flux:
+                t_pts = torch.full_like(mesh_y, float(t_grid[k]))
+                q_left = left_wall_qL(params, mesh_y, t_pts, device, t_ramp)
+            out = model(u, coords, tk, q_left=q_left)
             pred[:, k] = out[..., 0].view(B, Nx, Ny)
         pred_K = pred * sigma + mu
         truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)
