@@ -767,12 +767,9 @@ def validate_forcing_gnrmse(
     # g*(x-1), g = -q_L(y,t)/(k*sigma). It is dropped when q_left is None, so the
     # eval MUST feed q_L at every query point or it scores an insulated wall
     # (T_x(0)=raw_x(0)~0) and looks catastrophically wrong regardless of family.
-    # g depends on (y, t) only, so q_L over the full (y-column x t_grid) grid is
-    # reconstructed ONCE per chunk (same reconstruct_qL path as the residual) and
-    # indexed per slice, rather than rebuilt inside the time loop.
     use_left_flux = bool(getattr(model, "hard_left_flux", False))
-    mesh_y_np = mesh[0, :, 1].contiguous().cpu().numpy().astype(np.float64)
-    M = mesh_y_np.shape[0]
+    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
+    M = Nx * Ny
 
     ids = np.asarray(ids)
     per_sim_rmse: list[float] = []
@@ -786,17 +783,18 @@ def validate_forcing_gnrmse(
         coords = mesh.expand(B, -1, -1)
         q_all = None
         if use_left_flux:
-            # (B, Nt, M): q_L at every mesh point for every slice time, one
-            # reconstruct_qL per sim. yy/tt are the pointwise (slice-major) grid.
-            yy = np.broadcast_to(mesh_y_np[None, :], (Nt, M)).reshape(-1)
-            tt = np.repeat(t_grid, M)
+            # g depends on (y, t) only, so evaluate q_L on the distinct (Ny x Nt)
+            # grid with the vectorized q_image (one reconstruct per sim), then tile
+            # across x into mesh order (flat index = ix*Ny + iy, y fastest). This
+            # avoids the Nx-redundant pointwise Nt*Nx*Ny evaluation.
             q_np = np.empty((B, Nt, M), dtype=np.float32)
             for b, p in enumerate(params):
-                _, q_at = reconstruct_qL(
+                q_image, _ = reconstruct_qL(
                     p["temporal_family"], p["temporal_params"],
                     p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
                 )
-                q_np[b] = np.asarray(q_at(yy, tt), dtype=np.float32).reshape(Nt, M)
+                qg = np.asarray(q_image(y_grid_np, t_grid), dtype=np.float32)  # (Ny,Nt)
+                q_np[b] = np.tile(qg.T, (1, Nx))  # (Nt, M), y fastest
             q_all = torch.from_numpy(q_np).unsqueeze(-1).to(device)  # (B,Nt,M,1)
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
         for k in range(Nt):
