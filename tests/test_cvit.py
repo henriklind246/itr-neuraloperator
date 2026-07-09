@@ -192,6 +192,79 @@ def test_forcing_hard_dirichlet_exact():
     assert torch.allclose(out, torch.full_like(out, 0.7), atol=1e-5)
 
 
+def test_hard_left_flux_off_ignores_q_left():
+    # Default off: the lifting is inert and q_left has no effect; the output is
+    # the legacy (1 - x) * raw ansatz whether or not q_left is supplied.
+    m = _tiny_forcing()  # hard_left_flux defaults False
+    u = torch.randn(2, 1, 16, 20)
+    coords = torch.rand(2, 16, 2)
+    t = torch.rand(2, 16, 1) * 0.3
+    q_left = torch.rand(2, 16, 1)
+    with torch.no_grad():
+        out_q = m(u, coords, t, q_left=q_left)
+        out_none = m(u, coords, t)
+    assert torch.allclose(out_q, out_none, atol=0)
+
+
+def test_hard_left_flux_preserves_right_dirichlet():
+    # With the lifting on, x=1 must still collapse to t_right: g*(x-1) and
+    # (1 - x^2)*raw both vanish there, so the right Dirichlet wall is untouched.
+    m = _tiny_forcing(t_right_tilde=0.4, hard_left_flux=True, left_flux_scale=0.2)
+    u = torch.randn(2, 1, 16, 20)
+    coords = torch.rand(2, 32, 2)
+    coords[..., 0] = 1.0
+    t = torch.rand(2, 32, 1) * 0.3
+    q_left = torch.rand(2, 32, 1)
+    out = m(u, coords, t, q_left=q_left)
+    assert torch.allclose(out, torch.full_like(out, 0.4), atol=1e-5)
+
+
+def test_hard_left_flux_none_preserves_right_dirichlet():
+    # IC / eval path passes q_left=None -> g=0; x=1 stays pinned to t_right.
+    m = _tiny_forcing(t_right_tilde=0.3, hard_left_flux=True, left_flux_scale=0.2)
+    u = torch.randn(1, 1, 16, 20)
+    coords = torch.rand(1, 16, 2)
+    coords[..., 0] = 1.0
+    t = torch.rand(1, 16, 1) * 0.3
+    out = m(u, coords, t, q_left=None)
+    assert torch.allclose(out, torch.full_like(out, 0.3), atol=1e-5)
+
+
+def test_hard_left_flux_collapses_bc_left_to_forcing_independent():
+    # left_flux_scale = 1/(k*sigma): the lifting's -q_L/(k*sigma)*(x-1) term makes
+    # the left-wall residual dT_tilde/dx + q_L/(k*sigma) reduce to raw_x(0), which
+    # does not depend on q_L. Two different q_L over the SAME (x=0, y, t) leaves
+    # must give the same residual.
+    sigma, k = 5.0, 1.0
+    m = _tiny_forcing(hard_left_flux=True, left_flux_scale=1.0 / (k * sigma))
+    u = torch.randn(2, 1, 16, 20)
+    x = torch.zeros(2, 8, 1, requires_grad=True)
+    y = torch.rand(2, 8, 1, requires_grad=True)
+    t = (torch.rand(2, 8, 1) * 0.3).requires_grad_(True)
+    q1 = torch.rand(2, 8, 1)
+    q2 = q1 + 0.5
+    r1 = forcing_neumann_residual(m, u, x, y, t, q_L=q1, sigma=sigma, k=k)
+    r2 = forcing_neumann_residual(m, u, x, y, t, q_L=q2, sigma=sigma, k=k)
+    assert torch.allclose(r1, r2, atol=1e-5)
+
+
+def test_hard_left_flux_double_backward_left_neumann():
+    # The collapsed left residual must remain twice differentiable (grad w.r.t. x
+    # for the Neumann term, then w.r.t. params through the loss).
+    sigma, k = 5.0, 1.0
+    m = _tiny_forcing(hard_left_flux=True, left_flux_scale=1.0 / (k * sigma))
+    u = torch.randn(2, 1, 16, 20)
+    x = torch.zeros(2, 8, 1, requires_grad=True)
+    y = torch.rand(2, 8, 1, requires_grad=True)
+    t = (torch.rand(2, 8, 1) * 0.3).requires_grad_(True)
+    q_L = torch.rand(2, 8, 1)
+    r = forcing_neumann_residual(m, u, x, y, t, q_L=q_L, sigma=sigma, k=k)
+    r.pow(2).mean().backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    assert grads, "no parameter received a gradient"
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
 def test_forcing_double_backward_left_neumann():
     # The left-wall forcing residual dT_tilde/dx + q_L/(k*sigma) must be twice
     # differentiable: grad w.r.t. x (first order) and w.r.t. the model params

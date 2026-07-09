@@ -22,7 +22,7 @@ class _ExactHeat:
     validate the autodiff wiring independent of any learned weights.
     """
 
-    def __call__(self, u, coords, t):
+    def __call__(self, u, coords, t, q_left=None):
         x = coords[..., 0:1]
         y = coords[..., 1:2]
         out = torch.exp(-2.0 * PI * PI * t) * torch.cos(PI * x) * torch.cos(PI * y)
@@ -59,6 +59,36 @@ def test_neumann_zero_on_walls():
     # top y=1
     y1 = torch.ones(1, n, 1, requires_grad=True)
     assert neumann_residual(m, u, x, y1, t, "top").abs().max().item() < 1e-5
+
+
+class _PerSimLinearX:
+    """T(x,y,t) = c_b * x with c_b = mean(u_b), so dT/dx = c_b differs per sim.
+
+    Used to pin that a derivative residual computed from a SHARED (1,N,1)
+    collocation leaf stays per-sim (row b == c_b), not the batch sum sum_b c_b.
+    """
+
+    def __call__(self, u, coords, t, q_left=None):
+        x = coords[..., 0:1]
+        c = u.mean(dim=(1, 2, 3)).reshape(-1, 1, 1)
+        return c * x
+
+
+def test_shared_leaf_derivative_residual_is_per_sim_not_batch_summed():
+    m = _PerSimLinearX()
+    B, n = 3, 5
+    u = torch.randn(B, 1, 8, 8)
+    # Shared (1, n, 1) leaves, exactly as sample_collocation emits them.
+    x0 = torch.zeros(1, n, 1, requires_grad=True)
+    y = torch.rand(1, n, 1, requires_grad=True)
+    t = (torch.rand(1, n, 1) * 0.3).requires_grad_(True)
+    r = neumann_residual(m, u, x0, y, t, "left")  # dT/dx = c_b
+    assert r.shape == (B, n, 1)
+    c = u.mean(dim=(1, 2, 3)).reshape(B, 1, 1)
+    # Per-sim: every point of row b carries c_b (not the batch sum sum_b c_b).
+    assert torch.allclose(r, c.expand(B, n, 1), atol=1e-5)
+    batch_sum = c.sum()
+    assert (r - batch_sum).abs().min().item() > 1e-3  # decisively not the sum
 
 
 def test_neumann_unknown_wall_raises():
@@ -102,7 +132,7 @@ class _LinearLeftFlux:
         # Arbitrary smooth q(y, t) > 0; must match the q_L fed to the residual.
         return 2.0 + y + t
 
-    def __call__(self, u, coords, t):
+    def __call__(self, u, coords, t, q_left=None):
         x = coords[..., 0:1]
         y = coords[..., 1:2]
         out = -(self.q(y, t) / (self.k * self.sigma)) * x

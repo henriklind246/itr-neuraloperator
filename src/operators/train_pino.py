@@ -483,8 +483,11 @@ def pino_losses(
     )
 
     loss_bc_left = u.new_zeros(())
+    loss_bc_hom = u.new_zeros(())
     if compute_bc:
         bc_sq = 0.0
+        hom_sq = 0.0
+        n_hom = 0
         for w in WALLS:
             xw, yw, tw = batch["walls"][w]
             if w == "left" and left_qL is not None:
@@ -498,12 +501,23 @@ def pino_losses(
                 bc_sq = bc_sq + loss_bc_left
             else:
                 nb = neumann_residual(model, u, xw, yw, tw, w)
-                bc_sq = bc_sq + (nb ** 2).mean()
+                wall_sq = (nb ** 2).mean()
+                bc_sq = bc_sq + wall_sq
+                hom_sq = hom_sq + wall_sq
+                n_hom += 1
         loss_bc = bc_sq / len(WALLS)
+        if n_hom > 0:
+            loss_bc_hom = hom_sq / n_hom
     else:
         loss_bc = u.new_zeros(())
 
-    out = {"r": loss_r, "ic": loss_ic, "bc": loss_bc, "bc_left": loss_bc_left}
+    out = {
+        "r": loss_r,
+        "ic": loss_ic,
+        "bc": loss_bc,
+        "bc_left": loss_bc_left,
+        "bc_hom": loss_bc_hom,
+    }
     if res_bins and r is not None:
         if bin_mean is not None and bin_mean.numel() == res_bins:
             out["res_bins"] = bin_mean
@@ -830,6 +844,11 @@ def build_cvit(
     # Decoder time normalization horizon. Default to the data-derived t_final so
     # the temporal Fourier features live on [0, 1]; a config override wins.
     t_norm = float(c.get("t_final", None) if c.get("t_final", None) is not None else t_final)
+    # Hard left-flux lifting (opt-in): converts the inward flux q_L into the
+    # normalized slope it must produce via left_flux_scale = 1/(k*sigma). Only
+    # meaningful for the forcing variant, which carries the q_L signal.
+    hard_lf = bool(c.get("hard_left_flux", False))
+    left_flux_scale = 1.0 / (float(K_SLAB) * (float(sigma) + 1e-8))
     cls = ForcingCViT if variant == "forcing" else CViT
     return cls(
         in_ch=int(c.get("in_ch", 1)),
@@ -851,6 +870,8 @@ def build_cvit(
         hard_right_dirichlet=hard_rd,
         t_right_tilde=t_right_tilde,
         t_final=t_norm,
+        hard_left_flux=hard_lf,
+        left_flux_scale=left_flux_scale,
     )
 
 
@@ -1265,6 +1286,12 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     lam_r = float(pino["lambda_r"])
     lam_ic = float(pino["lambda_ic"])
     lam_bc = float(pino["lambda_bc"])
+    # Optional per-term forcing-wall weight. None (default) keeps the legacy
+    # single bc bucket (left+top+bottom averaged, weighted by lam_bc). When set,
+    # the forcing left wall is pulled out and weighted by lam_bc_left, while the
+    # homogeneous top/bottom walls stay on lam_bc via the bc_hom bucket.
+    lam_bc_left_cfg = pino.get("lambda_bc_left", None)
+    lam_bc_left = None if lam_bc_left_cfg is None else float(lam_bc_left_cfg)
     n_r = int(pino["n_r"])
     n_ic = int(pino["n_ic"])
     n_bc = int(pino["n_bc"])
@@ -1296,7 +1323,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     # signal and must be watchable independently of the homogeneous top/bottom.
     fieldnames = [
         "epoch", "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
-        "w_r", "w_ic", "w_bc",
+        "w_r", "w_ic", "w_bc", "w_bc_left",
         "val_gnrmse", "val_rmse_K",
         "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
     ]
@@ -1308,7 +1335,9 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
         f"img=({ny_img}x{nt_img}) a_ref={a_ref} t_ramp={t_ramp:.4g} "
         f"sampler={sampler} | lambda_r={lam_r} lambda_ic={lam_ic} "
-        f"lambda_bc={lam_bc} | n_r={n_r} n_ic={n_ic} n_bc={n_bc} "
+        f"lambda_bc={lam_bc} lambda_bc_left={lam_bc_left} "
+        f"hard_left_flux={bool(getattr(model, 'hard_left_flux', False))} | "
+        f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} "
         f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} | "
         f"warmup(epochs={warmup_epochs},ic_mult={warmup_ic_mult},"
         f"resample_every={warmup_resample_every})",
@@ -1351,7 +1380,22 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             left_qL=left_qL, sigma=float(sigma), k_slab=K_SLAB,
         )
         w_ic = lam_ic * (warmup_ic_mult if warming else 1.0)
-        loss = lam_r * losses["r"] + w_ic * losses["ic"] + lam_bc * losses["bc"]
+        if lam_bc_left is None:
+            w_bc = lam_bc
+            w_bc_left = lam_bc  # reported effective weight; left sits inside bc
+            loss = lam_r * losses["r"] + w_ic * losses["ic"] + lam_bc * losses["bc"]
+        else:
+            # Split BC: homogeneous top/bottom on lam_bc, forcing left on its own
+            # weight so the forcing residual is not diluted by the 1/len(WALLS)
+            # bucket average.
+            w_bc = lam_bc
+            w_bc_left = lam_bc_left
+            loss = (
+                lam_r * losses["r"]
+                + w_ic * losses["ic"]
+                + lam_bc * losses["bc_hom"]
+                + lam_bc_left * losses["bc_left"]
+            )
         loss.backward()
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
@@ -1364,7 +1408,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             "loss_ic": float(losses["ic"].detach().cpu()),
             "loss_bc": float(losses["bc"].detach().cpu()),
             "loss_bc_left": float(losses["bc_left"].detach().cpu()),
-            "w_r": lam_r, "w_ic": w_ic, "w_bc": lam_bc,
+            "w_r": lam_r, "w_ic": w_ic, "w_bc": w_bc, "w_bc_left": w_bc_left,
             "val_gnrmse": "", "val_rmse_K": "",
             "gnrmse_amp_low": "", "gnrmse_amp_mid": "", "gnrmse_amp_high": "",
         }

@@ -386,10 +386,13 @@ class CViT(nn.Module):
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
+        hard_left_flux: bool = False,
+        left_flux_scale: float = 1.0,
     ):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
         self.hard_right_dirichlet = bool(hard_right_dirichlet)
+        self.hard_left_flux = bool(hard_left_flux)
         self.encoder = CViTEncoder(
             in_ch=in_ch,
             emb_dim=emb_dim,
@@ -426,9 +429,20 @@ class CViT(nn.Module):
         self.register_buffer(
             "t_norm", torch.tensor(float(t_final), dtype=torch.float32)
         )
+        # 1 / (k * sigma): converts an inward left-wall flux q_L into the
+        # normalized-temperature slope dT_tilde/dx it must produce. Only read
+        # when hard_left_flux is on.
+        self.register_buffer(
+            "left_flux_scale",
+            torch.tensor(float(left_flux_scale), dtype=torch.float32),
+        )
 
     def forward(
-        self, u: torch.Tensor, coords: torch.Tensor, t: torch.Tensor
+        self,
+        u: torch.Tensor,
+        coords: torch.Tensor,
+        t: torch.Tensor,
+        q_left: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B = u.shape[0]
         # torch attention does not broadcast batch dims: expand shared dim-1
@@ -439,10 +453,20 @@ class CViT(nn.Module):
             t = t.expand(B, -1, -1)
         tokens = self.encoder(u)
         raw = self.decoder(tokens, coords, t / self.t_norm)
-        if self.hard_right_dirichlet:
-            x = coords[..., 0:1]
-            return self.t_right_tilde + (1.0 - x) * raw
-        return raw
+        if not self.hard_right_dirichlet:
+            return raw
+        x = coords[..., 0:1]
+        if self.hard_left_flux:
+            # T = t_right + g*(x - 1) + (1 - x^2)*raw, with g = -q_L/(k*sigma).
+            # x=1: both added terms vanish, so the right-Dirichlet wall is kept.
+            # x=0: T_x = g + raw_x(0), so the inhomogeneous left-flux condition
+            # T_x(0) = g is met by construction and the bc_left residual collapses
+            # to the forcing-independent raw_x(0). q_left is a detached, coords-
+            # aligned (B, Nq, 1) tensor (None -> g=0, e.g. the t=0 IC where the
+            # ramp gives q_L=0), so autograd sees g only as an x-linear term.
+            g = torch.zeros_like(x) if q_left is None else -q_left * self.left_flux_scale
+            return self.t_right_tilde + g * (x - 1.0) + (1.0 - x * x) * raw
+        return self.t_right_tilde + (1.0 - x) * raw
 
 
 class ForcingCViT(CViT):
@@ -491,6 +515,8 @@ class ForcingCViT(CViT):
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
+        hard_left_flux: bool = False,
+        left_flux_scale: float = 1.0,
     ):
         # grid_size is the (Ny, Nt) forcing-image resolution; every block,
         # including the double-backward-safe explicit-attention encoder and the
@@ -512,4 +538,6 @@ class ForcingCViT(CViT):
             hard_right_dirichlet=hard_right_dirichlet,
             t_right_tilde=t_right_tilde,
             t_final=t_final,
+            hard_left_flux=hard_left_flux,
+            left_flux_scale=left_flux_scale,
         )

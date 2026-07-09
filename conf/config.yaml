@@ -68,6 +68,12 @@ model:
     activation: gelu
     hard_right_dirichlet: true
     hard_right_dirichlet_t_right: 300.0
+    # Opt-in hard left-flux lifting (forcing PINO only). false -> legacy
+    # (1 - x) * raw ansatz. true -> T = t_right + g*(x - 1) + (1 - x^2)*raw with
+    # g = -q_L/(k*sigma), so the inhomogeneous left-wall Neumann flux is met by
+    # construction and the bc_left residual collapses to the forcing-independent
+    # raw_x(0). Detached q_L (autograd only); has no effect without a forcing q_L.
+    hard_left_flux: false
 
   # ---- ForcingCViT (single-slab forcing PINO path) ----
   # Read ONLY by train_pino.run_one_seed_forcing_pino (benchmark=diffusion_forcing).
@@ -170,6 +176,12 @@ training:
     lambda_r: 1.0
     lambda_ic: 1.0
     lambda_bc: 1.0
+    # Per-term forcing-wall weight (forcing PINO only). null (default) keeps the
+    # legacy single bc bucket: mean(left, top, bottom) weighted by lambda_bc, so
+    # the forcing left wall is diluted by 1/len(WALLS). When set, the left wall is
+    # pulled out and weighted by lambda_bc_left while the homogeneous top/bottom
+    # stay on lambda_bc, removing that dilution.
+    lambda_bc_left: null
     n_r: 4096
     n_ic: 1024
     n_bc: 512
