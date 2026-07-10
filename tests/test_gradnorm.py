@@ -148,6 +148,111 @@ def test_state_round_trip_and_term_mismatch_raises():
 
 
 # --------------------------------------------------------------------------- #
+# 1b. Guardrails — clamp/floor bracket the EMA, bound-hit counters, resume     #
+# --------------------------------------------------------------------------- #
+
+
+def _imbalanced_step(gn):
+    """One update on a 100x-imbalanced pair (a: norm 10, small: norm 0.01)."""
+    m = _lin()
+    y = m(torch.ones(1, 1))
+    return gn.maybe_update(
+        {"a": (10.0 * y).sum(), "small": (0.01 * y).sum()}, list(m.parameters())
+    )
+
+
+def test_no_bounds_default_is_exact_noop():
+    """Explicit all-None guardrails reproduce the unbounded multipliers exactly."""
+    plain = _imbalanced_step(GradNormBalancer(["a", "small"], alpha_w=0.3, update_every=1))
+    bounded = _imbalanced_step(
+        GradNormBalancer(
+            ["a", "small"], alpha_w=0.3, update_every=1,
+            w_min=None, w_max=None, floors={},
+        )
+    )
+    assert bounded == plain
+
+
+def test_w_max_caps_tiny_grad_term():
+    """The small-gradient term's target overshoots; ``w_max`` caps the STORED
+    weight (alpha_w=0 -> stored == clamped target) and records one max hit."""
+    gn = GradNormBalancer(
+        ["a", "small"], alpha_w=0.0, update_every=1, w_max=1.5,
+    )
+    mults = _imbalanced_step(gn)
+    assert mults["small"] == pytest.approx(1.5)
+    assert gn.bound_hit_counts["small"]["max"] == 1
+    assert gn.bound_hit_counts["a"]["max"] == 0
+
+
+def test_floor_holds_post_ema_when_prior_below_floor():
+    """A floor must be re-applied AFTER the EMA: a prior weight below the floor
+    blended toward a floored target can still land below it pre-clamp."""
+    gn = GradNormBalancer(
+        ["a", "big"], alpha_w=0.9, update_every=1, floors={"big": 0.25},
+    )
+    gn.multipliers["big"] = 0.0  # simulate a prior weight below the floor
+    m2 = _lin()
+    y = m2(torch.ones(1, 1))
+    # big has grad norm 100 -> tiny raw target, floored to 0.25; EMA with prev=0
+    # gives 0.025, which the POST-EMA floor lifts back to exactly 0.25.
+    mults = gn.maybe_update(
+        {"a": (1.0 * y).sum(), "big": (100.0 * y).sum()}, list(m2.parameters())
+    )
+    assert mults["big"] == pytest.approx(0.25)
+    assert gn.bound_hit_counts["big"]["floor"] == 1
+
+
+def test_floor_above_w_max_raises():
+    with pytest.raises(ValueError, match="floor"):
+        GradNormBalancer(["a"], w_max=1.0, floors={"a": 2.0})
+
+
+def test_w_min_above_w_max_raises():
+    with pytest.raises(ValueError, match="w_min"):
+        GradNormBalancer(["a", "b"], w_min=2.0, w_max=1.0)
+
+
+def test_zero_gradient_term_held_no_bound_hit():
+    """An exactly-zero-gradient term is held (existing rule) and never counted as
+    a bound hit even with guardrails active."""
+    m = _lin()
+    y = m(torch.ones(1, 1))
+    gn = GradNormBalancer(
+        ["a", "zero"], alpha_w=0.0, update_every=1, w_min=0.1, w_max=5.0,
+    )
+    mults = gn.maybe_update(
+        {"a": (10.0 * y).sum(), "zero": (0.0 * y).sum()}, list(m.parameters())
+    )
+    assert mults["zero"] == 1.0  # held at prior
+    assert gn.bound_hit_counts["zero"] == {"min": 0, "max": 0, "floor": 0}
+
+
+def test_stable_term_order_exact_list():
+    gn = GradNormBalancer(["r", "ic", "bc_left", "bc_hom"], update_every=1)
+    assert gn.state_dict()["term_names"] == ["r", "ic", "bc_left", "bc_hom"]
+
+
+def test_multipliers_are_detached_floats():
+    """Returned multipliers must be plain floats -- never tensors that could pull
+    the adaptive weights into the optimization graph."""
+    mults = _imbalanced_step(GradNormBalancer(["a", "small"], update_every=1))
+    assert all(isinstance(v, float) for v in mults.values())
+    assert all(not getattr(v, "requires_grad", False) for v in mults.values())
+
+
+def test_load_state_dict_reclamps_into_new_bounds():
+    """A checkpoint from a bounds-free run is re-clamped on load so newly enabled
+    guardrails cannot be bypassed by a stale multiplier."""
+    src = GradNormBalancer(["a", "b"], update_every=1)
+    src.multipliers = {"a": 10.0, "b": 0.01}
+    gn = GradNormBalancer(["a", "b"], update_every=1, w_min=0.1, w_max=5.0)
+    gn.load_state_dict(src.state_dict())
+    assert gn.multipliers["a"] == pytest.approx(5.0)
+    assert gn.multipliers["b"] == pytest.approx(0.1)
+
+
+# --------------------------------------------------------------------------- #
 # 2. Single compose site — bit-identity                                       #
 # --------------------------------------------------------------------------- #
 

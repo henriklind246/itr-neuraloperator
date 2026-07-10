@@ -11,6 +11,9 @@ params:
   # training.physics.warmup.enabled=true).
   training.physics.causal_weighting.eps: tag(log, interval(0.01, 100.0))
   training.gradnorm.alpha_w: interval(0.5, 0.99)
+  # Upper clamp on the GradNorm multiplier -- caps how far a small-gradient term
+  # (e.g. a noisy bc_left sampled with few points) can be amplified per update.
+  training.gradnorm.w_max: tag(log, interval(2.0, 20.0))
   training.physics.warmup.resample_every: int(interval(50, 100))
   training.physics.warmup.ic_multiplier: interval(2.0, 10.0)
   training.physics.warmup.steps: int(tag(log, interval(50, 2000)))

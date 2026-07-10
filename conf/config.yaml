@@ -324,6 +324,14 @@ training:
     alpha_w: 0.9
     update_every: 10
     eps: 1.0e-8
+    # Optional guardrails (all default to no-ops). w_min / w_max clamp every
+    # multiplier; floor is a per-term MULTIPLIER floor (NOT an effective-weight
+    # floor) so the effective weight of a floored term is >= lambda_term * floor.
+    # Example enabled forcing screen: w_min: 0.1, w_max: 5.0, floor: {bc_left: 0.25}
+    # (with lambda_bc_left=6 the effective left weight stays >= 1.5).
+    w_min: null
+    w_max: null
+    floor: {}
   # Physics-informed FV-residual regularizer. The combined objective is
   #   L = lambda_data * L_data + lambda_physics * L_phys.
   # lambda_physics: 0.0 is a TRUE no-op: train.py must skip building the physics

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -575,23 +576,41 @@ def _curriculum_weights(
     return s * lam_r, lam_ic, s * lam_bc
 
 
-def build_gradnorm(config: dict, lam_r: float, lam_ic: float, lam_bc: float):
+def build_gradnorm(
+    config: dict,
+    lam_r: float | None = None,
+    lam_ic: float | None = None,
+    lam_bc: float | None = None,
+    *,
+    term_weights: dict[str, float] | None = None,
+):
     """GradNormBalancer over the active PINO terms, or None when disabled.
 
     Reuses the FNO path's balancer (inverse gradient-norm multipliers, EMA
-    smoothed). Term set is the base terms with a positive static ``lambda_*`` (an
-    IC-first curriculum may zero ``r``/``bc`` for early epochs, but those terms
-    still come online during the ramp, so they belong in ``term_names``).
+    smoothed). ``term_weights`` gives an explicit ordered term -> static-weight map
+    (its insertion order fixes ``term_names``); the forcing trainer passes the split
+    set ``{r, ic, bc_left, bc_hom}`` so the left forcing wall is isolated from the
+    near-satisfied adiabatic walls. When ``term_weights`` is None the legacy generic
+    set ``{r, ic, bc}`` is used. A term is included when its static weight > 0 (an
+    IC-first curriculum may zero ``r``/``bc`` early, but those still ramp on later,
+    so they belong in ``term_names``). Opt-in ``w_min`` / ``w_max`` / ``floor``
+    guardrails are threaded through from ``config["training"]["gradnorm"]``.
     """
     gn_cfg = config["training"].get("gradnorm", {}) or {}
     if not bool(gn_cfg.get("enabled", False)):
         return None
-    terms = [n for n, w in (("r", lam_r), ("ic", lam_ic), ("bc", lam_bc)) if w > 0.0]
+    if term_weights is None:
+        term_weights = {"r": lam_r, "ic": lam_ic, "bc": lam_bc}
+    terms = [n for n, w in term_weights.items() if w is not None and w > 0.0]
+    floor_cfg = gn_cfg.get("floor", {}) or {}
     return GradNormBalancer(
         terms,
         alpha_w=float(gn_cfg.get("alpha_w", 0.9)),
         update_every=int(gn_cfg.get("update_every", 10)),
         eps=float(gn_cfg.get("eps", 1.0e-8)),
+        w_min=None if gn_cfg.get("w_min") is None else float(gn_cfg["w_min"]),
+        w_max=None if gn_cfg.get("w_max") is None else float(gn_cfg["w_max"]),
+        floors={str(k): float(v) for k, v in dict(floor_cfg).items()},
     )
 
 
@@ -611,6 +630,73 @@ def _term_grad_norms(terms: dict[str, torch.Tensor], params) -> dict[str, float]
             if g is not None:
                 sq = sq + g.detach().pow(2).sum()
         out[name] = float(torch.sqrt(sq))
+    return out
+
+
+def _term_grad_cosines(
+    terms: dict[str, torch.Tensor],
+    params,
+    pairs: list[tuple[str, str]] | None = None,
+    *,
+    tiny: float = 1.0e-12,
+) -> dict[str, float | None]:
+    """Pairwise cosine similarity of raw-loss gradients over ``params``.
+
+    Diagnostic: a near-zero cosine means the terms are mostly a MAGNITUDE problem
+    (GradNorm-friendly); a strongly negative cosine means a DIRECTION conflict that
+    GradNorm alone will not resolve. Dot products and squared norms are accumulated
+    tensorwise (never concatenating one giant vector). A pair maps to ``None`` when
+    either gradient norm < ``tiny`` (e.g. a near-satisfied ``bc_hom``) so the log
+    carries an honest null instead of a NaN or an artificial 0. Uses
+    ``retain_graph=True``; call BEFORE the caller's ``loss.backward()``.
+    """
+    params = [p for p in params if p.requires_grad]
+    grads = {
+        name: torch.autograd.grad(
+            term, params, retain_graph=True, allow_unused=True,
+        )
+        for name, term in terms.items()
+    }
+
+    def _sq(g):
+        s = None
+        for t in g:
+            if t is None:
+                continue
+            c = t.detach().pow(2).sum()
+            s = c if s is None else s + c
+        return s
+
+    def _dot(ga, gb):
+        s = None
+        for a, b in zip(ga, gb):
+            if a is None or b is None:
+                continue
+            c = (a.detach() * b.detach()).sum()
+            s = c if s is None else s + c
+        return s
+
+    if pairs is None:
+        keys = list(terms.keys())
+        pairs = [
+            (keys[i], keys[j])
+            for i in range(len(keys))
+            for j in range(i + 1, len(keys))
+        ]
+    sq_norms = {name: _sq(g) for name, g in grads.items()}
+    out: dict[str, float | None] = {}
+    for a, b in pairs:
+        key = f"{a}|{b}"
+        sa, sb = sq_norms.get(a), sq_norms.get(b)
+        if sa is None or sb is None:
+            out[key] = None
+            continue
+        na, nb = float(torch.sqrt(sa)), float(torch.sqrt(sb))
+        if na < tiny or nb < tiny:
+            out[key] = None
+            continue
+        d = _dot(grads[a], grads[b])
+        out[key] = None if d is None else float(d) / (na * nb)
     return out
 
 
@@ -1393,6 +1479,23 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     # Fixed uniform 300 K IC in normalized space (mu ~ 300 -> ~0).
     t_right_tilde_ic = (T_RIGHT - mu) / (sigma + 1e-8)
 
+    # GradNorm balances the RAW per-term gradient magnitudes so the forcing
+    # left-wall residual is not swamped by the interior PDE gradient (SOAP only
+    # sees the combined gradient). The term set matches the loss composition: the
+    # split {r, ic, bc_left, bc_hom} isolates the forcing wall from the
+    # near-satisfied adiabatic walls; the legacy single-bucket set is {r, ic, bc}.
+    # None (disabled) is an exact no-op (multipliers == 1). Guardrails come from
+    # config["training"]["gradnorm"] (w_min / w_max / floor).
+    if lam_bc_left is None:
+        gn_term_weights = {"r": lam_r, "ic": lam_ic, "bc": lam_bc}
+        gn_cos_pairs = None
+    else:
+        gn_term_weights = {
+            "r": lam_r, "ic": lam_ic, "bc_left": lam_bc_left, "bc_hom": lam_bc,
+        }
+        gn_cos_pairs = [("r", "bc_left"), ("ic", "bc_left"), ("bc_hom", "bc_left")]
+    gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
+
     # Warm-up (5b): hold the forcing batch + collocation fixed and upweight the IC
     # anchor for the first ``warmup.epochs`` steps so the fixed T=300 solution is
     # learned before the PDE/BC residuals dominate. Run-0 defaults are inert.
@@ -1414,12 +1517,24 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     metrics_path = run_dir / "train_metrics.csv"
     # loss_bc_left is logged as its OWN column: the left wall is the forcing
     # signal and must be watchable independently of the homogeneous top/bottom.
+    # GradNorm diagnostics keep the existing w_* columns at their STATIC meaning
+    # and add explicit new columns for the split term set {r, ic, bc_left, bc_hom}:
+    # gn_mult_* (multiplier), w_eff_* (static x multiplier == what SOAP sees),
+    # grad_norm_* (raw per-term gradient norm) and grad_norm_eff_* (effective).
+    # These + JSON supplements are populated on validation epochs only.
+    gn_cols = ["r", "ic", "bc_left", "bc_hom"]
     fieldnames = [
         "epoch", "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
         "loss_data",
         "w_r", "w_ic", "w_bc", "w_bc_left", "w_data",
         "val_gnrmse", "val_rmse_K",
         "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
+        *[f"gn_mult_{c}" for c in gn_cols],
+        *[f"w_eff_{c}" for c in gn_cols],
+        *[f"grad_norm_{c}" for c in gn_cols],
+        *[f"grad_norm_eff_{c}" for c in gn_cols],
+        "gradnorm_mean_mult", "gradnorm_ms",
+        "gradnorm_weights", "grad_cosines", "gradnorm_bound_hits",
     ]
     with open(metrics_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
@@ -1446,6 +1561,9 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     for epoch in range(epochs):
         model.train()
         warming = epoch < warmup_epochs
+        # Computed up front: the cosine diagnostic runs on the training step that
+        # coincides with a validation epoch, before backward.
+        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
         re = warmup_resample_every if warming else 1
         # Online resampling: fresh forcing batch + fresh collocation. During
         # warm-up they are held for ``re`` steps to let the IC anchor settle.
@@ -1475,22 +1593,51 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             left_qL=left_qL, sigma=float(sigma), k_slab=K_SLAB,
         )
         w_ic = lam_ic * (warmup_ic_mult if warming else 1.0)
+        # Static per-term weights ``sw`` (name -> lambda). Dict order preserves the
+        # ORIGINAL left-to-right summation so the disabled path (gn_mults empty,
+        # multiplier == 1.0) reproduces the previous ``loss`` exactly.
         if lam_bc_left is None:
             w_bc = lam_bc
             w_bc_left = lam_bc  # reported effective weight; left sits inside bc
-            loss = lam_r * losses["r"] + w_ic * losses["ic"] + lam_bc * losses["bc"]
+            sw = {"r": lam_r, "ic": w_ic, "bc": lam_bc}
         else:
             # Split BC: homogeneous top/bottom on lam_bc, forcing left on its own
             # weight so the forcing residual is not diluted by the 1/len(WALLS)
             # bucket average.
             w_bc = lam_bc
             w_bc_left = lam_bc_left
-            loss = (
-                lam_r * losses["r"]
-                + w_ic * losses["ic"]
-                + lam_bc * losses["bc_hom"]
-                + lam_bc_left * losses["bc_left"]
+            sw = {"r": lam_r, "ic": w_ic, "bc_hom": lam_bc, "bc_left": lam_bc_left}
+
+        # GradNorm rebalances the RAW per-term gradient magnitudes BEFORE backward
+        # (one extra autograd.grad per active term every ``update_every`` steps).
+        # ``w_eff[k] = sw[k] * m_k`` -- static lambda priorities are preserved; the
+        # multiplier equalizes the raw magnitudes SOAP sees. Disabled -> m_k == 1.
+        gn_mults: dict[str, float] = {}
+        gradnorm_ms: float | str = ""
+        if gradnorm is not None:
+            active = {k: losses[k] for k in gradnorm.term_names if k in losses}
+            gn_params = [p for p in model.parameters() if p.requires_grad]
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            gn_mults = gradnorm.maybe_update(active, gn_params, dist_info=None)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            gradnorm_ms = (time.perf_counter() - _t0) * 1000.0
+        # Cosine diagnostic on the decoder subset, only on the training step that
+        # coincides with a validation epoch, on the LIVE graph before backward.
+        grad_cosines: dict[str, float | None] | None = None
+        if do_val and gradnorm is not None:
+            grad_cosines = _term_grad_cosines(
+                {k: losses[k] for k in sw}, model.decoder.parameters(),
+                pairs=gn_cos_pairs,
             )
+        w_eff = {k: sw[k] * float(gn_mults.get(k, 1.0)) for k in sw}
+        loss = None
+        for k, wk in w_eff.items():
+            term = wk * losses[k]
+            loss = term if loss is None else loss + term
+
         loss_data = None
         if lam_data > 0.0:
             loss_data = forcing_data_loss(
@@ -1533,7 +1680,6 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             flush=True,
         )
 
-        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
         if do_val:
             model.eval()
             val = validate_forcing_gnrmse(
@@ -1544,6 +1690,27 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             row["val_rmse_K"] = val["val_rmse_K"]
             for c in ("gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high"):
                 row[c] = val.get(c, "")
+            if gradnorm is not None:
+                # GradNorm diagnostics logged on val epochs only. Raw per-term norms
+                # come from the balancer's most-recent-update snapshot (fresh within
+                # ``update_every``); effective = w_eff * raw is what SOAP sees.
+                raw_norms = gradnorm.last_raw_norms
+                for k in sw:
+                    m = float(gn_mults.get(k, 1.0))
+                    row[f"gn_mult_{k}"] = m
+                    row[f"w_eff_{k}"] = w_eff[k]
+                    g_raw = raw_norms.get(k)
+                    if g_raw is not None:
+                        row[f"grad_norm_{k}"] = g_raw
+                        row[f"grad_norm_eff_{k}"] = w_eff[k] * g_raw
+                row["gradnorm_mean_mult"] = gradnorm.last_mean_multiplier
+                row["gradnorm_ms"] = gradnorm_ms
+                row["gradnorm_weights"] = json.dumps(
+                    {k: float(v) for k, v in gn_mults.items()}
+                )
+                row["gradnorm_bound_hits"] = json.dumps(gradnorm.bound_hit_counts)
+                if grad_cosines is not None:
+                    row["grad_cosines"] = json.dumps(grad_cosines)
             is_best = val["val_gnrmse"] < best_val
             if is_best:
                 best_val = val["val_gnrmse"]
@@ -1552,6 +1719,9 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
                         "model_state": model.state_dict(),
                         "mu_global": mu, "sigma_global": sigma,
                         "config": config, "epoch": epoch, "best_val": best_val,
+                        "gradnorm_state": (
+                            gradnorm.state_dict() if gradnorm is not None else None
+                        ),
                         "forcing_image": {
                             "ny_img": ny_img, "nt_img": nt_img,
                             "a_ref": a_ref, "t_ramp": t_ramp,

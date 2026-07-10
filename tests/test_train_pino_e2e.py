@@ -25,7 +25,9 @@ from src.operators.train_pino import (
     _causal_weights,
     _curriculum_weights,
     _ic_loss,
+    run_one_seed_forcing_pino,
     run_one_seed_pino,
+    sample_forcing_params,
 )
 
 
@@ -501,3 +503,172 @@ def test_e2e_ic_loss_rel_runs_and_reports_bands(tmp_path):
         for row in prt:
             for _, v in row.items():
                 assert math.isfinite(float(v))
+
+
+# --------- forcing PINO trainer: split-BC GradNorm ---------
+
+def _write_synthetic_forcing(tmp_path, num_sims=8, Nt=6, Nx=10, Ny=16):
+    # ForcingCViT trains physics-only on ONLINE-sampled forcing; the saved FV
+    # trajectories + sim_params are VALIDATION-only (deviation-field gnRMSE).
+    rng = np.random.default_rng(0)
+    traj = (300.0 + 5.0 * rng.standard_normal((num_sims, Nt, Nx, Ny))).astype(
+        np.float32
+    )
+    x_grid = np.linspace(0.0, 1.0, Nx).astype(np.float32)
+    y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
+    t_grid = np.linspace(0.0, 0.3, Nt).astype(np.float32)
+    # sim_params.npy MUST live beside trajectories.npy (the trainer loads it there).
+    records = sample_forcing_params(rng, num_sims, dt=0.3 / (Nt - 1), t_final=0.3)
+    sim_params = np.array(records, dtype=object)
+    np.save(tmp_path / "trajectories.npy", traj)
+    np.save(tmp_path / "x_grid.npy", x_grid)
+    np.save(tmp_path / "y_grid.npy", y_grid)
+    np.save(tmp_path / "t_grid.npy", t_grid)
+    np.save(tmp_path / "sim_params.npy", sim_params)
+    return traj
+
+
+def _forcing_config(tmp_path):
+    # Forcing image grid = (ny_img=Ny=16, nt_img=20); patch_size=4 divides both.
+    return {
+        "benchmark": {"name": "diffusion_forcing"},
+        "data": {
+            "trajectories.npy": str(tmp_path / "trajectories.npy"),
+            "x_grid_path": str(tmp_path / "x_grid.npy"),
+            "y_grid_path": str(tmp_path / "y_grid.npy"),
+            "t_grid_path": str(tmp_path / "t_grid.npy"),
+        },
+        "model": {
+            "cvit": {
+                "in_ch": 1,
+                "out_dim": 1,
+                "emb_dim": 32,
+                "dec_emb_dim": None,
+                "patch_size": 4,
+                "depth_enc": 1,
+                "depth_dec": 1,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+                "fourier_freq": 1.0,
+                "activation": "gelu",
+                "hard_right_dirichlet": True,
+                "hard_right_dirichlet_t_right": 300.0,
+                "hard_left_flux": True,
+            }
+        },
+        "training": {
+            "device": "cpu",
+            "epochs": 2,
+            "validate_every": 1,
+            "learning_rate": 0.001,
+            "weight_decay": 1e-5,
+            "optimizer": "SOAP",
+            "soap": {
+                "betas": [0.95, 0.95],
+                "shampoo_beta": 0.95,
+                "eps": 1.0e-8,
+                "precondition_frequency": 3,
+                "max_precond_dim": 10000,
+                "merge_dims": False,
+                "precondition_1d": False,
+            },
+            "scheduler": {"type": "StepLR", "step_size": 1, "gamma": 0.9},
+            "pino": {
+                "lambda_r": 1.0,
+                "lambda_ic": 1.0,
+                "lambda_bc": 1.0,
+                "lambda_bc_left": 6.0,
+                "n_r": 64,
+                "n_ic": 32,
+                "n_bc": 16,
+                "sim_batch": 4,
+                "alpha": 1.0,
+                "forcing": {"nt_img": 20, "ramp_seconds": 0.003},
+            },
+        },
+    }
+
+
+def test_e2e_forcing_gradnorm_enabled(tmp_path):
+    _write_synthetic_forcing(tmp_path)
+    cfg = _forcing_config(tmp_path)
+    cfg["training"]["gradnorm"] = {
+        "enabled": True, "alpha_w": 0.5, "update_every": 1, "eps": 1e-8,
+        "w_min": 0.1, "w_max": 5.0, "floor": {"bc_left": 0.25},
+    }
+    run_dir = tmp_path / "run_forcing_gn"
+
+    run_one_seed_forcing_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+
+    gn_cols = ["r", "ic", "bc_left", "bc_hom"]
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left"):
+            assert math.isfinite(float(r[col]))
+        # Static weight columns keep their STATIC meaning (not the multiplier).
+        assert float(r["w_r"]) == 1.0
+        assert float(r["w_bc_left"]) == 6.0
+        # validate_every=1 -> GradNorm diagnostics on every epoch.
+        for c in gn_cols:
+            assert math.isfinite(float(r[f"gn_mult_{c}"]))
+            assert float(r[f"gn_mult_{c}"]) > 0.0
+            assert math.isfinite(float(r[f"w_eff_{c}"]))
+        # Raw / effective grad norms populated for the terms that carry gradient
+        # (a held near-zero term logs empty, not NaN -- allowed here).
+        for c in gn_cols:
+            for stem in (f"grad_norm_{c}", f"grad_norm_eff_{c}"):
+                if r[stem] not in ("", None):
+                    assert math.isfinite(float(r[stem]))
+        assert r["grad_norm_r"] not in ("", None)
+        assert r["grad_norm_bc_left"] not in ("", None)
+        # Effective left weight respects the multiplier floor: w_eff_bc_left =
+        # lambda_bc_left * m_bc_left >= 6.0 * 0.25 = 1.5.
+        assert float(r["w_eff_bc_left"]) >= 6.0 * 0.25 - 1e-6
+        # JSON supplements parse and carry the split term set.
+        weights = json.loads(r["gradnorm_weights"])
+        assert set(weights) == {"r", "ic", "bc_left", "bc_hom"}
+        cos = json.loads(r["grad_cosines"])
+        assert set(cos) == {"r|bc_left", "ic|bc_left", "bc_hom|bc_left"}
+        for v in cos.values():
+            assert v is None or math.isfinite(float(v))
+        hits = json.loads(r["gradnorm_bound_hits"])
+        assert set(hits) == {"r", "ic", "bc_left", "bc_hom"}
+
+    # GradNorm state persists the EXACT ordered split term set.
+    ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
+    gn = ckpt.get("gradnorm_state")
+    assert gn is not None
+    assert gn["term_names"] == ["r", "ic", "bc_left", "bc_hom"]
+    assert set(gn["multipliers"]) == {"r", "ic", "bc_left", "bc_hom"}
+    for v in gn["multipliers"].values():
+        assert math.isfinite(float(v)) and float(v) > 0.0
+        # Restored multipliers sit inside the enabled clamp [0.1, 5.0].
+        assert 0.1 - 1e-6 <= float(v) <= 5.0 + 1e-6
+
+
+def test_e2e_forcing_gradnorm_disabled_is_noop(tmp_path):
+    _write_synthetic_forcing(tmp_path)
+    cfg = _forcing_config(tmp_path)
+    run_dir = tmp_path / "run_forcing_nogn"
+
+    run_one_seed_forcing_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left"):
+            assert math.isfinite(float(r[col]))
+        # Static weights unchanged; GradNorm columns stay empty when disabled.
+        assert float(r["w_r"]) == 1.0
+        assert float(r["w_ic"]) == 1.0
+        assert float(r["w_bc"]) == 1.0
+        assert float(r["w_bc_left"]) == 6.0
+        for c in ("r", "ic", "bc_left", "bc_hom"):
+            assert r[f"gn_mult_{c}"] in ("", None)
+            assert r[f"w_eff_{c}"] in ("", None)
+        assert r["gradnorm_weights"] in ("", None)
+        assert r["grad_cosines"] in ("", None)
+
+    ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
+    assert ckpt.get("gradnorm_state") is None

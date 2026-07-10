@@ -1079,16 +1079,75 @@ class GradNormBalancer:
     ``mean(g)`` is over VALID terms only; held terms keep their prior multiplier.
     Valid multipliers are renormalized so their mean is ~1 (the bare
     ``mean(g)/g_t`` does not guarantee this), keeping the overall loss scale stable.
+
+    Optional guardrails (``w_min`` / ``w_max`` / per-term ``floors``; all default to
+    no-ops) bracket the EMA: the mean-normalized target is floored/clamped, then the
+    EMA-blended stored weight is floored/clamped again (a clamp applied only before
+    the EMA can be re-violated by the blend). No renormalization runs after the final
+    clamp -- so the stored mean can drift from 1 when a bound bites; that mean is
+    exposed as ``last_mean_multiplier``. Running ``bound_hit_counts`` and the
+    ``last_*`` diagnostic snapshots are non-persistent (reset on resume).
     """
 
-    def __init__(self, term_names, *, alpha_w=0.9, update_every=10, eps=1.0e-8):
+    def __init__(
+        self, term_names, *, alpha_w=0.9, update_every=10, eps=1.0e-8,
+        w_min=None, w_max=None, floors=None,
+    ):
         self.term_names = list(term_names)
         self.alpha_w = float(alpha_w)
         self.update_every = max(1, int(update_every))
         self.eps = float(eps)
+        self.w_min = None if w_min is None else float(w_min)
+        self.w_max = None if w_max is None else float(w_max)
+        self.floors = {str(k): float(v) for k, v in dict(floors or {}).items()}
+        if (
+            self.w_min is not None and self.w_max is not None
+            and self.w_min > self.w_max
+        ):
+            raise ValueError(
+                f"GradNormBalancer w_min ({self.w_min}) > w_max ({self.w_max})."
+            )
+        for name, fl in self.floors.items():
+            if fl < 0.0:
+                raise ValueError(
+                    f"GradNormBalancer floor[{name}]={fl} must be >= 0."
+                )
+            if self.w_max is not None and fl > self.w_max:
+                raise ValueError(
+                    f"GradNormBalancer floor[{name}]={fl} > w_max ({self.w_max})."
+                )
         self.multipliers = {name: 1.0 for name in self.term_names}
         self._step = 0
         self._nonfinite_count = 0
+        # Running (non-persistent) diagnostics; reset on resume (NOT in state_dict).
+        self.bound_hit_counts = {
+            name: {"min": 0, "max": 0, "floor": 0} for name in self.term_names
+        }
+        self.last_raw_norms: dict = {}
+        self.last_target_multipliers: dict = {}
+        self.last_multipliers: dict = {}
+        self.last_mean_multiplier: float = 1.0
+
+    def _apply_bounds(self, name, v):
+        """Apply per-term floor then global [w_min, w_max] clamp (each opt-in)."""
+        fl = self.floors.get(name)
+        if fl is not None:
+            v = max(v, fl)
+        if self.w_min is not None:
+            v = max(v, self.w_min)
+        if self.w_max is not None:
+            v = min(v, self.w_max)
+        return v
+
+    def _count_bound_hit(self, name, final_v):
+        """Count once per term per update if the FINAL stored value sits at a bound."""
+        fl = self.floors.get(name)
+        if fl is not None and fl > 0.0 and final_v == fl:
+            self.bound_hit_counts[name]["floor"] += 1
+        elif self.w_max is not None and final_v == self.w_max:
+            self.bound_hit_counts[name]["max"] += 1
+        elif self.w_min is not None and final_v == self.w_min:
+            self.bound_hit_counts[name]["min"] += 1
 
     def multipliers_for(self, names) -> dict:
         return {name: float(self.multipliers.get(name, 1.0)) for name in names}
@@ -1139,10 +1198,13 @@ class GradNormBalancer:
         norms = sq_norms.sqrt().cpu().numpy()
         hi = 1.0 / self.eps
         valid, clamped = [], {}
+        self.last_raw_norms = {}
         for i, name in enumerate(names):
             g = float(norms[i])
             if held[i]:
+                self.last_raw_norms[name] = None  # disconnected -> no measured norm
                 continue
+            self.last_raw_norms[name] = g
             if not np.isfinite(g):
                 self._nonfinite_count += 1  # hold
                 continue
@@ -1152,18 +1214,30 @@ class GradNormBalancer:
             valid.append(name)
 
         if not valid:
+            self.last_target_multipliers = {}
+            self.last_multipliers = self.multipliers_for(names)
             return self.multipliers_for(names)
         mean_g = float(np.mean([clamped[n] for n in valid]))
         target = {n: mean_g / clamped[n] for n in valid}
-        # Renormalize valid multipliers so their mean is ~1 (scale stability).
+        # Renormalize valid multipliers so their mean is ~1 (scale stability),
+        # THEN clamp/floor the TARGET so the guardrails bracket the EMA (a clamp
+        # applied only before the EMA can be re-violated by the EMA blend).
         mean_t = float(np.mean([target[n] for n in valid]))
         if mean_t > 0.0:
             target = {n: v / mean_t for n, v in target.items()}
+        target = {n: self._apply_bounds(n, v) for n, v in target.items()}
+        self.last_target_multipliers = dict(target)
         for name in valid:
             prev = float(self.multipliers.get(name, 1.0))
-            self.multipliers[name] = (
-                self.alpha_w * prev + (1.0 - self.alpha_w) * target[name]
-            )
+            blended = self.alpha_w * prev + (1.0 - self.alpha_w) * target[name]
+            # Clamp/floor the STORED weight again (do NOT renormalize afterwards:
+            # renormalizing could re-violate the bounds).
+            final_v = self._apply_bounds(name, blended)
+            self.multipliers[name] = final_v
+            self._count_bound_hit(name, final_v)
+        stored_vals = [float(self.multipliers[n]) for n in valid]
+        self.last_mean_multiplier = float(np.mean(stored_vals)) if stored_vals else 1.0
+        self.last_multipliers = self.multipliers_for(names)
         return self.multipliers_for(names)
 
     def state_dict(self) -> dict:
@@ -1182,8 +1256,11 @@ class GradNormBalancer:
                 "(hard-BC / IC / data / benchmark). Refusing to reassign "
                 "multipliers to the wrong objective."
             )
+        # Re-apply floor+clamp so a checkpoint from a bounds-free run cannot
+        # reintroduce out-of-bounds weights under newly enabled guardrails.
         self.multipliers = {
-            k: float(v) for k, v in dict(state["multipliers"]).items()
+            k: self._apply_bounds(k, float(v))
+            for k, v in dict(state["multipliers"]).items()
         }
         self._step = int(state["_step"])
 
