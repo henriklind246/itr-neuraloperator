@@ -1,0 +1,10 @@
+# @package search_space
+params:
+  # Static collocation-biasing fractions for the forcing PINO path. Each is
+  # bounded to [0.0, 0.45] so ANY sampled pair satisfies the wall_frac +
+  # lead_frac <= 1 guard (0.45 + 0.45 = 0.9 < 1). Runs must also set
+  # training.pino.collocation_bias.enabled=true. The primary experiment is the
+  # explicit baseline/wall-only/lead-only/combined factorial, not continuous
+  # search; this file exists for optional Optuna exploration around it.
+  training.pino.collocation_bias.wall_frac: interval(0.0, 0.45)
+  training.pino.collocation_bias.lead_frac: interval(0.0, 0.45)

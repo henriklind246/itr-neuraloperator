@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,114 @@ def _lhs_leaf(col: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return (col.reshape(1, -1, 1) * scale).detach().requires_grad_(True)
 
 
+def _collocation_bias_counts(
+    n_r: int, wall_frac: float, lead_frac: float
+) -> tuple[int, int, int]:
+    """Interior sub-population sizes (n_wall, n_lead, n_full) summing to n_r.
+
+    ``n_full`` absorbs the integer-rounding remainder so the total is exactly
+    ``n_r`` (count-preserving). Pure integer arithmetic; tested in isolation.
+    """
+    n_wall = int(wall_frac * n_r)
+    n_lead = int(lead_frac * n_r)
+    n_full = n_r - n_wall - n_lead
+    return n_wall, n_lead, n_full
+
+
+def _validate_collocation_bias(bias: dict) -> tuple[float, float, float, float]:
+    """Validate the collocation-bias spec and return (wall_frac, wall_x_cut,
+    lead_frac, lead_t_lo). Raises ``ValueError`` on any out-of-range / non-finite
+    value; the ``wall_frac + lead_frac <= 1`` guard prevents a negative n_full.
+    """
+    wall_frac = float(bias.get("wall_frac", 0.0))
+    wall_x_cut = float(bias.get("wall_x_cut", 0.333))
+    lead_frac = float(bias.get("lead_frac", 0.0))
+    lead_t_lo = float(bias.get("lead_t_lo", 0.5))
+    for name, v in (
+        ("wall_frac", wall_frac), ("lead_frac", lead_frac),
+        ("wall_x_cut", wall_x_cut), ("lead_t_lo", lead_t_lo),
+    ):
+        if not math.isfinite(v):
+            raise ValueError(f"collocation_bias.{name} must be finite, got {v}")
+    if not 0.0 <= wall_frac <= 1.0:
+        raise ValueError(f"collocation_bias.wall_frac must be in [0,1], got {wall_frac}")
+    if not 0.0 <= lead_frac <= 1.0:
+        raise ValueError(f"collocation_bias.lead_frac must be in [0,1], got {lead_frac}")
+    if wall_frac + lead_frac > 1.0:
+        raise ValueError(
+            "collocation_bias.wall_frac + lead_frac must be <= 1, got "
+            f"{wall_frac} + {lead_frac}"
+        )
+    if not 0.0 < wall_x_cut <= 1.0:
+        raise ValueError(f"collocation_bias.wall_x_cut must be in (0,1], got {wall_x_cut}")
+    if not 0.0 <= lead_t_lo < 1.0:
+        raise ValueError(f"collocation_bias.lead_t_lo must be in [0,1), got {lead_t_lo}")
+    return wall_frac, wall_x_cut, lead_frac, lead_t_lo
+
+
+def _resolve_collocation_bias(pino_cfg: dict) -> dict | None:
+    """Build the validated collocation-bias spec from the ``training.pino`` config,
+    or ``None`` when disabled. Returns ``None`` unless ``collocation_bias.enabled``
+    is truthy AND at least one of ``wall_frac`` / ``lead_frac`` is > 0 (so the
+    default and the enabled-but-zero cases both keep the legacy RNG-identical
+    draw). Validates eagerly, so a bad enabled spec raises before training.
+    """
+    bias_cfg = pino_cfg.get("collocation_bias", {}) or {}
+    if not bias_cfg.get("enabled"):
+        return None
+    wall_frac = float(bias_cfg.get("wall_frac", 0.0))
+    lead_frac = float(bias_cfg.get("lead_frac", 0.0))
+    if wall_frac <= 0.0 and lead_frac <= 0.0:
+        return None
+    coll_bias = {
+        "wall_frac": wall_frac,
+        "wall_x_cut": float(bias_cfg.get("wall_x_cut", 0.333)),
+        "lead_frac": lead_frac,
+        "lead_t_lo": float(bias_cfg.get("lead_t_lo", 0.5)),
+    }
+    _validate_collocation_bias(coll_bias)
+    return coll_bias
+
+
+def _biased_interior(
+    n_r: int, t_final: float, device, generator, lhs: bool, bias: dict
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Interior x/y/t leaves with a wall/lead/full mixture (static collocation
+    biasing). Each subgroup is drawn WITHOUT gradient (``_lhs_unit`` or
+    ``torch.rand``); the biased axis is rescaled into its band; the three groups
+    are concatenated (order wall->lead->full) and ONLY THEN made leaves via a
+    single ``requires_grad_`` per axis. Subgroup-wise LHS (each group stratified
+    in its own cube), not one global Latin hypercube.
+    """
+    wall_frac, wall_x_cut, lead_frac, lead_t_lo = _validate_collocation_bias(bias)
+    n_wall, n_lead, n_full = _collocation_bias_counts(n_r, wall_frac, lead_frac)
+    lead_lo = lead_t_lo * t_final
+    lead_span = t_final - lead_lo
+
+    def _draw(n: int, dim: int) -> torch.Tensor:
+        if n == 0:
+            return torch.empty((n, dim), device=device)
+        if lhs:
+            return _lhs_unit(n, dim, device, generator)
+        return torch.rand((n, dim), device=device, generator=generator)
+
+    xs, ys, ts = [], [], []
+    # wall group: x in [0, wall_x_cut]; y, t full range.
+    wall = _draw(n_wall, 3)
+    xs.append(wall[:, 0] * wall_x_cut); ys.append(wall[:, 1]); ts.append(wall[:, 2] * t_final)
+    # lead group: t in [lead_lo, t_final]; x, y full range.
+    lead = _draw(n_lead, 3)
+    xs.append(lead[:, 0]); ys.append(lead[:, 1]); ts.append(lead_lo + lead[:, 2] * lead_span)
+    # full group: legacy full cube.
+    full = _draw(n_full, 3)
+    xs.append(full[:, 0]); ys.append(full[:, 1]); ts.append(full[:, 2] * t_final)
+
+    x_r = torch.cat(xs).reshape(1, n_r, 1).requires_grad_(True)
+    y_r = torch.cat(ys).reshape(1, n_r, 1).requires_grad_(True)
+    t_r = torch.cat(ts).reshape(1, n_r, 1).requires_grad_(True)
+    return x_r, y_r, t_r
+
+
 def sample_collocation(
     n_r: int,
     n_ic: int,
@@ -94,6 +203,7 @@ def sample_collocation(
     generator: torch.Generator | None = None,
     dense_ic: bool = False,
     sampler: str = "uniform",
+    bias: dict | None = None,
 ) -> dict[str, Any]:
     """Free space-time collocation for one training step (shared across sims).
 
@@ -108,12 +218,26 @@ def sample_collocation(
     (``Nx*Ny`` points, no RNG draw): the constant field is the physics attractor
     for this benchmark, so a dense per-sim IC anchor is the primary stabilizer.
     The default (``False``) keeps the legacy random-node draw byte-identical.
+
+    ``bias`` (optional) applies static, diagnostic-informed nonuniform biasing to
+    the ``n_r`` interior points only (an implicit residual reweighting; total
+    count preserved). When ``None`` — or when both ``wall_frac`` and ``lead_frac``
+    are <= 0 — the legacy interior draw runs untouched (RNG-identical). IC/wall
+    blocks are never biased.
     """
     lhs = sampler == "lhs"
 
+    _wf = float(bias.get("wall_frac", 0.0)) if bias is not None else 0.0
+    _lf = float(bias.get("lead_frac", 0.0)) if bias is not None else 0.0
+    _biased = bias is not None and (_wf > 0.0 or _lf > 0.0)
+
     # interior: x, y ~ U(0,1); t ~ U(0, t_final). LHS stratifies the (x, y, t)
     # cube jointly for broader per-iteration coverage.
-    if lhs:
+    if _biased:
+        x_r, y_r, t_r = _biased_interior(
+            n_r, t_final, device, generator, lhs, bias
+        )
+    elif lhs:
         cube = _lhs_unit(n_r, 3, device, generator)
         x_r = _lhs_leaf(cube[:, 0])
         y_r = _lhs_leaf(cube[:, 1])
@@ -1449,6 +1573,12 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     )
     sampler = str(fcfg.get("collocation") or "lhs")
 
+    # Static, diagnostic-informed collocation biasing (implicit residual
+    # reweighting of the interior points). Disabled by default -> coll_bias is
+    # None, so sample_collocation runs the legacy RNG-identical interior draw.
+    # The helper validates eagerly (raises before the training loop).
+    coll_bias = _resolve_collocation_bias(pino)
+
     model = build_cvit(
         config, mu, sigma, grid_size=(ny_img, nt_img), t_final=t_final,
         variant="forcing",
@@ -1543,7 +1673,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         f"[pino-forcing] seed={seed} device={device} epochs={epochs} "
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
         f"img=({ny_img}x{nt_img}) a_ref={a_ref} t_ramp={t_ramp:.4g} "
-        f"sampler={sampler} | lambda_r={lam_r} lambda_ic={lam_ic} "
+        f"sampler={sampler} coll_bias={coll_bias} | lambda_r={lam_r} lambda_ic={lam_ic} "
         f"lambda_bc={lam_bc} lambda_bc_left={lam_bc_left} "
         f"lambda_data={lam_data} (n_data_sims={n_data_sims},n_data_pts={n_data_pts}) "
         f"hard_left_flux={bool(getattr(model, 'hard_left_flux', False))} | "
@@ -1574,7 +1704,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             )
             coll = sample_collocation(
                 n_r, n_ic, n_bc, t_final, x_grid_t, y_grid_t, device, gen,
-                sampler=sampler,
+                sampler=sampler, bias=coll_bias,
             )
 
         u = build_forcing_image(params_batch, y_img, t_img, a_ref, device, t_ramp)

@@ -268,6 +268,20 @@ training:
       enabled: false
       n_bins: 16
       eps_causal: 1.0
+    # Static, diagnostic-informed nonuniform collocation biasing of the interior
+    # points (benchmark=diffusion_forcing path only). Because the loss averages
+    # mean(r^2) with no inverse-density correction, biasing the sampling
+    # distribution implicitly reweights the residual toward the near-wall (#1) and
+    # late-time (#2) regions the forcing diagnostics localized. It is NOT adaptive
+    # sampling: the distribution is fixed for the whole run, and the total point
+    # count n_r is preserved. enabled: false is a TRUE no-op (RNG-identical to the
+    # legacy uniform/LHS interior draw). Requires wall_frac + lead_frac <= 1.
+    collocation_bias:
+      enabled: false
+      wall_frac: 0.0      # fraction of n_r with x in [0, wall_x_cut]                (#1)
+      wall_x_cut: 0.333
+      lead_frac: 0.0      # fraction of n_r with t in [lead_t_lo*t_final, t_final]   (#2)
+      lead_t_lo: 0.5
     # ---- Forcing PINO path (benchmark=diffusion_forcing) ----
     # Read ONLY by train_pino.run_one_seed_forcing_pino; inert for the diffusion
     # collocation path. The encoder input is the left-wall forcing space-time
