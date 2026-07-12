@@ -569,6 +569,8 @@ def _resolve_rigno_lr_values(training_cfg: dict, sched_cfg: dict) -> tuple[float
 
 
 class RIGNOThreePhaseScheduler:
+    step_unit = "epoch"
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -619,17 +621,143 @@ class RIGNOThreePhaseScheduler:
         self._set_lr(self._lr_for_epoch(self.next_epoch_index))
 
 
+class PICViTExponentialScheduler:
+    step_unit = "update"
+    STATE_VERSION = 1
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        peak_lr: float,
+        decay_every: int,
+        decay_rate: float,
+        min_lr: float,
+    ):
+        self.optimizer = optimizer
+        self.peak_lr = float(peak_lr)
+        self.decay_every = int(decay_every)
+        self.decay_rate = float(decay_rate)
+        self.min_lr = float(min_lr)
+
+        if self.peak_lr <= 0:
+            raise ValueError("PICViTExponential requires a positive peak_lr.")
+        if self.decay_every <= 0:
+            raise ValueError("PICViTExponential requires decay_every > 0.")
+        if not 0.0 < self.decay_rate < 1.0:
+            raise ValueError("PICViTExponential requires 0 < decay_rate < 1.")
+        if self.min_lr <= 0 or self.min_lr > self.peak_lr:
+            raise ValueError("PICViTExponential requires 0 < min_lr <= peak_lr.")
+
+        for group_idx, param_group in enumerate(self.optimizer.param_groups):
+            group_lr = float(param_group["lr"])
+            if not math.isclose(group_lr, self.peak_lr, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "PICViTExponential requires every optimizer parameter group "
+                    f"to start at training.learning_rate={self.peak_lr}; group "
+                    f"{group_idx} has lr={group_lr}."
+                )
+
+        self.next_update = 0
+        self._set_lr(self.lr_for_update(self.next_update))
+
+    def lr_for_update(self, update_idx: int) -> float:
+        if update_idx < 0:
+            raise ValueError(f"update_idx must be >= 0, got {update_idx}")
+        lr = self.peak_lr * self.decay_rate ** (update_idx / self.decay_every)
+        return max(self.min_lr, lr)
+
+    def _set_lr(self, lr: float) -> None:
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+    def step(self) -> None:
+        self.next_update += 1
+        self._set_lr(self.lr_for_update(self.next_update))
+
+    def state_dict(self) -> dict[str, int | float]:
+        return {
+            "version": self.STATE_VERSION,
+            "next_update": self.next_update,
+            "peak_lr": self.peak_lr,
+            "decay_every": self.decay_every,
+            "decay_rate": self.decay_rate,
+            "min_lr": self.min_lr,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        version = int(state_dict.get("version", -1))
+        if version != self.STATE_VERSION:
+            raise ValueError(
+                f"Unsupported PICViTExponential state version {version}; "
+                f"expected {self.STATE_VERSION}."
+            )
+
+        expected = {
+            "peak_lr": self.peak_lr,
+            "decay_every": self.decay_every,
+            "decay_rate": self.decay_rate,
+            "min_lr": self.min_lr,
+        }
+        for key, current_value in expected.items():
+            if key not in state_dict:
+                raise ValueError(f"PICViTExponential state is missing {key}.")
+            saved_value = state_dict[key]
+            matches = (
+                int(saved_value) == int(current_value)
+                if key == "decay_every"
+                else math.isclose(
+                    float(saved_value), float(current_value), rel_tol=0.0, abs_tol=1e-12
+                )
+            )
+            if not matches:
+                raise ValueError(
+                    f"PICViTExponential resume mismatch for {key}: "
+                    f"checkpoint={saved_value}, current={current_value}."
+                )
+
+        next_update = int(state_dict.get("next_update", -1))
+        if next_update < 0:
+            raise ValueError("PICViTExponential state requires next_update >= 0.")
+        self.next_update = next_update
+        self._set_lr(self.lr_for_update(self.next_update))
+
+
+def _set_scheduler_step_unit(scheduler, step_unit: str):
+    scheduler.step_unit = step_unit
+    return scheduler
+
+
+def _advance_scheduler(
+    scheduler,
+    *,
+    unit: str,
+    successful_updates: int,
+) -> bool:
+    if unit not in {"update", "epoch"}:
+        raise ValueError(f"Unknown scheduler step unit: {unit}")
+    scheduler_unit = getattr(scheduler, "step_unit", None)
+    if scheduler_unit not in {"update", "epoch"}:
+        raise ValueError("Scheduler must define step_unit as 'update' or 'epoch'.")
+    if successful_updates <= 0 or scheduler_unit != unit:
+        return False
+    scheduler.step()
+    return True
+
+
 def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
     training_cfg = config["training"]
     sched_cfg = training_cfg.get("scheduler", {})
     sched_type = sched_cfg.get("type", "StepLR")
 
     if sched_type == "CosineWarmRestarts":
-        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=sched_cfg.get("T_0", 100),
-            T_mult=sched_cfg.get("T_mult", 2),
-            eta_min=sched_cfg.get("eta_min", 1e-6),
+        return _set_scheduler_step_unit(
+            torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=sched_cfg.get("T_0", 100),
+                T_mult=sched_cfg.get("T_mult", 2),
+                eta_min=sched_cfg.get("eta_min", 1e-6),
+            ),
+            "epoch",
         )
 
     if sched_type == "RIGNOThreePhase":
@@ -647,11 +775,23 @@ def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
             final_lr=final_lr,
         )
 
+    if sched_type == "PICViTExponential":
+        return PICViTExponentialScheduler(
+            optimizer,
+            peak_lr=float(training_cfg["learning_rate"]),
+            decay_every=int(sched_cfg["decay_every"]),
+            decay_rate=float(sched_cfg["decay_rate"]),
+            min_lr=float(sched_cfg["min_lr"]),
+        )
+
     if sched_type == "StepLR":
-        return torch.optim.lr_scheduler.StepLR(
-            optimizer=optimizer,
-            step_size=sched_cfg["step_size"],
-            gamma=sched_cfg["gamma"],
+        return _set_scheduler_step_unit(
+            torch.optim.lr_scheduler.StepLR(
+                optimizer=optimizer,
+                step_size=sched_cfg["step_size"],
+                gamma=sched_cfg["gamma"],
+            ),
+            "epoch",
         )
 
     raise ValueError(f"Unsupported scheduler type: {sched_type}")
@@ -2376,6 +2516,7 @@ def train_one_epoch(
     model_unwrapped=None,
     warmup=None,
     global_step_start: int = 0,
+    scheduler=None,
 ) -> dict[str, float]:
     """Train one epoch and return a dict of epoch metrics.
 
@@ -2399,7 +2540,21 @@ def train_one_epoch(
     n_model_forwards = 0
     grad_norm_sum = 0.0
     n_grad_steps = 0
+    successful_updates = 0
+    lr_first = float("nan")
+    lr_last = float("nan")
     phys_leads_epoch: list[float] = []  # collocation leads actually drawn
+
+    def _record_successful_update(lr_used: float) -> None:
+        nonlocal successful_updates, lr_first, lr_last
+        successful_updates += 1
+        if successful_updates == 1:
+            lr_first = lr_used
+        lr_last = lr_used
+        if scheduler is not None:
+            _advance_scheduler(
+                scheduler, unit="update", successful_updates=1
+            )
 
     loss_sum = 0.0
     mse_sum = 0.0
@@ -2571,7 +2726,9 @@ def train_one_epoch(
                     grad_norm_sum += float(_gn)
                     n_grad_steps += 1
             _t_opt0 = _phase_now(_sync_timing)
+            lr_used = float(optimizer.param_groups[0]["lr"])
             optimizer.step()
+            _record_successful_update(lr_used)
             tm_optstep_sum += (_phase_now(_sync_timing) - _t_opt0) * 1000.0
             if causal_weighter is not None:
                 causal_weighter.commit(
@@ -2674,7 +2831,9 @@ def train_one_epoch(
                 grad_norm_sum += float(_gn)
                 n_grad_steps += 1
         _t_opt0 = _phase_now(_sync_timing) if phys_collocation else 0.0
+        lr_used = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
+        _record_successful_update(lr_used)
         if phys_collocation:
             tm_optstep_sum += (_phase_now(_sync_timing) - _t_opt0) * 1000.0
         if causal_commit_stats is not None:
@@ -2867,6 +3026,9 @@ def train_one_epoch(
         "gradnorm_ms": (tm_gradnorm_sum / n_tm) if n_tm > 0 else 0.0,
         "backward_ms": (tm_backward_sum / n_tm) if n_tm > 0 else 0.0,
         "optimizer_step_ms": (tm_optstep_sum / n_tm) if n_tm > 0 else 0.0,
+        "successful_updates": int(successful_updates),
+        "lr_first": lr_first,
+        "lr_last": lr_last,
         # Warm-up (Step 5): persistent optimizer-step counter after this epoch, so
         # run_one_seed can checkpoint it and resume the warm-up boundary exactly.
         "global_optimizer_step": int(global_step),
@@ -3744,7 +3906,7 @@ def run_one_seed(
         "train_physics_causal_interior", "causal_weights", "causal_eps",
         "gradnorm_weights", "opt_peak_mem_mb",
         "train_step_ms", "gradnorm_ms", "backward_ms", "optimizer_step_ms",
-        "lr", "is_best",
+        "lr_first", "lr_last", "lr", "is_best",
     ]
     csv_file = None
     csv_writer = None
@@ -3810,6 +3972,8 @@ def run_one_seed(
         )
         csv_writer.writerow({
             "epoch": -1,
+            "lr_first": float("nan"),
+            "lr_last": float("nan"),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "is_best": 0,
             "val_rel_l2": float(ref_metrics["rel_l2"]),
@@ -3843,8 +4007,6 @@ def run_one_seed(
         # DistributedSampler shuffle ordering: curriculum first, then set_epoch.
         if dist_info.is_distributed and hasattr(training_set.sampler, "set_epoch"):
             training_set.sampler.set_epoch(epoch)
-
-        lr = optimizer.param_groups[0]["lr"]
 
         # W2 collocation-lead curriculum. Two mutually-exclusive schedules:
         #  - staged causal curriculum (diffusion): fixed stages expand the max
@@ -3917,12 +4079,17 @@ def run_one_seed(
             model_unwrapped=fno_unwrapped,
             warmup=warmup_cfg,
             global_step_start=global_optimizer_step,
+            scheduler=scheduler,
         )
         global_optimizer_step = int(train_metrics["global_optimizer_step"])
         train_loss = train_metrics["loss"]
         train_rel_l2 = train_metrics["rel_l2"]
         train_iface_rel_l2 = train_metrics["iface_rel_l2"]
-        scheduler.step()
+        _advance_scheduler(
+            scheduler,
+            unit="epoch",
+            successful_updates=int(train_metrics["successful_updates"]),
+        )
 
         if is_main:
             print(
@@ -4165,7 +4332,9 @@ def run_one_seed(
                     "gradnorm_ms": _tm_opt("gradnorm_ms"),
                     "backward_ms": _tm_opt("backward_ms"),
                     "optimizer_step_ms": _tm_opt("optimizer_step_ms"),
-                    "lr": float(lr),
+                    "lr_first": float(train_metrics["lr_first"]),
+                    "lr_last": float(train_metrics["lr_last"]),
+                    "lr": float(train_metrics["lr_last"]),
                     "is_best": int(is_best),
                 }
             )

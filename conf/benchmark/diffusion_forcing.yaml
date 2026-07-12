@@ -16,6 +16,12 @@ benchmark:
   name: diffusion_forcing
 
 training:
+  learning_rate: 5.0e-4
+  scheduler:
+    type: PICViTExponential
+    decay_every: 500
+    decay_rate: 0.95
+    min_lr: 1.0e-5
   loss:
     # Single homogeneous slab has no interface; interface_weight = 1.0 -> plain
     # MSE and a 2-dim T_stats keeps the no-interface loss path clean.

@@ -21,9 +21,18 @@ from data.dataset import (
 from problems.diffusion import T_RIGHT
 from problems.diffusion_forcing import K_SLAB
 from problems.forcing import A_AMP_REF
-from src.operators.cvit import CViT, ForcingCViT
+from problems.interfaces import (
+    INTERFACE_X_RANGE,
+    K_LEFT,
+    K_RIGHT,
+    RC_RANGE,
+    normalize_interface_scalars,
+)
+from src.operators.cvit import CViT, ForcingCViT, InterfaceCViT
+from src.operators.losses import full_bc_physics_loss
 from src.operators.train import (
     GradNormBalancer,
+    _advance_scheduler,
     build_optimizer,
     build_scheduler,
     load_config,
@@ -33,10 +42,16 @@ from src.operators.utils import resolve_device
 from src.physics.boundary_forcing import (
     SPATIAL_SAMPLERS,
     TEMPORAL_SAMPLERS,
+    build_interface_forcing,
     default_ramp_seconds,
     reconstruct_qL,
     sample_spatial_family,
     sample_temporal_family,
+)
+from src.physics.fv_residual import (
+    FullBCData,
+    build_cn_geom_per_interface,
+    locate_interface,
 )
 from src.physics.pde_residual import (
     diffusion_residual,
@@ -1124,13 +1139,53 @@ def build_cvit(
     grid_size: tuple[int, int],
     t_final: float = 1.0,
     variant: str = "cvit",
-) -> CViT:
+) -> CViT | InterfaceCViT:
     """Construct the PINO surrogate. ``variant="cvit"`` (default) builds the
     diffusion :class:`CViT` conditioned on the IC field over ``grid_size =
     (Nx, Ny)``. ``variant="forcing"`` builds a :class:`ForcingCViT` whose encoder
     ingests the forcing space-time image over ``grid_size = (Ny_img, Nt_img)``;
     it reads ``model.forcing_cvit`` when present, falling back to ``model.cvit``.
+    ``variant="interfaces"`` builds a multimodal :class:`InterfaceCViT` over
+    ``grid_size = (Nx, Ny)`` whose three token streams (spatial field, sampled
+    forcing waveform, interface scalars) feed the decoder cross-attention; it
+    reads ``model.interface_cvit`` when present, falling back to ``model.cvit``.
     """
+    if variant == "interfaces":
+        c = {**config["model"]["cvit"], **config["model"].get("interface_cvit", {})}
+        t_right_K = float(c.get("hard_right_dirichlet_t_right", T_RIGHT))
+        hard_rd = bool(c.get("hard_right_dirichlet", True))
+        t_right_tilde = (t_right_K - mu) / (sigma + 1e-8) if hard_rd else 0.0
+        t_norm = float(
+            c.get("t_final", None) if c.get("t_final", None) is not None else t_final
+        )
+        return InterfaceCViT(
+            spatial_in_ch=int(c.get("spatial_in_ch", 3)),
+            out_dim=int(c.get("out_dim", 1)),
+            emb_dim=int(c.get("emb_dim", 256)),
+            dec_emb_dim=c.get("dec_emb_dim", None),
+            patch_size=int(c.get("patch_size", 10)),
+            grid_size=grid_size,
+            depth_enc=int(c.get("depth_enc", 4)),
+            depth_dec=int(c.get("depth_dec", 2)),
+            num_heads=int(c.get("num_heads", 8)),
+            mlp_ratio=float(c.get("mlp_ratio", 2.0)),
+            fourier_freq=float(c.get("fourier_freq", 1.0)),
+            fourier_freq_t=(
+                None if c.get("fourier_freq_t", None) is None
+                else float(c["fourier_freq_t"])
+            ),
+            activation=str(c.get("activation", "gelu")),
+            hard_right_dirichlet=hard_rd,
+            t_right_tilde=t_right_tilde,
+            t_final=t_norm,
+            temporal_token_dim=int(c.get("temporal_token_dim", 2)),
+            temporal_samples=int(c.get("temporal_samples", 128)),
+            num_forcing_tokens=int(c.get("num_forcing_tokens", 1)),
+            forcing_hidden=int(c.get("forcing_hidden", 128)),
+            n_param_scalars=int(c.get("n_param_scalars", 2)),
+            num_param_tokens=int(c.get("num_param_tokens", 1)),
+            param_hidden=int(c.get("param_hidden", 128)),
+        )
     if variant == "forcing":
         c = {**config["model"]["cvit"], **config["model"].get("forcing_cvit", {})}
     else:
@@ -1397,7 +1452,8 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         loss.backward()
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
-        scheduler.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
 
         row = {
             "epoch": epoch,
@@ -1654,7 +1710,8 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     # These + JSON supplements are populated on validation epochs only.
     gn_cols = ["r", "ic", "bc_left", "bc_hom"]
     fieldnames = [
-        "epoch", "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
+        "epoch", "lr_first", "lr_last",
+        "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
         "loss_data",
         "w_r", "w_ic", "w_bc", "w_bc_left", "w_data",
         "val_gnrmse", "val_rmse_K",
@@ -1781,10 +1838,13 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         loss.backward()
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
-        scheduler.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
 
         row: dict[str, Any] = {
             "epoch": epoch,
+            "lr_first": lr,
+            "lr_last": lr,
             "loss": float(loss.detach().cpu()),
             "loss_r": float(losses["r"].detach().cpu()),
             "loss_ic": float(losses["ic"].detach().cpu()),
@@ -1890,16 +1950,689 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     return summary
 
 
+# ---- Physics-only (PINO) training of an InterfaceCViT on `interfaces` ---------
+#
+# The interfaces benchmark carries two materials (k_left=2, k_right=1) split by a
+# per-sim interface location `interface_x` with per-sim contact resistance `R_c`,
+# a fixed `sin`/`uniform` left-wall Neumann forcing, and a VARYING initial
+# condition. The FV Crank-Nicolson residual (`full_bc_cn_residual` via
+# `full_bc_physics_loss`) is the only physics; validation is against saved FV
+# trajectories. The model is an `InterfaceCViT` (three token streams: spatial,
+# forcing waveform, interface scalars) conditioned only on inference-available
+# information -- it learns `(x_Gamma, R_c, a(.)) -> T`, never the synthetic
+# generator parameters.
+#
+# UNITS CONTRACT (see `fv_residual.full_bc_cn_residual`): model outputs are
+# NORMALIZED temperature (T_tilde); `FullBCData.qL_*` are PHYSICAL fluxes and
+# `qL_int` is the EXACT step integral (the residual divides by `sigma_global`
+# internally). The canonical `build_interface_forcing` emits both the sampled
+# waveform the model sees and the physical flux the residual enforces from the
+# same parameters, so they can never drift.
+#
+# NON-CAUSAL FORCING (documented): the model sees the COMPLETE sampled waveform
+# over [0, t_final] while predicting earlier times -- valid for a fully-known
+# loading schedule (forward/design), not a causal real-time predictor.
+
+
+def _interface_spatial_channels(
+    T0: np.ndarray, interface_x: float, x_grid: np.ndarray,
+    mu: float, sigma: float,
+) -> np.ndarray:
+    """Spatial encoder channels `[T0_tilde, K_norm, D_norm]` -> `(3, Nx, Ny)`.
+
+    Mirrors the FNO's interfaces spatial layout (`problems/interfaces`
+    `_material_channel` / `_signed_distance_channel`): `T0_tilde` is the
+    normalized IC field, `K_norm = (k(x) - 1.5)/0.5` the material map, and
+    `D_norm = (x - x_Gamma)/(x[-1]-x[0])` the signed distance. `K_norm`/`D_norm`
+    depend on x only and broadcast across y.
+    """
+    T0 = np.asarray(T0, dtype=np.float64)
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    Ny = T0.shape[1]
+    t0_tilde = (T0 - float(mu)) / (float(sigma) + 1e-8)
+    kx = np.where(x_grid <= float(interface_x), K_LEFT, K_RIGHT)
+    k_norm = ((kx - 1.5) / 0.5)[:, None] * np.ones((1, Ny))
+    span = float(x_grid[-1] - x_grid[0])
+    d_norm = ((x_grid - float(interface_x)) / span)[:, None] * np.ones((1, Ny))
+    return np.stack([t0_tilde, k_norm, d_norm], axis=0).astype(np.float32)
+
+
+def _decode_in_chunks(
+    model: InterfaceCViT, latent: torch.Tensor,
+    coords: torch.Tensor, t: torch.Tensor, chunk: int,
+) -> torch.Tensor:
+    """Differentiable `model.decode` split over the query axis (dim 1).
+
+    Cross-attention memory scales with the query count, so the full-grid FV
+    residual decode is chunked to bound peak memory; chunk outputs are
+    concatenated (autograd preserved) so the residual sees the whole grid. A
+    non-positive `chunk` (or a query set that already fits) decodes in one shot.
+    """
+    Nq = coords.shape[1]
+    if chunk is None or chunk <= 0 or Nq <= chunk:
+        return model.decode(latent, coords, t)
+    outs = []
+    for s in range(0, Nq, chunk):
+        e = min(s + chunk, Nq)
+        outs.append(model.decode(latent, coords[:, s:e, :], t[:, s:e, :]))
+    return torch.cat(outs, dim=1)
+
+
+def _sample_interval_times(
+    rng: np.random.Generator, batch_size: int, intervals_per_sim: int,
+    dt: float, t_final: float, stratified: bool, n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Draw CN interval midpoints over `M = batch_size * intervals_per_sim`.
+
+    Stratified sampling assigns bins across the WHOLE collection of intervals
+    (not per sim), so every bin is populated whenever `M >= n_bins` -- the
+    coverage causal weighting needs. Each `t_mid` is drawn uniformly inside its
+    assigned bin's sub-window of the feasible midpoint range
+    `[dt/2, t_final - dt/2]`, then `t_n = t_mid - dt/2`, `t_np1 = t_mid + dt/2`
+    stay inside `[0, t_final]` by construction (no rejection). Non-stratified
+    falls back to a uniform midpoint draw; `bin_ids` is then unused.
+    """
+    M = int(batch_size * intervals_per_sim)
+    lo = dt / 2.0
+    hi = t_final - dt / 2.0
+    if stratified and M >= 1:
+        bin_ids = np.arange(M) % int(n_bins)
+        rng.shuffle(bin_ids)
+        edges = np.linspace(lo, hi, int(n_bins) + 1)
+        t_mid = np.empty(M, dtype=np.float64)
+        for i in range(M):
+            k = int(bin_ids[i])
+            t_mid[i] = rng.uniform(edges[k], edges[k + 1])
+    else:
+        bin_ids = np.zeros(M, dtype=np.int64)
+        t_mid = rng.uniform(lo, hi, size=M)
+    t_n = t_mid - dt / 2.0
+    t_np1 = t_mid + dt / 2.0
+    return t_n, t_np1, t_mid, bin_ids
+
+
+def _interface_face_idx(x_grid: np.ndarray, interface_x: float) -> int:
+    """Discrete x-face carrying the series conductance (via `locate_interface`)."""
+    return int(locate_interface(x_grid, float(interface_x)).face_idx)
+
+
+def _compute_train_jump_scale(
+    data: dict[str, Any], sim_params: np.ndarray, ids: np.ndarray,
+) -> float:
+    """Frozen `sigma_dT,train = RMS_train(T_Gamma^- - T_Gamma^+)` in Kelvin.
+
+    The node jump uses the two interface-flanking nodes `[face_idx]`/`[face_idx+1]`
+    from `locate_interface`. Computed ONCE from the training trajectories and
+    frozen; the val jump metric normalizes by this so `E_zero` is stable and not
+    coupled to the val split (plan Section 6).
+    """
+    x_grid = np.asarray(data["x_grid"], dtype=np.float64)
+    traj = data["trajectories"]
+    ssq = 0.0
+    cnt = 0
+    for i in np.asarray(ids):
+        p = dict(sim_params[int(i)])
+        fidx = _interface_face_idx(x_grid, p["interface_x"])
+        tr = np.asarray(traj[int(i)], dtype=np.float64)          # (Nt, Nx, Ny)
+        dT = tr[:, fidx, :] - tr[:, fidx + 1, :]                 # (Nt, Ny)
+        ssq += float(np.sum(dT ** 2))
+        cnt += int(dT.size)
+    return math.sqrt(ssq / max(cnt, 1))
+
+
+def validate_interfaces_gnrmse(
+    model: InterfaceCViT,
+    data: dict[str, Any],
+    ids: np.ndarray,
+    sim_params: np.ndarray,
+    t_ramp: float,
+    dt: float,
+    a_ref: float,
+    forcing_samples: int,
+    sigma_dT_train: float,
+    device: torch.device,
+    query_batch: int = 8,
+) -> dict[str, float]:
+    """Deviation-field gnRMSE + interface-jump metrics over held-out sims.
+
+    Beyond the global deviation gnRMSE (`rmse_K / sigma`, amplitude-fair on the
+    300 K baseline), this reports the node interface jump error under the FROZEN
+    `sigma_dT_train` denominator:
+
+        E_model = RMS_val(dT_pred - dT_true) / sigma_dT_train
+        E_zero  = RMS_val(dT_true)           / sigma_dT_train   (zero-jump baseline)
+
+    so a good global fit that smooths the jump stays visible. Per-sim gnRMSE is
+    stratified by `R_c` and by `interface_x` terciles. Inputs are rebuilt with
+    the SAME `_interface_spatial_channels` / `build_interface_forcing` path the
+    trainer uses.
+    """
+    x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
+    y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
+    x_grid_np = np.asarray(data["x_grid"], dtype=np.float64)
+    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    Nx, Ny, Nt = int(x_grid.numel()), int(y_grid.numel()), len(t_grid)
+
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+
+    ids = np.asarray(ids)
+    per_sim_rmse: list[float] = []
+    per_sim_rc: list[float] = []
+    per_sim_ix: list[float] = []
+    jump_err_ssq = 0.0
+    jump_true_ssq = 0.0
+    jump_cnt = 0
+    for start in range(0, len(ids), query_batch):
+        chunk = ids[start:start + query_batch]
+        params = [dict(sim_params[int(i)]) for i in chunk]
+        B = len(params)
+        u_spatial = torch.from_numpy(
+            np.stack([
+                _interface_spatial_channels(
+                    p["T0"], p["interface_x"], x_grid_np, mu, sigma
+                ) for p in params
+            ])
+        ).to(device)
+        fseq = torch.from_numpy(
+            np.stack([
+                build_interface_forcing(
+                    p["temporal_family"], p["temporal_params"],
+                    p["spatial_family"], p["spatial_params"],
+                    y_grid_np, 0.0, dt, float(t_grid[-1]), t_ramp,
+                    a_ref=a_ref, n_forcing_samples=forcing_samples,
+                )[0] for p in params
+            ])
+        ).to(device)
+        pscal = torch.from_numpy(
+            np.stack([
+                normalize_interface_scalars(p["interface_x"], p["R_c"])
+                for p in params
+            ])
+        ).to(device)
+        latent = model.encode(u_spatial, fseq, pscal)
+        coords = mesh.expand(B, -1, -1)
+        pred = torch.empty((B, Nt, Nx, Ny), device=device)
+        for k in range(Nt):
+            tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
+            out = model.decode(latent, coords, tk)
+            pred[:, k] = out[..., 0].view(B, Nx, Ny)
+        pred_K = (pred * sigma + mu).detach().cpu().numpy()
+        truth = np.asarray(data["trajectories"][chunk], dtype=np.float64)
+        se = ((pred_K - truth) ** 2).sum(axis=(1, 2, 3))          # (B,)
+        rmse = np.sqrt(se / float(Nt * Nx * Ny))
+        for b, p in enumerate(params):
+            per_sim_rmse.append(float(rmse[b]))
+            per_sim_rc.append(float(p["R_c"]))
+            per_sim_ix.append(float(p["interface_x"]))
+            fidx = _interface_face_idx(x_grid_np, p["interface_x"])
+            dT_pred = pred_K[b][:, fidx, :] - pred_K[b][:, fidx + 1, :]  # (Nt,Ny)
+            dT_true = truth[b][:, fidx, :] - truth[b][:, fidx + 1, :]
+            jump_err_ssq += float(np.sum((dT_pred - dT_true) ** 2))
+            jump_true_ssq += float(np.sum(dT_true ** 2))
+            jump_cnt += int(dT_true.size)
+
+    rmse_arr = np.asarray(per_sim_rmse, dtype=np.float64)
+    rc_arr = np.asarray(per_sim_rc, dtype=np.float64)
+    ix_arr = np.asarray(per_sim_ix, dtype=np.float64)
+    gnrmse = rmse_arr / (float(sigma) + 1e-8)
+    denom = float(sigma_dT_train) + 1e-12
+    node_jump_rmse_K = math.sqrt(jump_err_ssq / max(jump_cnt, 1))
+    out = {
+        "val_gnrmse": float(gnrmse.mean()),
+        "val_rmse_K": float(rmse_arr.mean()),
+        "node_jump_rmse_K": node_jump_rmse_K,
+        "E_model": node_jump_rmse_K / denom,
+        "E_zero": math.sqrt(jump_true_ssq / max(jump_cnt, 1)) / denom,
+    }
+    for tag, arr in (("Rc", rc_arr), ("ix", ix_arr)):
+        if len(arr) >= 3:
+            q1, q2 = np.quantile(arr, [1.0 / 3.0, 2.0 / 3.0])
+            strata = {
+                "low": arr <= q1,
+                "mid": (arr > q1) & (arr <= q2),
+                "high": arr > q2,
+            }
+            for name, mask in strata.items():
+                out[f"gnrmse_{tag}_{name}"] = (
+                    float(gnrmse[mask].mean()) if mask.any() else float("nan")
+                )
+    return out
+
+
+def run_one_seed_interfaces_pino(
+    config: dict, seed: int, run_dir: Path
+) -> dict[str, Any]:
+    """Physics-only training of an :class:`InterfaceCViT` on the `interfaces`
+    benchmark with an FV Crank-Nicolson interface residual.
+
+    `saved_train` collocation (default): each step draws a sim minibatch from the
+    saved TRAIN split, reads `interface_x`, `R_c`, the IC field `T0`, and the
+    forcing params from `sim_params.npy`, and scores the FV residual on freshly
+    sampled CN intervals. `online` collocation instead draws those params fresh
+    each step via `ProblemSpec.sample_online_params` (IID from the generator's
+    target distributions, not the fixed LHS design); validation still uses the
+    saved val trajectories either way. GradNorm balances only the nontrivial terms
+    `{interior, left_neumann, topbot_adiabatic, ic}`; `right_dirichlet` is exact
+    under the hard ansatz (~0 gradient) so it is logged, not balanced. Causal
+    interior weighting (stratified `t_mid` bins) is optional and off for the tiny
+    debug run. Validation uses :func:`validate_interfaces_gnrmse` and three
+    checkpoints with a lexicographic jump gate (plan Section 6).
+    """
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    device = resolve_device(config["training"].get("device", "auto"))
+    data = load_diffusion_data(config)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    x_grid_np = np.asarray(data["x_grid"], dtype=np.float64)
+    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
+    t_grid_np = np.asarray(data["t_grid"], dtype=np.float64)
+    Nx, Ny = int(x_grid_np.shape[0]), int(y_grid_np.shape[0])
+    Nq = Nx * Ny
+    t_final = float(t_grid_np[-1])
+
+    sp_path = Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy"
+    sim_params = np.load(str(sp_path), allow_pickle=True)
+
+    pino = config["training"]["pino"]
+    fcfg = pino.get("forcing", {}) or {}
+    a_ref = float(fcfg.get("a_ref") if fcfg.get("a_ref") is not None else A_AMP_REF)
+    forcing_samples = int(pino.get("forcing_samples", 128))
+
+    # Frozen startup ramp shared by the model waveform AND the residual flux
+    # (config override wins; else the dataset's stored ramp; else dt-derived).
+    ramp_cfg = fcfg.get("ramp_seconds", None)
+    if ramp_cfg is not None:
+        t_ramp = float(ramp_cfg)
+    else:
+        t_ramp = load_ramp_seconds(config["data"]["t_grid_path"])
+        if t_ramp is None:
+            _dt0 = load_solver_dt(config["data"]["t_grid_path"])
+            t_ramp = default_ramp_seconds(_dt0 if _dt0 is not None else t_final / 100.0)
+
+    # CN step `dt`: config override, else the solver dt stored with the dataset,
+    # else the trajectory time spacing (so the residual matches the FV scheme).
+    dt_cfg = pino.get("dt", None)
+    if dt_cfg is not None:
+        dt = float(dt_cfg)
+    else:
+        dt = load_solver_dt(config["data"]["t_grid_path"])
+        if dt is None:
+            dt = t_final / max(len(t_grid_np) - 1, 1)
+
+    model = build_cvit(
+        config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final,
+        variant="interfaces",
+    ).to(device)
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+
+    lam_r = float(pino["lambda_r"])
+    lam_ic = float(pino["lambda_ic"])
+    lam_bc = float(pino["lambda_bc"])
+    lam_bc_left_cfg = pino.get("lambda_bc_left", None)
+    lam_bc_left = lam_bc if lam_bc_left_cfg is None else float(lam_bc_left_cfg)
+    sim_batch = int(pino["sim_batch"])
+    intervals_per_sim = int(pino.get("intervals_per_sim", 2))
+    stratified = bool(pino.get("stratified_time_sampling", True))
+    causal = pino.get("causal", {}) or {}
+    causal_enabled = bool(causal.get("enabled", False))
+    n_bins = int(pino.get("causal_num_bins", causal.get("n_bins", 6)))
+    eps_causal = float(causal.get("eps_causal", 1.0))
+    chunk_r = int(pino.get("chunk_r", 0))
+    collocation_source = str(pino.get("collocation_source", "saved_train"))
+    if collocation_source not in ("saved_train", "online"):
+        raise ValueError(
+            f"training.pino.collocation_source must be 'saved_train' or 'online'; "
+            f"got {collocation_source!r}."
+        )
+
+    # Right wall is 300 K here too (matches the model's hard right-Dirichlet).
+    t_right_tilde = (T_RIGHT - mu) / (sigma + 1e-8)
+    t_right_tilde_t = torch.tensor(
+        float(t_right_tilde), dtype=torch.float32, device=device
+    )
+
+    # GradNorm over the nontrivial terms only; right_dirichlet excluded (its hard
+    # ansatz makes the loss ~0 with ~0 gradient -> inverse-norm weighting would
+    # divide by ~0). None (disabled) is an exact no-op.
+    gn_term_weights = {
+        "interior": lam_r, "left_neumann": lam_bc_left,
+        "topbot_adiabatic": lam_bc, "ic": lam_ic,
+    }
+    gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
+
+    epochs = int(config["training"]["epochs"])
+    validate_every = int(config["training"].get("validate_every", 10))
+
+    x_grid_t = torch.as_tensor(x_grid_np, dtype=torch.float32, device=device)
+    y_grid_t = torch.as_tensor(y_grid_np, dtype=torch.float32, device=device)
+    gx, gy = torch.meshgrid(x_grid_t, y_grid_t, indexing="ij")
+    mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+
+    rng = np.random.default_rng(seed)
+    train_ids = np.asarray(data["train_ids"])
+
+    # Online collocation draws fresh (interface_x, R_c, IC, forcing) each step
+    # from the SAME target distributions the generator uses (IID, not the fixed
+    # LHS design of the saved set). Validation always uses the saved val
+    # trajectories, so sim_params stays loaded regardless of the source.
+    online_spec = online_grids = online_time_cfg = None
+    if collocation_source == "online":
+        online_spec = problem_from_config(config)
+        gxm, gym = np.meshgrid(x_grid_np, y_grid_np, indexing="ij")
+        online_grids = {
+            "X": gxm, "Y": gym, "x_grid": x_grid_np, "y_grid": y_grid_np,
+        }
+        online_time_cfg = {
+            "dt": dt, "t_final": t_final, "b": 1.0, "T_right": float(T_RIGHT),
+            "t_on": float(fcfg.get("t_on", 0.0)),
+            "t_off": float(fcfg.get("t_off", 0.2)),
+            "phase": float(fcfg.get("phase", 0.0)),
+            "tukey_alpha": float(fcfg.get("tukey_alpha", 0.5)),
+        }
+
+    # Frozen train jump scale for E_model / E_zero (computed once).
+    sigma_dT_train = _compute_train_jump_scale(data, sim_params, train_ids)
+
+    metrics_path = run_dir / "train_metrics.csv"
+    gn_cols = ["interior", "left_neumann", "topbot_adiabatic", "ic"]
+    fieldnames = [
+        "epoch", "loss",
+        "loss_interior", "loss_left_neumann", "loss_topbot", "loss_ic",
+        "loss_right_dir",
+        "w_interior", "w_left_neumann", "w_topbot", "w_ic",
+        "val_gnrmse", "val_rmse_K", "node_jump_rmse_K", "E_model", "E_zero",
+        "gnrmse_Rc_low", "gnrmse_Rc_mid", "gnrmse_Rc_high",
+        "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
+        *[f"gn_mult_{c}" for c in gn_cols],
+        *[f"w_eff_{c}" for c in gn_cols],
+        "gradnorm_weights",
+    ]
+    with open(metrics_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
+
+    print(
+        f"[pino-interfaces] seed={seed} device={device} epochs={epochs} "
+        f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} "
+        f"dt={dt:.4g} t_ramp={t_ramp:.4g} a_ref={a_ref} | "
+        f"sim_batch={sim_batch} intervals_per_sim={intervals_per_sim} "
+        f"collocation={collocation_source} "
+        f"stratified={stratified} causal={causal_enabled}(n_bins={n_bins}) | "
+        f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} "
+        f"lambda_bc_left={lam_bc_left} | k=({K_LEFT},{K_RIGHT}) "
+        f"sigma_dT_train={sigma_dT_train:.4g}",
+        flush=True,
+    )
+
+    best_global = float("inf")
+    best_jump = float("inf")
+    history: list[dict[str, Any]] = []
+    for epoch in range(epochs):
+        model.train()
+        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+
+        if collocation_source == "online":
+            params = online_spec.sample_online_params(
+                rng, sim_batch, online_grids, online_time_cfg
+            )
+        else:
+            replace = len(train_ids) < sim_batch
+            sim_ids = rng.choice(train_ids, size=sim_batch, replace=replace)
+            params = [dict(sim_params[int(i)]) for i in sim_ids]
+        B = len(params)
+
+        u_spatial = torch.from_numpy(
+            np.stack([
+                _interface_spatial_channels(
+                    p["T0"], p["interface_x"], x_grid_np, mu, sigma
+                ) for p in params
+            ])
+        ).to(device)
+        fseq = torch.from_numpy(
+            np.stack([
+                build_interface_forcing(
+                    p["temporal_family"], p["temporal_params"],
+                    p["spatial_family"], p["spatial_params"],
+                    y_grid_np, 0.0, dt, t_final, t_ramp,
+                    a_ref=a_ref, n_forcing_samples=forcing_samples,
+                )[0] for p in params
+            ])
+        ).to(device)
+        pscal = torch.from_numpy(
+            np.stack([
+                normalize_interface_scalars(p["interface_x"], p["R_c"])
+                for p in params
+            ])
+        ).to(device)
+        ic_target = torch.from_numpy(
+            np.stack([
+                ((np.asarray(p["T0"], dtype=np.float64) - mu) / (sigma + 1e-8))
+                .reshape(-1) for p in params
+            ])
+        ).to(torch.float32).to(device).unsqueeze(-1)          # (B, Nq, 1)
+        interface_x = np.array([float(p["interface_x"]) for p in params])
+        R_c = np.array([float(p["R_c"]) for p in params])
+
+        optimizer.zero_grad(set_to_none=True)
+        latent = model.encode(u_spatial, fseq, pscal)
+
+        # IC anchor: decode at t=0 against the (varying) normalized IC field.
+        t0q = torch.zeros((B, Nq, 1), device=device)
+        ic_pred = _decode_in_chunks(model, latent, mesh.expand(B, -1, -1), t0q, chunk_r)
+        ic_loss = ((ic_pred - ic_target) ** 2).mean()
+
+        # CN intervals over M = B * intervals_per_sim.
+        t_n, t_np1, t_mid, bin_ids = _sample_interval_times(
+            rng, B, intervals_per_sim, dt, t_final, stratified, n_bins
+        )
+        M = B * intervals_per_sim
+        sim_local = np.repeat(np.arange(B), intervals_per_sim)      # (M,)
+        latent_M = latent[torch.as_tensor(sim_local, device=device)]
+
+        qL_n = np.empty((M, Ny), dtype=np.float64)
+        qL_np1 = np.empty((M, Ny), dtype=np.float64)
+        qL_int = np.empty((M, Ny), dtype=np.float64)
+        for m in range(M):
+            p = params[int(sim_local[m])]
+            _, qn, qnp1, qint = build_interface_forcing(
+                p["temporal_family"], p["temporal_params"],
+                p["spatial_family"], p["spatial_params"],
+                y_grid_np, float(t_n[m]), float(t_np1[m]), t_final, t_ramp,
+                a_ref=a_ref, n_forcing_samples=forcing_samples,
+            )
+            qL_n[m] = qn
+            qL_np1[m] = qnp1
+            qL_int[m] = qint
+
+        coords_M = mesh.expand(M, -1, -1)
+        tn_q = (torch.from_numpy(t_n).to(torch.float32).to(device)
+                .view(M, 1, 1).expand(M, Nq, 1))
+        tnp1_q = (torch.from_numpy(t_np1).to(torch.float32).to(device)
+                  .view(M, 1, 1).expand(M, Nq, 1))
+        T_n = _decode_in_chunks(model, latent_M, coords_M, tn_q, chunk_r).view(M, Nx, Ny)
+        T_np1 = _decode_in_chunks(model, latent_M, coords_M, tnp1_q, chunk_r).view(M, Nx, Ny)
+
+        geom = build_cn_geom_per_interface(
+            x_grid_np, y_grid_np, K_LEFT, K_RIGHT,
+            interface_x[sim_local], R_c[sim_local], dt,
+            sigma_global=float(sigma), device=device, dtype=torch.float32,
+        )
+        bc = FullBCData(
+            T_right_tilde=t_right_tilde_t,
+            qL_n=torch.from_numpy(qL_n).to(torch.float32).to(device),
+            qL_np1=torch.from_numpy(qL_np1).to(torch.float32).to(device),
+            qL_int=torch.from_numpy(qL_int).to(torch.float32).to(device),
+        )
+        phys = full_bc_physics_loss(T_n, T_np1, geom, bc, per_sample=True)
+        interior_ps = phys["interior_per_sample"]                  # (M,)
+
+        if causal_enabled and stratified:
+            bins_t = torch.as_tensor(bin_ids, device=device, dtype=torch.long)
+            ones = torch.ones_like(interior_ps)
+            bsum = torch.zeros(n_bins, device=device, dtype=interior_ps.dtype)
+            bcnt = torch.zeros(n_bins, device=device, dtype=interior_ps.dtype)
+            bsum = bsum.index_add(0, bins_t, interior_ps)
+            bcnt = bcnt.index_add(0, bins_t, ones)
+            bmean = bsum / bcnt.clamp_min(1.0)
+            w = _causal_weights(bmean.detach(), eps_causal) * (bcnt > 0)
+            interior_loss = (w * bmean).sum() / w.sum().clamp_min(1e-12)
+        else:
+            interior_loss = interior_ps.mean()
+
+        losses = {
+            "interior": interior_loss,
+            "left_neumann": phys["phys_left_neumann_mse"],
+            "topbot_adiabatic": phys["phys_topbot_adiabatic_mse"],
+            "ic": ic_loss,
+        }
+        right_dir = phys["phys_right_dirichlet_mse"]               # logged only
+        sw = {
+            "interior": lam_r, "left_neumann": lam_bc_left,
+            "topbot_adiabatic": lam_bc, "ic": lam_ic,
+        }
+
+        gn_mults: dict[str, float] = {}
+        if gradnorm is not None:
+            active = {k: losses[k] for k in gradnorm.term_names if k in losses}
+            gn_params = [p for p in model.parameters() if p.requires_grad]
+            gn_mults = gradnorm.maybe_update(active, gn_params, dist_info=None)
+        w_eff = {k: sw[k] * float(gn_mults.get(k, 1.0)) for k in sw}
+        loss = None
+        for k, wk in w_eff.items():
+            term = wk * losses[k]
+            loss = term if loss is None else loss + term
+        loss.backward()
+        lr = float(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+
+        row: dict[str, Any] = {
+            "epoch": epoch,
+            "loss": float(loss.detach().cpu()),
+            "loss_interior": float(losses["interior"].detach().cpu()),
+            "loss_left_neumann": float(losses["left_neumann"].detach().cpu()),
+            "loss_topbot": float(losses["topbot_adiabatic"].detach().cpu()),
+            "loss_ic": float(losses["ic"].detach().cpu()),
+            "loss_right_dir": float(right_dir.detach().cpu()),
+            "w_interior": lam_r, "w_left_neumann": lam_bc_left,
+            "w_topbot": lam_bc, "w_ic": lam_ic,
+        }
+        print(
+            f"Epoch {epoch}: loss={row['loss']:.6f} "
+            f"(int={row['loss_interior']:.6f}, "
+            f"left={row['loss_left_neumann']:.6f}, "
+            f"tb={row['loss_topbot']:.6f}, ic={row['loss_ic']:.6f}, "
+            f"rd={row['loss_right_dir']:.2e}) lr={lr:.2e}",
+            flush=True,
+        )
+
+        if do_val:
+            model.eval()
+            with torch.no_grad():
+                val = validate_interfaces_gnrmse(
+                    model, data, data["val_ids"], sim_params,
+                    t_ramp, dt, a_ref, forcing_samples, sigma_dT_train, device,
+                )
+            for key in (
+                "val_gnrmse", "val_rmse_K", "node_jump_rmse_K", "E_model", "E_zero",
+                "gnrmse_Rc_low", "gnrmse_Rc_mid", "gnrmse_Rc_high",
+                "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
+            ):
+                row[key] = val.get(key, "")
+            if gradnorm is not None:
+                for k in gn_cols:
+                    row[f"gn_mult_{k}"] = float(gn_mults.get(k, 1.0))
+                    row[f"w_eff_{k}"] = w_eff[k]
+                row["gradnorm_weights"] = json.dumps(
+                    {k: float(v) for k, v in gn_mults.items()}
+                )
+
+            ckpt = {
+                "model_state": model.state_dict(),
+                "mu_global": mu, "sigma_global": sigma,
+                "config": config, "epoch": epoch,
+                "best_val_gnrmse": val["val_gnrmse"], "E_model": val["E_model"],
+                "E_zero": val["E_zero"], "sigma_dT_train": sigma_dT_train,
+                "interface_forcing": {
+                    "a_ref": a_ref, "t_ramp": t_ramp, "dt": dt,
+                    "t_final": t_final, "forcing_samples": forcing_samples,
+                },
+                "gradnorm_state": (
+                    gradnorm.state_dict() if gradnorm is not None else None
+                ),
+            }
+            is_best_global = val["val_gnrmse"] < best_global
+            if is_best_global:
+                best_global = val["val_gnrmse"]
+                torch.save(ckpt, run_dir / "cvit_best_global.pt")
+            # Lexicographic jump gate: only a model that beats the explicit gate
+            # E_model <= 0.5 * E_zero is eligible as the jump-best checkpoint.
+            passes_gate = val["E_model"] <= 0.5 * val["E_zero"]
+            is_best_jump = passes_gate and (val["E_model"] < best_jump)
+            if is_best_jump:
+                best_jump = val["E_model"]
+                torch.save(ckpt, run_dir / "cvit_best_jump.pt")
+
+            print(
+                f"Validation epoch {epoch}: "
+                f"val_gnrmse={val['val_gnrmse'] * 100:.4f}% "
+                f"rmse_K={val['val_rmse_K']:.4f}K "
+                f"jump_rmse_K={val['node_jump_rmse_K']:.4f}K "
+                f"E_model={val['E_model']:.4f} E_zero={val['E_zero']:.4f} "
+                f"(gate={'pass' if passes_gate else 'fail'})"
+                + ("  [best global]" if is_best_global else "")
+                + ("  [best jump]" if is_best_jump else ""),
+                flush=True,
+            )
+
+        history.append({k: (v if v != "" else None) for k, v in row.items()})
+        with open(metrics_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerow(row)
+
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "mu_global": mu, "sigma_global": sigma,
+            "config": config, "epoch": epochs - 1,
+            "sigma_dT_train": sigma_dT_train,
+            "interface_forcing": {
+                "a_ref": a_ref, "t_ramp": t_ramp, "dt": dt,
+                "t_final": t_final, "forcing_samples": forcing_samples,
+            },
+        },
+        run_dir / "cvit_last.pt",
+    )
+
+    summary = {
+        "seed": seed,
+        "best_val_gnrmse": best_global,
+        "best_E_model": (best_jump if best_jump != float("inf") else None),
+        "sigma_dT_train": sigma_dT_train,
+        "epochs": epochs,
+    }
+    with open(run_dir / "final_metrics.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+
 def run_config_seeds_pino(
     config: dict, base_run_dir: Path, seeds: list[int]
 ) -> dict[str, Any]:
     base_run_dir = Path(base_run_dir)
-    # Dispatch on the benchmark: the single-slab forcing benchmark trains a
-    # ForcingCViT physics-only on an online-sampled forcing image; every other
-    # benchmark uses the IC-conditioned diffusion CViT path.
+    # Dispatch on the benchmark: the interfaces benchmark trains an InterfaceCViT
+    # physics-only with the FV Crank-Nicolson interface residual; the single-slab
+    # forcing benchmark trains a ForcingCViT on an online-sampled forcing image;
+    # every other benchmark uses the IC-conditioned diffusion CViT path.
     bench = str(config.get("benchmark", {}).get("name", "diffusion"))
     runner = (
-        run_one_seed_forcing_pino if bench == "diffusion_forcing"
+        run_one_seed_interfaces_pino if bench == "interfaces"
+        else run_one_seed_forcing_pino if bench == "diffusion_forcing"
         else run_one_seed_pino
     )
     results = {}
@@ -1929,5 +2662,6 @@ __all__ = [
     "build_cvit",
     "run_one_seed_pino",
     "run_one_seed_forcing_pino",
+    "run_one_seed_interfaces_pino",
     "run_config_seeds_pino",
 ]
