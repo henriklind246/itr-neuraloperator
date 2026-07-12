@@ -224,6 +224,28 @@ class ProblemSpec(ABC):
         """
         return None
 
+    def sample_online_params(
+        self,
+        rng: np.random.Generator,
+        n: int,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        rng_profile: np.random.Generator | None = None,
+    ) -> list[dict]:
+        """Draw ``n`` fresh IID sim-param dicts for `online` physics collocation.
+
+        Same row schema as :meth:`sample_sim_params` (so the same channel/forcing
+        builders consume them), but each call draws parameters IID from the
+        benchmark's *target* distributions instead of a fixed global design.
+        Benchmarks that support online collocation override this; the default
+        raises so an `online` collocation source fails loudly rather than
+        silently reusing saved params.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support online collocation "
+            "sampling (sample_online_params)."
+        )
+
     # ---- optional OOD hooks (W3 out-of-distribution path; default off) ----
 
     def ood_axes(self) -> dict[str, OODAxis]:

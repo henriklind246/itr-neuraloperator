@@ -40,6 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.operators.train import (
+    _advance_scheduler,
     build_optimizer,
     build_scheduler,
     load_config,
@@ -301,7 +302,8 @@ def main() -> int:
 
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
 
         row = {"epoch": epoch, "loss": float(loss.detach().cpu()),
                "loss_r": val_r, "loss_ic": val_ic, "loss_bc": val_bc,

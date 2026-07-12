@@ -18,6 +18,7 @@ import json
 import math
 
 import numpy as np
+import pytest
 import torch
 
 from src.operators.train_pino import (
@@ -560,7 +561,7 @@ def _forcing_config(tmp_path):
             "device": "cpu",
             "epochs": 2,
             "validate_every": 1,
-            "learning_rate": 0.001,
+            "learning_rate": 5.0e-4,
             "weight_decay": 1e-5,
             "optimizer": "SOAP",
             "soap": {
@@ -572,7 +573,12 @@ def _forcing_config(tmp_path):
                 "merge_dims": False,
                 "precondition_1d": False,
             },
-            "scheduler": {"type": "StepLR", "step_size": 1, "gamma": 0.9},
+            "scheduler": {
+                "type": "PICViTExponential",
+                "decay_every": 500,
+                "decay_rate": 0.95,
+                "min_lr": 1.0e-5,
+            },
             "pino": {
                 "lambda_r": 1.0,
                 "lambda_ic": 1.0,
@@ -656,6 +662,12 @@ def test_e2e_forcing_gradnorm_disabled_is_noop(tmp_path):
     rows = _rows(run_dir)
     assert len(rows) == 2
 
+    assert float(rows[0]["lr_first"]) == pytest.approx(5.0e-4)
+    assert float(rows[0]["lr_last"]) == pytest.approx(5.0e-4)
+    expected_second_lr = 5.0e-4 * 0.95 ** (1.0 / 500.0)
+    assert float(rows[1]["lr_first"]) == pytest.approx(expected_second_lr)
+    assert float(rows[1]["lr_last"]) == pytest.approx(expected_second_lr)
+
     for r in rows:
         for col in ("loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left"):
             assert math.isfinite(float(r[col]))
@@ -671,4 +683,5 @@ def test_e2e_forcing_gradnorm_disabled_is_noop(tmp_path):
         assert r["grad_cosines"] in ("", None)
 
     ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
+    assert ckpt["config"]["training"]["optimizer"] == "SOAP"
     assert ckpt.get("gradnorm_state") is None

@@ -83,6 +83,21 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
     )
 
 
+def normalize_interface_scalars(interface_x, R_c) -> np.ndarray:
+    """Linear ``[x_hat, Rc_hat]`` over ``INTERFACE_X_RANGE``/``RC_RANGE``.
+
+    Exactly the ``build_cond_vector`` convention (lines 78, 80), factored out so
+    the ``InterfaceCViT`` parameter-token branch (trainer + validation) shares one
+    normalization with the dataset cond vector and cannot drift. Accepts scalars
+    or arrays and broadcasts; returns ``[..., 2]`` float32.
+    """
+    x_lo, x_hi = map(float, INTERFACE_X_RANGE)
+    r_lo, r_hi = map(float, RC_RANGE)
+    x_hat = (np.asarray(interface_x, dtype=np.float32) - x_lo) / (x_hi - x_lo)
+    rc_hat = (np.asarray(R_c, dtype=np.float32) - r_lo) / (r_hi - r_lo)
+    return np.stack([x_hat, rc_hat], axis=-1).astype(np.float32)
+
+
 # ----- sampling helpers (bit-parity with vary-interfaces generate_dataset) -----
 
 def _generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
@@ -206,36 +221,119 @@ class InterfacesProblem(ProblemSpec):
         interface_x_values = a + samples_scaled[:, 1] * (b - a)
         interface_x_values = _jitter_off_node(interface_x_values, a=a, b=b, Nx=Nx)
 
-        sim_params = []
-        for i in range(num_sims):
-            R_c = float(R_c_values[i])
-            interface_x = float(interface_x_values[i])
-
-            ic_family = sample_ic_family(rng)
-            ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
-            T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
-
-            temporal_family = "sin"
-            temporal_params = TEMPORAL_SAMPLERS["sin"](
-                rng_profile, dt=dt, t_final=t_final, **temporal_window
+        return [
+            self._build_sim_param(
+                float(R_c_values[i]), float(interface_x_values[i]),
+                rng, rng_profile, X, Y, Nx=Nx, Ny=Ny, dt=dt, t_final=t_final,
+                b_temp=b_temp, T_right=T_right, c=c, d=d,
+                temporal_window=temporal_window,
             )
+            for i in range(num_sims)
+        ]
 
-            spatial_family = "uniform"
-            spatial_params = SPATIAL_SAMPLERS["uniform"](rng_profile, c=c, d=d)
+    def _build_sim_param(
+        self,
+        R_c: float,
+        interface_x: float,
+        rng: np.random.Generator,
+        rng_profile: np.random.Generator,
+        X: np.ndarray,
+        Y: np.ndarray,
+        *,
+        Nx: int,
+        Ny: int,
+        dt: float,
+        t_final: float,
+        b_temp: float,
+        T_right: float,
+        c: float,
+        d: float,
+        temporal_window: dict,
+    ) -> dict:
+        """Assemble one sim-param dict from fixed (R_c, interface_x) plus fresh
+        IC/forcing draws. Shared by the saved LHS path and the online sampler so
+        the IC family, forcing family, and RNG consumption order stay identical.
+        """
+        ic_family = sample_ic_family(rng)
+        ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+        T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
 
-            sim_params.append({
-                "R_c": R_c,
-                "interface_x": interface_x,
-                "T0": T0,
-                "ic_family": ic_family,
-                "ic_params": ic_params,
-                "temporal_family": temporal_family,
-                "temporal_params": temporal_params,
-                "spatial_family": spatial_family,
-                "spatial_params": spatial_params,
-            })
+        temporal_family = "sin"
+        temporal_params = TEMPORAL_SAMPLERS["sin"](
+            rng_profile, dt=dt, t_final=t_final, **temporal_window
+        )
 
-        return sim_params
+        spatial_family = "uniform"
+        spatial_params = SPATIAL_SAMPLERS["uniform"](rng_profile, c=c, d=d)
+
+        return {
+            "R_c": float(R_c),
+            "interface_x": float(interface_x),
+            "T0": T0,
+            "ic_family": ic_family,
+            "ic_params": ic_params,
+            "temporal_family": temporal_family,
+            "temporal_params": temporal_params,
+            "spatial_family": spatial_family,
+            "spatial_params": spatial_params,
+        }
+
+    def sample_online_params(
+        self,
+        rng: np.random.Generator,
+        n: int,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        rng_profile: np.random.Generator | None = None,
+    ) -> list[dict]:
+        """Draw ``n`` fresh IID interface sims for `online` physics collocation.
+
+        Same row schema as :meth:`sample_sim_params`. Each call draws
+        ``(R_c, interface_x)`` IID from the marginal target ranges
+        (``RC_RANGE`` / ``INTERFACE_X_RANGE``) rather than placing them on the
+        fixed global LHS design used for the saved set: the marginals match, but
+        the joint coverage is IID, not the LHS grid, and successive minibatches
+        are independent. ``interface_x`` is jittered off grid nodes exactly as in
+        generation so the FV interface face is well-defined. IC family and the
+        fixed sin/uniform forcing are drawn through the same public samplers.
+        """
+        if rng_profile is None:
+            rng_profile = rng
+        X = grids["X"]
+        Y = grids["Y"]
+        x_grid = grids["x_grid"]
+        y_grid = grids["y_grid"]
+        Nx, Ny = X.shape[0], X.shape[1]
+        a = float(x_grid[0])
+        b = float(x_grid[-1])
+        c = float(y_grid[0])
+        d = float(y_grid[-1])
+
+        dt = float(time_cfg["dt"])
+        t_final = float(time_cfg["t_final"])
+        b_temp = float(time_cfg.get("b", 1.0))
+        T_right = float(time_cfg.get("T_right", 300.0))
+        temporal_window = dict(
+            t_on=float(time_cfg.get("t_on", 0.0)),
+            t_off=float(time_cfg.get("t_off", 0.2)),
+            phase=float(time_cfg.get("phase", 0.0)),
+            tukey_alpha=float(time_cfg.get("tukey_alpha", 0.5)),
+        )
+
+        R_c_values = rng.uniform(RC_RANGE[0], RC_RANGE[1], size=n)
+        ix_frac = rng.uniform(INTERFACE_X_RANGE[0], INTERFACE_X_RANGE[1], size=n)
+        interface_x_values = (a + ix_frac * (b - a)).astype(np.float64)
+        interface_x_values = _jitter_off_node(interface_x_values, a=a, b=b, Nx=Nx)
+
+        return [
+            self._build_sim_param(
+                float(R_c_values[i]), float(interface_x_values[i]),
+                rng, rng_profile, X, Y, Nx=Nx, Ny=Ny, dt=dt, t_final=t_final,
+                b_temp=b_temp, T_right=T_right, c=c, d=d,
+                temporal_window=temporal_window,
+            )
+            for i in range(n)
+        ]
 
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
         y_grid = base_kwargs["y_grid"]

@@ -80,6 +80,67 @@ def _node_k(x_grid: np.ndarray, k_left: float, k_right: float,
     return np.where(x_grid < interface_x, float(k_left), float(k_right))
 
 
+@dataclass
+class InterfaceLocation:
+    """Where a single vertical interface sits on the FV grid.
+
+    Separates the EXACT physical position (`interface_x_exact`, never quantized)
+    from its discrete FV face (`face_idx` and the sub-cell widths `h_left`/
+    `h_right` to that face). Continuous quantities (signed distance, the K-map,
+    query-relative side) must use `interface_x_exact` so they never snap to a
+    face center; the discrete conductance / dx adjustment / band masks use
+    `face_idx`/`h_left`/`h_right`.
+
+    Nodes never coincide with the interface (it is a face; the solver forbids an
+    on-node interface via `1 <= face_idx <= Nx-3`), so `left_node_mask`
+    (`x <= x_Gamma`, matching `problems/interfaces._material_channel`) and
+    `left_cell_mask` (node index `<= face_idx`) are identical here; both are
+    provided so the K-map side and the discrete band masks read from one source.
+    """
+    interface_x_exact: float
+    face_idx: int
+    h_left: float
+    h_right: float
+    left_node_mask: np.ndarray   # (Nx,) bool, x <= x_Gamma
+    left_cell_mask: np.ndarray   # (Nx,) bool, node index <= face_idx
+
+
+def locate_interface(x_grid, interface_x: float) -> InterfaceLocation:
+    """Locate `interface_x` on the uniform x-grid, mirroring the solver's face
+    indexing (`fv_solver_2d._validate_and_index_interfaces`).
+
+    `face_idx = floor((x_Gamma - a) / hx)` with sub-cell widths
+    `h_left = x_Gamma - x_node[face_idx]`, `h_right = hx - h_left`. Raises if the
+    interface lands outside the solver's admissible face band
+    `1 <= face_idx <= Nx-3` (so the Neumann/Dirichlet closures stay clear of it).
+    """
+    xg = np.asarray(x_grid, dtype=float)
+    Nx = xg.shape[0]
+    a = float(xg[0])
+    hx = float(xg[1] - xg[0])
+    x_exact = float(interface_x)
+
+    face_idx = int(np.floor((x_exact - a) / hx))
+    if face_idx < 1 or face_idx > Nx - 3:
+        raise ValueError(
+            f"interface_x={x_exact} maps to face slot {face_idx}; must satisfy "
+            f"1 <= face_idx <= {Nx - 3} (Nx={Nx})."
+        )
+    x_left_node = a + face_idx * hx
+    h_left = x_exact - x_left_node
+    h_right = hx - h_left
+
+    node_idx = np.arange(Nx)
+    return InterfaceLocation(
+        interface_x_exact=x_exact,
+        face_idx=face_idx,
+        h_left=float(h_left),
+        h_right=float(h_right),
+        left_node_mask=(xg <= x_exact),
+        left_cell_mask=(node_idx <= face_idx),
+    )
+
+
 def build_face_conductances(x_grid, y_grid, k_left: float, k_right: float,
                             interface_x: float, R_c,
                             device=None, dtype=torch.float64):
@@ -233,6 +294,118 @@ def build_cn_geom_batched(x_grid, y_grid, k_left: float, k_right: float,
     dxi = dx[None, :, None]    # (1,Nx,1)
     dyj = dy[None, None, :]    # (1,1,Ny)
     two_rc = 2.0 * rho_cp_val
+
+    r_w[:, 1:Nx - 1, :] = dt * G_x[:, 0:Nx - 2, :] / (two_rc * dxi[:, 1:Nx - 1, :])
+    r_e[:, 0:Nx - 1, :] = dt * G_x[:, 0:Nx - 1, :] / (two_rc * dxi[:, 0:Nx - 1, :])
+    r_s[:, 0:Nx - 1, 1:Ny] = dt * G_y[:, 0:Nx - 1, 0:Ny - 1] / (two_rc * dyj[:, :, 1:Ny])
+    r_n[:, 0:Nx - 1, 0:Ny - 1] = dt * G_y[:, 0:Nx - 1, 0:Ny - 1] / (two_rc * dyj[:, :, 0:Ny - 1])
+
+    interior_mask = torch.zeros((Nx, Ny), dtype=torch.bool, device=device)
+    interior_mask[1:Nx - 1, 1:Ny - 1] = True
+
+    rho_cp = torch.full((Nx, Ny), rho_cp_val, device=device, dtype=dtype)
+    return FVGeom(
+        G_x=G_x, G_y=G_y, dx=dx, dy=dy, rho_cp=rho_cp,
+        r_w=r_w, r_e=r_e, r_s=r_s, r_n=r_n,
+        interior_mask=interior_mask, dt=float(dt),
+        sigma_global=float(sigma_global), hx=float(hx),
+    )
+
+
+def build_cn_geom_per_interface(x_grid, y_grid, k_left: float, k_right: float,
+                                interface_x_batch, R_c_batch, dt: float,
+                                sigma_global: float = 1.0,
+                                rho: float = 1.0, cp: float = 1.0,
+                                device=None, dtype=torch.float64) -> FVGeom:
+    """Per-sample CN geometry for a batch of DISTINCT interface locations and
+    contact resistances.
+
+    Unlike `build_cn_geom_batched` (which fixes `interface_x` and only varies the
+    single interface x-face column with `R_c`), moving `interface_x` per sample
+    shifts `face_idx`, the sub-cell widths `h_L`/`h_R`, the material split of
+    every x-face and y-node conductance, and the two interface-adjacent `dx`
+    widths. So EVERY material-dependent quantity is batched here:
+      - `G_x` `(B, Nx-1, Ny)`: non-interface faces `k_face/hx` split by each
+        sample's interface, interface column the series conductance
+        `1/(h_L/k_L + R_c + h_R/k_R)`.
+      - `G_y` `(B, Nx, Ny-1)`: each node's `k/hx` per the sample's interface.
+      - `dx` `(B, Nx)`: the two interface-flanking widths shift with `h_L`/`h_R`.
+      - `r_w/r_e/r_s/r_n` `(B, Nx, Ny)`: derived from the batched `G_x/G_y/dx`.
+    `rho_cp` (uniform), `dy`, `interior_mask`, and `hx` are batch-independent.
+
+    Reduces bit-for-bit to `build_cn_geom` / `build_cn_geom_batched` when all
+    `interface_x` (and `R_c`) are equal (the interface is off-node, so the K-map
+    `<=` and the solver's strict `<` agree). Mirrors
+    `build_face_conductances` + `build_cn_geom`.
+    """
+    iface = torch.as_tensor(interface_x_batch, device=device, dtype=dtype).reshape(-1)
+    R_c_t = torch.as_tensor(R_c_batch, device=device, dtype=dtype).reshape(-1)
+    if iface.shape[0] != R_c_t.shape[0]:
+        raise ValueError(
+            f"interface_x_batch ({iface.shape[0]}) and R_c_batch "
+            f"({R_c_t.shape[0]}) must have the same length."
+        )
+    B = iface.shape[0]
+
+    xg = np.asarray(x_grid, dtype=float)
+    yg = np.asarray(y_grid, dtype=float)
+    Nx = xg.shape[0]
+    Ny = yg.shape[0]
+    a = float(xg[0])
+    hx = float(xg[1] - xg[0])
+
+    # Validate every interface once via the canonical locator (raises on an
+    # out-of-band or on-node interface) and gather the discrete indices.
+    locs = [locate_interface(xg, float(v)) for v in iface.tolist()]
+    face_idx = torch.as_tensor([loc.face_idx for loc in locs],
+                               device=device, dtype=torch.long)          # (B,)
+    # Mirror `build_face_conductances`'s h_L/h_R construction bit-for-bit
+    # (h_R = x_right_node - interface_x, NOT hx - h_L) so the per-interface
+    # geometry reduces exactly to `build_cn_geom` when interfaces coincide.
+    h_L = iface - (a + face_idx.to(dtype) * hx)                          # (B,)
+    h_R = (a + (face_idx.to(dtype) + 1.0) * hx) - iface                 # (B,)
+
+    x_nodes = torch.as_tensor(xg, device=device, dtype=dtype)           # (Nx,)
+    face_pos = torch.as_tensor(a + (np.arange(Nx - 1) + 0.5) * hx,
+                               device=device, dtype=dtype)              # (Nx-1,)
+    kL = torch.as_tensor(float(k_left), device=device, dtype=dtype)
+    kR = torch.as_tensor(float(k_right), device=device, dtype=dtype)
+
+    # --- G_x (B, Nx-1, Ny) ---
+    left_face = face_pos[None, :] < iface[:, None]                      # (B, Nx-1)
+    G_x2d = torch.where(left_face, kL, kR) / hx                         # (B, Nx-1)
+    G_series = 1.0 / (h_L / float(k_left) + R_c_t + h_R / float(k_right))  # (B,)
+    is_iface = (torch.arange(Nx - 1, device=device)[None, :]
+                == face_idx[:, None])                                    # (B, Nx-1)
+    G_x2d = torch.where(is_iface, G_series[:, None], G_x2d)             # (B, Nx-1)
+    G_x = G_x2d[:, :, None].expand(B, Nx - 1, Ny).contiguous()
+
+    # --- G_y (B, Nx, Ny-1) ---
+    left_node = x_nodes[None, :] < iface[:, None]                       # (B, Nx)
+    k_nodes = torch.where(left_node, kL, kR)                            # (B, Nx)
+    G_y = (k_nodes / hx)[:, :, None].expand(B, Nx, Ny - 1).contiguous()
+
+    # --- dx (B, Nx): boundary halves, then interface-flanking widths ---
+    dx = torch.full((B, Nx), hx, device=device, dtype=dtype)
+    dx[:, 0] = hx / 2.0
+    dx[:, Nx - 1] = hx / 2.0
+    brow = torch.arange(B, device=device)
+    dx[brow, face_idx] = 0.5 * hx + h_L
+    dx[brow, face_idx + 1] = h_R + 0.5 * hx
+
+    dy = torch.full((Ny,), hx, device=device, dtype=dtype)
+    dy[0] = hx / 2.0
+    dy[Ny - 1] = hx / 2.0
+
+    rho_cp_val = float(rho) * float(cp)
+    two_rc = 2.0 * rho_cp_val
+    r_w = torch.zeros((B, Nx, Ny), device=device, dtype=dtype)
+    r_e = torch.zeros((B, Nx, Ny), device=device, dtype=dtype)
+    r_s = torch.zeros((B, Nx, Ny), device=device, dtype=dtype)
+    r_n = torch.zeros((B, Nx, Ny), device=device, dtype=dtype)
+
+    dxi = dx[:, :, None]        # (B, Nx, 1)
+    dyj = dy[None, None, :]     # (1, 1, Ny)
 
     r_w[:, 1:Nx - 1, :] = dt * G_x[:, 0:Nx - 2, :] / (two_rc * dxi[:, 1:Nx - 1, :])
     r_e[:, 0:Nx - 1, :] = dt * G_x[:, 0:Nx - 1, :] / (two_rc * dxi[:, 0:Nx - 1, :])

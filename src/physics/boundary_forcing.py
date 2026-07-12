@@ -44,6 +44,13 @@ PULSE_SLOTS = 4
 FORCING_BINS = 16
 SIN_INTEGRAL_SAMPLES = 2049
 
+# Sampled-waveform representation for the interface CViT-PINO model input (§0).
+# `A_REF_FLUX` matches A_AMP_REF / SIN_AMP_RANGE[1] so a(t)/A_ref is O(1); the
+# waveform is sampled on `FORCING_TEMPORAL_SAMPLES` points over the WHOLE
+# prescribed schedule [0, t_final] with absolute normalized time.
+A_REF_FLUX = 300.0
+FORCING_TEMPORAL_SAMPLES = 128
+
 # Startup ramp on a(t) so q_L(0) = 0 (consistent with a zero left gradient at
 # t=0). `ramp_seconds` is a physical dataset parameter persisted with the data;
 # `default_ramp_seconds` is only the fallback initializer. 2*dt stays well under
@@ -576,6 +583,66 @@ def build_qL_integral(temporal_family: str, temporal_params: dict,
         ) * s_vec
 
     return q_left_integral, s_vec
+
+
+def build_interface_forcing(
+    temporal_family: str, temporal_params: dict,
+    spatial_family: str, spatial_params: dict,
+    y_grid: np.ndarray,
+    t_n: float, t_np1: float, t_final: float, t_ramp: float,
+    *,
+    a_ref: float = A_REF_FLUX,
+    n_forcing_samples: int = FORCING_TEMPORAL_SAMPLES,
+):
+    """Canonical single source for the interface CViT-PINO forcing (§0).
+
+    Emits BOTH the sampled waveform the model sees and the physical boundary
+    flux the FV residual enforces, from the SAME
+    ``(temporal_family, temporal_params, spatial_family, spatial_params,
+    t_ramp)``, so the representation can never drift from the flux. All four
+    outputs use the ramped temporal ``ramp(t) * a(t)`` (so q_L(0) = 0), exactly
+    like ``build_qL`` / ``build_qL_integral`` and the trainer's step assembly.
+
+    Returns ``(forcing_seq, qL_n, qL_np1, qL_int)``:
+      - ``forcing_seq`` ``(n_forcing_samples, 2)`` float32: the model input token
+        stream ``[(tau_m / t_final, a(tau_m) / a_ref)]`` sampled on
+        ``tau_m = linspace(0, t_final, n_forcing_samples)`` — the COMPLETE
+        prescribed schedule with ABSOLUTE normalized time (not interval-relative).
+        This assumes the whole loading schedule is known before prediction
+        (forward / design use); a causal variant would restrict this window.
+      - ``qL_n``  ``(Ny,)`` float64: physical inward flux ``a(t_n)   * s(y)``.
+      - ``qL_np1````(Ny,)`` float64: physical inward flux ``a(t_np1) * s(y)``.
+      - ``qL_int````(Ny,)`` float64: the EXACT signed step integral
+        ``(∫_{t_n}^{t_np1} ramp*a dt) * s(y)`` — an integral, NOT an average —
+        to match ``full_bc_cn_residual``'s exact left-Neumann RHS. Physical
+        units; the residual divides by ``sigma_global`` internally, so the model
+        output stays normalized.
+
+    Interfaces uses ``spatial_family="uniform"`` (s(y) = 1), so the per-sim
+    forcing signal is entirely in the temporal waveform; the (y, t) image the
+    ForcingCViT uses is unnecessary here.
+    """
+    y_grid = np.asarray(y_grid, dtype=float)
+    a_fn = ramped_temporal(temporal_family, temporal_params, t_ramp)
+    s_vec = np.asarray(
+        SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params), dtype=float
+    )
+
+    tau = np.linspace(0.0, float(t_final), int(n_forcing_samples))
+    a_tau = np.array([float(a_fn(float(tm))) for tm in tau], dtype=np.float64)
+    forcing_seq = np.stack(
+        [(tau / float(t_final)).astype(np.float32),
+         (a_tau / float(a_ref)).astype(np.float32)],
+        axis=-1,
+    ).astype(np.float32)
+
+    qL_n = (float(a_fn(float(t_n))) * s_vec).astype(np.float64)
+    qL_np1 = (float(a_fn(float(t_np1))) * s_vec).astype(np.float64)
+    a_int = integrate_temporal_ramped_signed(
+        temporal_family, temporal_params, float(t_n), float(t_np1), float(t_ramp)
+    )
+    qL_int = (float(a_int) * s_vec).astype(np.float64)
+    return forcing_seq, qL_n, qL_np1, qL_int
 
 
 def reconstruct_qL(temporal_family: str, temporal_params: dict,

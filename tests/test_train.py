@@ -14,6 +14,8 @@ from src.operators.fno2d import FNO2d
 from src.operators.losses import SpatiallyWeightedMSE, build_interface_mask
 
 from src.operators.train import (
+    PICViTExponentialScheduler,
+    _advance_scheduler,
     _per_pair_rel_l2_percent,
     _build_physics_loader,
     _selection_metric_value,
@@ -800,6 +802,307 @@ class TestRIGNOThreePhaseSchedule:
 
         with pytest.raises(ValueError, match="scheduler.peak_lr must match training.learning_rate"):
             build_scheduler(config, optimizer)
+
+
+class TestPICViTExponentialSchedule:
+    @staticmethod
+    def _config(**scheduler_overrides):
+        scheduler = {
+            "type": "PICViTExponential",
+            "decay_every": 500,
+            "decay_rate": 0.95,
+            "min_lr": 1.0e-5,
+            **scheduler_overrides,
+        }
+        return {
+            "training": {
+                "learning_rate": 5.0e-4,
+                "weight_decay": 0.0,
+                "optimizer": "AdamW",
+                "scheduler": scheduler,
+            }
+        }
+
+    @staticmethod
+    def _scheduler(optimizer=None, **scheduler_overrides):
+        if optimizer is None:
+            param = torch.nn.Parameter(torch.tensor([1.0]))
+            optimizer = torch.optim.SGD([param], lr=5.0e-4)
+        return PICViTExponentialScheduler(
+            optimizer,
+            peak_lr=5.0e-4,
+            decay_every=scheduler_overrides.get("decay_every", 500),
+            decay_rate=scheduler_overrides.get("decay_rate", 0.95),
+            min_lr=scheduler_overrides.get("min_lr", 1.0e-5),
+        )
+
+    @pytest.mark.parametrize(
+        ("update", "expected"),
+        [
+            (0, 5.0000000e-4),
+            (1, 4.999487093365246e-4),
+            (300, 4.848463912938404e-4),
+            (500, 4.7500000e-4),
+            (1500, 4.2868750e-4),
+            (38133, 1.0000886195936974e-5),
+            (38134, 1.0e-5),
+        ],
+    )
+    def test_expected_update_values(self, update, expected):
+        scheduler = self._scheduler()
+        assert scheduler.lr_for_update(update) == pytest.approx(
+            expected, rel=1e-12, abs=1e-15
+        )
+
+    def test_first_update_uses_peak_and_step_prepares_next_update(self):
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.SGD([param], lr=5.0e-4)
+        scheduler = self._scheduler(optimizer)
+
+        assert scheduler.next_update == 0
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(
+            scheduler.lr_for_update(0)
+        )
+        optimizer.step()
+        scheduler.step()
+
+        assert scheduler.next_update == 1
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(
+            scheduler.lr_for_update(1)
+        )
+
+    def test_decay_is_smooth_not_staircase(self):
+        scheduler = self._scheduler()
+        assert scheduler.lr_for_update(1) < scheduler.lr_for_update(0)
+        assert scheduler.lr_for_update(499) > scheduler.lr_for_update(500)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"peak_lr": 0.0}, "positive peak_lr"),
+            ({"decay_every": 0}, "decay_every > 0"),
+            ({"decay_rate": 0.0}, "0 < decay_rate < 1"),
+            ({"decay_rate": 1.0}, "0 < decay_rate < 1"),
+            ({"min_lr": 0.0}, "0 < min_lr <= peak_lr"),
+            ({"min_lr": 1.0e-3}, "0 < min_lr <= peak_lr"),
+        ],
+    )
+    def test_invalid_config_raises(self, kwargs, match):
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        peak_lr = kwargs.pop("peak_lr", 5.0e-4)
+        optimizer = torch.optim.SGD([param], lr=peak_lr)
+        with pytest.raises(ValueError, match=match):
+            PICViTExponentialScheduler(
+                optimizer,
+                peak_lr=peak_lr,
+                decay_every=kwargs.get("decay_every", 500),
+                decay_rate=kwargs.get("decay_rate", 0.95),
+                min_lr=kwargs.get("min_lr", 1.0e-5),
+            )
+
+    def test_parameter_groups_must_share_peak_lr(self):
+        p0 = torch.nn.Parameter(torch.tensor([1.0]))
+        p1 = torch.nn.Parameter(torch.tensor([2.0]))
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [p0], "lr": 5.0e-4},
+                {"params": [p1], "lr": 1.0e-3},
+            ]
+        )
+        with pytest.raises(ValueError, match="every optimizer parameter group"):
+            self._scheduler(optimizer)
+
+    def test_equal_parameter_groups_receive_same_scheduled_lr(self):
+        p0 = torch.nn.Parameter(torch.tensor([1.0]))
+        p1 = torch.nn.Parameter(torch.tensor([2.0]))
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [p0], "lr": 5.0e-4},
+                {"params": [p1], "lr": 5.0e-4},
+            ]
+        )
+        scheduler = self._scheduler(optimizer)
+        scheduler.step()
+        assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+            [scheduler.lr_for_update(1)] * 2
+        )
+
+    def test_step_unit_routing_and_skipped_updates(self):
+        update_scheduler = self._scheduler()
+        _advance_scheduler(
+            update_scheduler, unit="update", successful_updates=0
+        )
+        _advance_scheduler(
+            update_scheduler, unit="epoch", successful_updates=1
+        )
+        assert update_scheduler.next_update == 0
+
+        _advance_scheduler(
+            update_scheduler, unit="update", successful_updates=1
+        )
+        assert update_scheduler.next_update == 1
+
+        param = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.SGD([param], lr=1.0e-3)
+        epoch_scheduler = build_scheduler(
+            {
+                "training": {
+                    "scheduler": {"type": "StepLR", "step_size": 1, "gamma": 0.5}
+                }
+            },
+            optimizer,
+        )
+        _advance_scheduler(
+            epoch_scheduler, unit="update", successful_updates=1
+        )
+        _advance_scheduler(
+            epoch_scheduler, unit="epoch", successful_updates=0
+        )
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-3)
+        optimizer.step()
+        _advance_scheduler(
+            epoch_scheduler, unit="epoch", successful_updates=1
+        )
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(5.0e-4)
+
+    def test_train_one_epoch_steps_once_per_optimizer_update(self):
+        model = _make_tiny_fno()
+        loader = _make_dict_loader(n_samples=4, batch_size=2)
+        loss_fn = SpatiallyWeightedMSE(
+            x_grid=np.linspace(0.0, 1.0, 11),
+            y_grid=np.linspace(0.0, 1.0, 11),
+            interface_weight=1.0,
+        )
+        config = self._config()
+        optimizer = build_optimizer(config, model.parameters())
+        scheduler = build_scheduler(config, optimizer)
+
+        metrics = train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            loss_fn,
+            torch.device("cpu"),
+            scheduler=scheduler,
+        )
+
+        assert metrics["successful_updates"] == 2
+        assert metrics["lr_first"] == pytest.approx(scheduler.lr_for_update(0))
+        assert metrics["lr_last"] == pytest.approx(scheduler.lr_for_update(1))
+        assert scheduler.next_update == 2
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(
+            scheduler.lr_for_update(2)
+        )
+
+    def test_zero_update_epoch_logs_nan_and_does_not_advance(self):
+        model = _make_tiny_fno()
+        loader = _make_dict_loader(n_samples=0, batch_size=2)
+        loss_fn = SpatiallyWeightedMSE(
+            x_grid=np.linspace(0.0, 1.0, 11),
+            y_grid=np.linspace(0.0, 1.0, 11),
+            interface_weight=1.0,
+        )
+        config = self._config()
+        optimizer = build_optimizer(config, model.parameters())
+        scheduler = build_scheduler(config, optimizer)
+
+        metrics = train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            loss_fn,
+            torch.device("cpu"),
+            scheduler=scheduler,
+        )
+        _advance_scheduler(
+            scheduler,
+            unit="epoch",
+            successful_updates=metrics["successful_updates"],
+        )
+
+        assert metrics["successful_updates"] == 0
+        assert math.isnan(metrics["lr_first"])
+        assert math.isnan(metrics["lr_last"])
+        assert scheduler.next_update == 0
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(5.0e-4)
+
+    def test_state_version_and_schedule_mismatch_raise(self):
+        scheduler = self._scheduler()
+        state = scheduler.state_dict()
+
+        wrong_version = copy.deepcopy(state)
+        wrong_version["version"] = 2
+        with pytest.raises(ValueError, match="state version"):
+            scheduler.load_state_dict(wrong_version)
+
+        mismatch = copy.deepcopy(state)
+        mismatch["decay_rate"] = 0.9
+        with pytest.raises(ValueError, match="resume mismatch for decay_rate"):
+            scheduler.load_state_dict(mismatch)
+
+    def test_uninterrupted_and_resumed_sequences_match(self):
+        def make_pair(initial_state=None):
+            model = torch.nn.Linear(1, 1, bias=False)
+            if initial_state is not None:
+                model.load_state_dict(initial_state)
+            optimizer = torch.optim.SGD(model.parameters(), lr=5.0e-4)
+            scheduler = self._scheduler(optimizer)
+            return model, optimizer, scheduler
+
+        def run_steps(model, optimizer, scheduler, count):
+            lrs = []
+            x = torch.tensor([[2.0]])
+            target = torch.tensor([[0.5]])
+            for _ in range(count):
+                optimizer.zero_grad()
+                loss = (model(x) - target).pow(2).mean()
+                loss.backward()
+                lrs.append(float(optimizer.param_groups[0]["lr"]))
+                optimizer.step()
+                scheduler.step()
+            return lrs
+
+        torch.manual_seed(17)
+        initial_model = torch.nn.Linear(1, 1, bias=False).state_dict()
+        full_model, full_optimizer, full_scheduler = make_pair(initial_model)
+        full_lrs = run_steps(full_model, full_optimizer, full_scheduler, 7)
+
+        split_model, split_optimizer, split_scheduler = make_pair(initial_model)
+        first_lrs = run_steps(split_model, split_optimizer, split_scheduler, 4)
+        model_state = copy.deepcopy(split_model.state_dict())
+        optimizer_state = copy.deepcopy(split_optimizer.state_dict())
+        scheduler_state = copy.deepcopy(split_scheduler.state_dict())
+        optimizer_state["param_groups"][0]["lr"] = 123.0
+
+        resumed_model, resumed_optimizer, resumed_scheduler = make_pair(initial_model)
+        resumed_model.load_state_dict(model_state)
+        resumed_optimizer.load_state_dict(optimizer_state)
+        resumed_scheduler.load_state_dict(scheduler_state)
+        assert resumed_optimizer.param_groups[0]["lr"] == pytest.approx(
+            resumed_scheduler.lr_for_update(4)
+        )
+        resumed_lrs = run_steps(
+            resumed_model, resumed_optimizer, resumed_scheduler, 3
+        )
+
+        assert first_lrs + resumed_lrs == pytest.approx(full_lrs)
+        for resumed_param, full_param in zip(
+            resumed_model.parameters(), full_model.parameters()
+        ):
+            assert torch.equal(resumed_param, full_param)
+
+    def test_diffusion_forcing_config_selects_picvit_only(self, monkeypatch):
+        monkeypatch.setenv("BENCHMARK", "diffusion_forcing")
+        monkeypatch.setenv("REPRESENTATION", "temporal_encoder")
+        forcing_cfg = load_config()
+        assert forcing_cfg["training"]["scheduler"]["type"] == "PICViTExponential"
+        assert forcing_cfg["training"]["learning_rate"] == pytest.approx(5.0e-4)
+        assert forcing_cfg["training"]["optimizer"] == "AdamW"
+
+        monkeypatch.setenv("BENCHMARK", "forcing")
+        default_cfg = load_config()
+        assert default_cfg["training"]["scheduler"]["type"] == "RIGNOThreePhase"
+        assert default_cfg["training"]["learning_rate"] == pytest.approx(2.0e-3)
 
 
 class TestSearchSpaceConfig:

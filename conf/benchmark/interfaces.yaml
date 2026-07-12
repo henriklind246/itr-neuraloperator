@@ -16,3 +16,23 @@ training:
     # interface_x varies per sim in [0.2, 0.8]; track each sample's location for
     # the weighted loss and interface metric instead of the fixed interface_x.
     per_sample_interface_x: true
+  # Physics-only (PINO) InterfaceCViT training reads training.pino; these pin the
+  # interface-path knobs (the rest fall back to conf/config.yaml). saved_train
+  # collocation draws interface_x / R_c / forcing params from the saved TRAIN
+  # sim_params.npy and scores the FV Crank-Nicolson interface residual. The IC
+  # varies per sim here, so lambda_ic > 0 anchors the varying initial field
+  # (unlike the constant-IC diffusion_forcing benchmark). Causal interior
+  # weighting stays OFF for the tiny fixed-parameter debug run; enable it (with
+  # stratified_time_sampling) for the 41-epoch screen onward.
+  pino:
+    collocation_source: saved_train
+    lambda_r: 1.0
+    lambda_ic: 1.0
+    lambda_bc: 1.0
+    lambda_bc_left: null
+    forcing_samples: 128
+    intervals_per_sim: 2
+    stratified_time_sampling: true
+    causal_num_bins: 6
+    causal:
+      enabled: false
