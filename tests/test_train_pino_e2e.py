@@ -20,12 +20,17 @@ import math
 import numpy as np
 import pytest
 import torch
+import src.operators.train_pino as train_pino_mod
 
 from src.operators.train_pino import (
+    _adapt_causal_eps,
+    _causal_bin_stats,
     _causal_residual_loss,
     _causal_weights,
     _curriculum_weights,
     _ic_loss,
+    _resolve_forcing_causal,
+    _time_bin_index,
     run_one_seed_forcing_pino,
     run_one_seed_pino,
     sample_forcing_params,
@@ -214,8 +219,8 @@ def test_causal_residual_loss_masks_late_violation():
     # huge late residual, the late bin is suppressed and the reported loss tracks
     # the (small) early bins rather than the unweighted mean.
     t_final, n_bins = 1.0, 4
-    t_r = torch.tensor([0.1, 0.4, 0.9]).view(1, -1, 1)
-    r = torch.tensor([1.0, 1.0, 10.0]).view(1, -1, 1)
+    t_r = torch.tensor([0.0, 0.3, 0.6, 1.0]).view(1, -1, 1)
+    r = torch.tensor([1.0, 1.0, 1.0, 10.0]).view(1, -1, 1)
     loss, bin_mean = _causal_residual_loss(r, t_r, t_final, n_bins, eps_causal=5.0)
     plain = (r ** 2).mean()
     assert float(loss) < float(plain)
@@ -223,6 +228,48 @@ def test_causal_residual_loss_masks_late_violation():
     # the late bin's raw residual is still visible in the (detached) diagnostic.
     assert bin_mean.shape == (n_bins,)
     assert float(bin_mean[-1]) > float(bin_mean[0])
+
+
+def test_causal_empty_bin_falls_back_to_pointwise_mse():
+    t_r = torch.tensor([0.1, 0.9]).view(1, -1, 1)
+    r = torch.tensor([1.0, 10.0]).view(1, -1, 1)
+    loss, _ = _causal_residual_loss(r, t_r, 1.0, 4, eps_causal=5.0)
+    assert torch.equal(loss, (r ** 2).mean())
+
+
+def test_causal_bins_average_per_input_and_clamp_endpoints():
+    t_r = torch.tensor([0.0, 0.2, 0.8, 1.0]).view(1, -1, 1)
+    idx = _time_bin_index(t_r, 1.0, 2)
+    assert idx.reshape(-1).tolist() == [0, 0, 1, 1]
+    r = torch.tensor([
+        [1.0, 3.0, 2.0, 4.0],
+        [2.0, 4.0, 1.0, 3.0],
+    ]).unsqueeze(-1)
+    means, counts, pointwise = _causal_bin_stats(r, t_r, 1.0, 2)
+    expected = torch.tensor([(5.0 + 10.0) / 2.0, (10.0 + 5.0) / 2.0])
+    assert torch.allclose(means, expected)
+    assert counts.tolist() == [2.0, 2.0]
+    assert torch.allclose(pointwise, (r ** 2).mean())
+
+
+def test_causal_config_alias_validation_and_adaptation():
+    cfg = _resolve_forcing_causal({"enabled": True, "eps_causal": 0.1})
+    assert cfg["initial_eps"] == pytest.approx(0.1)
+    cfg2 = _resolve_forcing_causal({
+        "enabled": True, "initial_eps": 0.2, "eps_causal": 0.1,
+        "min_eps": 1e-3, "max_eps": 1.0, "step_size": 5.0,
+    })
+    assert cfg2["initial_eps"] == pytest.approx(0.2)
+    increased, action = _adapt_causal_eps(
+        0.2, torch.tensor([1.0, 1.0]), cfg2, populated=True,
+    )
+    assert (increased, action) == (1.0, "increase")
+    decreased, action = _adapt_causal_eps(
+        1e-3, torch.tensor([0.2, 0.0]), cfg2, populated=True,
+    )
+    assert (decreased, action) == (1e-3, "decrease")
+    with pytest.raises(ValueError, match="step_size"):
+        _resolve_forcing_causal({"step_size": 1.0})
 
 
 def test_e2e_curriculum_ic_first(tmp_path):
@@ -685,3 +732,112 @@ def test_e2e_forcing_gradnorm_disabled_is_noop(tmp_path):
     ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
     assert ckpt["config"]["training"]["optimizer"] == "SOAP"
     assert ckpt.get("gradnorm_state") is None
+
+
+def test_e2e_forcing_causal_warmup_and_completion_state(tmp_path):
+    _write_synthetic_forcing(tmp_path)
+    cfg = _forcing_config(tmp_path)
+    cfg["training"]["pino"]["causal"] = {
+        "enabled": True, "n_bins": 4, "initial_eps": 1e-2,
+        "eps_causal": None, "min_eps": 1e-12, "max_eps": 100.0,
+        "step_size": 5.0, "min_mean_weight": 0.4, "max_min_weight": 0.99,
+    }
+    cfg["training"]["pino"]["forcing"].update({
+        "save_latest_every": 1,
+        "warmup": {
+            "steps": 1, "epochs": 0, "resample_every": 25,
+            "r_mult": 2.0, "ic_mult": 1.0,
+            "bc_left_mult": 2.0, "bc_hom_mult": 1.0,
+        },
+    })
+    run_dir = tmp_path / "run_forcing_causal"
+    run_one_seed_forcing_pino(cfg, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert float(rows[0]["warm_mult_r"]) == 2.0
+    assert float(rows[0]["warm_mult_bc_left"]) == 2.0
+    assert float(rows[1]["warm_mult_r"]) == 1.0
+    for row in rows:
+        assert row["causal_adaptation_action"] in {"increase", "decrease", "hold"}
+        assert math.isfinite(float(row["causal_log_last_weight"]))
+        for i in range(4):
+            assert float(row[f"causal_count_bin_{i:02d}"]) > 0
+    assert (run_dir / "cvit_latest.pt").exists()
+    assert (run_dir / "cvit_best.pt").exists()
+    assert (run_dir / "cvit_final.pt").exists()
+    assert (run_dir / "RUN_COMPLETE").exists()
+    ckpt = torch.load(run_dir / "cvit_latest.pt", map_location="cpu", weights_only=False)
+    assert ckpt["completed_updates"] == 2
+    assert ckpt["causal_state"]["n_bins"] == 4
+    assert "rng_state" in ckpt and "forcing_cache" in ckpt
+
+
+def test_e2e_forcing_resume_matches_uninterrupted(tmp_path):
+    _write_synthetic_forcing(tmp_path)
+    full_cfg = _forcing_config(tmp_path)
+    full_cfg["training"]["epochs"] = 4
+    full_cfg["training"]["pino"]["forcing"]["save_latest_every"] = 1
+    full_dir = tmp_path / "full"
+    run_one_seed_forcing_pino(full_cfg, seed=4, run_dir=full_dir)
+
+    split_cfg = _forcing_config(tmp_path)
+    split_cfg["training"]["pino"]["forcing"]["save_latest_every"] = 1
+    split_dir = tmp_path / "split"
+    run_one_seed_forcing_pino(split_cfg, seed=4, run_dir=split_dir)
+    (split_dir / "RUN_COMPLETE").unlink()
+    split_cfg["training"]["epochs"] = 4
+    run_one_seed_forcing_pino(split_cfg, seed=4, run_dir=split_dir)
+
+    full = torch.load(full_dir / "cvit_final.pt", map_location="cpu", weights_only=False)
+    split = torch.load(split_dir / "cvit_final.pt", map_location="cpu", weights_only=False)
+    assert full["completed_updates"] == split["completed_updates"] == 4
+    for key, value in full["model_state"].items():
+        assert torch.equal(value, split["model_state"][key]), key
+    assert full["scheduler_state"] == split["scheduler_state"]
+    assert full["rng_state"]["numpy_local"] == split["rng_state"]["numpy_local"]
+
+
+def test_e2e_forcing_explicit_disabled_options_match_legacy(tmp_path):
+    _write_synthetic_forcing(tmp_path)
+    legacy_cfg = _forcing_config(tmp_path)
+    explicit_cfg = _forcing_config(tmp_path)
+    explicit_cfg["training"]["pino"]["causal"] = {"enabled": False}
+    explicit_cfg["training"]["pino"]["forcing"].update({
+        "grad_clip": None,
+        "warmup": {
+            "steps": None, "epochs": 0, "resample_every": 1,
+            "r_mult": 1.0, "ic_mult": 1.0,
+            "bc_left_mult": 1.0, "bc_hom_mult": 1.0,
+        },
+    })
+    run_one_seed_forcing_pino(legacy_cfg, seed=8, run_dir=tmp_path / "legacy")
+    run_one_seed_forcing_pino(explicit_cfg, seed=8, run_dir=tmp_path / "explicit")
+    legacy = torch.load(tmp_path / "legacy/cvit_final.pt", map_location="cpu", weights_only=False)
+    explicit = torch.load(tmp_path / "explicit/cvit_final.pt", map_location="cpu", weights_only=False)
+    for key, value in legacy["model_state"].items():
+        assert torch.equal(value, explicit["model_state"][key]), key
+    assert legacy["optimizer_state"].keys() == explicit["optimizer_state"].keys()
+    assert legacy["scheduler_state"] == explicit["scheduler_state"]
+    assert torch.equal(
+        legacy["rng_state"]["train_generator"],
+        explicit["rng_state"]["train_generator"],
+    )
+    assert legacy["rng_state"]["numpy_local"] == explicit["rng_state"]["numpy_local"]
+
+
+def test_e2e_forcing_nonfinite_loss_does_not_commit(tmp_path, monkeypatch):
+    _write_synthetic_forcing(tmp_path)
+    cfg = _forcing_config(tmp_path)
+    original = train_pino_mod.pino_losses
+
+    def nonfinite_losses(*args, **kwargs):
+        out = original(*args, **kwargs)
+        out["r"] = out["r"] * torch.tensor(float("nan"))
+        return out
+
+    monkeypatch.setattr(train_pino_mod, "pino_losses", nonfinite_losses)
+    run_dir = tmp_path / "nonfinite"
+    with pytest.raises(FloatingPointError, match="Non-finite forcing PINO loss"):
+        run_one_seed_forcing_pino(cfg, seed=0, run_dir=run_dir)
+    assert not (run_dir / "cvit_latest.pt").exists()
+    assert not (run_dir / "RUN_COMPLETE").exists()
+    assert _rows(run_dir) == []

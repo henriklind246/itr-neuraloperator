@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import math
+import os
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -489,6 +492,20 @@ def _bin_residual(
     return bin_sum / bin_cnt.clamp_min(1.0)
 
 
+def _causal_bin_stats(
+    r: torch.Tensor, t_r: torch.Tensor, t_final: float, n_bins: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-input bin MSE, shared-time counts, and pointwise residual MSE."""
+    sq = (r ** 2).reshape(r.shape[0], -1)
+    idx = _time_bin_index(t_r.reshape(-1).detach(), t_final, n_bins)
+    counts = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
+    counts.index_add_(0, idx, torch.ones_like(idx, dtype=sq.dtype))
+    sums = torch.zeros((sq.shape[0], n_bins), device=r.device, dtype=sq.dtype)
+    sums.scatter_add_(1, idx.unsqueeze(0).expand(sq.shape[0], -1), sq)
+    per_input = sums / counts.clamp_min(1.0).unsqueeze(0)
+    return per_input.mean(dim=0), counts, sq.mean()
+
+
 def _causal_weights(bin_mean: torch.Tensor, eps_causal: float) -> torch.Tensor:
     """Causal weights w_i = exp(-eps * sum_{j<i} L_j) from detached bin losses.
 
@@ -510,17 +527,56 @@ def _causal_residual_loss(
     squared residual, and returns a weighted mean over occupied bins with causal
     weights (detached, so they act as a mask, not an extra gradient path).
     """
-    sq = (r ** 2).mean(dim=0).reshape(-1)  # (n_r,) differentiable
-    idx = _time_bin_index(t_r.reshape(-1).detach(), t_final, n_bins)
-    bin_sum = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
-    bin_cnt = torch.zeros(n_bins, device=r.device, dtype=sq.dtype)
-    bin_sum = bin_sum.index_add(0, idx, sq)
-    bin_cnt = bin_cnt.index_add(0, idx, torch.ones_like(sq))
-    bin_mean = bin_sum / bin_cnt.clamp_min(1.0)  # (n_bins,) differentiable
-    w = _causal_weights(bin_mean.detach(), eps_causal) * (bin_cnt > 0)
-    denom = w.sum().clamp_min(1e-12)
-    loss = (w * bin_mean).sum() / denom
+    bin_mean, bin_cnt, pointwise = _causal_bin_stats(r, t_r, t_final, n_bins)
+    if bool((bin_cnt > 0).all().item()):
+        w = _causal_weights(bin_mean.detach(), eps_causal)
+        loss = (w * bin_mean).mean()
+    else:
+        loss = pointwise
     return loss, bin_mean.detach()
+
+
+def _resolve_forcing_causal(causal_cfg: dict | None) -> dict[str, Any]:
+    cfg = dict(causal_cfg or {})
+    initial = cfg.get("initial_eps")
+    if initial is None:
+        initial = cfg.get("eps_causal")
+    if initial is None:
+        initial = 1.0e-2
+    resolved = {
+        "enabled": bool(cfg.get("enabled", False)),
+        "n_bins": int(cfg.get("n_bins", 24)),
+        "initial_eps": float(initial),
+        "min_eps": float(cfg.get("min_eps", 1.0e-12)),
+        "max_eps": float(cfg.get("max_eps", 100.0)),
+        "step_size": float(cfg.get("step_size", 5.0)),
+        "min_mean_weight": float(cfg.get("min_mean_weight", 0.4)),
+        "max_min_weight": float(cfg.get("max_min_weight", 0.99)),
+    }
+    if resolved["n_bins"] <= 0:
+        raise ValueError("training.pino.causal.n_bins must be > 0")
+    if not 0.0 < resolved["min_eps"] <= resolved["initial_eps"] <= resolved["max_eps"]:
+        raise ValueError("causal epsilon values must satisfy 0 < min_eps <= initial_eps <= max_eps")
+    if resolved["step_size"] <= 1.0:
+        raise ValueError("training.pino.causal.step_size must be > 1")
+    for key in ("min_mean_weight", "max_min_weight"):
+        if not 0.0 <= resolved[key] <= 1.0:
+            raise ValueError(f"training.pino.causal.{key} must be in [0, 1]")
+    return resolved
+
+
+def _adapt_causal_eps(
+    eps: float, weights: torch.Tensor, cfg: dict[str, Any], *, populated: bool,
+) -> tuple[float, str]:
+    if not populated:
+        return float(eps), "hold_empty"
+    mean_weight = float(weights.mean().item())
+    last_weight = float(weights[-1].item())
+    if last_weight > cfg["max_min_weight"]:
+        return min(float(cfg["max_eps"]), eps * float(cfg["step_size"])), "increase"
+    if mean_weight < cfg["min_mean_weight"]:
+        return max(float(cfg["min_eps"]), eps / float(cfg["step_size"])), "decrease"
+    return float(eps), "hold"
 
 
 # --------- loss ---------
@@ -598,21 +654,32 @@ def pino_losses(
     legacy behavior.
     """
     bin_mean = None
+    bin_count = None
+    causal_weights = None
+    pointwise_r = None
     r = None
     if compute_r:
         x_r, y_r, t_r = batch["interior"]
         r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha)
+        pointwise_r = (r ** 2).mean()
         causal_on = bool(causal_cfg and causal_cfg.get("enabled", False))
         if causal_on:
             if t_final is None:
                 raise ValueError("causal residual weighting requires t_final")
-            loss_r, bin_mean = _causal_residual_loss(
-                r, t_r, float(t_final),
-                int(causal_cfg.get("n_bins", 16)),
-                float(causal_cfg.get("eps_causal", 1.0)),
+            n_bins = int(causal_cfg.get("n_bins", 24))
+            eps = float(causal_cfg.get("current_eps", causal_cfg.get("initial_eps", 1e-2)))
+            bin_mean_live, bin_count, pointwise_r = _causal_bin_stats(
+                r, t_r, float(t_final), n_bins,
             )
+            populated = bool((bin_count > 0).all().item())
+            causal_weights = _causal_weights(bin_mean_live.detach(), eps)
+            loss_r = (
+                (causal_weights * bin_mean_live).mean()
+                if populated else pointwise_r
+            )
+            bin_mean = bin_mean_live.detach()
         else:
-            loss_r = (r ** 2).mean()
+            loss_r = pointwise_r
     else:
         loss_r = u.new_zeros(())
 
@@ -658,6 +725,22 @@ def pino_losses(
         "bc_left": loss_bc_left,
         "bc_hom": loss_bc_hom,
     }
+    if pointwise_r is not None:
+        out["r_pointwise_mse"] = pointwise_r.detach()
+    if causal_weights is not None and bin_mean is not None and bin_count is not None:
+        populated = bool((bin_count > 0).all().item())
+        equal_bin = bin_mean.mean() if populated else pointwise_r.detach()
+        out.update({
+            "causal_bin_losses": bin_mean,
+            "causal_bin_counts": bin_count.detach(),
+            "causal_weights": causal_weights.detach(),
+            "causal_populated": populated,
+            "r_equal_bin_mean": equal_bin,
+            "r_causal_loss": loss_r.detach(),
+            "causal_reduction_ratio": (
+                loss_r.detach() / equal_bin.clamp_min(torch.finfo(equal_bin.dtype).tiny)
+            ),
+        })
     if res_bins and r is not None:
         if bin_mean is not None and bin_mean.numel() == res_bins:
             out["res_bins"] = bin_mean
@@ -1282,8 +1365,10 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
 
     dense_ic = bool(pino.get("dense_ic", False))
     resample_every = max(1, int(pino.get("resample_every", 1)))
-    causal_cfg = pino.get("causal", {}) or {}
+    causal_cfg = dict(pino.get("causal", {}) or {})
     causal_on = bool(causal_cfg.get("enabled", False))
+    if causal_on:
+        causal_cfg["eps_causal"] = _resolve_forcing_causal(causal_cfg)["initial_eps"]
     res_n_bins = (
         int(causal_cfg.get("n_bins", 16)) if causal_on
         else int(pino.get("diag_time_bins", 16))
@@ -1561,6 +1646,120 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     return summary
 
 
+def _forcing_warmup_config(fcfg: dict) -> dict[str, Any]:
+    cfg = dict(fcfg.get("warmup", {}) or {})
+    steps = cfg.get("steps")
+    if steps is None:
+        steps = cfg.get("epochs", 0)
+    return {
+        "steps": max(0, int(steps)),
+        "resample_every": max(1, int(cfg.get("resample_every", 1))),
+        "r_mult": float(cfg.get("r_mult", 1.0)),
+        "ic_mult": float(cfg.get("ic_mult", 1.0)),
+        "bc_left_mult": float(cfg.get("bc_left_mult", 1.0)),
+        "bc_hom_mult": float(cfg.get("bc_hom_mult", 1.0)),
+    }
+
+
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _atomic_text(text: str, path: Path) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _pack_tensors(value):
+    if isinstance(value, torch.Tensor):
+        return {
+            "__tensor__": value.detach().cpu(),
+            "requires_grad": bool(value.requires_grad),
+        }
+    if isinstance(value, dict):
+        return {k: _pack_tensors(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return {"__tuple__": [_pack_tensors(v) for v in value]}
+    if isinstance(value, list):
+        return [_pack_tensors(v) for v in value]
+    return copy.deepcopy(value)
+
+
+def _unpack_tensors(value, device):
+    if isinstance(value, dict) and "__tensor__" in value:
+        return value["__tensor__"].to(device).detach().requires_grad_(value["requires_grad"])
+    if isinstance(value, dict) and "__tuple__" in value:
+        return tuple(_unpack_tensors(v, device) for v in value["__tuple__"])
+    if isinstance(value, dict):
+        return {k: _unpack_tensors(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_unpack_tensors(v, device) for v in value]
+    return copy.deepcopy(value)
+
+
+def _capture_forcing_rng(rng, gen, eval_gen) -> dict[str, Any]:
+    state = {
+        "python": random.getstate(),
+        "numpy_global": np.random.get_state(),
+        "numpy_local": copy.deepcopy(rng.bit_generator.state),
+        "torch_cpu": torch.get_rng_state(),
+        "train_generator": gen.get_state(),
+        "eval_generator": eval_gen.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_forcing_rng(state, rng, gen, eval_gen) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy_global"])
+    rng.bit_generator.state = state["numpy_local"]
+    torch.set_rng_state(state["torch_cpu"])
+    gen.set_state(state["train_generator"])
+    eval_gen.set_state(state["eval_generator"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _forcing_resume_config(config: dict) -> dict:
+    normalized = copy.deepcopy(config)
+    training = normalized.setdefault("training", {})
+    pino = training.setdefault("pino", {})
+    forcing = pino.setdefault("forcing", {})
+    causal = _resolve_forcing_causal(pino.get("causal", {}))
+    pino["causal"] = causal
+    forcing["warmup"] = _forcing_warmup_config(forcing)
+    for key in ("epochs", "validate_every", "run"):
+        training.pop(key, None)
+    for key in ("save_latest_every", "extend_completed"):
+        forcing.pop(key, None)
+    normalized.pop("experiment", None)
+    normalized.pop("config_id", None)
+    paths = normalized.get("paths")
+    if isinstance(paths, dict):
+        paths.pop("runs_root", None)
+    return normalized
+
+
+def _reconcile_forcing_metrics(path: Path, fieldnames: list[str], last_update: int) -> None:
+    if not path.exists():
+        return
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    kept = [r for r in rows if int(r.get("completed_updates") or 0) <= last_update]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(kept)
+
+
 def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     """Physics-only training of a :class:`ForcingCViT` on the single-slab forcing
     benchmark. Run-0 recipe: static Adam weights, ONLINE forcing sampling, LHS
@@ -1577,6 +1776,10 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     set_seed(seed)
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = run_dir / "cvit_latest.pt"
+    best_path = run_dir / "cvit_best.pt"
+    final_path = run_dir / "cvit_final.pt"
+    complete_path = run_dir / "RUN_COMPLETE"
 
     device = resolve_device(config["training"].get("device", "auto"))
     data = load_diffusion_data(config)
@@ -1593,6 +1796,21 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
 
     pino = config["training"]["pino"]
     fcfg = pino.get("forcing", {}) or {}
+    extend_completed = bool(fcfg.get("extend_completed", False))
+    if complete_path.exists() and not extend_completed:
+        summary_path = run_dir / "final_metrics.json"
+        if summary_path.exists():
+            with open(summary_path) as f:
+                return json.load(f)
+        return {"seed": seed, "status": "complete", "run_dir": str(run_dir)}
+    resuming = latest_path.exists() and (not complete_path.exists() or extend_completed)
+    causal_cfg = _resolve_forcing_causal(pino.get("causal", {}))
+    warmup = _forcing_warmup_config(fcfg)
+    save_latest_every = max(1, int(fcfg.get("save_latest_every", 25)))
+    grad_clip_cfg = fcfg.get("grad_clip", None)
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    if grad_clip is not None and grad_clip <= 0.0:
+        raise ValueError("training.pino.forcing.grad_clip must be null or > 0")
     # `null` in YAML resolves to a dynamic default here (Ny/A_AMP_REF/t_final are
     # not knowable statically), so coalesce None rather than trusting .get's
     # absent-key fallback.
@@ -1682,14 +1900,6 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         gn_cos_pairs = [("r", "bc_left"), ("ic", "bc_left"), ("bc_hom", "bc_left")]
     gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
 
-    # Warm-up (5b): hold the forcing batch + collocation fixed and upweight the IC
-    # anchor for the first ``warmup.epochs`` steps so the fixed T=300 solution is
-    # learned before the PDE/BC residuals dominate. Run-0 defaults are inert.
-    wcfg = fcfg.get("warmup", {}) or {}
-    warmup_epochs = int(wcfg.get("epochs", 0))
-    warmup_ic_mult = float(wcfg.get("ic_mult", 1.0))
-    warmup_resample_every = max(1, int(wcfg.get("resample_every", 1)))
-
     epochs = int(config["training"]["epochs"])
     validate_every = int(config["training"].get("validate_every", 10))
 
@@ -1698,6 +1908,8 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
 
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(seed + 1_000_003)
     rng = np.random.default_rng(seed)
 
     metrics_path = run_dir / "train_metrics.csv"
@@ -1709,11 +1921,20 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     # grad_norm_* (raw per-term gradient norm) and grad_norm_eff_* (effective).
     # These + JSON supplements are populated on validation epochs only.
     gn_cols = ["r", "ic", "bc_left", "bc_hom"]
+    causal_cols = range(causal_cfg["n_bins"])
     fieldnames = [
-        "epoch", "lr_first", "lr_last",
+        "epoch", "completed_updates", "lr_first", "lr_last",
         "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
         "loss_data",
         "w_r", "w_ic", "w_bc", "w_bc_left", "w_data",
+        *[f"warm_mult_{c}" for c in gn_cols],
+        "r_pointwise_mse", "r_equal_bin_mean", "r_causal_loss",
+        "causal_reduction_ratio", "causal_eps", "causal_eps_next",
+        "causal_mean_weight", "causal_last_weight", "causal_log_last_weight",
+        "causal_adaptation_action",
+        *[f"causal_loss_bin_{i:02d}" for i in causal_cols],
+        *[f"causal_weight_bin_{i:02d}" for i in causal_cols],
+        *[f"causal_count_bin_{i:02d}" for i in causal_cols],
         "val_gnrmse", "val_rmse_K",
         "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
         *[f"gn_mult_{c}" for c in gn_cols],
@@ -1723,8 +1944,60 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         "gradnorm_mean_mult", "gradnorm_ms",
         "gradnorm_weights", "grad_cosines", "gradnorm_bound_hits",
     ]
-    with open(metrics_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
+
+    start_epoch = 0
+    completed_updates = 0
+    last_csv_update = 0
+    best_val = float("inf")
+    causal_eps = float(causal_cfg["initial_eps"])
+    causal_updates = 0
+    causal_calibrated = False
+    coll = None
+    params_batch: list[dict] | None = None
+
+    if resuming:
+        ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
+        saved_resume = ckpt.get("resume_config")
+        current_resume = _forcing_resume_config(config)
+        if saved_resume != current_resume:
+            raise ValueError(
+                "Incompatible diffusion_forcing resume configuration; use a fresh run directory."
+            )
+        saved_epochs = int(ckpt["config"]["training"]["epochs"])
+        if epochs < int(ckpt["next_epoch"]):
+            raise ValueError("training.epochs is below the checkpoint next_epoch")
+        if epochs != saved_epochs:
+            sched_type = str(config["training"]["scheduler"]["type"])
+            if sched_type not in {"PICViTExponential", "StepLR"}:
+                raise ValueError("Extending epochs requires a horizon-independent scheduler")
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        if gradnorm is not None:
+            if ckpt.get("gradnorm_state") is None:
+                raise ValueError("Resume checkpoint is missing GradNorm state")
+            gradnorm.load_state_dict(ckpt["gradnorm_state"])
+        start_epoch = int(ckpt["next_epoch"])
+        completed_updates = int(ckpt["completed_updates"])
+        last_csv_update = int(ckpt["last_csv_update"])
+        best_val = float(ckpt["best_val"])
+        causal_state = ckpt.get("causal_state") or {}
+        if causal_cfg["enabled"]:
+            if int(causal_state.get("n_bins", -1)) != causal_cfg["n_bins"]:
+                raise ValueError("Resume causal n_bins does not match the active configuration")
+            causal_eps = float(causal_state["eps"])
+            causal_updates = int(causal_state.get("updates", 0))
+            causal_calibrated = bool(causal_state.get("calibrated", False))
+        cache = ckpt.get("forcing_cache") or {}
+        params_batch = copy.deepcopy(cache.get("params_batch"))
+        coll = _unpack_tensors(cache.get("coll"), device) if cache.get("coll") else None
+        _restore_forcing_rng(ckpt["rng_state"], rng, gen, eval_gen)
+        _reconcile_forcing_metrics(metrics_path, fieldnames, last_csv_update)
+        if complete_path.exists():
+            complete_path.unlink()
+    else:
+        with open(metrics_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
 
     print(
         f"[pino-forcing] seed={seed} device={device} epochs={epochs} "
@@ -1736,25 +2009,22 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         f"hard_left_flux={bool(getattr(model, 'hard_left_flux', False))} | "
         f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} "
         f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} | "
-        f"warmup(epochs={warmup_epochs},ic_mult={warmup_ic_mult},"
-        f"resample_every={warmup_resample_every})",
+        f"causal={causal_cfg} | warmup={warmup} grad_clip={grad_clip} "
+        f"save_latest_every={save_latest_every} resume={resuming}",
         flush=True,
     )
 
-    best_val = float("inf")
     history: list[dict[str, float]] = []
-    coll = None
-    params_batch: list[dict] | None = None
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
-        warming = epoch < warmup_epochs
+        warming = completed_updates < warmup["steps"]
         # Computed up front: the cosine diagnostic runs on the training step that
         # coincides with a validation epoch, before backward.
         do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
-        re = warmup_resample_every if warming else 1
+        re = warmup["resample_every"] if warming else 1
         # Online resampling: fresh forcing batch + fresh collocation. During
         # warm-up they are held for ``re`` steps to let the IC anchor settle.
-        if params_batch is None or (epoch % re == 0):
+        if params_batch is None or (completed_updates % re == 0):
             params_batch = sample_forcing_params(
                 rng, sim_batch, dt_sample, t_final,
                 c=c_dom, d=d_dom, temporal_window=temporal_window,
@@ -1774,26 +2044,34 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         left_qL = left_wall_qL(params_batch, yw_left, tw_left, device, t_ramp)
 
         optimizer.zero_grad(set_to_none=True)
+        causal_step_cfg = {**causal_cfg, "current_eps": causal_eps}
         losses = pino_losses(
             model, u, coll, ic_target, alpha,
+            causal_cfg=causal_step_cfg,
             t_final=t_final, ic_loss="mse", t_right_tilde=t_right_tilde_ic,
             left_qL=left_qL, sigma=float(sigma), k_slab=K_SLAB,
         )
-        w_ic = lam_ic * (warmup_ic_mult if warming else 1.0)
+        warm_mult = {
+            "r": warmup["r_mult"] if warming else 1.0,
+            "ic": warmup["ic_mult"] if warming else 1.0,
+            "bc_left": warmup["bc_left_mult"] if warming else 1.0,
+            "bc_hom": warmup["bc_hom_mult"] if warming else 1.0,
+            "bc": warmup["bc_hom_mult"] if warming else 1.0,
+        }
         # Static per-term weights ``sw`` (name -> lambda). Dict order preserves the
         # ORIGINAL left-to-right summation so the disabled path (gn_mults empty,
         # multiplier == 1.0) reproduces the previous ``loss`` exactly.
         if lam_bc_left is None:
             w_bc = lam_bc
             w_bc_left = lam_bc  # reported effective weight; left sits inside bc
-            sw = {"r": lam_r, "ic": w_ic, "bc": lam_bc}
+            sw = {"r": lam_r, "ic": lam_ic, "bc": lam_bc}
         else:
             # Split BC: homogeneous top/bottom on lam_bc, forcing left on its own
             # weight so the forcing residual is not diluted by the 1/len(WALLS)
             # bucket average.
             w_bc = lam_bc
             w_bc_left = lam_bc_left
-            sw = {"r": lam_r, "ic": w_ic, "bc_hom": lam_bc, "bc_left": lam_bc_left}
+            sw = {"r": lam_r, "ic": lam_ic, "bc_hom": lam_bc, "bc_left": lam_bc_left}
 
         # GradNorm rebalances the RAW per-term gradient magnitudes BEFORE backward
         # (one extra autograd.grad per active term every ``update_every`` steps).
@@ -1819,7 +2097,9 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
                 {k: losses[k] for k in sw}, model.decoder.parameters(),
                 pairs=gn_cos_pairs,
             )
-        w_eff = {k: sw[k] * float(gn_mults.get(k, 1.0)) for k in sw}
+        w_eff = {
+            k: sw[k] * float(gn_mults.get(k, 1.0)) * warm_mult[k] for k in sw
+        }
         loss = None
         for k, wk in w_eff.items():
             term = wk * losses[k]
@@ -1835,14 +2115,43 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
                 device=device, rng=rng, gen=gen,
             )
             loss = loss + lam_data * loss_data
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(f"Non-finite forcing PINO loss at epoch {epoch}")
         loss.backward()
+        for parameter in model.parameters():
+            if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item()):
+                raise FloatingPointError(f"Non-finite forcing PINO gradient at epoch {epoch}")
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
         _advance_scheduler(scheduler, unit="update", successful_updates=1)
         _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        completed_updates += 1
+
+        eps_used = causal_eps
+        causal_action = "off"
+        if causal_cfg["enabled"]:
+            populated = bool(losses["causal_populated"])
+            causal_eps, causal_action = _adapt_causal_eps(
+                causal_eps, losses["causal_weights"], causal_cfg, populated=populated,
+            )
+            if populated:
+                causal_updates += 1
+                if not causal_calibrated:
+                    calibration = {}
+                    bin_losses = losses["causal_bin_losses"]
+                    for candidate in (1e-4, 1e-3, 1e-2, 1e-1, 1.0):
+                        cw = _causal_weights(bin_losses, candidate)
+                        calibration[str(candidate)] = {
+                            "mean": float(cw.mean().item()), "last": float(cw[-1].item()),
+                        }
+                    print(f"  causal epsilon calibration: {json.dumps(calibration)}", flush=True)
+                    causal_calibrated = True
 
         row: dict[str, Any] = {
             "epoch": epoch,
+            "completed_updates": completed_updates,
             "lr_first": lr,
             "lr_last": lr,
             "loss": float(loss.detach().cpu()),
@@ -1853,11 +2162,36 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             "loss_data": (
                 float(loss_data.detach().cpu()) if loss_data is not None else ""
             ),
-            "w_r": lam_r, "w_ic": w_ic, "w_bc": w_bc, "w_bc_left": w_bc_left,
+            "w_r": lam_r * warm_mult["r"],
+            "w_ic": lam_ic * warm_mult["ic"],
+            "w_bc": w_bc * warm_mult["bc_hom"],
+            "w_bc_left": w_bc_left * warm_mult["bc_left"],
             "w_data": lam_data,
             "val_gnrmse": "", "val_rmse_K": "",
             "gnrmse_amp_low": "", "gnrmse_amp_mid": "", "gnrmse_amp_high": "",
         }
+        for key in gn_cols:
+            row[f"warm_mult_{key}"] = warm_mult[key]
+        row["r_pointwise_mse"] = float(losses["r_pointwise_mse"].cpu())
+        if causal_cfg["enabled"]:
+            bins = losses["causal_bin_losses"].cpu()
+            weights = losses["causal_weights"].cpu()
+            counts = losses["causal_bin_counts"].cpu()
+            row.update({
+                "r_equal_bin_mean": float(losses["r_equal_bin_mean"].cpu()),
+                "r_causal_loss": float(losses["r_causal_loss"].cpu()),
+                "causal_reduction_ratio": float(losses["causal_reduction_ratio"].cpu()),
+                "causal_eps": eps_used,
+                "causal_eps_next": causal_eps,
+                "causal_mean_weight": float(weights.mean()),
+                "causal_last_weight": float(weights[-1]),
+                "causal_log_last_weight": -eps_used * float(bins[:-1].sum()),
+                "causal_adaptation_action": causal_action,
+            })
+            for i in causal_cols:
+                row[f"causal_loss_bin_{i:02d}"] = float(bins[i])
+                row[f"causal_weight_bin_{i:02d}"] = float(weights[i])
+                row[f"causal_count_bin_{i:02d}"] = float(counts[i])
         data_txt = (
             f", data={row['loss_data']:.6f}" if loss_data is not None else ""
         )
@@ -1904,22 +2238,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             is_best = val["val_gnrmse"] < best_val
             if is_best:
                 best_val = val["val_gnrmse"]
-                torch.save(
-                    {
-                        "model_state": model.state_dict(),
-                        "mu_global": mu, "sigma_global": sigma,
-                        "config": config, "epoch": epoch, "best_val": best_val,
-                        "gradnorm_state": (
-                            gradnorm.state_dict() if gradnorm is not None else None
-                        ),
-                        "forcing_image": {
-                            "ny_img": ny_img, "nt_img": nt_img,
-                            "a_ref": a_ref, "t_ramp": t_ramp,
-                            "c_dom": c_dom, "d_dom": d_dom, "t_final": t_final,
-                        },
-                    },
-                    run_dir / "cvit_best.pt",
-                )
+                # Full resumable best state is assembled after this row is flushed.
             fam_txt = " ".join(
                 f"{k.split('gnrmse_fam_')[1]}={v * 100:.2f}%"
                 for k, v in val.items() if k.startswith("gnrmse_fam_")
@@ -1942,11 +2261,57 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
 
         history.append({k: (v if v != "" else None) for k, v in row.items()})
         with open(metrics_path, "a", newline="") as f:
-            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerow(row)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+        last_csv_update = completed_updates
+
+        def checkpoint_payload() -> dict[str, Any]:
+            return {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "mu_global": mu, "sigma_global": sigma,
+                "config": config, "resume_config": _forcing_resume_config(config),
+                "epoch": epoch, "next_epoch": epoch + 1,
+                "completed_updates": completed_updates,
+                "last_csv_update": last_csv_update, "best_val": best_val,
+                "gradnorm_state": gradnorm.state_dict() if gradnorm is not None else None,
+                "causal_state": {
+                    "eps": causal_eps, "n_bins": causal_cfg["n_bins"],
+                    "updates": causal_updates, "calibrated": causal_calibrated,
+                } if causal_cfg["enabled"] else None,
+                "rng_state": _capture_forcing_rng(rng, gen, eval_gen),
+                "forcing_cache": {
+                    "params_batch": copy.deepcopy(params_batch),
+                    "coll": _pack_tensors(coll),
+                },
+                "forcing_image": {
+                    "ny_img": ny_img, "nt_img": nt_img, "a_ref": a_ref,
+                    "t_ramp": t_ramp, "c_dom": c_dom, "d_dom": d_dom,
+                    "t_final": t_final,
+                },
+            }
+
+        payload = checkpoint_payload()
+        if do_val and is_best:
+            _atomic_torch_save(payload, best_path)
+        if completed_updates % save_latest_every == 0 or epoch == epochs - 1:
+            checkpoint_start = time.perf_counter()
+            _atomic_torch_save(payload, latest_path)
+            checkpoint_ms = (time.perf_counter() - checkpoint_start) * 1000.0
+            checkpoint_mb = latest_path.stat().st_size / (1024.0 ** 2)
+            print(
+                f"  latest checkpoint: {checkpoint_ms:.1f} ms, {checkpoint_mb:.1f} MiB",
+                flush=True,
+            )
 
     summary = {"seed": seed, "best_val_gnrmse": best_val, "epochs": epochs}
-    with open(run_dir / "final_metrics.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    final_payload = torch.load(latest_path, map_location="cpu", weights_only=False)
+    _atomic_torch_save(final_payload, final_path)
+    _atomic_text(json.dumps(summary, indent=2) + "\n", run_dir / "final_metrics.json")
+    _atomic_text("complete\n", complete_path)
     return summary
 
 
@@ -2279,10 +2644,13 @@ def run_one_seed_interfaces_pino(
     sim_batch = int(pino["sim_batch"])
     intervals_per_sim = int(pino.get("intervals_per_sim", 2))
     stratified = bool(pino.get("stratified_time_sampling", True))
-    causal = pino.get("causal", {}) or {}
+    causal = dict(pino.get("causal", {}) or {})
     causal_enabled = bool(causal.get("enabled", False))
     n_bins = int(pino.get("causal_num_bins", causal.get("n_bins", 6)))
-    eps_causal = float(causal.get("eps_causal", 1.0))
+    eps_causal = (
+        float(_resolve_forcing_causal(causal)["initial_eps"])
+        if causal_enabled else 1.0
+    )
     chunk_r = int(pino.get("chunk_r", 0))
     collocation_source = str(pino.get("collocation_source", "saved_train"))
     if collocation_source not in ("saved_train", "online"):

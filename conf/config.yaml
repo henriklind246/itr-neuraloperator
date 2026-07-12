@@ -312,8 +312,16 @@ training:
     # a TRUE no-op (plain mean(r^2)).
     causal:
       enabled: false
-      n_bins: 16
-      eps_causal: 1.0
+      n_bins: 24
+      # initial_eps is the preferred spelling; eps_causal is a legacy alias.
+      # Both stay null so an old explicit eps_causal value is not shadowed.
+      initial_eps: null
+      eps_causal: null
+      min_eps: 1.0e-12
+      max_eps: 100.0
+      step_size: 5.0
+      min_mean_weight: 0.4
+      max_min_weight: 0.99
     # Static, diagnostic-informed nonuniform collocation biasing of the interior
     # points (benchmark=diffusion_forcing path only). Because the loss averages
     # mean(r^2) with no inverse-density correction, biasing the sampling
@@ -361,14 +369,22 @@ training:
       t_off: 0.2
       phase: 0.0
       tukey_alpha: 0.5
-      # Warm-up (paper-faithful stabilization): hold the sampled forcing batch and
-      # collocation fixed for resample_every steps and multiply the IC loss by
-      # ic_mult for the first `epochs` epochs so the constant-300 K anchor settles
-      # before PDE/BC residuals dominate. Run-0 defaults are inert (epochs=0).
+      # Warm-up stabilization: hold forcing/collocation for resample_every
+      # successful updates and apply per-term multipliers after GradNorm. The
+      # defaults are inert; forcing experiments can emphasize r / bc_left.
       warmup:
         epochs: 0
+        # Successful optimizer updates; non-null takes precedence over epochs.
+        steps: null
         ic_mult: 1.0
+        r_mult: 1.0
+        bc_left_mult: 1.0
+        bc_hom_mult: 1.0
         resample_every: 1
+      # Forcing-only update controls. null clipping preserves the legacy path.
+      grad_clip: null
+      save_latest_every: 25
+      extend_completed: false
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
   # GradNorm-style adaptive balancing of the RAW per-component physics losses
