@@ -9,6 +9,7 @@ from src.operators.losses import (
     build_interface_band,
     build_interface_mask,
     compute_interface_rel_l2,
+    full_bc_physics_loss,
     get_batch_interface_x,
     interface_flanking_nodes,
     interface_flanking_nodes_per_sample,
@@ -17,6 +18,12 @@ from src.operators.losses import (
     per_sample_nrmse,
     per_sample_sq_rms,
     tail_stats,
+)
+from src.physics.fv_residual import (
+    FullBCData,
+    build_cn_geom,
+    build_cn_geom_per_interface,
+    full_bc_cn_residual,
 )
 
 
@@ -561,3 +568,135 @@ class TestGnrmsePctIdentities:
         torch.testing.assert_close(
             node_jump_gnrmse_pct, node_jump_rmse_K / sigma_global * 100.0
         )
+
+
+# ============== interface-band split (full_bc_physics_loss) ==============
+
+
+class TestInterfaceBandSplit:
+    """The disjoint exact-2-column `interface_band` split of the interior CN
+    residual: `{face_idx-1, face_idx}` interior columns become a separate term,
+    `interior` becomes bulk-only, and the two recombine (cell-count weighted) to
+    the full-interior mean-square. Guard matrix asserts fail-loud behavior."""
+
+    NX = 60
+    NY = 40
+    IFACE = [0.3, 0.5, 0.7, 0.42]
+    R_C = [0.5, 0.4, 0.6, 0.5]
+
+    def _setup(self, dtype=torch.float64, seed=0):
+        xg = np.linspace(0.0, 1.0, self.NX)
+        yg = np.linspace(0.0, 1.0, self.NY)
+        B = len(self.IFACE)
+        geom = build_cn_geom_per_interface(
+            xg, yg, k_left=2.0, k_right=1.0,
+            interface_x_batch=self.IFACE, R_c_batch=self.R_C,
+            dt=0.005, sigma_global=1.0, dtype=dtype,
+        )
+        torch.manual_seed(seed)
+        T_n = torch.randn((B, self.NX, self.NY), dtype=dtype)
+        T_np1 = torch.randn((B, self.NX, self.NY), dtype=dtype)
+        bc = FullBCData(
+            T_right_tilde=torch.zeros((B, self.NY), dtype=dtype),
+            qL_n=torch.zeros((B, self.NY), dtype=dtype),
+            qL_np1=torch.zeros((B, self.NY), dtype=dtype),
+        )
+        return xg, yg, geom, T_n, T_np1, bc
+
+    def test_band_matches_manual_and_recombines(self):
+        xg, yg, geom, T_n, T_np1, bc = self._setup()
+        kept = full_bc_cn_residual(T_n, T_np1, geom, bc, keep_batch=True)
+        interior = kept["interior"]  # (B, Nx-2, Ny-2)
+        B, nx_int, ny_int = interior.shape
+
+        out = full_bc_physics_loss(
+            T_n, T_np1, geom, bc, per_sample=True, interface_band=True,
+        )
+        legacy = full_bc_physics_loss(T_n, T_np1, geom, bc, per_sample=True)
+
+        band_count = 2 * ny_int
+        bulk_count = (nx_int - 2) * ny_int
+        assert band_count + bulk_count == nx_int * ny_int  # disjoint partition
+        for b in range(B):
+            cols = [int(geom.face_idx[b]) - 1, int(geom.face_idx[b])]
+            sq = interior[b].square()
+            mask = torch.zeros(nx_int, dtype=torch.bool)
+            mask[cols] = True
+            manual_band = sq[mask, :].mean()
+            manual_bulk = sq[~mask, :].mean()
+            torch.testing.assert_close(
+                out["interface_band_per_sample"][b], manual_band, atol=1e-9, rtol=1e-12
+            )
+            torch.testing.assert_close(
+                out["interior_per_sample"][b], manual_bulk, atol=1e-9, rtol=1e-12
+            )
+            # cell-count-weighted recombination == full-interior mean-square.
+            recomb = (
+                manual_band * band_count + manual_bulk * bulk_count
+            ) / (band_count + bulk_count)
+            torch.testing.assert_close(
+                recomb, legacy["interior_per_sample"][b], atol=1e-9, rtol=1e-12
+            )
+        # scalar key is the batch mean of the per-sample band tensor.
+        torch.testing.assert_close(
+            out["phys_interface_band_mse"],
+            out["interface_band_per_sample"].mean(),
+            atol=0, rtol=0,
+        )
+
+    def test_band_false_is_exact_legacy(self):
+        """`interface_band=False` reproduces the per-sample outputs exactly,
+        whether `geom.face_idx` is present (per-interface geom) or None
+        (scalar geom); no band keys leak in."""
+        xg, yg, geom, T_n, T_np1, bc = self._setup()
+        a = full_bc_physics_loss(T_n, T_np1, geom, bc, per_sample=True)
+        b = full_bc_physics_loss(
+            T_n, T_np1, geom, bc, per_sample=True, interface_band=False
+        )
+        assert set(a) == set(b)
+        assert "interface_band_per_sample" not in b
+        for k in a:
+            assert torch.equal(a[k], b[k]), k
+
+        scalar_geom = build_cn_geom(
+            xg, yg, k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+            dt=0.005, sigma_global=1.0, dtype=torch.float64,
+        )
+        assert scalar_geom.face_idx is None
+        c = full_bc_physics_loss(
+            T_n, T_np1, scalar_geom, bc, per_sample=True, interface_band=False
+        )
+        assert "interface_band_per_sample" not in c
+
+    def test_band_requires_face_idx(self):
+        """A scalar geom (`face_idx is None`) with `interface_band=True` raises."""
+        xg, yg, _, T_n, T_np1, bc = self._setup()
+        scalar_geom = build_cn_geom(
+            xg, yg, k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+            dt=0.005, sigma_global=1.0, dtype=torch.float64,
+        )
+        with pytest.raises(ValueError, match="face_idx"):
+            full_bc_physics_loss(
+                T_n, T_np1, scalar_geom, bc, per_sample=True, interface_band=True
+            )
+
+    def test_band_requires_per_sample(self):
+        """`interface_band=True` without `per_sample` raises (band is defined on
+        the batch-shaped interior residual)."""
+        _, _, geom, T_n, T_np1, bc = self._setup()
+        with pytest.raises(ValueError, match="per_sample"):
+            full_bc_physics_loss(
+                T_n, T_np1, geom, bc, per_sample=False, interface_band=True
+            )
+
+    def test_band_out_of_range_column_raises(self):
+        """A mapped band column outside `[0, Nx-3]` raises rather than silently
+        wrapping/clamping."""
+        _, _, geom, T_n, T_np1, bc = self._setup()
+        nx_int = self.NX - 2
+        # face_idx = nx_int -> band column max = nx_int > nx_int-1 (out of range).
+        geom.face_idx = torch.full((len(self.IFACE),), nx_int, dtype=torch.long)
+        with pytest.raises(ValueError, match="out of range"):
+            full_bc_physics_loss(
+                T_n, T_np1, geom, bc, per_sample=True, interface_band=True
+            )

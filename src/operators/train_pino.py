@@ -2665,6 +2665,20 @@ def run_one_seed_interfaces_pino(
         float(t_right_tilde), dtype=torch.float32, device=device
     )
 
+    # Interface-band term (Remedy #1): split the two interior node columns
+    # flanking the interface face into a disjoint, separately balanced term so
+    # GradNorm sees the jump sub-signal isolated from bulk diffusion. Default OFF.
+    iface_band_cfg = dict(pino.get("interface_band", {}) or {})
+    band_enabled = bool(iface_band_cfg.get("enabled", False))
+    lam_band = float(iface_band_cfg.get("lambda", 1.0))
+    if band_enabled and lam_band <= 0.0:
+        raise ValueError(
+            "training.pino.interface_band.lambda must be > 0 when enabled "
+            f"(got {lam_band}); a non-positive weight would remove the band "
+            "columns from 'interior' yet drop 'interface_band' from GradNorm, "
+            "leaving the interface-adjacent residual completely unpenalized."
+        )
+
     # GradNorm over the nontrivial terms only; right_dirichlet excluded (its hard
     # ansatz makes the loss ~0 with ~0 gradient -> inverse-norm weighting would
     # divide by ~0). None (disabled) is an exact no-op.
@@ -2672,7 +2686,35 @@ def run_one_seed_interfaces_pino(
         "interior": lam_r, "left_neumann": lam_bc_left,
         "topbot_adiabatic": lam_bc, "ic": lam_ic,
     }
-    gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
+    if band_enabled:
+        gn_term_weights["interface_band"] = lam_band
+    balanced_terms = list(gn_term_weights.keys())
+
+    # Per-region standardization (Remedy #2): frozen calibration scales, default
+    # OFF. Not a moving EMA -- the constant per-term scale cancels in GradNorm's
+    # relative-progress ratio L_k(t)/L_k(0) only if L_k(0) is standardized too, so
+    # scales are frozen by a calibration pass BEFORE GradNorm is built (below).
+    std_cfg = dict(pino.get("region_standardize", {}) or {})
+    std_enabled = bool(std_cfg.get("enabled", False))
+    calibration_steps = int(std_cfg.get("calibration_steps", 50))
+    std_eps = float(std_cfg.get("eps", 1e-8))
+    if std_enabled:
+        if calibration_steps <= 0:
+            raise ValueError(
+                "training.pino.region_standardize.calibration_steps must be > 0 "
+                f"when enabled; got {calibration_steps}."
+            )
+        if std_eps <= 0.0:
+            raise ValueError(
+                "training.pino.region_standardize.eps must be > 0 when enabled; "
+                f"got {std_eps}."
+            )
+    std_scales: dict[str, float] = {k: 1.0 for k in balanced_terms}
+    std_calib_done = not std_enabled
+
+    # GradNorm is constructed AFTER the calibration pass (§4) so its reference
+    # L_k(0) is captured on the same standardized scale used in training.
+    gradnorm = None
 
     epochs = int(config["training"]["epochs"])
     validate_every = int(config["training"].get("validate_every", 10))
@@ -2708,17 +2750,23 @@ def run_one_seed_interfaces_pino(
     sigma_dT_train = _compute_train_jump_scale(data, sim_params, train_ids)
 
     metrics_path = run_dir / "train_metrics.csv"
-    gn_cols = ["interior", "left_neumann", "topbot_adiabatic", "ic"]
+    gn_cols = list(gn_term_weights.keys())
+    band_loss_cols = ["loss_interface_band"] if band_enabled else []
+    band_w_cols = ["w_interface_band"] if band_enabled else []
     fieldnames = [
         "epoch", "loss",
         "loss_interior", "loss_left_neumann", "loss_topbot", "loss_ic",
         "loss_right_dir",
+        *band_loss_cols,
         "w_interior", "w_left_neumann", "w_topbot", "w_ic",
+        *band_w_cols,
         "val_gnrmse", "val_rmse_K", "node_jump_rmse_K", "E_model", "E_zero",
         "gnrmse_Rc_low", "gnrmse_Rc_mid", "gnrmse_Rc_high",
         "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
         *[f"gn_mult_{c}" for c in gn_cols],
         *[f"w_eff_{c}" for c in gn_cols],
+        *([f"loss_opt_{c}" for c in gn_cols] if std_enabled else []),
+        *([f"std_scale_{c}" for c in gn_cols] if std_enabled else []),
         "gradnorm_weights",
     ]
     with open(metrics_path, "w", newline="") as f:
@@ -2733,24 +2781,30 @@ def run_one_seed_interfaces_pino(
         f"stratified={stratified} causal={causal_enabled}(n_bins={n_bins}) | "
         f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} "
         f"lambda_bc_left={lam_bc_left} | k=({K_LEFT},{K_RIGHT}) "
-        f"sigma_dT_train={sigma_dT_train:.4g}",
+        f"sigma_dT_train={sigma_dT_train:.4g} | "
+        f"interface_band={band_enabled}(lambda={lam_band})",
         flush=True,
     )
 
-    best_global = float("inf")
-    best_jump = float("inf")
-    history: list[dict[str, Any]] = []
-    for epoch in range(epochs):
-        model.train()
-        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+    # Constant static per-term weights (config lambdas); GradNorm multiplies these.
+    sw = {
+        "interior": lam_r, "left_neumann": lam_bc_left,
+        "topbot_adiabatic": lam_bc, "ic": lam_ic,
+    }
+    if band_enabled:
+        sw["interface_band"] = lam_band
 
+    def _forward_losses(sample_rng):
+        """One collocation batch -> raw (pre-standardization) balanced-term
+        losses dict + right-Dirichlet diagnostic. Shared by the §4 calibration
+        pass and the training loop so both use identical reductions."""
         if collocation_source == "online":
             params = online_spec.sample_online_params(
-                rng, sim_batch, online_grids, online_time_cfg
+                sample_rng, sim_batch, online_grids, online_time_cfg
             )
         else:
             replace = len(train_ids) < sim_batch
-            sim_ids = rng.choice(train_ids, size=sim_batch, replace=replace)
+            sim_ids = sample_rng.choice(train_ids, size=sim_batch, replace=replace)
             params = [dict(sim_params[int(i)]) for i in sim_ids]
         B = len(params)
 
@@ -2786,7 +2840,6 @@ def run_one_seed_interfaces_pino(
         interface_x = np.array([float(p["interface_x"]) for p in params])
         R_c = np.array([float(p["R_c"]) for p in params])
 
-        optimizer.zero_grad(set_to_none=True)
         latent = model.encode(u_spatial, fseq, pscal)
 
         # IC anchor: decode at t=0 against the (varying) normalized IC field.
@@ -2796,7 +2849,7 @@ def run_one_seed_interfaces_pino(
 
         # CN intervals over M = B * intervals_per_sim.
         t_n, t_np1, t_mid, bin_ids = _sample_interval_times(
-            rng, B, intervals_per_sim, dt, t_final, stratified, n_bins
+            sample_rng, B, intervals_per_sim, dt, t_final, stratified, n_bins
         )
         M = B * intervals_per_sim
         sim_local = np.repeat(np.arange(B), intervals_per_sim)      # (M,)
@@ -2836,43 +2889,123 @@ def run_one_seed_interfaces_pino(
             qL_np1=torch.from_numpy(qL_np1).to(torch.float32).to(device),
             qL_int=torch.from_numpy(qL_int).to(torch.float32).to(device),
         )
-        phys = full_bc_physics_loss(T_n, T_np1, geom, bc, per_sample=True)
-        interior_ps = phys["interior_per_sample"]                  # (M,)
+        phys = full_bc_physics_loss(
+            T_n, T_np1, geom, bc, per_sample=True, interface_band=band_enabled,
+        )
+        interior_ps = phys["interior_per_sample"]                  # (M,) bulk-only if band
 
+        # Shared causal weights: derived once from the interior bin means and
+        # applied identically to the band, so the two disjoint terms share the
+        # same temporal (causal-front) and spatial weighting for a clean
+        # one-hypothesis comparison and to avoid training late-time interface
+        # equations ahead of the causal front.
         if causal_enabled and stratified:
             bins_t = torch.as_tensor(bin_ids, device=device, dtype=torch.long)
             ones = torch.ones_like(interior_ps)
-            bsum = torch.zeros(n_bins, device=device, dtype=interior_ps.dtype)
             bcnt = torch.zeros(n_bins, device=device, dtype=interior_ps.dtype)
-            bsum = bsum.index_add(0, bins_t, interior_ps)
             bcnt = bcnt.index_add(0, bins_t, ones)
-            bmean = bsum / bcnt.clamp_min(1.0)
-            w = _causal_weights(bmean.detach(), eps_causal) * (bcnt > 0)
-            interior_loss = (w * bmean).sum() / w.sum().clamp_min(1e-12)
+            bsum_int = torch.zeros(n_bins, device=device, dtype=interior_ps.dtype)
+            bsum_int = bsum_int.index_add(0, bins_t, interior_ps)
+            bmean_int = bsum_int / bcnt.clamp_min(1.0)
+            causal_w = _causal_weights(bmean_int.detach(), eps_causal) * (bcnt > 0)
+
+            def _causal_reduce(ps: torch.Tensor) -> torch.Tensor:
+                bsum = torch.zeros(n_bins, device=device, dtype=ps.dtype)
+                bsum = bsum.index_add(0, bins_t, ps)
+                bmean = bsum / bcnt.clamp_min(1.0)
+                return (causal_w * bmean).sum() / causal_w.sum().clamp_min(1e-12)
         else:
-            interior_loss = interior_ps.mean()
+            def _causal_reduce(ps: torch.Tensor) -> torch.Tensor:
+                return ps.mean()
 
         losses = {
-            "interior": interior_loss,
+            "interior": _causal_reduce(interior_ps),
             "left_neumann": phys["phys_left_neumann_mse"],
             "topbot_adiabatic": phys["phys_topbot_adiabatic_mse"],
             "ic": ic_loss,
         }
+        if band_enabled:
+            losses["interface_band"] = _causal_reduce(phys["interface_band_per_sample"])
         right_dir = phys["phys_right_dirichlet_mse"]               # logged only
-        sw = {
-            "interior": lam_r, "left_neumann": lam_bc_left,
-            "topbot_adiabatic": lam_bc, "ic": lam_ic,
-        }
+        return losses, right_dir
+
+    # --- §4 calibration pass: freeze per-region scales on the INITIAL model,
+    # before any optimizer step and before GradNorm is built. Observationally
+    # inert: separate rng, snapshot/restore torch RNG, model state asserted
+    # unchanged. NOT under torch.no_grad (the FV autodiff residual needs
+    # grad-enabled ops to compute the forward loss).
+    if std_enabled:
+        state_before = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        cpu_rng_before = torch.get_rng_state()
+        cuda_rng_before = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        was_training = model.training
+        model.train()
+        calib_rng = np.random.default_rng(seed + 1_000_003)
+        accum = {k: 0.0 for k in balanced_terms}
+        t_calib0 = time.perf_counter()
+        for _ in range(calibration_steps):
+            losses_c, _ = _forward_losses(calib_rng)
+            for k in balanced_terms:
+                accum[k] += float(losses_c[k].detach().cpu())
+        calib_wall = time.perf_counter() - t_calib0
+        for k in balanced_terms:
+            std_scales[k] = max(accum[k] / calibration_steps, std_eps)
+        std_calib_done = True
+        # Restore prior train/eval mode + RNG; assert inertness (CViT is
+        # LayerNorm-only, so no running buffers are expected to move).
+        model.train(was_training)
+        torch.set_rng_state(cpu_rng_before)
+        if cuda_rng_before is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_before)
+        state_after = model.state_dict()
+        for k, v0 in state_before.items():
+            if not torch.equal(v0, state_after[k].to(v0.device)):
+                raise RuntimeError(
+                    f"region_standardize calibration mutated model state {k!r}; "
+                    "the calibration pass must be observationally inert."
+                )
+        print(
+            "[pino-interfaces] region_standardize: "
+            f"calibration_steps={calibration_steps} wall={calib_wall:.2f}s "
+            "scales="
+            + json.dumps({k: round(float(v), 8) for k, v in std_scales.items()}),
+            flush=True,
+        )
+
+    # GradNorm now, after calibration, so its reference L_k(0) sees standardized
+    # losses from optimizer step 0.
+    gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
+
+    best_global = float("inf")
+    best_jump = float("inf")
+    history: list[dict[str, Any]] = []
+    for epoch in range(epochs):
+        model.train()
+        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+
+        optimizer.zero_grad(set_to_none=True)
+        # Raw (pre-standardization) balanced-term losses via the shared closure.
+        losses, right_dir = _forward_losses(rng)
+        # §4: standardize each balanced term by its frozen calibration scale
+        # (identity when region_standardize is disabled). Both L_k(t) here and
+        # GradNorm's reference L_k(0) carry the same constant s_k, so it cancels
+        # in the relative-progress ratio.
+        if std_enabled:
+            losses_opt = {k: losses[k] / std_scales[k] for k in balanced_terms}
+        else:
+            losses_opt = losses
 
         gn_mults: dict[str, float] = {}
         if gradnorm is not None:
-            active = {k: losses[k] for k in gradnorm.term_names if k in losses}
+            active = {k: losses_opt[k] for k in gradnorm.term_names if k in losses_opt}
             gn_params = [p for p in model.parameters() if p.requires_grad]
             gn_mults = gradnorm.maybe_update(active, gn_params, dist_info=None)
         w_eff = {k: sw[k] * float(gn_mults.get(k, 1.0)) for k in sw}
         loss = None
         for k, wk in w_eff.items():
-            term = wk * losses[k]
+            term = wk * losses_opt[k]
             loss = term if loss is None else loss + term
         loss.backward()
         lr = float(optimizer.param_groups[0]["lr"])
@@ -2891,12 +3024,22 @@ def run_one_seed_interfaces_pino(
             "w_interior": lam_r, "w_left_neumann": lam_bc_left,
             "w_topbot": lam_bc, "w_ic": lam_ic,
         }
+        if band_enabled:
+            row["loss_interface_band"] = float(losses["interface_band"].detach().cpu())
+            row["w_interface_band"] = lam_band
+        if std_enabled:
+            for k in gn_cols:
+                row[f"loss_opt_{k}"] = float(losses_opt[k].detach().cpu())
+                row[f"std_scale_{k}"] = float(std_scales[k])
+        band_str = (
+            f", band={row['loss_interface_band']:.6f}" if band_enabled else ""
+        )
         print(
             f"Epoch {epoch}: loss={row['loss']:.6f} "
             f"(int={row['loss_interior']:.6f}, "
             f"left={row['loss_left_neumann']:.6f}, "
             f"tb={row['loss_topbot']:.6f}, ic={row['loss_ic']:.6f}, "
-            f"rd={row['loss_right_dir']:.2e}) lr={lr:.2e}",
+            f"rd={row['loss_right_dir']:.2e}{band_str}) lr={lr:.2e}",
             flush=True,
         )
 
@@ -2934,6 +3077,13 @@ def run_one_seed_interfaces_pino(
                 "gradnorm_state": (
                     gradnorm.state_dict() if gradnorm is not None else None
                 ),
+                "region_standardize": {
+                    "enabled": std_enabled,
+                    "calibration_steps": calibration_steps,
+                    "eps": std_eps,
+                    "std_scales": dict(std_scales),
+                    "std_calib_done": std_calib_done,
+                },
             }
             is_best_global = val["val_gnrmse"] < best_global
             if is_best_global:
@@ -2972,6 +3122,13 @@ def run_one_seed_interfaces_pino(
             "interface_forcing": {
                 "a_ref": a_ref, "t_ramp": t_ramp, "dt": dt,
                 "t_final": t_final, "forcing_samples": forcing_samples,
+            },
+            "region_standardize": {
+                "enabled": std_enabled,
+                "calibration_steps": calibration_steps,
+                "eps": std_eps,
+                "std_scales": dict(std_scales),
+                "std_calib_done": std_calib_done,
             },
         },
         run_dir / "cvit_last.pt",

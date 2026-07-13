@@ -247,6 +247,7 @@ def full_bc_physics_loss(
     region_weights: dict | None = None,
     dirichlet_both_ends: bool = False,
     per_sample: bool = False,
+    interface_band: bool = False,
 ) -> dict:
     """Region-partitioned full-BC physics loss for the Stage-2 ``full_bc`` path.
 
@@ -276,12 +277,32 @@ def full_bc_physics_loss(
     right-Dirichlet averages the ``n``/``np1`` halves under
     ``dirichlet_both_ends``). The scalar keys are the batch means of these, so
     they are numerically identical to the flattened default.
+
+    With ``interface_band`` (requires ``per_sample``; raises otherwise) the two
+    interior node columns flanking the interface face — full-grid columns
+    ``{face_idx, face_idx+1}`` = interior columns ``{face_idx-1, face_idx}`` from
+    ``geom.face_idx`` — are split off into a disjoint ``interface_band`` term.
+    ``interior_per_sample`` / ``phys_interior_mse`` then become **bulk-only**
+    (band columns removed) and two extra keys appear: ``interface_band_per_sample``
+    ``(B,)`` and ``phys_interface_band_mse`` (its batch mean). Fails loudly if
+    ``geom.face_idx`` is missing or a mapped column is out of range.
+    ``interface_band=False`` is byte-for-byte the legacy output.
     """
     from src.physics.fv_residual import full_bc_cn_residual
 
     if T_n.dim() == 4:
         T_n = T_n[..., 0]
         T_np1 = T_np1[..., 0]
+
+    # Fail loudly: interface_band is a per-sample-only feature. Never silently
+    # fall back to a band-less loss (that would make a "band-enabled" run
+    # byte-identical to the baseline). Only interface_band=False is legacy-exact.
+    if interface_band and not per_sample:
+        raise ValueError(
+            "full_bc_physics_loss: interface_band=True requires per_sample=True "
+            "(the disjoint band split is defined on the batch-shaped interior "
+            "residual)."
+        )
 
     if not per_sample:
         parts = full_bc_cn_residual(
@@ -323,8 +344,45 @@ def full_bc_physics_loss(
     def _ps(t: torch.Tensor) -> torch.Tensor:
         return t.pow(2).flatten(1).mean(dim=1)
 
+    interior_per_sample = _ps(parts["interior"])
+    interface_band_per_sample = None
+    if interface_band:
+        # (b) The band is derived from the per-sample interface face index; a
+        # scalar geom (face_idx is None) cannot supply it.
+        face_idx = getattr(geom, "face_idx", None)
+        if face_idx is None:
+            raise ValueError(
+                "full_bc_physics_loss: interface_band=True requires "
+                "geom.face_idx (per-sample interface face); got None. Build the "
+                "geometry with build_cn_geom_per_interface."
+            )
+        # parts["interior"] is (B, Nx-2, Ny-2). Full-grid column i maps to
+        # interior column k = i-1, so the interface-flanking full-grid columns
+        # {face_idx, face_idx+1} are interior columns {face_idx-1, face_idx}.
+        sq = parts["interior"].square()  # (B, Nx-2, Ny-2)
+        B, nx_int, ny_int = sq.shape
+        dev = sq.device
+        face_idx = face_idx.to(device=dev, dtype=torch.long)  # (B,)
+        band_idx = torch.stack([face_idx - 1, face_idx], dim=1)  # (B, 2)
+        # (c) Both mapped interior columns must be strictly inside [0, Nx-3].
+        if int(band_idx.min()) < 0 or int(band_idx.max()) > nx_int - 1:
+            raise ValueError(
+                "full_bc_physics_loss: interface band column out of range; "
+                f"mapped interior columns {{face_idx-1, face_idx}} must lie in "
+                f"[0, {nx_int - 1}] (Nx-3), got min={int(band_idx.min())} "
+                f"max={int(band_idx.max())}."
+            )
+        band_cols = torch.zeros(B, nx_int, dtype=torch.bool, device=dev)
+        rows = torch.arange(B, device=dev)[:, None].expand(-1, 2)
+        band_cols[rows, band_idx] = True  # (B, Nx-2) bool
+        band_mask = band_cols[:, :, None].expand_as(sq)  # (B, Nx-2, Ny-2)
+        band_count = band_mask.sum(dim=(1, 2))            # (B,) = 2*(Ny-2)
+        bulk_count = (~band_mask).sum(dim=(1, 2))         # (B,)
+        interface_band_per_sample = (sq * band_mask).sum(dim=(1, 2)) / band_count
+        interior_per_sample = (sq * ~band_mask).sum(dim=(1, 2)) / bulk_count
+
     per = {
-        "interior": _ps(parts["interior"]),
+        "interior": interior_per_sample,
         "left_neumann": _ps(parts["left_neumann"]),
         "topbot_adiabatic": _ps(parts["topbot_adiabatic"]),
         "right_dirichlet": _ps(parts["right_dirichlet"]),
@@ -345,7 +403,7 @@ def full_bc_physics_loss(
         [parts[name].flatten() for name in _FULL_BC_REGIONS]
     ).pow(2).mean()
 
-    return {
+    out = {
         "physics_loss_weighted": weighted,
         "physics_loss_allcell_mean": allcell,
         "phys_interior_mse": region_mse["interior"],
@@ -357,6 +415,13 @@ def full_bc_physics_loss(
         "topbot_adiabatic_per_sample": per["topbot_adiabatic"],
         "right_dirichlet_per_sample": per["right_dirichlet"],
     }
+    if interface_band:
+        # interior_* above are now bulk-only (band columns removed); the two
+        # terms are disjoint and cell-count-weighted-recombine to the full
+        # interior mean-square.
+        out["interface_band_per_sample"] = interface_band_per_sample
+        out["phys_interface_band_mse"] = interface_band_per_sample.mean()
+    return out
 
 
 # ---------------------------------------------------------------------------

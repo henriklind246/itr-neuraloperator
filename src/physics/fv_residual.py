@@ -62,6 +62,7 @@ class FVGeom:
     dt: float
     sigma_global: float
     hx: float                    # base grid spacing (left-Neumann flux uses h=hx)
+    face_idx: torch.Tensor | None = None  # (B,) per-sample interface face; None for scalar geom
 
     @property
     def Nx(self) -> int:
@@ -421,6 +422,7 @@ def build_cn_geom_per_interface(x_grid, y_grid, k_left: float, k_right: float,
         r_w=r_w, r_e=r_e, r_s=r_s, r_n=r_n,
         interior_mask=interior_mask, dt=float(dt),
         sigma_global=float(sigma_global), hx=float(hx),
+        face_idx=face_idx,
     )
 
 

@@ -246,6 +246,27 @@ training:
     intervals_per_sim: 2
     stratified_time_sampling: true
     causal_num_bins: 6
+    # interface_band (interfaces PINO only): split the two node columns flanking
+    # the interface face (interior columns {face_idx-1, face_idx}) out of the
+    # interior CN residual into a DISJOINT 5th balanced GradNorm term so the jump
+    # sub-signal is up-weighted independently of bulk diffusion. enabled: false is
+    # a TRUE no-op (interior keeps all columns, term set stays 4). lambda is the
+    # static coefficient GradNorm multiplies; enabled with lambda <= 0 raises.
+    interface_band:
+      enabled: false
+      lambda: 1.0
+    # region_standardize (interfaces PINO only): rescale each balanced term by a
+    # per-term scale s_k FROZEN from a short calibration pass on the INITIAL model
+    # (no optimizer steps) before GradNorm is built, so the composed loss is not
+    # dominated by the 1/hx left-Neumann units artifact. Not a moving EMA: the
+    # constant s_k cancels in GradNorm's L_k(t)/L_k(0) only because L_k(0) is also
+    # standardized. enabled: false is a TRUE no-op (scales stay 1.0, no calibration
+    # pass). calibration_steps forward batches accumulate the frozen scales;
+    # enabled with calibration_steps <= 0 or eps <= 0 raises.
+    region_standardize:
+      enabled: false
+      calibration_steps: 50
+      eps: 1.0e-8
     # ic_loss selects the IC term norm. "mse" (legacy) is the raw normalized MSE
     # mean(ic^2), which goes numerically small on a near-300 K field even when the
     # relative error in the thermal signal is large (t0 rel-L2 ~0.75 seeds the whole

@@ -6,6 +6,8 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.fv_residual import (
     build_face_conductances,
     build_cn_geom,
+    build_cn_geom_per_interface,
+    locate_interface,
     interior_cn_residual,
     full_bc_cn_residual,
     FullBCData,
@@ -433,6 +435,34 @@ def test_full_bc_per_sample_manual_two_rows():
         kept_swap["interior"][0].pow(2).mean(),
         ps["interior_per_sample"][1], atol=1e-12,
     )
+
+
+def test_per_interface_geom_exposes_face_idx():
+    """`build_cn_geom_per_interface` publishes the per-sample `face_idx` `(B,)`
+    equal to `locate_interface(...).face_idx` for each interface; the scalar
+    `build_cn_geom` leaves `face_idx` unset (None)."""
+    sim = _build_forcing_solver()
+    xg, yg = sim.grid_x, sim.grid_y
+    interface_x = [0.3, 0.5, 0.7, 0.42]
+    R_c = [0.5, 0.4, 0.6, 0.5]
+    geom = build_cn_geom_per_interface(
+        xg, yg, k_left=2.0, k_right=1.0,
+        interface_x_batch=interface_x, R_c_batch=R_c,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    assert geom.face_idx is not None
+    assert geom.face_idx.shape == (len(interface_x),)
+    assert geom.face_idx.dtype == torch.long
+    expected = torch.tensor(
+        [locate_interface(xg, ix).face_idx for ix in interface_x], dtype=torch.long
+    )
+    assert torch.equal(geom.face_idx, expected)
+
+    scalar_geom = build_cn_geom(
+        xg, yg, k_left=2.0, k_right=1.0, interface_x=0.5, R_c=0.5,
+        dt=sim.dt, sigma_global=1.0, dtype=torch.float64,
+    )
+    assert scalar_geom.face_idx is None
 
 
 def _build_pulse_train_solver(dt: float = 0.005, t_final: float = 0.3, Ny: int = 100):

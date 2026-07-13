@@ -148,6 +148,64 @@ def test_state_round_trip_and_term_mismatch_raises():
 
 
 # --------------------------------------------------------------------------- #
+# 1c. Interfaces PINO 5-term set (interface_band as a balanced term)          #
+# --------------------------------------------------------------------------- #
+
+_IFACE_TERMS = ["interior", "left_neumann", "topbot_adiabatic", "ic", "interface_band"]
+
+
+def test_five_term_interface_band_round_trip_and_mismatch():
+    """The `interfaces` PINO balancer over the 5-term set (band added last)
+    constructs, keeps insertion order, round-trips through state, and a 4<->5
+    term-name mismatch raises on load (same guard as the 4-term set)."""
+    m = _lin()
+    y = m(torch.ones(1, 1))
+    gn = GradNormBalancer(_IFACE_TERMS, alpha_w=0.5, update_every=1)
+    assert gn.state_dict()["term_names"] == _IFACE_TERMS
+    gn.maybe_update({k: ((i + 1) * y).sum() for i, k in enumerate(_IFACE_TERMS)},
+                    list(m.parameters()))
+    state = gn.state_dict()
+
+    gn2 = GradNormBalancer(_IFACE_TERMS, alpha_w=0.5, update_every=1)
+    gn2.load_state_dict(state)
+    assert gn2.multipliers == gn.multipliers
+    assert gn2._step == gn._step
+
+    four_term = GradNormBalancer(_IFACE_TERMS[:4], alpha_w=0.5, update_every=1)
+    with pytest.raises(ValueError, match="term_names"):
+        four_term.load_state_dict(state)
+
+
+def test_build_gradnorm_includes_interface_band_when_weighted():
+    """`build_gradnorm` (the real trainer wiring) admits `interface_band` as a
+    balanced term when its static weight > 0, preserving insertion order, and
+    filters out any zero-weight term."""
+    from src.operators.train_pino import build_gradnorm
+
+    config = {"training": {"gradnorm": {"enabled": True, "update_every": 10}}}
+    term_weights = {
+        "interior": 1.0,
+        "left_neumann": 1.0,
+        "topbot_adiabatic": 1.0,
+        "ic": 1.0,
+        "interface_band": 1.0,
+    }
+    gn = build_gradnorm(config, term_weights=term_weights)
+    assert gn is not None
+    assert gn.state_dict()["term_names"] == list(term_weights)
+
+    # A zero (or None) static weight drops the term from the balanced set.
+    term_weights_zero = dict(term_weights)
+    term_weights_zero["interface_band"] = 0.0
+    gn_zero = build_gradnorm(config, term_weights=term_weights_zero)
+    assert "interface_band" not in gn_zero.state_dict()["term_names"]
+
+    # Disabled config -> no balancer at all.
+    off = {"training": {"gradnorm": {"enabled": False}}}
+    assert build_gradnorm(off, term_weights=term_weights) is None
+
+
+# --------------------------------------------------------------------------- #
 # 1b. Guardrails — clamp/floor bracket the EMA, bound-hit counters, resume     #
 # --------------------------------------------------------------------------- #
 
