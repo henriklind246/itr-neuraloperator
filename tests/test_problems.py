@@ -4,6 +4,7 @@ import pytest
 from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
 from problems.diffusion import DiffusionProblem
+from problems.diffusion_forcing_single import DiffusionForcingSingleProblem
 from problems.forcing import FORCING_TEMPORAL_SAMPLES, ForcingProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
@@ -55,6 +56,12 @@ CONTRACTS = {
     ),
     # diffusion_forcing: single slab, forcing-driven; temporal_encoder only.
     ("diffusion_forcing", "temporal_encoder"): dict(
+        in_ch=4, cond=2, has_fseq=True, token=2, t_stats=2,
+        encoder=True, s_y=3, aug=True,
+    ),
+    # diffusion_forcing_single: diffusion_forcing restricted to the sin/uniform
+    # forcing family; identical tensor contract to diffusion_forcing.
+    ("diffusion_forcing_single", "temporal_encoder"): dict(
         in_ch=4, cond=2, has_fseq=True, token=2, t_stats=2,
         encoder=True, s_y=3, aug=True,
     ),
@@ -149,6 +156,11 @@ class TestRegistry:
 
     def test_diffusion_registered(self):
         assert isinstance(get_problem("diffusion"), DiffusionProblem)
+
+    def test_diffusion_forcing_single_registered(self):
+        assert isinstance(
+            get_problem("diffusion_forcing_single"), DiffusionForcingSingleProblem
+        )
 
     def test_diffusion_rejects_bins(self):
         # diffusion supports only temporal_encoder; bins must raise in __init__.
@@ -407,6 +419,60 @@ class TestInterfacesSampleParity:
     def test_interfaces_keep_varying_initial_conditions(self, interfaces_dataset):
         ds = interfaces_dataset
         assert any(not np.allclose(p["T0"], 300.0) for p in ds.sim_params)
+
+
+# ===================== diffusion_forcing_single adapter =====================
+
+def _dfs_sample_params(n=8):
+    """Sample n sim_params from the diffusion_forcing_single spec on a tiny grid."""
+    x_grid = np.linspace(0.0, 1.0, 5)
+    y_grid = np.linspace(0.0, 1.0, 4)
+    t_grid = np.linspace(0.0, 0.3, 7)
+    trajectories = np.zeros((n, t_grid.size, x_grid.size, y_grid.size), dtype=np.float32)
+    return _adapter_sim_params(
+        get_problem("diffusion_forcing_single"),
+        trajectories, x_grid, y_grid, t_grid,
+    )
+
+
+class TestDiffusionForcingSingleSampleParity:
+    def test_only_sin_uniform(self):
+        params = _dfs_sample_params(n=16)
+        assert len(params) == 16
+        for p in params:
+            assert p["temporal_family"] == "sin"
+            assert p["spatial_family"] == "uniform"
+
+    def test_fixed_uniform_300k_ic(self):
+        # Single-slab benchmark pins the 300 K uniform IC; only forcing varies.
+        for p in _dfs_sample_params(n=8):
+            assert np.allclose(p["T0"], 300.0)
+
+
+class TestDiffusionForcingSingleSchema:
+    def test_accepts_all_sin_uniform(self):
+        spec = get_problem("diffusion_forcing_single")
+        params = _dfs_sample_params(n=8)
+        spec.validate_schema(params, np.arange(len(params)))
+
+    def test_rejects_mixed_family(self):
+        spec = get_problem("diffusion_forcing_single")
+        bad_temporal = np.array([{
+            "T0": np.full((5, 4), 300.0, dtype=np.float32),
+            "ic_family": "uniform_2d", "ic_params": {"T0_offset": 0.0},
+            "temporal_family": "exp", "temporal_params": {},
+            "spatial_family": "uniform", "spatial_params": {},
+        }], dtype=object)
+        with pytest.raises(ValueError, match="admits"):
+            spec.validate_schema(bad_temporal, np.array([0]))
+        bad_spatial = np.array([{
+            "T0": np.full((5, 4), 300.0, dtype=np.float32),
+            "ic_family": "uniform_2d", "ic_params": {"T0_offset": 0.0},
+            "temporal_family": "sin", "temporal_params": {},
+            "spatial_family": "patch", "spatial_params": {},
+        }], dtype=object)
+        with pytest.raises(ValueError, match="admits"):
+            spec.validate_schema(bad_spatial, np.array([0]))
 
 
 # ===================== source adapter =====================

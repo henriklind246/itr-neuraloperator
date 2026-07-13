@@ -387,6 +387,8 @@ def sample_forcing_params(
     c: float = 0.0,
     d: float = 1.0,
     temporal_window: dict | None = None,
+    temporal_family: str | None = None,
+    spatial_family: str | None = None,
 ) -> list[dict]:
     """Draw ``n`` fresh separable-forcing parameter sets ``q_L = a(t)*s(y)``.
 
@@ -396,6 +398,12 @@ def sample_forcing_params(
     ``sim_params.npy`` is read: physics-only training is not tied to a finite
     saved set (Chen et al. arXiv:2606.06164). ``c, d`` bound the y-domain the
     spatial profile lives on; ``temporal_window`` supplies the sin on/off window.
+
+    ``temporal_family`` / ``spatial_family`` optionally pin the family: when
+    ``None`` (default) the family is drawn as before (``sample_*_family(rng)``),
+    preserving the existing RNG consumption; when a family string is given, the
+    corresponding family draw is skipped and that fixed family is used (the
+    ``diffusion_forcing_single`` benchmark pins ``sin`` / ``uniform``).
     """
     tw = temporal_window or {}
     win = dict(
@@ -406,9 +414,9 @@ def sample_forcing_params(
     )
     out: list[dict] = []
     for _ in range(int(n)):
-        tf = sample_temporal_family(rng)
+        tf = temporal_family if temporal_family is not None else sample_temporal_family(rng)
         tp = TEMPORAL_SAMPLERS[tf](rng, dt=dt, t_final=t_final, **win)
-        sf = sample_spatial_family(rng)
+        sf = spatial_family if spatial_family is not None else sample_spatial_family(rng)
         sp = SPATIAL_SAMPLERS[sf](rng, c=c, d=d)
         out.append({
             "temporal_family": tf, "temporal_params": tp,
@@ -1840,6 +1848,10 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         phase=float(fcfg.get("phase", 0.0)),
         tukey_alpha=float(fcfg.get("tukey_alpha", 0.5)),
     )
+    # None -> draw all families (diffusion_forcing); a family string pins the
+    # online sampler (diffusion_forcing_single pins sin/uniform).
+    tf_fix = fcfg.get("temporal_family")
+    sf_fix = fcfg.get("spatial_family")
     dt_sample = (
         float(fcfg["dt_sample"])
         if fcfg.get("dt_sample") is not None
@@ -2028,6 +2040,7 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
             params_batch = sample_forcing_params(
                 rng, sim_batch, dt_sample, t_final,
                 c=c_dom, d=d_dom, temporal_window=temporal_window,
+                temporal_family=tf_fix, spatial_family=sf_fix,
             )
             coll = sample_collocation(
                 n_r, n_ic, n_bc, t_final, x_grid_t, y_grid_t, device, gen,
@@ -3157,7 +3170,8 @@ def run_config_seeds_pino(
     bench = str(config.get("benchmark", {}).get("name", "diffusion"))
     runner = (
         run_one_seed_interfaces_pino if bench == "interfaces"
-        else run_one_seed_forcing_pino if bench == "diffusion_forcing"
+        else run_one_seed_forcing_pino
+        if bench in ("diffusion_forcing", "diffusion_forcing_single")
         else run_one_seed_pino
     )
     results = {}

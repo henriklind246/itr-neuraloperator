@@ -576,6 +576,43 @@ def _write_synthetic_forcing(tmp_path, num_sims=8, Nt=6, Nx=10, Ny=16):
     return traj
 
 
+def test_sample_forcing_params_pins_sin_uniform():
+    # diffusion_forcing_single pins the online sampler to sin/uniform; every
+    # drawn record must use that single family.
+    rng = np.random.default_rng(0)
+    records = sample_forcing_params(
+        rng, 32, dt=0.3 / 5, t_final=0.3,
+        temporal_family="sin", spatial_family="uniform",
+    )
+    assert len(records) == 32
+    for r in records:
+        assert r["temporal_family"] == "sin"
+        assert r["spatial_family"] == "uniform"
+
+
+def test_sample_forcing_params_default_path_is_deterministic():
+    # Adding the family kwargs must not perturb the default (all-family) RNG
+    # consumption: two freshly-seeded draws with default kwargs match exactly.
+    def _draw():
+        rng = np.random.default_rng(1234)
+        return sample_forcing_params(rng, 16, dt=0.3 / 5, t_final=0.3)
+
+    a, b = _draw(), _draw()
+    assert [r["temporal_family"] for r in a] == [r["temporal_family"] for r in b]
+    assert [r["spatial_family"] for r in a] == [r["spatial_family"] for r in b]
+    # Same seed => byte-identical param sequence; repr captures floats/arrays alike.
+    assert repr(a) == repr(b)
+
+
+def test_sample_forcing_params_default_path_draws_multiple_families():
+    # Default (unpinned) sampling still spans more than one temporal family, so
+    # the pin above is a real restriction rather than a no-op.
+    rng = np.random.default_rng(7)
+    records = sample_forcing_params(rng, 64, dt=0.3 / 5, t_final=0.3)
+    families = {r["temporal_family"] for r in records}
+    assert len(families) > 1
+
+
 def _forcing_config(tmp_path):
     # Forcing image grid = (ny_img=Ny=16, nt_img=20); patch_size=4 divides both.
     return {
