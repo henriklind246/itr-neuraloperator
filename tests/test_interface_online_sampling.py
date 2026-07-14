@@ -1,12 +1,17 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
+import yaml
 
 from problems.base import ProblemSpec
+from problems.diffusion_forcing_single import DiffusionForcingSingleProblem
 from problems.interfaces import (
     INTERFACE_X_RANGE,
     RC_RANGE,
     InterfacesProblem,
 )
+from src.physics.init_conditions import IC_FAMILIES
 
 """
 Stage 7 gates for `online` interface collocation sampling
@@ -21,6 +26,13 @@ REQUIRED_KEYS = (
     "R_c", "interface_x", "T0", "ic_family", "ic_params",
     "temporal_family", "temporal_params", "spatial_family", "spatial_params",
 )
+
+
+def test_interfaces_benchmark_defaults_to_online_collocation():
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "conf/benchmark/interfaces.yaml").read_text()
+    )
+    assert config["training"]["pino"]["collocation_source"] == "online"
 
 
 def _grids(Nx=24, Ny=20, a=0.0, b=1.0, c=0.0, d=1.0):
@@ -126,6 +138,67 @@ def test_online_matches_saved_sim_params_schema():
     online = spec.sample_online_params(np.random.default_rng(5), 8, grids, tcfg)
 
     assert set(online[0].keys()) == set(saved[0].keys())
+
+
+def test_named_streams_keep_interface_and_resistance_independent():
+    spec = InterfacesProblem()
+    names = (
+        "ic_family", "ic_params", "forcing_params", "interface_position",
+        "contact_resistance",
+    )
+
+    def streams():
+        return {
+            name: np.random.default_rng(100 + index)
+            for index, name in enumerate(names)
+        }
+
+    a_streams = streams()
+    b_streams = streams()
+    b_streams["interface_position"].random(17)
+    assignment = list(IC_FAMILIES) * 2
+    a = spec.sample_online_params(
+        a_streams["ic_params"], 8, _grids(), _time_cfg(),
+        rng_streams=a_streams, ic_family_assignment=assignment,
+    )
+    b = spec.sample_online_params(
+        b_streams["ic_params"], 8, _grids(), _time_cfg(),
+        rng_streams=b_streams, ic_family_assignment=assignment,
+    )
+    np.testing.assert_array_equal(
+        [record["R_c"] for record in a], [record["R_c"] for record in b],
+    )
+    for left, right in zip(a, b):
+        assert left["ic_family"] == right["ic_family"]
+        np.testing.assert_array_equal(left["T0"], right["T0"])
+    assert not np.array_equal(
+        [record["interface_x"] for record in a],
+        [record["interface_x"] for record in b],
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 16])
+def test_explicit_balanced_assignments_are_preserved(batch_size):
+    families = list(IC_FAMILIES)
+    assignment = [families[index % len(families)] for index in range(batch_size)]
+    records = InterfacesProblem().sample_online_params(
+        np.random.default_rng(0), batch_size, _grids(), _time_cfg(),
+        ic_family_assignment=assignment,
+    )
+    assert [record["ic_family"] for record in records] == assignment
+
+
+def test_diffusion_forcing_single_online_records_are_complete():
+    assignment = list(IC_FAMILIES)
+    records = DiffusionForcingSingleProblem().sample_online_params(
+        np.random.default_rng(0), len(assignment), _grids(), _time_cfg(),
+        rng_profile=np.random.default_rng(1),
+        ic_family_assignment=assignment,
+    )
+    assert [record["ic_family"] for record in records] == assignment
+    assert all(record["temporal_family"] == "sin" for record in records)
+    assert all(record["spatial_family"] == "uniform" for record in records)
+    assert all(record["T0"].dtype == np.float32 for record in records)
 
 
 def test_base_spec_refuses_online_sampling():

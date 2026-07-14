@@ -233,15 +233,22 @@ class ProblemSpec(ABC):
         grids: dict[str, np.ndarray],
         time_cfg: dict[str, Any],
         rng_profile: np.random.Generator | None = None,
+        *,
+        rng_streams: dict[str, np.random.Generator] | None = None,
+        ic_family_assignment: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
         """Draw ``n`` fresh IID sim-param dicts for `online` physics collocation.
 
         Same row schema as :meth:`sample_sim_params` (so the same channel/forcing
         builders consume them), but each call draws parameters IID from the
         benchmark's *target* distributions instead of a fixed global design.
-        Benchmarks that support online collocation override this; the default
-        raises so an `online` collocation source fails loudly rather than
-        silently reusing saved params.
+        ``rng_streams`` and ``ic_family_assignment`` let physics-only trainers
+        isolate logically independent draws and impose a batch-level family
+        balance. They are optional so existing callers retain the legacy
+        ``rng``/``rng_profile`` behavior. Benchmarks that support online
+        collocation override this; the default raises so an `online`
+        collocation source fails loudly rather than silently reusing saved
+        params.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support online collocation "

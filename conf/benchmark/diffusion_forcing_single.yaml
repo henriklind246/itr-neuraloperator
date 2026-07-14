@@ -34,16 +34,16 @@ training:
     per_sample_interface_x: false
   physics:
     mode: collocation
-    # Train the collocation sampler on training sims so val stays honest.
-    collocation_source: train
+    # The PINO optimizer samples complete IC/forcing problems online; saved
+    # trajectories remain the fixed validation and normalization reference.
+    collocation_source: online
     # Anchor the sampled (now varying) IC. The forcing_ic runner reads the IC
     # anchor weight from training.pino.lambda_ic (default 1.0); this mirrors the
     # intent for the non-forcing collocation path and documents that the IC is
     # anchored, not free.
     lambda_ic: 1.0
-    # IC anchor node budget: sample this many EXACT IC grid nodes per step (values
-    # gathered from the saved T0 with no interpolation); coverage accumulates as
-    # the nodes resample across steps. Read only by run_one_seed_forcing_ic_pino.
+    # IC anchor node budget: sample this many exact grid nodes per step and gather
+    # targets from the same transferred normalized IC buffer seen by the encoder.
     n_ic_points: 1024
   pino:
     # The two-branch ForcingICCViT is the only compatible surrogate; the dispatch

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import csv
 import copy
+import hashlib
 import json
 import math
 import os
+import platform
 import random
+import struct
+import sys
 import time
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -64,6 +70,12 @@ from src.physics.fv_residual import (
     build_homogeneous_cn_geom,
     locate_interface,
 )
+from src.physics.init_conditions import (
+    IC_BUILDER_SCHEMA_VERSION,
+    ONLINE_IC_SAMPLER_VERSION,
+    balanced_ic_family_assignments,
+    build_ic,
+)
 from src.physics.pde_residual import (
     diffusion_residual,
     forcing_neumann_residual,
@@ -80,6 +92,289 @@ from src.physics.pde_residual import (
 # target) snapshots are used; validation compares against the saved trajectories.
 
 WALLS = ("left", "top", "bottom")
+
+_ONLINE_NUMPY_STREAMS = (
+    "ic_family",
+    "ic_params",
+    "forcing_family",
+    "forcing_params",
+    "interface_position",
+    "contact_resistance",
+    "other_materials",
+    "fv_intervals",
+    "evaluation",
+)
+_CANONICAL_EXCLUDED_KEYS = {
+    "T0", "T0_sha256", "problem_key", "batch_key", "sample_key",
+    "device", "runtime", "latent", "decoded",
+}
+
+
+@dataclass
+class OnlineSamplerRNGs:
+    """Independent online-sampling streams with checkpointable state."""
+
+    numpy: dict[str, np.random.Generator]
+    autodiff_collocation: torch.Generator
+    evaluation: torch.Generator
+
+    @classmethod
+    def create(cls, seed: int, device: torch.device) -> "OnlineSamplerRNGs":
+        children = np.random.SeedSequence(int(seed)).spawn(
+            len(_ONLINE_NUMPY_STREAMS) + 2
+        )
+        numpy = {
+            name: np.random.default_rng(child)
+            for name, child in zip(_ONLINE_NUMPY_STREAMS, children)
+        }
+
+        def _torch_generator(child) -> torch.Generator:
+            generator = torch.Generator(device=device)
+            raw = int(child.generate_state(1, dtype=np.uint64)[0])
+            generator.manual_seed(raw % (2**63 - 1))
+            return generator
+
+        return cls(
+            numpy=numpy,
+            autodiff_collocation=_torch_generator(children[-2]),
+            evaluation=_torch_generator(children[-1]),
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "numpy": {
+                name: copy.deepcopy(generator.bit_generator.state)
+                for name, generator in self.numpy.items()
+            },
+            "autodiff_collocation": self.autodiff_collocation.get_state(),
+            "evaluation": self.evaluation.get_state(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state.get("version", -1)) != 1:
+            raise ValueError("unsupported OnlineSamplerRNGs checkpoint version")
+        if tuple(state.get("numpy", {}).keys()) != _ONLINE_NUMPY_STREAMS:
+            raise ValueError("online RNG stream names do not match this trainer")
+        for name in _ONLINE_NUMPY_STREAMS:
+            self.numpy[name].bit_generator.state = copy.deepcopy(state["numpy"][name])
+        self.autodiff_collocation.set_state(state["autodiff_collocation"])
+        self.evaluation.set_state(state["evaluation"])
+
+
+def _canonical_descriptor_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_descriptor_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_canonical_descriptor_value(item) for item in value)
+    if isinstance(value, list):
+        if value and all(
+            isinstance(item, (int, np.integer)) and not isinstance(item, bool)
+            for item in value
+        ):
+            return np.asarray(value, dtype="<i8")
+        if value and all(isinstance(item, (float, np.floating)) for item in value):
+            return np.asarray(value, dtype="<f8")
+        return [_canonical_descriptor_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return np.array(value, copy=True, order="C")
+    if isinstance(value, (float, np.floating)):
+        return np.float64(value)
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        return np.int64(value)
+    return copy.deepcopy(value)
+
+
+def _canonical_binary_encode(value) -> bytes:
+    chunks: list[bytes] = []
+
+    def _length(n: int) -> bytes:
+        return struct.pack("<Q", int(n))
+
+    def _encode(item) -> None:
+        if isinstance(item, torch.Tensor):
+            item = item.detach().cpu().numpy()
+        if item is None:
+            chunks.append(b"N")
+        elif isinstance(item, (bool, np.bool_)):
+            chunks.append(b"B\x01" if bool(item) else b"B\x00")
+        elif isinstance(item, (int, np.integer)):
+            chunks.extend((b"I", struct.pack("<q", int(item))))
+        elif isinstance(item, (float, np.floating)):
+            chunks.extend((b"F", struct.pack("<d", float(item))))
+        elif isinstance(item, str):
+            encoded = item.encode("utf-8")
+            chunks.extend((b"S", _length(len(encoded)), encoded))
+        elif isinstance(item, bytes):
+            chunks.extend((b"Y", _length(len(item)), item))
+        elif isinstance(item, np.ndarray):
+            arr = np.asarray(item)
+            dtype = arr.dtype
+            if dtype.byteorder == ">" or (dtype.byteorder == "=" and sys.byteorder == "big"):
+                dtype = dtype.newbyteorder("<")
+                arr = arr.astype(dtype, copy=False)
+            elif dtype.byteorder == "=":
+                dtype = dtype.newbyteorder("<")
+                arr = arr.astype(dtype, copy=False)
+            arr = np.ascontiguousarray(arr)
+            dtype_name = dtype.str.encode("ascii")
+            chunks.extend((b"A", _length(len(dtype_name)), dtype_name))
+            chunks.append(_length(arr.ndim))
+            for dim in arr.shape:
+                chunks.append(struct.pack("<q", int(dim)))
+            raw = arr.tobytes(order="C")
+            chunks.extend((_length(len(raw)), raw))
+        elif isinstance(item, dict):
+            entries = sorted(
+                ((str(key), value) for key, value in item.items()
+                 if str(key) not in _CANONICAL_EXCLUDED_KEYS),
+                key=lambda pair: pair[0],
+            )
+            chunks.extend((b"M", _length(len(entries))))
+            for key, child in entries:
+                _encode(key)
+                _encode(child)
+        elif isinstance(item, (list, tuple)):
+            chunks.extend((b"L" if isinstance(item, list) else b"T", _length(len(item))))
+            for child in item:
+                _encode(child)
+        else:
+            raise TypeError(f"unsupported canonical descriptor value {type(item)!r}")
+
+    _encode(value)
+    return b"".join(chunks)
+
+
+def _content_key(value) -> str:
+    return hashlib.sha256(_canonical_binary_encode(value)).hexdigest()
+
+
+def _environment_fingerprint() -> dict[str, Any]:
+    return {
+        "numpy_version": np.__version__,
+        "endianness": sys.byteorder,
+        "architecture": platform.machine(),
+        "ic_builder_version": IC_BUILDER_SCHEMA_VERSION,
+    }
+
+
+def _validate_environment_fingerprint(saved: dict, current: dict) -> None:
+    for key in ("endianness", "architecture"):
+        if saved.get(key) != current.get(key):
+            raise ValueError(
+                f"online IC environment {key} mismatch: "
+                f"{saved.get(key)!r} != {current.get(key)!r}"
+            )
+    if saved.get("ic_builder_version") != current.get("ic_builder_version"):
+        raise ValueError("online IC builder version mismatch")
+    if saved.get("numpy_version") != current.get("numpy_version"):
+        warnings.warn(
+            "NumPy version differs from the online-IC checkpoint; exact "
+            "reconstruction hashes will be verified before training.",
+            RuntimeWarning,
+        )
+
+
+def _final_float32_hash(field: np.ndarray) -> str:
+    field = np.ascontiguousarray(field, dtype=np.float32)
+    return hashlib.sha256(field.tobytes(order="C")).hexdigest()
+
+
+def _online_record_descriptor(record: dict) -> dict:
+    T0 = np.ascontiguousarray(record["T0"], dtype=np.float32)
+    descriptor = {
+        key: _canonical_descriptor_value(value)
+        for key, value in record.items() if key != "T0"
+    }
+    descriptor.update({
+        "sampler_version": ONLINE_IC_SAMPLER_VERSION,
+        "builder_version": np.int64(IC_BUILDER_SCHEMA_VERSION),
+        "T0_sha256": _final_float32_hash(T0),
+    })
+    descriptor["problem_key"] = _content_key(descriptor)
+    return descriptor
+
+
+def _materialize_online_records(
+    descriptors: list[dict], X: np.ndarray, Y: np.ndarray, *,
+    T_right: float = 300.0, b: float = 1.0,
+) -> list[dict]:
+    records: list[dict] = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor.get("builder_version"), np.integer):
+            raise ValueError(
+                "online IC descriptors must come from the lossless binary checkpoint; "
+                "audit JSON is not an authoritative resume source"
+            )
+        if descriptor.get("sampler_version") != ONLINE_IC_SAMPLER_VERSION:
+            raise ValueError("online IC sampler version mismatch")
+        if int(descriptor.get("builder_version", -1)) != IC_BUILDER_SCHEMA_VERSION:
+            raise ValueError("online IC builder version mismatch")
+        T0 = build_ic(
+            str(descriptor["ic_family"]), descriptor["ic_params"], X, Y,
+            T_right=float(T_right), b=float(b),
+        )
+        if _final_float32_hash(T0) != descriptor["T0_sha256"]:
+            raise ValueError(
+                f"online IC reconstruction failed for {descriptor['problem_key']}"
+            )
+        record = {
+            key: copy.deepcopy(value) for key, value in descriptor.items()
+            if key not in {
+                "sampler_version", "builder_version", "T0_sha256", "problem_key",
+            }
+        }
+        record["T0"] = T0
+        record["problem_key"] = descriptor["problem_key"]
+        records.append(record)
+    return records
+
+
+def _normalized_online_ic_buffer(
+    records: list[dict], mu: float, sigma: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    sigma32 = np.float32(sigma)
+    if not np.isfinite(sigma32) or sigma32 <= 0.0:
+        raise ValueError("online IC normalization requires finite sigma_global > 0")
+    physical = np.ascontiguousarray(
+        np.stack([np.asarray(record["T0"], dtype=np.float32) for record in records]),
+        dtype=np.float32,
+    )
+    normalized = np.empty_like(physical, dtype=np.float32)
+    np.subtract(physical, np.float32(mu), out=normalized)
+    np.divide(normalized, sigma32, out=normalized)
+    diagnostics: dict[str, Any] = {
+        "max_abs_z": float(np.max(np.abs(normalized))),
+        "frac_abs_z_gt_5": float(np.mean(np.abs(normalized) > 5.0)),
+        "per_family": {},
+    }
+    families = np.asarray([str(record.get("ic_family", "saved")) for record in records])
+    for family in np.unique(families):
+        values = normalized[families == family]
+        diagnostics["per_family"][str(family)] = {
+            "min": float(values.min()), "max": float(values.max()),
+        }
+    return physical, normalized, diagnostics
+
+
+def _transfer_normalized_ic(
+    normalized: np.ndarray, device: torch.device,
+) -> torch.Tensor:
+    tensor = torch.from_numpy(normalized).unsqueeze(1)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory()
+        return tensor.to(device, non_blocking=True)
+    return tensor.to(device)
+
+
+def _batch_key(records: list[dict], collocation_descriptor) -> str:
+    return _content_key({
+        "problem_keys": [record["problem_key"] for record in records],
+        "collocation": collocation_descriptor,
+    })
 
 
 # --------- collocation sampling ---------
@@ -398,8 +693,10 @@ def build_ic_batch(
 ) -> torch.Tensor:
     """Encoder input u = normalized IC field (snapshot 0); (B, 1, Nx, Ny)."""
     ic = np.asarray(trajectories[ids, 0, :, :], dtype=np.float32)
-    ic = (ic - mu) / (sigma + 1e-8)
-    return torch.from_numpy(ic).unsqueeze(1).to(device)
+    normalized = np.empty_like(ic)
+    np.subtract(ic, np.float32(mu), out=normalized)
+    np.divide(normalized, np.float32(sigma), out=normalized)
+    return torch.from_numpy(normalized).unsqueeze(1).to(device)
 
 
 def _ic_targets(
@@ -1893,10 +2190,76 @@ def _forcing_warmup_config(fcfg: dict) -> dict[str, Any]:
     }
 
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _atomic_torch_save(payload: dict, path: Path) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
-    torch.save(payload, tmp)
+    with open(tmp, "wb") as stream:
+        torch.save(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(tmp, path)
+    _fsync_directory(path.parent)
+
+
+def _atomic_hashed_torch_save(payload: dict, path: Path) -> str:
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "wb") as stream:
+        torch.save(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    digest = _sha256_file(tmp)
+    if _sha256_file(tmp) != digest:
+        tmp.unlink(missing_ok=True)
+        raise OSError(f"hash verification failed while writing {path}")
+    os.replace(tmp, path)
+    _fsync_directory(path.parent)
+    _atomic_text(digest + "\n", path.with_name(path.name + ".sha256"))
+    return digest
+
+
+def _load_hashed_calibration(
+    path: Path, expected_metadata: dict[str, Any],
+) -> tuple[dict, str]:
+    hash_path = path.with_name(path.name + ".sha256")
+    if not path.exists() or not hash_path.exists():
+        raise FileNotFoundError("calibration artifact or SHA-256 sidecar is missing")
+    expected_hash = hash_path.read_text().strip()
+    actual_hash = _sha256_file(path)
+    if actual_hash != expected_hash:
+        raise ValueError("region-standardization calibration SHA-256 mismatch")
+    artifact = torch.load(path, map_location="cpu", weights_only=False)
+    saved_metadata = artifact.get("metadata", {})
+    saved_semantics = copy.deepcopy(saved_metadata)
+    expected_semantics = copy.deepcopy(expected_metadata)
+    saved_environment = saved_semantics.pop("environment", {})
+    current_environment = expected_semantics.pop("environment", {})
+    if saved_semantics != expected_semantics:
+        raise ValueError("region-standardization calibration metadata mismatch")
+    _validate_environment_fingerprint(saved_environment, current_environment)
+    scales = artifact.get("std_scales", {})
+    if set(scales) != set(expected_metadata.get("balanced_terms", scales)):
+        raise ValueError("calibration scale terms do not match the active objective")
+    if not scales or not all(
+        math.isfinite(float(value)) and float(value) > 0.0
+        for value in scales.values()
+    ):
+        raise ValueError("calibration scales must all be finite and positive")
+    return artifact, actual_hash
 
 
 def _atomic_text(text: str, path: Path) -> None:
@@ -1906,6 +2269,7 @@ def _atomic_text(text: str, path: Path) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_directory(path.parent)
 
 
 def _pack_tensors(value):
@@ -2660,6 +3024,94 @@ def _resolve_forcing_residual_method(pino: dict) -> str:
     return method
 
 
+def _sample_online_problem_descriptors(
+    problem,
+    rngs: OnlineSamplerRNGs,
+    batch_size: int,
+    grids: dict[str, np.ndarray],
+    time_cfg: dict[str, Any],
+) -> list[dict]:
+    assignments = balanced_ic_family_assignments(
+        rngs.numpy["ic_family"], batch_size,
+    )
+    records = problem.sample_online_params(
+        rngs.numpy["ic_params"], batch_size, grids, time_cfg,
+        rng_profile=rngs.numpy["forcing_params"],
+        rng_streams=rngs.numpy,
+        ic_family_assignment=assignments,
+    )
+    descriptors = [_online_record_descriptor(record) for record in records]
+    if [str(record["ic_family"]) for record in descriptors] != assignments:
+        raise AssertionError("ProblemSpec changed the explicit IC-family assignment")
+    return descriptors
+
+
+def _should_resample_online_batch(
+    completed_updates: int, warmup_updates: int, resample_every: int,
+) -> bool:
+    if completed_updates < warmup_updates:
+        return completed_updates % resample_every == 0
+    return True
+
+
+def _online_sampling_signature(problem, grid_shape: tuple[int, int]) -> dict[str, Any]:
+    return {
+        "sampler_version": ONLINE_IC_SAMPLER_VERSION,
+        "builder_version": IC_BUILDER_SCHEMA_VERSION,
+        "problem": getattr(problem, "name", type(problem).__name__),
+        "problem_version": getattr(problem, "problem_version", None),
+        "grid_shape": [int(grid_shape[0]), int(grid_shape[1])],
+    }
+
+
+def _all_finite(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(torch.isfinite(value).all().item())
+    if isinstance(value, dict):
+        return all(_all_finite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_all_finite(item) for item in value)
+    return True
+
+
+def _online_failure_payload(
+    *, phase: str, completed_updates: int, records: list[dict] | None,
+    batch_key: str | None, coll, rng_state: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "phase": str(phase),
+        "completed_updates": int(completed_updates),
+        "records": copy.deepcopy(records),
+        "problem_keys": (
+            [] if records is None else [record["problem_key"] for record in records]
+        ),
+        "batch_key": batch_key,
+        "collocation": None if coll is None else _pack_tensors(coll),
+        "sampler_version": ONLINE_IC_SAMPLER_VERSION,
+        "builder_version": IC_BUILDER_SCHEMA_VERSION,
+        "environment": _environment_fingerprint(),
+        "rng_state": copy.deepcopy(rng_state),
+    }
+
+
+def _write_online_failure(
+    run_dir: Path, *, phase: str, completed_updates: int,
+    records: list[dict] | None, batch_key: str | None, coll,
+    rng_state: dict[str, Any],
+) -> None:
+    _atomic_torch_save(
+        _online_failure_payload(
+            phase=phase,
+            completed_updates=completed_updates,
+            records=records,
+            batch_key=batch_key,
+            coll=coll,
+            rng_state=rng_state,
+        ),
+        Path(run_dir) / "failed_online_batch.pt",
+    )
+
+
 def _resolve_forcing_fv_dt(
     config: dict, pino: dict, t_final: float,
 ) -> tuple[float, str, int]:
@@ -2831,7 +3283,7 @@ def _forcing_ic_fv_losses(
     coll: dict[str, Any],
     ic_target: torch.Tensor,
     params_batch: list[dict],
-    ids_batch: np.ndarray,
+    ids_batch: np.ndarray | None,
     problem,
     collocation_ctx,
     geom_cfg: dict,
@@ -2888,7 +3340,9 @@ def _forcing_ic_fv_losses(
     for m in range(M):
         local = int(sim_local[m])
         closure = problem.collocation_closure(
-            collocation_ctx, int(ids_batch[local]), params_batch[local],
+            collocation_ctx,
+            local if ids_batch is None else int(ids_batch[local]),
+            params_batch[local],
             float(tn[m]), float(tnp1[m]),
         )
         if closure is None:
@@ -3011,12 +3465,9 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     checkpoint machinery.
 
     Each step encodes ONCE (``latent = model.encode(u_forcing, u_ic)``) and every
-    residual reuses that latent. The forcing image is online-sampled (decoupled from
-    the IC's sim -- any ``(IC, forcing)`` pair defines a valid physics problem);
-    the IC field ``u_ic`` and the IC anchor targets are read from the saved TRAIN
-    trajectories' snapshot 0 (invisible in the forcing image, so they must come
-    from data). Validation reconstructs each held-out sim from its OWN saved
-    forcing AND saved IC (:func:`validate_forcing_ic_gnrmse`).
+    residual reuses that latent. Complete IC + forcing problems are sampled online
+    from lossless descriptors; saved trajectories are used only for frozen
+    normalization and validation.
     """
     set_seed(seed)
     run_dir = Path(run_dir)
@@ -3033,7 +3484,6 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     t_final = float(data["t_grid"][-1])
     y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
     c_dom, d_dom = float(y_grid_np[0]), float(y_grid_np[-1])
-    train_ids = np.asarray(data["train_ids"])
 
     # Saved FV forcing records are VALIDATION-only. sim_params.npy lives beside
     # trajectories.npy (same directory the data generator writes to).
@@ -3088,6 +3538,10 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     )
     tf_fix = fcfg.get("temporal_family")
     sf_fix = fcfg.get("spatial_family")
+    if tf_fix not in (None, "sin") or sf_fix not in (None, "uniform"):
+        raise ValueError(
+            "diffusion_forcing_single online sampling is fixed to sin/uniform"
+        )
     dt_sample = (
         float(fcfg["dt_sample"])
         if fcfg.get("dt_sample") is not None
@@ -3107,6 +3561,27 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
         raise ValueError("training.pino.chunk_r must be >= 0")
 
     problem = problem_from_config(config)
+    X_online, Y_online = np.meshgrid(
+        np.asarray(data["x_grid"], dtype=np.float64),
+        np.asarray(data["y_grid"], dtype=np.float64),
+        indexing="ij",
+    )
+    online_grids = {
+        "X": X_online,
+        "Y": Y_online,
+        "x_grid": np.asarray(data["x_grid"], dtype=np.float64),
+        "y_grid": np.asarray(data["y_grid"], dtype=np.float64),
+    }
+    online_time_cfg = {
+        "dt": float(dt_sample),
+        "t_final": t_final,
+        "b": float(data["x_grid"][-1]),
+        "T_right": float(T_RIGHT),
+        **temporal_window,
+    }
+    b_online = float(online_grids["x_grid"][-1])
+    online_signature = _online_sampling_signature(problem, (Nx, Ny))
+    environment = _environment_fingerprint()
     collocation_ctx = SimpleNamespace(
         x_grid=np.asarray(data["x_grid"], dtype=np.float64),
         y_grid=np.asarray(data["y_grid"], dtype=np.float64),
@@ -3174,10 +3649,8 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     n_bc = int(pino["n_bc"])
     sim_batch = int(pino["sim_batch"])
     alpha = float(pino.get("alpha", 1.0))
-    # IC anchor node budget: sample n_ic_points exact grid nodes per step (values
-    # gathered from the saved IC with no interpolation); coverage accumulates as
-    # the nodes resample across steps. Defaults to the physics-block knob, else
-    # the collocation n_ic.
+    # IC anchor nodes gather from the same transferred normalized online field
+    # that feeds the encoder, avoiding a separately normalized target path.
     physics_cfg = config["training"].get("physics", {}) or {}
     n_ic_points = int(
         physics_cfg.get("n_ic_points")
@@ -3209,14 +3682,10 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     x_grid_t = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
     y_grid_t = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
 
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    eval_gen = torch.Generator(device=device)
-    eval_gen.manual_seed(seed + 1_000_003)
-    rng = np.random.default_rng(seed)
-    # Separate stream for IC-sim selection so drawing training ICs does not perturb
-    # the forcing-parameter RNG sequence.
-    ic_rng = np.random.default_rng(seed + 7)
+    online_rngs = OnlineSamplerRNGs.create(seed, device)
+    gen = online_rngs.autodiff_collocation
+    eval_gen = online_rngs.evaluation
+    rng = online_rngs.numpy["forcing_params"]
 
     metrics_path = run_dir / "train_metrics.csv"
     gn_cols = ["r", "ic", "bc_left", "bc_hom"]
@@ -3243,6 +3712,9 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
         *[f"grad_norm_eff_{c}" for c in gn_cols],
         "gradnorm_mean_mult", "gradnorm_ms",
         "gradnorm_weights", "grad_cosines", "gradnorm_bound_hits",
+        "online_max_abs_z", "online_frac_abs_z_gt_5", "online_family_z_ranges",
+        "problem_keys", "batch_key",
+        "online_sampling_fraction",
     ]
 
     start_epoch = 0
@@ -3254,7 +3726,15 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     causal_calibrated = False
     coll = None
     params_batch: list[dict] | None = None
-    ids_batch: np.ndarray | None = None
+    active_batch_key: str | None = None
+    profile_cfg = dict(pino.get("online_sampling", {}) or {})
+    profile_every = max(1, int(profile_cfg.get("profile_every", 100)))
+    min_profile_samples = max(1, int(profile_cfg.get("min_profile_samples", 10)))
+    warn_fraction = float(profile_cfg.get("warn_fraction", 0.10))
+    if not math.isfinite(warn_fraction) or warn_fraction <= 0.0:
+        raise ValueError("training.pino.online_sampling.warn_fraction must be > 0")
+    profile_ratios: list[float] = []
+    profile_warned = False
 
     if resuming:
         ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
@@ -3270,6 +3750,13 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
             raise ValueError(
                 "Incompatible finite-volume residual semantics; use a fresh run directory."
             )
+        if ckpt.get("online_sampling_signature") != online_signature:
+            raise ValueError(
+                "Incompatible online IC sampling semantics; use a fresh run directory."
+            )
+        _validate_environment_fingerprint(
+            ckpt.get("online_environment", {}), environment,
+        )
         saved_epochs = int(ckpt["config"]["training"]["epochs"])
         if epochs < int(ckpt["next_epoch"]):
             raise ValueError("training.epochs is below the checkpoint next_epoch")
@@ -3295,15 +3782,22 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
             causal_eps = float(causal_state["eps"])
             causal_updates = int(causal_state.get("updates", 0))
             causal_calibrated = bool(causal_state.get("calibrated", False))
-        cache = ckpt.get("forcing_cache") or {}
-        params_batch = copy.deepcopy(cache.get("params_batch"))
+        cache = ckpt.get("online_cache") or ckpt.get("forcing_cache") or {}
+        params_batch = copy.deepcopy(
+            cache.get("records", cache.get("params_batch"))
+        )
         coll = _unpack_tensors(cache.get("coll"), device) if cache.get("coll") else None
-        cached_ids = cache.get("ids_batch")
-        ids_batch = None if cached_ids is None else np.asarray(cached_ids)
+        active_batch_key = cache.get("batch_key")
         _restore_forcing_rng(ckpt["rng_state"], rng, gen, eval_gen)
-        ic_rng_state = ckpt.get("ic_rng_state")
-        if ic_rng_state is not None:
-            ic_rng.bit_generator.state = ic_rng_state
+        online_rngs.load_state_dict(ckpt["online_rng_state"])
+        if params_batch is not None:
+            _materialize_online_records(
+                params_batch, X_online, Y_online,
+                T_right=T_RIGHT, b=b_online,
+            )
+            reconstructed_key = _batch_key(params_batch, _pack_tensors(coll))
+            if reconstructed_key != active_batch_key:
+                raise ValueError("online batch descriptor key mismatch on resume")
         _reconcile_forcing_metrics(metrics_path, fieldnames, last_csv_update)
         if complete_path.exists():
             complete_path.unlink()
@@ -3327,7 +3821,7 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
         f"n_r={n_r} n_ic={n_ic} n_ic_points={n_ic_points} n_bc={n_bc} "
         f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} "
         f"{residual_detail}"
-        f"n_train={len(train_ids)} | "
+        f"online_ic={ONLINE_IC_SAMPLER_VERSION}/v{IC_BUILDER_SCHEMA_VERSION} | "
         f"causal={causal_cfg} | warmup={warmup} grad_clip={grad_clip} "
         f"save_latest_every={save_latest_every} resume={resuming}",
         flush=True,
@@ -3338,18 +3832,14 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
         model.train()
         warming = completed_updates < warmup["steps"]
         do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
-        re = warmup["resample_every"] if warming else 1
-        # Online resampling: fresh forcing batch + fresh IC-sim batch + fresh
-        # collocation. During warm-up they are held for ``re`` steps.
-        if params_batch is None or ids_batch is None or (completed_updates % re == 0):
-            params_batch = sample_forcing_params(
-                rng, sim_batch, dt_sample, t_final,
-                c=c_dom, d=d_dom, temporal_window=temporal_window,
-                temporal_family=tf_fix, spatial_family=sf_fix,
-            )
-            ids_batch = ic_rng.choice(
-                train_ids, size=sim_batch,
-                replace=sim_batch > len(train_ids),
+        profile_this = completed_updates % profile_every == 0
+        descriptor_seconds = 0.0
+        if params_batch is None or _should_resample_online_batch(
+            completed_updates, warmup["steps"], warmup["resample_every"],
+        ):
+            descriptor_start = time.perf_counter()
+            params_batch = _sample_online_problem_descriptors(
+                problem, online_rngs, sim_batch, online_grids, online_time_cfg,
             )
             if residual_method == "autodiff":
                 coll = sample_collocation(
@@ -3363,39 +3853,62 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
                         n_ic_points, x_grid_t, y_grid_t, device, gen,
                     ),
                     "fv": _sample_lattice_intervals(
-                        rng, sim_batch, intervals_per_sim, int(fv_n_steps),
+                        online_rngs.numpy["fv_intervals"], sim_batch,
+                        intervals_per_sim, int(fv_n_steps),
                         causal_cfg["n_bins"], stratified_fv,
                     ),
                 }
+            active_batch_key = _batch_key(params_batch, _pack_tensors(coll))
+            descriptor_seconds = time.perf_counter() - descriptor_start
 
-        u_forcing = build_forcing_image(params_batch, y_img, t_img, a_ref, device, t_ramp)
-        if residual_method == "finite_volume":
-            ic_np = np.asarray(
-                data["trajectories"][ids_batch, 0, :, :], dtype=np.float32,
-            )
-            u_ic = torch.from_numpy((ic_np - mu) / sigma).unsqueeze(1).to(device)
-        else:
-            u_ic = build_ic_batch(data["trajectories"], ids_batch, mu, sigma, device)
+        ic_build_start = time.perf_counter()
+        online_records = _materialize_online_records(
+            params_batch, X_online, Y_online,
+            T_right=T_RIGHT, b=b_online,
+        )
+        _physical_ic, normalized_ic, online_diag = _normalized_online_ic_buffer(
+            online_records, mu, sigma,
+        )
+        ic_build_seconds = time.perf_counter() - ic_build_start
+
+        transfer_start_cpu = time.perf_counter()
+        transfer_start_event = transfer_end_event = None
+        if profile_this and device.type == "cuda":
+            transfer_start_event = torch.cuda.Event(enable_timing=True)
+            transfer_end_event = torch.cuda.Event(enable_timing=True)
+            transfer_start_event.record()
+        u_ic = _transfer_normalized_ic(normalized_ic, device)
+        u_forcing = build_forcing_image(
+            online_records, y_img, t_img, a_ref, device, t_ramp,
+        )
+        if transfer_end_event is not None:
+            transfer_end_event.record()
+        transfer_seconds_cpu = time.perf_counter() - transfer_start_cpu
         B = u_forcing.shape[0]
-        # Per-sim IC anchor targets at the sampled grid nodes (exact, no interp).
+        ix = coll["ic"]["ix"].to(device=device, dtype=torch.long)
+        iy = coll["ic"]["iy"].to(device=device, dtype=torch.long)
+        batch_indices = torch.arange(B, device=device)[:, None]
+        ic_target = u_ic[:, 0][
+            batch_indices, ix[None, :], iy[None, :]
+        ].unsqueeze(-1)
+        if ic_target.shape != (B, int(ix.numel()), 1):
+            raise AssertionError("online IC anchor gather returned the wrong shape")
         if residual_method == "finite_volume":
-            ix_np = coll["ic"]["ix"].detach().cpu().numpy()
-            iy_np = coll["ic"]["iy"].detach().cpu().numpy()
-            target_np = ic_np[:, ix_np, iy_np]
-            ic_target = torch.from_numpy(
-                ((target_np - mu) / sigma).astype(np.float32)
-            ).unsqueeze(-1).to(device)
             left_qL = None
         else:
-            ic_target = _ic_targets(
-                data["trajectories"], ids_batch,
-                coll["ic"]["ix"], coll["ic"]["iy"], mu, sigma, device,
-            )
             _, yw_left, tw_left = coll["walls"]["left"]
-            left_qL = left_wall_qL(params_batch, yw_left, tw_left, device, t_ramp)
+            left_qL = left_wall_qL(
+                online_records, yw_left, tw_left, device, t_ramp,
+            )
 
         # Encode ONCE per step; every residual reuses this latent via the decode
         # closure. The latent is NOT detached (gradients flow to both encoders).
+        train_start_cpu = time.perf_counter()
+        train_start_event = train_end_event = None
+        if profile_this and device.type == "cuda":
+            train_start_event = torch.cuda.Event(enable_timing=True)
+            train_end_event = torch.cuda.Event(enable_timing=True)
+            train_start_event.record()
         latent = model.encode(u_forcing, u_ic)
 
         def _predict(coords, t, q_left=None, _latent=latent):
@@ -3417,8 +3930,8 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
                 latent=latent,
                 coll=coll,
                 ic_target=ic_target,
-                params_batch=params_batch,
-                ids_batch=ids_batch,
+                params_batch=online_records,
+                ids_batch=None,
                 problem=problem,
                 collocation_ctx=collocation_ctx,
                 geom_cfg=fv_geom_cfg,
@@ -3473,15 +3986,86 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
             term = wk * losses[k]
             loss = term if loss is None else loss + term
         if not bool(torch.isfinite(loss).item()):
+            _write_online_failure(
+                run_dir,
+                phase="pre_step",
+                completed_updates=completed_updates,
+                records=params_batch,
+                batch_key=active_batch_key,
+                coll=coll,
+                rng_state={
+                    "online": online_rngs.state_dict(),
+                    "global": _capture_forcing_rng(rng, gen, eval_gen),
+                },
+            )
             raise FloatingPointError(f"Non-finite forcing-ic PINO loss at epoch {epoch}")
         loss.backward()
-        for parameter in model.parameters():
-            if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item()):
-                raise FloatingPointError(f"Non-finite forcing-ic PINO gradient at epoch {epoch}")
+        gradients_finite = all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        )
+        if not gradients_finite:
+            _write_online_failure(
+                run_dir,
+                phase="pre_step",
+                completed_updates=completed_updates,
+                records=params_batch,
+                batch_key=active_batch_key,
+                coll=coll,
+                rng_state={
+                    "online": online_rngs.state_dict(),
+                    "global": _capture_forcing_rng(rng, gen, eval_gen),
+                },
+            )
+            raise FloatingPointError(f"Non-finite forcing-ic PINO gradient at epoch {epoch}")
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
+        if not _all_finite(model.state_dict()) or not _all_finite(optimizer.state):
+            _write_online_failure(
+                run_dir,
+                phase="post_step",
+                completed_updates=completed_updates,
+                records=params_batch,
+                batch_key=active_batch_key,
+                coll=coll,
+                rng_state={
+                    "online": online_rngs.state_dict(),
+                    "global": _capture_forcing_rng(rng, gen, eval_gen),
+                },
+            )
+            raise FloatingPointError(
+                f"Non-finite forcing-ic model/optimizer state at epoch {epoch}"
+            )
+        if train_end_event is not None:
+            train_end_event.record()
+        train_seconds_cpu = time.perf_counter() - train_start_cpu
+        sampling_fraction: float | str = ""
+        if profile_this:
+            if device.type == "cuda":
+                train_end_event.synchronize()
+                transfer_seconds = transfer_start_event.elapsed_time(
+                    transfer_end_event
+                ) / 1000.0
+                train_seconds = train_start_event.elapsed_time(train_end_event) / 1000.0
+            else:
+                transfer_seconds = transfer_seconds_cpu
+                train_seconds = train_seconds_cpu
+            numerator = descriptor_seconds + ic_build_seconds + transfer_seconds
+            sampling_fraction = numerator / max(train_seconds, 1e-12)
+            profile_ratios.append(float(sampling_fraction))
+            if (
+                not profile_warned
+                and len(profile_ratios) >= min_profile_samples
+                and float(np.median(profile_ratios)) > warn_fraction
+            ):
+                warnings.warn(
+                    "Online IC descriptor/build/normalization/transfer median "
+                    f"overhead is {np.median(profile_ratios):.1%} of training time.",
+                    RuntimeWarning,
+                )
+                profile_warned = True
         _advance_scheduler(scheduler, unit="update", successful_updates=1)
         _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
         completed_updates += 1
@@ -3530,6 +4114,14 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
             "w_data": 0.0,
             "val_gnrmse": "", "val_rmse_K": "",
             "gnrmse_amp_low": "", "gnrmse_amp_mid": "", "gnrmse_amp_high": "",
+            "online_max_abs_z": online_diag["max_abs_z"],
+            "online_frac_abs_z_gt_5": online_diag["frac_abs_z_gt_5"],
+            "online_family_z_ranges": json.dumps(online_diag["per_family"]),
+            "problem_keys": json.dumps([
+                record["problem_key"] for record in params_batch
+            ]),
+            "batch_key": active_batch_key,
+            "online_sampling_fraction": sampling_fraction,
         }
         for key in gn_cols:
             row[f"warm_mult_{key}"] = warm_mult[key]
@@ -3642,7 +4234,12 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
                     "updates": causal_updates, "calibrated": causal_calibrated,
                 } if causal_cfg["enabled"] else None,
                 "rng_state": _capture_forcing_rng(rng, gen, eval_gen),
-                "ic_rng_state": ic_rng.bit_generator.state,
+                "online_rng_state": online_rngs.state_dict(),
+                "ic_rng_state": copy.deepcopy(
+                    online_rngs.numpy["ic_family"].bit_generator.state
+                ),
+                "online_sampling_signature": copy.deepcopy(online_signature),
+                "online_environment": copy.deepcopy(environment),
                 "fv_residual_signature": fv_signature,
                 "fv_residual_metadata": (
                     {
@@ -3651,9 +4248,15 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
                     }
                     if residual_method == "finite_volume" else None
                 ),
+                "online_cache": {
+                    "records": copy.deepcopy(params_batch),
+                    "batch_key": active_batch_key,
+                    "coll": _pack_tensors(coll),
+                },
                 "forcing_cache": {
                     "params_batch": copy.deepcopy(params_batch),
-                    "ids_batch": None if ids_batch is None else np.asarray(ids_batch).tolist(),
+                    "ids_batch": None,
+                    "batch_key": active_batch_key,
                     "coll": _pack_tensors(coll),
                 },
                 "forcing_image": {
@@ -3728,15 +4331,32 @@ def _interface_spatial_channels(
     `D_norm = (x - x_Gamma)/(x[-1]-x[0])` the signed distance. `K_norm`/`D_norm`
     depend on x only and broadcast across y.
     """
-    T0 = np.asarray(T0, dtype=np.float64)
+    T0 = np.asarray(T0, dtype=np.float32)
     x_grid = np.asarray(x_grid, dtype=np.float64)
     Ny = T0.shape[1]
-    t0_tilde = (T0 - float(mu)) / (float(sigma) + 1e-8)
+    t0_tilde = np.empty_like(T0)
+    np.subtract(T0, np.float32(mu), out=t0_tilde)
+    np.divide(t0_tilde, np.float32(sigma), out=t0_tilde)
     kx = np.where(x_grid <= float(interface_x), K_LEFT, K_RIGHT)
     k_norm = ((kx - 1.5) / 0.5)[:, None] * np.ones((1, Ny))
     span = float(x_grid[-1] - x_grid[0])
     d_norm = ((x_grid - float(interface_x)) / span)[:, None] * np.ones((1, Ny))
     return np.stack([t0_tilde, k_norm, d_norm], axis=0).astype(np.float32)
+
+
+def _interface_spatial_channels_from_normalized(
+    T0_tilde: np.ndarray, interface_x: float, x_grid: np.ndarray,
+) -> np.ndarray:
+    T0_tilde = np.asarray(T0_tilde, dtype=np.float32)
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    Ny = T0_tilde.shape[1]
+    kx = np.where(x_grid <= float(interface_x), K_LEFT, K_RIGHT)
+    k_norm = np.broadcast_to(((kx - 1.5) / 0.5)[:, None], T0_tilde.shape)
+    span = float(x_grid[-1] - x_grid[0])
+    d_norm = np.broadcast_to(
+        ((x_grid - float(interface_x)) / span)[:, None], T0_tilde.shape,
+    )
+    return np.stack([T0_tilde, k_norm, d_norm], axis=0).astype(np.float32)
 
 
 def _decode_in_chunks(
@@ -3942,13 +4562,11 @@ def run_one_seed_interfaces_pino(
     """Physics-only training of an :class:`InterfaceCViT` on the `interfaces`
     benchmark with an FV Crank-Nicolson interface residual.
 
-    `saved_train` collocation (default): each step draws a sim minibatch from the
-    saved TRAIN split, reads `interface_x`, `R_c`, the IC field `T0`, and the
-    forcing params from `sim_params.npy`, and scores the FV residual on freshly
-    sampled CN intervals. `online` collocation instead draws those params fresh
-    each step via `ProblemSpec.sample_online_params` (IID from the generator's
-    target distributions, not the fixed LHS design); validation still uses the
-    saved val trajectories either way. GradNorm balances only the nontrivial terms
+    `online` collocation (default) draws interface, resistance, forcing, and a
+    balanced IC family batch from independent streams. `saved_train` remains an
+    explicit diagnostic that reads complete records from the saved training
+    split. Both score freshly sampled CN intervals, and validation remains fixed
+    to the saved validation trajectories. GradNorm balances only the nontrivial terms
     `{interior, left_neumann, topbot_adiabatic, ic}`; `right_dirichlet` is exact
     under the hard ansatz (~0 gradient) so it is logged, not balanced. Causal
     interior weighting (stratified `t_mid` bins) is optional and off for the tiny
@@ -4069,12 +4687,20 @@ def run_one_seed_interfaces_pino(
         if causal_enabled else 1.0
     )
     chunk_r = int(pino.get("chunk_r", 0))
-    collocation_source = str(pino.get("collocation_source", "saved_train"))
+    collocation_source = str(pino.get("collocation_source", "online"))
     if collocation_source not in ("saved_train", "online"):
         raise ValueError(
             f"training.pino.collocation_source must be 'saved_train' or 'online'; "
             f"got {collocation_source!r}."
         )
+    profile_cfg = dict(pino.get("online_sampling", {}) or {})
+    profile_every = max(1, int(profile_cfg.get("profile_every", 100)))
+    min_profile_samples = max(1, int(profile_cfg.get("min_profile_samples", 10)))
+    warn_fraction = float(profile_cfg.get("warn_fraction", 0.10))
+    if not math.isfinite(warn_fraction) or warn_fraction <= 0.0:
+        raise ValueError("training.pino.online_sampling.warn_fraction must be > 0")
+    profile_ratios: list[float] = []
+    profile_warned = False
 
     # Right wall is 300 K here too (matches the model's hard right-Dirichlet).
     t_right_tilde = (T_RIGHT - mu) / (sigma + 1e-8)
@@ -4142,26 +4768,36 @@ def run_one_seed_interfaces_pino(
     mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
 
     rng = np.random.default_rng(seed)
+    online_rngs = OnlineSamplerRNGs.create(seed, device)
     train_ids = np.asarray(data["train_ids"])
 
     # Online collocation draws fresh (interface_x, R_c, IC, forcing) each step
     # from the SAME target distributions the generator uses (IID, not the fixed
     # LHS design of the saved set). Validation always uses the saved val
     # trajectories, so sim_params stays loaded regardless of the source.
-    online_spec = online_grids = online_time_cfg = None
+    online_spec = problem_from_config(config)
+    gxm, gym = np.meshgrid(x_grid_np, y_grid_np, indexing="ij")
+    online_grids = {
+        "X": gxm, "Y": gym, "x_grid": x_grid_np, "y_grid": y_grid_np,
+    }
+    online_time_cfg = {
+        "dt": dt, "t_final": t_final, "b": 1.0, "T_right": float(T_RIGHT),
+        "t_on": float(fcfg.get("t_on", 0.0)),
+        "t_off": float(fcfg.get("t_off", 0.2)),
+        "phase": float(fcfg.get("phase", 0.0)),
+        "tukey_alpha": float(fcfg.get("tukey_alpha", 0.5)),
+    }
     if collocation_source == "online":
-        online_spec = problem_from_config(config)
-        gxm, gym = np.meshgrid(x_grid_np, y_grid_np, indexing="ij")
-        online_grids = {
-            "X": gxm, "Y": gym, "x_grid": x_grid_np, "y_grid": y_grid_np,
-        }
-        online_time_cfg = {
-            "dt": dt, "t_final": t_final, "b": 1.0, "T_right": float(T_RIGHT),
-            "t_on": float(fcfg.get("t_on", 0.0)),
-            "t_off": float(fcfg.get("t_off", 0.2)),
-            "phase": float(fcfg.get("phase", 0.0)),
-            "tukey_alpha": float(fcfg.get("tukey_alpha", 0.5)),
-        }
+        online_signature = _online_sampling_signature(online_spec, (Nx, Ny))
+        saved_record_sampler = None
+    else:
+        online_signature = None
+        def saved_record_sampler(sample_rng):
+            replace = len(train_ids) < sim_batch
+            sim_ids = sample_rng.choice(
+                train_ids, size=sim_batch, replace=replace,
+            )
+            return [dict(sim_params[int(i)]) for i in sim_ids]
 
     # Frozen train jump scale for E_model / E_zero (computed once).
     sigma_dT_train = _compute_train_jump_scale(data, sim_params, train_ids)
@@ -4171,7 +4807,7 @@ def run_one_seed_interfaces_pino(
     band_loss_cols = ["loss_interface_band"] if band_enabled else []
     band_w_cols = ["w_interface_band"] if band_enabled else []
     fieldnames = [
-        "epoch", "loss",
+        "epoch", "completed_updates", "loss",
         "loss_interior", "loss_left_neumann", "loss_topbot", "loss_ic",
         "loss_right_dir",
         *band_loss_cols,
@@ -4185,6 +4821,9 @@ def run_one_seed_interfaces_pino(
         *([f"loss_opt_{c}" for c in gn_cols] if std_enabled else []),
         *([f"std_scale_{c}" for c in gn_cols] if std_enabled else []),
         "gradnorm_weights",
+        "online_max_abs_z", "online_frac_abs_z_gt_5", "online_family_z_ranges",
+        "problem_keys", "batch_key",
+        "online_sampling_fraction",
     ]
     with open(metrics_path, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
@@ -4213,27 +4852,83 @@ def run_one_seed_interfaces_pino(
     if band_enabled:
         sw["interface_band"] = lam_band
 
-    def _forward_losses(sample_rng):
+    last_online_batch: dict[str, Any] | None = None
+    last_online_diagnostics: dict[str, Any] | None = None
+    last_online_timing = {"descriptor": 0.0, "build": 0.0, "transfer": 0.0}
+
+    def _forward_losses(
+        sample_rng=None, *, online_batch: dict[str, Any] | None = None,
+        rng_bundle: OnlineSamplerRNGs | None = None, profile: bool = False,
+    ):
         """One collocation batch -> raw (pre-standardization) balanced-term
         losses dict + right-Dirichlet diagnostic. Shared by the §4 calibration
         pass and the training loop so both use identical reductions."""
+        nonlocal last_online_batch, last_online_diagnostics, last_online_timing
+        descriptor_start = time.perf_counter()
         if collocation_source == "online":
-            params = online_spec.sample_online_params(
-                sample_rng, sim_batch, online_grids, online_time_cfg
+            bundle = online_rngs if rng_bundle is None else rng_bundle
+            if online_batch is None:
+                descriptors = _sample_online_problem_descriptors(
+                    online_spec, bundle, sim_batch, online_grids, online_time_cfg,
+                )
+                t_n, t_np1, t_mid, bin_ids = _sample_interval_times(
+                    bundle.numpy["fv_intervals"], sim_batch, intervals_per_sim,
+                    dt, t_final, stratified, n_bins,
+                )
+                interval_descriptor = {
+                    "t_n": np.asarray(t_n, dtype="<f8"),
+                    "t_np1": np.asarray(t_np1, dtype="<f8"),
+                    "t_mid": np.asarray(t_mid, dtype="<f8"),
+                    "causal_bin_ids": np.asarray(bin_ids, dtype="<i8"),
+                    "sim_local": np.repeat(
+                        np.arange(sim_batch, dtype="<i8"), intervals_per_sim,
+                    ),
+                }
+                online_batch = {
+                    "records": descriptors,
+                    "intervals": interval_descriptor,
+                    "batch_key": _batch_key(descriptors, interval_descriptor),
+                }
+            descriptors = copy.deepcopy(online_batch["records"])
+            params = _materialize_online_records(
+                descriptors, online_grids["X"], online_grids["Y"],
+                T_right=T_RIGHT, b=float(x_grid_np[-1]),
             )
+            intervals = online_batch["intervals"]
+            t_n = np.asarray(intervals["t_n"], dtype=np.float64)
+            t_np1 = np.asarray(intervals["t_np1"], dtype=np.float64)
+            t_mid = np.asarray(intervals["t_mid"], dtype=np.float64)
+            bin_ids = np.asarray(intervals["causal_bin_ids"], dtype=np.int64)
+            last_online_batch = copy.deepcopy(online_batch)
         else:
-            replace = len(train_ids) < sim_batch
-            sim_ids = sample_rng.choice(train_ids, size=sim_batch, replace=replace)
-            params = [dict(sim_params[int(i)]) for i in sim_ids]
+            if sample_rng is None:
+                raise ValueError("saved_train collocation requires a sampling RNG")
+            params = saved_record_sampler(sample_rng)
+            last_online_batch = None
         B = len(params)
+        descriptor_seconds = time.perf_counter() - descriptor_start
 
-        u_spatial = torch.from_numpy(
-            np.stack([
-                _interface_spatial_channels(
-                    p["T0"], p["interface_x"], x_grid_np, mu, sigma
-                ) for p in params
-            ])
-        ).to(device)
+        build_start = time.perf_counter()
+        _physical_ic, normalized_ic, _online_diag = _normalized_online_ic_buffer(
+            params, mu, sigma,
+        )
+        last_online_diagnostics = _online_diag
+        spatial_cpu = np.ascontiguousarray(np.stack([
+            _interface_spatial_channels_from_normalized(
+                normalized_ic[index], p["interface_x"], x_grid_np,
+            )
+            for index, p in enumerate(params)
+        ]), dtype=np.float32)
+        build_seconds = time.perf_counter() - build_start
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize()
+        transfer_start = time.perf_counter()
+        spatial_tensor = torch.from_numpy(spatial_cpu)
+        if device.type == "cuda":
+            spatial_tensor = spatial_tensor.pin_memory()
+            u_spatial = spatial_tensor.to(device, non_blocking=True)
+        else:
+            u_spatial = spatial_tensor.to(device)
         forcing_image = build_forcing_image(
             params, y_img, t_img, a_ref, device, t_ramp
         )
@@ -4243,12 +4938,15 @@ def run_one_seed_interfaces_pino(
                 for p in params
             ])
         ).to(device)
-        ic_target = torch.from_numpy(
-            np.stack([
-                ((np.asarray(p["T0"], dtype=np.float64) - mu) / (sigma + 1e-8))
-                .reshape(-1) for p in params
-            ])
-        ).to(torch.float32).to(device).unsqueeze(-1)          # (B, Nq, 1)
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize()
+        transfer_seconds = time.perf_counter() - transfer_start
+        last_online_timing = {
+            "descriptor": descriptor_seconds,
+            "build": build_seconds,
+            "transfer": transfer_seconds,
+        }
+        ic_target = u_spatial[:, 0].reshape(B, Nq, 1)
         interface_x = np.array([float(p["interface_x"]) for p in params])
         R_c = np.array([float(p["R_c"]) for p in params])
 
@@ -4260,9 +4958,10 @@ def run_one_seed_interfaces_pino(
         ic_loss = ((ic_pred - ic_target) ** 2).mean()
 
         # CN intervals over M = B * intervals_per_sim.
-        t_n, t_np1, t_mid, bin_ids = _sample_interval_times(
-            sample_rng, B, intervals_per_sim, dt, t_final, stratified, n_bins
-        )
+        if collocation_source != "online":
+            t_n, t_np1, t_mid, bin_ids = _sample_interval_times(
+                sample_rng, B, intervals_per_sim, dt, t_final, stratified, n_bins
+            )
         M = B * intervals_per_sim
         sim_local = np.repeat(np.arange(B), intervals_per_sim)      # (M,)
         latent_M = latent[torch.as_tensor(sim_local, device=device)]
@@ -4340,46 +5039,110 @@ def run_one_seed_interfaces_pino(
         right_dir = phys["phys_right_dirichlet_mse"]               # logged only
         return losses, right_dir
 
+    calibration_path = run_dir / "region_standardize_calibration.pt"
+    calibration_metadata = {
+        "version": 1,
+        "collocation_source": collocation_source,
+        "seed": int(seed + 1_000_003),
+        "calibration_steps": calibration_steps,
+        "descriptor_count": int(calibration_steps * sim_batch),
+        "sim_batch": sim_batch,
+        "intervals_per_sim": intervals_per_sim,
+        "stratified_time_sampling": stratified,
+        "causal_num_bins": n_bins,
+        "dt": float(dt),
+        "grid_shape": [Nx, Ny],
+        "balanced_terms": list(balanced_terms),
+        "eps": std_eps,
+        "online_sampling_signature": online_signature,
+        "environment": _environment_fingerprint(),
+        "model_config_key": _content_key(config.get("model", {})),
+    }
+    calibration_hash: str | None = None
+
     # --- §4 calibration pass: freeze per-region scales on the INITIAL model,
     # before any optimizer step and before GradNorm is built. Observationally
     # inert: separate rng, snapshot/restore torch RNG, model state asserted
     # unchanged. This finite-volume path needs only scalar loss values, so retaining
     # decoder graphs would waste the dominant GPU memory.
     if std_enabled:
-        state_before = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        cpu_rng_before = torch.get_rng_state()
-        cuda_rng_before = (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        )
-        was_training = model.training
-        model.train()
-        calib_rng = np.random.default_rng(seed + 1_000_003)
-        accum = {k: 0.0 for k in balanced_terms}
-        t_calib0 = time.perf_counter()
-        with torch.no_grad():
-            for _calib_step in range(calibration_steps):
-                losses_c, right_dir_c = _forward_losses(calib_rng)
-                for k in balanced_terms:
-                    accum[k] += float(losses_c[k].cpu())
-                del losses_c, right_dir_c
-        calib_wall = time.perf_counter() - t_calib0
-        for k in balanced_terms:
-            std_scales[k] = max(accum[k] / calibration_steps, std_eps)
-        std_calib_done = True
-        # Restore prior train/eval mode + RNG; assert inertness (CViT is
-        # LayerNorm-only, so no running buffers are expected to move).
-        model.train(was_training)
-        torch.set_rng_state(cpu_rng_before)
-        if cuda_rng_before is not None:
-            torch.cuda.set_rng_state_all(cuda_rng_before)
-        state_after = model.state_dict()
-        for k, v0 in state_before.items():
-            if not torch.equal(v0, state_after[k].to(v0.device)):
-                raise RuntimeError(
-                    f"region_standardize calibration mutated model state {k!r}; "
-                    "the calibration pass must be observationally inert."
+        if calibration_path.exists():
+            artifact, calibration_hash = _load_hashed_calibration(
+                calibration_path, calibration_metadata,
+            )
+            if collocation_source == "online":
+                calibration_batches = artifact.get("batches", [])
+                descriptor_count = sum(
+                    len(batch.get("records", [])) for batch in calibration_batches
                 )
-        del state_before, state_after, cpu_rng_before, cuda_rng_before
+                if descriptor_count != calibration_metadata["descriptor_count"]:
+                    raise ValueError(
+                        "region-standardization calibration descriptor count mismatch"
+                    )
+                for batch in calibration_batches:
+                    descriptors = batch["records"]
+                    _materialize_online_records(
+                        descriptors, online_grids["X"], online_grids["Y"],
+                        T_right=T_RIGHT, b=float(x_grid_np[-1]),
+                    )
+                    if _batch_key(descriptors, batch["intervals"]) != batch["batch_key"]:
+                        raise ValueError(
+                            "region-standardization calibration batch key mismatch"
+                        )
+            std_scales = {
+                key: float(value) for key, value in artifact["std_scales"].items()
+            }
+            std_calib_done = True
+            calib_wall = 0.0
+        else:
+            state_before = {
+                k: v.detach().clone() for k, v in model.state_dict().items()
+            }
+            cpu_rng_before = torch.get_rng_state()
+            cuda_rng_before = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            was_training = model.training
+            model.train()
+            calib_rngs = OnlineSamplerRNGs.create(seed + 1_000_003, device)
+            calib_saved_rng = np.random.default_rng(seed + 1_000_003)
+            accum = {k: 0.0 for k in balanced_terms}
+            calibration_batches: list[dict[str, Any]] = []
+            t_calib0 = time.perf_counter()
+            with torch.no_grad():
+                for _calib_step in range(calibration_steps):
+                    losses_c, right_dir_c = _forward_losses(
+                        calib_saved_rng, rng_bundle=calib_rngs,
+                    )
+                    if collocation_source == "online":
+                        calibration_batches.append(copy.deepcopy(last_online_batch))
+                    for k in balanced_terms:
+                        accum[k] += float(losses_c[k].cpu())
+                    del losses_c, right_dir_c
+            calib_wall = time.perf_counter() - t_calib0
+            for k in balanced_terms:
+                std_scales[k] = max(accum[k] / calibration_steps, std_eps)
+            std_calib_done = True
+            model.train(was_training)
+            torch.set_rng_state(cpu_rng_before)
+            if cuda_rng_before is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_before)
+            state_after = model.state_dict()
+            for k, v0 in state_before.items():
+                if not torch.equal(v0, state_after[k].to(v0.device)):
+                    raise RuntimeError(
+                        f"region_standardize calibration mutated model state {k!r}; "
+                        "the calibration pass must be observationally inert."
+                    )
+            artifact = {
+                "metadata": copy.deepcopy(calibration_metadata),
+                "std_scales": dict(std_scales),
+                "batches": calibration_batches,
+            }
+            calibration_hash = _atomic_hashed_torch_save(
+                artifact, calibration_path,
+            )
+            del state_before, state_after, cpu_rng_before, cuda_rng_before
         print(
             "[pino-interfaces] region_standardize: "
             f"calibration_steps={calibration_steps} wall={calib_wall:.2f}s "
@@ -4388,20 +5151,39 @@ def run_one_seed_interfaces_pino(
             flush=True,
         )
 
+    calibration_checkpoint = (
+        None if not std_enabled else {
+            "relative_path": str(calibration_path.relative_to(run_dir)),
+            "sha256": calibration_hash,
+            "configuration": copy.deepcopy(calibration_metadata),
+            "seed": calibration_metadata["seed"],
+            "descriptor_count": calibration_metadata["descriptor_count"],
+            "sampler_version": ONLINE_IC_SAMPLER_VERSION,
+            "builder_version": IC_BUILDER_SCHEMA_VERSION,
+            "environment": _environment_fingerprint(),
+            "std_scales": dict(std_scales),
+        }
+    )
+
     # GradNorm now, after calibration, so its reference L_k(0) sees standardized
     # losses from optimizer step 0.
     gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
 
     best_global = float("inf")
     best_jump = float("inf")
+    completed_updates = 0
     history: list[dict[str, Any]] = []
     for epoch in range(epochs):
         model.train()
         do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+        profile_this = completed_updates % profile_every == 0
+        if profile_this and device.type == "cuda":
+            torch.cuda.synchronize()
+        profiled_update_start = time.perf_counter()
 
         optimizer.zero_grad(set_to_none=True)
         # Raw (pre-standardization) balanced-term losses via the shared closure.
-        losses, right_dir = _forward_losses(rng)
+        losses, right_dir = _forward_losses(rng, profile=profile_this)
         # §4: standardize each balanced term by its frozen calibration scale
         # (identity when region_standardize is disabled). Both L_k(t) here and
         # GradNorm's reference L_k(0) carry the same constant s_k, so it cancels
@@ -4421,14 +5203,96 @@ def run_one_seed_interfaces_pino(
         for k, wk in w_eff.items():
             term = wk * losses_opt[k]
             loss = term if loss is None else loss + term
+        failure_records = (
+            None if last_online_batch is None else last_online_batch["records"]
+        )
+        failure_key = (
+            None if last_online_batch is None else last_online_batch["batch_key"]
+        )
+        failure_coll = (
+            None if last_online_batch is None else last_online_batch["intervals"]
+        )
+        if not bool(torch.isfinite(loss).item()):
+            _write_online_failure(
+                run_dir,
+                phase="pre_step",
+                completed_updates=completed_updates,
+                records=failure_records,
+                batch_key=failure_key,
+                coll=failure_coll,
+                rng_state={
+                    "online": online_rngs.state_dict(),
+                    "saved_train": copy.deepcopy(rng.bit_generator.state),
+                },
+            )
+            raise FloatingPointError(
+                f"Non-finite interfaces PINO loss at epoch {epoch}"
+            )
         loss.backward()
+        if not all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        ):
+            _write_online_failure(
+                run_dir,
+                phase="pre_step",
+                completed_updates=completed_updates,
+                records=failure_records,
+                batch_key=failure_key,
+                coll=failure_coll,
+                rng_state={
+                    "online": online_rngs.state_dict(),
+                    "saved_train": copy.deepcopy(rng.bit_generator.state),
+                },
+            )
+            raise FloatingPointError(
+                f"Non-finite interfaces PINO gradient at epoch {epoch}"
+            )
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
+        if not _all_finite(model.state_dict()) or not _all_finite(optimizer.state):
+            _write_online_failure(
+                run_dir,
+                phase="post_step",
+                completed_updates=completed_updates,
+                records=failure_records,
+                batch_key=failure_key,
+                coll=failure_coll,
+                rng_state={
+                    "online": online_rngs.state_dict(),
+                    "saved_train": copy.deepcopy(rng.bit_generator.state),
+                },
+            )
+            raise FloatingPointError(
+                f"Non-finite interfaces model/optimizer state at epoch {epoch}"
+            )
+        sampling_fraction: float | str = ""
+        if profile_this:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            total_seconds = time.perf_counter() - profiled_update_start
+            numerator = sum(last_online_timing.values())
+            denominator = max(total_seconds - numerator, 1e-12)
+            sampling_fraction = numerator / denominator
+            profile_ratios.append(float(sampling_fraction))
+            if (
+                not profile_warned
+                and len(profile_ratios) >= min_profile_samples
+                and float(np.median(profile_ratios)) > warn_fraction
+            ):
+                warnings.warn(
+                    "Online IC descriptor/build/normalization/transfer median "
+                    f"overhead is {np.median(profile_ratios):.1%} of training time.",
+                    RuntimeWarning,
+                )
+                profile_warned = True
         _advance_scheduler(scheduler, unit="update", successful_updates=1)
         _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        completed_updates += 1
 
         row: dict[str, Any] = {
             "epoch": epoch,
+            "completed_updates": completed_updates,
             "loss": float(loss.detach().cpu()),
             "loss_interior": float(losses["interior"].detach().cpu()),
             "loss_left_neumann": float(losses["left_neumann"].detach().cpu()),
@@ -4437,6 +5301,20 @@ def run_one_seed_interfaces_pino(
             "loss_right_dir": float(right_dir.detach().cpu()),
             "w_interior": lam_r, "w_left_neumann": lam_bc_left,
             "w_topbot": lam_bc, "w_ic": lam_ic,
+            "online_max_abs_z": last_online_diagnostics["max_abs_z"],
+            "online_frac_abs_z_gt_5": last_online_diagnostics["frac_abs_z_gt_5"],
+            "online_family_z_ranges": json.dumps(
+                last_online_diagnostics["per_family"]
+            ),
+            "problem_keys": (
+                "" if last_online_batch is None else json.dumps([
+                    record["problem_key"] for record in last_online_batch["records"]
+                ])
+            ),
+            "batch_key": (
+                "" if last_online_batch is None else last_online_batch["batch_key"]
+            ),
+            "online_sampling_fraction": sampling_fraction,
         }
         if band_enabled:
             row["loss_interface_band"] = float(losses["interface_band"].detach().cpu())
@@ -4494,19 +5372,22 @@ def run_one_seed_interfaces_pino(
                     "eps": std_eps,
                     "std_scales": dict(std_scales),
                     "std_calib_done": std_calib_done,
+                    "artifact": copy.deepcopy(calibration_checkpoint),
                 },
+                "online_sampling_signature": copy.deepcopy(online_signature),
+                "online_environment": _environment_fingerprint(),
             }
             is_best_global = val["val_gnrmse"] < best_global
             if is_best_global:
                 best_global = val["val_gnrmse"]
-                torch.save(ckpt, run_dir / "cvit_best_global.pt")
+                _atomic_torch_save(ckpt, run_dir / "cvit_best_global.pt")
             # Lexicographic jump gate: only a model that beats the explicit gate
             # E_model <= 0.5 * E_zero is eligible as the jump-best checkpoint.
             passes_gate = val["E_model"] <= 0.5 * val["E_zero"]
             is_best_jump = passes_gate and (val["E_model"] < best_jump)
             if is_best_jump:
                 best_jump = val["E_model"]
-                torch.save(ckpt, run_dir / "cvit_best_jump.pt")
+                _atomic_torch_save(ckpt, run_dir / "cvit_best_jump.pt")
 
             print(
                 f"Validation epoch {epoch}: "
@@ -4524,7 +5405,7 @@ def run_one_seed_interfaces_pino(
         with open(metrics_path, "a", newline="") as f:
             csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerow(row)
 
-    torch.save(
+    _atomic_torch_save(
         {
             "model_state": model.state_dict(),
             "mu_global": mu, "sigma_global": sigma,
@@ -4537,7 +5418,10 @@ def run_one_seed_interfaces_pino(
                 "eps": std_eps,
                 "std_scales": dict(std_scales),
                 "std_calib_done": std_calib_done,
+                "artifact": copy.deepcopy(calibration_checkpoint),
             },
+            "online_sampling_signature": copy.deepcopy(online_signature),
+            "online_environment": _environment_fingerprint(),
         },
         run_dir / "cvit_last.pt",
     )
@@ -4592,6 +5476,7 @@ def run_config_seeds_pino(
 
 
 __all__ = [
+    "OnlineSamplerRNGs",
     "sample_collocation",
     "sample_forcing_params",
     "build_forcing_image",

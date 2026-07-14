@@ -24,7 +24,14 @@ from src.physics.boundary_forcing import (
     ramped_temporal,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
-from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
+from src.physics.init_conditions import (
+    IC_BUILDER_SCHEMA_VERSION,
+    IC_SAMPLERS,
+    ONLINE_IC_SAMPLER_VERSION,
+    build_ic,
+    canonical_ic_params,
+    sample_ic_family,
+)
 
 # ----- representation constants (canonical home for the interfaces benchmark) ---
 
@@ -154,6 +161,8 @@ class InterfacesProblem(ProblemSpec):
     """
 
     name = "interfaces"
+    online_sampler_version = ONLINE_IC_SAMPLER_VERSION
+    ic_builder_version = IC_BUILDER_SCHEMA_VERSION
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -249,13 +258,17 @@ class InterfacesProblem(ProblemSpec):
         c: float,
         d: float,
         temporal_window: dict,
+        ic_family: str | None = None,
+        canonical_params: bool = False,
     ) -> dict:
         """Assemble one sim-param dict from fixed (R_c, interface_x) plus fresh
         IC/forcing draws. Shared by the saved LHS path and the online sampler so
         the IC family, forcing family, and RNG consumption order stay identical.
         """
-        ic_family = sample_ic_family(rng)
+        ic_family = sample_ic_family(rng) if ic_family is None else str(ic_family)
         ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+        if canonical_params:
+            ic_params = canonical_ic_params(ic_family, ic_params)
         T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
 
         temporal_family = "sin"
@@ -285,6 +298,9 @@ class InterfacesProblem(ProblemSpec):
         grids: dict[str, np.ndarray],
         time_cfg: dict[str, Any],
         rng_profile: np.random.Generator | None = None,
+        *,
+        rng_streams: dict[str, np.random.Generator] | None = None,
+        ic_family_assignment: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
         """Draw ``n`` fresh IID interface sims for `online` physics collocation.
 
@@ -299,6 +315,12 @@ class InterfacesProblem(ProblemSpec):
         """
         if rng_profile is None:
             rng_profile = rng
+        streams = rng_streams or {}
+        ic_family_rng = streams.get("ic_family", rng)
+        ic_param_rng = streams.get("ic_params", rng)
+        forcing_rng = streams.get("forcing_params", rng_profile)
+        interface_rng = streams.get("interface_position", rng)
+        resistance_rng = streams.get("contact_resistance", rng)
         X = grids["X"]
         Y = grids["Y"]
         x_grid = grids["x_grid"]
@@ -320,17 +342,30 @@ class InterfacesProblem(ProblemSpec):
             tukey_alpha=float(time_cfg.get("tukey_alpha", 0.5)),
         )
 
-        R_c_values = rng.uniform(RC_RANGE[0], RC_RANGE[1], size=n)
-        ix_frac = rng.uniform(INTERFACE_X_RANGE[0], INTERFACE_X_RANGE[1], size=n)
+        if ic_family_assignment is not None and len(ic_family_assignment) != int(n):
+            raise ValueError(
+                "ic_family_assignment length must equal the online batch size"
+            )
+        R_c_values = resistance_rng.uniform(RC_RANGE[0], RC_RANGE[1], size=n)
+        ix_frac = interface_rng.uniform(
+            INTERFACE_X_RANGE[0], INTERFACE_X_RANGE[1], size=n,
+        )
         interface_x_values = (a + ix_frac * (b - a)).astype(np.float64)
         interface_x_values = _jitter_off_node(interface_x_values, a=a, b=b, Nx=Nx)
 
         return [
             self._build_sim_param(
                 float(R_c_values[i]), float(interface_x_values[i]),
-                rng, rng_profile, X, Y, Nx=Nx, Ny=Ny, dt=dt, t_final=t_final,
+                ic_param_rng, forcing_rng, X, Y,
+                Nx=Nx, Ny=Ny, dt=dt, t_final=t_final,
                 b_temp=b_temp, T_right=T_right, c=c, d=d,
                 temporal_window=temporal_window,
+                ic_family=(
+                    str(ic_family_assignment[i])
+                    if ic_family_assignment is not None
+                    else sample_ic_family(ic_family_rng)
+                ),
+                canonical_params=True,
             )
             for i in range(n)
         ]

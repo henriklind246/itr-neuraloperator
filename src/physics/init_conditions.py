@@ -12,6 +12,10 @@ avoid a spurious initial discontinuity, and pins the last column exactly.
 
 IC_FAMILIES = {"uniform_2d": 0, "random_sinusoid_2d": 1, "grf_2d": 2, "hot_spot_2d": 3}
 
+# Bump whenever a builder change can alter the final contiguous float32 field.
+IC_BUILDER_SCHEMA_VERSION = 1
+ONLINE_IC_SAMPLER_VERSION = "online_balanced_ic_v1"
+
 UNIFORM_OFFSET_RANGE = (-20.0, 20.0)
 
 SINU_N_CHOICES = (3, 4, 5)
@@ -148,6 +152,55 @@ def sample_ic_family(rng: np.random.Generator,
     return str(rng.choice(families, p=probs))
 
 
+def balanced_ic_family_assignments(
+    rng: np.random.Generator, batch_size: int,
+) -> list[str]:
+    """Balanced family labels with unbiased, without-replacement remainders."""
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0; got {batch_size}")
+    families = np.asarray(tuple(IC_FAMILIES), dtype=object)
+    if batch_size < len(families):
+        labels = rng.choice(families, size=batch_size, replace=False)
+    else:
+        quotient, remainder = divmod(batch_size, len(families))
+        labels = np.repeat(families, quotient)
+        if remainder:
+            extra = rng.choice(families, size=remainder, replace=False)
+            labels = np.concatenate((labels, extra))
+    labels = np.asarray(labels, dtype=object)
+    rng.shuffle(labels)
+    return [str(label) for label in labels]
+
+
+def canonical_ic_params(ic_family: str, ic_params: dict) -> dict:
+    """Lossless, dtype-explicit IC parameters used by online descriptors."""
+    p = dict(ic_params)
+    if ic_family == "uniform_2d":
+        return {"T0_offset": np.float64(p["T0_offset"])}
+    if ic_family == "random_sinusoid_2d":
+        return {
+            "A_list": np.asarray(p["A_list"], dtype="<f8"),
+            "nx_list": np.asarray(p["nx_list"], dtype="<i8"),
+            "ny_list": np.asarray(p["ny_list"], dtype="<i8"),
+            "phi_list": np.asarray(p["phi_list"], dtype="<f8"),
+        }
+    if ic_family == "grf_2d":
+        return {
+            "ell": np.float64(p["ell"]),
+            "sigma": np.float64(p["sigma"]),
+            "wn_seed": np.int64(p["wn_seed"]),
+        }
+    if ic_family == "hot_spot_2d":
+        return {
+            "A_list": np.asarray(p["A_list"], dtype="<f8"),
+            "mu_x_list": np.asarray(p["mu_x_list"], dtype="<f8"),
+            "mu_y_list": np.asarray(p["mu_y_list"], dtype="<f8"),
+            "sigma_list": np.asarray(p["sigma_list"], dtype="<f8"),
+        }
+    raise ValueError(f"unknown IC family {ic_family!r}")
+
+
 # -------- TAPER + WRAPPER --------
 
 def _smoothstep_window(dist: np.ndarray, edge_width: float) -> np.ndarray:
@@ -173,10 +226,13 @@ def build_ic(ic_family: str, ic_params: dict,
              X: np.ndarray, Y: np.ndarray, T_right: float,
              b: float = 1.0, taper: bool = True,
              pin_right_edge: bool = True) -> np.ndarray:
-    dev = IC_BUILDERS[ic_family](X, Y, **ic_params)
+    X64 = np.asarray(X, dtype=np.float64)
+    Y64 = np.asarray(Y, dtype=np.float64)
+    params = canonical_ic_params(ic_family, ic_params)
+    dev = IC_BUILDERS[ic_family](X64, Y64, **params)
     if taper:
-        dev = dev * boundary_taper(X, Y)
-    T0 = (dev + T_right).astype(np.float32)
+        dev = dev * boundary_taper(X64, Y64)
+    T0 = np.ascontiguousarray(dev + np.float64(T_right), dtype=np.float32)
     if pin_right_edge:
         T0[-1, :] = np.float32(T_right)
     return T0

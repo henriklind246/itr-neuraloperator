@@ -248,9 +248,10 @@ training:
     # Used by the interfaces trainer and by diffusion_forcing_single when
     # residual_method=finite_volume.
     # collocation_source selects where the per-step interface_x / R_c / forcing
-    # params come from: "saved_train" (default) reads them from the saved TRAIN
-    # sim_params.npy; "online" draws fresh from the generator distributions
-    # (Stage 7). The interfaces benchmark overrides forcing.ny_img/nt_img/a_ref
+    # params come from: "saved_train" reads them from the saved TRAIN
+    # sim_params.npy; "online" draws fresh from the generator distributions.
+    # The interfaces benchmark defaults this to online and overrides
+    # forcing.ny_img/nt_img/a_ref
     # for its complete-schedule image. dt is the CN step for the two-slice
     # residual. For diffusion_forcing_single, null requires the solver dt stored
     # with the dataset; the interfaces runner retains its trajectory-spacing
@@ -266,6 +267,10 @@ training:
     intervals_per_sim: 2
     stratified_time_sampling: true
     causal_num_bins: 6
+    online_sampling:
+      profile_every: 100
+      min_profile_samples: 10
+      warn_fraction: 0.10
     # interface_band (interfaces PINO only): split the two node columns flanking
     # the interface face (interior columns {face_idx-1, face_idx}) out of the
     # interior CN residual into a DISJOINT 5th balanced GradNorm term so the jump

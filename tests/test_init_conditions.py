@@ -1,5 +1,8 @@
+import random
+
 import numpy as np
 import pytest
+import torch
 
 from src.physics.init_conditions import (
     IC_FAMILIES,
@@ -17,7 +20,9 @@ from src.physics.init_conditions import (
     UNIFORM_OFFSET_RANGE,
     EDGE_TAPER_WIDTH,
     boundary_taper,
+    balanced_ic_family_assignments,
     build_ic,
+    canonical_ic_params,
     right_edge_taper,
     sample_ic_family,
     sample_uniform_ic_params,
@@ -34,6 +39,19 @@ def _mesh(Nx: int = 100, Ny: int = 100, b: float = 1.0):
 
 
 class TestSamplers:
+    @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 16])
+    def test_balanced_family_assignments(self, batch_size):
+        labels = balanced_ic_family_assignments(
+            np.random.default_rng(123), batch_size,
+        )
+        counts = [labels.count(family) for family in IC_FAMILIES]
+        assert len(labels) == batch_size
+        assert max(counts) - min(counts) <= 1
+        if batch_size >= len(IC_FAMILIES):
+            assert all(count > 0 for count in counts)
+        else:
+            assert len(set(labels)) == batch_size
+
     def test_uniform_keys(self):
         rng = np.random.default_rng(0)
         p = sample_uniform_ic_params(rng)
@@ -225,6 +243,26 @@ class TestBuildIC:
                       taper=False, pin_right_edge=True)
         assert np.allclose(T0[:-1, :], 311.0)
         np.testing.assert_allclose(T0[-1, :], 300.0)
+
+    @pytest.mark.parametrize("fam", list(IC_FAMILIES.keys()))
+    def test_lossless_descriptor_reconstruction_and_rng_purity(self, fam):
+        X, Y = _mesh(Nx=31, Ny=29)
+        params = IC_SAMPLERS[fam](np.random.default_rng(7), Nx=31, Ny=29)
+        descriptor = canonical_ic_params(fam, params)
+        numpy_state = np.random.get_state()
+        python_state = random.getstate()
+        torch_state = torch.get_rng_state().clone()
+
+        original = build_ic(fam, descriptor, X, Y, T_right=300.0)
+        reconstructed = build_ic(fam, descriptor, X, Y, T_right=300.0)
+
+        assert np.array_equal(original, reconstructed)
+        after_numpy = np.random.get_state()
+        assert numpy_state[0] == after_numpy[0]
+        np.testing.assert_array_equal(numpy_state[1], after_numpy[1])
+        assert numpy_state[2:] == after_numpy[2:]
+        assert random.getstate() == python_state
+        assert torch.equal(torch.get_rng_state(), torch_state)
 
 
 # Non-uniform IC families whose deviation is a deterministic continuous function

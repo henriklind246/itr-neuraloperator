@@ -14,6 +14,7 @@ The synthetic grid is 20x20 so ``patch_size=10`` divides it (the fixture's
 """
 
 import csv
+import copy
 import json
 import math
 
@@ -21,6 +22,7 @@ import numpy as np
 import pytest
 import torch
 import src.operators.train_pino as train_pino_mod
+from src.physics.init_conditions import IC_BUILDER_SCHEMA_VERSION, IC_SAMPLERS, build_ic
 
 from src.operators.train_pino import (
     _adapt_causal_eps,
@@ -142,6 +144,7 @@ def _write_synthetic_interfaces(tmp_path, num_sims=12, Nt=3, Nx=20, Ny=20):
 
 def _interface_config(tmp_path):
     cfg = _config(tmp_path)
+    cfg["benchmark"] = {"name": "interfaces", "representation": "temporal_encoder"}
     cfg["model"]["cvit"].update({"emb_dim": 16, "num_heads": 2})
     cfg["model"]["interface_cvit"] = {
         "spatial_in_ch": 3,
@@ -304,6 +307,48 @@ def test_interface_region_calibration_disables_autograd(tmp_path, monkeypatch):
     assert all(
         math.isfinite(float(v)) and float(v) > 0.0
         for v in metadata["std_scales"].values()
+    )
+    artifact = metadata["artifact"]
+    assert artifact["relative_path"] == "region_standardize_calibration.pt"
+    assert len(artifact["sha256"]) == 64
+    assert artifact["descriptor_count"] == 4
+    assert (run_dir / artifact["relative_path"]).exists()
+
+
+def test_interface_online_optimizer_isolated_from_saved_samples(tmp_path, monkeypatch):
+    _write_synthetic_interfaces(tmp_path)
+    config = _interface_config(tmp_path)
+    config["training"]["pino"]["collocation_source"] = "online"
+    loaded = load_diffusion_data(config)
+
+    class _RaisingSavedArray:
+        def __getitem__(self, key):
+            raise AssertionError(f"optimizer indexed saved data with {key!r}")
+
+    loaded["trajectories"] = _RaisingSavedArray()
+    monkeypatch.setattr(train_pino_mod, "load_diffusion_data", lambda _cfg: loaded)
+    monkeypatch.setattr(train_pino_mod, "_compute_train_jump_scale", lambda *a: 1.0)
+    monkeypatch.setattr(
+        train_pino_mod,
+        "validate_interfaces_gnrmse",
+        lambda *args, **kwargs: {
+            "val_gnrmse": 1.0,
+            "val_rmse_K": 1.0,
+            "node_jump_rmse_K": 1.0,
+            "E_model": 1.0,
+            "E_zero": 1.0,
+        },
+    )
+    original_np_load = np.load
+
+    def guarded_np_load(path, *args, **kwargs):
+        if str(path).endswith("sim_params.npy"):
+            return _RaisingSavedArray()
+        return original_np_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(train_pino_mod.np, "load", guarded_np_load)
+    run_one_seed_interfaces_pino(
+        config, seed=0, run_dir=tmp_path / "interface_online_isolated",
     )
 
 
@@ -1171,6 +1216,120 @@ def _forcing_ic_config(tmp_path):
     }
 
 
+def test_online_warmup_resample_boundary():
+    should = train_pino_mod._should_resample_online_batch
+    assert should(0, 5, 3)
+    assert not should(1, 5, 3)
+    assert not should(2, 5, 3)
+    assert should(3, 5, 3)
+    assert not should(4, 5, 3)
+    assert should(5, 5, 3)
+    assert should(6, 5, 3)
+
+
+def test_canonical_online_keys_ignore_layout_order_and_runtime_fields():
+    base = np.arange(24, dtype=np.float64).reshape(4, 6)[:, ::2]
+    big_endian = np.asarray(base, dtype=">f8")
+    left = {
+        "b": np.float64(0.5),
+        "a": base,
+        "runtime": {"device": "cuda"},
+    }
+    right = {
+        "a": big_endian,
+        "b": 0.5,
+        "runtime": {"device": "cpu"},
+    }
+    assert train_pino_mod._content_key(left) == train_pino_mod._content_key(right)
+
+    batch_a = train_pino_mod._batch_key(
+        [{"problem_key": "p0"}], {"x": np.array([0.1], dtype=np.float32)},
+    )
+    batch_b = train_pino_mod._batch_key(
+        [{"problem_key": "p0"}], {"x": np.array([0.2], dtype=np.float32)},
+    )
+    assert batch_a != batch_b
+
+
+def test_online_descriptor_roundtrip_and_normalized_target_identity(tmp_path):
+    x = np.linspace(0.0, 1.0, 12)
+    X, Y = np.meshgrid(x, x, indexing="ij")
+    params = IC_SAMPLERS["grf_2d"](np.random.default_rng(4), Nx=12, Ny=12)
+    raw = {
+        "T0": build_ic("grf_2d", params, X, Y, T_right=300.0),
+        "ic_family": "grf_2d",
+        "ic_params": params,
+        "temporal_family": "sin",
+        "temporal_params": {"A": 100.0, "f": 3.0},
+        "spatial_family": "uniform",
+        "spatial_params": {},
+    }
+    descriptor = train_pino_mod._online_record_descriptor(raw)
+    path = tmp_path / "descriptors.pt"
+    torch.save({"records": [descriptor]}, path)
+    loaded = torch.load(path, weights_only=False)["records"]
+    records = train_pino_mod._materialize_online_records(loaded, X, Y)
+    assert np.array_equal(records[0]["T0"], raw["T0"])
+
+    physical, normalized, _ = train_pino_mod._normalized_online_ic_buffer(
+        records, 301.25, 7.5,
+    )
+    u_ic = train_pino_mod._transfer_normalized_ic(normalized, torch.device("cpu"))
+    ix = torch.tensor([0, 3, 11], dtype=torch.long)
+    iy = torch.tensor([2, 7, 11], dtype=torch.long)
+    anchor = u_ic[:, 0][torch.arange(1)[:, None], ix[None], iy[None]]
+    assert torch.equal(anchor, u_ic[0, 0, ix, iy].unsqueeze(0))
+    torch.testing.assert_close(
+        u_ic[:, 0] * torch.tensor(7.5, dtype=torch.float32)
+        + torch.tensor(301.25, dtype=torch.float32),
+        torch.from_numpy(physical),
+        rtol=1e-6,
+        atol=1e-4,
+    )
+
+    json_like = copy.deepcopy(descriptor)
+    json_like["builder_version"] = int(IC_BUILDER_SCHEMA_VERSION)
+    with pytest.raises(ValueError, match="audit JSON"):
+        train_pino_mod._materialize_online_records([json_like], X, Y)
+    wrong_version = copy.deepcopy(descriptor)
+    wrong_version["builder_version"] = np.int64(IC_BUILDER_SCHEMA_VERSION + 1)
+    with pytest.raises(ValueError, match="builder version"):
+        train_pino_mod._materialize_online_records([wrong_version], X, Y)
+
+
+def test_online_rng_stream_state_and_consumers_are_independent():
+    a = train_pino_mod.OnlineSamplerRNGs.create(11, torch.device("cpu"))
+    b = train_pino_mod.OnlineSamplerRNGs.create(11, torch.device("cpu"))
+    a.numpy["interface_position"].random(19)
+    np.testing.assert_array_equal(
+        a.numpy["contact_resistance"].random(8),
+        b.numpy["contact_resistance"].random(8),
+    )
+    state = b.state_dict()
+    expected = b.numpy["forcing_params"].random(5)
+    restored = train_pino_mod.OnlineSamplerRNGs.create(99, torch.device("cpu"))
+    restored.load_state_dict(state)
+    np.testing.assert_array_equal(
+        expected, restored.numpy["forcing_params"].random(5),
+    )
+
+
+def test_calibration_artifact_hash_rejects_corruption(tmp_path):
+    path = tmp_path / "region_standardize_calibration.pt"
+    metadata = {"version": 1, "sampler_version": "online_balanced_ic_v1"}
+    train_pino_mod._atomic_hashed_torch_save(
+        {"metadata": metadata, "std_scales": {"interior": 1.0}}, path,
+    )
+    with path.open("r+b") as stream:
+        stream.seek(7)
+        original = stream.read(1)
+        stream.seek(7)
+        stream.write(bytes([original[0] ^ 0x01]))
+        stream.flush()
+    with pytest.raises(ValueError, match="SHA-256"):
+        train_pino_mod._load_hashed_calibration(path, metadata)
+
+
 def test_e2e_forcing_ic_smoke_finite(tmp_path):
     # Phase C gate: one two-branch runner completes with finite losses + a finite
     # validation gnRMSE, and the checkpoint bakes the frozen normalization.
@@ -1203,8 +1362,165 @@ def test_e2e_forcing_ic_smoke_finite(tmp_path):
     ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
     assert math.isfinite(float(ckpt["mu_global"]))
     assert float(ckpt["sigma_global"]) > 0.0
-    # The two-branch runner carries its own IC-sim RNG state for reproducible resume.
+    # The two-branch runner carries independent online streams and descriptors.
     assert ckpt.get("ic_rng_state") is not None
+    assert ckpt["online_sampling_signature"]["sampler_version"] == "online_balanced_ic_v1"
+    assert ckpt.get("online_rng_state") is not None
+    assert ckpt["online_cache"]["batch_key"]
+    assert all("T0" not in record for record in ckpt["online_cache"]["records"])
+    assert ckpt["forcing_cache"]["ids_batch"] is None
+
+
+def test_forcing_ic_online_resume_reproduces_descriptors_and_parameters(
+    tmp_path, monkeypatch,
+):
+    _write_synthetic_forcing_ic(tmp_path)
+
+    def _small_config(epochs):
+        cfg = _forcing_ic_config(tmp_path)
+        cfg["training"]["epochs"] = epochs
+        cfg["training"]["validate_every"] = 1
+        cfg["training"]["optimizer"] = "AdamW"
+        cfg["training"]["pino"].update({
+            "n_r": 8, "n_bc": 4, "sim_batch": 2,
+        })
+        cfg["training"]["physics"]["n_ic_points"] = 4
+        cfg["training"]["pino"]["forcing"]["save_latest_every"] = 1
+        return cfg
+
+    monkeypatch.setattr(
+        train_pino_mod,
+        "validate_forcing_ic_gnrmse",
+        lambda *args, **kwargs: {"val_gnrmse": 1.0, "val_rmse_K": 1.0},
+    )
+    full_dir = tmp_path / "online_resume_full"
+    run_one_seed_forcing_ic_pino(_small_config(3), seed=9, run_dir=full_dir)
+
+    split_dir = tmp_path / "online_resume_split"
+    run_one_seed_forcing_ic_pino(_small_config(1), seed=9, run_dir=split_dir)
+    resumed = _small_config(3)
+    resumed["training"]["pino"]["forcing"]["extend_completed"] = True
+    run_one_seed_forcing_ic_pino(resumed, seed=9, run_dir=split_dir)
+
+    full = torch.load(
+        full_dir / "cvit_final.pt", map_location="cpu", weights_only=False,
+    )
+    split = torch.load(
+        split_dir / "cvit_final.pt", map_location="cpu", weights_only=False,
+    )
+    assert full["completed_updates"] == split["completed_updates"] == 3
+    assert full["online_cache"]["batch_key"] == split["online_cache"]["batch_key"]
+    assert [
+        record["problem_key"] for record in full["online_cache"]["records"]
+    ] == [
+        record["problem_key"] for record in split["online_cache"]["records"]
+    ]
+    assert full["online_rng_state"]["numpy"] == split["online_rng_state"]["numpy"]
+    for name, value in full["model_state"].items():
+        torch.testing.assert_close(
+            value, split["model_state"][name], rtol=1e-7, atol=1e-8,
+        )
+
+
+@pytest.mark.parametrize("residual_method", ["autodiff", "finite_volume"])
+def test_forcing_ic_optimizer_never_indexes_saved_training_samples(
+    tmp_path, monkeypatch, residual_method,
+):
+    _write_synthetic_forcing_ic(tmp_path)
+    cfg = _forcing_ic_config(tmp_path)
+    cfg["training"]["epochs"] = 1
+    cfg["training"]["pino"]["residual_method"] = residual_method
+    cfg["training"]["pino"]["sim_batch"] = 2
+    cfg["training"]["pino"]["n_r"] = 8
+    cfg["training"]["pino"]["n_bc"] = 4
+    cfg["training"]["physics"]["n_ic_points"] = 4
+    loaded = load_diffusion_data(cfg)
+
+    class _RaisingSavedArray:
+        def __getitem__(self, key):
+            raise AssertionError(f"optimizer indexed saved trajectories with {key!r}")
+
+    loaded["trajectories"] = _RaisingSavedArray()
+    monkeypatch.setattr(train_pino_mod, "load_diffusion_data", lambda _cfg: loaded)
+    original_np_load = np.load
+
+    def guarded_np_load(path, *args, **kwargs):
+        if str(path).endswith("sim_params.npy"):
+            return _RaisingSavedArray()
+        return original_np_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(train_pino_mod.np, "load", guarded_np_load)
+    monkeypatch.setattr(
+        train_pino_mod,
+        "validate_forcing_ic_gnrmse",
+        lambda *args, **kwargs: {"val_gnrmse": 1.0, "val_rmse_K": 1.0},
+    )
+    run_one_seed_forcing_ic_pino(
+        cfg, seed=0, run_dir=tmp_path / f"isolated_{residual_method}",
+    )
+
+
+@pytest.mark.parametrize("phase", ["pre_step", "post_step"])
+def test_forcing_ic_nonfinite_failure_artifact_is_atomic(
+    tmp_path, monkeypatch, phase,
+):
+    _write_synthetic_forcing_ic(tmp_path)
+    cfg = _forcing_ic_config(tmp_path)
+    cfg["training"].update({
+        "epochs": 1,
+        "optimizer": "AdamW",
+        "scheduler": {"type": "StepLR", "step_size": 10, "gamma": 0.5},
+    })
+    cfg["training"]["pino"].update({"n_r": 8, "n_bc": 4, "sim_batch": 2})
+    cfg["training"]["physics"]["n_ic_points"] = 4
+    scheduler_calls = []
+    monkeypatch.setattr(
+        train_pino_mod,
+        "_advance_scheduler",
+        lambda *args, **kwargs: scheduler_calls.append((args, kwargs)),
+    )
+
+    if phase == "pre_step":
+        def nonfinite_losses(model, u, coll, ic_target, alpha, **kwargs):
+            nan = torch.tensor(float("nan"), requires_grad=True)
+            zero = torch.tensor(0.0, requires_grad=True)
+            return {
+                "r": nan, "ic": zero, "bc": zero,
+                "bc_left": zero, "bc_hom": zero,
+                "r_pointwise_mse": nan.detach(),
+            }
+        monkeypatch.setattr(train_pino_mod, "pino_losses", nonfinite_losses)
+    else:
+        original_build_scheduler = train_pino_mod.build_scheduler
+
+        def corrupting_scheduler(config, optimizer):
+            scheduler = original_build_scheduler(config, optimizer)
+            params = [p for group in optimizer.param_groups for p in group["params"]]
+            original_step = optimizer.step
+
+            def step(*args, **kwargs):
+                result = original_step(*args, **kwargs)
+                with torch.no_grad():
+                    params[0].view(-1)[0] = float("inf")
+                return result
+
+            optimizer.step = step
+            return scheduler
+
+        monkeypatch.setattr(train_pino_mod, "build_scheduler", corrupting_scheduler)
+
+    run_dir = tmp_path / f"failure_{phase}"
+    with pytest.raises(FloatingPointError):
+        run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=run_dir)
+    artifact = torch.load(
+        run_dir / "failed_online_batch.pt", map_location="cpu", weights_only=False,
+    )
+    assert artifact["phase"] == phase
+    assert artifact["completed_updates"] == 0
+    assert artifact["batch_key"]
+    assert artifact["records"]
+    assert not (run_dir / "cvit_latest.pt").exists()
+    assert scheduler_calls == []
 
 
 def test_forcing_ic_fv_full_grid_layout_contract():

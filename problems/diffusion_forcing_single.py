@@ -6,7 +6,15 @@ import numpy as np
 
 from problems.diffusion_forcing import DiffusionForcingProblem
 from src.physics.boundary_forcing import SPATIAL_SAMPLERS, TEMPORAL_SAMPLERS
-from src.physics.init_conditions import IC_FAMILIES, IC_SAMPLERS, build_ic
+from src.physics.init_conditions import (
+    IC_BUILDER_SCHEMA_VERSION,
+    IC_FAMILIES,
+    IC_SAMPLERS,
+    ONLINE_IC_SAMPLER_VERSION,
+    build_ic,
+    canonical_ic_params,
+    sample_ic_family,
+)
 
 # The single forcing family this benchmark pins.
 FIXED_TEMPORAL_FAMILY = "sin"
@@ -46,6 +54,8 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
     # load-time guard. Present only on this spec.
     problem_version = PROBLEM_VERSION
     ic_mode = IC_MODE
+    online_sampler_version = ONLINE_IC_SAMPLER_VERSION
+    ic_builder_version = IC_BUILDER_SCHEMA_VERSION
 
     def sample_sim_params(
         self,
@@ -115,6 +125,74 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
                 "spatial_params": spatial_params,
             })
         return sim_params
+
+    def sample_online_params(
+        self,
+        rng: np.random.Generator,
+        n: int,
+        grids: dict[str, np.ndarray],
+        time_cfg: dict[str, Any],
+        rng_profile: np.random.Generator | None = None,
+        *,
+        rng_streams: dict[str, np.random.Generator] | None = None,
+        ic_family_assignment: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        streams = rng_streams or {}
+        ic_family_rng = streams.get("ic_family", rng)
+        ic_param_rng = streams.get("ic_params", rng)
+        forcing_rng = streams.get(
+            "forcing_params", rng_profile if rng_profile is not None else rng,
+        )
+        X = np.asarray(grids["X"], dtype=np.float64)
+        Y = np.asarray(grids["Y"], dtype=np.float64)
+        Nx, Ny = X.shape
+        y_grid = np.asarray(grids.get("y_grid", Y[0]), dtype=np.float64)
+        c, d = float(y_grid[0]), float(y_grid[-1])
+        dt = float(time_cfg["dt"])
+        t_final = float(time_cfg["t_final"])
+        T_right = float(time_cfg.get("T_right", 300.0))
+        b_temp = float(time_cfg.get("b", 1.0))
+        temporal_window = {
+            "t_on": float(time_cfg.get("t_on", 0.0)),
+            "t_off": float(time_cfg.get("t_off", 0.2)),
+            "phase": float(time_cfg.get("phase", 0.0)),
+            "tukey_alpha": float(time_cfg.get("tukey_alpha", 0.5)),
+        }
+        if ic_family_assignment is not None and len(ic_family_assignment) != int(n):
+            raise ValueError(
+                "ic_family_assignment length must equal the online batch size"
+            )
+
+        records: list[dict] = []
+        for i in range(int(n)):
+            family = (
+                str(ic_family_assignment[i])
+                if ic_family_assignment is not None
+                else sample_ic_family(ic_family_rng)
+            )
+            if family not in IC_FAMILIES:
+                raise ValueError(f"unknown IC family {family!r}")
+            ic_params = canonical_ic_params(
+                family, IC_SAMPLERS[family](ic_param_rng, Nx=Nx, Ny=Ny),
+            )
+            temporal_params = TEMPORAL_SAMPLERS[FIXED_TEMPORAL_FAMILY](
+                forcing_rng, dt=dt, t_final=t_final, **temporal_window,
+            )
+            spatial_params = SPATIAL_SAMPLERS[FIXED_SPATIAL_FAMILY](
+                forcing_rng, c=c, d=d,
+            )
+            records.append({
+                "T0": build_ic(
+                    family, ic_params, X, Y, T_right=T_right, b=b_temp,
+                ),
+                "ic_family": family,
+                "ic_params": ic_params,
+                "temporal_family": FIXED_TEMPORAL_FAMILY,
+                "temporal_params": temporal_params,
+                "spatial_family": FIXED_SPATIAL_FAMILY,
+                "spatial_params": spatial_params,
+            })
+        return records
 
     def validate_schema(self, sim_params: np.ndarray, sim_ids: np.ndarray) -> None:
         # Parent enforces required keys and forbids interface_x / R_c.
