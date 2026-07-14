@@ -87,6 +87,24 @@ model:
     in_ch: 1
     patch_size: 8
 
+  # ---- ForcingICCViT (varying-IC single-slab forcing PINO path) ----
+  # Read ONLY by train_pino.run_one_seed_forcing_ic_pino
+  # (benchmark=diffusion_forcing_single). These keys OVERRIDE model.cvit for the
+  # two-branch surrogate; anything omitted falls back to model.cvit. Two encoder
+  # streams fuse in the decoder cross-attention via a 2-way per-token modality
+  # embedding: (a) the forcing space-time image q_L(y,t)/a_ref over
+  # (ny_img, nt_img) -- forcing_patch_size must divide BOTH image axes (reuse the
+  # good ForcingCViT run's forcing_cvit.patch_size=8; ny_img->Ny=64, nt_img=128
+  # are both /8); and (b) the per-sim initial-condition field T0_tilde over the
+  # data grid (Nx, Ny) -- ic_patch_size must divide BOTH Nx and Ny. The decoder,
+  # coords, and hard-right-Dirichlet ansatz are identical to cvit; the left wall
+  # stays SOFT (flux enforced in the residual, no q_left in decode).
+  forcing_ic_cvit:
+    forcing_in_ch: 1
+    ic_in_ch: 1
+    forcing_patch_size: 8
+    ic_patch_size: 10
+
   # ---- InterfaceCViT (interfaces PINO path) ----
   # Read ONLY by train_pino.run_one_seed_interfaces_pino (benchmark=interfaces).
   # These keys OVERRIDE model.cvit for the interface surrogate; anything omitted

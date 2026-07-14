@@ -29,16 +29,25 @@ def model_xyt(
     y: torch.Tensor,
     t: torch.Tensor,
     q_left: torch.Tensor | None = None,
+    predict: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Query the CViT with x, y as separate leaves; returns (B, Nq, out_dim).
+    """Query the surrogate with x, y as separate leaves; returns (B, Nq, out_dim).
 
     x, y, t are each (B, Nq, 1). They are concatenated to coords=(B, Nq, 2) and
     passed through unchanged so autograd sees x and y as distinct inputs.
     ``q_left`` is forwarded to the model's hard-left-flux lifting when set; it is
     a detached, coords-aligned (B, Nq, 1) tensor and is ignored unless the model
     was built with ``hard_left_flux=True``.
+
+    ``predict`` is an optional decode closure ``predict(coords, t, q_left=None)``
+    over a pre-encoded latent (the two-branch :class:`ForcingICCViT` path): when
+    given, ``model``/``u`` are unused for the query and the latent is reused
+    across every residual call in the step. When ``None`` the monolithic
+    ``model(u, coords, t, q_left)`` path is used unchanged.
     """
     coords = torch.cat([x, y], dim=-1)
+    if predict is not None:
+        return predict(coords, t, q_left=q_left)
     return model(u, coords, t, q_left=q_left)
 
 
@@ -80,6 +89,7 @@ def diffusion_residual(
     y: torch.Tensor,
     t: torch.Tensor,
     alpha: float = 1.0,
+    predict: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Return r = T_t - alpha (T_xx + T_yy) at the given points; shape (B, Nq, 1).
 
@@ -87,13 +97,15 @@ def diffusion_residual(
     is built with create_graph=True so the residual loss is itself
     differentiable w.r.t. the model parameters. Shared ``(1, Nq, 1)`` collocation
     leaves are expanded to per-sim leaves so the returned residual is per-sim
-    ``(B, Nq, 1)`` rather than summed over the batch.
+    ``(B, Nq, 1)`` rather than summed over the batch. ``predict`` selects the
+    pre-encoded decode closure (see :func:`model_xyt`); ``u`` still supplies the
+    sim batch size.
     """
     B = u.shape[0]
     x = _as_batch_leaf(x, B)
     y = _as_batch_leaf(y, B)
     t = _as_batch_leaf(t, B)
-    T = model_xyt(model, u, x, y, t)
+    T = model_xyt(model, u, x, y, t, predict=predict)
     T_t = _grad(T, t, create_graph=True)
     T_x = _grad(T, x, create_graph=True)
     T_xx = _grad(T_x, x, create_graph=True)
@@ -109,6 +121,7 @@ def neumann_residual(
     y: torch.Tensor,
     t: torch.Tensor,
     wall: str,
+    predict: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Zero-flux wall residual; shape (B, Nq, 1).
 
@@ -118,12 +131,13 @@ def neumann_residual(
       - "bottom" (y=0): dT/dy
     The right wall (x=1) is handled by the hard-Dirichlet ansatz, not here.
     Shared collocation leaves are expanded per-sim so the residual is per-sim.
+    ``predict`` selects the pre-encoded decode closure (see :func:`model_xyt`).
     """
     B = u.shape[0]
     x = _as_batch_leaf(x, B)
     y = _as_batch_leaf(y, B)
     t = _as_batch_leaf(t, B)
-    T = model_xyt(model, u, x, y, t)
+    T = model_xyt(model, u, x, y, t, predict=predict)
     if wall == "left":
         return _grad(T, x, create_graph=True)
     if wall in ("top", "bottom"):
@@ -140,6 +154,7 @@ def forcing_neumann_residual(
     q_L: torch.Tensor,
     sigma: float,
     k: float = 1.0,
+    predict: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Inhomogeneous left-wall (x=0) Neumann residual; shape (B, Nq, 1).
 
@@ -170,7 +185,7 @@ def forcing_neumann_residual(
     x = _as_batch_leaf(x, B)
     y = _as_batch_leaf(y, B)
     t = _as_batch_leaf(t, B)
-    T = model_xyt(model, u, x, y, t, q_left=q_L)
+    T = model_xyt(model, u, x, y, t, q_left=q_L, predict=predict)
     T_x = _grad(T, x, create_graph=True)
     return T_x + q_L / (float(k) * float(sigma))
 
@@ -181,11 +196,17 @@ def ic_residual(
     coords_ic: torch.Tensor,
     t_ic: torch.Tensor,
     ic_target_tilde: torch.Tensor,
+    predict: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Initial-condition residual T(x, y, 0) - T0_tilde; shape (B, Nq, out_dim).
 
     coords_ic:(B or 1, Nq, 2), t_ic:(B or 1, Nq, 1) all zeros, ic_target_tilde:
-    (B, Nq, out_dim) the normalized IC sampled at those points.
+    (B, Nq, out_dim) the normalized IC sampled at those points. ``predict``
+    selects the pre-encoded decode closure (see :func:`model_xyt`); ``u`` is
+    unused on that path.
     """
-    T = model(u, coords_ic, t_ic)
+    if predict is not None:
+        T = predict(coords_ic, t_ic, q_left=None)
+    else:
+        T = model(u, coords_ic, t_ic)
     return T - ic_target_tilde

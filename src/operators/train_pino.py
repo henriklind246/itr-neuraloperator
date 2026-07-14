@@ -8,7 +8,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ from problems.interfaces import (
     RC_RANGE,
     normalize_interface_scalars,
 )
-from src.operators.cvit import CViT, ForcingCViT, InterfaceCViT
+from src.operators.cvit import CViT, ForcingCViT, ForcingICCViT, InterfaceCViT
 from src.operators.losses import full_bc_physics_loss
 from src.operators.train import (
     GradNormBalancer,
@@ -694,6 +694,7 @@ def pino_losses(
     left_qL: torch.Tensor | None = None,
     sigma: float = 1.0,
     k_slab: float = 1.0,
+    predict: Callable[..., torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Raw physics/IC/BC losses. ``causal_cfg.enabled`` swaps the plain
     ``mean(r^2)`` interior term for a causally time-weighted one (needs
@@ -705,6 +706,13 @@ def pino_losses(
     (expensive, double-backward) residual / BC autodiff entirely and return a
     zero placeholder -- used for the IC-only diagnostic. All default off/on ->
     legacy behavior.
+
+    ``predict`` is an optional decode closure ``predict(coords, t, q_left=None)``
+    over a latent encoded ONCE per step (the two-branch :class:`ForcingICCViT`
+    path). When given, every residual reuses that single latent and ``model``/
+    ``u`` are only used for batch size / dtype; when ``None`` the monolithic
+    ``model(u, ...)`` path is unchanged. The residual math (interior, soft-left
+    forcing Neumann, homogeneous walls, IC) is identical on both paths.
     """
     bin_mean = None
     bin_count = None
@@ -713,7 +721,7 @@ def pino_losses(
     r = None
     if compute_r:
         x_r, y_r, t_r = batch["interior"]
-        r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha)
+        r = diffusion_residual(model, u, x_r, y_r, t_r, alpha=alpha, predict=predict)
         pointwise_r = (r ** 2).mean()
         causal_on = bool(causal_cfg and causal_cfg.get("enabled", False))
         if causal_on:
@@ -736,7 +744,9 @@ def pino_losses(
     else:
         loss_r = u.new_zeros(())
 
-    ic = ic_residual(model, u, batch["ic"]["coords"], batch["ic"]["t"], ic_target)
+    ic = ic_residual(
+        model, u, batch["ic"]["coords"], batch["ic"]["t"], ic_target, predict=predict,
+    )
     loss_ic = _ic_loss(
         ic, ic_target, mode=ic_loss, t_right_tilde=t_right_tilde, eps=ic_eps,
         den=ic_den,
@@ -755,12 +765,12 @@ def pino_losses(
                 # left wall is now the actual forcing signal (top/bottom stay
                 # homogeneous adiabatic). q_L is a precomputed constant tensor.
                 nb = forcing_neumann_residual(
-                    model, u, xw, yw, tw, left_qL, sigma, k=k_slab,
+                    model, u, xw, yw, tw, left_qL, sigma, k=k_slab, predict=predict,
                 )
                 loss_bc_left = (nb ** 2).mean()
                 bc_sq = bc_sq + loss_bc_left
             else:
-                nb = neumann_residual(model, u, xw, yw, tw, w)
+                nb = neumann_residual(model, u, xw, yw, tw, w, predict=predict)
                 wall_sq = (nb ** 2).mean()
                 bc_sq = bc_sq + wall_sq
                 hom_sq = hom_sq + wall_sq
@@ -1279,7 +1289,7 @@ def build_cvit(
     grid_size: tuple[int, int],
     t_final: float = 1.0,
     variant: str = "cvit",
-) -> CViT | InterfaceCViT:
+) -> CViT | InterfaceCViT | ForcingICCViT:
     """Construct the PINO surrogate. ``variant="cvit"`` (default) builds the
     diffusion :class:`CViT` conditioned on the IC field over ``grid_size =
     (Nx, Ny)``. ``variant="forcing"`` builds a :class:`ForcingCViT` whose encoder
@@ -1289,7 +1299,46 @@ def build_cvit(
     ``grid_size = (Nx, Ny)`` whose three token streams (spatial field, forcing
     image, interface scalars) feed the decoder cross-attention; it
     reads ``model.interface_cvit`` when present, falling back to ``model.cvit``.
+    ``variant="forcing_ic"`` builds a two-branch :class:`ForcingICCViT` over the
+    IC data grid ``grid_size = (Nx, Ny)`` plus the forcing space-time image
+    ``(Ny_img, Nt_img)`` read from ``training.pino.forcing``; it reads
+    ``model.forcing_ic_cvit`` when present, falling back to ``model.cvit``.
     """
+    if variant == "forcing_ic":
+        c = {**config["model"]["cvit"], **(config["model"].get("forcing_ic_cvit", {}) or {})}
+        forcing_cfg = config.get("training", {}).get("pino", {}).get("forcing", {}) or {}
+        ny_img = int(forcing_cfg.get("ny_img") if forcing_cfg.get("ny_img") is not None else grid_size[1])
+        nt_img = int(forcing_cfg.get("nt_img") if forcing_cfg.get("nt_img") is not None else 128)
+        t_right_K = float(c.get("hard_right_dirichlet_t_right", T_RIGHT))
+        hard_rd = bool(c.get("hard_right_dirichlet", True))
+        t_right_tilde = (t_right_K - mu) / (sigma + 1e-8) if hard_rd else 0.0
+        t_norm = float(
+            c.get("t_final", None) if c.get("t_final", None) is not None else t_final
+        )
+        return ForcingICCViT(
+            forcing_in_ch=int(c.get("forcing_in_ch", 1)),
+            ic_in_ch=int(c.get("ic_in_ch", 1)),
+            out_dim=int(c.get("out_dim", 1)),
+            emb_dim=int(c.get("emb_dim", 256)),
+            dec_emb_dim=c.get("dec_emb_dim", None),
+            ic_patch_size=int(c.get("ic_patch_size", 10)),
+            ic_grid_size=grid_size,
+            forcing_patch_size=int(c.get("forcing_patch_size", 8)),
+            forcing_grid_size=(ny_img, nt_img),
+            depth_enc=int(c.get("depth_enc", 4)),
+            depth_dec=int(c.get("depth_dec", 2)),
+            num_heads=int(c.get("num_heads", 8)),
+            mlp_ratio=float(c.get("mlp_ratio", 2.0)),
+            fourier_freq=float(c.get("fourier_freq", 1.0)),
+            fourier_freq_t=(
+                None if c.get("fourier_freq_t", None) is None
+                else float(c["fourier_freq_t"])
+            ),
+            activation=str(c.get("activation", "gelu")),
+            hard_right_dirichlet=hard_rd,
+            t_right_tilde=t_right_tilde,
+            t_final=t_norm,
+        )
     if variant == "interfaces":
         interface_cfg = config["model"].get("interface_cvit", {}) or {}
         pino_cfg = config.get("training", {}).get("pino", {}) or {}
@@ -2500,6 +2549,641 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     return summary
 
 
+@torch.no_grad()
+def validate_forcing_ic_gnrmse(
+    model: ForcingICCViT,
+    data: dict[str, Any],
+    ids: np.ndarray,
+    sim_params: np.ndarray,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    a_ref: float,
+    t_ramp: float,
+    device: torch.device,
+    query_batch: int = 8,
+) -> dict[str, float]:
+    """Two-branch deviation-field gnRMSE for the varying-IC single-slab benchmark.
+
+    Identical amplitude-fair metric as :func:`validate_forcing_gnrmse`
+    (``gnrmse = rmse_K / sigma_global`` on the ``T - T_RIGHT`` deviation field),
+    but each held-out sim is reconstructed from BOTH its saved forcing image
+    (``build_forcing_image`` / ``reconstruct_qL``) and its saved initial-condition
+    field (snapshot 0), which the second encoder branch consumes. The latent is
+    encoded ONCE per sim chunk and decoded slice-by-slice over the saved time
+    grid (soft left wall -> no ``q_left`` term). Per-sim results are stratified by
+    forcing-amplitude tercile and by ``ic_family`` so a family the model cannot
+    fit stays visible rather than averaged away.
+    """
+    x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
+    y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    Nx, Ny, Nt = x_grid.numel(), y_grid.numel(), len(t_grid)
+
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+
+    ids = np.asarray(ids)
+    per_sim_rmse: list[float] = []
+    per_sim_amp: list[float] = []
+    per_sim_fam: list[str] = []
+    for start in range(0, len(ids), query_batch):
+        chunk = ids[start:start + query_batch]
+        params = [dict(sim_params[int(i)]) for i in chunk]
+        u_forcing = build_forcing_image(params, y_img, t_img, a_ref, device, t_ramp)
+        u_ic = build_ic_batch(data["trajectories"], chunk, mu, sigma, device)
+        B = u_forcing.shape[0]
+        latent = model.encode(u_forcing, u_ic)
+        coords = mesh.expand(B, -1, -1)
+        pred = torch.empty((B, Nt, Nx, Ny), device=device)
+        for k in range(Nt):
+            tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
+            out = model.decode(latent, coords, tk)
+            pred[:, k] = out[..., 0].view(B, Nx, Ny)
+        pred_K = pred * sigma + mu
+        truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)
+        truth_t = torch.from_numpy(truth).to(device)
+        se = ((pred_K - truth_t) ** 2).sum(dim=(1, 2, 3))  # (B,)
+        rmse = torch.sqrt(se / float(Nt * Nx * Ny)).detach().cpu().numpy()
+        for b, p in enumerate(params):
+            per_sim_rmse.append(float(rmse[b]))
+            forcing = reconstruct_qL(
+                p["temporal_family"], p["temporal_params"],
+                p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
+            )
+            per_sim_amp.append(
+                float(np.max(np.abs(forcing.evaluate_grid(y_img, t_img))))
+            )
+            per_sim_fam.append(str(p.get("ic_family", "")))
+
+    rmse_arr = np.asarray(per_sim_rmse, dtype=np.float64)
+    amp_arr = np.asarray(per_sim_amp, dtype=np.float64)
+    fam_arr = np.asarray(per_sim_fam)
+    gnrmse = rmse_arr / (float(sigma) + 1e-8)
+
+    out = {
+        "val_gnrmse": float(gnrmse.mean()),
+        "val_rmse_K": float(rmse_arr.mean()),
+    }
+    if len(amp_arr) >= 3:
+        q1, q2 = np.quantile(amp_arr, [1.0 / 3.0, 2.0 / 3.0])
+        strata = {
+            "amp_low": amp_arr <= q1,
+            "amp_mid": (amp_arr > q1) & (amp_arr <= q2),
+            "amp_high": amp_arr > q2,
+        }
+        for name, mask in strata.items():
+            out[f"gnrmse_{name}"] = (
+                float(gnrmse[mask].mean()) if mask.any() else float("nan")
+            )
+    for fam in np.unique(fam_arr):
+        out[f"gnrmse_fam_{fam}"] = float(gnrmse[fam_arr == fam].mean())
+    return out
+
+
+def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
+    """Physics-only training of a :class:`ForcingICCViT` on the single-slab
+    forcing benchmark with a VARYING initial condition.
+
+    This is the two-branch sibling of :func:`run_one_seed_forcing_pino`. It keeps
+    the successful forcing-image PINO recipe verbatim -- autodiff residuals on
+    free continuous collocation, a SOFT inhomogeneous left-wall Neumann residual,
+    the hard right-Dirichlet ansatz, and the online forcing sampler pinned to
+    ``sin``/``uniform`` -- and adds ONE thing: a second encoder branch over the
+    per-sim initial-condition field, anchored to the sampled IC instead of a
+    fixed 300 K field.
+
+    Each step encodes ONCE (``latent = model.encode(u_forcing, u_ic)``) and every
+    residual reuses that latent through a lightweight ``predict`` decode closure
+    (see :func:`pino_losses`). The forcing image is online-sampled (decoupled from
+    the IC's sim -- any ``(IC, forcing)`` pair defines a valid physics problem);
+    the IC field ``u_ic`` and the IC anchor targets are read from the saved TRAIN
+    trajectories' snapshot 0 (invisible in the forcing image, so they must come
+    from data). Validation reconstructs each held-out sim from its OWN saved
+    forcing AND saved IC (:func:`validate_forcing_ic_gnrmse`).
+    """
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = run_dir / "cvit_latest.pt"
+    best_path = run_dir / "cvit_best.pt"
+    final_path = run_dir / "cvit_final.pt"
+    complete_path = run_dir / "RUN_COMPLETE"
+
+    device = resolve_device(config["training"].get("device", "auto"))
+    data = load_diffusion_data(config)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    Nx, Ny = int(data["x_grid"].shape[0]), int(data["y_grid"].shape[0])
+    t_final = float(data["t_grid"][-1])
+    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
+    c_dom, d_dom = float(y_grid_np[0]), float(y_grid_np[-1])
+    train_ids = np.asarray(data["train_ids"])
+
+    # Saved FV forcing records are VALIDATION-only. sim_params.npy lives beside
+    # trajectories.npy (same directory the data generator writes to).
+    sp_path = Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy"
+    sim_params = np.load(str(sp_path), allow_pickle=True)
+
+    pino = config["training"]["pino"]
+    fcfg = pino.get("forcing", {}) or {}
+    extend_completed = bool(fcfg.get("extend_completed", False))
+    if complete_path.exists() and not extend_completed:
+        summary_path = run_dir / "final_metrics.json"
+        if summary_path.exists():
+            with open(summary_path) as f:
+                return json.load(f)
+        return {"seed": seed, "status": "complete", "run_dir": str(run_dir)}
+    resuming = latest_path.exists() and (not complete_path.exists() or extend_completed)
+    causal_cfg = _resolve_forcing_causal(pino.get("causal", {}))
+    warmup = _forcing_warmup_config(fcfg)
+    save_latest_every = max(1, int(fcfg.get("save_latest_every", 25)))
+    grad_clip_cfg = fcfg.get("grad_clip", None)
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    if grad_clip is not None and grad_clip <= 0.0:
+        raise ValueError("training.pino.forcing.grad_clip must be null or > 0")
+    a_ref = float(fcfg.get("a_ref") if fcfg.get("a_ref") is not None else A_AMP_REF)
+    ny_img = int(fcfg.get("ny_img") if fcfg.get("ny_img") is not None else Ny)
+    nt_img = int(fcfg.get("nt_img") if fcfg.get("nt_img") is not None else 128)
+    y_img = np.linspace(c_dom, d_dom, ny_img, dtype=np.float64)
+    t_img = np.linspace(0.0, t_final, nt_img, dtype=np.float64)
+
+    ramp_cfg = fcfg.get("ramp_seconds", None)
+    if ramp_cfg is not None:
+        t_ramp = float(ramp_cfg)
+    else:
+        t_ramp = load_ramp_seconds(config["data"]["t_grid_path"])
+        if t_ramp is None:
+            dt = load_solver_dt(config["data"]["t_grid_path"])
+            t_ramp = default_ramp_seconds(dt if dt is not None else t_final / 100.0)
+
+    temporal_window = dict(
+        t_on=float(fcfg.get("t_on", 0.0)),
+        t_off=float(fcfg.get("t_off", 0.2)),
+        phase=float(fcfg.get("phase", 0.0)),
+        tukey_alpha=float(fcfg.get("tukey_alpha", 0.5)),
+    )
+    tf_fix = fcfg.get("temporal_family")
+    sf_fix = fcfg.get("spatial_family")
+    dt_sample = (
+        float(fcfg["dt_sample"])
+        if fcfg.get("dt_sample") is not None
+        else t_final / max(nt_img - 1, 1)
+    )
+    sampler = str(fcfg.get("collocation") or "lhs")
+    coll_bias = _resolve_collocation_bias(pino)
+
+    model = build_cvit(
+        config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final,
+        variant="forcing_ic",
+    ).to(device)
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+
+    lam_r = float(pino["lambda_r"])
+    lam_ic = float(pino["lambda_ic"])
+    lam_bc = float(pino["lambda_bc"])
+    lam_bc_left_cfg = pino.get("lambda_bc_left", None)
+    lam_bc_left = None if lam_bc_left_cfg is None else float(lam_bc_left_cfg)
+    # The two-branch path is physics-only: the supervised interior-field data term
+    # calls the monolithic model(u, coords, t) signature and is incompatible with
+    # ForcingICCViT.forward(u_forcing, u_ic, coords, t). Guard rather than silently
+    # ignore a set lambda_data.
+    lam_data = float(pino.get("lambda_data", 0.0))
+    if lam_data > 0.0:
+        raise ValueError(
+            "lambda_data (supervised interior term) is not supported on the "
+            "two-branch forcing_ic path; keep it 0.0 (physics-only)."
+        )
+    n_r = int(pino["n_r"])
+    n_ic = int(pino["n_ic"])
+    n_bc = int(pino["n_bc"])
+    sim_batch = int(pino["sim_batch"])
+    alpha = float(pino.get("alpha", 1.0))
+    # IC anchor node budget: sample n_ic_points exact grid nodes per step (values
+    # gathered from the saved IC with no interpolation); coverage accumulates as
+    # the nodes resample across steps. Defaults to the physics-block knob, else
+    # the collocation n_ic.
+    physics_cfg = config["training"].get("physics", {}) or {}
+    n_ic_points = int(
+        physics_cfg.get("n_ic_points")
+        if physics_cfg.get("n_ic_points") is not None
+        else n_ic
+    )
+    # Right-wall Dirichlet baseline (300 K) for the hard ansatz. The IC anchor is
+    # the SAMPLED T0_tilde (per-sim), NOT this constant -- t_right_tilde only feeds
+    # the ic_loss="rel" denominator, unused on the "mse" path.
+    t_right_tilde = (T_RIGHT - mu) / (sigma + 1e-8)
+
+    if lam_bc_left is None:
+        gn_term_weights = {"r": lam_r, "ic": lam_ic, "bc": lam_bc}
+        gn_cos_pairs = None
+    else:
+        gn_term_weights = {
+            "r": lam_r, "ic": lam_ic, "bc_left": lam_bc_left, "bc_hom": lam_bc,
+        }
+        gn_cos_pairs = [("r", "bc_left"), ("ic", "bc_left"), ("bc_hom", "bc_left")]
+    gradnorm = build_gradnorm(config, term_weights=gn_term_weights)
+
+    epochs = int(config["training"]["epochs"])
+    validate_every = int(config["training"].get("validate_every", 10))
+
+    x_grid_t = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
+    y_grid_t = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(seed + 1_000_003)
+    rng = np.random.default_rng(seed)
+    # Separate stream for IC-sim selection so drawing training ICs does not perturb
+    # the forcing-parameter RNG sequence.
+    ic_rng = np.random.default_rng(seed + 7)
+
+    metrics_path = run_dir / "train_metrics.csv"
+    gn_cols = ["r", "ic", "bc_left", "bc_hom"]
+    causal_cols = range(causal_cfg["n_bins"])
+    fieldnames = [
+        "epoch", "completed_updates", "lr_first", "lr_last",
+        "loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left",
+        "loss_data",
+        "w_r", "w_ic", "w_bc", "w_bc_left", "w_data",
+        *[f"warm_mult_{c}" for c in gn_cols],
+        "r_pointwise_mse", "r_equal_bin_mean", "r_causal_loss",
+        "causal_reduction_ratio", "causal_eps", "causal_eps_next",
+        "causal_mean_weight", "causal_last_weight", "causal_log_last_weight",
+        "causal_adaptation_action",
+        *[f"causal_loss_bin_{i:02d}" for i in causal_cols],
+        *[f"causal_weight_bin_{i:02d}" for i in causal_cols],
+        *[f"causal_count_bin_{i:02d}" for i in causal_cols],
+        "val_gnrmse", "val_rmse_K",
+        "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
+        *[f"gn_mult_{c}" for c in gn_cols],
+        *[f"w_eff_{c}" for c in gn_cols],
+        *[f"grad_norm_{c}" for c in gn_cols],
+        *[f"grad_norm_eff_{c}" for c in gn_cols],
+        "gradnorm_mean_mult", "gradnorm_ms",
+        "gradnorm_weights", "grad_cosines", "gradnorm_bound_hits",
+    ]
+
+    start_epoch = 0
+    completed_updates = 0
+    last_csv_update = 0
+    best_val = float("inf")
+    causal_eps = float(causal_cfg["initial_eps"])
+    causal_updates = 0
+    causal_calibrated = False
+    coll = None
+    params_batch: list[dict] | None = None
+    ids_batch: np.ndarray | None = None
+
+    if resuming:
+        ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
+        saved_resume = ckpt.get("resume_config")
+        current_resume = _forcing_resume_config(config)
+        if saved_resume != current_resume:
+            raise ValueError(
+                "Incompatible diffusion_forcing resume configuration; use a fresh run directory."
+            )
+        saved_epochs = int(ckpt["config"]["training"]["epochs"])
+        if epochs < int(ckpt["next_epoch"]):
+            raise ValueError("training.epochs is below the checkpoint next_epoch")
+        if epochs != saved_epochs:
+            sched_type = str(config["training"]["scheduler"]["type"])
+            if sched_type not in {"PICViTExponential", "StepLR"}:
+                raise ValueError("Extending epochs requires a horizon-independent scheduler")
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        if gradnorm is not None:
+            if ckpt.get("gradnorm_state") is None:
+                raise ValueError("Resume checkpoint is missing GradNorm state")
+            gradnorm.load_state_dict(ckpt["gradnorm_state"])
+        start_epoch = int(ckpt["next_epoch"])
+        completed_updates = int(ckpt["completed_updates"])
+        last_csv_update = int(ckpt["last_csv_update"])
+        best_val = float(ckpt["best_val"])
+        causal_state = ckpt.get("causal_state") or {}
+        if causal_cfg["enabled"]:
+            if int(causal_state.get("n_bins", -1)) != causal_cfg["n_bins"]:
+                raise ValueError("Resume causal n_bins does not match the active configuration")
+            causal_eps = float(causal_state["eps"])
+            causal_updates = int(causal_state.get("updates", 0))
+            causal_calibrated = bool(causal_state.get("calibrated", False))
+        cache = ckpt.get("forcing_cache") or {}
+        params_batch = copy.deepcopy(cache.get("params_batch"))
+        coll = _unpack_tensors(cache.get("coll"), device) if cache.get("coll") else None
+        cached_ids = cache.get("ids_batch")
+        ids_batch = None if cached_ids is None else np.asarray(cached_ids)
+        _restore_forcing_rng(ckpt["rng_state"], rng, gen, eval_gen)
+        ic_rng_state = ckpt.get("ic_rng_state")
+        if ic_rng_state is not None:
+            ic_rng.bit_generator.state = ic_rng_state
+        _reconcile_forcing_metrics(metrics_path, fieldnames, last_csv_update)
+        if complete_path.exists():
+            complete_path.unlink()
+    else:
+        with open(metrics_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
+
+    print(
+        f"[pino-forcing-ic] seed={seed} device={device} epochs={epochs} "
+        f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} | "
+        f"img=({ny_img}x{nt_img}) a_ref={a_ref} t_ramp={t_ramp:.4g} "
+        f"sampler={sampler} coll_bias={coll_bias} | lambda_r={lam_r} lambda_ic={lam_ic} "
+        f"lambda_bc={lam_bc} lambda_bc_left={lam_bc_left} | "
+        f"n_r={n_r} n_ic={n_ic} n_ic_points={n_ic_points} n_bc={n_bc} "
+        f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} | "
+        f"n_train={len(train_ids)} | "
+        f"causal={causal_cfg} | warmup={warmup} grad_clip={grad_clip} "
+        f"save_latest_every={save_latest_every} resume={resuming}",
+        flush=True,
+    )
+
+    history: list[dict[str, float]] = []
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        warming = completed_updates < warmup["steps"]
+        do_val = (epoch % validate_every == 0) or (epoch == epochs - 1)
+        re = warmup["resample_every"] if warming else 1
+        # Online resampling: fresh forcing batch + fresh IC-sim batch + fresh
+        # collocation. During warm-up they are held for ``re`` steps.
+        if params_batch is None or ids_batch is None or (completed_updates % re == 0):
+            params_batch = sample_forcing_params(
+                rng, sim_batch, dt_sample, t_final,
+                c=c_dom, d=d_dom, temporal_window=temporal_window,
+                temporal_family=tf_fix, spatial_family=sf_fix,
+            )
+            ids_batch = ic_rng.choice(
+                train_ids, size=sim_batch,
+                replace=sim_batch > len(train_ids),
+            )
+            coll = sample_collocation(
+                n_r, n_ic_points, n_bc, t_final, x_grid_t, y_grid_t, device, gen,
+                sampler=sampler, bias=coll_bias,
+            )
+
+        u_forcing = build_forcing_image(params_batch, y_img, t_img, a_ref, device, t_ramp)
+        u_ic = build_ic_batch(data["trajectories"], ids_batch, mu, sigma, device)
+        B = u_forcing.shape[0]
+        # Per-sim IC anchor targets at the sampled grid nodes (exact, no interp).
+        ic_target = _ic_targets(
+            data["trajectories"], ids_batch,
+            coll["ic"]["ix"], coll["ic"]["iy"], mu, sigma, device,
+        )
+        _, yw_left, tw_left = coll["walls"]["left"]
+        left_qL = left_wall_qL(params_batch, yw_left, tw_left, device, t_ramp)
+
+        # Encode ONCE per step; every residual reuses this latent via the decode
+        # closure. The latent is NOT detached (gradients flow to both encoders).
+        latent = model.encode(u_forcing, u_ic)
+
+        def _predict(coords, t, q_left=None, _latent=latent):
+            return model.decode(_latent, coords, t)
+
+        optimizer.zero_grad(set_to_none=True)
+        causal_step_cfg = {**causal_cfg, "current_eps": causal_eps}
+        losses = pino_losses(
+            model, u_forcing, coll, ic_target, alpha,
+            causal_cfg=causal_step_cfg,
+            t_final=t_final, ic_loss="mse", t_right_tilde=t_right_tilde,
+            left_qL=left_qL, sigma=float(sigma), k_slab=K_SLAB,
+            predict=_predict,
+        )
+        warm_mult = {
+            "r": warmup["r_mult"] if warming else 1.0,
+            "ic": warmup["ic_mult"] if warming else 1.0,
+            "bc_left": warmup["bc_left_mult"] if warming else 1.0,
+            "bc_hom": warmup["bc_hom_mult"] if warming else 1.0,
+            "bc": warmup["bc_hom_mult"] if warming else 1.0,
+        }
+        if lam_bc_left is None:
+            w_bc = lam_bc
+            w_bc_left = lam_bc
+            sw = {"r": lam_r, "ic": lam_ic, "bc": lam_bc}
+        else:
+            w_bc = lam_bc
+            w_bc_left = lam_bc_left
+            sw = {"r": lam_r, "ic": lam_ic, "bc_hom": lam_bc, "bc_left": lam_bc_left}
+
+        gn_mults: dict[str, float] = {}
+        gradnorm_ms: float | str = ""
+        if gradnorm is not None:
+            active = {k: losses[k] for k in gradnorm.term_names if k in losses}
+            gn_params = [p for p in model.parameters() if p.requires_grad]
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+            gn_mults = gradnorm.maybe_update(active, gn_params, dist_info=None)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            gradnorm_ms = (time.perf_counter() - _t0) * 1000.0
+        grad_cosines: dict[str, float | None] | None = None
+        if do_val and gradnorm is not None:
+            grad_cosines = _term_grad_cosines(
+                {k: losses[k] for k in sw}, model.decoder.parameters(),
+                pairs=gn_cos_pairs,
+            )
+        w_eff = {
+            k: sw[k] * float(gn_mults.get(k, 1.0)) * warm_mult[k] for k in sw
+        }
+        loss = None
+        for k, wk in w_eff.items():
+            term = wk * losses[k]
+            loss = term if loss is None else loss + term
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(f"Non-finite forcing-ic PINO loss at epoch {epoch}")
+        loss.backward()
+        for parameter in model.parameters():
+            if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item()):
+                raise FloatingPointError(f"Non-finite forcing-ic PINO gradient at epoch {epoch}")
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        lr = float(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        completed_updates += 1
+
+        eps_used = causal_eps
+        causal_action = "off"
+        if causal_cfg["enabled"]:
+            populated = bool(losses["causal_populated"])
+            causal_eps, causal_action = _adapt_causal_eps(
+                causal_eps, losses["causal_weights"], causal_cfg, populated=populated,
+            )
+            if populated:
+                causal_updates += 1
+                if not causal_calibrated:
+                    calibration = {}
+                    bin_losses = losses["causal_bin_losses"]
+                    for candidate in (1e-4, 1e-3, 1e-2, 1e-1, 1.0):
+                        cw = _causal_weights(bin_losses, candidate)
+                        calibration[str(candidate)] = {
+                            "mean": float(cw.mean().item()), "last": float(cw[-1].item()),
+                        }
+                    print(f"  causal epsilon calibration: {json.dumps(calibration)}", flush=True)
+                    causal_calibrated = True
+
+        row: dict[str, Any] = {
+            "epoch": epoch,
+            "completed_updates": completed_updates,
+            "lr_first": lr,
+            "lr_last": lr,
+            "loss": float(loss.detach().cpu()),
+            "loss_r": float(losses["r"].detach().cpu()),
+            "loss_ic": float(losses["ic"].detach().cpu()),
+            "loss_bc": float(losses["bc"].detach().cpu()),
+            "loss_bc_left": float(losses["bc_left"].detach().cpu()),
+            "loss_data": "",
+            "w_r": lam_r * warm_mult["r"],
+            "w_ic": lam_ic * warm_mult["ic"],
+            "w_bc": w_bc * warm_mult["bc_hom"],
+            "w_bc_left": w_bc_left * warm_mult["bc_left"],
+            "w_data": 0.0,
+            "val_gnrmse": "", "val_rmse_K": "",
+            "gnrmse_amp_low": "", "gnrmse_amp_mid": "", "gnrmse_amp_high": "",
+        }
+        for key in gn_cols:
+            row[f"warm_mult_{key}"] = warm_mult[key]
+        row["r_pointwise_mse"] = float(losses["r_pointwise_mse"].cpu())
+        if causal_cfg["enabled"]:
+            bins = losses["causal_bin_losses"].cpu()
+            weights = losses["causal_weights"].cpu()
+            counts = losses["causal_bin_counts"].cpu()
+            row.update({
+                "r_equal_bin_mean": float(losses["r_equal_bin_mean"].cpu()),
+                "r_causal_loss": float(losses["r_causal_loss"].cpu()),
+                "causal_reduction_ratio": float(losses["causal_reduction_ratio"].cpu()),
+                "causal_eps": eps_used,
+                "causal_eps_next": causal_eps,
+                "causal_mean_weight": float(weights.mean()),
+                "causal_last_weight": float(weights[-1]),
+                "causal_log_last_weight": -eps_used * float(bins[:-1].sum()),
+                "causal_adaptation_action": causal_action,
+            })
+            for i in causal_cols:
+                row[f"causal_loss_bin_{i:02d}"] = float(bins[i])
+                row[f"causal_weight_bin_{i:02d}"] = float(weights[i])
+                row[f"causal_count_bin_{i:02d}"] = float(counts[i])
+        print(
+            f"Epoch {epoch}: loss={row['loss']:.6f} "
+            f"(r={row['loss_r']:.6f}, ic={row['loss_ic']:.6f}, "
+            f"bc={row['loss_bc']:.6f}, bc_left={row['loss_bc_left']:.6f}) "
+            f"lr={lr:.2e}" + ("  [warmup]" if warming else ""),
+            flush=True,
+        )
+
+        if do_val:
+            model.eval()
+            val = validate_forcing_ic_gnrmse(
+                model, data, data["val_ids"], sim_params,
+                y_img, t_img, a_ref, t_ramp, device,
+            )
+            row["val_gnrmse"] = val["val_gnrmse"]
+            row["val_rmse_K"] = val["val_rmse_K"]
+            for c in ("gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high"):
+                row[c] = val.get(c, "")
+            if gradnorm is not None:
+                raw_norms = gradnorm.last_raw_norms
+                for k in sw:
+                    m = float(gn_mults.get(k, 1.0))
+                    row[f"gn_mult_{k}"] = m
+                    row[f"w_eff_{k}"] = w_eff[k]
+                    g_raw = raw_norms.get(k)
+                    if g_raw is not None:
+                        row[f"grad_norm_{k}"] = g_raw
+                        row[f"grad_norm_eff_{k}"] = w_eff[k] * g_raw
+                row["gradnorm_mean_mult"] = gradnorm.last_mean_multiplier
+                row["gradnorm_ms"] = gradnorm_ms
+                row["gradnorm_weights"] = json.dumps(
+                    {k: float(v) for k, v in gn_mults.items()}
+                )
+                row["gradnorm_bound_hits"] = json.dumps(gradnorm.bound_hit_counts)
+                if grad_cosines is not None:
+                    row["grad_cosines"] = json.dumps(grad_cosines)
+            is_best = val["val_gnrmse"] < best_val
+            if is_best:
+                best_val = val["val_gnrmse"]
+            fam_txt = " ".join(
+                f"{k.split('gnrmse_fam_')[1]}={v * 100:.2f}%"
+                for k, v in val.items() if k.startswith("gnrmse_fam_")
+            )
+            print(
+                f"Validation for epoch {epoch}: "
+                f"val_gnrmse={val['val_gnrmse'] * 100:.4f}% "
+                f"val_rmse_K={val['val_rmse_K']:.4f}K (best={best_val * 100:.4f}%)"
+                + ("  [new best -> cvit_best.pt]" if is_best else ""),
+                flush=True,
+            )
+            print(
+                f"  gnrmse[amp low/mid/high]="
+                f"{val.get('gnrmse_amp_low', float('nan')) * 100:.2f}/"
+                f"{val.get('gnrmse_amp_mid', float('nan')) * 100:.2f}/"
+                f"{val.get('gnrmse_amp_high', float('nan')) * 100:.2f}%  "
+                f"fam[{fam_txt}]",
+                flush=True,
+            )
+        else:
+            is_best = False
+
+        history.append({k: (v if v != "" else None) for k, v in row.items()})
+        with open(metrics_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+        last_csv_update = completed_updates
+
+        def checkpoint_payload() -> dict[str, Any]:
+            return {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "mu_global": mu, "sigma_global": sigma,
+                "config": config, "resume_config": _forcing_resume_config(config),
+                "epoch": epoch, "next_epoch": epoch + 1,
+                "completed_updates": completed_updates,
+                "last_csv_update": last_csv_update, "best_val": best_val,
+                "gradnorm_state": gradnorm.state_dict() if gradnorm is not None else None,
+                "causal_state": {
+                    "eps": causal_eps, "n_bins": causal_cfg["n_bins"],
+                    "updates": causal_updates, "calibrated": causal_calibrated,
+                } if causal_cfg["enabled"] else None,
+                "rng_state": _capture_forcing_rng(rng, gen, eval_gen),
+                "ic_rng_state": ic_rng.bit_generator.state,
+                "forcing_cache": {
+                    "params_batch": copy.deepcopy(params_batch),
+                    "ids_batch": None if ids_batch is None else np.asarray(ids_batch).tolist(),
+                    "coll": _pack_tensors(coll),
+                },
+                "forcing_image": {
+                    "ny_img": ny_img, "nt_img": nt_img, "a_ref": a_ref,
+                    "t_ramp": t_ramp, "c_dom": c_dom, "d_dom": d_dom,
+                    "t_final": t_final,
+                },
+            }
+
+        payload = checkpoint_payload()
+        if do_val and is_best:
+            _atomic_torch_save(payload, best_path)
+        if completed_updates % save_latest_every == 0 or epoch == epochs - 1:
+            checkpoint_start = time.perf_counter()
+            _atomic_torch_save(payload, latest_path)
+            checkpoint_ms = (time.perf_counter() - checkpoint_start) * 1000.0
+            checkpoint_mb = latest_path.stat().st_size / (1024.0 ** 2)
+            print(
+                f"  latest checkpoint: {checkpoint_ms:.1f} ms, {checkpoint_mb:.1f} MiB",
+                flush=True,
+            )
+
+    summary = {"seed": seed, "best_val_gnrmse": best_val, "epochs": epochs}
+    final_payload = torch.load(latest_path, map_location="cpu", weights_only=False)
+    _atomic_torch_save(final_payload, final_path)
+    _atomic_text(json.dumps(summary, indent=2) + "\n", run_dir / "final_metrics.json")
+    _atomic_text("complete\n", complete_path)
+    return summary
+
+
 # ---- Physics-only (PINO) training of an InterfaceCViT on `interfaces` ---------
 #
 # The interfaces benchmark carries two materials (k_left=2, k_right=1) split by a
@@ -3367,14 +4051,29 @@ def run_config_seeds_pino(
 ) -> dict[str, Any]:
     base_run_dir = Path(base_run_dir)
     # Dispatch on the benchmark: the interfaces benchmark trains an InterfaceCViT
-    # physics-only with the FV Crank-Nicolson interface residual; the single-slab
-    # forcing benchmark trains a ForcingCViT on an online-sampled forcing image;
-    # every other benchmark uses the IC-conditioned diffusion CViT path.
+    # physics-only with the FV Crank-Nicolson interface residual; the constant-IC
+    # forcing benchmark (diffusion_forcing) trains a ForcingCViT on an
+    # online-sampled forcing image; the varying-IC single-slab benchmark
+    # (diffusion_forcing_single) trains a two-branch ForcingICCViT that also
+    # encodes the sampled IC field; every other benchmark uses the IC-conditioned
+    # diffusion CViT path.
     bench = str(config.get("benchmark", {}).get("name", "diffusion"))
+    if bench == "diffusion_forcing_single":
+        # The runner hardcodes variant="forcing_ic"; an old ForcingCViT config
+        # (variant "forcing") routed here would silently ignore the varying IC.
+        # Refuse any explicitly declared variant that is not "forcing_ic".
+        declared = (config.get("training", {}).get("pino", {}) or {}).get("variant")
+        if declared is not None and str(declared) != "forcing_ic":
+            raise ValueError(
+                "benchmark=diffusion_forcing_single trains a two-branch "
+                "ForcingICCViT (varying IC); training.pino.variant must be "
+                f"'forcing_ic' but the config declares {declared!r}. An old "
+                "ForcingCViT ('forcing') config would ignore the sampled IC."
+            )
     runner = (
         run_one_seed_interfaces_pino if bench == "interfaces"
-        else run_one_seed_forcing_pino
-        if bench in ("diffusion_forcing", "diffusion_forcing_single")
+        else run_one_seed_forcing_ic_pino if bench == "diffusion_forcing_single"
+        else run_one_seed_forcing_pino if bench == "diffusion_forcing"
         else run_one_seed_pino
     )
     results = {}
@@ -3401,10 +4100,12 @@ __all__ = [
     "build_gradnorm",
     "validate_rel_l2",
     "validate_forcing_gnrmse",
+    "validate_forcing_ic_gnrmse",
     "build_cvit",
     "load_interface_cvit_checkpoint",
     "run_one_seed_pino",
     "run_one_seed_forcing_pino",
+    "run_one_seed_forcing_ic_pino",
     "run_one_seed_interfaces_pino",
     "run_config_seeds_pino",
 ]

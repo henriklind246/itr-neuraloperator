@@ -783,3 +783,218 @@ class InterfaceCViT(nn.Module):
     ) -> torch.Tensor:
         """Single-shot ``encode`` + ``decode`` (chunked callers use them directly)."""
         return self.decode(self.encode(u_spatial, forcing_image, params), coords, t)
+
+
+class ForcingICCViT(nn.Module):
+    """Two-branch token-fusion CViT for ``diffusion_forcing_single`` with a
+    varying initial condition.
+
+    The single-slab forcing benchmark encodes the boundary flux as a space-time
+    image ``q_L(y, t)/a_ref`` (:class:`ForcingCViT`). When the IC stops being a
+    fixed uniform 300 K field it becomes per-sim information the forcing image
+    cannot carry, so a **second encoder branch** ingests the initial temperature
+    field and the two token streams are fused for the shared decoder — exactly
+    the multimodal recipe of :class:`InterfaceCViT`, minus the interface/param
+    stream.
+
+    Streams (each -> ``emb_dim``-wide tokens, plus a learned 2-way modality
+    embedding so the decoder can tell them apart):
+      1. forcing ``z_f``: :class:`CViTEncoder` over the boundary space-time image
+         ``(B, 1, Ny_img, Nt_img)`` (axes rows=y-nodes, cols=time). Reuse the
+         successful :class:`ForcingCViT` image config verbatim.
+      2. ic ``z_ic``: independent :class:`CViTEncoder` over the normalized
+         initial field ``T0_tilde = (T0 - T_right)/sigma_global`` on the data
+         grid ``(B, 1, Nx, Ny)``.
+
+    ``encode(u_forcing, u_ic)`` builds the query-independent latent (run once per
+    sim, reuse for every decode); ``decode(latent, coords, t)`` is the pure
+    coordinate+time query. The hard right-Dirichlet ansatz
+    ``T = t_right_tilde + (1 - x) * raw`` keeps the x=1 wall exact; the left-wall
+    Neumann stays **soft** (enforced by the PINO residual), so ``decode`` takes
+    no ``q_left`` (matching :meth:`InterfaceCViT.decode`).
+
+    The decoder output, the IC encoder input, and the IC loss target must all
+    live in the SAME normalized space (frozen ``sigma_global``); this module does
+    not normalize — callers pass ``T0_tilde`` already scaled.
+    """
+
+    def __init__(
+        self,
+        forcing_in_ch: int = 1,
+        ic_in_ch: int = 1,
+        out_dim: int = 1,
+        emb_dim: int = 256,
+        dec_emb_dim: int | None = None,
+        ic_patch_size: int = 10,
+        ic_grid_size: tuple[int, int] = (100, 100),
+        forcing_patch_size: int = 8,
+        forcing_grid_size: tuple[int, int] = (96, 256),
+        depth_enc: int = 4,
+        depth_dec: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+        fourier_freq: float = 1.0,
+        fourier_freq_t: float | None = None,
+        activation: str = "gelu",
+        hard_right_dirichlet: bool = True,
+        t_right_tilde: float = 0.0,
+        t_final: float = 1.0,
+    ):
+        super().__init__()
+        dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
+        self.hard_right_dirichlet = bool(hard_right_dirichlet)
+        if int(forcing_in_ch) != 1:
+            raise ValueError(
+                "ForcingICCViT requires exactly one forcing-image channel "
+                f"q_L(y,t)/a_ref; got forcing_in_ch={forcing_in_ch}."
+            )
+        forcing_grid_size = tuple(int(v) for v in forcing_grid_size)
+        forcing_patch_size = int(forcing_patch_size)
+        if len(forcing_grid_size) != 2 or forcing_patch_size <= 0 or any(
+            v <= 0 for v in forcing_grid_size
+        ):
+            raise ValueError(
+                "forcing_grid_size must contain two positive dimensions and "
+                f"forcing_patch_size must be positive; got {forcing_grid_size} "
+                f"and {forcing_patch_size}."
+            )
+        if any(v % forcing_patch_size != 0 for v in forcing_grid_size):
+            raise ValueError(
+                "forcing_grid_size dimensions must be divisible by "
+                f"forcing_patch_size; got {forcing_grid_size} and {forcing_patch_size}."
+            )
+        # IC branch runs on the data grid (Nx, Ny). PatchEmbed2d is scalar and
+        # drops a border strip on non-divisible grids, so require an exact tiling
+        # (the intended config values on the 100x100 grid are ic_patch_size in
+        # {10, 20}).
+        ic_grid_size = tuple(int(v) for v in ic_grid_size)
+        ic_patch_size = int(ic_patch_size)
+        if len(ic_grid_size) != 2 or ic_patch_size <= 0 or any(
+            v <= 0 for v in ic_grid_size
+        ):
+            raise ValueError(
+                "ic_grid_size must contain two positive dimensions and "
+                f"ic_patch_size must be positive; got {ic_grid_size} and "
+                f"{ic_patch_size}."
+            )
+        if ic_grid_size[0] % ic_patch_size != 0 or ic_grid_size[1] % ic_patch_size != 0:
+            raise ValueError(
+                "ic_grid_size dimensions (Nx, Ny) must both be divisible by "
+                f"ic_patch_size; got {ic_grid_size} and {ic_patch_size}."
+            )
+        self.forcing_grid_size = forcing_grid_size
+        self.forcing_patch_size = forcing_patch_size
+        self.ic_grid_size = ic_grid_size
+        self.ic_patch_size = ic_patch_size
+        self.num_forcing_tokens = (
+            forcing_grid_size[0] // forcing_patch_size
+        ) * (forcing_grid_size[1] // forcing_patch_size)
+        self.num_ic_tokens = (
+            ic_grid_size[0] // ic_patch_size
+        ) * (ic_grid_size[1] // ic_patch_size)
+        self.forcing_encoder = CViTEncoder(
+            in_ch=int(forcing_in_ch),
+            emb_dim=emb_dim,
+            patch_size=forcing_patch_size,
+            grid_size=forcing_grid_size,
+            depth=depth_enc,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            activation=activation,
+        )
+        self.ic_encoder = CViTEncoder(
+            in_ch=int(ic_in_ch),
+            emb_dim=emb_dim,
+            patch_size=ic_patch_size,
+            grid_size=ic_grid_size,
+            depth=depth_enc,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            activation=activation,
+        )
+        # Learned 2-way modality embedding (forcing / ic) added per token before
+        # the streams are concatenated along the token dim — the same scheme as
+        # InterfaceCViT.encode, so the decoder cross-attention can distinguish
+        # the heterogeneous sources.
+        self.modality = nn.Parameter(torch.randn(2, emb_dim) * 0.02)
+        self.decoder = CViTDecoder(
+            enc_emb_dim=emb_dim,
+            dec_emb_dim=dec_emb_dim,
+            out_dim=out_dim,
+            depth=depth_dec,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            fourier_freq=fourier_freq,
+            fourier_freq_t=fourier_freq_t,
+            activation=activation,
+        )
+        self.register_buffer(
+            "t_right_tilde", torch.tensor(float(t_right_tilde), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "t_norm", torch.tensor(float(t_final), dtype=torch.float32)
+        )
+
+    def encode(
+        self, u_forcing: torch.Tensor, u_ic: torch.Tensor
+    ) -> torch.Tensor:
+        """Build the cached latent token set; ``(B, N_f + N_ic, emb_dim)``.
+
+        u_forcing:(B, 1, Ny_img, Nt_img) boundary space-time image;
+        u_ic:(B, 1, Nx, Ny) normalized initial field ``T0_tilde``.
+        Query-independent, so run once per sim and reuse for every decode.
+        """
+        if tuple(u_forcing.shape[1:]) != (1, *self.forcing_grid_size):
+            raise ValueError(
+                "u_forcing must have shape (B, 1, Ny_img, Nt_img) with "
+                f"(Ny_img, Nt_img)={self.forcing_grid_size}; got "
+                f"{tuple(u_forcing.shape)}."
+            )
+        if tuple(u_ic.shape[1:]) != (1, *self.ic_grid_size):
+            raise ValueError(
+                "u_ic must have shape (B, 1, Nx, Ny) with "
+                f"(Nx, Ny)={self.ic_grid_size}; got {tuple(u_ic.shape)}."
+            )
+        z_f = self.forcing_encoder(u_forcing) + self.modality[0]
+        if z_f.shape[1] != self.num_forcing_tokens:
+            raise RuntimeError(
+                f"Expected {self.num_forcing_tokens} forcing tokens, got {z_f.shape[1]}."
+            )
+        z_ic = self.ic_encoder(u_ic) + self.modality[1]
+        if z_ic.shape[1] != self.num_ic_tokens:
+            raise RuntimeError(
+                f"Expected {self.num_ic_tokens} IC tokens, got {z_ic.shape[1]}."
+            )
+        return torch.cat([z_f, z_ic], dim=1)
+
+    def decode(
+        self, latent: torch.Tensor, coords: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        """Pure coordinate+time query against a cached latent; ``(B, Nq, out_dim)``.
+
+        No static conditioning enters here, so the same latent serves every query
+        batch. Shared ``(1, Nq, .)`` coordinate/time sets are expanded to the sim
+        minibatch (torch attention does not broadcast batch dims). The left wall
+        stays soft (no ``q_left`` lifting); only the hard right-Dirichlet ansatz
+        is applied.
+        """
+        B = latent.shape[0]
+        if coords.shape[0] == 1 and B > 1:
+            coords = coords.expand(B, -1, -1)
+        if t.shape[0] == 1 and B > 1:
+            t = t.expand(B, -1, -1)
+        raw = self.decoder(latent, coords, t / self.t_norm)
+        if not self.hard_right_dirichlet:
+            return raw
+        x = coords[..., 0:1]
+        return self.t_right_tilde + (1.0 - x) * raw
+
+    def forward(
+        self,
+        u_forcing: torch.Tensor,
+        u_ic: torch.Tensor,
+        coords: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-shot ``encode`` + ``decode`` (chunked callers use them directly)."""
+        return self.decode(self.encode(u_forcing, u_ic), coords, t)

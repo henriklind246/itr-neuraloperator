@@ -1,17 +1,22 @@
 # @package _global_
 # Single-slab, forcing-driven diffusion benchmark restricted to the sin/uniform
-# forcing family. Identical physics to diffusion_forcing (one homogeneous slab
-# k = rho = cp = 1 so alpha = 1, fixed uniform 300 K initial condition, right
+# forcing family, with a VARYING initial condition. Identical physics to
+# diffusion_forcing (one homogeneous slab k = rho = cp = 1 so alpha = 1, right
 # Dirichlet wall at 300 K, adiabatic top/bottom, inhomogeneous left-wall Neumann
-# flux q_L(y, t) = a(t) * s(y)), but the forcing family is locked to the sin
+# flux q_L(y, t) = a(t) * s(y)), and the forcing family stays locked to the sin
 # temporal profile and uniform spatial profile so only the sinusoid amplitude and
-# frequency vary per simulation (matching the interfaces benchmark's forcing
-# setup, without the interface). Only the temporal_encoder representation is
-# supported.
+# frequency vary per simulation. The ONE change from the constant-IC probe: the
+# initial condition is sampled per sim across all four IC families (uniform_2d,
+# random_sinusoid_2d, grf_2d, hot_spot_2d) instead of a fixed uniform 300 K field.
 #
-# This is a capability/isolation probe for the ForcingCViT image/PINO path: the
-# saved FV validation set is single-family (pinned by the spec schema), and the
-# online training sampler is pinned to sin/uniform via training.pino.forcing.
+# A varying IC is invisible in the forcing image, so the surrogate is a two-branch
+# ForcingICCViT (variant forcing_ic): one encoder over the forcing space-time
+# image, a second over the per-sim IC field, fused in the decoder cross-attention.
+# Trained physics-only (PINO) with autodiff residuals on free continuous
+# collocation, a SOFT inhomogeneous left-wall Neumann residual, and the IC anchor
+# targeting the SAMPLED T0 (not a constant 300 K). The saved FV validation set is
+# single-family (sin/uniform) with varying ICs; the online training sampler is
+# pinned to sin/uniform via training.pino.forcing.
 
 benchmark:
   name: diffusion_forcing_single
@@ -30,12 +35,22 @@ training:
     per_sample_interface_x: false
   physics:
     mode: collocation
-    # Train the collocation sampler on training sims so val_rel_l2 stays honest.
+    # Train the collocation sampler on training sims so val stays honest.
     collocation_source: train
-    # OFF by default so a data-only smoke run stays pure data. Set =1.0 on the CLI
-    # for any physics/anchor run to anchor the fixed 300 K IC.
-    lambda_ic: 0.0
+    # Anchor the sampled (now varying) IC. The forcing_ic runner reads the IC
+    # anchor weight from training.pino.lambda_ic (default 1.0); this mirrors the
+    # intent for the non-forcing collocation path and documents that the IC is
+    # anchored, not free.
+    lambda_ic: 1.0
+    # IC anchor node budget: sample this many EXACT IC grid nodes per step (values
+    # gathered from the saved T0 with no interpolation); coverage accumulates as
+    # the nodes resample across steps. Read only by run_one_seed_forcing_ic_pino.
+    n_ic_points: 1024
   pino:
+    # The two-branch ForcingICCViT is the only compatible surrogate; the dispatch
+    # asserts this so an old ForcingCViT ("forcing") config cannot silently ignore
+    # the varying IC.
+    variant: forcing_ic
     forcing:
       # Lock the online training sampler to the single sin/uniform family so it
       # matches the pinned single-family FV validation set.

@@ -31,11 +31,17 @@ from src.operators.train_pino import (
     _ic_loss,
     _resolve_forcing_causal,
     _time_bin_index,
+    build_cvit,
+    build_forcing_image,
+    build_ic_batch,
+    load_diffusion_data,
     load_interface_cvit_checkpoint,
+    run_one_seed_forcing_ic_pino,
     run_one_seed_forcing_pino,
     run_one_seed_interfaces_pino,
     run_one_seed_pino,
     sample_forcing_params,
+    validate_forcing_ic_gnrmse,
 )
 
 
@@ -1016,3 +1022,283 @@ def test_e2e_forcing_nonfinite_loss_does_not_commit(tmp_path, monkeypatch):
     assert not (run_dir / "cvit_latest.pt").exists()
     assert not (run_dir / "RUN_COMPLETE").exists()
     assert _rows(run_dir) == []
+
+
+# ----------------------------------------------------------------------------
+# Two-branch varying-IC single-slab benchmark (diffusion_forcing_single):
+# run_one_seed_forcing_ic_pino end-to-end.
+# ----------------------------------------------------------------------------
+
+_IC_FAMILIES = ("uniform_2d", "random_sinusoid_2d", "grf_2d", "hot_spot_2d")
+
+
+def _write_synthetic_forcing_ic(tmp_path, num_sims=24, Nt=6, Nx=20, Ny=20):
+    """Synthetic varying-IC single-slab dataset for the two-branch runner.
+
+    Physics-only training online-samples the forcing; the saved trajectories +
+    ``sim_params.npy`` (sin/uniform forcing plus a per-sim ``ic_family``) are
+    VALIDATION-only and also supply the per-sim IC field (snapshot 0) that the
+    second encoder branch consumes. ``meta.npy`` carries the ``problem_version``
+    the load-time guard asserts. Snapshot 0 is made sim-specific (a distinct
+    low-frequency field per sim) so IC-shuffling produces a real difference.
+    """
+    rng = np.random.default_rng(0)
+    x_grid = np.linspace(0.0, 1.0, Nx).astype(np.float32)
+    y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
+    t_grid = np.linspace(0.0, 0.3, Nt).astype(np.float32)
+    gx, gy = np.meshgrid(x_grid, y_grid, indexing="ij")
+
+    traj = np.empty((num_sims, Nt, Nx, Ny), dtype=np.float32)
+    for s in range(num_sims):
+        # Distinct smooth IC per sim: right wall pinned to 300 K (x=1), varying
+        # low-frequency structure toward the left so shuffling ICs is observable.
+        phase = 0.3 * s
+        ic = 300.0 + (1.0 - gx) * (
+            6.0 * np.sin(2.0 * np.pi * gy + phase) + 3.0 * np.cos(np.pi * gx + phase)
+        )
+        traj[s, 0] = ic.astype(np.float32)
+        for k in range(1, Nt):
+            traj[s, k] = (ic + 2.0 * rng.standard_normal((Nx, Ny))).astype(np.float32)
+
+    records = sample_forcing_params(
+        rng, num_sims, dt=0.3 / (Nt - 1), t_final=0.3,
+        temporal_family="sin", spatial_family="uniform",
+    )
+    for i, r in enumerate(records):
+        r["ic_family"] = _IC_FAMILIES[i % len(_IC_FAMILIES)]
+    sim_params = np.array(records, dtype=object)
+
+    meta = {
+        "problem_version": "forcing_single_varying_ic_v1",
+        "ic_mode": "varying",
+        "ic_families": list(_IC_FAMILIES),
+    }
+
+    np.save(tmp_path / "trajectories.npy", traj)
+    np.save(tmp_path / "x_grid.npy", x_grid)
+    np.save(tmp_path / "y_grid.npy", y_grid)
+    np.save(tmp_path / "t_grid.npy", t_grid)
+    np.save(tmp_path / "sim_params.npy", sim_params)
+    np.save(tmp_path / "meta.npy", np.array(meta, dtype=object), allow_pickle=True)
+    return traj, sim_params
+
+
+def _forcing_ic_config(tmp_path):
+    # IC data grid = (Nx=20, Ny=20); ic_patch_size=10 divides both (2x2 tokens).
+    # Forcing image grid = (ny_img=16, nt_img=20); forcing_patch_size=4 divides
+    # both (4x5 tokens) and is DECOUPLED from the IC data grid.
+    return {
+        "benchmark": {"name": "diffusion_forcing_single"},
+        "data": {
+            "trajectories.npy": str(tmp_path / "trajectories.npy"),
+            "x_grid_path": str(tmp_path / "x_grid.npy"),
+            "y_grid_path": str(tmp_path / "y_grid.npy"),
+            "t_grid_path": str(tmp_path / "t_grid.npy"),
+        },
+        "model": {
+            "cvit": {
+                "out_dim": 1,
+                "emb_dim": 32,
+                "dec_emb_dim": None,
+                "depth_enc": 1,
+                "depth_dec": 1,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+                "fourier_freq": 1.0,
+                "activation": "gelu",
+                "hard_right_dirichlet": True,
+                "hard_right_dirichlet_t_right": 300.0,
+            },
+            "forcing_ic_cvit": {
+                "forcing_in_ch": 1,
+                "ic_in_ch": 1,
+                "forcing_patch_size": 4,
+                "ic_patch_size": 10,
+            },
+        },
+        "training": {
+            "device": "cpu",
+            "epochs": 2,
+            "validate_every": 1,
+            "learning_rate": 5.0e-4,
+            "weight_decay": 1e-5,
+            "optimizer": "SOAP",
+            "soap": {
+                "betas": [0.95, 0.95],
+                "shampoo_beta": 0.95,
+                "eps": 1.0e-8,
+                "precondition_frequency": 3,
+                "max_precond_dim": 10000,
+                "merge_dims": False,
+                "precondition_1d": False,
+            },
+            "scheduler": {
+                "type": "PICViTExponential",
+                "decay_every": 500,
+                "decay_rate": 0.95,
+                "min_lr": 1.0e-5,
+            },
+            "physics": {"n_ic_points": 32},
+            "pino": {
+                "variant": "forcing_ic",
+                "lambda_r": 1.0,
+                "lambda_ic": 1.0,
+                "lambda_bc": 1.0,
+                "lambda_bc_left": 6.0,
+                "n_r": 64,
+                "n_ic": 32,
+                "n_bc": 16,
+                "sim_batch": 4,
+                "alpha": 1.0,
+                "forcing": {
+                    "ny_img": 16,
+                    "nt_img": 20,
+                    "ramp_seconds": 0.003,
+                    "temporal_family": "sin",
+                    "spatial_family": "uniform",
+                },
+            },
+        },
+    }
+
+
+def test_e2e_forcing_ic_smoke_finite(tmp_path):
+    # Phase C gate: one two-branch runner completes with finite losses + a finite
+    # validation gnRMSE, and the checkpoint bakes the frozen normalization.
+    _write_synthetic_forcing_ic(tmp_path)
+    cfg = _forcing_ic_config(tmp_path)
+    cfg["training"]["gradnorm"] = {
+        "enabled": True, "alpha_w": 0.5, "update_every": 1, "eps": 1e-8,
+        "w_min": 0.1, "w_max": 5.0, "floor": {"bc_left": 0.25},
+    }
+    run_dir = tmp_path / "run_forcing_ic"
+
+    run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=run_dir)
+
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+    for r in rows:
+        for col in ("loss", "loss_r", "loss_ic", "loss_bc", "loss_bc_left"):
+            assert math.isfinite(float(r[col]))
+        # The supervised interior-field term is unused on the two-branch path.
+        assert r["loss_data"] in ("", None)
+        # validate_every=1 -> validation on every epoch.
+        assert math.isfinite(float(r["val_gnrmse"]))
+        assert math.isfinite(float(r["val_rmse_K"]))
+        # GradNorm multipliers finite/positive for every split term.
+        for c in ("r", "ic", "bc_left", "bc_hom"):
+            assert math.isfinite(float(r[f"gn_mult_{c}"]))
+            assert float(r[f"gn_mult_{c}"]) > 0.0
+
+    assert (run_dir / "RUN_COMPLETE").exists()
+    ckpt = torch.load(run_dir / "cvit_best.pt", map_location="cpu", weights_only=False)
+    assert math.isfinite(float(ckpt["mu_global"]))
+    assert float(ckpt["sigma_global"]) > 0.0
+    # The two-branch runner carries its own IC-sim RNG state for reproducible resume.
+    assert ckpt.get("ic_rng_state") is not None
+
+
+def test_e2e_forcing_ic_stale_dataset_guard(tmp_path):
+    # In-place editing keeps the benchmark name + tensor shapes identical to the
+    # old fixed-IC set, so a missing meta.npy must be rejected as stale data
+    # rather than silently training on a constant IC.
+    _write_synthetic_forcing_ic(tmp_path)
+    (tmp_path / "meta.npy").unlink()
+    cfg = _forcing_ic_config(tmp_path)
+    with pytest.raises(ValueError, match="problem_version"):
+        run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=tmp_path / "stale")
+
+
+def _reconstruct_ic_paired(model, data, sim_params, forcing_ids, ic_ids):
+    """Full-grid trajectory decode pairing each sim's forcing with a chosen IC.
+
+    Mirrors :func:`validate_forcing_ic_gnrmse`'s decode loop but lets the IC feed
+    come from ``ic_ids`` (possibly a permutation of ``forcing_ids``) so an
+    IC-shuffle changes only the second encoder branch. Returns ``(B, Nt, Nx, Ny)``
+    in Kelvin.
+    """
+    device = torch.device("cpu")
+    x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32)
+    y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32)
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    Nx, Ny, Nt = x_grid.numel(), y_grid.numel(), len(t_grid)
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+
+    params = [dict(sim_params[int(i)]) for i in forcing_ids]
+    y_img = np.linspace(float(data["y_grid"][0]), float(data["y_grid"][-1]), 16)
+    t_img = np.linspace(0.0, float(t_grid[-1]), 20)
+    u_forcing = build_forcing_image(params, y_img, t_img, 300.0, device, 0.003)
+    u_ic = build_ic_batch(data["trajectories"], np.asarray(ic_ids), mu, sigma, device)
+    B = u_forcing.shape[0]
+    latent = model.encode(u_forcing, u_ic)
+    coords = mesh.expand(B, -1, -1)
+    pred = torch.empty((B, Nt, Nx, Ny))
+    for k in range(Nt):
+        tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]))
+        out = model.decode(latent, coords, tk)
+        pred[:, k] = out[..., 0].view(B, Nx, Ny)
+    return (pred * sigma + mu).detach()
+
+
+def test_e2e_forcing_ic_shuffle_changes_reconstruction(tmp_path):
+    # Cross-cutting gate: the eval reconstruction must genuinely consume the
+    # per-sim IC field. Both an across-all IC shuffle AND a within-family IC
+    # shuffle (same forcing family, different specific field) must change the
+    # decoded trajectory -- proving the model uses the specific IC, not just the
+    # family, and that the second branch is not ignored at eval.
+    _write_synthetic_forcing_ic(tmp_path)
+    cfg = _forcing_ic_config(tmp_path)
+    run_dir = tmp_path / "run_forcing_ic_shuffle"
+    run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=run_dir)
+
+    data = load_diffusion_data(cfg)
+    sim_params = np.load(tmp_path / "sim_params.npy", allow_pickle=True)
+    ckpt = torch.load(run_dir / "cvit_final.pt", map_location="cpu", weights_only=False)
+    model = build_cvit(
+        cfg, ckpt["mu_global"], ckpt["sigma_global"],
+        grid_size=(data["x_grid"].shape[0], data["y_grid"].shape[0]),
+        t_final=float(data["t_grid"][-1]), variant="forcing_ic",
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+
+    ids = np.arange(len(sim_params))
+    with torch.no_grad():
+        pred_correct = _reconstruct_ic_paired(model, data, sim_params, ids, ids)
+        # Re-pairing each sim with its OWN IC is deterministic (zero difference).
+        pred_same = _reconstruct_ic_paired(model, data, sim_params, ids, ids)
+        assert torch.allclose(pred_correct, pred_same)
+
+        # Across-all shuffle: a full derangement of the IC feed.
+        ic_all = np.roll(ids, 1)
+        assert np.all(ic_all != ids)
+        pred_all = _reconstruct_ic_paired(model, data, sim_params, ids, ic_all)
+
+        # Within-family shuffle: derange the IC feed inside each ic_family so the
+        # forcing family is preserved but the specific field is swapped.
+        fams = np.array([str(sim_params[int(i)]["ic_family"]) for i in ids])
+        ic_within = ids.copy()
+        for fam in np.unique(fams):
+            grp = ids[fams == fam]
+            assert len(grp) >= 2  # 6 per family in the synthetic set
+            ic_within[fams == fam] = np.roll(grp, 1)
+        assert np.all(ic_within != ids)
+        pred_within = _reconstruct_ic_paired(model, data, sim_params, ids, ic_within)
+
+    # Both shuffles perturb the reconstruction well beyond floating-point noise.
+    # Identical pairing is bit-exact (asserted above), so any change here is
+    # attributable ONLY to the IC feed; float32 noise on ~300 K fields is ~3e-5 K,
+    # so a 1e-4 K floor cleanly separates "genuinely uses the IC" from noise. The
+    # margin stays modest because the model is randomly initialized + 2 epochs;
+    # a converged model widens it (Phase D screen), which is out of scope here.
+    d_all = (pred_all - pred_correct).abs().mean().item()
+    d_within = (pred_within - pred_correct).abs().mean().item()
+    assert d_all > 1e-4
+    assert d_within > 1e-4
+    # The perturbation is present at t=0 too (the IC anchor slice), not only late.
+    d_all_t0 = (pred_all[:, 0] - pred_correct[:, 0]).abs().mean().item()
+    d_within_t0 = (pred_within[:, 0] - pred_correct[:, 0]).abs().mean().item()
+    assert d_all_t0 > 1e-4
+    assert d_within_t0 > 1e-4
