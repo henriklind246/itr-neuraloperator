@@ -6,6 +6,7 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.fv_residual import (
     build_face_conductances,
     build_cn_geom,
+    build_homogeneous_cn_geom,
     build_cn_geom_per_interface,
     locate_interface,
     interior_cn_residual,
@@ -49,6 +50,196 @@ def _build_forcing_solver(dt: float = 0.005, t_final: float = 0.3):
         t_final=t_final, phase=0.0,
     )
     return sim
+
+
+def _build_homogeneous_solver(N: int = 10, dt: float = 0.005, t_final: float = 0.01):
+    return FVSolver2D(
+        a=0.0, b=1.0, c=0.0, d=1.0,
+        Nx=N, Ny=N,
+        layers=[Layer2D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)],
+        interface_R=None,
+        lam_target=0.5,
+        dt=dt,
+        flux_f=1.0, flux_A=0.0,
+        t_on=0.0, t_off=0.2,
+        t_final=t_final, phase=0.0,
+    )
+
+
+def test_homogeneous_geometry_matches_one_layer_solver():
+    sim = _build_homogeneous_solver()
+    geom = build_homogeneous_cn_geom(
+        sim.grid_x, sim.grid_y, k=1.0, dt=sim.dt,
+        rho=1.0, cp=1.0, dtype=torch.float64,
+    )
+    for actual, expected in (
+        (geom.G_x, sim.G_x), (geom.G_y, sim.G_y),
+        (geom.dx, sim.dx), (geom.dy, sim.dy),
+        (geom.r_w, sim.r_w), (geom.r_e, sim.r_e),
+        (geom.r_s, sim.r_s), (geom.r_n, sim.r_n),
+    ):
+        np.testing.assert_allclose(actual.numpy(), expected, rtol=0, atol=1e-12)
+
+
+def test_homogeneous_geometry_matches_zero_resistance_midpoint_interface():
+    sim = _build_homogeneous_solver()
+    direct = build_homogeneous_cn_geom(
+        sim.grid_x, sim.grid_y, k=1.0, dt=sim.dt, dtype=torch.float64,
+    )
+    equivalent = build_cn_geom(
+        sim.grid_x, sim.grid_y,
+        k_left=1.0, k_right=1.0, interface_x=0.5, R_c=0.0,
+        dt=sim.dt, dtype=torch.float64,
+    )
+    for name in ("G_x", "G_y", "dx", "dy", "r_w", "r_e", "r_s", "r_n"):
+        assert torch.allclose(getattr(direct, name), getattr(equivalent, name), atol=1e-12)
+
+
+def test_homogeneous_geometry_rejects_anisotropic_grid():
+    with pytest.raises(ValueError, match="isotropic"):
+        build_homogeneous_cn_geom(
+            np.linspace(0.0, 1.0, 10), np.linspace(0.0, 1.0, 12),
+            k=1.0, dt=0.005,
+        )
+
+
+def test_homogeneous_regions_normalize_as_physical_residual_over_sigma():
+    sim = _build_homogeneous_solver()
+    sigma = 7.25
+    mu = 296.0
+    torch.manual_seed(17)
+    T_n = 300.0 + torch.randn((2, sim.Nx, sim.Ny), dtype=torch.float64)
+    T_np1 = 300.0 + torch.randn((2, sim.Nx, sim.Ny), dtype=torch.float64)
+    qn = torch.randn((2, sim.Ny), dtype=torch.float64)
+    qnp1 = torch.randn((2, sim.Ny), dtype=torch.float64)
+    qint = torch.randn((2, sim.Ny), dtype=torch.float64) * sim.dt
+
+    physical = full_bc_cn_residual(
+        T_n, T_np1,
+        build_homogeneous_cn_geom(
+            sim.grid_x, sim.grid_y, 1.0, sim.dt,
+            sigma_global=1.0, dtype=torch.float64,
+        ),
+        FullBCData(
+            T_right_tilde=torch.tensor(300.0, dtype=torch.float64),
+            qL_n=qn, qL_np1=qnp1, qL_int=qint,
+        ),
+        dirichlet_both_ends=True,
+    )
+    normalized = full_bc_cn_residual(
+        (T_n - mu) / sigma, (T_np1 - mu) / sigma,
+        build_homogeneous_cn_geom(
+            sim.grid_x, sim.grid_y, 1.0, sim.dt,
+            sigma_global=sigma, dtype=torch.float64,
+        ),
+        FullBCData(
+            T_right_tilde=torch.tensor((300.0 - mu) / sigma, dtype=torch.float64),
+            qL_n=qn, qL_np1=qnp1, qL_int=qint,
+        ),
+        dirichlet_both_ends=True,
+    )
+    for name in physical:
+        assert torch.allclose(normalized[name], physical[name] / sigma, atol=1e-12), name
+
+
+def test_homogeneous_constant_state_is_zero_in_every_region():
+    sim = _build_homogeneous_solver()
+    geom = build_homogeneous_cn_geom(
+        sim.grid_x, sim.grid_y, 1.0, sim.dt,
+        sigma_global=5.0, dtype=torch.float64,
+    )
+    field = torch.full((1, sim.Nx, sim.Ny), (300.0 - 295.0) / 5.0, dtype=torch.float64)
+    zero = torch.zeros((1, sim.Ny), dtype=torch.float64)
+    parts = full_bc_cn_residual(
+        field, field, geom,
+        FullBCData(
+            T_right_tilde=torch.tensor(1.0, dtype=torch.float64),
+            qL_n=zero, qL_np1=zero, qL_int=zero,
+        ),
+    )
+    assert all(float(value.abs().max()) == 0.0 for value in parts.values())
+
+
+def test_homogeneous_solver_truth_requires_matching_exact_flux_integral():
+    N = 10
+    dt = 0.01
+    amp = 40.0
+    omega = 70.0
+
+    def q_left(t):
+        return amp * np.sin(omega * t) * np.ones(N)
+
+    def q_left_integral(t0, t1):
+        value = amp * (np.cos(omega * t0) - np.cos(omega * t1)) / omega
+        return value * np.ones(N)
+
+    sim = FVSolver2D(
+        a=0.0, b=1.0, c=0.0, d=1.0,
+        Nx=N, Ny=N,
+        layers=[Layer2D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)],
+        interface_R=None,
+        lam_target=0.5,
+        dt=dt,
+        flux_f=1.0, flux_A=0.0,
+        t_on=0.0, t_off=0.03,
+        t_final=0.03, phase=0.0,
+        q_left_fn=q_left,
+        q_left_integral_fn=q_left_integral,
+    )
+    gx, gy = np.meshgrid(sim.grid_x, sim.grid_y, indexing="ij")
+    T0 = 300.0 + 4.0 * (1.0 - gx) * np.sin(2.0 * np.pi * gy)
+    _, _, _, history = sim.solve(T0=T0, store_trajectory=True)
+    geom = build_homogeneous_cn_geom(
+        sim.grid_x, sim.grid_y, 1.0, dt, dtype=torch.float64,
+    )
+
+    n = 1
+    tn, tnp1 = float(sim.t[n]), float(sim.t[n + 1])
+    exact = full_bc_cn_residual(
+        torch.as_tensor(history[n], dtype=torch.float64),
+        torch.as_tensor(history[n + 1], dtype=torch.float64),
+        geom,
+        FullBCData(
+            T_right_tilde=torch.tensor(300.0, dtype=torch.float64),
+            qL_n=torch.as_tensor(q_left(tn), dtype=torch.float64),
+            qL_np1=torch.as_tensor(q_left(tnp1), dtype=torch.float64),
+            qL_int=torch.as_tensor(q_left_integral(tn, tnp1), dtype=torch.float64),
+        ),
+    )
+    assert all(float(value.abs().max()) < 1e-7 for value in exact.values())
+
+    endpoint = full_bc_cn_residual(
+        torch.as_tensor(history[n], dtype=torch.float64),
+        torch.as_tensor(history[n + 1], dtype=torch.float64),
+        geom,
+        FullBCData(
+            T_right_tilde=torch.tensor(300.0, dtype=torch.float64),
+            qL_n=torch.as_tensor(q_left(tn), dtype=torch.float64),
+            qL_np1=torch.as_tensor(q_left(tnp1), dtype=torch.float64),
+        ),
+    )
+    assert float(endpoint["left_neumann"].abs().max()) > 1e-5
+
+
+def test_left_corner_is_complete_control_volume_balance():
+    sim = _build_homogeneous_solver()
+    geom = build_homogeneous_cn_geom(
+        sim.grid_x, sim.grid_y, 1.0, sim.dt, dtype=torch.float64,
+    )
+    base = torch.zeros((1, sim.Nx, sim.Ny), dtype=torch.float64)
+    qzero = torch.zeros((1, sim.Ny), dtype=torch.float64)
+    bc = FullBCData(
+        T_right_tilde=torch.tensor(0.0), qL_n=qzero, qL_np1=qzero, qL_int=qzero,
+    )
+
+    y_neighbor = base.clone()
+    y_neighbor[:, 0, 1] = 1.0
+    x_neighbor = base.clone()
+    x_neighbor[:, 1, 0] = 1.0
+    y_corner = full_bc_cn_residual(base, y_neighbor, geom, bc)["left_neumann"][0]
+    x_corner = full_bc_cn_residual(base, x_neighbor, geom, bc)["left_neumann"][0]
+    assert torch.allclose(y_corner, -geom.r_n[0, 0])
+    assert torch.allclose(x_corner, -geom.r_e[0, 0])
 
 
 def test_face_conductances_match_solver():

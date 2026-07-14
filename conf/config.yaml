@@ -210,9 +210,13 @@ training:
   # Read ONLY by src.operators.train_pino; inert for the FNO path. Loss is
   #   L = lambda_r*mean(r^2) + lambda_ic*mean(ic^2) + lambda_bc*mean(neumann^2).
   # n_r/n_ic/n_bc are collocation counts per step; sim_batch sims per step.
-  # chunk_r splits the interior residual into gradient-accumulation chunks to cap
-  # peak double-backward memory (0/null = no chunking).
+  # chunk_r caps query/decode memory: autodiff uses residual chunks; finite volume
+  # uses full-grid decoder chunks (0/null = no chunking).
   pino:
+    # Residual backend for the diffusion_forcing_single ForcingICCViT trainer.
+    # finite_volume uses full-grid, solver-lattice CN intervals; autodiff keeps
+    # the free point-collocation path and remains the default.
+    residual_method: autodiff
     lambda_r: 1.0
     lambda_ic: 1.0
     lambda_bc: 1.0
@@ -240,22 +244,23 @@ training:
     sim_batch: 16
     chunk_r: 0
     alpha: 1.0
-    # ---- Interfaces PINO path (benchmark=interfaces) ----
-    # Read ONLY by train_pino.run_one_seed_interfaces_pino; inert elsewhere.
+    # ---- Finite-volume PINO controls ----
+    # Used by the interfaces trainer and by diffusion_forcing_single when
+    # residual_method=finite_volume.
     # collocation_source selects where the per-step interface_x / R_c / forcing
     # params come from: "saved_train" (default) reads them from the saved TRAIN
     # sim_params.npy; "online" draws fresh from the generator distributions
     # (Stage 7). The interfaces benchmark overrides forcing.ny_img/nt_img/a_ref
     # for its complete-schedule image. dt is the CN step for the two-slice
-    # residual; null resolves to the solver dt stored
-    # with the dataset (else the trajectory time spacing) so the residual matches
-    # the FV scheme. intervals_per_sim CN intervals are scored per sim per step
+    # residual. For diffusion_forcing_single, null requires the solver dt stored
+    # with the dataset; the interfaces runner retains its trajectory-spacing
+    # fallback. intervals_per_sim CN intervals are scored per sim per step
     # (M = sim_batch * intervals_per_sim). stratified_time_sampling assigns causal
     # bins across the WHOLE M-interval batch so every bin is populated when
     # M >= causal_num_bins (needed for causal.enabled interior weighting); the
     # midpoint t_mid is drawn uniformly inside its bin. causal_num_bins is the
     # interface-path bin count (distinct from causal.n_bins used by the diffusion
-    # path). Causal weighting is applied to the interior CN residual only.
+    # forcing path). Causal weighting is applied to the interior CN residual only.
     collocation_source: saved_train
     dt: null
     intervals_per_sim: 2

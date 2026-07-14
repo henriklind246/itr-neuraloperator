@@ -14,11 +14,14 @@ from problems.forcing import (
     _sample_a,
 )
 from src.physics.boundary_forcing import (
+    FORCING_SCHEMA_VERSION,
+    RAMP_SCHEMA_VERSION,
     SPATIAL_BUILDERS,
     SPATIAL_SAMPLERS,
     TEMPORAL_SAMPLERS,
     build_qL,
     build_qL_integral,
+    build_interface_forcing,
     default_ramp_seconds,
     ramped_temporal,
     sample_spatial_family,
@@ -177,6 +180,44 @@ class DiffusionForcingProblem(ProblemSpec):
             q_left_integral_fn=q_left_integral_fn,
             source=None,
         )
+
+    # ---- collocation hooks (shared by forcing descendants) ----
+
+    def collocation_geom_cfg(
+        self, ds, phys_cfg: dict, mu_global: float, sigma_global: float, dt: float,
+    ) -> dict[str, Any]:
+        """Direct homogeneous geometry and solver-matching closure metadata."""
+        sigma = float(sigma_global)
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError("sigma_global must be finite and > 0 for FV residuals")
+        return {
+            "geometry_kind": "homogeneous",
+            "geometry_version": "homogeneous_cn_v1",
+            "x_grid": np.asarray(ds.x_grid, dtype=np.float64),
+            "y_grid": np.asarray(ds.y_grid, dtype=np.float64),
+            "k": K_SLAB,
+            "rho": 1.0,
+            "cp": 1.0,
+            "dt": float(dt),
+            "sigma_global": sigma,
+            "T_right_tilde": (T_RIGHT - float(mu_global)) / sigma,
+            "forcing_quadrature": "exact_interval_integral",
+            "closure_identity": "separable_left_flux_exact_v1",
+            "forcing_schema_version": FORCING_SCHEMA_VERSION,
+            "ramp_schema_version": RAMP_SCHEMA_VERSION,
+        }
+
+    def collocation_closure(
+        self, ds, sid: int, params: dict, t: float, t_dt: float,
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+        """Reconstruct the exact left-flux integral used by ``FVSolver2D``."""
+        qn, qnp1, qint = build_interface_forcing(
+            params["temporal_family"], params["temporal_params"],
+            params["spatial_family"], params["spatial_params"],
+            np.asarray(ds.y_grid, dtype=np.float64), float(t), float(t_dt),
+            float(ds.ramp_seconds),
+        )
+        return 0.0, qn, qnp1, qint
 
     # ---- dataset item (minimal; physics-only path does not consume it) ----
 

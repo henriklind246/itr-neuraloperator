@@ -508,6 +508,31 @@ class TestDiffusionForcingSingleSchema:
         with pytest.raises(ValueError, match="admits"):
             spec.validate_schema(bad_spatial, np.array([0]))
 
+    def test_inherits_homogeneous_fv_geometry_and_exact_closure(self):
+        spec = get_problem("diffusion_forcing_single")
+        params = dict(_dfs_sample_params(n=1)[0])
+
+        class _DS:
+            x_grid = np.linspace(0.0, 1.0, 5)
+            y_grid = np.linspace(0.0, 1.0, 5)
+            Ny = 5
+            ramp_seconds = 0.01
+
+        geom = spec.collocation_geom_cfg(
+            _DS(), {}, mu_global=295.0, sigma_global=5.0, dt=0.05,
+        )
+        assert geom["geometry_kind"] == "homogeneous"
+        assert geom["forcing_quadrature"] == "exact_interval_integral"
+        assert geom["k"] == geom["rho"] == geom["cp"] == 1.0
+        assert geom["T_right_tilde"] == 1.0
+
+        R_c, qn, qnp1, qint = spec.collocation_closure(
+            _DS(), 0, params, 0.05, 0.10,
+        )
+        assert R_c == 0.0
+        assert qn.shape == qnp1.shape == qint.shape == (5,)
+        assert np.all(np.isfinite(qint))
+
 
 class TestDiffusionForcingSingleBalancedData:
     ALLOWED = ["uniform_2d", "random_sinusoid_2d", "grf_2d", "hot_spot_2d"]

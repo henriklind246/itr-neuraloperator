@@ -691,7 +691,10 @@ def load_solver_dt(t_grid_path: str | Path) -> float | None:
     dt_path = Path(t_grid_path).parent / "dt.npy"
     if not dt_path.exists():
         return None
-    return float(np.load(dt_path))
+    value = np.load(dt_path)
+    if np.asarray(value).ndim != 0:
+        raise ValueError(f"{dt_path} must contain a scalar solver dt")
+    return float(value)
 
 
 def load_ramp_seconds(t_grid_path: str | Path) -> float | None:

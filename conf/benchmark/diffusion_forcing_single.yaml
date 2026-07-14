@@ -12,11 +12,10 @@
 # A varying IC is invisible in the forcing image, so the surrogate is a two-branch
 # ForcingICCViT (variant forcing_ic): one encoder over the forcing space-time
 # image, a second over the per-sim IC field, fused in the decoder cross-attention.
-# Trained physics-only (PINO) with autodiff residuals on free continuous
-# collocation, a SOFT inhomogeneous left-wall Neumann residual, and the IC anchor
-# targeting the SAMPLED T0 (not a constant 300 K). The saved FV validation set is
-# single-family (sin/uniform) with varying ICs; the online training sampler is
-# pinned to sin/uniform via training.pino.forcing.
+# Trained physics-only (PINO) with a selectable autodiff or finite-volume main
+# residual and an IC anchor targeting the SAMPLED T0 (not a constant 300 K).
+# The saved FV validation set is single-family (sin/uniform) with varying ICs;
+# the online training sampler is pinned to sin/uniform via training.pino.forcing.
 
 benchmark:
   name: diffusion_forcing_single
@@ -51,6 +50,8 @@ training:
     # asserts this so an old ForcingCViT ("forcing") config cannot silently ignore
     # the varying IC.
     variant: forcing_ic
+    # Select "finite_volume" for full-grid solver-lattice CN collocation.
+    residual_method: autodiff
     forcing:
       # Lock the online training sampler to the single sin/uniform family so it
       # matches the pinned single-family FV validation set.

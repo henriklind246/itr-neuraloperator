@@ -81,6 +81,16 @@ def _node_k(x_grid: np.ndarray, k_left: float, k_right: float,
     return np.where(x_grid < interface_x, float(k_left), float(k_right))
 
 
+def _solver_face_coefficient(k: float, h: float) -> float:
+    return float(k) / float(h)
+
+
+def _solver_control_widths(n: int, h: float) -> np.ndarray:
+    widths = np.full(int(n), float(h))
+    widths[0] = widths[-1] = float(h) / 2.0
+    return widths
+
+
 @dataclass
 class InterfaceLocation:
     """Where a single vertical interface sits on the FV grid.
@@ -179,25 +189,146 @@ def build_face_conductances(x_grid, y_grid, k_left: float, k_right: float,
             G_x[i, :] = 1.0 / (h_L / k_left + Rc + h_R / k_right)
         else:
             k_face = k_left if face_pos[i] < interface_x else k_right
-            G_x[i, :] = k_face / hx
+            G_x[i, :] = _solver_face_coefficient(k_face, hx)
 
     # --- G_y (Nx, Ny-1): k of the node's layer / hx ---
     k_nodes = _node_k(x_grid, k_left, k_right, interface_x)
-    G_y = np.repeat((k_nodes / hx)[:, None], Ny - 1, axis=1)
+    G_y = np.repeat(
+        np.asarray([_solver_face_coefficient(k, hx) for k in k_nodes])[:, None],
+        Ny - 1,
+        axis=1,
+    )
 
     # --- Control-volume widths (mirror the dx/dy construction) ---
-    dx = np.full(Nx, hx)
-    dx[0] = hx / 2.0
-    dx[Nx - 1] = hx / 2.0
+    dx = _solver_control_widths(Nx, hx)
     dx[face_idx] = 0.5 * hx + h_L
     dx[face_idx + 1] = h_R + 0.5 * hx
 
-    dy = np.full(Ny, hx)
-    dy[0] = hx / 2.0
-    dy[Ny - 1] = hx / 2.0
+    dy = _solver_control_widths(Ny, hx)
 
     t = lambda arr: torch.as_tensor(arr, device=device, dtype=dtype)
     return t(G_x), t(G_y), t(dx), t(dy)
+
+
+def _assemble_scalar_cn_geom(
+    G_x: torch.Tensor,
+    G_y: torch.Tensor,
+    dx: torch.Tensor,
+    dy: torch.Tensor,
+    *,
+    dt: float,
+    sigma_global: float,
+    rho: float,
+    cp: float,
+    hx: float,
+) -> FVGeom:
+    """Assemble scalar-geometry CN coefficients from solver-style face data."""
+    Nx = dx.shape[0]
+    Ny = dy.shape[0]
+    rho_cp = torch.full(
+        (Nx, Ny), float(rho) * float(cp), device=dx.device, dtype=dx.dtype,
+    )
+
+    r_w = torch.zeros((Nx, Ny), device=dx.device, dtype=dx.dtype)
+    r_e = torch.zeros((Nx, Ny), device=dx.device, dtype=dx.dtype)
+    r_s = torch.zeros((Nx, Ny), device=dx.device, dtype=dx.dtype)
+    r_n = torch.zeros((Nx, Ny), device=dx.device, dtype=dx.dtype)
+
+    dxi = dx[:, None]
+    dyj = dy[None, :]
+    two_rc = 2.0 * rho_cp
+
+    r_w[1:Nx - 1, :] = (
+        dt * G_x[0:Nx - 2, :] / (two_rc[1:Nx - 1, :] * dxi[1:Nx - 1, :])
+    )
+    r_e[0:Nx - 1, :] = (
+        dt * G_x[0:Nx - 1, :] / (two_rc[0:Nx - 1, :] * dxi[0:Nx - 1, :])
+    )
+    r_s[0:Nx - 1, 1:Ny] = (
+        dt * G_y[0:Nx - 1, 0:Ny - 1]
+        / (two_rc[0:Nx - 1, 1:Ny] * dyj[:, 1:Ny])
+    )
+    r_n[0:Nx - 1, 0:Ny - 1] = (
+        dt * G_y[0:Nx - 1, 0:Ny - 1]
+        / (two_rc[0:Nx - 1, 0:Ny - 1] * dyj[:, 0:Ny - 1])
+    )
+
+    interior_mask = torch.zeros((Nx, Ny), dtype=torch.bool, device=dx.device)
+    interior_mask[1:Nx - 1, 1:Ny - 1] = True
+    return FVGeom(
+        G_x=G_x,
+        G_y=G_y,
+        dx=dx,
+        dy=dy,
+        rho_cp=rho_cp,
+        r_w=r_w,
+        r_e=r_e,
+        r_s=r_s,
+        r_n=r_n,
+        interior_mask=interior_mask,
+        dt=float(dt),
+        sigma_global=float(sigma_global),
+        hx=float(hx),
+    )
+
+
+def build_homogeneous_cn_geom(
+    x_grid,
+    y_grid,
+    k: float,
+    dt: float,
+    sigma_global: float = 1.0,
+    rho: float = 1.0,
+    cp: float = 1.0,
+    device=None,
+    dtype=torch.float64,
+) -> FVGeom:
+    """Assemble the direct one-layer CN geometry used by ``FVSolver2D``.
+
+    The solver's face coefficients are per unit orthogonal face length. On the
+    required isotropic grid this gives ``k / h`` in both directions; the
+    orthogonal width cancels against the control-volume area in the local CN
+    coefficients. Boundary nodes use half-width one-dimensional control-volume
+    widths, so corner volumes are one quarter of an interior volume.
+    """
+    xg = np.asarray(x_grid, dtype=float)
+    yg = np.asarray(y_grid, dtype=float)
+    if xg.ndim != 1 or yg.ndim != 1 or xg.size < 2 or yg.size < 2:
+        raise ValueError("x_grid and y_grid must be one-dimensional with at least 2 nodes")
+    hx = float((xg[-1] - xg[0]) / (xg.size - 1))
+    hy = float((yg[-1] - yg[0]) / (yg.size - 1))
+    if not np.allclose(np.diff(xg), hx, rtol=1e-6, atol=1e-8):
+        raise ValueError("x_grid must be uniform for homogeneous CN geometry")
+    if not np.allclose(np.diff(yg), hy, rtol=1e-6, atol=1e-8):
+        raise ValueError("y_grid must be uniform for homogeneous CN geometry")
+    if not np.isclose(hx, hy, rtol=1e-12):
+        raise ValueError(
+            f"Grid is not isotropic: hx={hx:.15e}, hy={hy:.15e}. "
+            "Uniform isotropic grid required (hx == hy)."
+        )
+    if not np.isfinite(sigma_global) or float(sigma_global) <= 0.0:
+        raise ValueError("sigma_global must be finite and > 0")
+
+    Nx, Ny = xg.size, yg.size
+    G_x = torch.full(
+        (Nx - 1, Ny), _solver_face_coefficient(k, hx), device=device, dtype=dtype,
+    )
+    G_y = torch.full(
+        (Nx, Ny - 1), _solver_face_coefficient(k, hx), device=device, dtype=dtype,
+    )
+    dx = torch.as_tensor(_solver_control_widths(Nx, hx), device=device, dtype=dtype)
+    dy = torch.as_tensor(_solver_control_widths(Ny, hx), device=device, dtype=dtype)
+    return _assemble_scalar_cn_geom(
+        G_x,
+        G_y,
+        dx,
+        dy,
+        dt=dt,
+        sigma_global=sigma_global,
+        rho=rho,
+        cp=cp,
+        hx=hx,
+    )
 
 
 def build_cn_geom(x_grid, y_grid, k_left: float, k_right: float,
@@ -213,39 +344,17 @@ def build_cn_geom(x_grid, y_grid, k_left: float, k_right: float,
         x_grid, y_grid, k_left, k_right, interface_x, R_c,
         device=device, dtype=dtype,
     )
-    Nx = dx.shape[0]
-    Ny = dy.shape[0]
-    rho_cp = torch.full((Nx, Ny), float(rho) * float(cp),
-                        device=device, dtype=dtype)
-
-    r_w = torch.zeros((Nx, Ny), device=device, dtype=dtype)
-    r_e = torch.zeros((Nx, Ny), device=device, dtype=dtype)
-    r_s = torch.zeros((Nx, Ny), device=device, dtype=dtype)
-    r_n = torch.zeros((Nx, Ny), device=device, dtype=dtype)
-
-    dxi = dx[:, None]          # (Nx,1)
-    dyj = dy[None, :]          # (1,Ny)
-    two_rc = 2.0 * rho_cp
-
-    # Active rows i = 0..Nx-2 (Dirichlet row i=Nx-1 stays zero).
-    # West face exists for i >= 1: G_x[i-1, j].
-    r_w[1:Nx - 1, :] = dt * G_x[0:Nx - 2, :] / (two_rc[1:Nx - 1, :] * dxi[1:Nx - 1, :])
-    # East face exists for i <= Nx-2: G_x[i, j].
-    r_e[0:Nx - 1, :] = dt * G_x[0:Nx - 1, :] / (two_rc[0:Nx - 1, :] * dxi[0:Nx - 1, :])
-    # South face exists for j >= 1: G_y[i, j-1].
-    r_s[0:Nx - 1, 1:Ny] = dt * G_y[0:Nx - 1, 0:Ny - 1] / (two_rc[0:Nx - 1, 1:Ny] * dyj[:, 1:Ny])
-    # North face exists for j <= Ny-2: G_y[i, j].
-    r_n[0:Nx - 1, 0:Ny - 1] = dt * G_y[0:Nx - 1, 0:Ny - 1] / (two_rc[0:Nx - 1, 0:Ny - 1] * dyj[:, 0:Ny - 1])
-
-    interior_mask = torch.zeros((Nx, Ny), dtype=torch.bool, device=device)
-    interior_mask[1:Nx - 1, 1:Ny - 1] = True
-
     hx = float(np.asarray(x_grid, dtype=float)[1] - np.asarray(x_grid, dtype=float)[0])
-    return FVGeom(
-        G_x=G_x, G_y=G_y, dx=dx, dy=dy, rho_cp=rho_cp,
-        r_w=r_w, r_e=r_e, r_s=r_s, r_n=r_n,
-        interior_mask=interior_mask, dt=float(dt),
-        sigma_global=float(sigma_global), hx=hx,
+    return _assemble_scalar_cn_geom(
+        G_x,
+        G_y,
+        dx,
+        dy,
+        dt=dt,
+        sigma_global=sigma_global,
+        rho=rho,
+        cp=cp,
+        hx=hx,
     )
 
 

@@ -30,6 +30,9 @@ from src.operators.train_pino import (
     _curriculum_weights,
     _ic_loss,
     _resolve_forcing_causal,
+    _resolve_forcing_fv_dt,
+    _forcing_resume_config,
+    _full_grid_query_mesh,
     _time_bin_index,
     build_cvit,
     build_forcing_image,
@@ -56,6 +59,7 @@ def _write_synthetic_diffusion(tmp_path, num_sims=16, Nt=6, Nx=20, Ny=20):
     np.save(tmp_path / "x_grid.npy", x_grid)
     np.save(tmp_path / "y_grid.npy", y_grid)
     np.save(tmp_path / "t_grid.npy", t_grid)
+    np.save(tmp_path / "dt.npy", np.array(float(t_grid[1] - t_grid[0])))
     return traj
 
 
@@ -1080,6 +1084,7 @@ def _write_synthetic_forcing_ic(tmp_path, num_sims=24, Nt=6, Nx=20, Ny=20):
     np.save(tmp_path / "t_grid.npy", t_grid)
     np.save(tmp_path / "sim_params.npy", sim_params)
     np.save(tmp_path / "meta.npy", np.array(meta, dtype=object), allow_pickle=True)
+    np.save(tmp_path / "dt.npy", np.array(float(t_grid[1] - t_grid[0])))
     return traj, sim_params
 
 
@@ -1141,6 +1146,7 @@ def _forcing_ic_config(tmp_path):
             "physics": {"n_ic_points": 32},
             "pino": {
                 "variant": "forcing_ic",
+                "residual_method": "autodiff",
                 "lambda_r": 1.0,
                 "lambda_ic": 1.0,
                 "lambda_bc": 1.0,
@@ -1149,6 +1155,9 @@ def _forcing_ic_config(tmp_path):
                 "n_ic": 32,
                 "n_bc": 16,
                 "sim_batch": 4,
+                "intervals_per_sim": 2,
+                "stratified_time_sampling": True,
+                "chunk_r": 0,
                 "alpha": 1.0,
                 "forcing": {
                     "ny_img": 16,
@@ -1196,6 +1205,212 @@ def test_e2e_forcing_ic_smoke_finite(tmp_path):
     assert float(ckpt["sigma_global"]) > 0.0
     # The two-branch runner carries its own IC-sim RNG state for reproducible resume.
     assert ckpt.get("ic_rng_state") is not None
+
+
+def test_forcing_ic_fv_full_grid_layout_contract():
+    x = torch.linspace(0.0, 1.0, 4)
+    y = torch.linspace(0.0, 1.0, 5)
+    mesh = _full_grid_query_mesh(x, y)
+    decoded = mesh[..., 0] + 2.0 * mesh[..., 1]
+    field = decoded.reshape(1, 4, 5)
+    expected = x[:, None] + 2.0 * y[None, :]
+    assert torch.equal(field[0], expected)
+    assert field[0, 0, 0] == 0.0
+    assert field[0, -1, -1] == 3.0
+
+
+def test_forcing_ic_rejects_invalid_residual_method(tmp_path):
+    _write_synthetic_forcing_ic(tmp_path)
+    cfg = _forcing_ic_config(tmp_path)
+    cfg["training"]["pino"]["residual_method"] = "spectral"
+    with pytest.raises(ValueError, match="residual_method"):
+        run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=tmp_path / "invalid_method")
+
+
+def test_forcing_ic_fv_requires_solver_dt(tmp_path):
+    _write_synthetic_forcing_ic(tmp_path)
+    (tmp_path / "dt.npy").unlink()
+    cfg = _forcing_ic_config(tmp_path)
+    cfg["training"]["pino"]["residual_method"] = "finite_volume"
+    cfg["training"]["pino"]["dt"] = None
+    with pytest.raises(ValueError, match="requires training.pino.dt or dt.npy"):
+        run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=tmp_path / "missing_dt")
+
+
+@pytest.mark.parametrize("dt", [0.0, -0.01, float("nan"), 0.31, 0.07])
+def test_forcing_ic_fv_rejects_invalid_dt(dt):
+    with pytest.raises(ValueError, match="finite-volume|integral"):
+        _resolve_forcing_fv_dt(
+            {"data": {"t_grid_path": "unused"}}, {"dt": dt}, t_final=0.3,
+        )
+
+
+def test_forcing_ic_fv_resume_compares_resolved_dt_not_provenance(tmp_path):
+    cfg_from_file = _forcing_ic_config(tmp_path)
+    cfg_from_file["training"]["pino"].update({
+        "residual_method": "finite_volume", "dt": None,
+    })
+    cfg_explicit = json.loads(json.dumps(cfg_from_file))
+    cfg_explicit["training"]["pino"]["dt"] = 0.06
+    assert _forcing_resume_config(
+        cfg_from_file, resolved_fv_dt=0.06,
+    ) == _forcing_resume_config(
+        cfg_explicit, resolved_fv_dt=0.06,
+    )
+
+
+def test_forcing_ic_fv_loop_accepts_per_sample_single_interface_geometry():
+    class _Model:
+        def decode(self, latent, coords, t):
+            return latent[:, :1, :].expand(-1, coords.shape[1], -1) + 0.1 * t
+
+    class _Problem:
+        def collocation_closure(self, ds, sid, params, t, t_dt):
+            zeros = np.zeros(ds.Ny, dtype=np.float64)
+            return params["R_c"], zeros, zeros.copy(), zeros.copy()
+
+    N = 10
+    grid = torch.linspace(0.0, 1.0, N)
+    latent = torch.tensor([[[0.2]], [[-0.1]]], requires_grad=True)
+    coll = {
+        "ic": {
+            "coords": torch.tensor([[[0.0, 0.0], [0.5, 0.5]]]),
+            "t": torch.zeros((1, 2, 1)),
+        },
+        "fv": {
+            "start_idx": torch.tensor([0, 1]),
+            "causal_bin_ids": torch.tensor([0, 1]),
+            "sim_local": torch.tensor([0, 1]),
+        },
+    }
+    params = [
+        {"interface_x": 0.35, "R_c": 0.1},
+        {"interface_x": 0.65, "R_c": 0.2},
+    ]
+    ctx = type("Ctx", (), {"Ny": N})()
+    geom_cfg = {
+        "geometry_kind": "single_interface",
+        "x_grid": grid.numpy(),
+        "y_grid": grid.numpy(),
+        "k_left": 1.0,
+        "k_right": 1.0,
+        "rho": 1.0,
+        "cp": 1.0,
+        "T_right_tilde": 0.0,
+        "forcing_quadrature": "exact_interval_integral",
+    }
+    losses = train_pino_mod._forcing_ic_fv_losses(
+        model=_Model(),
+        latent=latent,
+        coll=coll,
+        ic_target=latent.expand(-1, 2, -1).detach(),
+        params_batch=params,
+        ids_batch=np.array([3, 4]),
+        problem=_Problem(),
+        collocation_ctx=ctx,
+        geom_cfg=geom_cfg,
+        x_grid=grid,
+        y_grid=grid,
+        dt=0.05,
+        n_steps=6,
+        sigma_global=1.0,
+        causal_cfg={"enabled": False, "n_bins": 2},
+        causal_eps=0.01,
+        chunk_r=17,
+    )
+    total = losses["r"] + losses["bc_left"] + losses["bc_hom"] + losses["ic"]
+    total.backward()
+    assert torch.isfinite(total)
+    assert latent.grad is not None and torch.isfinite(latent.grad).all()
+
+
+def test_e2e_forcing_ic_finite_volume_excludes_autodiff_and_updates(
+    tmp_path, monkeypatch,
+):
+    _write_synthetic_forcing_ic(tmp_path)
+    cfg = _forcing_ic_config(tmp_path)
+    cfg["training"].update({
+        "epochs": 1,
+        "optimizer": "AdamW",
+        "scheduler": {"type": "StepLR", "step_size": 50, "gamma": 0.5},
+    })
+    pino = cfg["training"]["pino"]
+    pino.update({
+        "residual_method": "finite_volume",
+        "sim_batch": 2,
+        "intervals_per_sim": 1,
+        "chunk_r": 128,
+    })
+    cfg["training"]["physics"]["n_ic_points"] = 8
+
+    def _autodiff_forbidden(*args, **kwargs):
+        raise AssertionError("autodiff residual called in finite_volume mode")
+
+    monkeypatch.setattr(train_pino_mod, "pino_losses", _autodiff_forbidden)
+    monkeypatch.setattr(train_pino_mod, "diffusion_residual", _autodiff_forbidden)
+    monkeypatch.setattr(train_pino_mod, "forcing_neumann_residual", _autodiff_forbidden)
+    monkeypatch.setattr(train_pino_mod, "neumann_residual", _autodiff_forbidden)
+
+    original_build_optimizer = train_pino_mod.build_optimizer
+    original_build_scheduler = train_pino_mod.build_scheduler
+    observed = {"finite_nonzero_grad": False, "parameter_changed": False}
+    tracked_params = []
+
+    def _tracked_optimizer(config, parameters):
+        params = list(parameters)
+        tracked_params.extend(params)
+        return original_build_optimizer(config, params)
+
+    def _tracked_scheduler(config, optimizer):
+        scheduler = original_build_scheduler(config, optimizer)
+        original_step = optimizer.step
+
+        def _step(*args, **kwargs):
+            observed["finite_nonzero_grad"] = any(
+                p.grad is not None
+                and bool(torch.isfinite(p.grad).all())
+                and float(p.grad.abs().sum()) > 0.0
+                for p in tracked_params
+            )
+            before = [p.detach().clone() for p in tracked_params]
+            result = original_step(*args, **kwargs)
+            observed["parameter_changed"] = any(
+                not torch.equal(old, new.detach())
+                for old, new in zip(before, tracked_params)
+            )
+            return result
+
+        optimizer.step = _step
+        return scheduler
+
+    monkeypatch.setattr(train_pino_mod, "build_optimizer", _tracked_optimizer)
+    monkeypatch.setattr(train_pino_mod, "build_scheduler", _tracked_scheduler)
+    run_dir = tmp_path / "run_forcing_ic_fv"
+    summary = run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=run_dir)
+
+    assert observed == {"finite_nonzero_grad": True, "parameter_changed": True}
+    assert summary["residual_method"] == "finite_volume"
+    rows = _rows(run_dir)
+    assert len(rows) == 1 and rows[0]["residual_method"] == "finite_volume"
+    for key in (
+        "loss", "loss_r", "loss_ic", "loss_bc_left", "loss_bc_hom",
+        "loss_right_dir", "val_gnrmse",
+    ):
+        assert math.isfinite(float(rows[0][key]))
+
+    ckpt_path = run_dir / "cvit_latest.pt"
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert ckpt["fv_residual_signature"]["geometry_kind"] == "homogeneous"
+    assert ckpt["fv_residual_signature"]["forcing_quadrature"] == "exact_interval_integral"
+    assert ckpt["fv_residual_metadata"]["dt_source"] == "dt.npy"
+    assert "latent" not in repr(ckpt["forcing_cache"]).lower()
+
+    ckpt["fv_residual_signature"]["closure_identity"] = "mismatched"
+    torch.save(ckpt, ckpt_path)
+    cfg["training"]["epochs"] = 2
+    cfg["training"]["pino"]["forcing"]["extend_completed"] = True
+    with pytest.raises(ValueError, match="residual semantics"):
+        run_one_seed_forcing_ic_pino(cfg, seed=0, run_dir=run_dir)
 
 
 def test_e2e_forcing_ic_stale_dataset_guard(tmp_path):

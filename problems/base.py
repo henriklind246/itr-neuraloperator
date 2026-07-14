@@ -197,20 +197,22 @@ class ProblemSpec(ABC):
         """Geometry/closure config for the full_bc collocation residual.
 
         Return a dict consumed by the training loop's collocation sampler
-        (``x_grid``, ``y_grid``, ``k_left``, ``k_right``, ``interface_x``,
-        ``dt``, ``sigma_global``, ``T_right_tilde``). The default ``None`` makes
-        the training loop fall back to its built-in (forcing) geometry block, so
-        benchmarks that do not opt in keep the existing behavior unchanged.
+        (including ``geometry_kind``, grids/materials, normalization, and the
+        forcing-quadrature identity). The default ``None`` makes the training
+        loop fall back to its built-in geometry block, so benchmarks that do not
+        opt in keep the existing behavior unchanged.
         """
         return None
 
     def collocation_closure(
         self, ds, sid: int, params: dict, t: float, t_dt: float,
-    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray] | None:
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray | None] | None:
         """Per-item boundary closure for a collocation pair.
 
         Return ``(R_c, qL_n, qL_np1, qL_int)`` for the two collocation times, or
-        ``None`` to use the training loop's built-in (forcing) closure.
+        ``None`` to use the training loop's built-in closure. ``qL_int`` may be
+        ``None`` only when the geometry metadata explicitly selects endpoint CN
+        quadrature.
         """
         return None
 
