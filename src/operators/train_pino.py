@@ -3151,8 +3151,8 @@ def run_one_seed_interfaces_pino(
     # --- §4 calibration pass: freeze per-region scales on the INITIAL model,
     # before any optimizer step and before GradNorm is built. Observationally
     # inert: separate rng, snapshot/restore torch RNG, model state asserted
-    # unchanged. NOT under torch.no_grad (the FV autodiff residual needs
-    # grad-enabled ops to compute the forward loss).
+    # unchanged. This finite-volume path needs only scalar loss values, so retaining
+    # decoder graphs would waste the dominant GPU memory.
     if std_enabled:
         state_before = {k: v.detach().clone() for k, v in model.state_dict().items()}
         cpu_rng_before = torch.get_rng_state()
@@ -3164,10 +3164,12 @@ def run_one_seed_interfaces_pino(
         calib_rng = np.random.default_rng(seed + 1_000_003)
         accum = {k: 0.0 for k in balanced_terms}
         t_calib0 = time.perf_counter()
-        for _ in range(calibration_steps):
-            losses_c, _ = _forward_losses(calib_rng)
-            for k in balanced_terms:
-                accum[k] += float(losses_c[k].detach().cpu())
+        with torch.no_grad():
+            for _calib_step in range(calibration_steps):
+                losses_c, right_dir_c = _forward_losses(calib_rng)
+                for k in balanced_terms:
+                    accum[k] += float(losses_c[k].cpu())
+                del losses_c, right_dir_c
         calib_wall = time.perf_counter() - t_calib0
         for k in balanced_terms:
             std_scales[k] = max(accum[k] / calibration_steps, std_eps)
@@ -3185,6 +3187,7 @@ def run_one_seed_interfaces_pino(
                     f"region_standardize calibration mutated model state {k!r}; "
                     "the calibration pass must be observationally inert."
                 )
+        del state_before, state_after, cpu_rng_before, cuda_rng_before
         print(
             "[pino-interfaces] region_standardize: "
             f"calibration_steps={calibration_steps} wall={calib_wall:.2f}s "

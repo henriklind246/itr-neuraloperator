@@ -265,6 +265,38 @@ def test_interface_image_e2e_has_finite_metrics_and_complete_metadata(tmp_path):
         run_one_seed_interfaces_pino(config, seed=0, run_dir=run_dir)
 
 
+def test_interface_region_calibration_disables_autograd(tmp_path, monkeypatch):
+    _write_synthetic_interfaces(tmp_path)
+    config = _interface_config(tmp_path)
+    config["training"]["pino"]["region_standardize"] = {
+        "enabled": True,
+        "calibration_steps": 2,
+        "eps": 1e-8,
+    }
+    grad_modes = []
+    original = train_pino_mod.full_bc_physics_loss
+
+    def record_grad_mode(*args, **kwargs):
+        grad_modes.append(torch.is_grad_enabled())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(train_pino_mod, "full_bc_physics_loss", record_grad_mode)
+    run_dir = tmp_path / "interface_calibration"
+    run_one_seed_interfaces_pino(config, seed=0, run_dir=run_dir)
+
+    assert grad_modes == [False, False, True]
+    checkpoint = torch.load(
+        run_dir / "cvit_best_global.pt", map_location="cpu", weights_only=False
+    )
+    metadata = checkpoint["region_standardize"]
+    assert metadata["enabled"] is True
+    assert metadata["std_calib_done"] is True
+    assert all(
+        math.isfinite(float(v)) and float(v) > 0.0
+        for v in metadata["std_scales"].values()
+    )
+
+
 # --------- IC-first curriculum ---------
 
 def test_curriculum_weights_schedule():
