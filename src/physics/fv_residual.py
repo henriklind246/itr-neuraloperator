@@ -297,9 +297,9 @@ def build_homogeneous_cn_geom(
         raise ValueError("x_grid and y_grid must be one-dimensional with at least 2 nodes")
     hx = float((xg[-1] - xg[0]) / (xg.size - 1))
     hy = float((yg[-1] - yg[0]) / (yg.size - 1))
-    if not np.allclose(np.diff(xg), hx, rtol=1e-6, atol=1e-8):
+    if not np.allclose(np.diff(xg), hx, rtol=1e-5, atol=1e-8):
         raise ValueError("x_grid must be uniform for homogeneous CN geometry")
-    if not np.allclose(np.diff(yg), hy, rtol=1e-6, atol=1e-8):
+    if not np.allclose(np.diff(yg), hy, rtol=1e-5, atol=1e-8):
         raise ValueError("y_grid must be uniform for homogeneous CN geometry")
     if not np.isclose(hx, hy, rtol=1e-12):
         raise ValueError(

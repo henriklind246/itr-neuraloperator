@@ -95,6 +95,29 @@ def test_homogeneous_geometry_matches_zero_resistance_midpoint_interface():
         assert torch.allclose(getattr(direct, name), getattr(equivalent, name), atol=1e-12)
 
 
+def test_homogeneous_geometry_accepts_serialized_float32_grid():
+    grid32 = np.linspace(0.0, 1.0, 100, dtype=np.float32)
+    actual = build_homogeneous_cn_geom(
+        grid32, grid32, k=1.0, dt=0.005, dtype=torch.float64,
+    )
+    expected = build_homogeneous_cn_geom(
+        np.linspace(0.0, 1.0, 100), np.linspace(0.0, 1.0, 100),
+        k=1.0, dt=0.005, dtype=torch.float64,
+    )
+    for name in ("G_x", "G_y", "dx", "dy", "r_w", "r_e", "r_s", "r_n"):
+        torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
+
+
+def test_homogeneous_geometry_rejects_nonuniform_grid():
+    x_grid = np.linspace(0.0, 1.0, 100, dtype=np.float32)
+    x_grid[50] += 1e-4
+    with pytest.raises(ValueError, match="x_grid must be uniform"):
+        build_homogeneous_cn_geom(
+            x_grid, np.linspace(0.0, 1.0, 100, dtype=np.float32),
+            k=1.0, dt=0.005,
+        )
+
+
 def test_homogeneous_geometry_rejects_anisotropic_grid():
     with pytest.raises(ValueError, match="isotropic"):
         build_homogeneous_cn_geom(
