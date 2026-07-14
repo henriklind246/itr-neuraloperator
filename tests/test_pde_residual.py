@@ -173,7 +173,7 @@ def test_qL_image_equals_pointwise_on_grid():
     # Mandatory single-source check: the encoder-image q_L (q_image) and the
     # residual q_L (q_at) come from the SAME reconstruct_qL helper, so they must
     # agree exactly on shared (y, t) grid nodes.
-    q_image, q_at = reconstruct_qL(
+    forcing = reconstruct_qL(
         temporal_family="sin",
         temporal_params=dict(A=1.0, f=3.0, t_on=0.0, t_off=0.2,
                              phase=0.0, tukey_alpha=0.5),
@@ -183,11 +183,11 @@ def test_qL_image_equals_pointwise_on_grid():
     )
     y_grid = np.linspace(0.0, 1.0, 12)
     t_axis = np.linspace(0.0, 0.3, 16)
-    img = q_image(y_grid, t_axis)  # (Ny, Nt)
+    img = forcing.evaluate_grid(y_grid, t_axis)
     assert img.shape == (12, 16)
     # Compare against q_at at the matched meshgrid points.
     YY, TT = np.meshgrid(y_grid, t_axis, indexing="ij")
-    pointwise = q_at(YY.ravel(), TT.ravel()).reshape(12, 16)
+    pointwise = forcing.evaluate_points(YY.ravel(), TT.ravel()).reshape(12, 16)
     assert np.allclose(img, pointwise, atol=1e-9)
 
 
@@ -208,13 +208,13 @@ def test_qL_image_resolves_sharpest_pulse():
 
     # Pick Nt so the grid spacing resolves the narrowest pulse (>= 2 samples in it).
     Nt = int(np.ceil(t_final / width)) * 4 + 1
-    q_image, _ = reconstruct_qL(
+    forcing = reconstruct_qL(
         temporal_family="pulse_train", temporal_params=tp,
         spatial_family="uniform", spatial_params={}, t_ramp=0.0,
     )
     y_grid = np.array([0.5])
     t_axis = np.linspace(0.0, t_final, Nt)
-    a_axis = q_image(y_grid, t_axis)[0]  # uniform s == 1 -> row is a(t)
+    a_axis = forcing.evaluate_grid(y_grid, t_axis)[0]
 
     in_support = (t_axis >= t_c) & (t_axis < t_c + width)
     assert in_support.sum() >= 2  # grid actually resolves the pulse

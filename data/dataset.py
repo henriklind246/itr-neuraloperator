@@ -733,6 +733,65 @@ def split_sim_ids(
     return train_ids, val_ids, test_ids
 
 
+def split_sim_ids_stratified(
+    labels,
+    train_frac: float = 0.7,
+    val_frac: float = 0.15,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Family-balanced train/val/test split for varying-IC datasets.
+
+    ``labels`` is a per-sim sequence of category strings (here the IC family).
+    Sims are shuffled within each family (seeded), then round-robin interleaved
+    across families so any contiguous chunk of length ``L`` holds each family
+    either ``floor(L/k)`` or ``ceil(L/k)`` times. The train/val/test cut is
+    contiguous on that interleaving, so each split's per-family counts differ by
+    at most one and every split with ``>= k`` samples contains all ``k``
+    families. Falls back to the plain shuffled split behavior only in ordering;
+    the fractions match :func:`split_sim_ids` exactly.
+    """
+    labels = np.asarray(labels)
+    num_sims = int(labels.shape[0])
+    rng = np.random.default_rng(seed)
+
+    families = sorted({str(v) for v in labels.tolist()})
+    queues: list[list[int]] = []
+    for fam in families:
+        fam_ids = np.nonzero(labels == fam)[0]
+        rng.shuffle(fam_ids)
+        queues.append(list(int(i) for i in fam_ids))
+
+    order: list[int] = []
+    idx = 0
+    while len(order) < num_sims:
+        q = queues[idx % len(queues)]
+        if q:
+            order.append(q.pop())
+        idx += 1
+    order_arr = np.asarray(order, dtype=int)
+
+    n_train = int(num_sims * train_frac)
+    n_val = int(num_sims * val_frac)
+    train_ids = order_arr[:n_train]
+    val_ids = order_arr[n_train:n_train + n_val]
+    test_ids = order_arr[n_train + n_val:]
+    return train_ids, val_ids, test_ids
+
+
+def load_dataset_meta(t_grid_path: str | Path) -> dict | None:
+    """Return the dataset ``meta.npy`` provenance dict, or None if absent.
+
+    Looks for ``meta.npy`` beside the trajectory grids. Written at generation
+    time for versioned (e.g. varying-IC) benchmarks with ``problem_version`` /
+    ``ic_mode`` / ``ic_families``; absent for legacy fixed-IC datasets, which the
+    load-time guard treats as a stale-dataset failure when a version is expected.
+    """
+    meta_path = Path(t_grid_path).parent / "meta.npy"
+    if not meta_path.exists():
+        return None
+    return dict(np.load(meta_path, allow_pickle=True).item())
+
+
 # ------- GLOBAL NORMALIZATION STATISTICS -------
 
 def compute_global_stats(

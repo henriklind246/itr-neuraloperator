@@ -337,11 +337,13 @@ def _q_left_grid(
     nt = int(t_values.shape[0])
     q_np = np.empty((bsz, nt, nx * ny), dtype=np.float32)
     for b, p in enumerate(params):
-        q_image, _ = reconstruct_qL(
+        forcing = reconstruct_qL(
             p["temporal_family"], p["temporal_params"],
             p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
         )
-        qg = np.asarray(q_image(y_grid_np, t_values), dtype=np.float32)  # (Ny, T)
+        qg = np.asarray(
+            forcing.evaluate_grid(y_grid_np, t_values), dtype=np.float32
+        )
         q_np[b] = np.tile(qg.T, (1, nx))  # (T, Nx*Ny)
     return torch.from_numpy(q_np).unsqueeze(-1).to(device)
 
@@ -453,11 +455,11 @@ def forcing_severity(
     peak and a ``pulse_train`` peak deposit very different heat); ``q_rms`` and
     ``Q_in`` are. ``amp`` is retained as metadata only.
     """
-    q_image, _ = reconstruct_qL(
+    forcing = reconstruct_qL(
         params["temporal_family"], params["temporal_params"],
         params["spatial_family"], params["spatial_params"], t_ramp=t_ramp,
     )
-    q = np.asarray(q_image(y_grid, t_dense), dtype=np.float64)  # (Ny, Nt)
+    q = np.asarray(forcing.evaluate_grid(y_grid, t_dense), dtype=np.float64)
     return severity_from_grid(q, np.asarray(y_grid, float), np.asarray(t_dense, float))
 
 

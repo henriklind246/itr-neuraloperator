@@ -93,16 +93,14 @@ model:
   # falls back to model.cvit above. Three heterogeneous token streams feed the
   # decoder cross-attention: a spatial CViTEncoder over spatial_in_ch channels
   # [T0_tilde, K_norm, D_norm] (patch_size must divide BOTH Nx and Ny of the data
-  # grid); a lightweight temporal encoder over the sampled forcing waveform
-  # forcing_seq (temporal_samples, temporal_token_dim) -> num_forcing_tokens
-  # tokens; and a param MLP over n_param_scalars=[x_hat, Rc_hat] -> num_param_tokens
-  # tokens. The decoder/coords/hard-right-Dirichlet behavior is identical to cvit.
+  # grid); an independent CViTEncoder over the signed forcing image
+  # q_L(y,t)/a_ref (forcing_patch_size must divide both image axes); and a param
+  # MLP over n_param_scalars=[x_hat, Rc_hat] -> num_param_tokens tokens. The
+  # decoder/coords/hard-right-Dirichlet behavior is identical to cvit.
   interface_cvit:
     spatial_in_ch: 3
-    temporal_token_dim: 2
-    temporal_samples: 128
-    num_forcing_tokens: 1
-    forcing_hidden: 128
+    forcing_in_ch: 1
+    forcing_patch_size: 8
     n_param_scalars: 2
     num_param_tokens: 1
     param_hidden: 128
@@ -229,9 +227,9 @@ training:
     # collocation_source selects where the per-step interface_x / R_c / forcing
     # params come from: "saved_train" (default) reads them from the saved TRAIN
     # sim_params.npy; "online" draws fresh from the generator distributions
-    # (Stage 7). forcing_samples is the sampled-waveform grid over [0, t_final]
-    # shown to the model (matches model.interface_cvit.temporal_samples). dt is the
-    # CN step for the two-slice residual; null resolves to the solver dt stored
+    # (Stage 7). The interfaces benchmark overrides forcing.ny_img/nt_img/a_ref
+    # for its complete-schedule image. dt is the CN step for the two-slice
+    # residual; null resolves to the solver dt stored
     # with the dataset (else the trajectory time spacing) so the residual matches
     # the FV scheme. intervals_per_sim CN intervals are scored per sim per step
     # (M = sim_batch * intervals_per_sim). stratified_time_sampling assigns causal
@@ -241,7 +239,6 @@ training:
     # interface-path bin count (distinct from causal.n_bins used by the diffusion
     # path). Causal weighting is applied to the interior CN residual only.
     collocation_source: saved_train
-    forcing_samples: 128
     dt: null
     intervals_per_sim: 2
     stratified_time_sampling: true

@@ -29,6 +29,33 @@ from problems.registry import get_problem
 
 DATA_DIR = Path(__file__).resolve().parent
 
+# Separate seed for the balanced IC-family shuffle. Distinct from the rng=0
+# (IC params) and rng_profile=1 (forcing params) streams so that changing IC
+# balancing never perturbs the forcing-parameter sequence.
+IC_ASSIGN_SEED = 2
+
+
+def build_balanced_ic_families(
+    num_sims: int, allowed_families: list[str], seed: int = IC_ASSIGN_SEED
+) -> list[str]:
+    """Return a length-``num_sims`` per-sim IC-family list with equal quotas.
+
+    Each allowed family gets ``num_sims // n`` sims; the first ``num_sims % n``
+    families get one extra, so per-family counts differ by at most one. The list
+    is shuffled by an independent seeded RNG so the assignment order is
+    decorrelated from the forcing/IC-parameter draws.
+    """
+    n = len(allowed_families)
+    if n == 0:
+        raise ValueError("allowed_families must be non-empty.")
+    base, rem = divmod(num_sims, n)
+    families: list[str] = []
+    for i, fam in enumerate(allowed_families):
+        families.extend([fam] * (base + (1 if i < rem else 0)))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(families)
+    return families
+
 
 def generate_lhs_samples(num_sims: int, seed: int = 0) -> np.ndarray:
     # R_c is the only material parameter sampled here; forcing-family params
@@ -201,6 +228,7 @@ def save_dataset(
     t_ramp: float,
     trajectories: np.ndarray,
     sim_params: list[dict],
+    meta: dict | None = None,
 ) -> Path:
     """Write the standard dataset .npy files and return the save directory."""
     x_grid = x.astype(np.float32)
@@ -222,6 +250,11 @@ def save_dataset(
     np.save(save_path / "ramp_seconds.npy", np.float64(t_ramp))
     np.save(save_path / "trajectories.npy", trajectories)
     np.save(save_path / "sim_params.npy", np.array(sim_params, dtype=object), allow_pickle=True)
+    # Dataset-format tag + IC provenance. In-place editing of a varying-IC
+    # benchmark keeps the same name and tensor shapes as the old fixed-IC set, so
+    # meta.npy is the only signal that distinguishes them and is asserted on load.
+    if meta is not None:
+        np.save(save_path / "meta.npy", np.array(meta, dtype=object), allow_pickle=True)
     print("Saved to:", save_path, x_grid.shape, y_grid.shape, t_grid.shape, trajectories.shape, flush=True)
     return save_path
 
@@ -250,6 +283,16 @@ def generate_sim_data(
     print(f"Benchmark: {benchmark}", flush=True)
     print("Building simulation parameters.", flush=True)
 
+    # Varying-IC benchmarks consume a per-sim balanced family assignment built by
+    # a separate seeded RNG (so IC balancing never perturbs the forcing draws).
+    # The spec reads a scalar per sim; it never decides the balance itself. Other
+    # benchmarks (no ic_mode attribute) are byte-unaffected: the key is absent.
+    allowed_ic_families = ic_families if ic_families is not None else list(IC_FAMILIES.keys())
+    if getattr(spec, "ic_mode", None) == "varying":
+        setup["time_cfg"]["ic_family_assignment"] = build_balanced_ic_families(
+            num_sims=num_sims, allowed_families=allowed_ic_families, seed=IC_ASSIGN_SEED,
+        )
+
     sim_params = spec.sample_sim_params(
         rng=rng, rng_profile=rng_profile,
         grids=setup["grids"], time_cfg=setup["time_cfg"],
@@ -260,10 +303,22 @@ def generate_sim_data(
         setup["Nt_saved"], setup["Nx"], setup["Ny"],
     )
 
+    # Persist the dataset-format tag + IC provenance only when the spec declares a
+    # version, so the load-time guard can reject a stale fixed-IC dataset that
+    # shares this benchmark's name and shapes.
+    meta = None
+    problem_version = getattr(spec, "problem_version", None)
+    if problem_version is not None:
+        meta = {
+            "problem_version": problem_version,
+            "ic_mode": getattr(spec, "ic_mode", None),
+            "ic_families": list(allowed_ic_families),
+        }
+
     save_path = Path(save_dir) if save_dir is not None else DATA_DIR
     save_dataset(
         save_path, x, y, t, save_stride, setup["dt"], setup["t_ramp"],
-        trajectories, sim_params,
+        trajectories, sim_params, meta=meta,
     )
 
 def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:

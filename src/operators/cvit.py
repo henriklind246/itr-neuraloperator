@@ -543,50 +543,6 @@ class ForcingCViT(CViT):
         )
 
 
-# --------- interface-benchmark token encoders ---------
-
-class ForcingTokenEncoder(nn.Module):
-    """Sampled forcing waveform ``forcing_seq (B, M, token_dim)`` -> forcing
-    tokens ``z_f (B, num_tokens, emb_dim)``.
-
-    A lightweight conv1d + mean/max-pool encoder (the FNO's
-    ``TemporalForcingEncoder`` pattern, ``fno2d.py:181``), NOT a vision
-    transformer: it consumes the same sampled ``a(t)`` function values the FNO
-    sees and emits CViT-width cross-attention tokens. The baseline
-    ``num_tokens=1`` projects the pooled schedule summary to a single token; a
-    larger count adds temporally-resolved read-out tokens. Max pooling keeps
-    localized pulse activations that mean pooling would smear.
-    """
-
-    def __init__(
-        self,
-        token_dim: int,
-        emb_dim: int,
-        num_tokens: int = 1,
-        hidden: int = 128,
-    ):
-        super().__init__()
-        self.num_tokens = int(num_tokens)
-        self.emb_dim = int(emb_dim)
-        self.lift = nn.Linear(token_dim, hidden)
-        self.conv1 = nn.Conv1d(hidden, hidden, kernel_size=5, padding=2)
-        self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=5, padding=2)
-        self.proj = nn.Linear(2 * hidden, self.num_tokens * self.emb_dim)
-        self.act = nn.GELU()
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        B = z.shape[0]
-        h = self.act(self.lift(z))          # (B, M, hidden)
-        h = h.transpose(1, 2)               # (B, hidden, M)
-        h = self.act(self.conv1(h))
-        h = self.act(self.conv2(h))
-        h_mean = h.mean(dim=-1)             # (B, hidden)
-        h_max = h.amax(dim=-1)              # (B, hidden)
-        h = torch.cat([h_mean, h_max], dim=-1)
-        out = self.proj(h)                  # (B, num_tokens*emb_dim)
-        return out.view(B, self.num_tokens, self.emb_dim)
-
-
 class ParamTokenEncoder(nn.Module):
     """Interface scalars ``[x_hat, Rc_hat] (B, n_scalars)`` -> parameter tokens
     ``z_p (B, num_tokens, emb_dim)``.
@@ -628,17 +584,18 @@ class InterfaceCViT(nn.Module):
     from three heterogeneous streams; the decoder stays a pure coordinate+time
     query with the existing time-only FiLM (``CViTDecoder``). The model is
     conditioned only on information available at inference — the interface
-    geometry ``(x_Gamma, R_c)`` and the sampled applied-flux waveform ``a(.)`` —
+    geometry ``(x_Gamma, R_c)`` and the applied-flux image ``q_L(y,t)`` —
     never the synthetic generator parameters, so it learns the operator
-    ``(x_Gamma, R_c, a(.)) -> T``.
+    ``(x_Gamma, R_c, q_L(y,t)) -> T``.
 
     Streams (each -> ``emb_dim``-wide tokens, plus a learned 3-way modality
     embedding):
       1. spatial  ``z_s``: full ``CViTEncoder`` over ``[T0_tilde, K_norm, D_norm]``.
-      2. forcing  ``z_f``: ``ForcingTokenEncoder`` over ``forcing_seq (B,128,2)``.
+      2. forcing  ``z_f``: independent ``CViTEncoder`` over the normalized
+         boundary space-time image ``(B,1,Ny_img,Nt_img)``.
       3. param    ``z_p``: ``ParamTokenEncoder`` over ``[x_hat, Rc_hat]``.
 
-    ``encode(u_spatial, forcing_seq, params)`` builds the cached latent token set
+    ``encode(u_spatial, forcing_image, params)`` builds the cached latent token set
     (query-independent, so run once per sim); ``decode(latent, coords, t)`` is the
     pure coordinate+time query reused for both CN time slices. The hard
     right-Dirichlet ansatz ``T = t_right_tilde + (1 - x) * raw`` keeps the x=1
@@ -649,11 +606,14 @@ class InterfaceCViT(nn.Module):
     def __init__(
         self,
         spatial_in_ch: int = 3,
+        forcing_in_ch: int = 1,
         out_dim: int = 1,
         emb_dim: int = 256,
         dec_emb_dim: int | None = None,
         patch_size: int = 10,
         grid_size: tuple[int, int] = (100, 100),
+        forcing_patch_size: int = 8,
+        forcing_grid_size: tuple[int, int] = (96, 256),
         depth_enc: int = 4,
         depth_dec: int = 2,
         num_heads: int = 8,
@@ -664,10 +624,6 @@ class InterfaceCViT(nn.Module):
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
-        temporal_token_dim: int = 2,
-        temporal_samples: int = 128,
-        num_forcing_tokens: int = 1,
-        forcing_hidden: int = 128,
         n_param_scalars: int = 2,
         num_param_tokens: int = 1,
         param_hidden: int = 128,
@@ -675,7 +631,32 @@ class InterfaceCViT(nn.Module):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
         self.hard_right_dirichlet = bool(hard_right_dirichlet)
-        self.temporal_samples = int(temporal_samples)
+        if int(forcing_in_ch) != 1 or int(n_param_scalars) != 2:
+            raise ValueError(
+                "InterfaceCViT requires one forcing-image channel and exactly "
+                "two parameter scalars [interface_x, R_c]."
+            )
+        self.n_param_scalars = 2
+        forcing_grid_size = tuple(int(v) for v in forcing_grid_size)
+        forcing_patch_size = int(forcing_patch_size)
+        if len(forcing_grid_size) != 2 or forcing_patch_size <= 0 or any(
+            v <= 0 for v in forcing_grid_size
+        ):
+            raise ValueError(
+                "forcing_grid_size must contain two positive dimensions and "
+                f"forcing_patch_size must be positive; got {forcing_grid_size} "
+                f"and {forcing_patch_size}."
+            )
+        if any(v % forcing_patch_size != 0 for v in forcing_grid_size):
+            raise ValueError(
+                "forcing_grid_size dimensions must be divisible by "
+                f"forcing_patch_size; got {forcing_grid_size} and {forcing_patch_size}."
+            )
+        self.forcing_grid_size = forcing_grid_size
+        self.forcing_patch_size = forcing_patch_size
+        self.num_forcing_tokens = (
+            forcing_grid_size[0] // forcing_patch_size
+        ) * (forcing_grid_size[1] // forcing_patch_size)
         self.spatial_encoder = CViTEncoder(
             in_ch=int(spatial_in_ch),
             emb_dim=emb_dim,
@@ -686,11 +667,15 @@ class InterfaceCViT(nn.Module):
             mlp_ratio=mlp_ratio,
             activation=activation,
         )
-        self.forcing_encoder = ForcingTokenEncoder(
-            token_dim=int(temporal_token_dim),
+        self.forcing_encoder = CViTEncoder(
+            in_ch=int(forcing_in_ch),
             emb_dim=emb_dim,
-            num_tokens=int(num_forcing_tokens),
-            hidden=int(forcing_hidden),
+            patch_size=forcing_patch_size,
+            grid_size=forcing_grid_size,
+            depth=depth_enc,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            activation=activation,
         )
         self.param_encoder = ParamTokenEncoder(
             n_scalars=int(n_param_scalars),
@@ -723,19 +708,49 @@ class InterfaceCViT(nn.Module):
     def encode(
         self,
         u_spatial: torch.Tensor,
-        forcing_seq: torch.Tensor,
+        forcing_image: torch.Tensor,
         params: torch.Tensor,
     ) -> torch.Tensor:
         """Build the cached latent token set; shape ``(B, N_s+N_f+N_p, emb_dim)``.
 
-        u_spatial:(B, spatial_in_ch, Nx, Ny); forcing_seq:(B, M, token_dim);
+        u_spatial:(B, spatial_in_ch, Nx, Ny); forcing_image:(B, 1, Ny_img, Nt_img);
         params:(B, n_param_scalars) = ``[x_hat, Rc_hat]``. Query-independent, so
         run once per sim and reuse for every decode.
         """
+        if tuple(forcing_image.shape[1:]) != (1, *self.forcing_grid_size):
+            raise ValueError(
+                "forcing_image must have shape (B, 1, Ny_img, Nt_img) with "
+                f"(Ny_img, Nt_img)={self.forcing_grid_size}; got "
+                f"{tuple(forcing_image.shape)}."
+            )
+        if params.ndim != 2 or params.shape[1] != self.n_param_scalars:
+            raise ValueError(
+                "params must have shape (B, 2) = [normalized interface_x, "
+                f"normalized R_c]; got {tuple(params.shape)}."
+            )
         z_s = self.spatial_encoder(u_spatial) + self.modality[0]
-        z_f = self.forcing_encoder(forcing_seq) + self.modality[1]
+        z_f = self.forcing_encoder(forcing_image) + self.modality[1]
+        if z_f.shape[1] != self.num_forcing_tokens:
+            raise RuntimeError(
+                f"Expected {self.num_forcing_tokens} forcing tokens, got {z_f.shape[1]}."
+            )
         z_p = self.param_encoder(params) + self.modality[2]
         return torch.cat([z_s, z_f, z_p], dim=1)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        legacy = any(
+            key.startswith((
+                "forcing_encoder.lift.", "forcing_encoder.conv1.",
+                "forcing_encoder.conv2.", "forcing_encoder.proj.",
+            ))
+            for key in state_dict
+        )
+        if legacy:
+            raise RuntimeError(
+                "Legacy InterfaceCViT checkpoint uses waveform_tokens; expected "
+                "space_time_image representation version 1. Start a fresh run."
+            )
+        return super().load_state_dict(state_dict, strict=strict)
 
     def decode(
         self, latent: torch.Tensor, coords: torch.Tensor, t: torch.Tensor
@@ -763,8 +778,8 @@ class InterfaceCViT(nn.Module):
         u_spatial: torch.Tensor,
         coords: torch.Tensor,
         t: torch.Tensor,
-        forcing_seq: torch.Tensor,
+        forcing_image: torch.Tensor,
         params: torch.Tensor,
     ) -> torch.Tensor:
         """Single-shot ``encode`` + ``decode`` (chunked callers use them directly)."""
-        return self.decode(self.encode(u_spatial, forcing_seq, params), coords, t)
+        return self.decode(self.encode(u_spatial, forcing_image, params), coords, t)

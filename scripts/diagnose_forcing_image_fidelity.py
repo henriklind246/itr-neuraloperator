@@ -233,16 +233,20 @@ def run_image_fidelity(
     for tf in TEMPORAL_FAMILY_ORDER:
         for sf in SPATIAL_FAMILY_ORDER:
             params = _sample_params(tf, sf, dt, t_final, c_dom, d_dom, seed)
-            q_image, _ = reconstruct_qL(
+            forcing = reconstruct_qL(
                 params["temporal_family"], params["temporal_params"],
                 params["spatial_family"], params["spatial_params"], t_ramp=t_ramp,
             )
-            q_ref = np.asarray(q_image(y_dense, t_dense), dtype=np.float64)
+            q_ref = np.asarray(
+                forcing.evaluate_grid(y_dense, t_dense), dtype=np.float64
+            )
             for ny_img in ny_img_list:
                 for nt_img in nt_img_list:
                     y_img = np.linspace(c_dom, d_dom, ny_img)
                     t_img = np.linspace(0.0, t_final, nt_img)
-                    q_coarse = np.asarray(q_image(y_img, t_img), dtype=np.float64)
+                    q_coarse = np.asarray(
+                        forcing.evaluate_grid(y_img, t_img), dtype=np.float64
+                    )
                     q_rec = _bilinear_to_dense(q_coarse, y_img, t_img, y_dense, t_dense)
                     # encoder-faithful sampled image (build_forcing_image / a_ref);
                     # multiply back by a_ref to recover q at the img nodes.
@@ -305,14 +309,18 @@ def _make_plots(
 
     def _overlay(tf, sf, axis, fname, title):
         params = _sample_params(tf, sf, dt, t_final, c_dom, d_dom, seed)
-        q_image, _ = reconstruct_qL(
+        forcing = reconstruct_qL(
             params["temporal_family"], params["temporal_params"],
             params["spatial_family"], params["spatial_params"], t_ramp=t_ramp,
         )
-        q_ref = np.asarray(q_image(y_dense, t_dense), dtype=np.float64)
+        q_ref = np.asarray(
+            forcing.evaluate_grid(y_dense, t_dense), dtype=np.float64
+        )
         y_img = np.linspace(c_dom, d_dom, ny0)
         t_img = np.linspace(0.0, t_final, nt0)
-        q_coarse = np.asarray(q_image(y_img, t_img), dtype=np.float64)
+        q_coarse = np.asarray(
+            forcing.evaluate_grid(y_img, t_img), dtype=np.float64
+        )
         q_rec = _bilinear_to_dense(q_coarse, y_img, t_img, y_dense, t_dense)
         fig, ax = plt.subplots(figsize=(6.4, 4.0))
         if axis == "t":

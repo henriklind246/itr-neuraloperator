@@ -11,15 +11,15 @@ from problems.interfaces import (
     RC_RANGE,
 )
 from src.operators.cvit import CViT, ForcingCViT, InterfaceCViT
-from src.operators.train_pino import build_cvit
+from src.operators.train_pino import build_cvit, load_interface_cvit_checkpoint
 
 """
-Stage 3 deterministic architecture / wiring tests for `InterfaceCViT` (§2/§5).
-These are exact, seed-free assertions on how the three token streams are wired
-(spatial field / sampled forcing waveform / interface scalars) and on the
-function-value information contract `(x_Gamma, R_c, a(.)) -> T` — NOT claims about
+Deterministic architecture / wiring tests for `InterfaceCViT`. These are exact,
+seed-free assertions on how the three token streams are wired (spatial field /
+forcing image / interface scalars) and on the function-value information
+contract `(x_Gamma, R_c, q_L(y,t)) -> T` — NOT claims about
 learned behavior. They pin:
-  - the model consumes only `(u_spatial, forcing_seq, params=[x_hat, Rc_hat])`,
+  - the model consumes only `(u_spatial, forcing_image, params=[x_hat, Rc_hat])`,
     never the raw generator parameters;
   - forcing / parameter tokens depend deterministically on their inputs and are
     on the autograd path;
@@ -28,6 +28,7 @@ learned behavior. They pin:
 """
 
 GRID = (20, 20)
+FORCING_GRID = (16, 32)
 EMB = 32
 
 
@@ -35,7 +36,8 @@ def _model(**kw):
     defaults = dict(
         spatial_in_ch=3, emb_dim=EMB, patch_size=10, grid_size=GRID,
         depth_enc=1, depth_dec=1, num_heads=4, t_final=0.2,
-        num_forcing_tokens=1, num_param_tokens=1,
+        forcing_patch_size=8, forcing_grid_size=FORCING_GRID,
+        num_param_tokens=1,
     )
     defaults.update(kw)
     m = InterfaceCViT(**defaults)
@@ -45,42 +47,51 @@ def _model(**kw):
 def _inputs(B=2, Nq=7, seed=0):
     g = torch.Generator().manual_seed(seed)
     u = torch.randn(B, 3, *GRID, generator=g)
-    fseq = torch.randn(B, 128, 2, generator=g)
+    forcing_image = torch.randn(B, 1, *FORCING_GRID, generator=g)
     params = torch.rand(B, 2, generator=g)
     coords = torch.rand(B, Nq, 2, generator=g)
     t = torch.rand(B, Nq, 1, generator=g) * 0.2
-    return u, fseq, params, coords, t
+    return u, forcing_image, params, coords, t
 
 
 def test_model_smoke_shapes():
     m = _model()
-    u, fseq, params, coords, t = _inputs()
-    out = m(u, coords, t, fseq, params)
+    u, forcing_image, params, coords, t = _inputs()
+    out = m(u, coords, t, forcing_image, params)
     assert out.shape == (2, 7, 1)
-    lat = m.encode(u, fseq, params)
-    # 100/patch^2 spatial tokens (10x10) + 1 forcing + 1 param... grid 20x20 p10 -> 4
-    assert lat.shape == (2, 4 + 1 + 1, EMB)
+    lat = m.encode(u, forcing_image, params)
+    assert lat.shape == (2, 4 + 8 + 1, EMB)
 
 
 def test_encode_signature_excludes_generator_params():
     """The function-value contract: `encode` takes only the spatial field, the
-    sampled waveform, and the two interface scalars — there is no argument path
+    forcing image, and the two interface scalars — there is no argument path
     for amplitude/frequency/phase."""
     sig = list(inspect.signature(InterfaceCViT.encode).parameters)
-    assert sig == ["self", "u_spatial", "forcing_seq", "params"]
+    assert sig == ["self", "u_spatial", "forcing_image", "params"]
     for bad in ("amplitude", "frequency", "phase", "temporal_params"):
         assert bad not in sig
 
 
-def test_forcing_tokens_track_sampled_sequence():
+def test_external_waveform_record_cannot_change_fixed_model_inputs():
+    model = _model()
+    u, forcing_image, params, coords, t = _inputs()
+    external_record = {"A": 50.0, "f": 2.0, "phase": 0.0}
+    first = model(u, coords, t, forcing_image, params)
+    external_record.update({"A": 300.0, "f": 20.0, "phase": 1.5})
+    second = model(u, coords, t, forcing_image, params)
+    assert torch.equal(first, second)
+
+
+def test_forcing_tokens_track_image():
     m = _model()
-    u, fseq, params, _, _ = _inputs()
-    zf_a = m.forcing_encoder(fseq)
-    zf_b = m.forcing_encoder(fseq.clone())
-    assert torch.equal(zf_a, zf_b)  # identical seq -> bitwise identical token
-    fseq2 = fseq.clone()
-    fseq2[0, :, 1] += 1.0  # different waveform for sim 0 only
-    zf_c = m.forcing_encoder(fseq2)
+    _, forcing_image, _, _, _ = _inputs()
+    zf_a = m.forcing_encoder(forcing_image)
+    zf_b = m.forcing_encoder(forcing_image.clone())
+    assert torch.equal(zf_a, zf_b)
+    image2 = forcing_image.clone()
+    image2[0] += 1.0
+    zf_c = m.forcing_encoder(image2)
     assert not torch.allclose(zf_a[0], zf_c[0])  # sim 0 token changed
     assert torch.equal(zf_a[1], zf_c[1])         # sim 1 untouched
 
@@ -99,8 +110,8 @@ def test_param_token_tracks_scalars():
 
 def test_gradients_reach_forcing_and_param_branches():
     m = _model().train()
-    u, fseq, params, coords, t = _inputs()
-    out = m(u, coords, t, fseq, params)
+    u, forcing_image, params, coords, t = _inputs()
+    out = m(u, coords, t, forcing_image, params)
     out.sum().backward()
     fp = list(m.forcing_encoder.parameters())
     pp = list(m.param_encoder.parameters())
@@ -113,8 +124,8 @@ def test_double_backward_through_decode():
     """The PDE residual differentiates the decoder twice w.r.t. coords with
     create_graph=True; the explicit-attention decoder must survive it."""
     m = _model()
-    u, fseq, params, _, _ = _inputs()
-    lat = m.encode(u, fseq, params)
+    u, forcing_image, params, _, _ = _inputs()
+    lat = m.encode(u, forcing_image, params)
     B = u.shape[0]
     x = torch.rand(B, 5, 1, requires_grad=True)
     y = torch.rand(B, 5, 1, requires_grad=True)
@@ -128,8 +139,8 @@ def test_double_backward_through_decode():
 
 def test_hard_right_dirichlet_exact_at_x1():
     m = _model()
-    u, fseq, params, coords, t = _inputs()
-    lat = m.encode(u, fseq, params)
+    u, forcing_image, params, coords, t = _inputs()
+    lat = m.encode(u, forcing_image, params)
     coords1 = coords.clone()
     coords1[..., 0] = 1.0  # x = 1 wall
     out = m.decode(lat, coords1, t)
@@ -138,29 +149,31 @@ def test_hard_right_dirichlet_exact_at_x1():
 
 def test_encode_once_decode_twice_matches_single_shot():
     m = _model()
-    u, fseq, params, coords, t = _inputs()
-    lat = m.encode(u, fseq, params)
+    u, forcing_image, params, coords, t = _inputs()
+    lat = m.encode(u, forcing_image, params)
     d = m.decode(lat, coords, t)
-    f = m(u, coords, t, fseq, params)
+    f = m(u, coords, t, forcing_image, params)
     assert torch.allclose(d, f, atol=1e-6)
 
 
 def test_batch_permutation_equivariance():
     m = _model()
-    u, fseq, params, coords, t = _inputs(B=3)
-    out = m(u, coords, t, fseq, params)
+    u, forcing_image, params, coords, t = _inputs(B=3)
+    out = m(u, coords, t, forcing_image, params)
     perm = torch.tensor([2, 0, 1])
-    out_p = m(u[perm], coords[perm], t[perm], fseq[perm], params[perm])
+    out_p = m(
+        u[perm], coords[perm], t[perm], forcing_image[perm], params[perm]
+    )
     assert torch.allclose(out_p, out[perm], atol=1e-6)
 
 
 def test_changing_one_sim_forcing_isolates_to_that_sim():
     m = _model()
-    u, fseq, params, coords, t = _inputs(B=3)
-    out = m(u, coords, t, fseq, params)
-    fseq2 = fseq.clone()
-    fseq2[1, :, 1] += 2.0  # perturb only sim 1's waveform
-    out2 = m(u, coords, t, fseq2, params)
+    u, forcing_image, params, coords, t = _inputs(B=3)
+    out = m(u, coords, t, forcing_image, params)
+    image2 = forcing_image.clone()
+    image2[1] += 2.0
+    out2 = m(u, coords, t, image2, params)
     assert not torch.allclose(out[1], out2[1])           # sim 1 responds
     assert torch.allclose(out[0], out2[0], atol=1e-6)    # sims 0, 2 unchanged
     assert torch.allclose(out[2], out2[2], atol=1e-6)
@@ -199,16 +212,115 @@ def test_build_cvit_interfaces_variant():
                 "num_heads": 4, "mlp_ratio": 2.0,
             },
             "interface_cvit": {
-                "spatial_in_ch": 3, "num_forcing_tokens": 1, "num_param_tokens": 1,
+                "spatial_in_ch": 3, "forcing_in_ch": 1,
+                "forcing_patch_size": 8, "num_param_tokens": 1,
             },
-        }
+        },
+        "training": {"pino": {"forcing": {
+            "ny_img": FORCING_GRID[0], "nt_img": FORCING_GRID[1], "a_ref": 300.0,
+        }}},
     }
     m = build_cvit(config, mu=300.0, sigma=10.0, grid_size=GRID, t_final=0.2,
                    variant="interfaces")
     assert isinstance(m, InterfaceCViT)
-    u, fseq, params, coords, t = _inputs()
-    out = m(u, coords, t, fseq, params)
+    u, forcing_image, params, coords, t = _inputs()
+    out = m(u, coords, t, forcing_image, params)
     assert out.shape == (2, 7, 1)
+
+
+def test_production_token_contract_is_384_plus_100_plus_one():
+    m = InterfaceCViT(
+        spatial_in_ch=3, emb_dim=16, patch_size=10, grid_size=(100, 100),
+        forcing_patch_size=8, forcing_grid_size=(96, 256), depth_enc=0,
+        depth_dec=1, num_heads=4,
+    )
+    assert m.forcing_encoder.pos_emb.shape[1] == 384
+    assert m.spatial_encoder.pos_emb.shape[1] == 100
+    assert 384 + 100 + m.param_encoder.num_tokens == 485
+
+
+def test_rejects_invalid_forcing_image_contract():
+    with pytest.raises(ValueError, match="divisible"):
+        _model(forcing_grid_size=(95, 256))
+    m = _model()
+    u, forcing_image, params, _, _ = _inputs()
+    with pytest.raises(ValueError, match="forcing_image must have shape"):
+        m.encode(u, forcing_image[..., :-1], params)
+    with pytest.raises(ValueError, match="params must have shape"):
+        m.encode(u, forcing_image, torch.zeros(u.shape[0], 3))
+
+
+def test_rejects_legacy_waveform_configuration():
+    config = {
+        "model": {
+            "cvit": {"emb_dim": EMB, "patch_size": 10},
+            "interface_cvit": {"temporal_samples": 128},
+        },
+        "training": {"pino": {"forcing": {
+            "ny_img": 16, "nt_img": 32, "a_ref": 300.0,
+        }}},
+    }
+    with pytest.raises(ValueError, match="no longer supports waveform-token"):
+        build_cvit(config, 300.0, 10.0, GRID, 0.2, variant="interfaces")
+
+
+def test_legacy_waveform_state_fails_before_generic_state_mismatch():
+    m = _model()
+    with pytest.raises(RuntimeError, match="waveform_tokens"):
+        m.load_state_dict({"forcing_encoder.lift.weight": torch.zeros(1)})
+
+
+def test_checkpoint_round_trip_uses_saved_config_and_image_spec(tmp_path):
+    config = {
+        "model": {
+            "cvit": {
+                "emb_dim": EMB, "patch_size": 10, "depth_enc": 1,
+                "depth_dec": 1, "num_heads": 4, "mlp_ratio": 2.0,
+            },
+            "interface_cvit": {
+                "spatial_in_ch": 3, "forcing_in_ch": 1,
+                "forcing_patch_size": 8, "num_param_tokens": 1,
+            },
+        },
+        "training": {"pino": {"forcing": {
+            "ny_img": 16, "nt_img": 32, "a_ref": 300.0,
+        }}},
+    }
+    model = build_cvit(
+        config, mu=300.0, sigma=10.0, grid_size=GRID, t_final=0.2,
+        variant="interfaces",
+    ).eval()
+    spec = {
+        "representation": "space_time_image", "version": 1,
+        "forcing_schema_version": 1, "axis_order": "channel_y_time",
+        "dtype": "float32", "ny_img": 16, "nt_img": 32,
+        "patch_size": 8, "include_endpoints": True, "y_min": 0.0,
+        "y_max": 1.0, "t_min": 0.0, "t_final": 0.2,
+        "sign_convention": "positive_inward_left_flux",
+        "normalization": "fixed_division", "a_ref": 300.0,
+        "clipping": False,
+        "ramp": {"type": "cubic_smoothstep", "version": 1, "duration": 0.01},
+        "spatial_grid_size": list(GRID),
+    }
+    path = tmp_path / "interface.pt"
+    torch.save({
+        "model_state": model.state_dict(), "mu_global": 300.0,
+        "sigma_global": 10.0, "config": config, "interface_forcing": spec,
+    }, path)
+    restored, checkpoint = load_interface_cvit_checkpoint(path)
+    restored.eval()
+    u, forcing_image, params, coords, t = _inputs()
+    torch.testing.assert_close(
+        restored(u, coords, t, forcing_image, params),
+        model(u, coords, t, forcing_image, params),
+        rtol=0.0, atol=0.0,
+    )
+    assert checkpoint["interface_forcing"] == spec
+
+    legacy_path = tmp_path / "legacy.pt"
+    torch.save({"model_state": {}, "config": config}, legacy_path)
+    with pytest.raises(RuntimeError, match="Legacy waveform-token checkpoints"):
+        load_interface_cvit_checkpoint(legacy_path)
 
 
 def test_untouched_cvit_forcingcvit_still_build():

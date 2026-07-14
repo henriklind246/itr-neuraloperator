@@ -340,16 +340,18 @@ def run_linearity(
         df_add = cache[i]["df"] + cache[j]["df"]
         m = _delta_metrics(dm_joint, df_joint, dm_add, df_add, delta_eps)
         # combined severity of q_i + q_j on the dense grid.
-        qi_img, _ = reconstruct_qL(
+        forcing_i = reconstruct_qL(
             pi["temporal_family"], pi["temporal_params"],
             pi["spatial_family"], pi["spatial_params"], t_ramp=cfg.t_ramp,
         )
-        qj_img, _ = reconstruct_qL(
+        forcing_j = reconstruct_qL(
             pj["temporal_family"], pj["temporal_params"],
             pj["spatial_family"], pj["spatial_params"], t_ramp=cfg.t_ramp,
         )
-        q_sum = (np.asarray(qi_img(y_dense, t_dense), dtype=np.float64)
-                 + np.asarray(qj_img(y_dense, t_dense), dtype=np.float64))
+        q_sum = (
+            np.asarray(forcing_i.evaluate_grid(y_dense, t_dense), dtype=np.float64)
+            + np.asarray(forcing_j.evaluate_grid(y_dense, t_dense), dtype=np.float64)
+        )
         sev = severity_from_grid(q_sum, y_dense, t_dense)
         rows.append({
             "test": "superposition", "regime": "id_local",

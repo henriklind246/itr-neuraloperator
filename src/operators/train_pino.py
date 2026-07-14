@@ -15,11 +15,13 @@ import torch
 
 from data.dataset import (
     compute_global_stats,
+    load_dataset_meta,
     load_ramp_seconds,
     load_sim_data,
     load_solver_dt,
     problem_from_config,
     split_sim_ids,
+    split_sim_ids_stratified,
 )
 from problems.diffusion import T_RIGHT
 from problems.diffusion_forcing import K_SLAB
@@ -43,6 +45,9 @@ from src.operators.train import (
 )
 from src.operators.utils import resolve_device
 from src.physics.boundary_forcing import (
+    A_REF_FLUX,
+    FORCING_SCHEMA_VERSION,
+    RAMP_SCHEMA_VERSION,
     SPATIAL_SAMPLERS,
     TEMPORAL_SAMPLERS,
     build_interface_forcing,
@@ -325,9 +330,45 @@ def load_diffusion_data(config: dict) -> dict[str, Any]:
         y_grid_path=config["data"]["y_grid_path"],
         t_grid_path=config["data"]["t_grid_path"],
     )
-    train_ids, val_ids, test_ids = split_sim_ids(
-        num_sims=trajectories.shape[0], train_frac=0.7, val_frac=0.15, seed=0,
-    )
+    num_sims = int(trajectories.shape[0])
+
+    # Versioned (varying-IC) benchmarks: assert the dataset was regenerated with
+    # the matching problem_version and stratify the split by IC family. In-place
+    # editing keeps the benchmark name and tensor shapes identical to the old
+    # fixed-IC set, so this guard is the only thing catching a stale dataset.
+    spec = problem_from_config(config)
+    expected_version = getattr(spec, "problem_version", None)
+    if expected_version is not None:
+        meta = load_dataset_meta(config["data"]["t_grid_path"])
+        if meta is None:
+            raise ValueError(
+                f"Benchmark {getattr(spec, 'name', '?')!r} expects "
+                f"problem_version={expected_version!r} but the dataset has no "
+                f"meta.npy; regenerate it with data/generate_dataset.py."
+            )
+        found_version = meta.get("problem_version")
+        if found_version != expected_version:
+            raise ValueError(
+                f"Dataset problem_version={found_version!r} != expected "
+                f"{expected_version!r} for benchmark {getattr(spec, 'name', '?')!r}; "
+                f"the dataset is stale — regenerate it."
+            )
+        sim_params = np.load(
+            Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy",
+            allow_pickle=True,
+        )
+        if len(sim_params) != num_sims:
+            raise ValueError(
+                f"sim_params length {len(sim_params)} != num_sims {num_sims}."
+            )
+        ic_labels = np.array([str(sp["ic_family"]) for sp in sim_params])
+        train_ids, val_ids, test_ids = split_sim_ids_stratified(
+            ic_labels, train_frac=0.7, val_frac=0.15, seed=0,
+        )
+    else:
+        train_ids, val_ids, test_ids = split_sim_ids(
+            num_sims=num_sims, train_frac=0.7, val_frac=0.15, seed=0,
+        )
     norm_max_time = config["data"].get("norm_max_time", None)
     mu_global, sigma_global = compute_global_stats(
         trajectories, train_ids, t_grid=t_grid, max_time=norm_max_time,
@@ -439,15 +480,19 @@ def build_forcing_image(
     ``reconstruct_qL`` helper the left-wall residual uses, so the encoder image
     and the residual forcing can never diverge. Axes are (rows = y, cols = t).
     """
+    if float(a_ref) <= 0.0:
+        raise ValueError(f"a_ref must be > 0; got {a_ref}.")
     B = len(params)
     Ny, Nt = int(y_img.shape[0]), int(t_img.shape[0])
     img = np.empty((B, 1, Ny, Nt), dtype=np.float32)
     for b, p in enumerate(params):
-        q_image, _ = reconstruct_qL(
+        forcing = reconstruct_qL(
             p["temporal_family"], p["temporal_params"],
             p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
         )
-        img[b, 0] = np.asarray(q_image(y_img, t_img), dtype=np.float32) / float(a_ref)
+        img[b, 0] = np.asarray(
+            forcing.evaluate_grid(y_img, t_img), dtype=np.float32
+        ) / float(a_ref)
     return torch.from_numpy(img).to(device)
 
 
@@ -470,11 +515,11 @@ def left_wall_qL(
     B, N = len(params), int(yv.shape[0])
     q = np.empty((B, N), dtype=np.float32)
     for b, p in enumerate(params):
-        _, q_at = reconstruct_qL(
+        forcing = reconstruct_qL(
             p["temporal_family"], p["temporal_params"],
             p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
         )
-        q[b] = np.asarray(q_at(yv, tv), dtype=np.float32)
+        q[b] = np.asarray(forcing.evaluate_points(yv, tv), dtype=np.float32)
     return torch.from_numpy(q).unsqueeze(-1).to(device)
 
 
@@ -1105,11 +1150,13 @@ def validate_forcing_gnrmse(
             # avoids the Nx-redundant pointwise Nt*Nx*Ny evaluation.
             q_np = np.empty((B, Nt, M), dtype=np.float32)
             for b, p in enumerate(params):
-                q_image, _ = reconstruct_qL(
+                forcing = reconstruct_qL(
                     p["temporal_family"], p["temporal_params"],
                     p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
                 )
-                qg = np.asarray(q_image(y_grid_np, t_grid), dtype=np.float32)  # (Ny,Nt)
+                qg = np.asarray(
+                    forcing.evaluate_grid(y_grid_np, t_grid), dtype=np.float32
+                )
                 q_np[b] = np.tile(qg.T, (1, Nx))  # (Nt, M), y fastest
             q_all = torch.from_numpy(q_np).unsqueeze(-1).to(device)  # (B,Nt,M,1)
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
@@ -1125,11 +1172,13 @@ def validate_forcing_gnrmse(
         rmse = torch.sqrt(se / float(Nt * Nx * Ny)).detach().cpu().numpy()
         for b, p in enumerate(params):
             per_sim_rmse.append(float(rmse[b]))
-            q_image, _ = reconstruct_qL(
+            forcing = reconstruct_qL(
                 p["temporal_family"], p["temporal_params"],
                 p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
             )
-            per_sim_amp.append(float(np.max(np.abs(q_image(y_img, t_img)))))
+            per_sim_amp.append(
+                float(np.max(np.abs(forcing.evaluate_grid(y_img, t_img))))
+            )
             per_sim_fam.append(str(p.get("temporal_family", "")))
 
     rmse_arr = np.asarray(per_sim_rmse, dtype=np.float64)
@@ -1237,12 +1286,32 @@ def build_cvit(
     ingests the forcing space-time image over ``grid_size = (Ny_img, Nt_img)``;
     it reads ``model.forcing_cvit`` when present, falling back to ``model.cvit``.
     ``variant="interfaces"`` builds a multimodal :class:`InterfaceCViT` over
-    ``grid_size = (Nx, Ny)`` whose three token streams (spatial field, sampled
-    forcing waveform, interface scalars) feed the decoder cross-attention; it
+    ``grid_size = (Nx, Ny)`` whose three token streams (spatial field, forcing
+    image, interface scalars) feed the decoder cross-attention; it
     reads ``model.interface_cvit`` when present, falling back to ``model.cvit``.
     """
     if variant == "interfaces":
-        c = {**config["model"]["cvit"], **config["model"].get("interface_cvit", {})}
+        interface_cfg = config["model"].get("interface_cvit", {}) or {}
+        pino_cfg = config.get("training", {}).get("pino", {}) or {}
+        legacy = [
+            key for key in (
+                "temporal_token_dim", "temporal_samples", "num_forcing_tokens",
+                "forcing_hidden",
+            )
+            if key in interface_cfg
+        ]
+        if "forcing_samples" in pino_cfg:
+            legacy.append("training.pino.forcing_samples")
+        if legacy:
+            raise ValueError(
+                "InterfaceCViT no longer supports waveform-token settings "
+                f"{legacy}; use the space-time image configuration and a fresh "
+                "experiment name."
+            )
+        c = {**config["model"]["cvit"], **interface_cfg}
+        forcing_cfg = config.get("training", {}).get("pino", {}).get("forcing", {}) or {}
+        ny_img = int(forcing_cfg.get("ny_img") or 96)
+        nt_img = int(forcing_cfg.get("nt_img") or 256)
         t_right_K = float(c.get("hard_right_dirichlet_t_right", T_RIGHT))
         hard_rd = bool(c.get("hard_right_dirichlet", True))
         t_right_tilde = (t_right_K - mu) / (sigma + 1e-8) if hard_rd else 0.0
@@ -1251,11 +1320,14 @@ def build_cvit(
         )
         return InterfaceCViT(
             spatial_in_ch=int(c.get("spatial_in_ch", 3)),
+            forcing_in_ch=int(c.get("forcing_in_ch", 1)),
             out_dim=int(c.get("out_dim", 1)),
             emb_dim=int(c.get("emb_dim", 256)),
             dec_emb_dim=c.get("dec_emb_dim", None),
             patch_size=int(c.get("patch_size", 10)),
             grid_size=grid_size,
+            forcing_patch_size=int(c.get("forcing_patch_size", 8)),
+            forcing_grid_size=(ny_img, nt_img),
             depth_enc=int(c.get("depth_enc", 4)),
             depth_dec=int(c.get("depth_dec", 2)),
             num_heads=int(c.get("num_heads", 8)),
@@ -1269,10 +1341,6 @@ def build_cvit(
             hard_right_dirichlet=hard_rd,
             t_right_tilde=t_right_tilde,
             t_final=t_norm,
-            temporal_token_dim=int(c.get("temporal_token_dim", 2)),
-            temporal_samples=int(c.get("temporal_samples", 128)),
-            num_forcing_tokens=int(c.get("num_forcing_tokens", 1)),
-            forcing_hidden=int(c.get("forcing_hidden", 128)),
             n_param_scalars=int(c.get("n_param_scalars", 2)),
             num_param_tokens=int(c.get("num_param_tokens", 1)),
             param_hidden=int(c.get("param_hidden", 128)),
@@ -1316,6 +1384,110 @@ def build_cvit(
         hard_left_flux=hard_lf,
         left_flux_scale=left_flux_scale,
     )
+
+
+def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
+    if not isinstance(spec, dict):
+        raise RuntimeError(
+            "Incompatible InterfaceCViT checkpoint: missing interface_forcing "
+            "space-time image specification. Legacy waveform-token checkpoints "
+            "cannot be loaded; start a fresh experiment."
+        )
+    expected = {
+        "representation": "space_time_image",
+        "version": 1,
+        "forcing_schema_version": FORCING_SCHEMA_VERSION,
+        "axis_order": "channel_y_time",
+        "dtype": "float32",
+        "include_endpoints": True,
+        "sign_convention": "positive_inward_left_flux",
+        "normalization": "fixed_division",
+        "clipping": False,
+    }
+    for key, value in expected.items():
+        if spec.get(key) != value:
+            raise RuntimeError(
+                "Incompatible InterfaceCViT checkpoint image specification: "
+                f"{key}={spec.get(key)!r}, expected {value!r}."
+            )
+    required = (
+        "ny_img", "nt_img", "patch_size", "y_min", "y_max", "t_min",
+        "t_final", "a_ref", "ramp", "spatial_grid_size",
+    )
+    missing = [key for key in required if key not in spec]
+    if missing:
+        raise RuntimeError(
+            "Incomplete InterfaceCViT checkpoint image specification; missing "
+            + ", ".join(missing)
+            + "."
+        )
+    ramp = spec["ramp"]
+    if not isinstance(ramp, dict) or ramp.get("type") != "cubic_smoothstep" or int(
+        ramp.get("version", -1)
+    ) != RAMP_SCHEMA_VERSION or "duration" not in ramp:
+        raise RuntimeError(
+            "Incompatible InterfaceCViT checkpoint ramp specification; expected "
+            "cubic_smoothstep version 1 with a persisted duration."
+        )
+    ny_img, nt_img = int(spec["ny_img"]), int(spec["nt_img"])
+    patch_size = int(spec["patch_size"])
+    if ny_img < 2 or nt_img < 2 or patch_size <= 0:
+        raise RuntimeError(
+            "Invalid InterfaceCViT checkpoint image dimensions or patch size; "
+            f"got ({ny_img}, {nt_img}) and patch_size={patch_size}."
+        )
+    if ny_img % patch_size or nt_img % patch_size:
+        raise RuntimeError(
+            "Invalid InterfaceCViT checkpoint image dimensions: "
+            f"({ny_img}, {nt_img}) is not divisible by patch_size={patch_size}."
+        )
+    if float(spec["a_ref"]) <= 0.0:
+        raise RuntimeError("Invalid InterfaceCViT checkpoint: a_ref must be positive.")
+
+    forcing_cfg = config.get("training", {}).get("pino", {}).get("forcing", {}) or {}
+    model_cfg = config.get("model", {}).get("interface_cvit", {}) or {}
+    comparisons = (
+        ("training.pino.forcing.ny_img", forcing_cfg.get("ny_img"), ny_img),
+        ("training.pino.forcing.nt_img", forcing_cfg.get("nt_img"), nt_img),
+        ("training.pino.forcing.a_ref", forcing_cfg.get("a_ref"), float(spec["a_ref"])),
+        ("model.interface_cvit.forcing_patch_size",
+         model_cfg.get("forcing_patch_size"), patch_size),
+        ("model.interface_cvit.forcing_in_ch", model_cfg.get("forcing_in_ch"), 1),
+    )
+    for name, configured, saved in comparisons:
+        if configured is None or float(configured) != float(saved):
+            raise RuntimeError(
+                "InterfaceCViT checkpoint config/image-spec mismatch: "
+                f"{name}={configured!r}, image specification requires {saved!r}."
+            )
+    return spec
+
+
+def load_interface_cvit_checkpoint(
+    checkpoint_path: str | Path,
+    device: str | torch.device = "cpu",
+) -> tuple[InterfaceCViT, dict[str, Any]]:
+    """Reconstruct an interface image-CViT solely from persisted checkpoint data."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = checkpoint.get("config")
+    if not isinstance(config, dict):
+        raise RuntimeError("InterfaceCViT checkpoint is missing its saved config.")
+    spec = _validate_interface_image_spec(config, checkpoint.get("interface_forcing"))
+    grid_size_raw = spec["spatial_grid_size"]
+    if not isinstance(grid_size_raw, (list, tuple)) or len(grid_size_raw) != 2:
+        raise RuntimeError(
+            "Invalid InterfaceCViT checkpoint spatial_grid_size; expected [Nx, Ny]."
+        )
+    model = build_cvit(
+        config,
+        float(checkpoint["mu_global"]),
+        float(checkpoint["sigma_global"]),
+        grid_size=(int(grid_size_raw[0]), int(grid_size_raw[1])),
+        t_final=float(spec["t_final"]),
+        variant="interfaces",
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    return model.to(device), checkpoint
 
 
 def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
@@ -2464,9 +2636,9 @@ def validate_interfaces_gnrmse(
     ids: np.ndarray,
     sim_params: np.ndarray,
     t_ramp: float,
-    dt: float,
     a_ref: float,
-    forcing_samples: int,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
     sigma_dT_train: float,
     device: torch.device,
     query_batch: int = 8,
@@ -2482,8 +2654,7 @@ def validate_interfaces_gnrmse(
 
     so a good global fit that smooths the jump stays visible. Per-sim gnRMSE is
     stratified by `R_c` and by `interface_x` terciles. Inputs are rebuilt with
-    the SAME `_interface_spatial_channels` / `build_interface_forcing` path the
-    trainer uses.
+    the same spatial/image builders the trainer uses.
     """
     x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32, device=device)
     y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32, device=device)
@@ -2514,23 +2685,16 @@ def validate_interfaces_gnrmse(
                 ) for p in params
             ])
         ).to(device)
-        fseq = torch.from_numpy(
-            np.stack([
-                build_interface_forcing(
-                    p["temporal_family"], p["temporal_params"],
-                    p["spatial_family"], p["spatial_params"],
-                    y_grid_np, 0.0, dt, float(t_grid[-1]), t_ramp,
-                    a_ref=a_ref, n_forcing_samples=forcing_samples,
-                )[0] for p in params
-            ])
-        ).to(device)
+        forcing_image = build_forcing_image(
+            params, y_img, t_img, a_ref, device, t_ramp
+        )
         pscal = torch.from_numpy(
             np.stack([
                 normalize_interface_scalars(p["interface_x"], p["R_c"])
                 for p in params
             ])
         ).to(device)
-        latent = model.encode(u_spatial, fseq, pscal)
+        latent = model.encode(u_spatial, forcing_image, pscal)
         coords = mesh.expand(B, -1, -1)
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
         for k in range(Nt):
@@ -2601,6 +2765,18 @@ def run_one_seed_interfaces_pino(
     """
     set_seed(seed)
     run_dir = Path(run_dir)
+    stale_artifacts = [
+        run_dir / name for name in (
+            "train_metrics.csv", "cvit_best_global.pt", "cvit_best_jump.pt",
+            "cvit_last.pt", "final_metrics.json",
+        )
+        if (run_dir / name).exists()
+    ]
+    if stale_artifacts:
+        raise FileExistsError(
+            "InterfaceCViT image runs require a fresh experiment name; found "
+            + ", ".join(str(path) for path in stale_artifacts)
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(config["training"].get("device", "auto"))
@@ -2618,10 +2794,20 @@ def run_one_seed_interfaces_pino(
 
     pino = config["training"]["pino"]
     fcfg = pino.get("forcing", {}) or {}
-    a_ref = float(fcfg.get("a_ref") if fcfg.get("a_ref") is not None else A_AMP_REF)
-    forcing_samples = int(pino.get("forcing_samples", 128))
+    a_ref = float(fcfg.get("a_ref") if fcfg.get("a_ref") is not None else A_REF_FLUX)
+    if a_ref <= 0.0:
+        raise ValueError(f"training.pino.forcing.a_ref must be > 0; got {a_ref}.")
+    ny_img = int(fcfg.get("ny_img") or 96)
+    nt_img = int(fcfg.get("nt_img") or 256)
+    if ny_img < 2 or nt_img < 2:
+        raise ValueError(
+            "training.pino.forcing.ny_img and nt_img must both be >= 2 to "
+            f"include both schedule endpoints; got {ny_img} and {nt_img}."
+        )
+    y_img = np.linspace(float(y_grid_np[0]), float(y_grid_np[-1]), ny_img)
+    t_img = np.linspace(0.0, t_final, nt_img)
 
-    # Frozen startup ramp shared by the model waveform AND the residual flux
+    # Frozen startup ramp shared by the model image and the residual flux
     # (config override wins; else the dataset's stored ramp; else dt-derived).
     ramp_cfg = fcfg.get("ramp_seconds", None)
     if ramp_cfg is not None:
@@ -2646,6 +2832,32 @@ def run_one_seed_interfaces_pino(
         config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final,
         variant="interfaces",
     ).to(device)
+    image_spec = {
+        "representation": "space_time_image",
+        "version": 1,
+        "forcing_schema_version": FORCING_SCHEMA_VERSION,
+        "axis_order": "channel_y_time",
+        "dtype": "float32",
+        "ny_img": ny_img,
+        "nt_img": nt_img,
+        "patch_size": int(model.forcing_patch_size),
+        "include_endpoints": True,
+        "y_min": float(y_img[0]),
+        "y_max": float(y_img[-1]),
+        "t_min": float(t_img[0]),
+        "t_final": float(t_img[-1]),
+        "sign_convention": "positive_inward_left_flux",
+        "normalization": "fixed_division",
+        "a_ref": a_ref,
+        "clipping": False,
+        "ramp": {
+            "type": "cubic_smoothstep",
+            "version": RAMP_SCHEMA_VERSION,
+            "duration": float(t_ramp),
+        },
+        "fv_dt": float(dt),
+        "spatial_grid_size": [Nx, Ny],
+    }
     optimizer = build_optimizer(config, model.parameters())
     scheduler = build_scheduler(config, optimizer)
 
@@ -2788,7 +3000,9 @@ def run_one_seed_interfaces_pino(
     print(
         f"[pino-interfaces] seed={seed} device={device} epochs={epochs} "
         f"validate_every={validate_every} | grid={Nx}x{Ny} t_final={t_final:.4f} "
-        f"dt={dt:.4g} t_ramp={t_ramp:.4g} a_ref={a_ref} | "
+        f"dt={dt:.4g} t_ramp={t_ramp:.4g} "
+        f"forcing_image={ny_img}x{nt_img}/p{model.forcing_patch_size} "
+        f"a_ref={a_ref} | "
         f"sim_batch={sim_batch} intervals_per_sim={intervals_per_sim} "
         f"collocation={collocation_source} "
         f"stratified={stratified} causal={causal_enabled}(n_bins={n_bins}) | "
@@ -2828,16 +3042,9 @@ def run_one_seed_interfaces_pino(
                 ) for p in params
             ])
         ).to(device)
-        fseq = torch.from_numpy(
-            np.stack([
-                build_interface_forcing(
-                    p["temporal_family"], p["temporal_params"],
-                    p["spatial_family"], p["spatial_params"],
-                    y_grid_np, 0.0, dt, t_final, t_ramp,
-                    a_ref=a_ref, n_forcing_samples=forcing_samples,
-                )[0] for p in params
-            ])
-        ).to(device)
+        forcing_image = build_forcing_image(
+            params, y_img, t_img, a_ref, device, t_ramp
+        )
         pscal = torch.from_numpy(
             np.stack([
                 normalize_interface_scalars(p["interface_x"], p["R_c"])
@@ -2853,7 +3060,7 @@ def run_one_seed_interfaces_pino(
         interface_x = np.array([float(p["interface_x"]) for p in params])
         R_c = np.array([float(p["R_c"]) for p in params])
 
-        latent = model.encode(u_spatial, fseq, pscal)
+        latent = model.encode(u_spatial, forcing_image, pscal)
 
         # IC anchor: decode at t=0 against the (varying) normalized IC field.
         t0q = torch.zeros((B, Nq, 1), device=device)
@@ -2873,11 +3080,10 @@ def run_one_seed_interfaces_pino(
         qL_int = np.empty((M, Ny), dtype=np.float64)
         for m in range(M):
             p = params[int(sim_local[m])]
-            _, qn, qnp1, qint = build_interface_forcing(
+            qn, qnp1, qint = build_interface_forcing(
                 p["temporal_family"], p["temporal_params"],
                 p["spatial_family"], p["spatial_params"],
-                y_grid_np, float(t_n[m]), float(t_np1[m]), t_final, t_ramp,
-                a_ref=a_ref, n_forcing_samples=forcing_samples,
+                y_grid_np, float(t_n[m]), float(t_np1[m]), t_ramp,
             )
             qL_n[m] = qn
             qL_np1[m] = qnp1
@@ -3061,7 +3267,7 @@ def run_one_seed_interfaces_pino(
             with torch.no_grad():
                 val = validate_interfaces_gnrmse(
                     model, data, data["val_ids"], sim_params,
-                    t_ramp, dt, a_ref, forcing_samples, sigma_dT_train, device,
+                    t_ramp, a_ref, y_img, t_img, sigma_dT_train, device,
                 )
             for key in (
                 "val_gnrmse", "val_rmse_K", "node_jump_rmse_K", "E_model", "E_zero",
@@ -3083,10 +3289,7 @@ def run_one_seed_interfaces_pino(
                 "config": config, "epoch": epoch,
                 "best_val_gnrmse": val["val_gnrmse"], "E_model": val["E_model"],
                 "E_zero": val["E_zero"], "sigma_dT_train": sigma_dT_train,
-                "interface_forcing": {
-                    "a_ref": a_ref, "t_ramp": t_ramp, "dt": dt,
-                    "t_final": t_final, "forcing_samples": forcing_samples,
-                },
+                "interface_forcing": copy.deepcopy(image_spec),
                 "gradnorm_state": (
                     gradnorm.state_dict() if gradnorm is not None else None
                 ),
@@ -3132,10 +3335,7 @@ def run_one_seed_interfaces_pino(
             "mu_global": mu, "sigma_global": sigma,
             "config": config, "epoch": epochs - 1,
             "sigma_dT_train": sigma_dT_train,
-            "interface_forcing": {
-                "a_ref": a_ref, "t_ramp": t_ramp, "dt": dt,
-                "t_final": t_final, "forcing_samples": forcing_samples,
-            },
+            "interface_forcing": copy.deepcopy(image_spec),
             "region_standardize": {
                 "enabled": std_enabled,
                 "calibration_steps": calibration_steps,
@@ -3199,6 +3399,7 @@ __all__ = [
     "validate_rel_l2",
     "validate_forcing_gnrmse",
     "build_cvit",
+    "load_interface_cvit_checkpoint",
     "run_one_seed_pino",
     "run_one_seed_forcing_pino",
     "run_one_seed_interfaces_pino",

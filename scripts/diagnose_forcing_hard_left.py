@@ -90,14 +90,16 @@ def _q_grid(
     amps: list[float] = []
     fams: list[str] = []
     for b, p in enumerate(params):
-        q_image, _ = reconstruct_qL(
+        forcing = reconstruct_qL(
             p["temporal_family"],
             p["temporal_params"],
             p["spatial_family"],
             p["spatial_params"],
             t_ramp=t_ramp,
         )
-        qg = np.asarray(q_image(y_grid, t_grid), dtype=np.float32)  # (Ny, Nt)
+        qg = np.asarray(
+            forcing.evaluate_grid(y_grid, t_grid), dtype=np.float32
+        )
         q_all[b] = np.tile(qg.T, (1, nx))
         amps.append(float(np.max(np.abs(qg))))
         fams.append(str(p.get("temporal_family", "")))

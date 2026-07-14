@@ -1,3 +1,7 @@
+import copy
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
 import numpy as np
 from src.physics.fv_solver_1d import windowed_sin_flux
 
@@ -44,12 +48,13 @@ PULSE_SLOTS = 4
 FORCING_BINS = 16
 SIN_INTEGRAL_SAMPLES = 2049
 
-# Sampled-waveform representation for the interface CViT-PINO model input (§0).
-# `A_REF_FLUX` matches A_AMP_REF / SIN_AMP_RANGE[1] so a(t)/A_ref is O(1); the
-# waveform is sampled on `FORCING_TEMPORAL_SAMPLES` points over the WHOLE
-# prescribed schedule [0, t_final] with absolute normalized time.
+# Fixed flux scale shared by forcing representations. It is the predetermined
+# maximum sampled forcing amplitude, not the 300 K temperature baseline.
 A_REF_FLUX = 300.0
+# Retained for the FNO temporal representation; InterfaceCViT no longer uses it.
 FORCING_TEMPORAL_SAMPLES = 128
+FORCING_SCHEMA_VERSION = 1
+RAMP_SCHEMA_VERSION = 1
 
 # Startup ramp on a(t) so q_L(0) = 0 (consistent with a zero left gradient at
 # t=0). `ramp_seconds` is a physical dataset parameter persisted with the data;
@@ -337,6 +342,76 @@ def ramped_temporal(temporal_family: str, temporal_params: dict, t_ramp: float):
     return a_ramped
 
 
+@dataclass(frozen=True)
+class BoundaryForcingEvaluator:
+    """Canonical separable left-boundary forcing evaluator."""
+
+    temporal_family: str
+    temporal_params: Mapping[str, Any] = field(repr=False)
+    spatial_family: str
+    spatial_params: Mapping[str, Any] = field(repr=False)
+    t_ramp: float = 0.0
+    schema_version: int = FORCING_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "temporal_params", copy.deepcopy(dict(self.temporal_params)))
+        object.__setattr__(self, "spatial_params", copy.deepcopy(dict(self.spatial_params)))
+        object.__setattr__(self, "t_ramp", float(self.t_ramp))
+        if int(self.schema_version) != FORCING_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported forcing schema version {self.schema_version}; "
+                f"expected {FORCING_SCHEMA_VERSION}."
+            )
+
+    def _spatial(self, y: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            SPATIAL_BUILDERS[self.spatial_family](
+                np.asarray(y, dtype=float), **self.spatial_params
+            ),
+            dtype=float,
+        )
+
+    def _temporal(self, t: np.ndarray) -> np.ndarray:
+        a_fn = ramped_temporal(
+            self.temporal_family, dict(self.temporal_params), self.t_ramp
+        )
+        t_arr = np.asarray(t, dtype=float)
+        values = np.array(
+            [float(a_fn(float(value))) for value in t_arr.reshape(-1)], dtype=float
+        )
+        return values.reshape(t_arr.shape)
+
+    def evaluate_grid(
+        self, y_axis: np.ndarray, t_axis: np.ndarray
+    ) -> np.ndarray:
+        """Return ``q_L`` on the outer-product grid ``(y, t)``."""
+        y = np.asarray(y_axis, dtype=float).reshape(-1)
+        t = np.asarray(t_axis, dtype=float).reshape(-1)
+        return np.outer(self._spatial(y), self._temporal(t))
+
+    def evaluate_points(
+        self, y_points: np.ndarray, t_points: np.ndarray
+    ) -> np.ndarray:
+        """Return ``q_L`` at broadcast-compatible paired ``(y, t)`` points."""
+        y, t = np.broadcast_arrays(
+            np.asarray(y_points, dtype=float), np.asarray(t_points, dtype=float)
+        )
+        return self._spatial(y) * self._temporal(t)
+
+    def integral(
+        self, y_axis: np.ndarray, t_lo: float, t_hi: float
+    ) -> np.ndarray:
+        """Return the exact signed time integral of ``q_L`` over an interval."""
+        a_int = integrate_temporal_ramped_signed(
+            self.temporal_family,
+            dict(self.temporal_params),
+            float(t_lo),
+            float(t_hi),
+            self.t_ramp,
+        )
+        return float(a_int) * self._spatial(np.asarray(y_axis, dtype=float))
+
+
 def _integrate_ramp_window(a_fn, t_lo: float, t_hi: float, t_ramp: float) -> float:
     """Numerically integrate ramp_envelope(t) * a_fn(t) over [t_lo, t_hi].
 
@@ -554,12 +629,14 @@ def build_qL(temporal_family: str, temporal_params: dict,
     signature exactly. The samplers in `TEMPORAL_SAMPLERS` produce the
     canonical schema. `t_ramp > 0` applies the startup ramp so q_L(0) = 0.
     """
-    a_fn = ramped_temporal(temporal_family, temporal_params, t_ramp)
-    s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
-    s_vec = np.asarray(s_vec, dtype=float)
+    forcing = reconstruct_qL(
+        temporal_family, temporal_params, spatial_family, spatial_params, t_ramp
+    )
+    y_grid = np.asarray(y_grid, dtype=float)
+    s_vec = forcing._spatial(y_grid)
 
     def q_left(t):
-        return a_fn(t) * s_vec
+        return forcing.evaluate_points(y_grid, t)
 
     return q_left, s_vec
 
@@ -574,13 +651,14 @@ def build_qL_integral(temporal_family: str, temporal_params: dict,
     integrate_temporal_ramped_signed(...) * s_vec. `t_ramp > 0` applies the
     startup ramp so q_L(0) = 0.
     """
-    s_vec = SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params)
-    s_vec = np.asarray(s_vec, dtype=float)
+    forcing = reconstruct_qL(
+        temporal_family, temporal_params, spatial_family, spatial_params, t_ramp
+    )
+    y_grid = np.asarray(y_grid, dtype=float)
+    s_vec = forcing._spatial(y_grid)
 
     def q_left_integral(t_lo, t_hi):
-        return integrate_temporal_ramped_signed(
-            temporal_family, temporal_params, t_lo, t_hi, t_ramp
-        ) * s_vec
+        return forcing.integral(y_grid, t_lo, t_hi)
 
     return q_left_integral, s_vec
 
@@ -589,109 +667,30 @@ def build_interface_forcing(
     temporal_family: str, temporal_params: dict,
     spatial_family: str, spatial_params: dict,
     y_grid: np.ndarray,
-    t_n: float, t_np1: float, t_final: float, t_ramp: float,
-    *,
-    a_ref: float = A_REF_FLUX,
-    n_forcing_samples: int = FORCING_TEMPORAL_SAMPLES,
+    t_n: float, t_np1: float, t_ramp: float,
 ):
-    """Canonical single source for the interface CViT-PINO forcing (§0).
-
-    Emits BOTH the sampled waveform the model sees and the physical boundary
-    flux the FV residual enforces, from the SAME
-    ``(temporal_family, temporal_params, spatial_family, spatial_params,
-    t_ramp)``, so the representation can never drift from the flux. All four
-    outputs use the ramped temporal ``ramp(t) * a(t)`` (so q_L(0) = 0), exactly
-    like ``build_qL`` / ``build_qL_integral`` and the trainer's step assembly.
-
-    Returns ``(forcing_seq, qL_n, qL_np1, qL_int)``:
-      - ``forcing_seq`` ``(n_forcing_samples, 2)`` float32: the model input token
-        stream ``[(tau_m / t_final, a(tau_m) / a_ref)]`` sampled on
-        ``tau_m = linspace(0, t_final, n_forcing_samples)`` — the COMPLETE
-        prescribed schedule with ABSOLUTE normalized time (not interval-relative).
-        This assumes the whole loading schedule is known before prediction
-        (forward / design use); a causal variant would restrict this window.
-      - ``qL_n``  ``(Ny,)`` float64: physical inward flux ``a(t_n)   * s(y)``.
-      - ``qL_np1````(Ny,)`` float64: physical inward flux ``a(t_np1) * s(y)``.
-      - ``qL_int````(Ny,)`` float64: the EXACT signed step integral
-        ``(∫_{t_n}^{t_np1} ramp*a dt) * s(y)`` — an integral, NOT an average —
-        to match ``full_bc_cn_residual``'s exact left-Neumann RHS. Physical
-        units; the residual divides by ``sigma_global`` internally, so the model
-        output stays normalized.
-
-    Interfaces uses ``spatial_family="uniform"`` (s(y) = 1), so the per-sim
-    forcing signal is entirely in the temporal waveform; the (y, t) image the
-    ForcingCViT uses is unnecessary here.
-    """
+    """Return physical FV endpoint fluxes and exact signed interval integral."""
     y_grid = np.asarray(y_grid, dtype=float)
-    a_fn = ramped_temporal(temporal_family, temporal_params, t_ramp)
-    s_vec = np.asarray(
-        SPATIAL_BUILDERS[spatial_family](y_grid, **spatial_params), dtype=float
+    forcing = reconstruct_qL(
+        temporal_family, temporal_params, spatial_family, spatial_params, t_ramp
     )
-
-    tau = np.linspace(0.0, float(t_final), int(n_forcing_samples))
-    a_tau = np.array([float(a_fn(float(tm))) for tm in tau], dtype=np.float64)
-    forcing_seq = np.stack(
-        [(tau / float(t_final)).astype(np.float32),
-         (a_tau / float(a_ref)).astype(np.float32)],
-        axis=-1,
-    ).astype(np.float32)
-
-    qL_n = (float(a_fn(float(t_n))) * s_vec).astype(np.float64)
-    qL_np1 = (float(a_fn(float(t_np1))) * s_vec).astype(np.float64)
-    a_int = integrate_temporal_ramped_signed(
-        temporal_family, temporal_params, float(t_n), float(t_np1), float(t_ramp)
-    )
-    qL_int = (float(a_int) * s_vec).astype(np.float64)
-    return forcing_seq, qL_n, qL_np1, qL_int
+    qL_n = forcing.evaluate_points(y_grid, float(t_n)).astype(np.float64)
+    qL_np1 = forcing.evaluate_points(y_grid, float(t_np1)).astype(np.float64)
+    qL_int = forcing.integral(y_grid, float(t_n), float(t_np1)).astype(np.float64)
+    return qL_n, qL_np1, qL_int
 
 
 def reconstruct_qL(temporal_family: str, temporal_params: dict,
                    spatial_family: str, spatial_params: dict,
-                   t_ramp: float = 0.0):
-    """Single-source q_L(y, t) reconstruction over the same builders as build_qL.
-
-    Returns ``(q_image, q_at)``, two evaluators for the separable inward flux
-    ``q_L(y, t) = ramp(t) * a(t) * s(y)`` built from the exact same
-    ``ramped_temporal`` / ``SPATIAL_BUILDERS`` primitives as ``build_qL``, so the
-    forcing image fed to the ForcingCViT encoder and the ``q_L`` used in the
-    left-wall PINO residual are guaranteed to agree.
-
-    - ``q_image(y_grid, t_axis) -> (Ny, Nt)``: outer product for the encoder
-      space-time image (rows = left-wall y-nodes, cols = time samples).
-    - ``q_at(y_pts, t_pts) -> (N,)``: elementwise q_L at matched collocation
-      points ``y_pts[i], t_pts[i]`` (``s`` evaluated at ARBITRARY y, not just a
-      grid node).
-
-    ``a(t)`` is evaluated per scalar t because the exp / pulse_train / exp_train
-    temporal builders are scalar closures.
-    """
-    a_fn = ramped_temporal(temporal_family, temporal_params, t_ramp)
-    s_builder = SPATIAL_BUILDERS[spatial_family]
-
-    def _s_at(y):
-        return np.asarray(
-            s_builder(np.asarray(y, dtype=float), **spatial_params), dtype=float
-        )
-
-    def _a_over(t):
-        t_arr = np.asarray(t, dtype=float).ravel()
-        return np.array([float(a_fn(float(tn))) for tn in t_arr], dtype=float)
-
-    def q_image(y_grid, t_axis):
-        s = _s_at(y_grid)          # (Ny,)
-        a = _a_over(t_axis)        # (Nt,)
-        return np.outer(s, a)      # (Ny, Nt)
-
-    def q_at(y_pts, t_pts):
-        y_pts = np.asarray(y_pts, dtype=float).ravel()
-        t_pts = np.asarray(t_pts, dtype=float).ravel()
-        if y_pts.shape != t_pts.shape:
-            raise ValueError(
-                f"q_at expects matched y_pts/t_pts; got {y_pts.shape} vs {t_pts.shape}."
-            )
-        return _s_at(y_pts) * _a_over(t_pts)
-
-    return q_image, q_at
+                   t_ramp: float = 0.0) -> BoundaryForcingEvaluator:
+    """Build the canonical evaluator for one separable inward-flux record."""
+    return BoundaryForcingEvaluator(
+        temporal_family=temporal_family,
+        temporal_params=temporal_params,
+        spatial_family=spatial_family,
+        spatial_params=spatial_params,
+        t_ramp=t_ramp,
+    )
 
 # --------- PARAMETER ENCODING ----------
 

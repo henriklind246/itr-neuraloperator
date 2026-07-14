@@ -52,6 +52,12 @@ export RUNS_ROOT="$LOCAL_RUNS"
 PERSISTENT_RUNS="${PERSISTENT_RUNS:-$HOME/cvit_runs}"
 mkdir -p "$LOCAL_RUNS" "$PERSISTENT_RUNS"
 
+if [[ "$BENCHMARK" == "interfaces" && -e "$PERSISTENT_RUNS/$EXPERIMENT_NAME" ]]; then
+    echo "ERROR: interface image-CViT runs require a fresh EXPERIMENT_NAME;" >&2
+    echo "       $PERSISTENT_RUNS/$EXPERIMENT_NAME already exists." >&2
+    exit 1
+fi
+
 # Always copy partial results back, even if training aborts.
 copy_back() {
     echo "Copying results from $LOCAL_RUNS to $PERSISTENT_RUNS ..."

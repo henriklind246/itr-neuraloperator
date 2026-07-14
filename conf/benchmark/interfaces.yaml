@@ -30,7 +30,10 @@ training:
     lambda_ic: 1.0
     lambda_bc: 1.0
     lambda_bc_left: null
-    forcing_samples: 128
+    forcing:
+      ny_img: 96
+      nt_img: 256
+      a_ref: 300.0
     intervals_per_sim: 2
     stratified_time_sampling: true
     causal_num_bins: 6

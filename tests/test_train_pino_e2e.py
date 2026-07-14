@@ -31,7 +31,9 @@ from src.operators.train_pino import (
     _ic_loss,
     _resolve_forcing_causal,
     _time_bin_index,
+    load_interface_cvit_checkpoint,
     run_one_seed_forcing_pino,
+    run_one_seed_interfaces_pino,
     run_one_seed_pino,
     sample_forcing_params,
 )
@@ -107,6 +109,63 @@ def _config(tmp_path):
     }
 
 
+def _write_synthetic_interfaces(tmp_path, num_sims=12, Nt=3, Nx=20, Ny=20):
+    traj = _write_synthetic_diffusion(tmp_path, num_sims, Nt, Nx, Ny)
+    x_grid = np.load(tmp_path / "x_grid.npy")
+    faces = [(x_grid[8] + x_grid[9]) / 2.0, (x_grid[10] + x_grid[11]) / 2.0]
+    sim_params = []
+    for i in range(num_sims):
+        sim_params.append({
+            "T0": traj[i, 0].copy(),
+            "interface_x": float(faces[i % 2]),
+            "R_c": 0.2 if i % 2 == 0 else 0.7,
+            "temporal_family": "sin",
+            "temporal_params": {
+                "A": 100.0 + i, "f": 5.0, "t_on": 0.0, "t_off": 0.2,
+                "phase": 0.0, "tukey_alpha": 0.5, "rectified": True,
+            },
+            "spatial_family": "uniform",
+            "spatial_params": {},
+        })
+    np.save(tmp_path / "sim_params.npy", np.asarray(sim_params, dtype=object))
+
+
+def _interface_config(tmp_path):
+    cfg = _config(tmp_path)
+    cfg["model"]["cvit"].update({"emb_dim": 16, "num_heads": 2})
+    cfg["model"]["interface_cvit"] = {
+        "spatial_in_ch": 3,
+        "forcing_in_ch": 1,
+        "forcing_patch_size": 8,
+        "n_param_scalars": 2,
+        "num_param_tokens": 1,
+        "param_hidden": 16,
+    }
+    cfg["training"].update({"epochs": 1, "optimizer": "Adam"})
+    cfg["training"]["pino"] = {
+        "lambda_r": 1.0,
+        "lambda_ic": 1.0,
+        "lambda_bc": 1.0,
+        "lambda_bc_left": 1.0,
+        "sim_batch": 2,
+        "chunk_r": 0,
+        "collocation_source": "saved_train",
+        "dt": 0.005,
+        "intervals_per_sim": 1,
+        "stratified_time_sampling": False,
+        "causal": {"enabled": False},
+        "interface_band": {"enabled": False},
+        "region_standardize": {"enabled": False},
+        "forcing": {
+            "ny_img": 16,
+            "nt_img": 32,
+            "a_ref": 300.0,
+            "ramp_seconds": 0.01,
+        },
+    }
+    return cfg
+
+
 def _rows(run_dir):
     with (run_dir / "train_metrics.csv").open("r", newline="") as f:
         return list(csv.DictReader(f))
@@ -157,6 +216,53 @@ def test_e2e_runs_logs_and_checkpoints(tmp_path):
         assert float(r["w_ic"]) == 1.0
         assert float(r["w_bc"]) == 1.0
     assert ckpt.get("gradnorm_state") is None
+
+
+def test_interface_image_e2e_has_finite_metrics_and_complete_metadata(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    config = _interface_config(tmp_path)
+    run_dir = tmp_path / "interface_run"
+
+    summary = run_one_seed_interfaces_pino(config, seed=0, run_dir=run_dir)
+    rows = _rows(run_dir)
+    assert len(rows) == 1
+    for key in (
+        "loss", "loss_interior", "loss_left_neumann", "loss_topbot",
+        "loss_ic", "loss_right_dir", "val_gnrmse", "val_rmse_K",
+        "node_jump_rmse_K", "E_model", "E_zero",
+    ):
+        assert math.isfinite(float(rows[0][key])), key
+    assert math.isfinite(summary["best_val_gnrmse"])
+
+    checkpoint_path = run_dir / "cvit_best_global.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    spec = checkpoint["interface_forcing"]
+    assert spec == {
+        "representation": "space_time_image",
+        "version": 1,
+        "forcing_schema_version": 1,
+        "axis_order": "channel_y_time",
+        "dtype": "float32",
+        "ny_img": 16,
+        "nt_img": 32,
+        "patch_size": 8,
+        "include_endpoints": True,
+        "y_min": 0.0,
+        "y_max": 1.0,
+        "t_min": 0.0,
+        "t_final": float(np.float32(0.3)),
+        "sign_convention": "positive_inward_left_flux",
+        "normalization": "fixed_division",
+        "a_ref": 300.0,
+        "clipping": False,
+        "ramp": {"type": "cubic_smoothstep", "version": 1, "duration": 0.01},
+        "fv_dt": 0.005,
+        "spatial_grid_size": [20, 20],
+    }
+    restored, _ = load_interface_cvit_checkpoint(checkpoint_path)
+    assert restored.forcing_grid_size == (16, 32)
+    with pytest.raises(FileExistsError, match="fresh experiment name"):
+        run_one_seed_interfaces_pino(config, seed=0, run_dir=run_dir)
 
 
 # --------- IC-first curriculum ---------

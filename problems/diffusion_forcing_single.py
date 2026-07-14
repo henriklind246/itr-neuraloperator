@@ -6,24 +6,46 @@ import numpy as np
 
 from problems.diffusion_forcing import DiffusionForcingProblem
 from src.physics.boundary_forcing import SPATIAL_SAMPLERS, TEMPORAL_SAMPLERS
+from src.physics.init_conditions import IC_FAMILIES, IC_SAMPLERS, build_ic
 
 # The single forcing family this benchmark pins.
 FIXED_TEMPORAL_FAMILY = "sin"
 FIXED_SPATIAL_FAMILY = "uniform"
 
+# Dataset-format tag stamped into meta.npy at generation and asserted on load.
+# In-place editing keeps the benchmark name and tensor shapes identical to the
+# old fixed-300 K set, so this string is the only signal that distinguishes a
+# varying-IC dataset from a stale fixed-IC one; bump it on any breaking change.
+PROBLEM_VERSION = "forcing_single_varying_ic_v1"
+IC_MODE = "varying"
+
 
 class DiffusionForcingSingleProblem(DiffusionForcingProblem):
-    """Single-slab forcing benchmark restricted to the sin/uniform family.
+    """Single-slab forcing benchmark: sin/uniform forcing, varying IC.
 
     Identical physics to :class:`DiffusionForcingProblem` (single homogeneous
-    slab, fixed uniform 300 K IC, left-wall Neumann forcing), but the forcing is
-    locked to the ``sin`` temporal family and ``uniform`` spatial profile so only
-    the sinusoid amplitude/frequency vary per simulation. This mirrors the
-    ``interfaces`` benchmark's forcing setup without the interface, isolating the
-    ForcingCViT image/PINO path on a simpler problem.
+    slab, left-wall Neumann forcing) with the forcing locked to the ``sin``
+    temporal family and ``uniform`` spatial profile, but the **initial condition
+    varies per simulation** across all four families in
+    ``src.physics.init_conditions`` (``uniform_2d``, ``random_sinusoid_2d``,
+    ``grf_2d``, ``hot_spot_2d``). This mirrors the ``interfaces`` benchmark's
+    IC + forcing setup without the interface, isolating the two-branch
+    ForcingICCViT (forcing image + IC field) PINO path on a simpler problem.
+
+    IC-family *balancing* lives in the generator, which hands this spec an
+    explicit per-sim ``ic_family_assignment`` list via ``time_cfg`` (a separate
+    seeded RNG shuffles it, so IC balancing never perturbs the forcing-parameter
+    sequence). The spec only consumes ``ic_family_assignment[i]`` for sim ``i``;
+    it never decides the balance itself. IC parameter draws use ``rng`` and the
+    forcing draws use ``rng_profile`` so the two streams stay decoupled.
     """
 
     name = "diffusion_forcing_single"
+
+    # Dataset version / mode advertised to the generator (meta.npy) and the
+    # load-time guard. Present only on this spec.
+    problem_version = PROBLEM_VERSION
+    ic_mode = IC_MODE
 
     def sample_sim_params(
         self,
@@ -33,15 +55,18 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
         time_cfg: dict[str, Any],
     ) -> list[dict]:
         X = grids["X"]
+        Y = grids["Y"]
+        Nx, Ny = X.shape[0], X.shape[1]
         y_grid = grids.get("y_grid")
         if y_grid is None:
-            Y = grids["Y"]
             c, d = float(np.min(Y)), float(np.max(Y))
         else:
             c, d = float(y_grid[0]), float(y_grid[-1])
         num_sims = int(time_cfg["num_sims"])
         dt = float(time_cfg["dt"])
         t_final = float(time_cfg["t_final"])
+        b_temp = float(time_cfg.get("b", 1.0))
+        T_right = float(time_cfg.get("T_right", 300.0))
         temporal_window = dict(
             t_on=float(time_cfg.get("t_on", 0.0)),
             t_off=float(time_cfg.get("t_off", 0.2)),
@@ -49,12 +74,29 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
             tukey_alpha=float(time_cfg.get("tukey_alpha", 0.5)),
         )
 
+        # Per-sim IC family assignment. The generator supplies a balanced,
+        # separately-shuffled list; fall back to an IID per-sim draw only when it
+        # is absent (e.g. an ad-hoc caller) so behavior stays well-defined.
+        assignment = time_cfg.get("ic_family_assignment")
+        if assignment is not None and len(assignment) != num_sims:
+            raise ValueError(
+                f"ic_family_assignment length {len(assignment)} != num_sims "
+                f"{num_sims} for benchmark {self.name!r}."
+            )
+
         sim_params = []
-        for _ in range(num_sims):
-            # Fixed uniform 300 K IC: the forcing is the only per-sim signal.
-            ic_family = "uniform_2d"
-            ic_params = {"T0_offset": 0.0}
-            T0 = np.full(X.shape, 300.0, dtype=np.float32)
+        for i in range(num_sims):
+            if assignment is not None:
+                ic_family = str(assignment[i])
+            else:
+                ic_family = str(rng.choice(list(IC_FAMILIES.keys())))
+            if ic_family not in IC_FAMILIES:
+                raise ValueError(
+                    f"ic_family {ic_family!r} for sim {i} is not a known family "
+                    f"{tuple(IC_FAMILIES)}."
+                )
+            ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+            T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
 
             temporal_family = FIXED_TEMPORAL_FAMILY
             temporal_params = TEMPORAL_SAMPLERS[temporal_family](
@@ -90,4 +132,10 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
                     f"sim_params[{int(sid)}] has spatial_family="
                     f"{entry['spatial_family']!r}; benchmark {self.name!r} admits "
                     f"only {FIXED_SPATIAL_FAMILY!r}."
+                )
+            if entry["ic_family"] not in IC_FAMILIES:
+                raise ValueError(
+                    f"sim_params[{int(sid)}] has ic_family="
+                    f"{entry['ic_family']!r}; benchmark {self.name!r} admits only "
+                    f"{tuple(IC_FAMILIES)}."
                 )

@@ -435,6 +435,20 @@ def _dfs_sample_params(n=8):
     )
 
 
+def _dfs_family_params(family, n=6):
+    """Sample n sim_params pinned to a single IC ``family`` on a tiny grid."""
+    x_grid = np.linspace(0.0, 1.0, 5)
+    y_grid = np.linspace(0.0, 1.0, 4)
+    t_grid = np.linspace(0.0, 0.3, 7)
+    trajectories = np.zeros((n, t_grid.size, x_grid.size, y_grid.size), dtype=np.float32)
+    params = _adapter_sim_params(
+        get_problem("diffusion_forcing_single"),
+        trajectories, x_grid, y_grid, t_grid,
+        ic_family_assignment=[family] * n,
+    )
+    return params, x_grid, y_grid
+
+
 class TestDiffusionForcingSingleSampleParity:
     def test_only_sin_uniform(self):
         params = _dfs_sample_params(n=16)
@@ -443,10 +457,30 @@ class TestDiffusionForcingSingleSampleParity:
             assert p["temporal_family"] == "sin"
             assert p["spatial_family"] == "uniform"
 
-    def test_fixed_uniform_300k_ic(self):
-        # Single-slab benchmark pins the 300 K uniform IC; only forcing varies.
-        for p in _dfs_sample_params(n=8):
-            assert np.allclose(p["T0"], 300.0)
+    @pytest.mark.parametrize(
+        "family", ["uniform_2d", "random_sinusoid_2d", "grf_2d", "hot_spot_2d"]
+    )
+    def test_ic_family_fields(self, family):
+        # IC now varies across all four families. Every field is Nx x Ny, finite,
+        # and pins the right (x=1) Dirichlet wall to 300 K; the three non-trivial
+        # families show spatial variation.
+        params, x_grid, y_grid = _dfs_family_params(family, n=6)
+        for p in params:
+            assert p["ic_family"] == family
+            T0 = np.asarray(p["T0"])
+            assert T0.shape == (x_grid.size, y_grid.size)
+            assert np.all(np.isfinite(T0))
+            assert np.allclose(T0[-1, :], 300.0)
+        if family != "uniform_2d":
+            assert any(np.ptp(np.asarray(p["T0"])) > 1e-6 for p in params)
+
+    def test_ic_reproducible_fixed_seed(self):
+        # Same seeds + same assignment reproduce identical families and fields.
+        p1 = _dfs_sample_params(n=8)
+        p2 = _dfs_sample_params(n=8)
+        for a, b in zip(p1, p2):
+            assert a["ic_family"] == b["ic_family"]
+            np.testing.assert_allclose(np.asarray(a["T0"]), np.asarray(b["T0"]))
 
 
 class TestDiffusionForcingSingleSchema:
@@ -473,6 +507,46 @@ class TestDiffusionForcingSingleSchema:
         }], dtype=object)
         with pytest.raises(ValueError, match="admits"):
             spec.validate_schema(bad_spatial, np.array([0]))
+
+
+class TestDiffusionForcingSingleBalancedData:
+    ALLOWED = ["uniform_2d", "random_sinusoid_2d", "grf_2d", "hot_spot_2d"]
+
+    def test_balanced_family_quota_and_reproducible(self):
+        from collections import Counter
+        from data.generate_dataset import build_balanced_ic_families
+
+        fams = build_balanced_ic_families(40, self.ALLOWED, seed=2)
+        counts = Counter(fams)
+        assert set(counts) == set(self.ALLOWED)
+        assert max(counts.values()) - min(counts.values()) <= 1
+        assert build_balanced_ic_families(40, self.ALLOWED, seed=2) == fams
+
+    def test_balanced_family_non_multiple(self):
+        from collections import Counter
+        from data.generate_dataset import build_balanced_ic_families
+
+        fams = build_balanced_ic_families(42, self.ALLOWED, seed=2)
+        assert len(fams) == 42
+        counts = Counter(fams)
+        assert max(counts.values()) - min(counts.values()) <= 1
+
+    def test_stratified_split_covers_families(self):
+        from collections import Counter
+        from data.dataset import split_sim_ids_stratified
+        from data.generate_dataset import build_balanced_ic_families
+
+        labels = np.array(build_balanced_ic_families(40, self.ALLOWED, seed=2))
+        tr, va, te = split_sim_ids_stratified(labels, seed=0)
+        assert len(tr) + len(va) + len(te) == 40
+        assert set(tr.tolist()).isdisjoint(va.tolist())
+        assert set(tr.tolist()).isdisjoint(te.tolist())
+        assert set(va.tolist()).isdisjoint(te.tolist())
+        for ids in (tr, va, te):
+            counts = Counter(labels[ids].tolist())
+            if len(ids) >= 4:
+                assert set(counts) == set(self.ALLOWED)
+                assert max(counts.values()) - min(counts.values()) <= 1
 
 
 # ===================== source adapter =====================
