@@ -105,8 +105,8 @@ model:
     forcing_patch_size: 8
     ic_patch_size: 10
 
-  # ---- InterfaceCViT (interfaces PINO path) ----
-  # Read ONLY by train_pino.run_one_seed_interfaces_pino (benchmark=interfaces).
+  # ---- InterfaceCViT (layered-interface PINO paths) ----
+  # Read by the forcing and interfaces InterfaceCViT runners.
   # These keys OVERRIDE model.cvit for the interface surrogate; anything omitted
   # falls back to model.cvit above. Three heterogeneous token streams feed the
   # decoder cross-attention: a spatial CViTEncoder over spatial_in_ch channels
@@ -208,16 +208,16 @@ training:
   num_workers: null
   # ---- PINO (physics-only) training ----
   # Read ONLY by src.operators.train_pino; inert for the FNO path. Loss is
-  #   L = lambda_r*mean(r^2) + lambda_ic*mean(ic^2) + lambda_bc*mean(neumann^2).
+  # Layered forcing additionally separates the interface and left-boundary terms.
   # n_r/n_ic/n_bc are collocation counts per step; sim_batch sims per step.
   # chunk_r caps query/decode memory: autodiff uses residual chunks; finite volume
   # uses full-grid decoder chunks (0/null = no chunking).
   pino:
-    # Residual backend for the diffusion_forcing_single ForcingICCViT trainer.
-    # finite_volume uses full-grid, solver-lattice CN intervals; autodiff keeps
-    # the free point-collocation path and remains the default.
+    # For forcing, the benchmark override selects finite_volume and this may be
+    # changed to hybrid. Other PINO runners retain their documented backends.
     residual_method: autodiff
     lambda_r: 1.0
+    lambda_interface: 1.0
     lambda_ic: 1.0
     lambda_bc: 1.0
     # Per-term forcing-wall weight (forcing PINO only). null (default) keeps the
@@ -271,15 +271,12 @@ training:
       profile_every: 100
       min_profile_samples: 10
       warn_fraction: 0.10
-    # interface_band (interfaces PINO only): split the two node columns flanking
-    # the interface face (interior columns {face_idx-1, face_idx}) out of the
-    # interior CN residual into a DISJOINT 5th balanced GradNorm term so the jump
-    # sub-signal is up-weighted independently of bulk diffusion. enabled: false is
-    # a TRUE no-op (interior keeps all columns, term set stays 4). lambda is the
-    # static coefficient GradNorm multiplies; enabled with lambda <= 0 raises.
-    interface_band:
-      enabled: false
-      lambda: 1.0
+    finite_volume:
+      # Pure FV residual partitioning, never interface labels or supervision.
+      # The forcing InterfaceCViT comparison requires this split in full-FV mode;
+      # hybrid mode always owns its two interface columns independently.
+      interface_residual_weighting:
+        enabled: false
     # region_standardize (interfaces PINO only): rescale each balanced term by a
     # per-term scale s_k FROZEN from a short calibration pass on the INITIAL model
     # (no optimizer steps) before GradNorm is built, so the composed loss is not

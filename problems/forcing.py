@@ -29,7 +29,7 @@ from src.physics.boundary_forcing import (
     build_qL,
     build_qL_integral,
 )
-from src.physics.fv_solver_2d import FVSolver2D
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 # ----- representation constants (canonical home for the forcing benchmark) -----
 
@@ -49,6 +49,14 @@ COND_STATIC_DIM = (
 FORCING_TEMPORAL_SAMPLES = 128
 FORCING_TEMPORAL_TOKEN_DIM = 2
 A_AMP_REF = 300.0
+INTERFACE_X = 0.5
+K_LEFT = 2.0
+K_RIGHT = 1.0
+RHO_LEFT = 1.0
+RHO_RIGHT = 1.0
+CP_LEFT = 1.0
+CP_RIGHT = 1.0
+T_RIGHT = 300.0
 
 # Spatial channels per representation. temporal_encoder mode lifts the lean
 # [T_tilde, x, y, s_y] base; bins mode appends the FORCING_BINS integral Q-bins.
@@ -105,6 +113,19 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
     spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
 
     return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
+
+
+def normalize_interface_scalars(interface_x, R_c) -> np.ndarray:
+    """InterfaceCViT parameter tokens ``[fixed-interface, normalized R_c]``."""
+    interface = np.asarray(interface_x, dtype=np.float32)
+    if not np.allclose(interface, INTERFACE_X, rtol=0.0, atol=1e-7):
+        raise ValueError(
+            f"forcing InterfaceCViT requires interface_x={INTERFACE_X}"
+        )
+    rc = np.asarray(R_c, dtype=np.float32)
+    interface, rc = np.broadcast_arrays(interface, rc)
+    rc_hat = (rc - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
+    return np.stack([np.full_like(rc_hat, 0.5), rc_hat], axis=-1).astype(np.float32)
 
 
 def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
@@ -295,6 +316,7 @@ class ForcingProblem(ProblemSpec):
 
             sim_params.append({
                 "R_c": R_c,
+                "interface_x": INTERFACE_X,
                 "T0": T0,
                 "ic_family": ic_family,
                 "ic_params": ic_params,
@@ -306,7 +328,44 @@ class ForcingProblem(ProblemSpec):
 
         return sim_params
 
+    def physics_parameters(
+        self, a: float = 0.0, b: float = 1.0,
+        c: float = 0.0, d: float = 1.0,
+    ) -> dict[str, Any]:
+        if not all(np.isclose(float(value), target) for value, target in (
+            (a, 0.0), (b, 1.0), (c, 0.0), (d, 1.0),
+        )):
+            raise ValueError("forcing physics is defined on the fixed domain [0, 1]^2")
+        return {
+            "a": 0.0,
+            "b": 1.0,
+            "c": 0.0,
+            "d": 1.0,
+            "interface_x": INTERFACE_X,
+            "k_left": K_LEFT,
+            "k_right": K_RIGHT,
+            "rho_left": RHO_LEFT,
+            "rho_right": RHO_RIGHT,
+            "cp_left": CP_LEFT,
+            "cp_right": CP_RIGHT,
+            "T_right": T_RIGHT,
+            "layers": [
+                Layer2D(
+                    x_left=0.0, x_right=INTERFACE_X,
+                    rho=RHO_LEFT, cp=CP_LEFT, k=K_LEFT,
+                ),
+                Layer2D(
+                    x_left=INTERFACE_X, x_right=1.0,
+                    rho=RHO_RIGHT, cp=CP_RIGHT, k=K_RIGHT,
+                ),
+            ],
+        }
+
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
+        physics = self.physics_parameters(
+            base_kwargs["a"], base_kwargs["b"],
+            base_kwargs["c"], base_kwargs["d"],
+        )
         y_grid = base_kwargs["y_grid"]
         ramp = base_kwargs.get("ramp_seconds")
         t_ramp = float(ramp) if ramp is not None else default_ramp_seconds(base_kwargs["dt"])
@@ -331,7 +390,7 @@ class ForcingProblem(ProblemSpec):
             c=base_kwargs["c"], d=base_kwargs["d"],
             Nx=base_kwargs["Nx"], Ny=base_kwargs["Ny"],
             lam_target=base_kwargs["lam_target"],
-            layers=base_kwargs["layers"],
+            layers=physics["layers"],
             t_final=base_kwargs["t_final"],
             flux_f=base_kwargs["flux_f"], flux_A=base_kwargs["flux_A"],
             t_on=base_kwargs["t_on"], t_off=base_kwargs["t_off"],

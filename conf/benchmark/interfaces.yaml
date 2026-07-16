@@ -37,11 +37,9 @@ training:
     intervals_per_sim: 2
     stratified_time_sampling: true
     causal_num_bins: 6
-    # Interface-band 5th balanced term + per-region frozen-scale standardization.
-    # Both default OFF here; the screens override enabled=true on the CLI.
-    interface_band:
-      enabled: false
-      lambda: 1.0
+    finite_volume:
+      interface_residual_weighting:
+        enabled: false
     region_standardize:
       enabled: false
       calibration_steps: 50

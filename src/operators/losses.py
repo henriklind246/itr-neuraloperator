@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -421,6 +423,57 @@ def full_bc_physics_loss(
         # interior mean-square.
         out["interface_band_per_sample"] = interface_band_per_sample
         out["phys_interface_band_mse"] = interface_band_per_sample.mean()
+    return out
+
+
+def region_balanced_fv_rate_loss(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom,
+    bc,
+    *,
+    t_ref: float,
+    dirichlet_both_ends: bool = False,
+) -> dict:
+    """Dimensionless, per-interval FV losses over disjoint physical regions."""
+    from src.physics.fv_residual import region_balanced_fv_rate_residual
+
+    if not math.isfinite(float(t_ref)) or float(t_ref) <= 0.0:
+        raise ValueError(f"t_ref must be finite and positive, got {t_ref!r}")
+    parts = region_balanced_fv_rate_residual(
+        T_n,
+        T_np1,
+        geom,
+        bc,
+        dirichlet_both_ends=dirichlet_both_ends,
+        keep_batch=True,
+    )
+
+    scale = float(t_ref)
+
+    def _rate_mse_per_interval(value: torch.Tensor) -> torch.Tensor:
+        return (scale * value).square().flatten(1).mean(dim=1)
+
+    per = {
+        "interior": _rate_mse_per_interval(parts["interior"]),
+        "interface": _rate_mse_per_interval(parts["interface"]),
+        "left_neumann": _rate_mse_per_interval(parts["left_neumann"]),
+        "top_adiabatic": _rate_mse_per_interval(parts["top_adiabatic"]),
+        "bottom_adiabatic": _rate_mse_per_interval(parts["bottom_adiabatic"]),
+    }
+    per["topbot_adiabatic"] = 0.5 * (
+        per["top_adiabatic"] + per["bottom_adiabatic"]
+    )
+    right = parts["right_dirichlet"].square().flatten(1).mean(dim=1)
+    if dirichlet_both_ends:
+        right = 0.5 * (
+            right
+            + parts["right_dirichlet_n"].square().flatten(1).mean(dim=1)
+        )
+    per["right_dirichlet"] = right
+
+    out = {f"{name}_per_sample": value for name, value in per.items()}
+    out.update({f"phys_{name}_mse": value.mean() for name, value in per.items()})
     return out
 
 

@@ -32,7 +32,12 @@ from data.dataset import (
 )
 from problems.diffusion import T_RIGHT
 from problems.diffusion_forcing import K_SLAB
-from problems.forcing import A_AMP_REF
+from problems.forcing import (
+    A_AMP_REF,
+    INTERFACE_X as FORCING_INTERFACE_X,
+    RC_RANGE as FORCING_RC_RANGE,
+    normalize_interface_scalars as normalize_forcing_interface_scalars,
+)
 from problems.interfaces import (
     INTERFACE_X_RANGE,
     K_LEFT,
@@ -41,7 +46,7 @@ from problems.interfaces import (
     normalize_interface_scalars,
 )
 from src.operators.cvit import CViT, ForcingCViT, ForcingICCViT, InterfaceCViT
-from src.operators.losses import full_bc_physics_loss
+from src.operators.losses import full_bc_physics_loss, region_balanced_fv_rate_loss
 from src.operators.train import (
     GradNormBalancer,
     _advance_scheduler,
@@ -68,6 +73,7 @@ from src.physics.fv_residual import (
     build_cn_geom_batched,
     build_cn_geom_per_interface,
     build_homogeneous_cn_geom,
+    interface_residual_rate,
     locate_interface,
 )
 from src.physics.init_conditions import (
@@ -160,6 +166,56 @@ class OnlineSamplerRNGs:
             self.numpy[name].bit_generator.state = copy.deepcopy(state["numpy"][name])
         self.autodiff_collocation.set_state(state["autodiff_collocation"])
         self.evaluation.set_state(state["evaluation"])
+
+
+@dataclass
+class HybridForcingRNGs:
+    """Independent common and backend-specific streams for the forcing screen."""
+
+    forcing_selection: np.random.Generator
+    contact_resistance: np.random.Generator
+    interval_selection: np.random.Generator
+    bulk_collocation: torch.Generator
+    boundary_collocation: torch.Generator
+    ic_collocation: torch.Generator
+    validation: torch.Generator
+
+    @classmethod
+    def create(cls, seed: int, device: torch.device) -> "HybridForcingRNGs":
+        children = np.random.SeedSequence(int(seed)).spawn(7)
+
+        def _torch_generator(child) -> torch.Generator:
+            generator = torch.Generator(device=device)
+            raw = int(child.generate_state(1, dtype=np.uint64)[0])
+            generator.manual_seed(raw % (2**63 - 1))
+            return generator
+
+        return cls(
+            forcing_selection=np.random.default_rng(children[0]),
+            contact_resistance=np.random.default_rng(children[1]),
+            interval_selection=np.random.default_rng(children[2]),
+            bulk_collocation=_torch_generator(children[3]),
+            boundary_collocation=_torch_generator(children[4]),
+            ic_collocation=_torch_generator(children[5]),
+            validation=_torch_generator(children[6]),
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "forcing_selection": copy.deepcopy(
+                self.forcing_selection.bit_generator.state
+            ),
+            "contact_resistance": copy.deepcopy(
+                self.contact_resistance.bit_generator.state
+            ),
+            "interval_selection": copy.deepcopy(
+                self.interval_selection.bit_generator.state
+            ),
+            "bulk_collocation": self.bulk_collocation.get_state(),
+            "boundary_collocation": self.boundary_collocation.get_state(),
+            "ic_collocation": self.ic_collocation.get_state(),
+            "validation": self.validation.get_state(),
+        }
 
 
 def _canonical_descriptor_value(value):
@@ -4556,6 +4612,1021 @@ def validate_interfaces_gnrmse(
     return out
 
 
+def _validate_forcing_layered_dataset(
+    problem, data: dict[str, Any], sim_params: np.ndarray, dt: float,
+) -> tuple[dict[str, Any], int, tuple[float, float]]:
+    x = np.asarray(data["x_grid"], dtype=np.float64)
+    y = np.asarray(data["y_grid"], dtype=np.float64)
+    t = np.asarray(data["t_grid"], dtype=np.float64)
+    if x.size < 7 or y.size < 3:
+        raise ValueError("forcing hybrid residual requires Nx >= 7 and Ny >= 3")
+    hx = float(x[1] - x[0])
+    hy = float(y[1] - y[0])
+    if not np.allclose(np.diff(x), hx) or not np.allclose(np.diff(y), hy):
+        raise ValueError("forcing hybrid residual requires uniform x/y grids")
+    if not np.isclose(hx, hy, rtol=1e-10, atol=1e-12):
+        raise ValueError("forcing hybrid residual requires the solver's isotropic grid")
+    physics = problem.physics_parameters(
+        float(x[0]), float(x[-1]), float(y[0]), float(y[-1])
+    )
+    interface_x = float(physics["interface_x"])
+    location = locate_interface(x, interface_x)
+    f = int(location.face_idx)
+    if not np.isclose(interface_x, 0.5 * (x[f] + x[f + 1]), atol=1e-12):
+        raise ValueError(
+            f"interface_x={interface_x} is not face-aligned on the selected grid"
+        )
+    if f - 2 < 0 or f + 3 >= x.size:
+        raise ValueError("interface trace reconstruction requires f-2 >= 0 and f+3 < Nx")
+    if not np.isclose(float(t[-1]), 0.3, rtol=0.0, atol=5e-8):
+        raise ValueError(f"forcing reference time expects t_final=0.3, got {t[-1]}")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("forcing FV residual requires a positive solver dt")
+    for sid, raw in enumerate(sim_params):
+        params = dict(raw)
+        if "interface_x" in params and not np.isclose(
+            float(params["interface_x"]), interface_x, atol=1e-8
+        ):
+            raise ValueError(
+                f"sim_params[{sid}] interface_x conflicts with ForcingProblem physics"
+            )
+        for key in ("k_left", "k_right", "rho_left", "rho_right", "cp_left", "cp_right"):
+            if key in params and not np.isclose(float(params[key]), float(physics[key])):
+                raise ValueError(
+                    f"sim_params[{sid}] {key} conflicts with ForcingProblem physics"
+                )
+        if "T_right" in params and not np.isclose(
+            float(params["T_right"]), float(physics["T_right"])
+        ):
+            raise ValueError(
+                f"sim_params[{sid}] T_right conflicts with ForcingProblem physics"
+            )
+    exclusion = (0.5 * (x[f - 1] + x[f]), 0.5 * (x[f + 1] + x[f + 2]))
+    return physics, f, exclusion
+
+
+def _quadratic_trace_weights(nodes: np.ndarray, x_eval: float) -> tuple[np.ndarray, np.ndarray]:
+    nodes = np.asarray(nodes, dtype=np.float64)
+    vandermonde = np.stack((np.ones(3), nodes, nodes ** 2), axis=1)
+    inverse = np.linalg.inv(vandermonde)
+    value = np.array([1.0, x_eval, x_eval ** 2]) @ inverse
+    derivative = np.array([0.0, 1.0, 2.0 * x_eval]) @ inverse
+    return value, derivative
+
+
+def validate_forcing_interface_gnrmse(
+    model: InterfaceCViT,
+    data: dict[str, Any],
+    ids: np.ndarray,
+    sim_params: np.ndarray,
+    *,
+    physics: dict[str, Any],
+    t_ramp: float,
+    q_ref: float,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    t_ref: float,
+    device: torch.device,
+    query_batch: int = 8,
+) -> dict[str, float]:
+    x_np = np.asarray(data["x_grid"], dtype=np.float64)
+    y_np = np.asarray(data["y_grid"], dtype=np.float64)
+    t_np = np.asarray(data["t_grid"], dtype=np.float64)
+    x_t = torch.as_tensor(x_np, dtype=torch.float32, device=device)
+    y_t = torch.as_tensor(y_np, dtype=torch.float32, device=device)
+    mu, sigma = float(data["mu_global"]), float(data["sigma_global"])
+    Nx, Ny, Nt = x_np.size, y_np.size, t_np.size
+    interface_x = float(physics["interface_x"])
+    f = locate_interface(x_np, interface_x).face_idx
+    if f - 2 < 0 or f + 3 >= Nx:
+        raise ValueError("interface trace reconstruction stencil lies outside the grid")
+    left_nodes = np.array([f - 2, f - 1, f])
+    right_nodes = np.array([f + 1, f + 2, f + 3])
+    left_value_w, left_deriv_w = _quadratic_trace_weights(
+        x_np[left_nodes], interface_x
+    )
+    right_value_w, right_deriv_w = _quadratic_trace_weights(
+        x_np[right_nodes], interface_x
+    )
+    gx, gy = torch.meshgrid(x_t, y_t, indexing="ij")
+    mesh = torch.stack((gx.reshape(-1), gy.reshape(-1)), dim=-1).unsqueeze(0)
+
+    per_sim_rmse: list[float] = []
+    per_sim_lead_rmse: list[np.ndarray] = []
+    temporal_families: list[str] = []
+    spatial_families: list[str] = []
+    jump_ssq = flux_ssq = contact_ssq = energy_ssq = 0.0
+    jump_count = flux_count = energy_count = 0
+    for start in range(0, len(ids), query_batch):
+        chunk = np.asarray(ids[start:start + query_batch])
+        params = []
+        for sid in chunk:
+            record = dict(sim_params[int(sid)])
+            record.setdefault("interface_x", interface_x)
+            params.append(record)
+        B = len(params)
+        fixed_ic = np.full((Nx, Ny), float(physics["T_right"]), dtype=np.float32)
+        u_spatial = torch.from_numpy(np.stack([
+            _interface_spatial_channels(
+                fixed_ic, interface_x, x_np, mu, sigma
+            ) for _ in params
+        ])).to(device)
+        forcing_image = build_forcing_image(
+            params, y_img, t_img, q_ref, device, t_ramp
+        )
+        pscal = torch.from_numpy(np.stack([
+            normalize_forcing_interface_scalars(interface_x, p["R_c"])
+            for p in params
+        ])).to(device)
+        latent = model.encode(u_spatial, forcing_image, pscal)
+        coords = mesh.expand(B, -1, -1)
+        pred = torch.empty((B, Nt, Nx, Ny), device=device)
+        for index, time_value in enumerate(t_np):
+            tq = torch.full(
+                (B, Nx * Ny, 1), float(time_value), device=device
+            )
+            pred[:, index] = model.decode(latent, coords, tq)[..., 0].view(B, Nx, Ny)
+        pred_norm = pred.detach().cpu().numpy().astype(np.float64)
+        pred_K = pred_norm * sigma + mu
+        truth = np.asarray(data["trajectories"][chunk], dtype=np.float64)
+        rmse = np.sqrt(((pred_K - truth) ** 2).mean(axis=(1, 2, 3)))
+        per_sim_rmse.extend(float(value) for value in rmse)
+        per_sim_lead_rmse.extend(
+            np.sqrt(((pred_K - truth) ** 2).mean(axis=(2, 3)))
+        )
+        temporal_families.extend(str(p["temporal_family"]) for p in params)
+        spatial_families.extend(str(p["spatial_family"]) for p in params)
+
+        jump_error = (
+            pred_K[:, :, f, :] - pred_K[:, :, f + 1, :]
+            - (truth[:, :, f, :] - truth[:, :, f + 1, :])
+        )
+        jump_ssq += float(np.square(jump_error).sum())
+        jump_count += int(jump_error.size)
+
+        left_field = pred_K[:, :, left_nodes, :]
+        right_field = pred_K[:, :, right_nodes, :]
+        T_minus = np.einsum("k,btkj->btj", left_value_w, left_field)
+        T_plus = np.einsum("k,btkj->btj", right_value_w, right_field)
+        dTdx_minus = np.einsum("k,btkj->btj", left_deriv_w, left_field)
+        dTdx_plus = np.einsum("k,btkj->btj", right_deriv_w, right_field)
+        q_minus = -float(physics["k_left"]) * dTdx_minus
+        q_plus = -float(physics["k_right"]) * dTdx_plus
+        flux_error = q_minus - q_plus
+        rc = np.asarray([float(p["R_c"]) for p in params])[:, None, None]
+        contact_error = T_minus - T_plus - rc * 0.5 * (q_minus + q_plus)
+        flux_ssq += float(np.square(flux_error).sum())
+        contact_ssq += float(np.square(contact_error).sum())
+        flux_count += int(flux_error.size)
+
+        if Nt > 1:
+            dt_val = float(t_np[1] - t_np[0])
+            interval_count = Nt - 1
+            Tn = pred[:, :-1].reshape(B * interval_count, Nx, Ny)
+            Tnp1 = pred[:, 1:].reshape(B * interval_count, Nx, Ny)
+            rc_rep = np.repeat(np.asarray([float(p["R_c"]) for p in params]), interval_count)
+            iface_rep = np.full(B * interval_count, interface_x)
+            geom = build_cn_geom_per_interface(
+                x_np, y_np, physics["k_left"], physics["k_right"],
+                iface_rep, rc_rep, dt_val, sigma_global=sigma,
+                rho=physics["rho_left"], cp=physics["cp_left"],
+                device=device, dtype=pred.dtype,
+            )
+            energy = float(t_ref) * interface_residual_rate(Tn, Tnp1, geom)
+            energy_ssq += float(energy.square().sum().cpu())
+            energy_count += int(energy.numel())
+
+    rmse_arr = np.asarray(per_sim_rmse, dtype=np.float64)
+    lead_rmse = np.asarray(per_sim_lead_rmse, dtype=np.float64)
+    out = {
+        "val_gnrmse": float((rmse_arr / (sigma + 1e-8)).mean()),
+        "val_rmse_K": float(rmse_arr.mean()),
+        "node_jump_rmse_K": math.sqrt(jump_ssq / max(jump_count, 1)),
+        "interface_flux_mismatch": math.sqrt(flux_ssq / max(flux_count, 1)) / q_ref,
+        "interface_contact_rmse_K": math.sqrt(contact_ssq / max(flux_count, 1)),
+        "interface_contact_rmse_norm": (
+            math.sqrt(contact_ssq / max(flux_count, 1)) / (sigma + 1e-8)
+        ),
+        "interface_energy_rms": math.sqrt(energy_ssq / max(energy_count, 1)),
+    }
+    positive_leads = t_np > 0.0
+    lead_edges = (t_np[-1] / 3.0, 2.0 * t_np[-1] / 3.0)
+    lead_masks = {
+        "short": positive_leads & (t_np <= lead_edges[0]),
+        "mid": (t_np > lead_edges[0]) & (t_np <= lead_edges[1]),
+        "long": t_np > lead_edges[1],
+    }
+    for name, mask in lead_masks.items():
+        if mask.any():
+            out[f"gnrmse_lead_{name}"] = float(
+                (lead_rmse[:, mask] / (sigma + 1e-8)).mean()
+            )
+    for prefix, values in (
+        ("temporal", np.asarray(temporal_families)),
+        ("spatial", np.asarray(spatial_families)),
+    ):
+        for family in np.unique(values):
+            mask = values == family
+            out[f"gnrmse_{prefix}_{family}"] = float(
+                (rmse_arr[mask] / (sigma + 1e-8)).mean()
+            )
+    return out
+
+
+def _open_uniform(
+    shape: tuple[int, ...], low: float, high: float, *,
+    device: torch.device, generator: torch.Generator,
+) -> torch.Tensor:
+    if not high > low:
+        raise ValueError(f"empty open sampling interval ({low}, {high})")
+    eps = 16.0 * torch.finfo(torch.float32).eps
+    unit = torch.rand(shape, device=device, generator=generator)
+    unit = eps + (1.0 - 2.0 * eps) * unit
+    return float(low) + (float(high) - float(low)) * unit
+
+
+def _sample_hybrid_bulk(
+    batch_size: int,
+    n_points: int,
+    *,
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    exclusion: tuple[float, float],
+    t_final: float,
+    device: torch.device,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    a, b = map(float, x_bounds)
+    c, d = map(float, y_bounds)
+    exclusion_left, exclusion_right = map(float, exclusion)
+    left_width = exclusion_left - a
+    right_width = b - exclusion_right
+    if left_width <= 0.0 or right_width <= 0.0:
+        raise ValueError("interface exclusion removes an entire material interior")
+    side = torch.rand(
+        (batch_size, n_points, 1), device=device, generator=generator
+    ) < left_width / (left_width + right_width)
+    x_left = _open_uniform(
+        (batch_size, n_points, 1), a, exclusion_left,
+        device=device, generator=generator,
+    )
+    x_right = _open_uniform(
+        (batch_size, n_points, 1), exclusion_right, b,
+        device=device, generator=generator,
+    )
+    x = torch.where(side, x_left, x_right)
+    y = _open_uniform(
+        (batch_size, n_points, 1), c, d,
+        device=device, generator=generator,
+    )
+    t = _open_uniform(
+        (batch_size, n_points, 1), 0.0, t_final,
+        device=device, generator=generator,
+    )
+    return torch.cat((x, y), dim=-1).detach().requires_grad_(True), t.detach().requires_grad_(True)
+
+
+def _decode_derivatives(
+    model: InterfaceCViT,
+    latent: torch.Tensor,
+    coords: torch.Tensor,
+    time_query: torch.Tensor,
+    *,
+    second_order: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    prediction = model.decode(latent, coords, time_query)
+    ones = torch.ones_like(prediction)
+    grad_xy = torch.autograd.grad(
+        prediction, coords, ones, create_graph=True, retain_graph=True
+    )[0]
+    grad_t = torch.autograd.grad(
+        prediction, time_query, ones, create_graph=True, retain_graph=True
+    )[0]
+    if not second_order:
+        return prediction, grad_xy, grad_t, None, None
+    grad_xx = torch.autograd.grad(
+        grad_xy[..., 0:1], coords, torch.ones_like(grad_xy[..., 0:1]),
+        create_graph=True, retain_graph=True,
+    )[0][..., 0:1]
+    grad_yy = torch.autograd.grad(
+        grad_xy[..., 1:2], coords, torch.ones_like(grad_xy[..., 1:2]),
+        create_graph=True, retain_graph=True,
+    )[0][..., 1:2]
+    return prediction, grad_xy, grad_t, grad_xx, grad_yy
+
+
+def _forcing_q_at_batch(
+    params: list[dict], y: torch.Tensor, t: torch.Tensor, t_ramp: float,
+) -> torch.Tensor:
+    y_np = y.detach().cpu().numpy()
+    t_np = t.detach().cpu().numpy()
+    values = np.empty(y_np.shape, dtype=np.float32)
+    for index, record in enumerate(params):
+        forcing = reconstruct_qL(
+            record["temporal_family"], record["temporal_params"],
+            record["spatial_family"], record["spatial_params"],
+            t_ramp=t_ramp,
+        )
+        values[index, :, 0] = forcing.evaluate_points(
+            y_np[index, :, 0], t_np[index, :, 0]
+        )
+    return torch.from_numpy(values).to(device=y.device, dtype=y.dtype)
+
+
+def _forcing_hybrid_ad_losses(
+    model: InterfaceCViT,
+    latent: torch.Tensor,
+    params: list[dict],
+    *,
+    physics: dict[str, Any],
+    exclusion: tuple[float, float],
+    sigma: float,
+    q_ref: float,
+    t_ref: float,
+    t_final: float,
+    t_ramp: float,
+    n_r: int,
+    n_bc: int,
+    bulk_generator: torch.Generator,
+    boundary_generator: torch.Generator,
+) -> dict[str, torch.Tensor]:
+    device = latent.device
+    batch_size = latent.shape[0]
+    x_bounds = (float(physics["a"]), float(physics["b"]))
+    y_bounds = (float(physics["c"]), float(physics["d"]))
+    interface_x = float(physics["interface_x"])
+
+    coords, tq = _sample_hybrid_bulk(
+        batch_size, n_r, x_bounds=x_bounds, y_bounds=y_bounds,
+        exclusion=exclusion, t_final=t_final, device=device,
+        generator=bulk_generator,
+    )
+    _, _, grad_t, grad_xx, grad_yy = _decode_derivatives(
+        model, latent, coords, tq, second_order=True
+    )
+    alpha_left = float(physics["k_left"]) / (
+        float(physics["rho_left"]) * float(physics["cp_left"])
+    )
+    alpha_right = float(physics["k_right"]) / (
+        float(physics["rho_right"]) * float(physics["cp_right"])
+    )
+    alpha = torch.where(
+        coords[..., 0:1] < interface_x,
+        torch.as_tensor(alpha_left, device=device, dtype=coords.dtype),
+        torch.as_tensor(alpha_right, device=device, dtype=coords.dtype),
+    )
+    bulk_rate = grad_t - alpha * (grad_xx + grad_yy)
+    bulk = (float(t_ref) * bulk_rate).square().flatten(1).mean(dim=1).mean()
+
+    def _boundary_coords(kind: str) -> tuple[torch.Tensor, torch.Tensor]:
+        free = _open_uniform(
+            (batch_size, n_bc, 1), 0.0, 1.0,
+            device=device, generator=boundary_generator,
+        )
+        if kind != "left":
+            interface = torch.as_tensor(
+                interface_x, device=device, dtype=free.dtype
+            )
+            shift = 32.0 * torch.finfo(free.dtype).eps
+            free = torch.where(
+                (free - interface).abs() <= shift, free + shift, free
+            )
+        time = _open_uniform(
+            (batch_size, n_bc, 1), 0.0, t_final,
+            device=device, generator=boundary_generator,
+        )
+        if kind == "left":
+            xy = torch.cat((torch.zeros_like(free), free), dim=-1)
+        elif kind == "top":
+            xy = torch.cat((free, torch.ones_like(free)), dim=-1)
+        elif kind == "bottom":
+            xy = torch.cat((free, torch.zeros_like(free)), dim=-1)
+        else:
+            raise ValueError(f"unknown boundary {kind!r}")
+        return xy.detach().requires_grad_(True), time.detach().requires_grad_(True)
+
+    left_coords, left_t = _boundary_coords("left")
+    _, left_grad, _, _, _ = _decode_derivatives(
+        model, latent, left_coords, left_t, second_order=False
+    )
+    q_left = _forcing_q_at_batch(
+        params, left_coords[..., 1:2], left_t, t_ramp
+    )
+    left_flux = -float(physics["k_left"]) * float(sigma) * left_grad[..., 0:1]
+    left = ((left_flux - q_left) / float(q_ref)).square().flatten(1).mean(dim=1).mean()
+
+    wall_losses = {}
+    for wall in ("top", "bottom"):
+        wall_coords, wall_t = _boundary_coords(wall)
+        _, wall_grad, _, _, _ = _decode_derivatives(
+            model, latent, wall_coords, wall_t, second_order=False
+        )
+        conductivity = torch.where(
+            wall_coords[..., 0:1] < interface_x,
+            torch.as_tensor(physics["k_left"], device=device, dtype=wall_coords.dtype),
+            torch.as_tensor(physics["k_right"], device=device, dtype=wall_coords.dtype),
+        )
+        wall_flux = conductivity * float(sigma) * wall_grad[..., 1:2]
+        wall_losses[wall] = (
+            (wall_flux / float(q_ref)).square().flatten(1).mean(dim=1).mean()
+        )
+
+    return {
+        "interior": bulk,
+        "left_neumann": left,
+        "top_adiabatic": wall_losses["top"],
+        "bottom_adiabatic": wall_losses["bottom"],
+        "topbot_adiabatic": 0.5 * (
+            wall_losses["top"] + wall_losses["bottom"]
+        ),
+    }
+
+
+def _mean_problem_intervals(
+    values: torch.Tensor, batch_size: int, intervals_per_sim: int,
+) -> torch.Tensor:
+    if values.shape != (batch_size * intervals_per_sim,):
+        raise ValueError(
+            f"expected {batch_size * intervals_per_sim} interval losses, got {tuple(values.shape)}"
+        )
+    return values.view(batch_size, intervals_per_sim).mean(dim=1).mean()
+
+
+def _sample_online_layered_forcing_params(
+    rngs: HybridForcingRNGs,
+    n: int,
+    *,
+    dt: float,
+    t_final: float,
+    y_bounds: tuple[float, float],
+    temporal_window: dict[str, float],
+) -> list[dict]:
+    params = sample_forcing_params(
+        rngs.forcing_selection,
+        n,
+        dt,
+        t_final,
+        c=float(y_bounds[0]),
+        d=float(y_bounds[1]),
+        temporal_window=temporal_window,
+    )
+    resistance = rngs.contact_resistance.uniform(
+        FORCING_RC_RANGE[0], FORCING_RC_RANGE[1], size=int(n)
+    )
+    for record, value in zip(params, resistance):
+        record["R_c"] = float(value)
+        record["interface_x"] = FORCING_INTERFACE_X
+    return params
+
+
+def _forcing_layered_batch_losses(
+    model: InterfaceCViT,
+    params: list[dict],
+    *,
+    residual_method: str,
+    physics: dict[str, Any],
+    interface_face: int,
+    exclusion: tuple[float, float],
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    mu: float,
+    sigma: float,
+    q_ref: float,
+    t_ref: float,
+    t_final: float,
+    t_ramp: float,
+    dt: float,
+    n_steps: int,
+    intervals_per_sim: int,
+    stratified: bool,
+    n_bins: int,
+    n_r: int,
+    n_bc: int,
+    n_ic: int,
+    chunk_r: int,
+    rngs: HybridForcingRNGs,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    device = x_grid.device
+    batch_size = len(params)
+    Nx, Ny = int(x_grid.numel()), int(y_grid.numel())
+    x_np = x_grid.detach().cpu().numpy().astype(np.float64)
+    fixed_ic_tilde = np.float32(
+        (float(physics["T_right"]) - float(mu)) / float(sigma)
+    )
+    normalized_ic = np.full(
+        (batch_size, Nx, Ny), fixed_ic_tilde, dtype=np.float32
+    )
+    u_spatial = torch.from_numpy(np.stack([
+        _interface_spatial_channels_from_normalized(
+            normalized_ic[index], float(physics["interface_x"]), x_np
+        )
+        for index in range(batch_size)
+    ])).to(device)
+    forcing_image = build_forcing_image(
+        params, y_img, t_img, q_ref, device, t_ramp
+    )
+    pscal = torch.from_numpy(np.stack([
+        normalize_forcing_interface_scalars(physics["interface_x"], p["R_c"])
+        for p in params
+    ])).to(device)
+    latent = model.encode(u_spatial, forcing_image, pscal)
+
+    ix = torch.randint(
+        0, Nx, (batch_size, n_ic), device=device, generator=rngs.ic_collocation
+    )
+    iy = torch.randint(
+        0, Ny, (batch_size, n_ic), device=device, generator=rngs.ic_collocation
+    )
+    ic_coords = torch.stack((x_grid[ix], y_grid[iy]), dim=-1)
+    ic_time = torch.zeros((batch_size, n_ic, 1), device=device)
+    ic_pred = _decode_in_chunks(model, latent, ic_coords, ic_time, chunk_r)
+    batch_index = torch.arange(batch_size, device=device)[:, None]
+    ic_target = u_spatial[batch_index, 0, ix, iy].unsqueeze(-1)
+    loss_ic = (ic_pred - ic_target).square().flatten(1).mean(dim=1).mean()
+
+    coll = _sample_lattice_intervals(
+        rngs.interval_selection, batch_size, intervals_per_sim,
+        n_steps, n_bins, stratified,
+    )
+    starts = coll["start_idx"].to(device=device, dtype=torch.long)
+    sim_local = coll["sim_local"].to(device=device, dtype=torch.long)
+    interval_count = int(starts.numel())
+    tn = starts.to(dtype=torch.float64) * float(dt)
+    tnp1 = tn + float(dt)
+    latent_intervals = latent[sim_local]
+
+    interface_values = np.full(interval_count, float(physics["interface_x"]))
+    resistance = np.asarray([
+        float(params[int(index)]["R_c"])
+        for index in sim_local.detach().cpu().numpy()
+    ])
+    geom = build_cn_geom_per_interface(
+        x_np, y_grid.detach().cpu().numpy(),
+        physics["k_left"], physics["k_right"],
+        interface_values, resistance, dt,
+        sigma_global=sigma, rho=physics["rho_left"], cp=physics["cp_left"],
+        device=device, dtype=x_grid.dtype,
+    )
+    if not bool((geom.face_idx == int(interface_face)).all().item()):
+        raise AssertionError("forcing interface face changed inside a training batch")
+
+    if residual_method == "finite_volume":
+        query_mesh = _full_grid_query_mesh(x_grid, y_grid)
+        query_count = Nx * Ny
+    else:
+        local_x = x_grid[interface_face - 1:interface_face + 3]
+        gx, gy = torch.meshgrid(local_x, y_grid, indexing="ij")
+        query_mesh = torch.stack((gx.reshape(-1), gy.reshape(-1)), dim=-1).unsqueeze(0)
+        query_count = 4 * Ny
+    coords = query_mesh.expand(interval_count, -1, -1)
+    tn_query = tn.to(dtype=x_grid.dtype).view(interval_count, 1, 1).expand(
+        interval_count, query_count, 1
+    )
+    tnp1_query = tnp1.to(dtype=x_grid.dtype).view(interval_count, 1, 1).expand(
+        interval_count, query_count, 1
+    )
+    T_n = _decode_in_chunks(
+        model, latent_intervals, coords, tn_query, chunk_r
+    )[..., 0].view(interval_count, -1, Ny)
+    T_np1 = _decode_in_chunks(
+        model, latent_intervals, coords, tnp1_query, chunk_r
+    )[..., 0].view(interval_count, -1, Ny)
+
+    if residual_method == "finite_volume":
+        qn = np.empty((interval_count, Ny), dtype=np.float64)
+        qnp1 = np.empty_like(qn)
+        qint = np.empty_like(qn)
+        y_np = y_grid.detach().cpu().numpy()
+        sim_np = sim_local.detach().cpu().numpy()
+        for interval in range(interval_count):
+            record = params[int(sim_np[interval])]
+            qn_i, qnp1_i, qint_i = build_interface_forcing(
+                record["temporal_family"], record["temporal_params"],
+                record["spatial_family"], record["spatial_params"],
+                y_np, float(tn[interval]), float(tnp1[interval]), t_ramp,
+            )
+            qn[interval], qnp1[interval], qint[interval] = qn_i, qnp1_i, qint_i
+        bc = FullBCData(
+            T_right_tilde=torch.as_tensor(
+                (float(physics["T_right"]) - mu) / sigma,
+                device=device, dtype=T_n.dtype,
+            ),
+            qL_n=torch.from_numpy(qn).to(device=device, dtype=T_n.dtype),
+            qL_np1=torch.from_numpy(qnp1).to(device=device, dtype=T_n.dtype),
+            qL_int=torch.from_numpy(qint).to(device=device, dtype=T_n.dtype),
+        )
+        fv = region_balanced_fv_rate_loss(
+            T_n, T_np1, geom, bc, t_ref=t_ref, dirichlet_both_ends=True
+        )
+        losses = {
+            "interior": _mean_problem_intervals(
+                fv["interior_per_sample"], batch_size, intervals_per_sim
+            ),
+            "interface": _mean_problem_intervals(
+                fv["interface_per_sample"], batch_size, intervals_per_sim
+            ),
+            "left_neumann": _mean_problem_intervals(
+                fv["left_neumann_per_sample"], batch_size, intervals_per_sim
+            ),
+            "top_adiabatic": _mean_problem_intervals(
+                fv["top_adiabatic_per_sample"], batch_size, intervals_per_sim
+            ),
+            "bottom_adiabatic": _mean_problem_intervals(
+                fv["bottom_adiabatic_per_sample"], batch_size, intervals_per_sim
+            ),
+            "topbot_adiabatic": _mean_problem_intervals(
+                fv["topbot_adiabatic_per_sample"], batch_size, intervals_per_sim
+            ),
+            "ic": loss_ic,
+        }
+        right_dir = fv["phys_right_dirichlet_mse"]
+    else:
+        interface_rate = interface_residual_rate(T_n, T_np1, geom)
+        interface_per_interval = (
+            float(t_ref) * interface_rate
+        ).square().flatten(1).mean(dim=1)
+        ad = _forcing_hybrid_ad_losses(
+            model, latent, params, physics=physics, exclusion=exclusion,
+            sigma=sigma, q_ref=q_ref, t_ref=t_ref, t_final=t_final,
+            t_ramp=t_ramp, n_r=n_r, n_bc=n_bc,
+            bulk_generator=rngs.bulk_collocation,
+            boundary_generator=rngs.boundary_collocation,
+        )
+        losses = {
+            **ad,
+            "interface": _mean_problem_intervals(
+                interface_per_interval, batch_size, intervals_per_sim
+            ),
+            "ic": loss_ic,
+        }
+        right_dir = torch.zeros((), device=device, dtype=T_n.dtype)
+    return losses, right_dir
+
+
+def run_one_seed_forcing_interface_pino(
+    config: dict, seed: int, run_dir: Path,
+) -> dict[str, Any]:
+    """Physics-only forcing InterfaceCViT with online problems and saved validation."""
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    stale_names = (
+        "train_metrics.csv", "cvit_best_global.pt", "cvit_last.pt",
+        "final_metrics.json",
+    )
+    stale = [run_dir / name for name in stale_names if (run_dir / name).exists()]
+    if stale:
+        raise FileExistsError(
+            "forcing InterfaceCViT residual screens require a fresh experiment name; found "
+            + ", ".join(str(path) for path in stale)
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    device = resolve_device(config["training"].get("device", "auto"))
+    data = load_diffusion_data(config)
+    mu, sigma = float(data["mu_global"]), float(data["sigma_global"])
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("forcing InterfaceCViT requires a positive global temperature scale")
+    x_np = np.asarray(data["x_grid"], dtype=np.float64)
+    y_np = np.asarray(data["y_grid"], dtype=np.float64)
+    t_np = np.asarray(data["t_grid"], dtype=np.float64)
+    Nx, Ny = x_np.size, y_np.size
+    t_final = float(t_np[-1])
+    t_ref = 0.3
+    q_ref = float(A_AMP_REF)
+
+    sim_params_path = Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy"
+    sim_params = np.load(sim_params_path, allow_pickle=True)
+    if len(sim_params) != data["trajectories"].shape[0]:
+        raise ValueError("sim_params length does not match trajectories")
+    problem = problem_from_config(config)
+    if getattr(problem, "name", None) != "forcing":
+        raise ValueError("forcing InterfaceCViT runner requires benchmark=forcing")
+    val_ids = np.asarray(data["val_ids"])
+    problem.validate_schema(sim_params, val_ids)
+
+    pino = config["training"]["pino"]
+    residual_method = str(pino.get("residual_method", "finite_volume"))
+    if residual_method not in {"finite_volume", "hybrid"}:
+        raise ValueError(
+            "forcing InterfaceCViT residual_method must be 'finite_volume' or "
+            f"'hybrid', got {residual_method!r}"
+        )
+    if str(pino.get("collocation_source", "online")) != "online":
+        raise ValueError(
+            "the forcing residual comparison requires collocation_source=online"
+        )
+    fv_weighting = dict(
+        (pino.get("finite_volume", {}) or {}).get(
+            "interface_residual_weighting", {}
+        ) or {}
+    )
+    if residual_method == "finite_volume" and not bool(fv_weighting.get("enabled", False)):
+        raise ValueError(
+            "finite_volume forcing mode requires "
+            "training.pino.finite_volume.interface_residual_weighting.enabled=true"
+        )
+    if bool((pino.get("causal", {}) or {}).get("enabled", False)):
+        raise ValueError("causal weighting must be disabled for the matched residual screen")
+    if bool((pino.get("region_standardize", {}) or {}).get("enabled", False)):
+        raise ValueError("region standardization must be disabled for the matched residual screen")
+    if bool((config["training"].get("gradnorm", {}) or {}).get("enabled", False)):
+        raise ValueError("GradNorm must be disabled for the matched residual screen")
+    if float(pino.get("lambda_data", 0.0)) != 0.0:
+        raise ValueError("forcing residual comparison is physics-only; lambda_data must be zero")
+
+    lam_r = float(pino["lambda_r"])
+    lam_interface = float(pino.get("lambda_interface", 1.0))
+    lam_ic = float(pino["lambda_ic"])
+    lam_bc = float(pino["lambda_bc"])
+    lam_bc_left_cfg = pino.get("lambda_bc_left", None)
+    lam_bc_left = lam_bc if lam_bc_left_cfg is None else float(lam_bc_left_cfg)
+    weights = {
+        "interior": lam_r,
+        "interface": lam_interface,
+        "left_neumann": lam_bc_left,
+        "topbot_adiabatic": lam_bc,
+        "ic": lam_ic,
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in weights.values()):
+        raise ValueError("forcing residual weights must be finite and non-negative")
+    if lam_interface <= 0.0:
+        raise ValueError("lambda_interface must be positive")
+
+    fcfg = dict(pino.get("forcing", {}) or {})
+    if fcfg.get("temporal_family") is not None or fcfg.get("spatial_family") is not None:
+        raise ValueError(
+            "layered forcing residual screens require unpinned online temporal "
+            "and spatial families"
+        )
+    configured_ref = float(fcfg.get("a_ref", q_ref))
+    if not math.isclose(configured_ref, q_ref, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            f"forcing image a_ref={configured_ref} must equal q_ref={q_ref} W/m^2"
+        )
+    ny_img = int(fcfg.get("ny_img") or 96)
+    nt_img = int(fcfg.get("nt_img") or 256)
+    y_img = np.linspace(float(y_np[0]), float(y_np[-1]), ny_img)
+    t_img = np.linspace(0.0, t_final, nt_img)
+    temporal_window = {
+        "t_on": float(fcfg.get("t_on", 0.0)),
+        "t_off": float(fcfg.get("t_off", 0.2)),
+        "phase": float(fcfg.get("phase", 0.0)),
+        "tukey_alpha": float(fcfg.get("tukey_alpha", 0.5)),
+    }
+    ramp_cfg = fcfg.get("ramp_seconds", None)
+    t_ramp = float(ramp_cfg) if ramp_cfg is not None else load_ramp_seconds(
+        config["data"]["t_grid_path"]
+    )
+    fv_dt, fv_dt_source, fv_n_steps = _resolve_forcing_fv_dt(
+        config, pino, t_final
+    )
+    stored_dt = load_solver_dt(config["data"]["t_grid_path"])
+    if stored_dt is None:
+        raise ValueError("forcing residual comparison requires dataset dt.npy metadata")
+    if not math.isclose(float(stored_dt), fv_dt, rel_tol=1e-7, abs_tol=1e-10):
+        raise ValueError(
+            f"configured FV dt={fv_dt} conflicts with dataset dt.npy={stored_dt}"
+        )
+    if t_ramp is None:
+        t_ramp = default_ramp_seconds(fv_dt)
+    physics, interface_face, exclusion = _validate_forcing_layered_dataset(
+        problem, data, sim_params[val_ids], fv_dt
+    )
+    if not math.isclose(float(physics["T_right"]), T_RIGHT):
+        raise ValueError("ForcingProblem right boundary conflicts with the CViT contract")
+
+    model = build_cvit(
+        config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final,
+        variant="interfaces",
+    ).to(device)
+    if not model.hard_right_dirichlet:
+        raise ValueError("forcing residual comparison requires hard_right_dirichlet=true")
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+    x_grid = torch.as_tensor(x_np, dtype=torch.float32, device=device)
+    y_grid = torch.as_tensor(y_np, dtype=torch.float32, device=device)
+
+    sim_batch = int(pino["sim_batch"])
+    intervals_per_sim = int(pino.get("intervals_per_sim", 2))
+    n_r = int(pino["n_r"])
+    n_bc = int(pino["n_bc"])
+    n_ic = int(pino["n_ic"])
+    n_bins = int(pino.get("causal_num_bins", 6))
+    stratified = bool(pino.get("stratified_time_sampling", True))
+    chunk_r = int(pino.get("chunk_r", 0))
+    epochs = int(config["training"]["epochs"])
+    validate_every = int(config["training"].get("validate_every", 10))
+    grad_clip_cfg = config["training"].get("grad_clip", None)
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    rngs = HybridForcingRNGs.create(seed, device)
+
+    image_spec = {
+        "representation": "space_time_image",
+        "version": 1,
+        "forcing_schema_version": FORCING_SCHEMA_VERSION,
+        "axis_order": "channel_y_time",
+        "dtype": "float32",
+        "ny_img": ny_img,
+        "nt_img": nt_img,
+        "patch_size": int(model.forcing_patch_size),
+        "include_endpoints": True,
+        "y_min": float(y_img[0]),
+        "y_max": float(y_img[-1]),
+        "t_min": 0.0,
+        "t_final": t_final,
+        "sign_convention": "positive_inward_left_flux",
+        "normalization": "fixed_division",
+        "a_ref": q_ref,
+        "clipping": False,
+        "ramp": {
+            "type": "cubic_smoothstep", "version": RAMP_SCHEMA_VERSION,
+            "duration": float(t_ramp),
+        },
+        "fv_dt": float(fv_dt),
+        "spatial_grid_size": [Nx, Ny],
+    }
+
+    family_columns = [
+        *[f"gnrmse_temporal_{name}" for name in ("sin", "exp", "pulse_train", "exp_train")],
+        *[f"gnrmse_spatial_{name}" for name in ("uniform", "patch", "gaussian", "triangle")],
+    ]
+    lead_columns = [
+        "gnrmse_lead_short", "gnrmse_lead_mid", "gnrmse_lead_long",
+    ]
+    fieldnames = [
+        "epoch", "completed_updates", "residual_method", "loss",
+        "loss_interior", "loss_interface", "loss_left_neumann",
+        "loss_top", "loss_bottom", "loss_topbot", "loss_ic", "loss_right_dir",
+        "lr", "epoch_seconds", "elapsed_seconds",
+        "val_gnrmse", "val_rmse_K", "node_jump_rmse_K",
+        "interface_flux_mismatch", "interface_contact_rmse_K",
+        "interface_contact_rmse_norm", "interface_energy_rms",
+        *lead_columns,
+        *family_columns,
+    ]
+    metrics_path = run_dir / "train_metrics.csv"
+    with open(metrics_path, "w", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=fieldnames).writeheader()
+
+    print(
+        f"[pino-forcing-interface] seed={seed} method={residual_method} device={device} "
+        f"grid={Nx}x{Ny} dt={fv_dt} t_ref={t_ref} q_ref={q_ref} "
+        f"interface_face={interface_face} exclusion={exclusion} "
+        f"online_forcing=all_families R_c_range={FORCING_RC_RANGE} "
+        f"weights={weights}",
+        flush=True,
+    )
+    best_val = float("inf")
+    best_validation: dict[str, float] | None = None
+    completed_updates = 0
+    start_time = time.perf_counter()
+    last_payload = None
+    for epoch in range(epochs):
+        epoch_start = time.perf_counter()
+        params = _sample_online_layered_forcing_params(
+            rngs,
+            sim_batch,
+            dt=fv_dt,
+            t_final=t_final,
+            y_bounds=(float(y_np[0]), float(y_np[-1])),
+            temporal_window=temporal_window,
+        )
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        losses, right_dir = _forcing_layered_batch_losses(
+            model, params, residual_method=residual_method, physics=physics,
+            interface_face=interface_face, exclusion=exclusion,
+            x_grid=x_grid, y_grid=y_grid, y_img=y_img, t_img=t_img,
+            mu=mu, sigma=sigma, q_ref=q_ref, t_ref=t_ref,
+            t_final=t_final, t_ramp=t_ramp, dt=fv_dt,
+            n_steps=fv_n_steps, intervals_per_sim=intervals_per_sim,
+            stratified=stratified, n_bins=n_bins, n_r=n_r, n_bc=n_bc,
+            n_ic=n_ic, chunk_r=chunk_r, rngs=rngs,
+        )
+        loss = sum(weights[name] * losses[name] for name in weights)
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(f"non-finite forcing {residual_method} loss")
+        loss.backward()
+        if not all(
+            parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        ):
+            raise FloatingPointError(f"non-finite forcing {residual_method} gradients")
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        lr = float(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        completed_updates += 1
+
+        row: dict[str, Any] = {
+            "epoch": epoch,
+            "completed_updates": completed_updates,
+            "residual_method": residual_method,
+            "loss": float(loss.detach().cpu()),
+            "loss_interior": float(losses["interior"].detach().cpu()),
+            "loss_interface": float(losses["interface"].detach().cpu()),
+            "loss_left_neumann": float(losses["left_neumann"].detach().cpu()),
+            "loss_top": float(losses["top_adiabatic"].detach().cpu()),
+            "loss_bottom": float(losses["bottom_adiabatic"].detach().cpu()),
+            "loss_topbot": float(losses["topbot_adiabatic"].detach().cpu()),
+            "loss_ic": float(losses["ic"].detach().cpu()),
+            "loss_right_dir": float(right_dir.detach().cpu()),
+            "lr": lr,
+        }
+        do_validation = epoch % validate_every == 0 or epoch == epochs - 1
+        is_best = False
+        if do_validation:
+            model.eval()
+            with torch.no_grad():
+                validation = validate_forcing_interface_gnrmse(
+                    model, data, data["val_ids"], sim_params,
+                    physics=physics, t_ramp=t_ramp, q_ref=q_ref,
+                    y_img=y_img, t_img=t_img, t_ref=t_ref, device=device,
+                )
+            row.update(validation)
+            is_best = validation["val_gnrmse"] < best_val
+            if is_best:
+                best_val = validation["val_gnrmse"]
+                best_validation = {
+                    name: float(value) for name, value in validation.items()
+                }
+
+        row["epoch_seconds"] = time.perf_counter() - epoch_start
+        row["elapsed_seconds"] = time.perf_counter() - start_time
+        with open(metrics_path, "a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writerow(row)
+
+        manifest = {
+            "residual_method": residual_method,
+            "weights": copy.deepcopy(weights),
+            "t_ref": float(t_ref),
+            "q_ref": float(q_ref),
+            "mu_global": mu,
+            "sigma_global": sigma,
+            "training_problem_sampling": {
+                "forcing": "online_all_families",
+                "contact_resistance": "online_uniform",
+                "R_c_range": list(FORCING_RC_RANGE),
+                "initial_condition_K": float(physics["T_right"]),
+            },
+            "rng_state": rngs.state_dict(),
+        }
+        last_payload = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "mu_global": mu,
+            "sigma_global": sigma,
+            "config": config,
+            "epoch": epoch,
+            "completed_updates": completed_updates,
+            "best_val_gnrmse": best_val,
+            "best_validation_metrics": copy.deepcopy(best_validation),
+            "interface_forcing": copy.deepcopy(image_spec),
+            "physics_manifest": manifest,
+        }
+        if is_best:
+            _atomic_torch_save(last_payload, run_dir / "cvit_best_global.pt")
+        print(
+            f"Epoch {epoch}: loss={row['loss']:.6f} "
+            f"(bulk={row['loss_interior']:.6f}, interface={row['loss_interface']:.6f}, "
+            f"left={row['loss_left_neumann']:.6f}, tb={row['loss_topbot']:.6f}, "
+            f"ic={row['loss_ic']:.6f})"
+            + (
+                f" val={row['val_gnrmse'] * 100:.4f}%"
+                if do_validation else ""
+            ),
+            flush=True,
+        )
+
+    if last_payload is None:
+        raise ValueError("training.epochs must be positive")
+    _atomic_torch_save(last_payload, run_dir / "cvit_last.pt")
+    wall_seconds = time.perf_counter() - start_time
+    summary = {
+        "seed": int(seed),
+        "residual_method": residual_method,
+        "best_val_gnrmse": best_val,
+        "epochs": epochs,
+        "completed_updates": completed_updates,
+        "wall_seconds": wall_seconds,
+        "gpu_hours": wall_seconds / 3600.0,
+        "fv_dt": float(fv_dt),
+        "fv_dt_source": fv_dt_source,
+        "t_ref": float(t_ref),
+        "q_ref": float(q_ref),
+        "best_validation_metrics": best_validation,
+    }
+    _atomic_text(json.dumps(summary, indent=2) + "\n", run_dir / "final_metrics.json")
+    return summary
+
+
 def run_one_seed_interfaces_pino(
     config: dict, seed: int, run_dir: Path
 ) -> dict[str, Any]:
@@ -4711,12 +5782,17 @@ def run_one_seed_interfaces_pino(
     # Interface-band term (Remedy #1): split the two interior node columns
     # flanking the interface face into a disjoint, separately balanced term so
     # GradNorm sees the jump sub-signal isolated from bulk diffusion. Default OFF.
-    iface_band_cfg = dict(pino.get("interface_band", {}) or {})
+    iface_band_cfg = dict(
+        (pino.get("finite_volume", {}) or {}).get(
+            "interface_residual_weighting", pino.get("interface_band", {})
+        ) or {}
+    )
     band_enabled = bool(iface_band_cfg.get("enabled", False))
-    lam_band = float(iface_band_cfg.get("lambda", 1.0))
+    lam_band = float(pino.get("lambda_interface", iface_band_cfg.get("lambda", 1.0)))
     if band_enabled and lam_band <= 0.0:
         raise ValueError(
-            "training.pino.interface_band.lambda must be > 0 when enabled "
+            "training.pino.lambda_interface must be > 0 when FV interface "
+            "residual weighting is enabled "
             f"(got {lam_band}); a non-positive weight would remove the band "
             "columns from 'interior' yet drop 'interface_band' from GradNorm, "
             "leaving the interface-adjacent residual completely unpenalized."
@@ -4840,7 +5916,7 @@ def run_one_seed_interfaces_pino(
         f"lambda_r={lam_r} lambda_ic={lam_ic} lambda_bc={lam_bc} "
         f"lambda_bc_left={lam_bc_left} | k=({K_LEFT},{K_RIGHT}) "
         f"sigma_dT_train={sigma_dT_train:.4g} | "
-        f"interface_band={band_enabled}(lambda={lam_band})",
+        f"interface_residual_weighting={band_enabled}(lambda={lam_band})",
         flush=True,
     )
 
@@ -5442,9 +6518,9 @@ def run_config_seeds_pino(
     config: dict, base_run_dir: Path, seeds: list[int]
 ) -> dict[str, Any]:
     base_run_dir = Path(base_run_dir)
-    # Dispatch on the benchmark: the interfaces benchmark trains an InterfaceCViT
-    # physics-only with the FV Crank-Nicolson interface residual; the constant-IC
-    # forcing benchmark (diffusion_forcing) trains a ForcingCViT on an
+    # Dispatch on the benchmark: forcing and interfaces use the layered
+    # InterfaceCViT paths; the constant-IC single-material forcing benchmark
+    # (diffusion_forcing) trains a ForcingCViT on an
     # online-sampled forcing image; the varying-IC single-slab benchmark
     # (diffusion_forcing_single) trains a two-branch ForcingICCViT that also
     # encodes the sampled IC field; every other benchmark uses the IC-conditioned
@@ -5463,7 +6539,8 @@ def run_config_seeds_pino(
                 "ForcingCViT ('forcing') config would ignore the sampled IC."
             )
     runner = (
-        run_one_seed_interfaces_pino if bench == "interfaces"
+        run_one_seed_forcing_interface_pino if bench == "forcing"
+        else run_one_seed_interfaces_pino if bench == "interfaces"
         else run_one_seed_forcing_ic_pino if bench == "diffusion_forcing_single"
         else run_one_seed_forcing_pino if bench == "diffusion_forcing"
         else run_one_seed_pino
@@ -5477,6 +6554,7 @@ def run_config_seeds_pino(
 
 __all__ = [
     "OnlineSamplerRNGs",
+    "HybridForcingRNGs",
     "sample_collocation",
     "sample_forcing_params",
     "build_forcing_image",
@@ -5496,6 +6574,7 @@ __all__ = [
     "validate_forcing_ic_gnrmse",
     "build_cvit",
     "load_interface_cvit_checkpoint",
+    "run_one_seed_forcing_interface_pino",
     "run_one_seed_pino",
     "run_one_seed_forcing_pino",
     "run_one_seed_forcing_ic_pino",

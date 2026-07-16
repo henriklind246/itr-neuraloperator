@@ -634,6 +634,237 @@ def _cn_laplacian_full(T: torch.Tensor, geom: FVGeom) -> torch.Tensor:
             + geom.r_s * (Ts - T) + geom.r_n * (Tn - T))
 
 
+def _interface_face_indices(geom: FVGeom, batch_size: int) -> torch.Tensor:
+    face_idx = geom.face_idx
+    if face_idx is None:
+        raise ValueError(
+            "interface rate residual requires geom.face_idx; build geometry "
+            "with build_cn_geom_per_interface"
+        )
+    face_idx = face_idx.to(device=geom.r_w.device, dtype=torch.long).reshape(-1)
+    if face_idx.numel() == 1 and batch_size > 1:
+        face_idx = face_idx.expand(batch_size)
+    if face_idx.numel() != batch_size:
+        raise ValueError(
+            f"geom.face_idx has {face_idx.numel()} entries for batch size {batch_size}"
+        )
+    if int(face_idx.min()) < 1 or int(face_idx.max()) > geom.Nx - 3:
+        raise ValueError(
+            "interface cells must stay clear of the physical boundary closures"
+        )
+    return face_idx
+
+
+def _full_cn_rate_balance(
+    T_n: torch.Tensor, T_np1: torch.Tensor, geom: FVGeom,
+) -> torch.Tensor:
+    """Normalized-temperature CN energy balance in temperature-rate units."""
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    if T_n.shape != T_np1.shape:
+        raise ValueError(
+            f"T_n shape {tuple(T_n.shape)} != T_np1 shape {tuple(T_np1.shape)}"
+        )
+    if T_n.shape[-2:] != (geom.Nx, geom.Ny):
+        raise ValueError(
+            f"full-grid fields must end in {(geom.Nx, geom.Ny)}, got {tuple(T_n.shape)}"
+        )
+    dt = float(geom.dt)
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"geom.dt must be finite and positive, got {dt!r}")
+    return (
+        (T_np1 - T_n) / dt
+        - (_cn_laplacian_full(T_np1, geom) + _cn_laplacian_full(T_n, geom)) / dt
+    )
+
+
+def _gather_x(tensor: torch.Tensor, columns: torch.Tensor) -> torch.Tensor:
+    """Gather per-batch x columns from a 2D or batched 3D geometry tensor."""
+    batch_size, n_columns = columns.shape
+    if tensor.dim() == 2:
+        tensor = tensor.unsqueeze(0).expand(batch_size, -1, -1)
+    elif tensor.dim() == 3 and tensor.shape[0] == 1 and batch_size > 1:
+        tensor = tensor.expand(batch_size, -1, -1)
+    if tensor.dim() != 3 or tensor.shape[0] != batch_size:
+        raise ValueError("geometry coefficient batch does not match the temperature batch")
+    return tensor.gather(
+        1, columns[:, :, None].expand(batch_size, n_columns, tensor.shape[-1])
+    )
+
+
+def interface_residual_rate(
+    T_n: torch.Tensor, T_np1: torch.Tensor, geom: FVGeom,
+) -> torch.Tensor:
+    """Rate-form FV residual in the two interface-adjacent columns.
+
+    Inputs may be full fields ``(B,Nx,Ny)`` or the local four-column stencil
+    ``(B,4,Ny)`` ordered ``[f-1,f,f+1,f+2]``. The result is always
+    ``(B,2,Ny)`` and includes the top and bottom interface cells.
+    """
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    if T_n.shape != T_np1.shape:
+        raise ValueError(
+            f"T_n shape {tuple(T_n.shape)} != T_np1 shape {tuple(T_np1.shape)}"
+        )
+    if T_n.dim() != 3 or T_n.shape[-1] != geom.Ny:
+        raise ValueError("interface fields must have shape (B,Nx_or_4,Ny)")
+
+    batch_size = T_n.shape[0]
+    face_idx = _interface_face_indices(geom, batch_size)
+    stencil_cols = face_idx[:, None] + torch.tensor(
+        [-1, 0, 1, 2], device=face_idx.device, dtype=torch.long,
+    )[None, :]
+    if T_n.shape[1] == geom.Nx:
+        T_n = T_n.gather(
+            1, stencil_cols[:, :, None].expand(batch_size, 4, geom.Ny)
+        )
+        T_np1 = T_np1.gather(
+            1, stencil_cols[:, :, None].expand(batch_size, 4, geom.Ny)
+        )
+    elif T_n.shape[1] != 4:
+        raise ValueError(
+            f"interface fields must contain Nx={geom.Nx} or 4 columns, got {T_n.shape[1]}"
+        )
+
+    target_cols = face_idx[:, None] + torch.tensor(
+        [0, 1], device=face_idx.device, dtype=torch.long,
+    )[None, :]
+    rw = _gather_x(geom.r_w, target_cols)
+    re = _gather_x(geom.r_e, target_cols)
+    rs = _gather_x(geom.r_s, target_cols)
+    rn = _gather_x(geom.r_n, target_cols)
+
+    def _local_laplacian(T: torch.Tensor) -> torch.Tensor:
+        center = T[:, 1:3, :]
+        west = T[:, 0:2, :]
+        east = T[:, 2:4, :]
+        south = torch.zeros_like(center)
+        south[:, :, 1:] = center[:, :, :-1]
+        north = torch.zeros_like(center)
+        north[:, :, :-1] = center[:, :, 1:]
+        return (
+            rw * (west - center)
+            + re * (east - center)
+            + rs * (south - center)
+            + rn * (north - center)
+        )
+
+    dt = float(geom.dt)
+    return (
+        (T_np1[:, 1:3, :] - T_n[:, 1:3, :]) / dt
+        - (_local_laplacian(T_np1) + _local_laplacian(T_n)) / dt
+    )
+
+
+def full_bc_cn_residual_rate(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom: FVGeom,
+    bc: FullBCData,
+    dirichlet_both_ends: bool = False,
+    keep_batch: bool = False,
+) -> dict:
+    """Full-boundary CN residual in normalized-temperature-rate units.
+
+    The energy-balance regions are the rate-form counterpart of
+    :func:`full_bc_cn_residual`. The algebraic right-Dirichlet residual remains
+    a normalized-temperature mismatch and is intentionally not divided by time.
+    """
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    balance = _full_cn_rate_balance(T_n, T_np1, geom)
+    Nx, Ny = geom.Nx, geom.Ny
+
+    rho_cp_left = geom.rho_cp[0, :]
+    denom = rho_cp_left[None, :] * geom.hx * geom.sigma_global
+    if bc.qL_int is not None:
+        forcing_rate = 2.0 * bc.qL_int / (float(geom.dt) * denom)
+    else:
+        forcing_rate = (bc.qL_n + bc.qL_np1) / denom
+    left = balance[:, 0, :] - forcing_rate
+    right = T_np1[:, Nx - 1, :] - bc.T_right_tilde
+    interior = balance[:, 1:Nx - 1, 1:Ny - 1]
+    top = balance[:, 1:Nx - 1, 0]
+    bottom = balance[:, 1:Nx - 1, Ny - 1]
+
+    out = {
+        "interior": interior,
+        "top_adiabatic": top,
+        "bottom_adiabatic": bottom,
+        "topbot_adiabatic": torch.cat((top, bottom), dim=1),
+        "left_neumann": left,
+        "right_dirichlet": right,
+    }
+    if dirichlet_both_ends:
+        out["right_dirichlet_n"] = T_n[:, Nx - 1, :] - bc.T_right_tilde
+    if keep_batch:
+        return out
+    return {key: value.reshape(-1) for key, value in out.items()}
+
+
+def region_balanced_fv_rate_residual(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom: FVGeom,
+    bc: FullBCData,
+    dirichlet_both_ends: bool = False,
+    keep_batch: bool = False,
+) -> dict:
+    """Disjoint rate residuals for bulk, interface, and physical boundaries."""
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    balance = _full_cn_rate_balance(T_n, T_np1, geom)
+    batch_size, Nx, Ny = balance.shape
+    face_idx = _interface_face_indices(geom, batch_size)
+
+    interface_cols = face_idx[:, None] + torch.tensor(
+        [0, 1], device=face_idx.device, dtype=torch.long,
+    )[None, :]
+    interface = balance.gather(
+        1, interface_cols[:, :, None].expand(batch_size, 2, Ny)
+    )
+
+    active = torch.arange(1, Nx - 1, device=balance.device)[None, :].expand(
+        batch_size, -1
+    )
+    keep = (active != face_idx[:, None]) & (active != (face_idx + 1)[:, None])
+    bulk_cols = active[keep].view(batch_size, Nx - 4)
+    bulk = balance.gather(
+        1, bulk_cols[:, :, None].expand(batch_size, Nx - 4, Ny)
+    )
+
+    rho_cp_left = geom.rho_cp[0, :]
+    denom = rho_cp_left[None, :] * geom.hx * geom.sigma_global
+    if bc.qL_int is not None:
+        forcing_rate = 2.0 * bc.qL_int / (float(geom.dt) * denom)
+    else:
+        forcing_rate = (bc.qL_n + bc.qL_np1) / denom
+    left = balance[:, 0, :] - forcing_rate
+    right = T_np1[:, Nx - 1, :] - bc.T_right_tilde
+
+    out = {
+        "interior": bulk[:, :, 1:Ny - 1],
+        "interface": interface,
+        "left_neumann": left,
+        "top_adiabatic": bulk[:, :, 0],
+        "bottom_adiabatic": bulk[:, :, Ny - 1],
+        "right_dirichlet": right,
+    }
+    out["topbot_adiabatic"] = torch.cat(
+        (out["top_adiabatic"], out["bottom_adiabatic"]), dim=1
+    )
+    if dirichlet_both_ends:
+        out["right_dirichlet_n"] = T_n[:, Nx - 1, :] - bc.T_right_tilde
+    if keep_batch:
+        return out
+    return {key: value.reshape(-1) for key, value in out.items()}
+
+
 def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
                         geom: FVGeom, bc: FullBCData,
                         dirichlet_both_ends: bool = False,

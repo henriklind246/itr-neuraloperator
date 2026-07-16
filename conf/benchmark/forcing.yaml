@@ -19,3 +19,25 @@ training:
     # Pin the legacy transductive W2 source so forcing's collocation path stays
     # byte-identical to before the diffusion benchmark added the `train` default.
     collocation_source: val
+  pino:
+    residual_method: finite_volume
+    # Training problems are sampled online; saved records/trajectories are
+    # reserved for held-out validation.
+    collocation_source: online
+    lambda_r: 1.0
+    lambda_interface: 1.0
+    lambda_ic: 1.0
+    lambda_bc: 1.0
+    lambda_bc_left: 1.0
+    forcing:
+      ny_img: 96
+      nt_img: 256
+      # Fixed physical flux scale in W m^-2; independent of sampled profiles.
+      a_ref: 300.0
+    finite_volume:
+      interface_residual_weighting:
+        enabled: true
+    causal:
+      enabled: false
+    region_standardize:
+      enabled: false
