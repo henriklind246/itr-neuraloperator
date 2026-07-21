@@ -50,12 +50,12 @@ from data.dataset import problem_from_config
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
-def _write_synthetic_interfaces(tmp_path, num_sims=8, Nt=6, Nx=20, Ny=20):
+def _write_synthetic_interfaces(tmp_path, num_sims=8, Nt=6, Nx=20, Ny=20, t_final=0.25):
     rng = np.random.default_rng(0)
     traj = 300.0 + 5.0 * rng.standard_normal((num_sims, Nt, Nx, Ny)).astype(np.float32)
     x_grid = np.linspace(0.0, 1.0, Nx).astype(np.float32)
     y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
-    t_grid = np.linspace(0.0, 0.25, Nt).astype(np.float32)
+    t_grid = np.linspace(0.0, t_final, Nt).astype(np.float32)
     np.save(tmp_path / "trajectories.npy", traj)
     np.save(tmp_path / "x_grid.npy", x_grid)
     np.save(tmp_path / "y_grid.npy", y_grid)
@@ -781,3 +781,22 @@ def test_runner_writes_architecture_metadata(tmp_path):
     )
     assert arch["num_forcing_tokens"] == expected_tokens
     assert isinstance(arch["version"], int)
+
+
+def test_runner_tolerates_float32_t_final_quantization(tmp_path):
+    """t_final reconstructed from the float32-saved t_grid carries ~1e-8 noise
+    (0.3 -> 0.30000001192). With an explicit dt that mathematically divides the
+    clean t_final, the runner must snap the noise out instead of failing the
+    solver's exact-divisibility check."""
+    # t_final=0.3 is not exactly representable in float32; dt=0.1 divides the
+    # clean value but not the quantized one (0.30000001192 / 0.1 = 3.0000001).
+    _write_synthetic_interfaces(tmp_path, t_final=0.3)
+    t_grid = np.load(tmp_path / "t_grid.npy")
+    assert float(t_grid[-1]) != 0.3  # float32 quantization noise is present
+
+    config = _one_step_config(tmp_path)
+    config["training"]["pino"]["dt"] = 0.1
+    run_dir = tmp_path / "t_final_quant"
+
+    run_one_seed_interfaces_one_step_pino(config, seed=0, run_dir=run_dir)
+    assert (run_dir / "cvit_last.pt").exists()

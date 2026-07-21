@@ -8493,6 +8493,18 @@ def run_one_seed_interfaces_one_step_pino(
         if dt is None:
             dt = t_final / max(len(t_grid_np) - 1, 1)
 
+    # ``t_final`` is reconstructed from the float32-saved t_grid, so it carries
+    # ~1e-8 quantization noise (e.g. 0.3 -> 0.30000001192). FVSolver2D treats a
+    # non-None dt as explicit and enforces exact divisibility (fv_solver_2d.py),
+    # so that noise makes an otherwise-integer step count fail. Snap t_final back
+    # onto the dt grid when the ratio is within float32 noise of an integer;
+    # leave a genuinely non-dividing dt untouched so the solver raises its
+    # precise error.
+    _ratio = t_final / dt
+    _n_steps = round(_ratio)
+    if _n_steps >= 1 and abs(_ratio - _n_steps) <= 1.0e-5 * _n_steps:
+        t_final = _n_steps * dt
+
     # One-step temporal contract (plan Section 0): one model step == one CN step.
     step_stride = int(os_cfg.get("step_stride", 1))
     if step_stride != 1:
