@@ -122,6 +122,10 @@ model:
     n_param_scalars: 2
     num_param_tokens: 1
     param_hidden: 128
+    jump_enrichment: false
+    jump_flux_depth: 1
+    jump_flux_conditioning: "all"
+    jump_flux_mode: "learned"
 
 training:
   device: "auto"
@@ -213,6 +217,65 @@ training:
   # chunk_r caps query/decode memory: autodiff uses residual chunks; finite volume
   # uses full-grid decoder chunks (0/null = no chunking).
   pino:
+    # mode selects the interfaces PINO formulation (benchmark=interfaces only;
+    # inert for every other benchmark). "collapse" (default) is the existing
+    # full-trajectory decoder that encodes one IC latent and decodes the whole
+    # trajectory by time-query (documented to collapse to the constant 300 K
+    # equilibrium). "one_step" trains the InterfaceCViT as a state-conditioned
+    # Markov operator T_n -> T_{n+1} on an online-sampled physics objective; it
+    # reads training.pino.one_step below and ignores the collapse-path knobs.
+    mode: collapse
+    # One-step Markov InterfaceCViT (mode=one_step). Every update draws n_cases
+    # DISTINCT descriptors from a continuously-refreshed FV-state pool, solves the
+    # FV trajectory per descriptor, draws an on-manifold T_n (detached), predicts
+    # T_{n+1} through the conservation head, and averages a physics-only objective
+    # (variational J=1/2 uAu - bu, or a single-sweep preconditioned defect) over
+    # the cases. T_{n+1} is never a supervised label. step_stride MUST be 1: one
+    # model step == one CN solver step (a coarse saved-output interval is NOT one
+    # CN interval). Validation autoregresses the full held-out trajectory.
+    one_step:
+      step_stride: 1
+      one_step_dt: solver_dt
+      objective: variational          # variational | defect
+      defect_sweeps: 1                 # multi-sweep only after single-sweep parity
+      defect_omega: 0.6667
+      n_cases: 8
+      state_source: fv_solve
+      state_pool_size: 128
+      state_pool_replace_per_update: 2
+      max_uses_per_case: 8
+      output_parameterization: rate    # rate | increment | deviation | absolute
+      sample_time_index: mixture
+      time_mixture: { uniform: 0.5, active_forcing: 0.25, high_change: 0.25 }
+      updates: 8000
+      # Exact-resume: when true and a resume_state.pt exists in the run dir, the
+      # runner regenerates FV trajectories from stored descriptors and continues
+      # the online stream identically (plan Section 9). Default false so a fresh
+      # experiment name is still required for a new run.
+      resume: false
+      conservation: conservative_storage_projection
+      lambda_trace: 0.0
+      lambda_flux: 0.0
+      fast_validation_cases: 16
+      full_validation_cases: 96
+      final_test_cases: 96
+      validate_every: 500
+      full_validate_every: 2000
+      keep_top_k_eligible: 5
+      # Paired-amplitude anti-collapse probes: n frozen descriptors, each run at
+      # forcing amplitude A and probe_amp_ratio * A, sharing the IC so the
+      # difference isolates the forcing / interface-jump response.
+      probe_pairs: 8
+      probe_amp_ratio: 0.5
+      anti_collapse:
+        forcing_response_slope_min: 0.25
+        jump_response_slope_min: 0.10
+        hard_global_storage_tol: 1.0e-6
+        interface_flux_tol: null       # diagnostic; calibrated pre-training
+        contact_law_tol: null          # diagnostic; calibrated pre-training
+      rollout:
+        require_finite: true
+        max_abs_temperature_K: null
     # For forcing, the benchmark override selects finite_volume and this may be
     # changed to hybrid. Other PINO runners retain their documented backends.
     residual_method: autodiff
@@ -243,6 +306,23 @@ training:
     n_bc: 512
     sim_batch: 16
     chunk_r: 0
+    # Fixed-probe instrumentation for the forcing InterfaceCViT residual
+    # screen. Disabled by default so historical runs remain byte-for-byte
+    # comparable; enabled screens write cvit_init.pt and diagnostics.csv.
+    diagnostics:
+      enabled: false
+      every_updates: 50
+      gradient_n_r: 128
+      gradient_n_bc: 64
+      gradient_n_ic: 64
+      probe_time_samples: 7
+      probe_x_samples: 9
+      probe_y_samples: 9
+      probe_query_chunk: 256
+    energy:
+      enabled: false
+      lambda: 1.0
+      scale_floor: 1.0
     alpha: 1.0
     # ---- Finite-volume PINO controls ----
     # Used by the interfaces trainer and by diffusion_forcing_single when
@@ -417,6 +497,12 @@ training:
       # online training distribution matches its single-family validation set.
       temporal_family: null
       spatial_family: null
+      # InterfaceCViT forcing gate only: pin the online residual trainer to one
+      # deterministic diagnostic probe ("pulse_low", "pulse_high", "smooth_mid").
+      # null preserves the all-family/all-Rc operator screen.
+      fixed_probe_case: null
+      # Optional deterministic cycle for fixed-problem reachability gates.
+      fixed_probe_cases: null
       # Warm-up stabilization: hold forcing/collocation for resample_every
       # successful updates and apply per-term multipliers after GradNorm. The
       # defaults are inert; forcing experiments can emphasize r / bc_left.
@@ -433,6 +519,27 @@ training:
       grad_clip: null
       save_latest_every: 25
       extend_completed: false
+    # Option-2 reachability falsifier for the forcing/hybrid path. The five
+    # constraints use FV-calibrated dead bands; dual and primal pressure share
+    # the same target so feasible residuals receive exactly zero pressure.
+    reformulation:
+      enabled: false
+      x_blocks_per_layer: 4
+      y_blocks: 8
+      scale_floor: 1.0
+      jump_floor_K: 1.0
+      tolerance_margin: 10.0
+      tolerance_min: 1.0e-8
+      tolerance_override: {}
+      rho: 1.0
+      ema_decay: 0.9
+      dual_every: 10
+      multiplier_cap: 1000.0
+      dual_enabled: true
+      causal_enabled: true
+      stage_fractions: [0.10, 0.25, 0.50, 0.75, 1.0]
+      stage_updates: [0, 200, 400, 600, 800]
+      resume_checkpoint: null
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
   # GradNorm-style adaptive balancing of the RAW per-component physics losses

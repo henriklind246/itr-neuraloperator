@@ -10,7 +10,12 @@ from problems.interfaces import (
     INTERFACE_X_RANGE,
     RC_RANGE,
 )
-from src.operators.cvit import CViT, ForcingCViT, InterfaceCViT
+from src.operators.cvit import (
+    CViT,
+    ForcingCViT,
+    InterfaceCViT,
+    moving_interface_jump_enrichment,
+)
 from src.operators.train_pino import build_cvit, load_interface_cvit_checkpoint
 
 """
@@ -61,6 +66,91 @@ def test_model_smoke_shapes():
     assert out.shape == (2, 7, 1)
     lat = m.encode(u, forcing_image, params)
     assert lat.shape == (2, 4 + 8 + 1, EMB)
+
+
+def test_moving_jump_enrichment_shifts_only_dynamic_left_side():
+    smooth = torch.zeros(2, 4, 1)
+    coords = torch.tensor([
+        [[0.1, 0.2], [0.4, 0.2], [0.6, 0.2], [1.0, 0.2]],
+        [[0.1, 0.2], [0.4, 0.2], [0.6, 0.2], [1.0, 0.2]],
+    ])
+    flux = torch.full_like(smooth, 2.0)
+    enriched = moving_interface_jump_enrichment(
+        smooth, coords, flux, torch.tensor([0.3, 0.7]), torch.tensor([3.0, 4.0])
+    )
+    assert torch.equal(enriched[0, :, 0], torch.tensor([6.0, 0.0, 0.0, 0.0]))
+    assert torch.equal(enriched[1, :, 0], torch.tensor([8.0, 8.0, 8.0, 0.0]))
+
+
+def test_jump_flux_head_is_zero_initialized_and_reaches_parameters():
+    model = _model(jump_enrichment=True).train()
+    u, forcing_image, params, coords, t = _inputs(B=2, Nq=9)
+    latent = model.encode(u, forcing_image, params)
+    flux = model.decode_interface_flux(latent, coords[..., 1:2], t)
+    assert torch.equal(flux, torch.zeros_like(flux))
+    loss = (flux - 1.0).square().mean()
+    loss.backward()
+    last = model.interface_flux_decoder.head.net[-1]
+    assert float(last.weight.grad.abs().sum()) > 0.0
+
+
+def test_state_param_flux_head_is_invariant_to_forcing_tokens():
+    torch.manual_seed(4)
+    model = _model(
+        jump_enrichment=True, jump_flux_conditioning="state_param"
+    ).eval()
+    with torch.no_grad():
+        model.interface_flux_decoder.head.net[-1].weight.normal_()
+    u, forcing_image, params, coords, t = _inputs(B=2, Nq=9, seed=5)
+    latent = model.encode(u, forcing_image, params)
+    baseline = model.decode_interface_flux(latent, coords[..., 1:2], t)
+    changed_forcing = latent.clone()
+    start = model.num_spatial_tokens
+    stop = start + model.num_forcing_tokens
+    changed_forcing[:, start:stop] += 100.0
+    forcing_result = model.decode_interface_flux(
+        changed_forcing, coords[..., 1:2], t
+    )
+    assert torch.equal(baseline, forcing_result)
+    changed_state = latent.clone()
+    changed_state[:, :start] += torch.randn_like(changed_state[:, :start])
+    state_result = model.decode_interface_flux(changed_state, coords[..., 1:2], t)
+    assert not torch.allclose(baseline, state_result)
+
+
+def test_rejects_unknown_jump_flux_conditioning():
+    with pytest.raises(ValueError, match="jump_flux_conditioning"):
+        _model(jump_flux_conditioning="forcing_only")
+
+
+def test_left_energy_closure_has_no_learned_flux_decoder():
+    model = _model(
+        jump_enrichment=True, jump_flux_mode="left_energy_closure"
+    )
+    assert not hasattr(model, "interface_flux_decoder")
+    u, forcing_image, params, coords, t = _inputs()
+    latent = model.encode(u, forcing_image, params)
+    with pytest.raises(RuntimeError, match="disabled"):
+        model.decode_interface_flux(latent, coords[..., 1:2], t)
+
+
+def test_two_sided_energy_closure_has_no_learned_flux_decoder():
+    model = _model(
+        jump_enrichment=True, jump_flux_mode="two_sided_energy_closure"
+    )
+    assert not hasattr(model, "interface_flux_decoder")
+
+
+def test_conservative_storage_projection_has_no_learned_flux_decoder():
+    model = _model(
+        jump_enrichment=True, jump_flux_mode="conservative_storage_projection"
+    )
+    assert not hasattr(model, "interface_flux_decoder")
+
+
+def test_rejects_unknown_jump_flux_mode():
+    with pytest.raises(ValueError, match="jump_flux_mode"):
+        _model(jump_flux_mode="explicit_guess")
 
 
 def test_encode_signature_excludes_generator_params():

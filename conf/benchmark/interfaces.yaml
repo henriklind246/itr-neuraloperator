@@ -25,6 +25,12 @@ training:
   # weighting stays OFF for the tiny fixed-parameter debug run; enable it (with
   # stratified_time_sampling) for the 41-epoch screen onward.
   pino:
+    # mode=collapse (default) trains the full-trajectory decoder. Set
+    # mode=one_step (CLI: training.pino.mode=one_step) to train the
+    # state-conditioned Markov operator; it reads training.pino.one_step from
+    # conf/config.yaml and reuses forcing.ny_img/nt_img (96 x 256) as the
+    # per-interval forcing-image resolution.
+    mode: collapse
     collocation_source: online
     lambda_r: 1.0
     lambda_ic: 1.0

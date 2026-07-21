@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from data.dataset import (
     compute_global_stats,
@@ -45,7 +46,9 @@ from problems.interfaces import (
     RC_RANGE,
     normalize_interface_scalars,
 )
-from src.operators.cvit import CViT, ForcingCViT, ForcingICCViT, InterfaceCViT
+from src.operators.cvit import (
+    CViT, CViTEncoder, ForcingCViT, ForcingICCViT, InterfaceCViT,
+)
 from src.operators.losses import full_bc_physics_loss, region_balanced_fv_rate_loss
 from src.operators.train import (
     GradNormBalancer,
@@ -70,10 +73,12 @@ from src.physics.boundary_forcing import (
 )
 from src.physics.fv_residual import (
     FullBCData,
+    block_energy_residual,
     build_cn_geom_batched,
     build_cn_geom_per_interface,
     build_homogeneous_cn_geom,
     interface_residual_rate,
+    interface_trace_constraint_residuals,
     locate_interface,
 )
 from src.physics.init_conditions import (
@@ -98,6 +103,11 @@ from src.physics.pde_residual import (
 # target) snapshots are used; validation compares against the saved trajectories.
 
 WALLS = ("left", "top", "bottom")
+
+# Architecture-version stamp for the one-step interfaces PINO run. Bump when the
+# encoder/decoder contract of the production InterfaceCViT changes so recorded
+# run metadata and the SLURM preflight can reject a mismatched checkpoint.
+ONE_STEP_ARCH_VERSION = 1
 
 _ONLINE_NUMPY_STREAMS = (
     "ic_family",
@@ -216,6 +226,111 @@ class HybridForcingRNGs:
             "ic_collocation": self.ic_collocation.get_state(),
             "validation": self.validation.get_state(),
         }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        for name in (
+            "forcing_selection", "contact_resistance", "interval_selection",
+        ):
+            getattr(self, name).bit_generator.state = copy.deepcopy(state[name])
+        for name in (
+            "bulk_collocation", "boundary_collocation", "ic_collocation",
+            "validation",
+        ):
+            getattr(self, name).set_state(state[name])
+
+
+_FORCING_CONSTRAINT_NAMES = (
+    "left_flux",
+    "local_energy_interface",
+    "local_energy_far",
+    "interface_flux",
+    "interface_contact",
+)
+
+
+class ForcingConstraintController:
+    """Dead-band augmented-Lagrangian state for the forcing reachability gate."""
+
+    def __init__(
+        self, tolerances: dict[str, float], *, rho: float = 1.0,
+        ema_decay: float = 0.9, dual_every: int = 10,
+        multiplier_cap: float = 1000.0, dual_enabled: bool = True,
+    ) -> None:
+        if tuple(tolerances) != _FORCING_CONSTRAINT_NAMES:
+            raise ValueError("forcing constraint tolerance names/order are invalid")
+        if any(not math.isfinite(v) or v < 0.0 for v in tolerances.values()):
+            raise ValueError("forcing constraint tolerances must be finite and non-negative")
+        if rho <= 0.0 or not 0.0 <= ema_decay < 1.0 or dual_every < 1:
+            raise ValueError("invalid forcing augmented-Lagrangian settings")
+        self.tolerances = dict(tolerances)
+        self.rho = float(rho)
+        self.ema_decay = float(ema_decay)
+        self.dual_every = int(dual_every)
+        self.multiplier_cap = float(multiplier_cap)
+        self.dual_enabled = bool(dual_enabled)
+        self.multipliers = {name: 0.0 for name in _FORCING_CONSTRAINT_NAMES}
+        self.ema = {name: 0.0 for name in _FORCING_CONSTRAINT_NAMES}
+        self.ema_initialized = {name: False for name in _FORCING_CONSTRAINT_NAMES}
+
+    def values(
+        self, residuals: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        rms = {
+            name: torch.sqrt(residuals[name].square().mean() + 1.0e-16)
+            for name in _FORCING_CONSTRAINT_NAMES
+        }
+        violation = {
+            name: torch.clamp(rms[name] - self.tolerances[name], min=0.0)
+            for name in _FORCING_CONSTRAINT_NAMES
+        }
+        return rms, violation
+
+    def primal(self, violation: dict[str, torch.Tensor]) -> torch.Tensor:
+        terms = [
+            self.multipliers[name] * violation[name]
+            + 0.5 * self.rho * violation[name].square()
+            for name in _FORCING_CONSTRAINT_NAMES
+        ]
+        return torch.stack(terms).sum()
+
+    def update(self, violation: dict[str, torch.Tensor], completed: int) -> None:
+        for name in _FORCING_CONSTRAINT_NAMES:
+            value = float(violation[name].detach().cpu())
+            if self.ema_initialized[name]:
+                self.ema[name] = (
+                    self.ema_decay * self.ema[name]
+                    + (1.0 - self.ema_decay) * value
+                )
+            else:
+                self.ema[name] = value
+                self.ema_initialized[name] = True
+        if self.dual_enabled and completed % self.dual_every == 0:
+            for name in _FORCING_CONSTRAINT_NAMES:
+                self.multipliers[name] = min(
+                    self.multiplier_cap,
+                    self.multipliers[name] + self.rho * self.ema[name],
+                )
+
+    def reset_stage_history(self) -> None:
+        self.ema = {name: 0.0 for name in _FORCING_CONSTRAINT_NAMES}
+        self.ema_initialized = {name: False for name in _FORCING_CONSTRAINT_NAMES}
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "tolerances": copy.deepcopy(self.tolerances), "rho": self.rho,
+            "ema_decay": self.ema_decay, "dual_every": self.dual_every,
+            "multiplier_cap": self.multiplier_cap,
+            "dual_enabled": self.dual_enabled,
+            "multipliers": copy.deepcopy(self.multipliers),
+            "ema": copy.deepcopy(self.ema),
+            "ema_initialized": copy.deepcopy(self.ema_initialized),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state["tolerances"] != self.tolerances:
+            raise ValueError("resume constraint tolerances differ from checkpoint")
+        for key in ("multipliers", "ema", "ema_initialized"):
+            setattr(self, key, copy.deepcopy(state[key]))
 
 
 def _canonical_descriptor_value(value):
@@ -1749,6 +1864,10 @@ def build_cvit(
             n_param_scalars=int(c.get("n_param_scalars", 2)),
             num_param_tokens=int(c.get("num_param_tokens", 1)),
             param_hidden=int(c.get("param_hidden", 128)),
+            jump_enrichment=bool(c.get("jump_enrichment", False)),
+            jump_flux_depth=int(c.get("jump_flux_depth", 1)),
+            jump_flux_conditioning=str(c.get("jump_flux_conditioning", "all")),
+            jump_flux_mode=str(c.get("jump_flux_mode", "learned")),
         )
     if variant == "forcing":
         c = {**config["model"]["cvit"], **config["model"].get("forcing_cvit", {})}
@@ -3228,11 +3347,15 @@ def _sample_lattice_intervals(
     n_steps: int,
     n_bins: int,
     stratified: bool,
+    max_start_step: int | None = None,
 ) -> dict[str, torch.Tensor]:
     M = int(batch_size * intervals_per_sim)
-    all_starts = np.arange(n_steps, dtype=np.int64)
+    active_steps = n_steps if max_start_step is None else int(max_start_step) + 1
+    if not 1 <= active_steps <= n_steps:
+        raise ValueError("active causal interval count is outside the FV lattice")
+    all_starts = np.arange(active_steps, dtype=np.int64)
     all_bins = np.minimum(
-        ((all_starts.astype(np.float64) + 0.5) * n_bins / n_steps).astype(np.int64),
+        ((all_starts.astype(np.float64) + 0.5) * n_bins / active_steps).astype(np.int64),
         n_bins - 1,
     )
     if stratified:
@@ -3369,7 +3492,10 @@ def _forcing_ic_fv_losses(
     ic_pred = _decode_in_chunks(model, latent, ic_coords, ic_t, chunk_r)
     loss_ic = (ic_pred - ic_target).square().mean()
 
-    tn = starts.to(dtype=torch.float64) * float(dt)
+    # MPS has no float64 tensor support.  The grid/query tensors are float32
+    # on MPS (and already provide the residual's working dtype), so keep the
+    # sampled CN times in that dtype instead of forcing a host-style float64.
+    tn = starts.to(dtype=x_grid.dtype) * float(dt)
     tnp1 = tn + float(dt)
     latent_M = latent[sim_local]
     coords_M = mesh.expand(M, -1, -1)
@@ -4949,6 +5075,7 @@ def _forcing_hybrid_ad_losses(
     n_bc: int,
     bulk_generator: torch.Generator,
     boundary_generator: torch.Generator,
+    active_t_final: float | None = None,
 ) -> dict[str, torch.Tensor]:
     device = latent.device
     batch_size = latent.shape[0]
@@ -4956,9 +5083,10 @@ def _forcing_hybrid_ad_losses(
     y_bounds = (float(physics["c"]), float(physics["d"]))
     interface_x = float(physics["interface_x"])
 
+    sample_t_final = float(t_final if active_t_final is None else active_t_final)
     coords, tq = _sample_hybrid_bulk(
         batch_size, n_r, x_bounds=x_bounds, y_bounds=y_bounds,
-        exclusion=exclusion, t_final=t_final, device=device,
+        exclusion=exclusion, t_final=sample_t_final, device=device,
         generator=bulk_generator,
     )
     _, _, grad_t, grad_xx, grad_yy = _decode_derivatives(
@@ -4992,7 +5120,7 @@ def _forcing_hybrid_ad_losses(
                 (free - interface).abs() <= shift, free + shift, free
             )
         time = _open_uniform(
-            (batch_size, n_bc, 1), 0.0, t_final,
+            (batch_size, n_bc, 1), 0.0, sample_t_final,
             device=device, generator=boundary_generator,
         )
         if kind == "left":
@@ -5013,7 +5141,8 @@ def _forcing_hybrid_ad_losses(
         params, left_coords[..., 1:2], left_t, t_ramp
     )
     left_flux = -float(physics["k_left"]) * float(sigma) * left_grad[..., 0:1]
-    left = ((left_flux - q_left) / float(q_ref)).square().flatten(1).mean(dim=1).mean()
+    left_residual = (left_flux - q_left) / float(q_ref)
+    left = left_residual.square().flatten(1).mean(dim=1).mean()
 
     wall_losses = {}
     for wall in ("top", "bottom"):
@@ -5039,6 +5168,7 @@ def _forcing_hybrid_ad_losses(
         "topbot_adiabatic": 0.5 * (
             wall_losses["top"] + wall_losses["bottom"]
         ),
+        "_constraint_left_flux": left_residual,
     }
 
 
@@ -5050,6 +5180,138 @@ def _mean_problem_intervals(
             f"expected {batch_size * intervals_per_sim} interval losses, got {tuple(values.shape)}"
         )
     return values.view(batch_size, intervals_per_sim).mean(dim=1).mean()
+
+
+def _forcing_interval_fluxes(
+    params: list[dict],
+    sim_local: torch.Tensor,
+    y_grid: torch.Tensor,
+    tn: torch.Tensor,
+    tnp1: torch.Tensor,
+    t_ramp: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    interval_count = int(sim_local.numel())
+    Ny = int(y_grid.numel())
+    qn = np.empty((interval_count, Ny), dtype=np.float64)
+    qnp1 = np.empty_like(qn)
+    qint = np.empty_like(qn)
+    y_np = y_grid.detach().cpu().numpy()
+    sim_np = sim_local.detach().cpu().numpy()
+    tn_np = tn.detach().cpu().numpy()
+    tnp1_np = tnp1.detach().cpu().numpy()
+    for interval in range(interval_count):
+        record = params[int(sim_np[interval])]
+        qn_i, qnp1_i, qint_i = build_interface_forcing(
+            record["temporal_family"], record["temporal_params"],
+            record["spatial_family"], record["spatial_params"],
+            y_np, float(tn_np[interval]), float(tnp1_np[interval]), t_ramp,
+        )
+        qn[interval], qnp1[interval], qint[interval] = qn_i, qnp1_i, qint_i
+    return qn, qnp1, qint
+
+
+def _forcing_energy_closure_residuals(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom: Any,
+    qL_int: torch.Tensor,
+    *,
+    interface_face: int,
+    physics: dict[str, Any],
+    sigma: float,
+    q_ref: float,
+    scale_floor: float,
+) -> dict[str, torch.Tensor]:
+    interval_count, Nx, Ny = T_n.shape
+    device, dtype = T_n.device, T_n.dtype
+    dt_values = torch.full(
+        (interval_count,), float(geom.dt), device=device, dtype=dtype,
+    )
+    dx = geom.dx
+    if dx.dim() == 1:
+        dx = dx.unsqueeze(0).expand(interval_count, -1)
+    dy = geom.dy.to(device=device, dtype=dtype)
+    cell_area = dx.to(device=device, dtype=dtype)[:, :, None] * dy[None, None, :]
+    rho_cp = geom.rho_cp.to(device=device, dtype=dtype)
+    if rho_cp.dim() == 2:
+        rho_cp = rho_cp.unsqueeze(0)
+    dE_cell = rho_cp * cell_area * (float(sigma) * (T_np1 - T_n))
+
+    x_ids = torch.arange(Nx, device=device)[None, :]
+    face_idx = torch.full(
+        (interval_count, 1), int(interface_face), device=device, dtype=torch.long,
+    )
+    left_mask = x_ids <= face_idx
+    right_mask = x_ids > face_idx
+    dE_left = (dE_cell * left_mask[:, :, None].to(dtype)).sum(dim=(1, 2))
+    dE_right = (dE_cell * right_mask[:, :, None].to(dtype)).sum(dim=(1, 2))
+
+    g_interface = geom.G_x.to(device=device, dtype=dtype).gather(
+        1, face_idx[:, :, None].expand(interval_count, 1, Ny)
+    ).squeeze(1)
+    Tn_jump = float(sigma) * (
+        T_n[:, int(interface_face), :] - T_n[:, int(interface_face) + 1, :]
+    )
+    Tnp1_jump = float(sigma) * (
+        T_np1[:, int(interface_face), :] - T_np1[:, int(interface_face) + 1, :]
+    )
+    q_gamma_integral = (
+        0.5 * dt_values[:, None] * g_interface * (Tn_jump + Tnp1_jump)
+    )
+    Q_gamma = (q_gamma_integral * dy[None, :]).sum(dim=1)
+    Q_left = (qL_int.to(device=device, dtype=dtype) * dy[None, :]).sum(dim=1)
+
+    h_right = float(geom.hx)
+    qR_n = -float(physics["k_right"]) * float(sigma) * (
+        T_n[:, -1, :] - T_n[:, -2, :]
+    ) / h_right
+    qR_np1 = -float(physics["k_right"]) * float(sigma) * (
+        T_np1[:, -1, :] - T_np1[:, -2, :]
+    ) / h_right
+    Q_right = (
+        0.5 * dt_values[:, None] * (qR_n + qR_np1) * dy[None, :]
+    ).sum(dim=1)
+
+    characteristic = (
+        float(q_ref) * dt_values * float(dy.sum().detach().cpu())
+        * max(float(scale_floor), 0.0)
+    )
+    denom = (Q_left.detach().abs() + characteristic).clamp_min(1.0e-12)
+    return {
+        "energy_left_residual": (dE_left - (Q_left - Q_gamma)) / denom,
+        "energy_right_residual": (dE_right - (Q_gamma - Q_right)) / denom,
+        "energy_global_residual": (
+            dE_left + dE_right - (Q_left - Q_right)
+        ) / denom,
+    }
+
+
+def _forcing_energy_closure_losses(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom: Any,
+    qL_int: torch.Tensor,
+    *,
+    interface_face: int,
+    physics: dict[str, Any],
+    sigma: float,
+    q_ref: float,
+    scale_floor: float,
+) -> dict[str, torch.Tensor]:
+    residuals = _forcing_energy_closure_residuals(
+        T_n, T_np1, geom, qL_int,
+        interface_face=interface_face, physics=physics, sigma=sigma,
+        q_ref=q_ref, scale_floor=scale_floor,
+    )
+    loss_left = residuals["energy_left_residual"].square().mean()
+    loss_right = residuals["energy_right_residual"].square().mean()
+    loss_global = residuals["energy_global_residual"].square().mean()
+    return {
+        "energy_left": loss_left,
+        "energy_right": loss_right,
+        "energy_global": loss_global,
+        "energy": loss_left + loss_right + loss_global,
+    }
 
 
 def _sample_online_layered_forcing_params(
@@ -5107,6 +5369,10 @@ def _forcing_layered_batch_losses(
     n_ic: int,
     chunk_r: int,
     rngs: HybridForcingRNGs,
+    energy_cfg: dict[str, Any] | None = None,
+    reformulation_cfg: dict[str, Any] | None = None,
+    max_start_step: int | None = None,
+    active_t_final: float | None = None,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     device = x_grid.device
     batch_size = len(params)
@@ -5148,12 +5414,14 @@ def _forcing_layered_batch_losses(
 
     coll = _sample_lattice_intervals(
         rngs.interval_selection, batch_size, intervals_per_sim,
-        n_steps, n_bins, stratified,
+        n_steps, n_bins, stratified, max_start_step=max_start_step,
     )
     starts = coll["start_idx"].to(device=device, dtype=torch.long)
     sim_local = coll["sim_local"].to(device=device, dtype=torch.long)
     interval_count = int(starts.numel())
-    tn = starts.to(dtype=torch.float64) * float(dt)
+    # MPS has no float64 tensor support; keep CN query times in the active
+    # grid dtype (float32 on MPS, float64 on CPU if callers choose it).
+    tn = starts.to(dtype=x_grid.dtype) * float(dt)
     tnp1 = tn + float(dt)
     latent_intervals = latent[sim_local]
 
@@ -5172,7 +5440,8 @@ def _forcing_layered_batch_losses(
     if not bool((geom.face_idx == int(interface_face)).all().item()):
         raise AssertionError("forcing interface face changed inside a training batch")
 
-    if residual_method == "finite_volume":
+    reformulation_enabled = bool((reformulation_cfg or {}).get("enabled", False))
+    if residual_method == "finite_volume" or reformulation_enabled:
         query_mesh = _full_grid_query_mesh(x_grid, y_grid)
         query_count = Nx * Ny
     else:
@@ -5194,28 +5463,38 @@ def _forcing_layered_batch_losses(
         model, latent_intervals, coords, tnp1_query, chunk_r
     )[..., 0].view(interval_count, -1, Ny)
 
+    energy_enabled = bool((energy_cfg or {}).get("enabled", False))
+    qn_np = qnp1_np = qint_np = None
+    T_n_energy = T_np1_energy = None
+    if energy_enabled and residual_method == "hybrid" and not reformulation_enabled:
+        full_mesh = _full_grid_query_mesh(x_grid, y_grid)
+        full_count = Nx * Ny
+        full_coords = full_mesh.expand(interval_count, -1, -1)
+        tn_full = tn.to(dtype=x_grid.dtype).view(interval_count, 1, 1).expand(
+            interval_count, full_count, 1
+        )
+        tnp1_full = tnp1.to(dtype=x_grid.dtype).view(interval_count, 1, 1).expand(
+            interval_count, full_count, 1
+        )
+        T_n_energy = _decode_in_chunks(
+            model, latent_intervals, full_coords, tn_full, chunk_r
+        )[..., 0].view(interval_count, Nx, Ny)
+        T_np1_energy = _decode_in_chunks(
+            model, latent_intervals, full_coords, tnp1_full, chunk_r
+        )[..., 0].view(interval_count, Nx, Ny)
+
     if residual_method == "finite_volume":
-        qn = np.empty((interval_count, Ny), dtype=np.float64)
-        qnp1 = np.empty_like(qn)
-        qint = np.empty_like(qn)
-        y_np = y_grid.detach().cpu().numpy()
-        sim_np = sim_local.detach().cpu().numpy()
-        for interval in range(interval_count):
-            record = params[int(sim_np[interval])]
-            qn_i, qnp1_i, qint_i = build_interface_forcing(
-                record["temporal_family"], record["temporal_params"],
-                record["spatial_family"], record["spatial_params"],
-                y_np, float(tn[interval]), float(tnp1[interval]), t_ramp,
-            )
-            qn[interval], qnp1[interval], qint[interval] = qn_i, qnp1_i, qint_i
+        qn_np, qnp1_np, qint_np = _forcing_interval_fluxes(
+            params, sim_local, y_grid, tn, tnp1, t_ramp
+        )
         bc = FullBCData(
             T_right_tilde=torch.as_tensor(
                 (float(physics["T_right"]) - mu) / sigma,
                 device=device, dtype=T_n.dtype,
             ),
-            qL_n=torch.from_numpy(qn).to(device=device, dtype=T_n.dtype),
-            qL_np1=torch.from_numpy(qnp1).to(device=device, dtype=T_n.dtype),
-            qL_int=torch.from_numpy(qint).to(device=device, dtype=T_n.dtype),
+            qL_n=torch.from_numpy(qn_np).to(device=device, dtype=T_n.dtype),
+            qL_np1=torch.from_numpy(qnp1_np).to(device=device, dtype=T_n.dtype),
+            qL_int=torch.from_numpy(qint_np).to(device=device, dtype=T_n.dtype),
         )
         fv = region_balanced_fv_rate_loss(
             T_n, T_np1, geom, bc, t_ref=t_ref, dirichlet_both_ends=True
@@ -5242,6 +5521,8 @@ def _forcing_layered_batch_losses(
             "ic": loss_ic,
         }
         right_dir = fv["phys_right_dirichlet_mse"]
+        if energy_enabled:
+            T_n_energy, T_np1_energy = T_n, T_np1
     else:
         interface_rate = interface_residual_rate(T_n, T_np1, geom)
         interface_per_interval = (
@@ -5253,6 +5534,7 @@ def _forcing_layered_batch_losses(
             t_ramp=t_ramp, n_r=n_r, n_bc=n_bc,
             bulk_generator=rngs.bulk_collocation,
             boundary_generator=rngs.boundary_collocation,
+            active_t_final=active_t_final,
         )
         losses = {
             **ad,
@@ -5262,7 +5544,885 @@ def _forcing_layered_batch_losses(
             "ic": loss_ic,
         }
         right_dir = torch.zeros((), device=device, dtype=T_n.dtype)
+    if reformulation_enabled:
+        _, _, qint_np = _forcing_interval_fluxes(
+            params, sim_local, y_grid, tn, tnp1, t_ramp
+        )
+        qint_t = torch.from_numpy(qint_np).to(device=device, dtype=T_n.dtype)
+        blocks = block_energy_residual(
+            T_n, T_np1, geom, qint_t,
+            x_blocks_per_layer=int(reformulation_cfg.get("x_blocks_per_layer", 4)),
+            y_blocks=int(reformulation_cfg.get("y_blocks", 8)),
+            q_ref=q_ref,
+            scale_floor=float(reformulation_cfg.get("scale_floor", 1.0)),
+        )
+        traces = interface_trace_constraint_residuals(
+            T_n, T_np1, geom, x_np, resistance,
+            k_left=float(physics["k_left"]),
+            k_right=float(physics["k_right"]), sigma_global=sigma,
+            q_ref=q_ref,
+            jump_floor_K=float(reformulation_cfg.get("jump_floor_K", 1.0)),
+        )
+        losses.update({
+            "_constraint_local_energy_interface": blocks["interface"],
+            "_constraint_local_energy_far": blocks["far"],
+            "_constraint_interface_flux": traces["flux"],
+            "_constraint_interface_contact": traces["contact"],
+            "local_energy_interface": blocks["interface"].square().mean(),
+            "local_energy_far": blocks["far"].square().mean(),
+            "interface_flux_constraint": traces["flux"].square().mean(),
+            "interface_contact_constraint": traces["contact"].square().mean(),
+            "local_energy_max_block": blocks["all"].abs().max(),
+        })
+    if energy_enabled:
+        if qint_np is None:
+            _, _, qint_np = _forcing_interval_fluxes(
+                params, sim_local, y_grid, tn, tnp1, t_ramp
+            )
+        qint_t = torch.from_numpy(qint_np).to(device=device, dtype=T_n.dtype)
+        losses.update(_forcing_energy_closure_losses(
+            T_n_energy, T_np1_energy, geom, qint_t,
+            interface_face=interface_face, physics=physics, sigma=sigma,
+            q_ref=q_ref,
+            scale_floor=float((energy_cfg or {}).get("scale_floor", 1.0)),
+        ))
     return losses, right_dir
+
+
+# ---- fixed forcing-screen instrumentation ----------------------------------
+
+def _forcing_diagnostic_probe_params() -> list[dict[str, Any]]:
+    """Return the small, deterministic forcing set used by the screen dashboard.
+
+    The probes are deliberately outside the online sampler RNG stream.  They
+    are fixed physical questions (a short pulse, a moderate smooth load, and
+    two contact resistances), so a change in a diagnostic row means the model
+    changed rather than the test problem changing.
+    """
+    base = {
+        "interface_x": float(FORCING_INTERFACE_X),
+        "spatial_family": "uniform",
+        "spatial_params": {},
+    }
+    pulse = {
+        **base,
+        "temporal_family": "pulse_train",
+        "temporal_params": {
+            "Np": 1, "A_list": [250.0], "t_list": [0.04],
+            "dt_list": [0.08],
+        },
+    }
+    smooth = {
+        **base,
+        "temporal_family": "sin",
+        "temporal_params": {
+            "A": 180.0, "f": 4.0, "t_on": 0.0, "t_off": 0.2,
+            "phase": 0.0, "tukey_alpha": 0.5, "rectified": True,
+        },
+    }
+    return [
+        {**pulse, "R_c": float(FORCING_RC_RANGE[0])},
+        {**pulse, "R_c": float(FORCING_RC_RANGE[1])},
+        {**smooth, "R_c": 0.5 * sum(FORCING_RC_RANGE)},
+    ]
+
+
+def _forcing_fixed_probe_case(case: str) -> dict[str, Any]:
+    cases = {
+        "pulse_low": 0,
+        "pulse_high": 1,
+        "smooth_mid": 2,
+    }
+    if case in cases:
+        return copy.deepcopy(_forcing_diagnostic_probe_params()[cases[case]])
+    compositional = {
+        "pulse_mid": (0, 0.5 * sum(FORCING_RC_RANGE)),
+        "smooth_low": (2, float(FORCING_RC_RANGE[0])),
+        "smooth_high": (2, float(FORCING_RC_RANGE[1])),
+    }
+    if case not in compositional:
+        raise ValueError(
+            "training.pino.forcing.fixed_probe_case must be one of "
+            f"{sorted([*cases, *compositional])}, got {case!r}"
+        )
+    source, resistance = compositional[case]
+    params = copy.deepcopy(_forcing_diagnostic_probe_params()[source])
+    params["R_c"] = float(resistance)
+    return params
+
+
+def _solve_forcing_diagnostic_truth(
+    problem: Any,
+    params: dict[str, Any],
+    physics: dict[str, Any],
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    dt: float,
+    t_ramp: float,
+) -> np.ndarray:
+    """Solve one fixed probe with the same FV implementation as the dataset."""
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    y_grid = np.asarray(y_grid, dtype=np.float64)
+    t_grid = np.asarray(t_grid, dtype=np.float64)
+    base_kwargs = {
+        "a": float(physics["a"]), "b": float(physics["b"]),
+        "c": float(physics["c"]), "d": float(physics["d"]),
+        "Nx": int(x_grid.size), "Ny": int(y_grid.size),
+        "lam_target": 0.8, "layers": physics["layers"],
+        "t_final": float(round(float(t_grid[-1]), 6)),
+        "flux_f": 0.0, "flux_A": 0.0,
+        "t_on": 0.0, "t_off": 0.2, "phase": 0.0,
+        "tukey_alpha": 0.5, "dt": float(dt), "y_grid": y_grid,
+        "ramp_seconds": float(t_ramp),
+    }
+    solver = problem.configure_solver(params, base_kwargs)
+    t_full, _, _, trajectory = solver.solve(
+        np.full((x_grid.size, y_grid.size), float(physics["T_right"])),
+        store_trajectory=True,
+    )
+    # The saved trajectory may be decimated relative to the solver.  The
+    # diagnostic uses the exact saved times and selects the corresponding CN
+    # states, with nearest-index fallback for custom local screens.
+    indices = np.asarray(
+        [int(np.argmin(np.abs(np.asarray(t_full) - value))) for value in t_grid],
+        dtype=np.int64,
+    )
+    return np.asarray(trajectory[indices], dtype=np.float64)
+
+
+def _calibrate_forcing_constraint_tolerances(
+    problem: Any, probe_params: list[dict[str, Any]], physics: dict[str, Any],
+    x_grid: np.ndarray, y_grid: np.ndarray, *, dt: float, t_final: float,
+    t_ramp: float, sigma: float, q_ref: float,
+    reformulation_cfg: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Measure attainable residual floors on exact FV probe trajectories."""
+    samples = {name: [] for name in _FORCING_CONSTRAINT_NAMES}
+    for params in probe_params:
+        base_kwargs = {
+            "a": float(physics["a"]), "b": float(physics["b"]),
+            "c": float(physics["c"]), "d": float(physics["d"]),
+            "Nx": int(len(x_grid)), "Ny": int(len(y_grid)),
+            "lam_target": 0.8, "layers": physics["layers"],
+            "t_final": float(round(float(t_final), 6)), "flux_f": 0.0, "flux_A": 0.0,
+            "t_on": 0.0, "t_off": 0.2, "phase": 0.0,
+            "tukey_alpha": 0.5, "dt": float(dt), "y_grid": y_grid,
+            "ramp_seconds": float(t_ramp),
+        }
+        solver = problem.configure_solver(params, base_kwargs)
+        times, _, _, trajectory = solver.solve(
+            np.full((len(x_grid), len(y_grid)), float(physics["T_right"])),
+            store_trajectory=True,
+        )
+        field = torch.as_tensor(
+            (np.asarray(trajectory) - float(physics["T_right"])) / float(sigma),
+            dtype=torch.float64,
+        )
+        count = field.shape[0] - 1
+        geom = build_cn_geom_per_interface(
+            x_grid, y_grid, physics["k_left"], physics["k_right"],
+            np.full(count, physics["interface_x"]),
+            np.full(count, params["R_c"]), dt, sigma_global=sigma,
+            rho=physics["rho_left"], cp=physics["cp_left"],
+            device=torch.device("cpu"), dtype=torch.float64,
+        )
+        sim_local = torch.zeros(count, dtype=torch.long)
+        tn = torch.as_tensor(times[:-1], dtype=torch.float64)
+        tnp1 = torch.as_tensor(times[1:], dtype=torch.float64)
+        _, _, qint_np = _forcing_interval_fluxes(
+            [params], sim_local, torch.as_tensor(y_grid), tn, tnp1, t_ramp,
+        )
+        blocks = block_energy_residual(
+            field[:-1], field[1:], geom, torch.as_tensor(qint_np),
+            x_blocks_per_layer=int(reformulation_cfg.get("x_blocks_per_layer", 4)),
+            y_blocks=int(reformulation_cfg.get("y_blocks", 8)), q_ref=q_ref,
+            scale_floor=float(reformulation_cfg.get("scale_floor", 1.0)),
+        )
+        traces = interface_trace_constraint_residuals(
+            field[:-1], field[1:], geom, x_grid,
+            np.full(count, params["R_c"]), k_left=physics["k_left"],
+            k_right=physics["k_right"], sigma_global=sigma, q_ref=q_ref,
+            jump_floor_K=float(reformulation_cfg.get("jump_floor_K", 1.0)),
+        )
+        for name, values in (
+            # The AD wall constraint is continuous. FV boundary nodes obey a
+            # half-cell balance, so a nodal finite-difference gradient is not
+            # its attainable floor and would create a large false dead band.
+            ("left_flux", torch.zeros(1, dtype=torch.float64)),
+            ("local_energy_interface", blocks["interface"]),
+            ("local_energy_far", blocks["far"]),
+            ("interface_flux", traces["flux"]),
+            ("interface_contact", traces["contact"]),
+        ):
+            samples[name].append(float(torch.sqrt(values.square().mean()).cpu()))
+    floors = {name: max(samples[name]) for name in _FORCING_CONSTRAINT_NAMES}
+    margin = float(reformulation_cfg.get("tolerance_margin", 10.0))
+    minimum = float(reformulation_cfg.get("tolerance_min", 1.0e-8))
+    overrides = dict(reformulation_cfg.get("tolerance_override", {}) or {})
+    tolerances = {
+        name: float(overrides.get(name, max(margin * floors[name], minimum)))
+        for name in _FORCING_CONSTRAINT_NAMES
+    }
+    return floors, tolerances
+
+
+def _forcing_probe_query_indices(
+    x_grid: np.ndarray, y_grid: np.ndarray, interface_face: int,
+    x_samples: int, y_samples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_idx = np.linspace(0, len(x_grid) - 1, max(int(x_samples), 2), dtype=int)
+    x_idx = np.unique(np.r_[x_idx, interface_face - 1, interface_face,
+                            interface_face + 1, interface_face + 2])
+    y_idx = np.linspace(0, len(y_grid) - 1, max(int(y_samples), 2), dtype=int)
+    return x_idx, np.unique(y_idx)
+
+
+def _forcing_probe_energy_losses(
+    model: InterfaceCViT,
+    latent: torch.Tensor,
+    probe_params: list[dict[str, Any]],
+    *,
+    physics: dict[str, Any],
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    time_idx: np.ndarray,
+    q_ref: float,
+    t_ramp: float,
+    interface_face: int,
+    sigma: float,
+    scale_floor: float,
+    query_chunk: int,
+    device: torch.device,
+) -> dict[str, float]:
+    if len(time_idx) < 2:
+        return {
+            "probe_loss_energy_left": float("nan"),
+            "probe_loss_energy_right": float("nan"),
+            "probe_loss_energy_global": float("nan"),
+            "probe_loss_energy": float("nan"),
+        }
+    Nx, Ny = int(x_grid.size), int(y_grid.size)
+    gx, gy = np.meshgrid(x_grid, y_grid, indexing="ij")
+    full_coords = torch.from_numpy(
+        np.stack((gx.reshape(-1), gy.reshape(-1)), axis=-1).astype(np.float32)
+    ).unsqueeze(0).to(device)
+    # The four rendered cases are [pulse-low, pulse-high, zeroed pulse-low,
+    # smooth-mid]; energy is evaluated on the three physical nonzero probes.
+    latent_energy = latent[torch.as_tensor([0, 1, 3], device=device)]
+    states = []
+    for grid_index in time_idx:
+        time_value = float(t_grid[int(grid_index)])
+        tq = torch.full(
+            (len(probe_params), full_coords.shape[1], 1),
+            time_value, device=device,
+        )
+        states.append(
+            _decode_in_chunks(
+                model, latent_energy,
+                full_coords.expand(len(probe_params), -1, -1), tq,
+                int(query_chunk),
+            )[..., 0].view(len(probe_params), Nx, Ny)
+        )
+    field = torch.stack(states, dim=1)
+    slabs = len(time_idx) - 1
+    T_n = field[:, :-1].reshape(len(probe_params) * slabs, Nx, Ny)
+    T_np1 = field[:, 1:].reshape(len(probe_params) * slabs, Nx, Ny)
+
+    t_values = np.asarray(t_grid[time_idx], dtype=np.float64)
+    t_lo = np.tile(t_values[:-1], len(probe_params))
+    t_hi = np.tile(t_values[1:], len(probe_params))
+    dt_values = t_hi - t_lo
+    interval_params = [
+        probe_params[case_index]
+        for case_index in range(len(probe_params))
+        for _ in range(slabs)
+    ]
+    sim_local = torch.arange(len(interval_params), device=device)
+    _, _, qint_np = _forcing_interval_fluxes(
+        interval_params, sim_local,
+        torch.as_tensor(y_grid, dtype=T_n.dtype, device=device),
+        torch.as_tensor(t_lo, dtype=T_n.dtype, device=device),
+        torch.as_tensor(t_hi, dtype=T_n.dtype, device=device),
+        t_ramp,
+    )
+    qint = torch.from_numpy(qint_np).to(device=device, dtype=T_n.dtype)
+
+    losses = {
+        "probe_loss_energy_left": 0.0,
+        "probe_loss_energy_right": 0.0,
+        "probe_loss_energy_global": 0.0,
+    }
+    total_count = 0
+    interval_x = np.full(len(interval_params), float(physics["interface_x"]))
+    interval_rc = np.asarray(
+        [float(record["R_c"]) for record in interval_params], dtype=np.float64,
+    )
+    for dt_value in np.unique(np.round(dt_values, 12)):
+        mask_np = np.isclose(dt_values, float(dt_value), rtol=0.0, atol=1e-12)
+        mask = torch.as_tensor(mask_np, dtype=torch.bool, device=device)
+        geom = build_cn_geom_per_interface(
+            x_grid, y_grid, physics["k_left"], physics["k_right"],
+            interval_x[mask_np], interval_rc[mask_np], float(dt_value),
+            sigma_global=sigma, rho=physics["rho_left"], cp=physics["cp_left"],
+            device=device, dtype=T_n.dtype,
+        )
+        if not bool((geom.face_idx == int(interface_face)).all().item()):
+            raise AssertionError("fixed probe interface face changed")
+        residuals = _forcing_energy_closure_residuals(
+            T_n[mask], T_np1[mask], geom, qint[mask],
+            interface_face=interface_face, physics=physics, sigma=sigma,
+            q_ref=q_ref, scale_floor=scale_floor,
+        )
+        count = int(mask_np.sum())
+        losses["probe_loss_energy_left"] += float(
+            residuals["energy_left_residual"].square().sum().detach().cpu()
+        )
+        losses["probe_loss_energy_right"] += float(
+            residuals["energy_right_residual"].square().sum().detach().cpu()
+        )
+        losses["probe_loss_energy_global"] += float(
+            residuals["energy_global_residual"].square().sum().detach().cpu()
+        )
+        total_count += count
+    for key in list(losses):
+        losses[key] /= max(total_count, 1)
+    losses["probe_loss_energy"] = (
+        losses["probe_loss_energy_left"]
+        + losses["probe_loss_energy_right"]
+        + losses["probe_loss_energy_global"]
+    )
+    return losses
+
+
+def _forcing_probe_model_outputs(
+    model: InterfaceCViT,
+    probe_params: list[dict[str, Any]],
+    *,
+    mu: float,
+    sigma: float,
+    physics: dict[str, Any],
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    q_ref: float,
+    t_ramp: float,
+    interface_face: int,
+    x_samples: int,
+    y_samples: int,
+    time_samples: int,
+    query_chunk: int,
+    device: torch.device,
+    energy_scale_floor: float = 1.0,
+    truth_cache: list[np.ndarray | None] | None = None,
+) -> dict[str, Any]:
+    """Evaluate fixed physical probes and their zero-forcing twins."""
+    was_training = model.training
+    model.eval()
+    x_idx, y_idx = _forcing_probe_query_indices(
+        x_grid, y_grid, interface_face, x_samples, y_samples,
+    )
+    time_idx = np.linspace(
+        0, len(t_grid) - 1, max(int(time_samples), 2), dtype=int,
+    )
+    time_idx = np.unique(time_idx)
+    gx, gy = np.meshgrid(x_grid[x_idx], y_grid[y_idx], indexing="ij")
+    sparse_coords = torch.from_numpy(
+        np.stack((gx.reshape(-1), gy.reshape(-1)), axis=-1).astype(np.float32)
+    ).unsqueeze(0).to(device)
+    jump_x = np.asarray([x_grid[interface_face], x_grid[interface_face + 1]])
+    jx, jy = np.meshgrid(jump_x, y_grid, indexing="ij")
+    jump_coords = torch.from_numpy(
+        np.stack((jx.reshape(-1), jy.reshape(-1)), axis=-1).astype(np.float32)
+    ).unsqueeze(0).to(device)
+
+    truth_cache_out: list[np.ndarray | None] = []
+    for probe_index, p in enumerate(probe_params):
+        if truth_cache is None:
+            truth_cache_out.append(_solve_forcing_diagnostic_truth(
+                problem=physics["problem"], params=p, physics=physics,
+                x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
+                dt=physics["fv_dt"], t_ramp=t_ramp,
+            ))
+        else:
+            truth_cache_out.append(truth_cache[probe_index])
+    # Exactly four cases: low-R pulse, high-R pulse, zeroed low-R pulse image,
+    # and moderate sinusoid.  The zero case intentionally retains the low-R
+    # parameter token so only the forcing image changes.
+    all_params = [probe_params[0], probe_params[1], probe_params[0], probe_params[2]]
+    zero_flags = [False, False, True, False]
+    truths: list[np.ndarray | None] = [
+        truth_cache_out[0], truth_cache_out[1], None, truth_cache_out[2],
+    ]
+
+    fixed_ic = np.full(
+        (len(all_params), x_grid.size, y_grid.size),
+        np.float32((float(physics["T_right"]) - mu) / sigma),
+    )
+    u_spatial = torch.from_numpy(np.stack([
+        _interface_spatial_channels_from_normalized(
+            fixed_ic[index], float(physics["interface_x"]), x_grid,
+        )
+        for index in range(len(all_params))
+    ])).to(device)
+    forcing_image = build_forcing_image(
+        all_params, y_img, t_img, q_ref, device, t_ramp,
+    )
+    for index, is_zero in enumerate(zero_flags):
+        if is_zero:
+            forcing_image[index].zero_()
+    pscal = torch.from_numpy(np.stack([
+        normalize_forcing_interface_scalars(
+            physics["interface_x"], p["R_c"],
+        ) for p in all_params
+    ])).to(device)
+    with torch.no_grad():
+        latent = model.encode(u_spatial, forcing_image, pscal)
+        probe_energy_losses = _forcing_probe_energy_losses(
+            model, latent, probe_params, physics=physics,
+            x_grid=x_grid, y_grid=y_grid, t_grid=t_grid, time_idx=time_idx,
+            q_ref=q_ref, t_ramp=t_ramp, interface_face=interface_face,
+            sigma=sigma, scale_floor=float(energy_scale_floor),
+            query_chunk=int(query_chunk), device=device,
+        )
+        sparse_prediction = np.empty(
+            (len(all_params), len(time_idx), len(x_idx), len(y_idx)),
+            dtype=np.float64,
+        )
+        jump_prediction = np.empty(
+            (len(all_params), len(time_idx), 2, len(y_grid)), dtype=np.float64,
+        )
+        for ti, grid_index in enumerate(time_idx):
+            time_value = float(t_grid[grid_index])
+            tq_sparse = torch.full(
+                (len(all_params), sparse_coords.shape[1], 1),
+                time_value, device=device,
+            )
+            tq_jump = torch.full(
+                (len(all_params), jump_coords.shape[1], 1),
+                time_value, device=device,
+            )
+            sparse_prediction[:, ti] = (
+                _decode_in_chunks(
+                    model, latent,
+                    sparse_coords.expand(len(all_params), -1, -1), tq_sparse,
+                    int(query_chunk),
+                )[..., 0].view(len(all_params), len(x_idx), len(y_idx))
+                .detach().cpu().numpy() * sigma + mu
+            )
+            jump_prediction[:, ti] = (
+                _decode_in_chunks(
+                    model, latent,
+                    jump_coords.expand(len(all_params), -1, -1), tq_jump,
+                    int(query_chunk),
+                )[..., 0].view(len(all_params), 2, len(y_grid))
+                .detach().cpu().numpy() * sigma + mu
+            )
+    truth_sparse: list[np.ndarray | None] = []
+    truth_jump: list[np.ndarray | None] = []
+    for truth in truths:
+        if truth is None:
+            truth_sparse.append(None)
+            truth_jump.append(None)
+        else:
+            truth_sparse.append(truth[time_idx][:, x_idx][:, :, y_idx])
+            truth_jump.append(truth[time_idx][:, [interface_face, interface_face + 1]])
+    if was_training:
+        model.train()
+    return {
+        "sparse_prediction": sparse_prediction,
+        "jump_prediction": jump_prediction,
+        "truth_sparse": truth_sparse,
+        "truth_jump": truth_jump,
+        "truth_full": truth_cache_out,
+        "time_idx": time_idx,
+        "zero_flags": np.asarray(zero_flags, dtype=bool),
+        "probe_energy_losses": probe_energy_losses,
+    }
+
+
+def _forcing_probe_metrics(
+    outputs: dict[str, np.ndarray],
+    init_outputs: dict[str, np.ndarray] | None,
+) -> dict[str, float]:
+    pred = outputs["sparse_prediction"]
+    jumps = outputs["jump_prediction"]
+    zero = outputs["zero_flags"]
+    truths = outputs["truth_sparse"]
+    truth_jumps = outputs["truth_jump"]
+    nonzero = ~zero
+    field_errors = []
+    departure = []
+    true_jumps = []
+    pred_jumps = []
+    jump_errors = []
+    for index in np.flatnonzero(nonzero):
+        truth = np.asarray(truths[index], dtype=np.float64)
+        field_errors.append(pred[index] - truth)
+        departure.append(pred[index] - 300.0)
+        truth_jump = np.asarray(truth_jumps[index], dtype=np.float64)
+        true_jumps.append(truth_jump[:, 0] - truth_jump[:, 1])
+        pred_jump = jumps[index, :, 0] - jumps[index, :, 1]
+        pred_jumps.append(pred_jump)
+        jump_errors.append(pred_jump - (truth_jump[:, 0] - truth_jump[:, 1]))
+    field_errors_arr = np.concatenate([value.reshape(-1) for value in field_errors])
+    departure_arr = np.concatenate([value.reshape(-1) for value in departure])
+    true_jump_arr = np.concatenate([value.reshape(-1) for value in true_jumps])
+    pred_jump_arr = np.concatenate([value.reshape(-1) for value in pred_jumps])
+    jump_error_arr = np.concatenate([value.reshape(-1) for value in jump_errors])
+
+    # Entries are [pulse-low, pulse-high, pulse-low-zero, smooth-mid].
+    forcing_sensitivity = pred[0] - pred[2]
+    true_forcing = np.asarray(truths[0], dtype=np.float64) - 300.0
+    rc_sensitivity = pred[1] - pred[0]
+    truth_rc_sensitivity = (
+        np.asarray(truths[1], dtype=np.float64)
+        - np.asarray(truths[0], dtype=np.float64)
+    )
+    out = {
+        "drift_from_init_K": float("nan"),
+        "departure_from_300_K": float(np.sqrt(np.mean(departure_arr ** 2))),
+        "field_rmse_K": float(np.sqrt(np.mean(field_errors_arr ** 2))),
+        "forcing_sensitivity_K": float(np.sqrt(np.mean(forcing_sensitivity ** 2))),
+        "forcing_response_ratio": float(
+            np.sqrt(np.mean(forcing_sensitivity ** 2))
+            / max(np.sqrt(np.mean(true_forcing ** 2)), 1e-12)
+        ),
+        "rc_sensitivity_K": float(np.sqrt(np.mean(rc_sensitivity ** 2))),
+        "rc_response_ratio": float(
+            np.sqrt(np.mean(rc_sensitivity ** 2))
+            / max(np.sqrt(np.mean(truth_rc_sensitivity ** 2)), 1e-12)
+        ),
+        "pred_jump_rms_K": float(np.sqrt(np.mean(pred_jump_arr ** 2))),
+        "true_jump_rms_K": float(np.sqrt(np.mean(true_jump_arr ** 2))),
+        "node_jump_rmse_K": float(np.sqrt(np.mean(jump_error_arr ** 2))),
+    }
+    out.update({
+        "probe_loss_energy_left": float("nan"),
+        "probe_loss_energy_right": float("nan"),
+        "probe_loss_energy_global": float("nan"),
+        "probe_loss_energy": float("nan"),
+        **{
+            key: float(value)
+            for key, value in dict(outputs.get("probe_energy_losses", {})).items()
+        },
+    })
+    if init_outputs is not None:
+        out["drift_from_init_K"] = float(np.sqrt(np.mean(
+            (pred[nonzero] - init_outputs["sparse_prediction"][nonzero]) ** 2
+        )))
+    return out
+
+
+def _gradient_norm_and_cosine(
+    model: torch.nn.Module, loss: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+) -> tuple[float, torch.Tensor]:
+    gradients = torch.autograd.grad(
+        loss, parameters, retain_graph=True, allow_unused=True,
+    )
+    pieces = [
+        torch.zeros_like(parameter).reshape(-1) if gradient is None
+        else gradient.reshape(-1)
+        for parameter, gradient in zip(parameters, gradients)
+    ]
+    vector = torch.cat(pieces) if pieces else torch.zeros(1, device=loss.device)
+    return float(torch.linalg.vector_norm(vector).detach().cpu()), vector
+
+
+def _forcing_pair_gradient_metrics(
+    l_discriminating: torch.Tensor,
+    l_stiff: torch.Tensor,
+    l_homogeneous: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+    *,
+    suffix: str = "",
+) -> dict[str, float]:
+    norm_d, grad_d = _gradient_norm_and_cosine(
+        None, l_discriminating, parameters
+    )
+    norm_p, grad_p = _gradient_norm_and_cosine(None, l_stiff, parameters)
+    norm_h, _ = _gradient_norm_and_cosine(None, l_homogeneous, parameters)
+    grad_d_norm = torch.linalg.vector_norm(grad_d)
+    grad_p_norm = torch.linalg.vector_norm(grad_p)
+    cosine = float(
+        (torch.dot(grad_d, grad_p) / (grad_d_norm * grad_p_norm + 1e-12))
+        .detach().cpu()
+    )
+    combined = grad_d + grad_p
+    projection_d = float(
+        (torch.dot(combined, grad_d) / (grad_d_norm + 1e-12)).detach().cpu()
+    )
+    projection_p = float(
+        (torch.dot(combined, grad_p) / (grad_p_norm + 1e-12)).detach().cpu()
+    )
+    total = norm_d + norm_p + norm_h
+    return {
+        f"grad_norm_discriminating{suffix}": norm_d,
+        f"grad_norm_stiff_physics{suffix}": norm_p,
+        f"grad_norm_homogeneous{suffix}": norm_h,
+        f"grad_ratio_discriminating_to_physics{suffix}": (
+            norm_d / max(norm_p, 1e-12)
+        ),
+        f"grad_cos_discriminating_physics{suffix}": cosine,
+        f"gradient_share_discriminating{suffix}": (
+            norm_d / max(norm_d + norm_p, 1e-12)
+        ),
+        f"effective_gradient_share_discriminating{suffix}": (
+            norm_d / max(total, 1e-12)
+        ),
+        f"grad_projection_on_discriminating{suffix}": projection_d,
+        f"grad_projection_on_physics{suffix}": projection_p,
+    }
+
+
+def _forcing_pair_metrics_from_vectors(
+    grad_d: torch.Tensor,
+    grad_p: torch.Tensor,
+    norm_h: float,
+    *,
+    suffix: str = "",
+) -> dict[str, float]:
+    norm_d = float(torch.linalg.vector_norm(grad_d).detach().cpu())
+    norm_p = float(torch.linalg.vector_norm(grad_p).detach().cpu())
+    grad_d_norm = torch.linalg.vector_norm(grad_d)
+    grad_p_norm = torch.linalg.vector_norm(grad_p)
+    cosine = float(
+        (torch.dot(grad_d, grad_p) / (grad_d_norm * grad_p_norm + 1e-12))
+        .detach().cpu()
+    )
+    combined = grad_d + grad_p
+    projection_d = float(
+        (torch.dot(combined, grad_d) / (grad_d_norm + 1e-12)).detach().cpu()
+    )
+    projection_p = float(
+        (torch.dot(combined, grad_p) / (grad_p_norm + 1e-12)).detach().cpu()
+    )
+    total = norm_d + norm_p + float(norm_h)
+    return {
+        f"grad_norm_discriminating{suffix}": norm_d,
+        f"grad_norm_stiff_physics{suffix}": norm_p,
+        f"grad_norm_homogeneous{suffix}": float(norm_h),
+        f"grad_ratio_discriminating_to_physics{suffix}": (
+            norm_d / max(norm_p, 1e-12)
+        ),
+        f"grad_cos_discriminating_physics{suffix}": cosine,
+        f"gradient_share_discriminating{suffix}": (
+            norm_d / max(norm_d + norm_p, 1e-12)
+        ),
+        f"effective_gradient_share_discriminating{suffix}": (
+            norm_d / max(total, 1e-12)
+        ),
+        f"grad_projection_on_discriminating{suffix}": projection_d,
+        f"grad_projection_on_physics{suffix}": projection_p,
+    }
+
+
+def _forcing_branch_parameters(
+    model: torch.nn.Module, prefix: str,
+) -> list[torch.nn.Parameter]:
+    return [
+        parameter for name, parameter in model.named_parameters()
+        if name.startswith(prefix) and parameter.requires_grad
+    ]
+
+
+def _forcing_branch_gradient_metrics(
+    l_discriminating: torch.Tensor,
+    l_stiff: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+    branch: str,
+) -> dict[str, float]:
+    if not parameters:
+        return {
+            f"grad_norm_discriminating_{branch}": 0.0,
+            f"grad_norm_stiff_physics_{branch}": 0.0,
+            f"grad_cos_discriminating_physics_{branch}": 0.0,
+        }
+    norm_d, grad_d = _gradient_norm_and_cosine(
+        None, l_discriminating, parameters
+    )
+    norm_p, grad_p = _gradient_norm_and_cosine(None, l_stiff, parameters)
+    cosine = float(
+        (torch.dot(grad_d, grad_p) / (
+            torch.linalg.vector_norm(grad_d) * torch.linalg.vector_norm(grad_p)
+            + 1e-12
+        )).detach().cpu()
+    )
+    return {
+        f"grad_norm_discriminating_{branch}": norm_d,
+        f"grad_norm_stiff_physics_{branch}": norm_p,
+        f"grad_cos_discriminating_physics_{branch}": cosine,
+    }
+
+
+def _forcing_group_losses(
+    losses: dict[str, torch.Tensor],
+    weights: dict[str, float],
+    *,
+    energy_weight: float,
+) -> dict[str, torch.Tensor]:
+    zero = losses["left_neumann"].new_zeros(())
+    energy = losses.get("energy", zero)
+    return {
+        "discriminating": (
+            float(weights["left_neumann"]) * losses["left_neumann"]
+            + float(energy_weight) * energy
+        ),
+        "stiff_physics": (
+            float(weights["interior"]) * losses["interior"]
+            + float(weights["interface"]) * losses["interface"]
+        ),
+        "homogeneous": (
+            float(weights["ic"]) * losses["ic"]
+            + float(weights["topbot_adiabatic"]) * losses["topbot_adiabatic"]
+        ),
+    }
+
+
+def _forcing_diagnostic_gradient_metrics(
+    model: InterfaceCViT,
+    *,
+    residual_method: str,
+    physics: dict[str, Any],
+    interface_face: int,
+    exclusion: tuple[float, float],
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    mu: float,
+    sigma: float,
+    q_ref: float,
+    t_ref: float,
+    t_final: float,
+    t_ramp: float,
+    dt: float,
+    n_steps: int,
+    intervals_per_sim: int,
+    stratified: bool,
+    n_bins: int,
+    n_r: int,
+    n_bc: int,
+    n_ic: int,
+    chunk_r: int,
+    seed: int,
+    weights: dict[str, float],
+    energy_cfg: dict[str, Any],
+    gradnorm_multipliers: dict[str, float] | None = None,
+    reformulation_cfg: dict[str, Any] | None = None,
+    constraint_controller: ForcingConstraintController | None = None,
+) -> dict[str, float]:
+    """Audit raw group gradients on a deterministic, non-training batch."""
+    params = _forcing_diagnostic_probe_params()[:2]
+    rngs = HybridForcingRNGs.create(int(seed), x_grid.device)
+    was_training = model.training
+    model.eval()
+    try:
+        losses, _ = _forcing_layered_batch_losses(
+            model, params, residual_method=residual_method, physics=physics,
+            interface_face=interface_face, exclusion=exclusion,
+            x_grid=x_grid, y_grid=y_grid, y_img=y_img, t_img=t_img,
+            mu=mu, sigma=sigma, q_ref=q_ref, t_ref=t_ref,
+            t_final=t_final, t_ramp=t_ramp, dt=dt, n_steps=n_steps,
+            intervals_per_sim=int(intervals_per_sim), stratified=stratified,
+            n_bins=n_bins, n_r=max(int(n_r), 1), n_bc=max(int(n_bc), 1),
+            n_ic=max(int(n_ic), 1), chunk_r=chunk_r, rngs=rngs,
+            energy_cfg=energy_cfg,
+            reformulation_cfg=reformulation_cfg,
+        )
+        parameters = [
+            parameter for parameter in model.parameters()
+            if parameter.requires_grad
+        ]
+        energy_weight = (
+            float(energy_cfg.get("lambda", 1.0))
+            if bool(energy_cfg.get("enabled", False)) else 0.0
+        )
+        if constraint_controller is not None:
+            constraint_residuals = {
+                name: losses[f"_constraint_{name}"]
+                for name in _FORCING_CONSTRAINT_NAMES
+            }
+            constraint_rms, violation = constraint_controller.values(constraint_residuals)
+            groups = {
+                "discriminating": constraint_controller.primal(violation),
+                "stiff_physics": (
+                    float(weights["interior"]) * losses["interior"]
+                    + float(weights["interface"]) * losses["interface"]
+                ),
+                "homogeneous": (
+                    float(weights["ic"]) * losses["ic"]
+                    + float(weights["topbot_adiabatic"])
+                    * losses["topbot_adiabatic"]
+                ),
+            }
+            constraint_metrics = {}
+            for name in _FORCING_CONSTRAINT_NAMES:
+                constraint_metrics[f"constraint_rms_{name}"] = float(
+                    constraint_rms[name].detach().cpu()
+                )
+                constraint_metrics[f"constraint_violation_{name}"] = float(
+                    violation[name].detach().cpu()
+                )
+                constraint_metrics[f"constraint_multiplier_{name}"] = float(
+                    constraint_controller.multipliers[name]
+                )
+            constraint_metrics["constraint_max_block"] = float(
+                losses["local_energy_max_block"].detach().cpu()
+            )
+        else:
+            groups = _forcing_group_losses(
+                losses, weights, energy_weight=energy_weight,
+            )
+        multipliers = {
+            "discriminating": 1.0,
+            "stiff_physics": 1.0,
+            **dict(gradnorm_multipliers or {}),
+        }
+        norm_d, grad_d = _gradient_norm_and_cosine(
+            None, groups["discriminating"], parameters
+        )
+        norm_p, grad_p = _gradient_norm_and_cosine(
+            None, groups["stiff_physics"], parameters
+        )
+        norm_h, _ = _gradient_norm_and_cosine(
+            None, groups["homogeneous"], parameters
+        )
+        out = _forcing_pair_metrics_from_vectors(
+            grad_d, grad_p, norm_h,
+        )
+        out.update(_forcing_pair_metrics_from_vectors(
+            float(multipliers["discriminating"]) * grad_d,
+            float(multipliers["stiff_physics"]) * grad_p,
+            norm_h, suffix="_weighted",
+        ))
+        for branch, prefix in (
+            ("decoder", "decoder."),
+            ("forcing_encoder", "forcing_encoder."),
+            ("param_encoder", "param_encoder."),
+        ):
+            out.update(_forcing_branch_gradient_metrics(
+                groups["discriminating"], groups["stiff_physics"],
+                _forcing_branch_parameters(model, prefix), branch,
+            ))
+        out["gradnorm_multiplier_discriminating"] = float(
+            multipliers["discriminating"]
+        )
+        out["gradnorm_multiplier_stiff_physics"] = float(
+            multipliers["stiff_physics"]
+        )
+        if constraint_controller is not None:
+            out.update(constraint_metrics)
+    finally:
+        if was_training:
+            model.train()
+        else:
+            model.eval()
+    return out
 
 
 def run_one_seed_forcing_interface_pino(
@@ -5272,8 +6432,8 @@ def run_one_seed_forcing_interface_pino(
     set_seed(seed)
     run_dir = Path(run_dir)
     stale_names = (
-        "train_metrics.csv", "cvit_best_global.pt", "cvit_last.pt",
-        "final_metrics.json",
+        "train_metrics.csv", "diagnostics.csv", "cvit_init.pt",
+        "cvit_best_global.pt", "cvit_last.pt", "final_metrics.json",
     )
     stale = [run_dir / name for name in stale_names if (run_dir / name).exists()]
     if stale:
@@ -5331,8 +6491,6 @@ def run_one_seed_forcing_interface_pino(
         raise ValueError("causal weighting must be disabled for the matched residual screen")
     if bool((pino.get("region_standardize", {}) or {}).get("enabled", False)):
         raise ValueError("region standardization must be disabled for the matched residual screen")
-    if bool((config["training"].get("gradnorm", {}) or {}).get("enabled", False)):
-        raise ValueError("GradNorm must be disabled for the matched residual screen")
     if float(pino.get("lambda_data", 0.0)) != 0.0:
         raise ValueError("forcing residual comparison is physics-only; lambda_data must be zero")
 
@@ -5353,13 +6511,55 @@ def run_one_seed_forcing_interface_pino(
         raise ValueError("forcing residual weights must be finite and non-negative")
     if lam_interface <= 0.0:
         raise ValueError("lambda_interface must be positive")
+    energy_cfg = dict(pino.get("energy", {}) or {})
+    energy_enabled = bool(energy_cfg.get("enabled", False))
+    energy_weight = float(energy_cfg.get("lambda", 1.0)) if energy_enabled else 0.0
+    if energy_weight < 0.0 or not math.isfinite(energy_weight):
+        raise ValueError("training.pino.energy.lambda must be finite and non-negative")
+    reformulation_cfg = dict(pino.get("reformulation", {}) or {})
+    reformulation_enabled = bool(reformulation_cfg.get("enabled", False))
+    if reformulation_enabled:
+        if residual_method != "hybrid":
+            raise ValueError("forcing reformulation requires residual_method=hybrid")
+        if energy_enabled:
+            raise ValueError("legacy energy losses and forcing reformulation are mutually exclusive")
+        if bool((config["training"].get("gradnorm", {}) or {}).get("enabled", False)):
+            raise ValueError("GradNorm and forcing augmented-Lagrangian are mutually exclusive")
 
     fcfg = dict(pino.get("forcing", {}) or {})
-    if fcfg.get("temporal_family") is not None or fcfg.get("spatial_family") is not None:
+    fixed_probe_case = fcfg.get("fixed_probe_case", None)
+    fixed_probe_cases = fcfg.get("fixed_probe_cases", None)
+    if fixed_probe_case is not None and fixed_probe_cases is not None:
+        raise ValueError("set fixed_probe_case or fixed_probe_cases, not both")
+    if fixed_probe_cases is not None:
+        fixed_probe_cases = [str(value) for value in fixed_probe_cases]
+        if not fixed_probe_cases:
+            raise ValueError("fixed_probe_cases cannot be empty")
+        for value in fixed_probe_cases:
+            _forcing_fixed_probe_case(value)
+    if (
+        fixed_probe_case is None
+        and (
+            fcfg.get("temporal_family") is not None
+            or fcfg.get("spatial_family") is not None
+        )
+    ):
         raise ValueError(
             "layered forcing residual screens require unpinned online temporal "
             "and spatial families"
         )
+    if fixed_probe_case is not None and (
+        fcfg.get("temporal_family") is not None
+        or fcfg.get("spatial_family") is not None
+    ):
+        raise ValueError(
+            "training.pino.forcing.fixed_probe_case cannot be combined with "
+            "temporal_family/spatial_family pins"
+        )
+    fixed_train_param = (
+        _forcing_fixed_probe_case(str(fixed_probe_case))
+        if fixed_probe_case is not None else None
+    )
     configured_ref = float(fcfg.get("a_ref", q_ref))
     if not math.isclose(configured_ref, q_ref, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError(
@@ -5394,6 +6594,14 @@ def run_one_seed_forcing_interface_pino(
     physics, interface_face, exclusion = _validate_forcing_layered_dataset(
         problem, data, sim_params[val_ids], fv_dt
     )
+    if reformulation_enabled:
+        f = int(interface_face)
+        if f - 3 < 0 or f + 4 >= Nx:
+            raise ValueError("six-column interface trace guard does not fit this grid")
+        exclusion = (
+            0.5 * (x_np[f - 3] + x_np[f - 2]),
+            0.5 * (x_np[f + 3] + x_np[f + 4]),
+        )
     if not math.isclose(float(physics["T_right"]), T_RIGHT):
         raise ValueError("ForcingProblem right boundary conflicts with the CViT contract")
 
@@ -5421,6 +6629,165 @@ def run_one_seed_forcing_interface_pino(
     grad_clip_cfg = config["training"].get("grad_clip", None)
     grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
     rngs = HybridForcingRNGs.create(seed, device)
+    gradnorm = build_gradnorm(
+        config,
+        term_weights={"discriminating": 1.0, "stiff_physics": 1.0},
+    )
+    constraint_controller = None
+    constraint_floors: dict[str, float] = {}
+    if reformulation_enabled:
+        constraint_floors, constraint_tolerances = _calibrate_forcing_constraint_tolerances(
+            problem, _forcing_diagnostic_probe_params(), physics, x_np, y_np,
+            dt=fv_dt, t_final=t_final, t_ramp=t_ramp, sigma=sigma,
+            q_ref=q_ref, reformulation_cfg=reformulation_cfg,
+        )
+        constraint_controller = ForcingConstraintController(
+            constraint_tolerances,
+            rho=float(reformulation_cfg.get("rho", 1.0)),
+            ema_decay=float(reformulation_cfg.get("ema_decay", 0.9)),
+            dual_every=int(reformulation_cfg.get("dual_every", 10)),
+            multiplier_cap=float(reformulation_cfg.get("multiplier_cap", 1000.0)),
+            dual_enabled=bool(reformulation_cfg.get("dual_enabled", True)),
+        )
+
+    diagnostics_cfg = dict(pino.get("diagnostics", {}) or {})
+    diagnostics_enabled = bool(diagnostics_cfg.get("enabled", False))
+    diagnostics_every = int(diagnostics_cfg.get("every_updates", 50))
+    if diagnostics_enabled and diagnostics_every < 1:
+        raise ValueError("training.pino.diagnostics.every_updates must be >= 1")
+    diagnostic_fields = [
+        "epoch", "completed_updates", "drift_from_init_K",
+        "departure_from_300_K", "field_rmse_K", "forcing_sensitivity_K",
+        "forcing_response_ratio", "rc_sensitivity_K", "rc_response_ratio",
+        "pred_jump_rms_K", "true_jump_rms_K", "node_jump_rmse_K",
+        "probe_loss_energy_left", "probe_loss_energy_right",
+        "probe_loss_energy_global", "probe_loss_energy",
+        "grad_norm_discriminating", "grad_norm_stiff_physics",
+        "grad_norm_homogeneous", "grad_ratio_discriminating_to_physics",
+        "grad_cos_discriminating_physics", "gradient_share_discriminating",
+        "effective_gradient_share_discriminating",
+        "grad_projection_on_discriminating", "grad_projection_on_physics",
+        "grad_norm_discriminating_weighted",
+        "grad_norm_stiff_physics_weighted", "grad_norm_homogeneous_weighted",
+        "grad_ratio_discriminating_to_physics_weighted",
+        "grad_cos_discriminating_physics_weighted",
+        "gradient_share_discriminating_weighted",
+        "effective_gradient_share_discriminating_weighted",
+        "grad_projection_on_discriminating_weighted",
+        "grad_projection_on_physics_weighted",
+        "grad_norm_discriminating_decoder",
+        "grad_norm_stiff_physics_decoder",
+        "grad_cos_discriminating_physics_decoder",
+        "grad_norm_discriminating_forcing_encoder",
+        "grad_norm_stiff_physics_forcing_encoder",
+        "grad_cos_discriminating_physics_forcing_encoder",
+        "grad_norm_discriminating_param_encoder",
+        "grad_norm_stiff_physics_param_encoder",
+        "grad_cos_discriminating_physics_param_encoder",
+        "gradnorm_multiplier_discriminating",
+        "gradnorm_multiplier_stiff_physics",
+        "causal_stage", "causal_fraction", "constraint_max_block",
+        *[f"constraint_rms_{name}" for name in _FORCING_CONSTRAINT_NAMES],
+        *[f"constraint_violation_{name}" for name in _FORCING_CONSTRAINT_NAMES],
+        *[f"constraint_multiplier_{name}" for name in _FORCING_CONSTRAINT_NAMES],
+    ]
+    diagnostics_path = run_dir / "diagnostics.csv"
+    probe_params = _forcing_diagnostic_probe_params()
+    diagnostic_physics = {**physics, "problem": problem, "fv_dt": fv_dt}
+    init_probe_outputs = None
+    if diagnostics_enabled:
+        init_probe_outputs = _forcing_probe_model_outputs(
+            model, probe_params, mu=mu, sigma=sigma, physics=diagnostic_physics,
+            x_grid=x_np, y_grid=y_np, t_grid=t_np, y_img=y_img, t_img=t_img,
+            q_ref=q_ref, t_ramp=t_ramp, interface_face=interface_face,
+            x_samples=int(diagnostics_cfg.get("probe_x_samples", 9)),
+            y_samples=int(diagnostics_cfg.get("probe_y_samples", 9)),
+            time_samples=int(diagnostics_cfg.get("probe_time_samples", 7)),
+            query_chunk=int(diagnostics_cfg.get("probe_query_chunk", 256)),
+            device=device,
+            energy_scale_floor=float(energy_cfg.get("scale_floor", 1.0)),
+        )
+        _atomic_torch_save({
+            "model_state": {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            },
+            "mu_global": mu,
+            "sigma_global": sigma,
+            "config": config,
+            "completed_updates": 0,
+            "probe_spec": {
+                "params": copy.deepcopy(probe_params),
+                "interface_face": int(interface_face),
+                "t_grid": t_np.tolist(),
+            },
+        }, run_dir / "cvit_init.pt")
+        with open(diagnostics_path, "w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=diagnostic_fields).writeheader()
+
+        def write_diagnostics(epoch: int, completed: int) -> None:
+            nonlocal init_probe_outputs
+            probe_outputs = _forcing_probe_model_outputs(
+                model, probe_params, mu=mu, sigma=sigma,
+                physics=diagnostic_physics, x_grid=x_np, y_grid=y_np,
+                t_grid=t_np, y_img=y_img, t_img=t_img, q_ref=q_ref,
+                t_ramp=t_ramp, interface_face=interface_face,
+                x_samples=int(diagnostics_cfg.get("probe_x_samples", 9)),
+                y_samples=int(diagnostics_cfg.get("probe_y_samples", 9)),
+                time_samples=int(diagnostics_cfg.get("probe_time_samples", 7)),
+                query_chunk=int(diagnostics_cfg.get("probe_query_chunk", 256)),
+                device=device,
+                energy_scale_floor=float(energy_cfg.get("scale_floor", 1.0)),
+                truth_cache=init_probe_outputs["truth_full"],
+            )
+            metrics = _forcing_probe_metrics(probe_outputs, init_probe_outputs)
+            gradients = _forcing_diagnostic_gradient_metrics(
+                model, residual_method=residual_method,
+                physics=physics, interface_face=interface_face,
+                exclusion=exclusion, x_grid=x_grid, y_grid=y_grid,
+                y_img=y_img, t_img=t_img, mu=mu, sigma=sigma, q_ref=q_ref,
+                t_ref=t_ref, t_final=t_final, t_ramp=t_ramp, dt=fv_dt,
+                n_steps=fv_n_steps,
+                intervals_per_sim=max(int(intervals_per_sim), 1),
+                stratified=stratified, n_bins=n_bins,
+                n_r=int(diagnostics_cfg.get("gradient_n_r", 128)),
+                n_bc=int(diagnostics_cfg.get("gradient_n_bc", 64)),
+                n_ic=int(diagnostics_cfg.get("gradient_n_ic", 64)),
+                chunk_r=chunk_r,
+                seed=seed + 1000003,
+                weights=weights,
+                energy_cfg=energy_cfg,
+                gradnorm_multipliers=(
+                    gradnorm.multipliers_for(
+                        ["discriminating", "stiff_physics"]
+                    ) if gradnorm is not None else None
+                ),
+                reformulation_cfg=reformulation_cfg,
+                constraint_controller=constraint_controller,
+            )
+            row = {"epoch": int(epoch), "completed_updates": int(completed)}
+            if reformulation_enabled:
+                stage_updates = list(reformulation_cfg.get(
+                    "stage_updates", [0, 200, 400, 600, 800]
+                ))
+                fractions = list(reformulation_cfg.get(
+                    "stage_fractions", [0.1, 0.25, 0.5, 0.75, 1.0]
+                ))
+                stage = max(i for i, start in enumerate(stage_updates) if completed >= start)
+                causal_enabled = bool(reformulation_cfg.get("causal_enabled", True))
+                row.update(
+                    causal_stage=(stage if causal_enabled else 0),
+                    causal_fraction=(fractions[stage] if causal_enabled else 1.0),
+                )
+            row.update(metrics)
+            row.update(gradients)
+            with open(diagnostics_path, "a", newline="") as handle:
+                csv.DictWriter(
+                    handle, fieldnames=diagnostic_fields,
+                    extrasaction="ignore",
+                ).writerow(row)
+
+        write_diagnostics(epoch=0, completed=0)
 
     image_spec = {
         "representation": "space_time_image",
@@ -5459,6 +6826,15 @@ def run_one_seed_forcing_interface_pino(
         "epoch", "completed_updates", "residual_method", "loss",
         "loss_interior", "loss_interface", "loss_left_neumann",
         "loss_top", "loss_bottom", "loss_topbot", "loss_ic", "loss_right_dir",
+        "loss_energy_left", "loss_energy_right", "loss_energy_global",
+        "loss_energy", "loss_group_discriminating",
+        "loss_group_stiff_physics", "loss_group_homogeneous",
+        "gradnorm_multiplier_discriminating",
+        "gradnorm_multiplier_stiff_physics",
+        "causal_stage", "causal_fraction", "constraint_max_block",
+        *[f"constraint_rms_{name}" for name in _FORCING_CONSTRAINT_NAMES],
+        *[f"constraint_violation_{name}" for name in _FORCING_CONSTRAINT_NAMES],
+        *[f"constraint_multiplier_{name}" for name in _FORCING_CONSTRAINT_NAMES],
         "lr", "epoch_seconds", "elapsed_seconds",
         "val_gnrmse", "val_rmse_K", "node_jump_rmse_K",
         "interface_flux_mismatch", "interface_contact_rmse_K",
@@ -5474,25 +6850,61 @@ def run_one_seed_forcing_interface_pino(
         f"[pino-forcing-interface] seed={seed} method={residual_method} device={device} "
         f"grid={Nx}x{Ny} dt={fv_dt} t_ref={t_ref} q_ref={q_ref} "
         f"interface_face={interface_face} exclusion={exclusion} "
-        f"online_forcing=all_families R_c_range={FORCING_RC_RANGE} "
-        f"weights={weights}",
+        f"online_forcing={('fixed_probe:' + str(fixed_probe_case)) if fixed_train_param is not None else 'all_families'} "
+        f"R_c_range={FORCING_RC_RANGE} "
+        f"weights={weights} energy={energy_cfg if energy_enabled else 'off'} "
+        f"gradnorm={'two_group' if gradnorm is not None else 'off'} "
+        f"reformulation={reformulation_cfg if reformulation_enabled else 'off'} "
+        f"constraint_floors={constraint_floors}",
         flush=True,
     )
     best_val = float("inf")
     best_validation: dict[str, float] | None = None
     completed_updates = 0
+    stage_updates = [int(v) for v in reformulation_cfg.get(
+        "stage_updates", [0, 200, 400, 600, 800]
+    )]
+    stage_fractions = [float(v) for v in reformulation_cfg.get(
+        "stage_fractions", [0.1, 0.25, 0.5, 0.75, 1.0]
+    )]
+    if len(stage_updates) != len(stage_fractions) or stage_updates[0] != 0:
+        raise ValueError("causal stage updates/fractions must align and start at zero")
+    if stage_updates != sorted(stage_updates) or any(
+        not 0.0 < value <= 1.0 for value in stage_fractions
+    ):
+        raise ValueError("invalid causal stage schedule")
+    previous_stage = 0
     start_time = time.perf_counter()
     last_payload = None
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
-        params = _sample_online_layered_forcing_params(
-            rngs,
-            sim_batch,
-            dt=fv_dt,
-            t_final=t_final,
-            y_bounds=(float(y_np[0]), float(y_np[-1])),
-            temporal_window=temporal_window,
+        if fixed_probe_cases is not None:
+            selected_case = fixed_probe_cases[completed_updates % len(fixed_probe_cases)]
+            selected = _forcing_fixed_probe_case(selected_case)
+            params = [copy.deepcopy(selected) for _ in range(sim_batch)]
+        elif fixed_train_param is None:
+            params = _sample_online_layered_forcing_params(
+                rngs,
+                sim_batch,
+                dt=fv_dt,
+                t_final=t_final,
+                y_bounds=(float(y_np[0]), float(y_np[-1])),
+                temporal_window=temporal_window,
+            )
+        else:
+            params = [
+                copy.deepcopy(fixed_train_param) for _ in range(sim_batch)
+            ]
+
+        stage = max(i for i, start in enumerate(stage_updates) if completed_updates >= start)
+        if stage != previous_stage and constraint_controller is not None:
+            constraint_controller.reset_stage_history()
+        previous_stage = stage
+        causal_on = reformulation_enabled and bool(
+            reformulation_cfg.get("causal_enabled", True)
         )
+        active_fraction = stage_fractions[stage] if causal_on else 1.0
+        active_steps = max(1, int(math.ceil(fv_n_steps * active_fraction)))
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -5504,9 +6916,52 @@ def run_one_seed_forcing_interface_pino(
             t_final=t_final, t_ramp=t_ramp, dt=fv_dt,
             n_steps=fv_n_steps, intervals_per_sim=intervals_per_sim,
             stratified=stratified, n_bins=n_bins, n_r=n_r, n_bc=n_bc,
-            n_ic=n_ic, chunk_r=chunk_r, rngs=rngs,
+            n_ic=n_ic, chunk_r=chunk_r, rngs=rngs, energy_cfg=energy_cfg,
+            reformulation_cfg=reformulation_cfg,
+            max_start_step=(active_steps - 1 if causal_on else None),
+            active_t_final=(active_steps * fv_dt if causal_on else None),
         )
-        loss = sum(weights[name] * losses[name] for name in weights)
+        if constraint_controller is not None:
+            constraint_residuals = {
+                name: losses[f"_constraint_{name}"]
+                for name in _FORCING_CONSTRAINT_NAMES
+            }
+            constraint_rms, constraint_violation = constraint_controller.values(
+                constraint_residuals
+            )
+            groups = {
+                "discriminating": constraint_controller.primal(constraint_violation),
+                "stiff_physics": (
+                    weights["interior"] * losses["interior"]
+                    + weights["interface"] * losses["interface"]
+                ),
+                "homogeneous": (
+                    weights["ic"] * losses["ic"]
+                    + weights["topbot_adiabatic"] * losses["topbot_adiabatic"]
+                ),
+            }
+        else:
+            constraint_rms = constraint_violation = {}
+            groups = _forcing_group_losses(
+                losses, weights, energy_weight=energy_weight,
+            )
+        if gradnorm is not None:
+            group_multipliers = gradnorm.maybe_update(
+                {
+                    "discriminating": groups["discriminating"],
+                    "stiff_physics": groups["stiff_physics"],
+                },
+                model.parameters(),
+            )
+        else:
+            group_multipliers = {}
+        multiplier_d = float(group_multipliers.get("discriminating", 1.0))
+        multiplier_p = float(group_multipliers.get("stiff_physics", 1.0))
+        loss = (
+            multiplier_d * groups["discriminating"]
+            + multiplier_p * groups["stiff_physics"]
+            + groups["homogeneous"]
+        )
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError(f"non-finite forcing {residual_method} loss")
         loss.backward()
@@ -5522,6 +6977,8 @@ def run_one_seed_forcing_interface_pino(
         _advance_scheduler(scheduler, unit="update", successful_updates=1)
         _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
         completed_updates += 1
+        if constraint_controller is not None:
+            constraint_controller.update(constraint_violation, completed_updates)
 
         row: dict[str, Any] = {
             "epoch": epoch,
@@ -5536,8 +6993,45 @@ def run_one_seed_forcing_interface_pino(
             "loss_topbot": float(losses["topbot_adiabatic"].detach().cpu()),
             "loss_ic": float(losses["ic"].detach().cpu()),
             "loss_right_dir": float(right_dir.detach().cpu()),
+            "loss_energy_left": float(
+                losses.get("energy_left", loss.new_zeros(())).detach().cpu()
+            ),
+            "loss_energy_right": float(
+                losses.get("energy_right", loss.new_zeros(())).detach().cpu()
+            ),
+            "loss_energy_global": float(
+                losses.get("energy_global", loss.new_zeros(())).detach().cpu()
+            ),
+            "loss_energy": float(
+                losses.get("energy", loss.new_zeros(())).detach().cpu()
+            ),
+            "loss_group_discriminating": float(
+                groups["discriminating"].detach().cpu()
+            ),
+            "loss_group_stiff_physics": float(
+                groups["stiff_physics"].detach().cpu()
+            ),
+            "loss_group_homogeneous": float(
+                groups["homogeneous"].detach().cpu()
+            ),
+            "gradnorm_multiplier_discriminating": multiplier_d,
+            "gradnorm_multiplier_stiff_physics": multiplier_p,
+            "causal_stage": stage,
+            "causal_fraction": active_fraction,
+            "constraint_max_block": float(
+                losses.get("local_energy_max_block", loss.new_zeros(())).detach().cpu()
+            ),
             "lr": lr,
         }
+        for name in _FORCING_CONSTRAINT_NAMES:
+            if constraint_controller is not None:
+                row[f"constraint_rms_{name}"] = float(constraint_rms[name].detach().cpu())
+                row[f"constraint_violation_{name}"] = float(
+                    constraint_violation[name].detach().cpu()
+                )
+                row[f"constraint_multiplier_{name}"] = float(
+                    constraint_controller.multipliers[name]
+                )
         do_validation = epoch % validate_every == 0 or epoch == epochs - 1
         is_best = False
         if do_validation:
@@ -5565,13 +7059,36 @@ def run_one_seed_forcing_interface_pino(
         manifest = {
             "residual_method": residual_method,
             "weights": copy.deepcopy(weights),
+            "energy": {
+                "enabled": bool(energy_enabled),
+                "lambda": float(energy_weight),
+                "scale_floor": float(energy_cfg.get("scale_floor", 1.0)),
+            },
+            "reformulation": ({
+                "enabled": True,
+                "config": copy.deepcopy(reformulation_cfg),
+                "measured_floors": copy.deepcopy(constraint_floors),
+                "tolerances": copy.deepcopy(constraint_controller.tolerances),
+                "controller_state": constraint_controller.state_dict(),
+                "ad_exclusion": [float(exclusion[0]), float(exclusion[1])],
+            } if constraint_controller is not None else {"enabled": False}),
             "t_ref": float(t_ref),
             "q_ref": float(q_ref),
             "mu_global": mu,
             "sigma_global": sigma,
             "training_problem_sampling": {
-                "forcing": "online_all_families",
-                "contact_resistance": "online_uniform",
+                "forcing": (
+                    f"fixed_probe:{fixed_probe_case}"
+                    if fixed_train_param is not None else (
+                        "fixed_probe_cycle:" + ",".join(fixed_probe_cases)
+                        if fixed_probe_cases is not None else "online_all_families"
+                    )
+                ),
+                "contact_resistance": (
+                    "fixed_probe"
+                    if fixed_train_param is not None or fixed_probe_cases is not None
+                    else "online_uniform"
+                ),
                 "R_c_range": list(FORCING_RC_RANGE),
                 "initial_condition_K": float(physics["T_right"]),
             },
@@ -5590,14 +7107,36 @@ def run_one_seed_forcing_interface_pino(
             "best_validation_metrics": copy.deepcopy(best_validation),
             "interface_forcing": copy.deepcopy(image_spec),
             "physics_manifest": manifest,
+            "gradnorm_state": (
+                gradnorm.state_dict() if gradnorm is not None else None
+            ),
+            "constraint_state": (
+                constraint_controller.state_dict()
+                if constraint_controller is not None else None
+            ),
+            "hybrid_rng_state": rngs.state_dict(),
+            "causal_stage": stage,
         }
         if is_best:
             _atomic_torch_save(last_payload, run_dir / "cvit_best_global.pt")
+        save_latest_every = int(fcfg.get("save_latest_every", 25))
+        if save_latest_every < 1:
+            raise ValueError("training.pino.forcing.save_latest_every must be >= 1")
+        if completed_updates % save_latest_every == 0:
+            _atomic_torch_save(last_payload, run_dir / "cvit_last.pt")
+        if diagnostics_enabled and (
+            completed_updates % diagnostics_every == 0 or epoch == epochs - 1
+        ):
+            write_diagnostics(epoch=epoch, completed=completed_updates)
         print(
             f"Epoch {epoch}: loss={row['loss']:.6f} "
             f"(bulk={row['loss_interior']:.6f}, interface={row['loss_interface']:.6f}, "
             f"left={row['loss_left_neumann']:.6f}, tb={row['loss_topbot']:.6f}, "
-            f"ic={row['loss_ic']:.6f})"
+            f"ic={row['loss_ic']:.6f}, energy={row['loss_energy']:.6f})"
+            + (
+                f" wD/P={multiplier_d:.3g}/{multiplier_p:.3g}"
+                if gradnorm is not None else ""
+            )
             + (
                 f" val={row['val_gnrmse'] * 100:.4f}%"
                 if do_validation else ""
@@ -6514,6 +8053,925 @@ def run_one_seed_interfaces_pino(
     return summary
 
 
+def validate_interfaces_one_step_gnrmse(
+    model: InterfaceCViT,
+    cases: list,
+    *,
+    mu: float,
+    sigma: float,
+    sigma_dT_train: float,
+    dt: float,
+    coords: torch.Tensor,
+    query_chunk: int,
+    a_ref: float,
+    right_value: float,
+    device: torch.device,
+) -> dict[str, float]:
+    """One-step operator validation: teacher-forced one-step + free rollout.
+
+    ``cases`` is a frozen list of :class:`OneStepCase` (never sampled for
+    training). Two modes per case (plan Section 5):
+
+    - teacher-forced one-step: FV-truth ``T_n -> hat T_{n+1}`` vs FV-truth
+      ``T_{n+1}`` (a diagnostic that isolates the learned one-step map from
+      rollout instability);
+    - free rollout: autoregress ``rollout_field`` from ``T_0`` over the whole
+      trajectory (the primary gate signal ``val_gnrmse``).
+
+    gnRMSE is the normalized-field RMSE (``rmse_K / sigma``); on the normalized
+    states that is exactly ``sqrt(mean (pred - truth)^2)``. The node interface
+    jump uses the FROZEN ``sigma_dT_train`` denominator so ``E_zero`` stays
+    comparable with the collapse runner. Emits per-case ``R_c`` / ``interface_x``
+    strata plus rollout-stability diagnostics (max stepwise / final-time gnRMSE,
+    rollout/teacher ratio, max ``|T|``, non-finite count).
+    """
+    from src.operators.one_step import predict_one_step_field, rollout_field
+
+    was_training = model.training
+    model.eval()
+
+    # The hard global-storage residual is only defined when the conservative
+    # storage-projection head is active; the learned/closure heads do not
+    # structurally enforce it, so it is reported as 0.0 there (plan Section 6).
+    want_storage = (
+        str(getattr(model, "jump_flux_mode", "learned"))
+        == "conservative_storage_projection"
+    )
+
+    per_case_rollout: list[float] = []
+    per_case_teacher: list[float] = []
+    per_case_rc: list[float] = []
+    per_case_ix: list[float] = []
+    per_case_max_step: list[float] = []
+    per_case_final: list[float] = []
+    jump_err_ssq = 0.0
+    jump_true_ssq = 0.0
+    jump_cnt = 0
+    max_abs_T_K = 0.0
+    nonfinite = 0
+    hard_storage_error = 0.0
+
+    with torch.no_grad():
+        for case in cases:
+            n_intervals = int(case.n_intervals)
+            if n_intervals < 1:
+                continue
+            truth = case.truth_states.to(device)              # (Nt, Nx, Ny)
+            face = int(case.geom.face_idx.reshape(-1)[0].item())
+
+            teacher_ssq = 0.0
+            teacher_cnt = 0
+            for n in range(n_intervals):
+                pred = predict_one_step_field(
+                    model,
+                    truth[n : n + 1],
+                    case.interval_images[n : n + 1],
+                    case.scalars,
+                    case.fixed_channels,
+                    coords,
+                    dt=dt,
+                    query_chunk=int(query_chunk),
+                    interface_x=case.interface_x,
+                    jump_scale=case.jump_scale,
+                    closure_geom=case.geom,
+                    q_left_integral=case.q_left_integrals[n : n + 1],
+                    resistance=case.resistance,
+                    sigma=sigma,
+                    q_ref=a_ref,
+                )
+                diff = pred - truth[n + 1 : n + 2]
+                teacher_ssq += float(diff.square().sum().cpu())
+                teacher_cnt += int(diff.numel())
+            per_case_teacher.append(math.sqrt(teacher_ssq / max(teacher_cnt, 1)))
+
+            roll_out = rollout_field(
+                model,
+                truth[0:1],
+                case.interval_images,
+                case.scalars,
+                case.fixed_channels,
+                coords,
+                dt=dt,
+                query_chunk=int(query_chunk),
+                steps=n_intervals,
+                interface_x=case.interface_x,
+                jump_scale=case.jump_scale,
+                closure_geom=case.geom,
+                q_left_integrals=case.q_left_integrals,
+                resistance=case.resistance,
+                sigma=sigma,
+                q_ref=a_ref,
+                return_storage_projection=want_storage,
+            )                                                  # (Nt, Nx, Ny)
+            if want_storage:
+                roll, _flux, _corr, implied_flux_gap = roll_out
+                gap = float(implied_flux_gap.abs().max().cpu()) / (float(a_ref) + 1e-12)
+                if math.isfinite(gap):
+                    hard_storage_error = max(hard_storage_error, gap)
+            else:
+                roll = roll_out
+            finite = bool(torch.isfinite(roll).all().item())
+            nonfinite += int((~torch.isfinite(roll)).sum().cpu())
+            roll_safe = torch.nan_to_num(roll, nan=0.0, posinf=0.0, neginf=0.0)
+            diff = roll_safe - truth
+            e_k = diff.reshape(diff.shape[0], -1).square().mean(dim=1).sqrt()
+            per_case_rollout.append(float(e_k.square().mean().sqrt().cpu()))
+            per_case_max_step.append(float(e_k[1:].max().cpu()) if n_intervals >= 1 else 0.0)
+            per_case_final.append(float(e_k[-1].cpu()))
+            per_case_rc.append(float(case.resistance))
+            per_case_ix.append(float(case.interface_x.reshape(-1)[0].cpu()))
+
+            T_K = roll_safe * float(sigma) + float(mu)
+            max_abs_T_K = max(max_abs_T_K, float(T_K.abs().max().cpu()) if finite else float("inf"))
+
+            dT_pred = (roll_safe[:, face] - roll_safe[:, face + 1]) * float(sigma)
+            dT_true = (truth[:, face] - truth[:, face + 1]) * float(sigma)
+            jump_err_ssq += float((dT_pred - dT_true).square().sum().cpu())
+            jump_true_ssq += float(dT_true.square().sum().cpu())
+            jump_cnt += int(dT_true.numel())
+
+    model.train(was_training)
+
+    roll_arr = np.asarray(per_case_rollout, dtype=np.float64)
+    teacher_arr = np.asarray(per_case_teacher, dtype=np.float64)
+    rc_arr = np.asarray(per_case_rc, dtype=np.float64)
+    ix_arr = np.asarray(per_case_ix, dtype=np.float64)
+    denom = float(sigma_dT_train) + 1e-12
+    node_jump_rmse_K = math.sqrt(jump_err_ssq / max(jump_cnt, 1))
+    val_gnrmse = float(roll_arr.mean()) if roll_arr.size else float("nan")
+    val_gnrmse_teacher = float(teacher_arr.mean()) if teacher_arr.size else float("nan")
+
+    out: dict[str, float] = {
+        "val_gnrmse": val_gnrmse,
+        "val_gnrmse_rollout": val_gnrmse,
+        "val_gnrmse_teacher": val_gnrmse_teacher,
+        "val_rmse_K": val_gnrmse * float(sigma),
+        "val_rmse_K_teacher": val_gnrmse_teacher * float(sigma),
+        "node_jump_rmse_K": node_jump_rmse_K,
+        "E_model": node_jump_rmse_K / denom,
+        "E_zero": math.sqrt(jump_true_ssq / max(jump_cnt, 1)) / denom,
+        "rollout_max_stepwise_gnrmse": (
+            float(np.mean(per_case_max_step)) if per_case_max_step else float("nan")
+        ),
+        "rollout_final_gnrmse": (
+            float(np.mean(per_case_final)) if per_case_final else float("nan")
+        ),
+        "rollout_teacher_ratio": (
+            val_gnrmse / (val_gnrmse_teacher + 1e-12)
+            if math.isfinite(val_gnrmse_teacher) else float("inf")
+        ),
+        "rollout_max_abs_T_K": max_abs_T_K,
+        "rollout_nonfinite": float(nonfinite),
+        "hard_global_storage_error": float(hard_storage_error),
+    }
+    for tag, arr in (("Rc", rc_arr), ("ix", ix_arr)):
+        if arr.size >= 3:
+            q1, q2 = np.quantile(arr, [1.0 / 3.0, 2.0 / 3.0])
+            strata = {
+                "low": arr <= q1,
+                "mid": (arr > q1) & (arr <= q2),
+                "high": arr > q2,
+            }
+            for name, mask in strata.items():
+                out[f"gnrmse_{tag}_{name}"] = (
+                    float(roll_arr[mask].mean()) if mask.any() else float("nan")
+                )
+    return out
+
+
+def _through_origin_slope(true_vals: np.ndarray, pred_vals: np.ndarray) -> float:
+    """Least-squares slope of ``pred`` on ``true`` forced through the origin.
+
+    ``s = sum(true * pred) / sum(true^2)`` (plan Section 6). Differencing paired
+    probes removes the shared 300 K baseline before this call, so a through-origin
+    fit is the response of the prediction to the true increment. Returns ``nan``
+    when the true signal is degenerate (``sum(true^2)`` ~ 0), which the gate
+    treats as ineligible.
+    """
+    t = np.asarray(true_vals, dtype=np.float64).reshape(-1)
+    p = np.asarray(pred_vals, dtype=np.float64).reshape(-1)
+    denom = float(np.dot(t, t))
+    if not math.isfinite(denom) or denom <= 1e-30:
+        return float("nan")
+    return float(np.dot(t, p) / denom)
+
+
+def interfaces_one_step_response_slopes(
+    model: InterfaceCViT,
+    probe_pairs: list,
+    *,
+    dt: float,
+    coords: torch.Tensor,
+    query_chunk: int,
+    a_ref: float,
+    sigma: float,
+    device: torch.device,
+) -> dict[str, float]:
+    """Paired-amplitude forcing / jump response slopes (anti-collapse probe).
+
+    Each element of ``probe_pairs`` is a ``(case_lo, case_hi)`` tuple built from
+    the SAME descriptor (identical IC, ``interface_x``, ``R_c``) but two forcing
+    amplitudes. Both one-step predictions are conditioned on the SHARED initial
+    state ``T_0`` so the 300 K baseline cancels in the difference (plan Section
+    6):
+
+    - ``forcing_response_slope``: through-origin slope of
+      ``dT_pred = pred_hi - pred_lo`` against ``dT_true = truth_hi[1] -
+      truth_lo[1]`` over the whole field.
+    - ``jump_response_slope``: through-origin slope of the interface node jump
+      ``T[face] - T[face+1]`` of the same paired differences, plus the jump RMSE
+      (K), correlation, and correct-sign fraction.
+
+    A constant-field (collapsed) operator yields ``dT_pred ~ 0`` and hence a
+    slope near zero, which the gate rejects.
+    """
+    from src.operators.one_step import predict_one_step_field
+
+    was_training = model.training
+    model.eval()
+
+    field_true: list[np.ndarray] = []
+    field_pred: list[np.ndarray] = []
+    jump_true: list[np.ndarray] = []
+    jump_pred: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for case_lo, case_hi in probe_pairs:
+            if int(case_lo.n_intervals) < 1 or int(case_hi.n_intervals) < 1:
+                continue
+            face = int(case_lo.geom.face_idx.reshape(-1)[0].item())
+            state0 = case_lo.truth_states[0:1].to(device)
+
+            def _predict(case):
+                return predict_one_step_field(
+                    model,
+                    state0,
+                    case.interval_images[0:1],
+                    case.scalars,
+                    case.fixed_channels,
+                    coords,
+                    dt=dt,
+                    query_chunk=int(query_chunk),
+                    interface_x=case.interface_x,
+                    jump_scale=case.jump_scale,
+                    closure_geom=case.geom,
+                    q_left_integral=case.q_left_integrals[0:1],
+                    resistance=case.resistance,
+                    sigma=sigma,
+                    q_ref=a_ref,
+                )
+
+            pred_lo = _predict(case_lo)[0]
+            pred_hi = _predict(case_hi)[0]
+            dpred = (pred_hi - pred_lo) * float(sigma)
+            dtrue = (
+                case_hi.truth_states[1].to(device)
+                - case_lo.truth_states[1].to(device)
+            ) * float(sigma)
+
+            field_true.append(dtrue.reshape(-1).cpu().numpy())
+            field_pred.append(dpred.reshape(-1).cpu().numpy())
+            jump_true.append(
+                (dtrue[face] - dtrue[face + 1]).reshape(-1).cpu().numpy()
+            )
+            jump_pred.append(
+                (dpred[face] - dpred[face + 1]).reshape(-1).cpu().numpy()
+            )
+
+    model.train(was_training)
+
+    if not field_true:
+        return {
+            "forcing_response_slope": float("nan"),
+            "jump_response_slope": float("nan"),
+            "jump_rmse_K": float("nan"),
+            "jump_correlation": float("nan"),
+            "jump_sign_fraction": float("nan"),
+        }
+
+    ft = np.concatenate(field_true)
+    fp = np.concatenate(field_pred)
+    jt = np.concatenate(jump_true)
+    jp = np.concatenate(jump_pred)
+
+    jump_rmse_K = float(np.sqrt(np.mean((jp - jt) ** 2)))
+    if jt.size >= 2 and np.std(jt) > 1e-12 and np.std(jp) > 1e-12:
+        jump_corr = float(np.corrcoef(jt, jp)[0, 1])
+    else:
+        jump_corr = float("nan")
+    active = np.abs(jt) > 1e-9
+    if active.any():
+        sign_frac = float(np.mean(np.sign(jt[active]) == np.sign(jp[active])))
+    else:
+        sign_frac = float("nan")
+
+    return {
+        "forcing_response_slope": _through_origin_slope(ft, fp),
+        "jump_response_slope": _through_origin_slope(jt, jp),
+        "jump_rmse_K": jump_rmse_K,
+        "jump_correlation": jump_corr,
+        "jump_sign_fraction": sign_frac,
+    }
+
+
+def anti_collapse_eligible(
+    metrics: dict[str, float],
+    *,
+    forcing_slope_min: float,
+    jump_slope_min: float,
+    max_abs_T_K: float | None = None,
+    hard_storage_tol: float | None = None,
+    require_finite: bool = True,
+) -> bool:
+    """Anti-collapse checkpoint eligibility gate (plan Section 6).
+
+    A checkpoint is eligible only if it shows live transport and stays
+    numerically sane. ``None`` thresholds skip that condition (e.g.
+    ``max_abs_temperature_K: null``). The response-slope minima reject the 300 K
+    constant-field collapse; the interface-flux / contact-law diagnostics are NOT
+    gate conditions for the initial screen.
+    """
+    slope_f = float(metrics.get("forcing_response_slope", float("nan")))
+    slope_j = float(metrics.get("jump_response_slope", float("nan")))
+    if not (math.isfinite(slope_f) and slope_f >= float(forcing_slope_min)):
+        return False
+    if not (math.isfinite(slope_j) and slope_j >= float(jump_slope_min)):
+        return False
+    if require_finite:
+        if float(metrics.get("rollout_nonfinite", 0.0)) > 0.0:
+            return False
+        if not math.isfinite(float(metrics.get("val_gnrmse", float("nan")))):
+            return False
+    if max_abs_T_K is not None:
+        max_T = float(metrics.get("rollout_max_abs_T_K", float("inf")))
+        if not (math.isfinite(max_T) and max_T <= float(max_abs_T_K)):
+            return False
+    if hard_storage_tol is not None:
+        err = float(metrics.get("hard_global_storage_error", float("inf")))
+        if not (math.isfinite(err) and err <= float(hard_storage_tol)):
+            return False
+    return True
+
+
+def run_one_seed_interfaces_one_step_pino(
+    config: dict, seed: int, run_dir: Path
+) -> dict[str, Any]:
+    """Physics-only one-step Markov training of an :class:`InterfaceCViT`.
+
+    Maps ``(T_n, interval forcing, R_c, interface_x) -> T_{n+1}`` under a
+    variational or preconditioned-defect CN objective (never using ``T_{n+1}``
+    as a supervised label). Each update draws ``n_cases`` distinct online
+    descriptors from a continuously-refreshed :class:`OneStepStatePool`, solves
+    the FV manifold once per descriptor, conditions on a detached on-manifold
+    ``T_n``, and averages the per-case gradients (single ``zero_grad`` /
+    ``optimizer.step``; each ``loss_c`` pre-divided by ``n_cases``). Validation
+    is :func:`validate_interfaces_one_step_gnrmse` with free-rollout gnRMSE as
+    the primary scalar gate (plan Sections 4-6).
+    """
+    from src.operators.one_step import (
+        OneStepStatePool,
+        predict_one_step_field,
+        prepare_interfaces_one_step_case,
+    )
+    from src.physics.one_step_objective import one_step_objective
+
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    resume_requested = bool(
+        (((config.get("training", {}) or {}).get("pino", {}) or {})
+         .get("one_step", {}) or {}).get("resume", False)
+    )
+    resume_path = run_dir / "resume_state.pt"
+    resuming = resume_requested and resume_path.exists()
+    stale_artifacts = [
+        run_dir / name for name in (
+            "train_metrics.csv", "cvit_best_global.pt", "cvit_last.pt",
+            "final_metrics.json",
+        )
+        if (run_dir / name).exists()
+    ]
+    if not resuming and stale_artifacts:
+        raise FileExistsError(
+            "InterfaceCViT one-step runs require a fresh experiment name; found "
+            + ", ".join(str(path) for path in stale_artifacts)
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    device = resolve_device(config["training"].get("device", "auto"))
+    data = load_diffusion_data(config)
+    mu, sigma = data["mu_global"], data["sigma_global"]
+    x_grid_np = np.asarray(data["x_grid"], dtype=np.float64)
+    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
+    t_grid_np = np.asarray(data["t_grid"], dtype=np.float64)
+    Nx, Ny = int(x_grid_np.shape[0]), int(y_grid_np.shape[0])
+    Nq = Nx * Ny
+    t_final = float(t_grid_np[-1])
+
+    pino = config["training"]["pino"]
+    os_cfg = dict(pino.get("one_step", {}) or {})
+    fcfg = pino.get("forcing", {}) or {}
+    a_ref = float(fcfg.get("a_ref") if fcfg.get("a_ref") is not None else A_REF_FLUX)
+    if a_ref <= 0.0:
+        raise ValueError(f"training.pino.forcing.a_ref must be > 0; got {a_ref}.")
+    ny_img = int(fcfg.get("ny_img") or 96)
+    nt_img = int(fcfg.get("nt_img") or 256)
+
+    ramp_cfg = fcfg.get("ramp_seconds", None)
+    if ramp_cfg is not None:
+        t_ramp = float(ramp_cfg)
+    else:
+        t_ramp = load_ramp_seconds(config["data"]["t_grid_path"])
+        if t_ramp is None:
+            _dt0 = load_solver_dt(config["data"]["t_grid_path"])
+            t_ramp = default_ramp_seconds(_dt0 if _dt0 is not None else t_final / 100.0)
+
+    dt_cfg = pino.get("dt", None)
+    if dt_cfg is not None:
+        dt = float(dt_cfg)
+    else:
+        dt = load_solver_dt(config["data"]["t_grid_path"])
+        if dt is None:
+            dt = t_final / max(len(t_grid_np) - 1, 1)
+
+    # One-step temporal contract (plan Section 0): one model step == one CN step.
+    step_stride = int(os_cfg.get("step_stride", 1))
+    if step_stride != 1:
+        raise ValueError(
+            "training.pino.one_step.step_stride must be 1 for this experiment "
+            "(one model step == one FV CN step); a coarse saved-output interval "
+            f"is not a single CN interval. Got {step_stride}."
+        )
+
+    kind = str(os_cfg.get("objective", "variational"))
+    if kind not in ("variational", "defect"):
+        raise ValueError(
+            f"training.pino.one_step.objective must be 'variational' or 'defect'; "
+            f"got {kind!r}."
+        )
+    defect_sweeps = int(os_cfg.get("defect_sweeps", 1))
+    defect_omega = float(os_cfg.get("defect_omega", 2.0 / 3.0))
+    n_cases = int(os_cfg.get("n_cases", 8))
+    pool_size = int(os_cfg.get("state_pool_size", 128))
+    replace_per_update = int(os_cfg.get("state_pool_replace_per_update", 2))
+    max_uses_per_case = int(os_cfg.get("max_uses_per_case", 8))
+    time_mixture = dict(os_cfg.get("time_mixture", {}) or {
+        "uniform": 0.5, "active_forcing": 0.25, "high_change": 0.25
+    })
+    updates = int(os_cfg.get("updates", int(config["training"].get("epochs", 8000))))
+    validate_every = int(os_cfg.get("validate_every", config["training"].get("validate_every", 500)))
+    fast_validation_cases = int(os_cfg.get("fast_validation_cases", 16))
+    chunk_r = int(pino.get("chunk_r", 0)) or Nq
+
+    # Anti-collapse checkpoint gate (plan Section 6). The response-slope minima
+    # reject the 300 K constant-field collapse; ``None`` thresholds skip that
+    # condition. ``keep_top_k_eligible`` best eligible checkpoints are retained
+    # for the deterministic full-development selection procedure.
+    ac_cfg = dict(os_cfg.get("anti_collapse", {}) or {})
+    rollout_cfg = dict(os_cfg.get("rollout", {}) or {})
+    forcing_slope_min = float(ac_cfg.get("forcing_response_slope_min", 0.25))
+    jump_slope_min = float(ac_cfg.get("jump_response_slope_min", 0.10))
+    hard_storage_tol = ac_cfg.get("hard_global_storage_tol", 1.0e-6)
+    hard_storage_tol = None if hard_storage_tol is None else float(hard_storage_tol)
+    max_abs_T_K_gate = rollout_cfg.get("max_abs_temperature_K", None)
+    max_abs_T_K_gate = None if max_abs_T_K_gate is None else float(max_abs_T_K_gate)
+    require_finite_gate = bool(rollout_cfg.get("require_finite", True))
+    keep_top_k_eligible = int(os_cfg.get("keep_top_k_eligible", 5))
+    n_probe_pairs = int(os_cfg.get("probe_pairs", 8))
+    probe_amp_ratio = float(os_cfg.get("probe_amp_ratio", 0.5))
+
+    model = build_cvit(
+        config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final,
+        variant="interfaces",
+    ).to(device)
+    # Encoder guard (plan Section 10): the one-step run MUST use the current 2D
+    # forcing-image InterfaceCViT, never the legacy waveform-token encoder. Check
+    # the model + forcing-encoder class, the (Ny_img, Nt_img) image grid, and the
+    # derived patch-token count (384 for the 96x256/patch-8 production encoder).
+    forcing_encoder = getattr(model, "forcing_encoder", None)
+    if not isinstance(model, InterfaceCViT) or not isinstance(
+        forcing_encoder, CViTEncoder
+    ):
+        raise ValueError(
+            "one-step run requires the 2D forcing-image InterfaceCViT with a "
+            f"CViTEncoder forcing branch; got model={type(model).__name__} "
+            f"forcing_encoder={type(forcing_encoder).__name__}."
+        )
+    if tuple(getattr(model, "forcing_grid_size", ())) != (ny_img, nt_img):
+        raise ValueError(
+            "one-step run requires the 2D forcing-image InterfaceCViT with "
+            f"forcing_grid_size=({ny_img}, {nt_img}); got "
+            f"{getattr(model, 'forcing_grid_size', None)}."
+        )
+    forcing_patch_size = int(getattr(model, "forcing_patch_size", 0))
+    expected_forcing_tokens = (
+        (ny_img // forcing_patch_size) * (nt_img // forcing_patch_size)
+        if forcing_patch_size > 0 else -1
+    )
+    num_forcing_tokens = int(getattr(model, "num_forcing_tokens", -1))
+    if num_forcing_tokens != expected_forcing_tokens:
+        raise ValueError(
+            "one-step forcing-image patch-token count mismatch: expected "
+            f"{expected_forcing_tokens} for forcing_grid_size=({ny_img}, "
+            f"{nt_img}) patch={forcing_patch_size}; got {num_forcing_tokens}."
+        )
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+
+    t_right_tilde = float((T_RIGHT - mu) / (sigma + 1e-8))
+
+    online_spec = problem_from_config(config)
+    gxm, gym = np.meshgrid(x_grid_np, y_grid_np, indexing="ij")
+    online_grids = {"X": gxm, "Y": gym, "x_grid": x_grid_np, "y_grid": y_grid_np}
+    online_time_cfg = {
+        "dt": dt, "t_final": t_final, "b": 1.0, "T_right": float(T_RIGHT),
+        "t_on": float(fcfg.get("t_on", 0.0)),
+        "t_off": float(fcfg.get("t_off", 0.2)),
+        "phase": float(fcfg.get("phase", 0.0)),
+        "tukey_alpha": float(fcfg.get("tukey_alpha", 0.5)),
+    }
+
+    base_kwargs = {
+        "a": float(x_grid_np[0]), "b": float(x_grid_np[-1]),
+        "c": float(y_grid_np[0]), "d": float(y_grid_np[-1]),
+        "Nx": Nx, "Ny": Ny, "lam_target": 0.8,
+        "t_final": t_final, "flux_f": 0.0, "flux_A": 0.0,
+        "t_on": online_time_cfg["t_on"], "t_off": online_time_cfg["t_off"],
+        "phase": online_time_cfg["phase"], "tukey_alpha": online_time_cfg["tukey_alpha"],
+        "dt": dt, "y_grid": y_grid_np, "ramp_seconds": t_ramp,
+    }
+
+    def solver_factory(params: dict):
+        return online_spec.configure_solver(params, base_kwargs)
+
+    def build_case_from_params(key: int, params: dict):
+        # Deterministic case build from a stored descriptor. This is the resume
+        # ``rebuild_fn`` (plan Section 9): FV trajectories are regenerated from
+        # the descriptor, never serialized into the checkpoint.
+        return prepare_interfaces_one_step_case(
+            key, params, solver_factory,
+            x_grid=x_grid_np, y_grid=y_grid_np, mu=mu, sigma=sigma,
+            t_ramp=t_ramp, q_ref=a_ref, k_left=K_LEFT, k_right=K_RIGHT,
+            ny_image=ny_img, image_time_points=nt_img,
+            right_value=t_right_tilde, device=device,
+        )
+
+    def make_case(key: int, sampler_rng: np.random.Generator):
+        params = online_spec.sample_online_params(
+            sampler_rng, 1, online_grids, online_time_cfg,
+        )[0]
+        return build_case_from_params(key, params)
+
+    pool_rng = np.random.default_rng(seed + 101)
+    pool = OneStepStatePool(
+        lambda key: make_case(key, pool_rng),
+        pool_size=pool_size, n_cases=n_cases,
+        replace_per_update=replace_per_update,
+        max_uses_per_case=max_uses_per_case,
+        time_mixture=time_mixture, rng=np.random.default_rng(seed + 202),
+    )
+
+    # Frozen validation cases (never sampled for training; plan Section 6).
+    val_rng = np.random.default_rng(seed + 777)
+    val_cases = [make_case(-1 - i, val_rng) for i in range(fast_validation_cases)]
+
+    def make_probe_pair(key: int, sampler_rng: np.random.Generator):
+        """Paired-amplitude probe: two cases sharing one descriptor / IC.
+
+        The base descriptor is drawn once, then the sin forcing amplitude ``A``
+        is scaled by ``probe_amp_ratio`` for the low probe and left at the
+        sampled value for the high probe. Everything else (IC, ``interface_x``,
+        ``R_c``, spatial profile) is identical, so differencing the two one-step
+        predictions isolates the forcing / jump response (plan Section 6).
+        """
+        base = online_spec.sample_online_params(
+            sampler_rng, 1, online_grids, online_time_cfg,
+        )[0]
+        a_high = float(base["temporal_params"]["A"])
+        pair = []
+        for tag, amp in (("lo", probe_amp_ratio * a_high), ("hi", a_high)):
+            params = copy.deepcopy(base)
+            params["temporal_params"] = dict(params["temporal_params"])
+            params["temporal_params"]["A"] = float(amp)
+            pair.append(prepare_interfaces_one_step_case(
+                (key * 2) + (0 if tag == "lo" else 1), params, solver_factory,
+                x_grid=x_grid_np, y_grid=y_grid_np, mu=mu, sigma=sigma,
+                t_ramp=t_ramp, q_ref=a_ref, k_left=K_LEFT, k_right=K_RIGHT,
+                ny_image=ny_img, image_time_points=nt_img,
+                right_value=t_right_tilde, device=device,
+            ))
+        return (pair[0], pair[1])
+
+    # Frozen anti-collapse probe pairs (never sampled for training).
+    probe_rng = np.random.default_rng(seed + 909)
+    probe_pairs = [
+        make_probe_pair(-1000 - i, probe_rng) for i in range(n_probe_pairs)
+    ]
+
+    x_grid_t = torch.as_tensor(x_grid_np, dtype=torch.float32, device=device)
+    y_grid_t = torch.as_tensor(y_grid_np, dtype=torch.float32, device=device)
+    gx, gy = torch.meshgrid(x_grid_t, y_grid_t, indexing="ij")
+    coords = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
+
+    sim_batch_ids = np.asarray(data["train_ids"])
+    sp_path = Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy"
+    sim_params = np.load(str(sp_path), allow_pickle=True)
+    sigma_dT_train = _compute_train_jump_scale(data, sim_params, sim_batch_ids)
+
+    metrics_path = run_dir / "train_metrics.csv"
+    fieldnames = [
+        "update", "completed_updates", "loss", "energy", "defect_rms",
+        "val_gnrmse", "val_gnrmse_rollout", "val_gnrmse_teacher",
+        "val_rmse_K", "val_rmse_K_teacher",
+        "node_jump_rmse_K", "E_model", "E_zero",
+        "gnrmse_Rc_low", "gnrmse_Rc_mid", "gnrmse_Rc_high",
+        "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
+        "rollout_max_stepwise_gnrmse", "rollout_final_gnrmse",
+        "rollout_teacher_ratio", "rollout_max_abs_T_K", "rollout_nonfinite",
+        "hard_global_storage_error",
+        "forcing_response_slope", "jump_response_slope",
+        "jump_rmse_K", "jump_correlation", "jump_sign_fraction",
+        "anti_collapse_eligible",
+        "pool_distinct_keys", "pool_size", "pool_mean_uses", "pool_max_age",
+    ]
+    if not resuming:
+        with open(metrics_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
+
+    print(
+        f"[pino-interfaces-one-step] seed={seed} device={device} "
+        f"updates={updates} validate_every={validate_every} | grid={Nx}x{Ny} "
+        f"t_final={t_final:.4f} dt={dt:.4g} t_ramp={t_ramp:.4g} "
+        f"forcing_image={ny_img}x{nt_img} a_ref={a_ref} | objective={kind} "
+        f"n_cases={n_cases} pool={pool_size}(replace={replace_per_update},"
+        f"max_uses={max_uses_per_case}) | k=({K_LEFT},{K_RIGHT}) "
+        f"sigma_dT_train={sigma_dT_train:.4g} jump_flux={getattr(model, 'jump_flux_mode', 'learned')}",
+        flush=True,
+    )
+
+    image_spec = {
+        "representation": "space_time_image",
+        "version": 1,
+        "forcing_schema_version": FORCING_SCHEMA_VERSION,
+        "ny_img": ny_img, "nt_img": nt_img,
+        "a_ref": a_ref, "fv_dt": float(dt),
+        "ramp": {"version": RAMP_SCHEMA_VERSION, "duration": float(t_ramp)},
+        "spatial_grid_size": [Nx, Ny],
+        "one_step": {"objective": kind, "step_stride": step_stride},
+        # Concrete encoder class + architecture version (plan Section 10) so the
+        # SLURM preflight and any resumed checkpoint can reject a run that was not
+        # produced by the current 2D forcing-image InterfaceCViT.
+        "architecture": {
+            "version": ONE_STEP_ARCH_VERSION,
+            "model_class": type(model).__name__,
+            "forcing_encoder_class": type(model.forcing_encoder).__name__,
+            "forcing_grid_size": [ny_img, nt_img],
+            "forcing_patch_size": forcing_patch_size,
+            "num_forcing_tokens": num_forcing_tokens,
+        },
+    }
+    with open(run_dir / "architecture.json", "w") as f:
+        json.dump(image_spec["architecture"], f, indent=2, sort_keys=True)
+
+    best_eligible = float("inf")
+    best_ungated = float("inf")
+    any_eligible = False
+    eligible_dir = run_dir / "eligible"
+    eligible_top: list[dict[str, Any]] = []  # top-k eligible: val_gnrmse ascending
+    completed_updates = 0
+    start_update = 0
+
+    def save_resume_state(next_update: int) -> None:
+        # Exact-resume snapshot (plan Section 9). Heavy FV trajectories are NOT
+        # serialized; only descriptors are stored and regenerated on resume via
+        # ``build_case_from_params``. Everything needed to continue the online
+        # stream identically is captured: model/optimizer/scheduler, the pool
+        # (selection rng + per-case descriptors/uses/ages/intervals), the pool
+        # factory rng, and the global torch/numpy/python rng states.
+        _atomic_torch_save(
+            {
+                "completed_updates": completed_updates,
+                "next_update": int(next_update),
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "pool_state": pool.state_dict(),
+                "pool_factory_rng": pool_rng.bit_generator.state,
+                "torch_rng": torch.get_rng_state(),
+                "numpy_rng": np.random.get_state(),
+                "python_rng": random.getstate(),
+                "best_eligible": best_eligible,
+                "best_ungated": best_ungated,
+                "any_eligible": any_eligible,
+                "eligible_top": eligible_top,
+                "objective": kind,
+            },
+            resume_path,
+        )
+
+    if resuming:
+        rs = torch.load(resume_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(rs["model_state"])
+        optimizer.load_state_dict(rs["optimizer_state"])
+        scheduler.load_state_dict(rs["scheduler_state"])
+        pool.load_state_dict(rs["pool_state"], build_case_from_params)
+        pool_rng.bit_generator.state = rs["pool_factory_rng"]
+        torch.set_rng_state(rs["torch_rng"])
+        np.random.set_state(rs["numpy_rng"])
+        random.setstate(rs["python_rng"])
+        best_eligible = float(rs["best_eligible"])
+        best_ungated = float(rs["best_ungated"])
+        any_eligible = bool(rs["any_eligible"])
+        eligible_top = list(rs["eligible_top"])
+        completed_updates = int(rs["completed_updates"])
+        start_update = int(rs["next_update"])
+        print(
+            f"[pino-interfaces-one-step] RESUME start_update={start_update} "
+            f"completed_updates={completed_updates}",
+            flush=True,
+        )
+
+    for update in range(start_update, updates):
+        model.train()
+        pool.refresh()
+        selection = pool.select()
+        optimizer.zero_grad(set_to_none=True)
+        loss_sum = 0.0
+        energy_sum = 0.0
+        defect_sum = 0.0
+        for case, step in selection:
+            state_n = case.truth_states[step : step + 1].to(device)
+            pred = predict_one_step_field(
+                model, state_n,
+                case.interval_images[step : step + 1],
+                case.scalars, case.fixed_channels, coords,
+                dt=dt, query_chunk=chunk_r,
+                interface_x=case.interface_x, jump_scale=case.jump_scale,
+                closure_geom=case.geom,
+                q_left_integral=case.q_left_integrals[step : step + 1],
+                resistance=case.resistance, sigma=sigma, q_ref=a_ref,
+            )
+            cn_step = {**case.cn, "forcing": case.cn["forcing"][step : step + 1]}
+            loss_c, m = one_step_objective(
+                kind, pred, state_n.detach(), cn_step,
+                right_value=t_right_tilde,
+                defect_sweeps=defect_sweeps, defect_omega=defect_omega,
+            )
+            (loss_c / n_cases).backward()
+            loss_sum += float(loss_c.detach().cpu()) / n_cases
+            energy_sum += float(m["energy"].cpu()) / n_cases
+            defect_sum += float(m["defect_rms"].cpu()) / n_cases
+        if not math.isfinite(loss_sum):
+            raise FloatingPointError(
+                f"Non-finite one-step objective at update {update}"
+            )
+        optimizer.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        completed_updates += 1
+
+        row: dict[str, Any] = {
+            "update": update,
+            "completed_updates": completed_updates,
+            "loss": loss_sum,
+            "energy": energy_sum,
+            "defect_rms": defect_sum,
+            **pool.diversity_stats(),
+        }
+
+        do_val = (update % validate_every == 0) or (update == updates - 1)
+        if do_val:
+            val = validate_interfaces_one_step_gnrmse(
+                model, val_cases,
+                mu=mu, sigma=sigma, sigma_dT_train=sigma_dT_train,
+                dt=dt, coords=coords, query_chunk=chunk_r,
+                a_ref=a_ref, right_value=t_right_tilde, device=device,
+            )
+            slopes = interfaces_one_step_response_slopes(
+                model, probe_pairs,
+                dt=dt, coords=coords, query_chunk=chunk_r,
+                a_ref=a_ref, sigma=sigma, device=device,
+            )
+            val.update(slopes)
+            eligible = anti_collapse_eligible(
+                val,
+                forcing_slope_min=forcing_slope_min,
+                jump_slope_min=jump_slope_min,
+                max_abs_T_K=max_abs_T_K_gate,
+                hard_storage_tol=hard_storage_tol,
+                require_finite=require_finite_gate,
+            )
+            for key in (
+                "val_gnrmse", "val_gnrmse_rollout", "val_gnrmse_teacher",
+                "val_rmse_K", "val_rmse_K_teacher",
+                "node_jump_rmse_K", "E_model", "E_zero",
+                "gnrmse_Rc_low", "gnrmse_Rc_mid", "gnrmse_Rc_high",
+                "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
+                "rollout_max_stepwise_gnrmse", "rollout_final_gnrmse",
+                "rollout_teacher_ratio", "rollout_max_abs_T_K",
+                "rollout_nonfinite", "hard_global_storage_error",
+                "forcing_response_slope", "jump_response_slope",
+                "jump_rmse_K", "jump_correlation", "jump_sign_fraction",
+            ):
+                row[key] = val.get(key, "")
+            row["anti_collapse_eligible"] = int(eligible)
+
+            ckpt = {
+                "model_state": model.state_dict(),
+                "mu_global": mu, "sigma_global": sigma,
+                "config": config, "update": update,
+                "best_val_gnrmse": val["val_gnrmse"],
+                "anti_collapse_eligible": bool(eligible),
+                "forcing_response_slope": val["forcing_response_slope"],
+                "jump_response_slope": val["jump_response_slope"],
+                "hard_global_storage_error": val["hard_global_storage_error"],
+                "sigma_dT_train": sigma_dT_train,
+                "interface_forcing": copy.deepcopy(image_spec),
+            }
+            v = float(val["val_gnrmse"])
+            saved_best = False
+            if eligible and math.isfinite(v):
+                # Eligible checkpoints take over cvit_best_global.pt; the top-k
+                # eligible pool feeds the deterministic selection (plan Section 6).
+                if v < best_eligible:
+                    best_eligible = v
+                    _atomic_torch_save(ckpt, run_dir / "cvit_best_global.pt")
+                    saved_best = True
+                any_eligible = True
+                if keep_top_k_eligible > 0:
+                    eligible_dir.mkdir(parents=True, exist_ok=True)
+                    ckpt_path = eligible_dir / f"ckpt_u{update:07d}.pt"
+                    _atomic_torch_save(ckpt, ckpt_path)
+                    eligible_top.append(
+                        {"val_gnrmse": v, "update": int(update),
+                         "path": str(ckpt_path),
+                         "forcing_response_slope": float(val["forcing_response_slope"]),
+                         "jump_response_slope": float(val["jump_response_slope"]),
+                         "jump_rmse_K": float(val["jump_rmse_K"]),
+                         "rollout_final_gnrmse": float(val["rollout_final_gnrmse"])}
+                    )
+                    eligible_top.sort(key=lambda r: r["val_gnrmse"])
+                    for stale in eligible_top[keep_top_k_eligible:]:
+                        Path(stale["path"]).unlink(missing_ok=True)
+                    eligible_top = eligible_top[:keep_top_k_eligible]
+            elif (not any_eligible) and math.isfinite(v) and v < best_ungated:
+                # Fallback while nothing has passed the gate: keep the best raw
+                # gnRMSE so a resumable checkpoint always exists.
+                best_ungated = v
+                _atomic_torch_save(ckpt, run_dir / "cvit_best_global.pt")
+                saved_best = True
+            print(
+                f"Update {update}: loss={loss_sum:.6e} energy={energy_sum:.6e} "
+                f"defect_rms={defect_sum:.6e} | "
+                f"val_gnrmse={val['val_gnrmse'] * 100:.4f}% "
+                f"teacher={val['val_gnrmse_teacher'] * 100:.4f}% "
+                f"final={val['rollout_final_gnrmse'] * 100:.4f}% "
+                f"fslope={val['forcing_response_slope']:.3f} "
+                f"jslope={val['jump_response_slope']:.3f} "
+                f"storage={val['hard_global_storage_error']:.2e} "
+                f"elig={int(eligible)}"
+                + ("  [best]" if saved_best else ""),
+                flush=True,
+            )
+        else:
+            print(
+                f"Update {update}: loss={loss_sum:.6e} energy={energy_sum:.6e} "
+                f"defect_rms={defect_sum:.6e}",
+                flush=True,
+            )
+
+        with open(metrics_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerow(row)
+
+        if do_val:
+            save_resume_state(update + 1)
+
+    save_resume_state(updates)
+    _atomic_torch_save(
+        {
+            "model_state": model.state_dict(),
+            "mu_global": mu, "sigma_global": sigma,
+            "config": config, "update": updates - 1,
+            "sigma_dT_train": sigma_dT_train,
+            "interface_forcing": copy.deepcopy(image_spec),
+        },
+        run_dir / "cvit_last.pt",
+    )
+
+    summary = {
+        "seed": seed,
+        "best_val_gnrmse": best_eligible if any_eligible else best_ungated,
+        "best_eligible_val_gnrmse": best_eligible if any_eligible else None,
+        "best_ungated_val_gnrmse": best_ungated,
+        "any_eligible": bool(any_eligible),
+        "eligible_top_k": eligible_top,
+        "sigma_dT_train": sigma_dT_train,
+        "updates": updates,
+        "objective": kind,
+    }
+    with open(run_dir / "final_metrics.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+
 def run_config_seeds_pino(
     config: dict, base_run_dir: Path, seeds: list[int]
 ) -> dict[str, Any]:
@@ -6538,9 +8996,24 @@ def run_config_seeds_pino(
                 f"'forcing_ic' but the config declares {declared!r}. An old "
                 "ForcingCViT ('forcing') config would ignore the sampled IC."
             )
+    pino_cfg = (config.get("training", {}).get("pino", {}) or {})
+    interfaces_mode = str(pino_cfg.get("mode", "collapse"))
+    if bench == "interfaces" and interfaces_mode not in ("collapse", "one_step"):
+        raise ValueError(
+            "benchmark=interfaces training.pino.mode must be 'collapse' "
+            f"(full-trajectory decoder) or 'one_step' but got {interfaces_mode!r}."
+        )
+    if bench == "interfaces":
+        interfaces_runner = (
+            run_one_seed_interfaces_one_step_pino
+            if interfaces_mode == "one_step"
+            else run_one_seed_interfaces_pino
+        )
+    else:
+        interfaces_runner = run_one_seed_interfaces_pino
     runner = (
         run_one_seed_forcing_interface_pino if bench == "forcing"
-        else run_one_seed_interfaces_pino if bench == "interfaces"
+        else interfaces_runner if bench == "interfaces"
         else run_one_seed_forcing_ic_pino if bench == "diffusion_forcing_single"
         else run_one_seed_forcing_pino if bench == "diffusion_forcing"
         else run_one_seed_pino
@@ -6548,6 +9021,8 @@ def run_config_seeds_pino(
     results = {}
     for seed in seeds:
         seed_dir = base_run_dir / f"seed{seed}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(OmegaConf.create(config), seed_dir / "config_used.yaml")
         results[str(seed)] = runner(config, int(seed), seed_dir)
     return {"run_dir": str(base_run_dir), "seeds": results}
 
@@ -6579,5 +9054,7 @@ __all__ = [
     "run_one_seed_forcing_pino",
     "run_one_seed_forcing_ic_pino",
     "run_one_seed_interfaces_pino",
+    "run_one_seed_interfaces_one_step_pino",
+    "validate_interfaces_one_step_gnrmse",
     "run_config_seeds_pino",
 ]

@@ -1322,14 +1322,15 @@ class GradNormBalancer:
 
         params = [p for p in params if p.requires_grad]
         device = params[0].device if params else torch.device("cpu")
-        sq_norms = torch.zeros(len(names), dtype=torch.float64, device=device)
+        norm_dtype = torch.float32 if device.type == "mps" else torch.float64
+        sq_norms = torch.zeros(len(names), dtype=norm_dtype, device=device)
         held = [False] * len(names)
         for i, name in enumerate(names):
             sq = self._grad_norm(raw_terms[name], params)
             if sq is None:
                 held[i] = True  # disconnected -> hold
             else:
-                sq_norms[i] = sq.to(torch.float64)
+                sq_norms[i] = sq.to(norm_dtype)
         if dist_info is not None and getattr(dist_info, "is_distributed", False):
             # gloo has no AVG; SUM then divide by world_size for a mean sq-norm.
             dist.all_reduce(sq_norms, op=dist.ReduceOp.SUM)

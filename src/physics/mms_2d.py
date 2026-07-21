@@ -9,6 +9,23 @@ Three test cases:
 
 import numpy as np
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+from src.physics.fv_residual import _quadratic_trace_weights
+
+
+def run_interface_trace_reconstruction_mms(N: int) -> tuple[float, float]:
+    """Quadratic one-sided interface trace derivative on a smooth cubic field."""
+    if N % 2 != 0 or N < 8:
+        raise ValueError("interface trace MMS requires an even N >= 8")
+    x = np.linspace(0.0, 1.0, N)
+    h = float(x[1] - x[0])
+    face = N // 2 - 1
+    interface_x = 0.5 * (x[face] + x[face + 1])
+    errors = []
+    for nodes in (x[face - 2:face + 1], x[face + 1:face + 4]):
+        _, derivative_weights = _quadratic_trace_weights(nodes, interface_x)
+        reconstructed = float(derivative_weights @ (nodes ** 3))
+        errors.append(abs(reconstructed - 3.0 * interface_x ** 2))
+    return h, max(errors)
 
 # ==============================================================
 # 1. y-independent MMS (identical physics to mms_1d.run_mms_once)

@@ -352,6 +352,25 @@ class CViTDecoder(nn.Module):
         return self.head(queries)                 # (B, Nq, out_dim)
 
 
+def moving_interface_jump_enrichment(
+    smooth: torch.Tensor,
+    coords: torch.Tensor,
+    interface_flux_normalized: torch.Tensor,
+    interface_x: torch.Tensor,
+    jump_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Add a moving Heaviside jump while leaving the right subdomain untouched."""
+    batch_size = smooth.shape[0]
+    interface = torch.as_tensor(
+        interface_x, device=smooth.device, dtype=smooth.dtype
+    ).reshape(batch_size, 1, 1)
+    scale = torch.as_tensor(
+        jump_scale, device=smooth.device, dtype=smooth.dtype
+    ).reshape(batch_size, 1, 1)
+    left = (coords[..., 0:1] < interface).to(smooth.dtype)
+    return smooth + left * scale * interface_flux_normalized
+
+
 # --------- full model ---------
 
 class CViT(nn.Module):
@@ -627,10 +646,32 @@ class InterfaceCViT(nn.Module):
         n_param_scalars: int = 2,
         num_param_tokens: int = 1,
         param_hidden: int = 128,
+        jump_enrichment: bool = False,
+        jump_flux_depth: int = 1,
+        jump_flux_conditioning: str = "all",
+        jump_flux_mode: str = "learned",
     ):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
         self.hard_right_dirichlet = bool(hard_right_dirichlet)
+        self.jump_enrichment = bool(jump_enrichment)
+        self.jump_flux_conditioning = str(jump_flux_conditioning)
+        if self.jump_flux_conditioning not in {"all", "state_param"}:
+            raise ValueError(
+                "jump_flux_conditioning must be 'all' or 'state_param'"
+            )
+        self.jump_flux_mode = str(jump_flux_mode)
+        if self.jump_flux_mode not in {
+            "learned",
+            "left_energy_closure",
+            "two_sided_energy_closure",
+            "conservative_storage_projection",
+        }:
+            raise ValueError(
+                "jump_flux_mode must be 'learned', 'left_energy_closure', or "
+                "'two_sided_energy_closure', or "
+                "'conservative_storage_projection'"
+            )
         if int(forcing_in_ch) != 1 or int(n_param_scalars) != 2:
             raise ValueError(
                 "InterfaceCViT requires one forcing-image channel and exactly "
@@ -667,6 +708,7 @@ class InterfaceCViT(nn.Module):
             mlp_ratio=mlp_ratio,
             activation=activation,
         )
+        self.num_spatial_tokens = int(self.spatial_encoder.pos_emb.shape[1])
         self.forcing_encoder = CViTEncoder(
             in_ch=int(forcing_in_ch),
             emb_dim=emb_dim,
@@ -698,6 +740,21 @@ class InterfaceCViT(nn.Module):
             fourier_freq_t=fourier_freq_t,
             activation=activation,
         )
+        if self.jump_enrichment and self.jump_flux_mode == "learned":
+            self.interface_flux_decoder = CViTDecoder(
+                enc_emb_dim=emb_dim,
+                dec_emb_dim=dec_emb_dim,
+                out_dim=1,
+                depth=int(jump_flux_depth),
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                fourier_freq=fourier_freq,
+                fourier_freq_t=fourier_freq_t,
+                activation=activation,
+            )
+            last = self.interface_flux_decoder.head.net[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
         self.register_buffer(
             "t_right_tilde", torch.tensor(float(t_right_tilde), dtype=torch.float32)
         )
@@ -772,6 +829,52 @@ class InterfaceCViT(nn.Module):
             return raw
         x = coords[..., 0:1]
         return self.t_right_tilde + (1.0 - x) * raw
+
+    def decode_interface_flux(
+        self, latent: torch.Tensor, y: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        """Query the auxiliary interface flux ``q_Gamma/q_ref`` along ``y``."""
+        if not self.jump_enrichment or self.jump_flux_mode != "learned":
+            raise RuntimeError("interface flux decoder is disabled")
+        batch_size = latent.shape[0]
+        if y.shape[0] == 1 and batch_size > 1:
+            y = y.expand(batch_size, -1, -1)
+        if t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size, -1, -1)
+        flux_coords = torch.cat((torch.zeros_like(y), y), dim=-1)
+        flux_latent = latent
+        if self.jump_flux_conditioning == "state_param":
+            forcing_stop = self.num_spatial_tokens + self.num_forcing_tokens
+            flux_latent = torch.cat(
+                (latent[:, : self.num_spatial_tokens], latent[:, forcing_stop:]),
+                dim=1,
+            )
+        return self.interface_flux_decoder(
+            flux_latent, flux_coords, t / self.t_norm
+        )
+
+    def decode_enriched(
+        self,
+        latent: torch.Tensor,
+        coords: torch.Tensor,
+        t: torch.Tensor,
+        interface_x: torch.Tensor,
+        jump_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return enriched temperature and its aligned ``q_Gamma/q_ref`` field."""
+        if not self.jump_enrichment or self.jump_flux_mode != "learned":
+            raise RuntimeError("jump enrichment is disabled")
+        batch_size = latent.shape[0]
+        if coords.shape[0] == 1 and batch_size > 1:
+            coords = coords.expand(batch_size, -1, -1)
+        if t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size, -1, -1)
+        smooth = self.decode(latent, coords, t)
+        flux = self.decode_interface_flux(latent, coords[..., 1:2], t)
+        enriched = moving_interface_jump_enrichment(
+            smooth, coords, flux, interface_x, jump_scale
+        )
+        return enriched, flux
 
     def forward(
         self,

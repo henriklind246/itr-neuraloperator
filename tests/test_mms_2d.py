@@ -1,6 +1,9 @@
+import math
+
 import pytest
 
 from src.physics.mms_2d import (
+    run_interface_trace_reconstruction_mms,
     near_node_interface_x_I,
     patch_source_neumann_residual,
     run_mms_2d_interface,
@@ -21,6 +24,13 @@ from src.physics.mms_2d import (
     time_order_test_2d_yflux,
     time_order_test_x_linear,
 )
+
+
+def test_interface_trace_reconstruction_is_second_order():
+    coarse_h, coarse_error = run_interface_trace_reconstruction_mms(20)
+    fine_h, fine_error = run_interface_trace_reconstruction_mms(40)
+    order = math.log(coarse_error / fine_error) / math.log(coarse_h / fine_h)
+    assert order > 1.9
 
 
 pytestmark = pytest.mark.slow

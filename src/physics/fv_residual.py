@@ -693,6 +693,18 @@ def _gather_x(tensor: torch.Tensor, columns: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _quadratic_trace_weights(
+    nodes: np.ndarray, x_eval: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    nodes = np.asarray(nodes, dtype=np.float64)
+    vandermonde = np.stack((np.ones(3), nodes, nodes ** 2), axis=1)
+    inverse = np.linalg.inv(vandermonde)
+    return (
+        np.array([1.0, x_eval, x_eval ** 2]) @ inverse,
+        np.array([0.0, 1.0, 2.0 * x_eval]) @ inverse,
+    )
+
+
 def interface_residual_rate(
     T_n: torch.Tensor, T_np1: torch.Tensor, geom: FVGeom,
 ) -> torch.Tensor:
@@ -757,6 +769,227 @@ def interface_residual_rate(
         (T_np1[:, 1:3, :] - T_n[:, 1:3, :]) / dt
         - (_local_laplacian(T_np1) + _local_laplacian(T_n)) / dt
     )
+
+
+def block_energy_residual(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom: FVGeom,
+    qL_int: torch.Tensor,
+    *,
+    x_blocks_per_layer: int,
+    y_blocks: int,
+    q_ref: float,
+    scale_floor: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Dimensionless conservative balances on deterministic rectangular blocks.
+
+    The block numerators are sums of the solver's existing per-cell CN balance,
+    converted back to physical energy. Internal face contributions therefore
+    telescope exactly. The algebraic right-Dirichlet node is excluded from the
+    energy cells; the face from ``Nx-2`` to that node is the discrete heat sink.
+    """
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    if T_n.shape != T_np1.shape or T_n.shape[-2:] != (geom.Nx, geom.Ny):
+        raise ValueError("block energy fields must have shape (B,Nx,Ny)")
+    if x_blocks_per_layer < 1 or y_blocks < 1:
+        raise ValueError("block counts must be positive")
+    if not np.isfinite(q_ref) or float(q_ref) <= 0.0:
+        raise ValueError("q_ref must be finite and positive")
+    if not np.isfinite(scale_floor) or float(scale_floor) <= 0.0:
+        raise ValueError("scale_floor must be finite and positive")
+
+    batch_size, Nx, Ny = T_n.shape
+    face_idx = _interface_face_indices(geom, batch_size)
+    if not bool((face_idx == face_idx[0]).all().item()):
+        raise ValueError("block energy currently requires one shared interface face")
+    face = int(face_idx[0].item())
+    left_cells = np.arange(0, face + 1, dtype=np.int64)
+    right_cells = np.arange(face + 1, Nx - 1, dtype=np.int64)
+    if min(left_cells.size, right_cells.size) < x_blocks_per_layer:
+        raise ValueError("too many x blocks for the available material cells")
+    if Ny < y_blocks:
+        raise ValueError("too many y blocks for the available rows")
+    x_parts = [
+        *np.array_split(left_cells, x_blocks_per_layer),
+        *np.array_split(right_cells, x_blocks_per_layer),
+    ]
+    y_parts = np.array_split(np.arange(Ny, dtype=np.int64), y_blocks)
+
+    balance = (
+        (T_np1 - T_n)
+        - (_cn_laplacian_full(T_np1, geom) + _cn_laplacian_full(T_n, geom))
+    )
+    rho_cp_left = geom.rho_cp[0, :]
+    left_denom = rho_cp_left[None, :] * float(geom.hx) * float(geom.sigma_global)
+    forcing_increment = 2.0 * qL_int.to(balance) / left_denom
+    balance[:, 0, :] = balance[:, 0, :] - forcing_increment
+
+    dx = geom.dx.to(balance)
+    if dx.dim() == 1:
+        dx = dx.unsqueeze(0).expand(batch_size, -1)
+    rho_cp = geom.rho_cp.to(balance)
+    if rho_cp.dim() == 2:
+        rho_cp = rho_cp.unsqueeze(0).expand(batch_size, -1, -1)
+    dy = geom.dy.to(balance)
+    capacity = rho_cp * dx[:, :, None] * dy[None, None, :]
+    physical_cell_residual = (
+        capacity * float(geom.sigma_global) * balance
+    )
+
+    residuals = []
+    numerators = []
+    denominators = []
+    interface_mask = []
+    block_x = []
+    block_y = []
+    for x_block, x_ids_np in enumerate(x_parts):
+        x_ids = torch.as_tensor(x_ids_np, device=balance.device, dtype=torch.long)
+        touches_left_wall = int(x_ids_np[0]) == 0
+        touches_interface = (
+            x_block == x_blocks_per_layer - 1
+            or x_block == x_blocks_per_layer
+        )
+        for y_block, y_ids_np in enumerate(y_parts):
+            y_ids = torch.as_tensor(y_ids_np, device=balance.device, dtype=torch.long)
+            numerator = physical_cell_residual.index_select(1, x_ids).index_select(
+                2, y_ids
+            ).sum(dim=(1, 2))
+            block_height = dy.index_select(0, y_ids).sum()
+            prescribed = (
+                (qL_int.to(balance).index_select(1, y_ids)
+                 * dy.index_select(0, y_ids)[None, :]).sum(dim=1).abs()
+                if touches_left_wall else torch.zeros_like(numerator)
+            )
+            characteristic = (
+                float(q_ref) * float(geom.dt) * block_height * float(scale_floor)
+            )
+            denominator = (prescribed + characteristic).clamp_min(1.0e-12)
+            residuals.append(numerator / denominator)
+            numerators.append(numerator)
+            denominators.append(denominator)
+            interface_mask.append(touches_interface)
+            block_x.append(x_block)
+            block_y.append(y_block)
+    residual = torch.stack(residuals, dim=1)
+    mask = torch.as_tensor(interface_mask, device=residual.device, dtype=torch.bool)
+    return {
+        "all": residual,
+        "numerator": torch.stack(numerators, dim=1),
+        "denominator": torch.stack(denominators, dim=1),
+        "interface": residual[:, mask],
+        "far": residual[:, ~mask],
+        "interface_mask": mask,
+        "block_x": torch.as_tensor(block_x, device=residual.device),
+        "block_y": torch.as_tensor(block_y, device=residual.device),
+    }
+
+
+def interface_trace_constraint_residuals(
+    T_n: torch.Tensor,
+    T_np1: torch.Tensor,
+    geom: FVGeom,
+    x_grid,
+    R_c,
+    *,
+    k_left: float,
+    k_right: float,
+    sigma_global: float,
+    q_ref: float,
+    jump_floor_K: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """One-sided quadratic interface flux and contact-law residuals."""
+    if T_n.dim() == 2:
+        T_n = T_n[None]
+        T_np1 = T_np1[None]
+    if T_n.shape != T_np1.shape or T_n.shape[-2:] != (geom.Nx, geom.Ny):
+        raise ValueError("interface trace fields must have shape (B,Nx,Ny)")
+    if min(k_left, k_right, sigma_global, q_ref, jump_floor_K) <= 0.0:
+        raise ValueError("interface trace scales and conductivities must be positive")
+    batch_size, _, Ny = T_n.shape
+    x = np.asarray(x_grid, dtype=np.float64)
+    face_idx = _interface_face_indices(geom, batch_size)
+    rc = torch.as_tensor(R_c, device=T_n.device, dtype=T_n.dtype).reshape(-1)
+    if rc.numel() == 1 and batch_size > 1:
+        rc = rc.expand(batch_size)
+    if rc.numel() != batch_size:
+        raise ValueError("R_c batch does not match the temperature batch")
+
+    value_left = []
+    deriv_left = []
+    value_right = []
+    deriv_right = []
+    for b in range(batch_size):
+        face = int(face_idx[b].item())
+        h_left = float(geom.dx[b, face].item() if geom.dx.dim() == 2 else geom.dx[face].item()) - 0.5 * float(geom.hx)
+        interface_x = float(x[face] + h_left)
+        lv, ld = _quadratic_trace_weights(x[face - 2:face + 1], interface_x)
+        rv, rd = _quadratic_trace_weights(x[face + 1:face + 4], interface_x)
+        value_left.append(lv)
+        deriv_left.append(ld)
+        value_right.append(rv)
+        deriv_right.append(rd)
+    weights = [
+        torch.as_tensor(np.asarray(values), device=T_n.device, dtype=T_n.dtype)
+        for values in (value_left, deriv_left, value_right, deriv_right)
+    ]
+    value_left_t, deriv_left_t, value_right_t, deriv_right_t = weights
+
+    endpoint_flux = []
+    endpoint_contact = []
+    raw = []
+    for field in (T_n, T_np1):
+        left_nodes = []
+        right_nodes = []
+        series_left = []
+        series_right = []
+        conductance = []
+        for b in range(batch_size):
+            face = int(face_idx[b].item())
+            left_nodes.append(field[b, face - 2:face + 1])
+            right_nodes.append(field[b, face + 1:face + 4])
+            series_left.append(field[b, face])
+            series_right.append(field[b, face + 1])
+            conductance.append(geom.G_x[b, face] if geom.G_x.dim() == 3 else geom.G_x[face])
+        left_nodes_t = torch.stack(left_nodes)
+        right_nodes_t = torch.stack(right_nodes)
+        T_minus = float(sigma_global) * torch.einsum(
+            "bi,bij->bj", value_left_t, left_nodes_t
+        )
+        T_plus = float(sigma_global) * torch.einsum(
+            "bi,bij->bj", value_right_t, right_nodes_t
+        )
+        q_minus = -float(k_left) * float(sigma_global) * torch.einsum(
+            "bi,bij->bj", deriv_left_t, left_nodes_t
+        )
+        q_plus = -float(k_right) * float(sigma_global) * torch.einsum(
+            "bi,bij->bj", deriv_right_t, right_nodes_t
+        )
+        g_face = torch.stack(conductance)
+        q_series = g_face * float(sigma_global) * (
+            torch.stack(series_left) - torch.stack(series_right)
+        )
+        endpoint_flux.append(torch.stack(
+            ((q_minus - q_series) / float(q_ref),
+             (q_plus - q_series) / float(q_ref)), dim=1,
+        ))
+        jump_scale = torch.maximum(
+            rc * float(q_ref), torch.full_like(rc, float(jump_floor_K))
+        )
+        endpoint_contact.append(
+            (T_minus - T_plus - rc[:, None] * q_series) / jump_scale[:, None]
+        )
+        raw.append((q_minus, q_plus, q_series, T_minus - T_plus))
+    return {
+        "flux": torch.stack(endpoint_flux, dim=1),
+        "contact": torch.stack(endpoint_contact, dim=1),
+        "q_minus": torch.stack([value[0] for value in raw], dim=1),
+        "q_plus": torch.stack([value[1] for value in raw], dim=1),
+        "q_series": torch.stack([value[2] for value in raw], dim=1),
+        "jump_K": torch.stack([value[3] for value in raw], dim=1),
+    }
 
 
 def full_bc_cn_residual_rate(

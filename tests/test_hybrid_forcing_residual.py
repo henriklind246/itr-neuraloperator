@@ -8,7 +8,9 @@ import torch
 from data.dataset import split_sim_ids
 from src.operators.losses import region_balanced_fv_rate_loss
 import src.operators.train_pino as train_pino_module
+from scripts.diagnose_supervised_overfit import _forcing_supervised_metrics
 from src.operators.train_pino import (
+    ForcingConstraintController,
     load_interface_cvit_checkpoint,
     run_config_seeds_pino,
     run_one_seed_forcing_interface_pino,
@@ -17,16 +19,21 @@ from src.operators.cvit import InterfaceCViT
 from src.operators.train_pino import (
     HybridForcingRNGs,
     _decode_derivatives,
+    _forcing_diagnostic_gradient_metrics,
     _forcing_layered_batch_losses,
+    _forcing_probe_metrics,
     _sample_online_layered_forcing_params,
     _sample_hybrid_bulk,
+    _sample_lattice_intervals,
 )
 from src.physics.fv_residual import (
     FullBCData,
+    block_energy_residual,
     build_cn_geom_per_interface,
     full_bc_cn_residual,
     full_bc_cn_residual_rate,
     interface_residual_rate,
+    interface_trace_constraint_residuals,
     region_balanced_fv_rate_residual,
 )
 
@@ -246,6 +253,77 @@ def test_piecewise_linear_contact_solution_zeroes_all_interface_rows():
     assert float(rate.abs().max()) < 1e-12
 
 
+def test_block_energy_constant_field_exposes_exact_prescribed_injection():
+    _, _, _, geom = _geometry(batch=1, sigma=5.0)
+    zeros = torch.zeros(1, 8, 8, dtype=torch.float64)
+    qint = torch.full((1, 8), 0.05 * 2.0, dtype=torch.float64)
+    blocks = block_energy_residual(
+        zeros, zeros, geom, qint,
+        x_blocks_per_layer=2, y_blocks=2, q_ref=3.0,
+    )
+    assert blocks["all"].shape == (1, 8)
+    assert blocks["interface"].shape == (1, 4)
+    assert blocks["far"].shape == (1, 4)
+    assert float(blocks["all"].abs().max()) > 0.0
+    assert torch.count_nonzero(blocks["numerator"]) == 2
+    expected_injection = -(qint * geom.dy[None]).sum()
+    assert blocks["numerator"].sum() == pytest.approx(float(expected_injection))
+
+
+def test_block_energy_zero_flux_constant_field_is_exact_and_partitions_blocks():
+    _, _, _, geom = _geometry(batch=1, sigma=5.0)
+    zeros = torch.zeros(1, 8, 8, dtype=torch.float64)
+    blocks = block_energy_residual(
+        zeros, zeros, geom, torch.zeros(1, 8, dtype=torch.float64),
+        x_blocks_per_layer=2, y_blocks=2, q_ref=3.0,
+    )
+    assert torch.equal(blocks["all"], torch.zeros_like(blocks["all"]))
+    assert int(blocks["interface_mask"].sum()) == 4
+    assert sorted(set(blocks["block_x"].tolist())) == [0, 1, 2, 3]
+    assert sorted(set(blocks["block_y"].tolist())) == [0, 1]
+
+
+def test_quadratic_interface_constraints_accept_piecewise_linear_contact_field():
+    x, _, interface, geom = _geometry(batch=1, sigma=5.0)
+    heat_flux = 1.7
+    resistance = 0.2
+    right_trace = 301.0
+    left_trace = right_trace + resistance * heat_flux
+    physical = np.where(
+        x[:, None] < interface,
+        left_trace + heat_flux * (interface - x[:, None]) / 2.0,
+        right_trace + heat_flux * (interface - x[:, None]),
+    )
+    physical = np.broadcast_to(physical, (8, 8)).copy()
+    normalized = torch.from_numpy((physical - 300.0) / 5.0).to(torch.float64)[None]
+    residuals = interface_trace_constraint_residuals(
+        normalized, normalized, geom, x, [resistance],
+        k_left=2.0, k_right=1.0, sigma_global=5.0, q_ref=3.0,
+    )
+    assert float(residuals["flux"].abs().max()) < 1e-11
+    assert float(residuals["contact"].abs().max()) < 1e-11
+    assert torch.allclose(
+        residuals["q_series"], torch.full_like(residuals["q_series"], heat_flux),
+        atol=1e-11, rtol=1e-11,
+    )
+
+
+def test_interface_constraints_detect_wrong_jump_and_reach_both_sides():
+    x, _, _, geom = _geometry(batch=1, sigma=5.0)
+    field = torch.zeros(1, 8, 8, dtype=torch.float64, requires_grad=True)
+    perturbed = field.clone()
+    perturbed[:, 3] = 0.4
+    residuals = interface_trace_constraint_residuals(
+        perturbed, perturbed, geom, x, [0.2],
+        k_left=2.0, k_right=1.0, sigma_global=5.0, q_ref=3.0,
+    )
+    loss = residuals["flux"].square().mean() + residuals["contact"].square().mean()
+    gradient = torch.autograd.grad(loss, field)[0]
+    assert float(loss) > 0.0
+    assert float(gradient[:, :4].abs().sum()) > 0.0
+    assert float(gradient[:, 4:].abs().sum()) > 0.0
+
+
 def test_backend_specific_draws_do_not_perturb_common_rng_streams():
     first = HybridForcingRNGs.create(19, torch.device("cpu"))
     second = HybridForcingRNGs.create(19, torch.device("cpu"))
@@ -393,6 +471,109 @@ class _PiecewiseSteadyModel(torch.nn.Module):
             + c[5] * right_distance.pow(3) + c[6] * time_query * right_distance
         )
         return torch.where(x < 0.5, left, right)
+
+
+def _assert_rng_state_equal(left, right):
+    if isinstance(left, torch.Tensor):
+        assert torch.equal(left, right)
+    elif isinstance(left, np.ndarray):
+        np.testing.assert_array_equal(left, right)
+    elif isinstance(left, dict):
+        assert set(left) == set(right)
+        for key in left:
+            _assert_rng_state_equal(left[key], right[key])
+    else:
+        assert left == right
+
+
+def _toy_probe_outputs(forcing_sensitive: bool):
+    pred = np.full((4, 2, 1, 1), 300.0, dtype=np.float64)
+    if forcing_sensitive:
+        pred[0, :, 0, 0] = [301.0, 302.0]
+    pred[1, :, 0, 0] = [300.5, 301.0]
+    pred[3, :, 0, 0] = [300.2, 300.4]
+    jumps = np.zeros((4, 2, 2, 1), dtype=np.float64)
+    jumps[:, :, 0, 0] = pred[:, :, 0, 0] + 0.1
+    jumps[:, :, 1, 0] = pred[:, :, 0, 0] - 0.1
+    truth0 = np.asarray([[[320.0]], [[340.0]]], dtype=np.float64)
+    truth1 = np.asarray([[[315.0]], [[330.0]]], dtype=np.float64)
+    truth3 = np.asarray([[[305.0]], [[310.0]]], dtype=np.float64)
+    truth_jump0 = np.asarray([[[321.0], [319.0]], [[342.0], [338.0]]])
+    truth_jump1 = np.asarray([[[316.0], [314.0]], [[332.0], [328.0]]])
+    truth_jump3 = np.asarray([[[306.0], [304.0]], [[312.0], [308.0]]])
+    return {
+        "sparse_prediction": pred,
+        "jump_prediction": jumps,
+        "truth_sparse": [truth0, truth1, None, truth3],
+        "truth_jump": [truth_jump0, truth_jump1, None, truth_jump3],
+        "zero_flags": np.asarray([False, False, True, False]),
+    }
+
+
+def test_fixed_probe_response_ratio_detects_forcing_sensitive_toy():
+    outputs = _toy_probe_outputs(forcing_sensitive=True)
+    metrics = _forcing_probe_metrics(
+        outputs, {"sparse_prediction": outputs["sparse_prediction"].copy()}
+    )
+    assert metrics["drift_from_init_K"] == pytest.approx(0.0)
+    assert metrics["forcing_sensitivity_K"] > 0.0
+    assert metrics["forcing_response_ratio"] > 0.0
+
+
+def test_fixed_probe_response_ratio_is_zero_for_forcing_independent_toy():
+    outputs = _toy_probe_outputs(forcing_sensitive=False)
+    metrics = _forcing_probe_metrics(outputs, None)
+    assert metrics["forcing_sensitivity_K"] == pytest.approx(0.0)
+    assert metrics["forcing_response_ratio"] == pytest.approx(0.0)
+
+
+def test_fixed_gradient_diagnostic_is_deterministic_and_isolated():
+    x = torch.linspace(0.0, 1.0, 8)
+    y = x.clone()
+    y_img = np.linspace(0.0, 1.0, 8)
+    t_img = np.linspace(0.0, 0.3, 8)
+    physics = {
+        "a": 0.0,
+        "b": 1.0,
+        "c": 0.0,
+        "d": 1.0,
+        "interface_x": 0.5,
+        "k_left": 2.0,
+        "k_right": 1.0,
+        "rho_left": 1.0,
+        "rho_right": 1.0,
+        "cp_left": 1.0,
+        "cp_right": 1.0,
+        "T_right": 300.0,
+    }
+    model = _PiecewiseSteadyModel()
+    model.train()
+    before_params = [parameter.detach().clone() for parameter in model.parameters()]
+    training_rngs = HybridForcingRNGs.create(19, torch.device("cpu"))
+    before_rng = training_rngs.state_dict()
+    kwargs = dict(
+        residual_method="hybrid", physics=physics, interface_face=3,
+        exclusion=(float(0.5 * (x[2] + x[3])), float(0.5 * (x[4] + x[5]))),
+        x_grid=x, y_grid=y, y_img=y_img, t_img=t_img, mu=300.0, sigma=100.0,
+        q_ref=300.0, t_ref=0.3, t_final=0.3, t_ramp=0.0, dt=0.05,
+        n_steps=6, intervals_per_sim=1, stratified=False, n_bins=2,
+        n_r=4, n_bc=4, n_ic=4, chunk_r=0, seed=1234,
+        weights={
+            "interior": 1.0, "interface": 1.0, "left_neumann": 1.0,
+            "topbot_adiabatic": 1.0, "ic": 1.0,
+        },
+        energy_cfg={"enabled": False},
+        gradnorm_multipliers=None,
+    )
+    first = _forcing_diagnostic_gradient_metrics(model, **kwargs)
+    second = _forcing_diagnostic_gradient_metrics(model, **kwargs)
+    assert model.training
+    for before, parameter in zip(before_params, model.parameters()):
+        assert torch.equal(before, parameter.detach())
+    _assert_rng_state_equal(before_rng, training_rngs.state_dict())
+    for key, value in first.items():
+        assert math.isfinite(value)
+        assert second[key] == pytest.approx(value)
 
 
 @pytest.mark.slow
@@ -610,6 +791,177 @@ def test_forcing_interface_runner_smoke(tmp_path, residual_method):
         )
 
 
+def test_forcing_runner_fixed_probe_diagnostics_are_written(tmp_path):
+    _write_forcing_dataset(tmp_path, num_sims=8, nt=4, nx=8, ny=8)
+    config = _forcing_config(tmp_path, "hybrid")
+    config["training"]["pino"]["diagnostics"] = {
+        "enabled": True,
+        "every_updates": 1,
+        "gradient_n_r": 4,
+        "gradient_n_bc": 4,
+        "gradient_n_ic": 4,
+        "probe_time_samples": 2,
+        "probe_x_samples": 3,
+        "probe_y_samples": 3,
+    }
+    run_dir = tmp_path / "diagnostics"
+    run_one_seed_forcing_interface_pino(config, seed=4, run_dir=run_dir)
+    assert (run_dir / "cvit_init.pt").exists()
+    with (run_dir / "diagnostics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["completed_updates"]) for row in rows] == [0, 1]
+    for name in (
+        "drift_from_init_K", "departure_from_300_K", "field_rmse_K",
+        "forcing_sensitivity_K", "forcing_response_ratio",
+        "rc_sensitivity_K", "rc_response_ratio", "pred_jump_rms_K",
+        "true_jump_rms_K", "node_jump_rmse_K",
+        "probe_loss_energy_left", "probe_loss_energy_right",
+        "probe_loss_energy_global", "probe_loss_energy",
+        "grad_norm_discriminating", "grad_norm_stiff_physics",
+        "grad_norm_homogeneous", "grad_cos_discriminating_physics",
+        "effective_gradient_share_discriminating",
+    ):
+        assert math.isfinite(float(rows[0][name])), name
+    assert float(rows[0]["drift_from_init_K"]) == pytest.approx(0.0, abs=1e-6)
+    assert float(rows[1]["drift_from_init_K"]) >= 0.0
+
+
+def test_forcing_runner_two_group_gradnorm_and_energy_are_logged(tmp_path):
+    _write_forcing_dataset(tmp_path, num_sims=8, nt=4, nx=8, ny=8)
+    config = _forcing_config(tmp_path, "hybrid")
+    config["training"]["gradnorm"] = {
+        "enabled": True, "alpha_w": 0.0, "update_every": 1,
+        "eps": 1e-8, "w_min": 0.1, "w_max": 10.0, "floor": {},
+    }
+    config["training"]["pino"]["energy"] = {
+        "enabled": True, "lambda": 1.0, "scale_floor": 1.0,
+    }
+    config["training"]["pino"]["diagnostics"] = {
+        "enabled": True,
+        "every_updates": 1,
+        "gradient_n_r": 4,
+        "gradient_n_bc": 4,
+        "gradient_n_ic": 4,
+        "probe_time_samples": 2,
+        "probe_x_samples": 3,
+        "probe_y_samples": 3,
+        "probe_query_chunk": 16,
+    }
+    run_dir = tmp_path / "energy_gradnorm"
+    run_one_seed_forcing_interface_pino(config, seed=5, run_dir=run_dir)
+    with (run_dir / "train_metrics.csv").open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    for name in (
+        "loss_energy_left", "loss_energy_right", "loss_energy_global",
+        "loss_energy", "loss_group_discriminating",
+        "loss_group_stiff_physics", "loss_group_homogeneous",
+        "gradnorm_multiplier_discriminating",
+        "gradnorm_multiplier_stiff_physics",
+    ):
+        assert math.isfinite(float(row[name])), name
+    with (run_dir / "diagnostics.csv").open(newline="") as handle:
+        diag0 = next(csv.DictReader(handle))
+    for name in (
+        "grad_norm_discriminating_weighted",
+        "grad_norm_stiff_physics_weighted",
+        "grad_ratio_discriminating_to_physics_weighted",
+        "grad_projection_on_discriminating_weighted",
+        "grad_projection_on_physics_weighted",
+        "probe_loss_energy_left", "probe_loss_energy",
+        "grad_norm_discriminating_decoder",
+        "grad_norm_stiff_physics_forcing_encoder",
+        "grad_norm_discriminating_param_encoder",
+    ):
+        assert math.isfinite(float(diag0[name])), name
+    checkpoint = torch.load(
+        run_dir / "cvit_last.pt", map_location="cpu", weights_only=False
+    )
+    assert checkpoint["gradnorm_state"]["term_names"] == [
+        "discriminating", "stiff_physics",
+    ]
+    assert checkpoint["physics_manifest"]["energy"]["enabled"] is True
+
+
+def test_forcing_runner_can_pin_fixed_probe_case(tmp_path):
+    _write_forcing_dataset(tmp_path, num_sims=8, nt=4, nx=8, ny=8)
+    config = _forcing_config(tmp_path, "hybrid")
+    config["training"]["pino"]["forcing"]["fixed_probe_case"] = "pulse_low"
+    run_dir = tmp_path / "fixed_probe"
+    run_one_seed_forcing_interface_pino(config, seed=6, run_dir=run_dir)
+    checkpoint = torch.load(
+        run_dir / "cvit_last.pt", map_location="cpu", weights_only=False
+    )
+    sampling = checkpoint["physics_manifest"]["training_problem_sampling"]
+    assert sampling["forcing"] == "fixed_probe:pulse_low"
+    assert sampling["contact_resistance"] == "fixed_probe"
+
+
+def test_compositional_fixed_probe_cases_cross_family_and_resistance():
+    pulse_mid = train_pino_module._forcing_fixed_probe_case("pulse_mid")
+    smooth_low = train_pino_module._forcing_fixed_probe_case("smooth_low")
+    smooth_high = train_pino_module._forcing_fixed_probe_case("smooth_high")
+    assert pulse_mid["temporal_family"] == "pulse_train"
+    assert pulse_mid["R_c"] == pytest.approx(0.525)
+    assert smooth_low["temporal_family"] == "sin"
+    assert smooth_low["R_c"] == pytest.approx(0.05)
+    assert smooth_high["temporal_family"] == "sin"
+    assert smooth_high["R_c"] == pytest.approx(1.0)
+
+
+def test_forcing_reformulation_runner_logs_constraints_and_checkpoints_state(tmp_path):
+    _write_forcing_dataset(tmp_path, num_sims=8, nt=4, nx=8, ny=8)
+    config = _forcing_config(tmp_path, "hybrid")
+    config["training"]["pino"]["forcing"]["fixed_probe_cases"] = [
+        "pulse_low", "pulse_high",
+    ]
+    config["training"]["pino"]["reformulation"] = {
+        "enabled": True, "x_blocks_per_layer": 2, "y_blocks": 2,
+        "scale_floor": 1.0, "jump_floor_K": 1.0,
+        "tolerance_margin": 10.0, "tolerance_min": 1.0e-8,
+        "rho": 1.0, "ema_decay": 0.0, "dual_every": 1,
+        "multiplier_cap": 1000.0, "dual_enabled": True,
+        "causal_enabled": True, "stage_fractions": [0.5, 1.0],
+        "stage_updates": [0, 1],
+    }
+    run_dir = tmp_path / "reformulation"
+    run_one_seed_forcing_interface_pino(config, seed=7, run_dir=run_dir)
+    with (run_dir / "train_metrics.csv").open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert float(row["causal_fraction"]) == pytest.approx(0.5)
+    for name in train_pino_module._FORCING_CONSTRAINT_NAMES:
+        assert math.isfinite(float(row[f"constraint_rms_{name}"]))
+        assert math.isfinite(float(row[f"constraint_violation_{name}"]))
+        assert math.isfinite(float(row[f"constraint_multiplier_{name}"]))
+    checkpoint = torch.load(
+        run_dir / "cvit_last.pt", map_location="cpu", weights_only=False
+    )
+    assert checkpoint["constraint_state"] is not None
+    assert checkpoint["hybrid_rng_state"] is not None
+    assert checkpoint["physics_manifest"]["reformulation"]["measured_floors"][
+        "left_flux"
+    ] == 0.0
+
+
+def test_forcing_supervised_metrics_distinguish_exact_jump_from_flat_field():
+    truth = np.full((3, 4, 2), 300.0)
+    truth[1:, 0] += 8.0
+    truth[1:, 1] += 6.0
+    truth[1:, 2] += 1.0
+    initialization = np.full_like(truth, 300.0)
+
+    exact = _forcing_supervised_metrics(truth, truth, initialization, 1)
+    assert exact["field_rmse_K"] == pytest.approx(0.0)
+    assert exact["node_jump_rmse_K"] == pytest.approx(0.0)
+    assert exact["jump_response_ratio"] == pytest.approx(1.0)
+    assert exact["temporal_response_ratio"] == pytest.approx(1.0)
+
+    flat = _forcing_supervised_metrics(initialization, truth, initialization, 1)
+    assert flat["field_signal_rel_l2"] == pytest.approx(1.0)
+    assert flat["pred_jump_rms_K"] == pytest.approx(0.0)
+    assert flat["node_jump_rmse_K"] == pytest.approx(flat["true_jump_rms_K"])
+    assert flat["jump_response_ratio"] == pytest.approx(0.0)
+
+
 def test_forcing_runner_rejects_dataset_solver_dt_conflict(tmp_path):
     _write_forcing_dataset(tmp_path)
     config = _forcing_config(tmp_path, "finite_volume")
@@ -649,3 +1001,57 @@ def test_forcing_benchmark_dispatches_to_layered_runner(tmp_path, monkeypatch):
     result = run_config_seeds_pino(config, tmp_path, [2, 7])
     assert calls == [(2, tmp_path / "seed2"), (7, tmp_path / "seed7")]
     assert result["seeds"] == {"2": {"seed": 2}, "7": {"seed": 7}}
+
+
+def test_forcing_constraint_dead_band_is_shared_by_primal_and_dual():
+    tolerances = {
+        name: 0.25 for name in train_pino_module._FORCING_CONSTRAINT_NAMES
+    }
+    controller = ForcingConstraintController(
+        tolerances, rho=2.0, ema_decay=0.0, dual_every=1,
+    )
+    feasible = {
+        name: torch.full((4,), 0.2, requires_grad=True)
+        for name in tolerances
+    }
+    _, violation = controller.values(feasible)
+    assert all(float(value) == 0.0 for value in violation.values())
+    assert float(controller.primal(violation)) == 0.0
+    controller.update(violation, completed=1)
+    assert all(value == 0.0 for value in controller.multipliers.values())
+
+    violated = {
+        name: torch.full((4,), 0.5, requires_grad=True)
+        for name in tolerances
+    }
+    _, violation = controller.values(violated)
+    loss = controller.primal(violation)
+    loss.backward()
+    assert all(value.grad is not None for value in violated.values())
+    controller.update(violation, completed=2)
+    assert all(value == pytest.approx(0.5) for value in controller.multipliers.values())
+
+
+def test_forcing_constraint_state_roundtrip_preserves_dual_history():
+    tolerances = {
+        name: 0.1 for name in train_pino_module._FORCING_CONSTRAINT_NAMES
+    }
+    source = ForcingConstraintController(tolerances, dual_every=1)
+    residuals = {name: torch.ones(3) for name in tolerances}
+    _, violation = source.values(residuals)
+    source.update(violation, completed=1)
+    restored = ForcingConstraintController(tolerances, dual_every=1)
+    restored.load_state_dict(source.state_dict())
+    assert restored.state_dict() == source.state_dict()
+    restored.reset_stage_history()
+    assert restored.multipliers == source.multipliers
+    assert not any(restored.ema_initialized.values())
+
+
+def test_causal_interval_sampler_never_exceeds_active_prefix():
+    sample = _sample_lattice_intervals(
+        np.random.default_rng(4), batch_size=4, intervals_per_sim=3,
+        n_steps=60, n_bins=6, stratified=True, max_start_step=5,
+    )
+    assert int(sample["start_idx"].max()) <= 5
+    assert set(sample["start_idx"].tolist()) == set(range(6))
