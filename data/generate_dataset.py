@@ -168,6 +168,7 @@ def build_base_setup(
     grids = {"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid}
     time_cfg = dict(
         num_sims=num_sims, dt=dt, t_final=t_final, lhs_seed=lhs_seed,
+        forcing_profile_seed=1,
         t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
         T_right=300.0, b=b, ic_families=ic_families,
     )
@@ -303,6 +304,16 @@ def generate_sim_data(
         setup["Nt_saved"], setup["Nx"], setup["Ny"],
     )
 
+    required_times = getattr(spec, "required_observation_times", ())
+    if required_times:
+        saved_times = np.asarray(t, dtype=np.float64)[::save_stride]
+        for requested in required_times:
+            if not np.any(np.isclose(saved_times, requested, rtol=0.0, atol=1e-10)):
+                raise ValueError(
+                    f"benchmark {benchmark!r} requires saved snapshot time "
+                    f"{requested:g}; generated schedule is {saved_times.tolist()}."
+                )
+
     # Persist the dataset-format tag + IC provenance only when the spec declares a
     # version, so the load-time guard can reject a stale fixed-IC dataset that
     # shares this benchmark's name and shapes.
@@ -334,7 +345,7 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         "--benchmark",
         type=str,
         default=os.environ.get("BENCHMARK", "forcing"),
-        help="Benchmark adapter to generate data for (forcing|interfaces|source).",
+        help="Registered benchmark adapter to generate.",
     )
     parser.add_argument("--nx", type=int, default=100, help="Number of x-direction grid nodes.")
     parser.add_argument("--ny", type=int, default=100, help="Number of y-direction grid nodes.")

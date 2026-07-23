@@ -164,6 +164,15 @@ def _write_source_itr_artifact(art_dir, sid):
     )
 
 
+def _write_forcing_itr_artifact(art_dir, sid):
+    _write_source_itr_artifact(art_dir, sid)
+    path = art_dir / f"sim_{sid:05d}.npz"
+    with np.load(path, allow_pickle=True) as stored:
+        payload = {key: stored[key] for key in stored.files}
+    payload["benchmark"] = np.str_("forcing_itr")
+    np.savez_compressed(path, **payload)
+
+
 @pytest.fixture
 def forcing_csv(tmp_path):
     path = tmp_path / "inverse_forcing.csv"
@@ -193,6 +202,22 @@ def source_itr_artifacts(tmp_path):
     d.mkdir()
     for sid in range(6):
         _write_source_itr_artifact(d, sid)
+    return d
+
+
+@pytest.fixture
+def forcing_itr_csv(tmp_path):
+    path = tmp_path / "inverse_forcing_itr.csv"
+    _write_csv(path, _source_itr_csv_columns())
+    return path
+
+
+@pytest.fixture
+def forcing_itr_artifacts(tmp_path):
+    d = tmp_path / "art_forcing_itr"
+    d.mkdir()
+    for sid in range(6):
+        _write_forcing_itr_artifact(d, sid)
     return d
 
 
@@ -246,6 +271,31 @@ def test_source_itr_four_plots_render_with_artifacts(tmp_path, source_itr_csv,
                              save_path=out / "s_uq.png")
     for p in (p1, p2, p3, p4):
         assert p.exists() and p.stat().st_size > 0
+
+
+def test_forcing_itr_four_plots_render_with_artifacts(
+    tmp_path, forcing_itr_csv, forcing_itr_artifacts
+):
+    spec = ip.spec_for("forcing_itr")
+    out = tmp_path / "forcing_itr_out"
+    paths = (
+        ip.plot_parameter_recovery(
+            forcing_itr_csv, spec, save_path=out / "parameter_recovery.png"
+        ),
+        ip.plot_identifiability(
+            forcing_itr_csv, spec, artifact_dir=forcing_itr_artifacts,
+            save_path=out / "identifiability.png",
+        ),
+        ip.plot_surrogate_fidelity(
+            forcing_itr_csv, spec, save_path=out / "surrogate_fidelity.png"
+        ),
+        ip.plot_uncertainty(
+            forcing_itr_csv, spec, artifact_dir=forcing_itr_artifacts,
+            save_path=out / "uncertainty.png",
+        ),
+    )
+    for path in paths:
+        assert path.exists() and path.stat().st_size > 0
 
 
 def test_source_itr_identifiability_falls_back_without_artifacts(tmp_path,

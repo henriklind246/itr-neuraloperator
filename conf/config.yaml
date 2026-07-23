@@ -103,6 +103,22 @@ model:
     forcing_patch_size: 8
     ic_patch_size: 10
 
+  # ---- ForcingTransitionCViT (causal varying-state transition path) ----
+  # Selected explicitly with training.pino.variant=forcing_transition. The
+  # forcing encoder consumes [q/A_ref, relative time, absolute time], while the
+  # source encoder consumes the normalized T_s field.
+  forcing_transition_cvit:
+    forcing_in_ch: 3
+    source_in_ch: 1
+    forcing_patch_size: 8
+    source_patch_size: 10
+    fourier_freq_source: 1.0
+    fourier_freq_lead: 1.0
+    query_time_conditioning: true
+    film_time_conditioning: true
+    film_init_std: 1.0e-3
+    coord_tolerance: 1.0e-6
+
   # ---- InterfaceCViT (layered-interface PINO paths) ----
   # Read by the forcing and interfaces InterfaceCViT runners.
   # These keys OVERRIDE model.cvit for the interface surrogate; anything omitted
@@ -463,6 +479,54 @@ training:
       wall_x_cut: 0.333
       lead_frac: 0.0      # fraction of n_r with t in [lead_t_lo*t_final, t_final]   (#2)
       lead_t_lo: 0.5
+    # Supervised causal transition operator. Inert unless
+    # training.pino.variant=forcing_transition.
+    transition:
+      objective: supervised  # supervised | physics_only
+      sim_batch: 16
+      n_queries: 1024
+      query_chunk: 0
+      lead_edges: [0.0, 0.05, 0.10, 0.20, 0.30]
+      source_edges: [0.0, 0.075, 0.15, 0.225, 0.30]
+      target_edges: [0.0, 0.075, 0.15, 0.225, 0.30]
+      loss_weight: 1.0
+      source_noise_std: 0.0
+      increment_signal_floor_sigma: 0.01
+      fast_val_max_sims: 64
+      fast_val_pairs_per_cell: 1
+      final_val_pairs_per_cell: 2
+      validation_batch_size: 8
+      validation_query_chunk: 2048
+      save_latest_every_updates: 25
+      extend_completed: false
+      physics:
+        gate_summary: null
+        network_gate_summary: null
+        objective: null
+        residual_method: finite_volume
+        dt: null
+        updates_per_epoch: null
+        source_state_mode: online_local_ivp
+        time_bundle: lead_bins
+        include_anchor_interval: true
+        intervals_per_cell: 1
+        consecutive_intervals:
+          enabled: false
+          probability: 0.25
+          min_length: 2
+          max_length: 4
+        production_screen:
+          enabled: true
+          updates: 2000
+          anti_collapse_every: 100
+          validate_every: 250
+          collapse_update: 500
+          minimum_skill_improvement: 0.10
+        mini_operator:
+          sources: 16
+          sources_per_ic_family: 4
+          grid_size: 20
+          updates: 4000
     # ---- Forcing PINO path (benchmark=diffusion_forcing) ----
     # Read ONLY by train_pino.run_one_seed_forcing_pino; inert for the diffusion
     # collocation path. The encoder input is the left-wall forcing space-time

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+
+
+@dataclass
+class TransitionEncoding:
+    memory_tokens: Tensor
+    forcing_context: Tensor
 
 # ---- Continuous Vision Transformer (CViT), PyTorch port ----------------------
 #
@@ -207,6 +215,66 @@ class FourierEmbed(nn.Module):
         return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
 
 
+def canonicalize_query_coords(
+    coords: Tensor,
+    *,
+    tolerance: float = 1.0e-6,
+) -> Tensor:
+    """Validate ``(x, y)`` queries on ``[0, 1]^2`` and clamp roundoff at its edges."""
+    if coords.ndim != 3 or coords.shape[-1] != 2:
+        raise ValueError(
+            "coords must have shape (B, Nq, 2) in (x, y) order; "
+            f"got {tuple(coords.shape)}."
+        )
+    if tolerance < 0.0 or not math.isfinite(float(tolerance)):
+        raise ValueError("coordinate tolerance must be finite and non-negative")
+    if not bool(torch.isfinite(coords).all().item()):
+        raise ValueError("coords must contain only finite values")
+    outside = (coords < -float(tolerance)) | (coords > 1.0 + float(tolerance))
+    if bool(outside.any().item()):
+        lo = float(coords.detach().amin().cpu())
+        hi = float(coords.detach().amax().cpu())
+        raise ValueError(
+            f"coords must lie in [0, 1] within tolerance {tolerance}; "
+            f"observed range [{lo}, {hi}]."
+        )
+    return coords.clamp(0.0, 1.0)
+
+
+def sample_source_at_queries(
+    source_field: Tensor,
+    query_coords: Tensor,
+    *,
+    tolerance: float = 1.0e-6,
+) -> tuple[Tensor, Tensor]:
+    """Bilinearly sample ``(B, 1, Nx, Ny)`` fields at continuous ``(x, y)`` queries."""
+    if source_field.ndim != 4 or source_field.shape[1] != 1:
+        raise ValueError(
+            "source_field must have shape (B, 1, Nx, Ny); "
+            f"got {tuple(source_field.shape)}."
+        )
+    coords = canonicalize_query_coords(query_coords, tolerance=tolerance)
+    if coords.shape[0] != source_field.shape[0]:
+        raise ValueError(
+            "source_field and query_coords batch dimensions must match; "
+            f"got {source_field.shape[0]} and {coords.shape[0]}."
+        )
+    # grid_sample interprets the last coordinate as (width, height). The stored
+    # field axes are (Nx, Ny), so physical (x, y) must be supplied as (y, x).
+    grid = torch.stack(
+        [2.0 * coords[..., 1] - 1.0, 2.0 * coords[..., 0] - 1.0],
+        dim=-1,
+    ).unsqueeze(2)
+    values = F.grid_sample(
+        source_field,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return values.squeeze(-1).transpose(1, 2), coords
+
+
 # --------- transformer blocks ---------
 
 class SelfAttnBlock(nn.Module):
@@ -362,6 +430,177 @@ class CViTDecoder(nn.Module):
             queries = block(queries, kv, scale=scale, shift=shift)
         queries = self.norm(queries)
         return self.head(queries)                 # (B, Nq, out_dim)
+
+
+def _batch_scalar(
+    value: Tensor,
+    *,
+    batch_size: int,
+    name: str,
+) -> Tensor:
+    tensor = torch.as_tensor(value)
+    if tensor.ndim == 0:
+        tensor = tensor.reshape(1, 1)
+    elif tensor.ndim == 1:
+        tensor = tensor.reshape(-1, 1)
+    else:
+        if tensor.shape[0] not in (1, batch_size):
+            raise ValueError(
+                f"{name} batch dimension must be 1 or {batch_size}; "
+                f"got {tuple(tensor.shape)}."
+            )
+        tensor = tensor.reshape(tensor.shape[0], -1)
+        if tensor.shape[1] != 1:
+            raise ValueError(
+                f"{name} must contain one scalar per sample; got {tuple(value.shape)}."
+            )
+    if tensor.shape[0] == 1 and batch_size > 1:
+        tensor = tensor.expand(batch_size, -1)
+    if tensor.shape[0] != batch_size:
+        raise ValueError(
+            f"{name} batch dimension must be 1 or {batch_size}; "
+            f"got {tensor.shape[0]}."
+        )
+    if not bool(torch.isfinite(tensor).all().item()):
+        raise ValueError(f"{name} must contain only finite values")
+    return tensor
+
+
+class TransitionCViTDecoder(nn.Module):
+    def __init__(
+        self,
+        enc_emb_dim: int,
+        dec_emb_dim: int,
+        forcing_context_dim: int,
+        out_dim: int,
+        depth: int,
+        num_heads: int,
+        mlp_ratio: float,
+        fourier_freq: float,
+        fourier_freq_source: float,
+        fourier_freq_lead: float,
+        activation: str,
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
+        query_time_conditioning: bool = True,
+        film_time_conditioning: bool = True,
+        film_init_std: float = 1.0e-3,
+    ):
+        super().__init__()
+        if not query_time_conditioning and not film_time_conditioning:
+            raise ValueError(
+                "At least one of query_time_conditioning or "
+                "film_time_conditioning must be enabled."
+            )
+        if film_init_std <= 0.0 or not math.isfinite(float(film_init_std)):
+            raise ValueError("film_init_std must be finite and positive")
+        self.depth = int(depth)
+        self.dec_emb_dim = int(dec_emb_dim)
+        self.query_time_conditioning = bool(query_time_conditioning)
+        self.film_time_conditioning = bool(film_time_conditioning)
+        self.fourier_x = FourierEmbed(2, dec_emb_dim, fourier_freq)
+        self.fourier_source = FourierEmbed(
+            1, dec_emb_dim, fourier_freq_source,
+        )
+        self.fourier_lead = FourierEmbed(
+            1, dec_emb_dim, fourier_freq_lead,
+        )
+        self.time_conditioner = MLP(
+            in_dim=2 + 2 * dec_emb_dim,
+            hidden_dim=dec_emb_dim,
+            out_dim=dec_emb_dim,
+            num_layers=2,
+            activation=film_activation,
+        )
+        if self.query_time_conditioning:
+            self.query_time_projection = nn.Linear(dec_emb_dim, dec_emb_dim)
+        if self.film_time_conditioning:
+            self.time_film = MLP(
+                in_dim=dec_emb_dim + forcing_context_dim,
+                hidden_dim=dec_emb_dim,
+                out_dim=depth * 2 * dec_emb_dim,
+                num_layers=film_hidden_layers + 1,
+                activation=film_activation,
+            )
+            film_head = self.time_film.net[-1]
+            if not isinstance(film_head, nn.Linear):
+                raise TypeError("time_film must end in a Linear layer")
+            nn.init.normal_(film_head.weight, mean=0.0, std=float(film_init_std))
+            nn.init.zeros_(film_head.bias)
+        self.proj_kv = nn.Linear(enc_emb_dim, dec_emb_dim)
+        self.blocks = nn.ModuleList(
+            [
+                CrossAttnBlock(
+                    dec_emb_dim, num_heads, mlp_ratio, activation,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(dec_emb_dim)
+        self.head = MLP(
+            dec_emb_dim,
+            dec_emb_dim,
+            out_dim,
+            head_hidden_layers + 1,
+            head_activation,
+        )
+
+    def forward(
+        self,
+        encoding: TransitionEncoding,
+        coords: Tensor,
+        source_time_norm: Tensor,
+        lead_time_norm: Tensor,
+    ) -> Tensor:
+        batch_size = encoding.memory_tokens.shape[0]
+        if coords.shape[0] == 1 and batch_size > 1:
+            coords = coords.expand(batch_size, -1, -1)
+        if coords.shape[0] != batch_size:
+            raise ValueError(
+                "encoding and coords batch dimensions must match; "
+                f"got {batch_size} and {coords.shape[0]}."
+            )
+        source = _batch_scalar(
+            source_time_norm, batch_size=batch_size, name="source_time",
+        ).to(device=coords.device, dtype=coords.dtype)
+        lead = _batch_scalar(
+            lead_time_norm, batch_size=batch_size, name="lead_time",
+        ).to(device=coords.device, dtype=coords.dtype)
+        time_raw = torch.stack([lead[:, 0], source[:, 0]], dim=-1).unsqueeze(1)
+        time_features = torch.cat(
+            [
+                time_raw,
+                self.fourier_lead(lead.unsqueeze(1)),
+                self.fourier_source(source.unsqueeze(1)),
+            ],
+            dim=-1,
+        )
+        time_context = self.time_conditioner(time_features)
+
+        queries = self.fourier_x(coords)
+        if self.query_time_conditioning:
+            queries = queries + self.query_time_projection(time_context)
+        kv = self.proj_kv(encoding.memory_tokens)
+        film = None
+        if self.film_time_conditioning:
+            forcing_context = encoding.forcing_context
+            if forcing_context.shape[0] != batch_size:
+                raise ValueError(
+                    "forcing_context and memory_tokens batch dimensions must match"
+                )
+            film_input = torch.cat(
+                [time_context[:, 0], forcing_context], dim=-1,
+            )
+            film = self.time_film(film_input).view(
+                batch_size, self.depth, 2, self.dec_emb_dim,
+            )
+        for index, block in enumerate(self.blocks):
+            scale = None if film is None else film[:, index, 0, :].unsqueeze(1)
+            shift = None if film is None else film[:, index, 1, :].unsqueeze(1)
+            queries = block(queries, kv, scale=scale, shift=shift)
+        return self.head(self.norm(queries))
 
 
 def moving_interface_jump_enrichment(
@@ -1347,3 +1586,274 @@ class ForcingICCViT(nn.Module):
     ) -> torch.Tensor:
         """Single-shot ``encode`` + ``decode`` (chunked callers use them directly)."""
         return self.decode(self.encode(u_forcing, u_ic), coords, t)
+
+
+class ForcingTransitionCViT(nn.Module):
+    """Causal transition operator over a source state and forcing interval."""
+
+    def __init__(
+        self,
+        forcing_in_ch: int = 3,
+        source_in_ch: int = 1,
+        out_dim: int = 1,
+        emb_dim: int = 256,
+        dec_emb_dim: int | None = None,
+        source_patch_size: int = 10,
+        source_grid_size: tuple[int, int] = (100, 100),
+        forcing_patch_size: int = 8,
+        forcing_grid_size: tuple[int, int] = (96, 128),
+        depth_enc: int = 4,
+        depth_dec: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+        fourier_freq: float = 1.0,
+        fourier_freq_source: float = 1.0,
+        fourier_freq_lead: float = 1.0,
+        activation: str = "gelu",
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
+        query_time_conditioning: bool = True,
+        film_time_conditioning: bool = True,
+        film_init_std: float = 1.0e-3,
+        coord_tolerance: float = 1.0e-6,
+        t_final: float = 1.0,
+    ):
+        super().__init__()
+        if int(forcing_in_ch) != 3:
+            raise ValueError(
+                "ForcingTransitionCViT requires three forcing channels "
+                "[q/A_ref, relative_time, absolute_time]."
+            )
+        if int(source_in_ch) != 1 or int(out_dim) != 1:
+            raise ValueError(
+                "ForcingTransitionCViT requires one source and one output channel."
+            )
+        if t_final <= 0.0 or not math.isfinite(float(t_final)):
+            raise ValueError("t_final must be finite and positive")
+        if coord_tolerance < 0.0 or not math.isfinite(float(coord_tolerance)):
+            raise ValueError("coord_tolerance must be finite and non-negative")
+
+        source_grid_size = tuple(int(value) for value in source_grid_size)
+        forcing_grid_size = tuple(int(value) for value in forcing_grid_size)
+        source_patch_size = int(source_patch_size)
+        forcing_patch_size = int(forcing_patch_size)
+        for name, grid_size, patch_size in (
+            ("source", source_grid_size, source_patch_size),
+            ("forcing", forcing_grid_size, forcing_patch_size),
+        ):
+            if (
+                len(grid_size) != 2
+                or patch_size <= 0
+                or any(value <= 0 for value in grid_size)
+            ):
+                raise ValueError(
+                    f"{name}_grid_size must contain two positive dimensions and "
+                    f"{name}_patch_size must be positive."
+                )
+            if any(value % patch_size != 0 for value in grid_size):
+                raise ValueError(
+                    f"{name}_grid_size dimensions must be divisible by "
+                    f"{name}_patch_size; got {grid_size} and {patch_size}."
+                )
+
+        dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
+        self.source_grid_size = source_grid_size
+        self.forcing_grid_size = forcing_grid_size
+        self.source_patch_size = source_patch_size
+        self.forcing_patch_size = forcing_patch_size
+        self.num_source_tokens = (
+            source_grid_size[0] // source_patch_size
+        ) * (source_grid_size[1] // source_patch_size)
+        self.num_forcing_tokens = (
+            forcing_grid_size[0] // forcing_patch_size
+        ) * (forcing_grid_size[1] // forcing_patch_size)
+        self.coord_tolerance = float(coord_tolerance)
+        self.query_time_conditioning = bool(query_time_conditioning)
+        self.film_time_conditioning = bool(film_time_conditioning)
+        self.film_init_std = float(film_init_std)
+
+        self.source_encoder = CViTEncoder(
+            in_ch=source_in_ch,
+            emb_dim=emb_dim,
+            patch_size=source_patch_size,
+            grid_size=source_grid_size,
+            depth=depth_enc,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            activation=activation,
+        )
+        self.forcing_encoder = CViTEncoder(
+            in_ch=forcing_in_ch,
+            emb_dim=emb_dim,
+            patch_size=forcing_patch_size,
+            grid_size=forcing_grid_size,
+            depth=depth_enc,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            activation=activation,
+        )
+        self.modality = nn.Parameter(torch.randn(2, emb_dim) * 0.02)
+        self.forcing_context_projection = MLP(
+            in_dim=2 * emb_dim,
+            hidden_dim=dec_emb_dim,
+            out_dim=dec_emb_dim,
+            num_layers=2,
+            activation=activation,
+        )
+        self.decoder = TransitionCViTDecoder(
+            enc_emb_dim=emb_dim,
+            dec_emb_dim=dec_emb_dim,
+            forcing_context_dim=dec_emb_dim,
+            out_dim=out_dim,
+            depth=depth_dec,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            fourier_freq=fourier_freq,
+            fourier_freq_source=fourier_freq_source,
+            fourier_freq_lead=fourier_freq_lead,
+            activation=activation,
+            film_hidden_layers=film_hidden_layers,
+            film_activation=film_activation,
+            head_hidden_layers=head_hidden_layers,
+            head_activation=head_activation,
+            query_time_conditioning=query_time_conditioning,
+            film_time_conditioning=film_time_conditioning,
+            film_init_std=film_init_std,
+        )
+        self.register_buffer(
+            "t_norm", torch.tensor(float(t_final), dtype=torch.float32),
+        )
+
+    def encode_source(self, u_source: Tensor) -> Tensor:
+        if tuple(u_source.shape[1:]) != (1, *self.source_grid_size):
+            raise ValueError(
+                "u_source must have shape (B, 1, Nx, Ny) with "
+                f"(Nx, Ny)={self.source_grid_size}; got {tuple(u_source.shape)}."
+            )
+        tokens = self.source_encoder(u_source) + self.modality[0]
+        if tokens.shape[1] != self.num_source_tokens:
+            raise RuntimeError(
+                f"Expected {self.num_source_tokens} source tokens, "
+                f"got {tokens.shape[1]}."
+            )
+        return tokens
+
+    def encode_forcing(self, u_forcing_segment: Tensor) -> Tensor:
+        if tuple(u_forcing_segment.shape[1:]) != (
+            3, *self.forcing_grid_size,
+        ):
+            raise ValueError(
+                "u_forcing_segment must have shape (B, 3, Ny_img, Nt_img) "
+                f"with (Ny_img, Nt_img)={self.forcing_grid_size}; got "
+                f"{tuple(u_forcing_segment.shape)}."
+            )
+        tokens = self.forcing_encoder(u_forcing_segment) + self.modality[1]
+        if tokens.shape[1] != self.num_forcing_tokens:
+            raise RuntimeError(
+                f"Expected {self.num_forcing_tokens} forcing tokens, "
+                f"got {tokens.shape[1]}."
+            )
+        return tokens
+
+    def fuse(
+        self,
+        source_tokens: Tensor,
+        forcing_tokens: Tensor,
+    ) -> TransitionEncoding:
+        if source_tokens.ndim != 3 or forcing_tokens.ndim != 3:
+            raise ValueError("source_tokens and forcing_tokens must be rank-three")
+        if source_tokens.shape[0] != forcing_tokens.shape[0]:
+            raise ValueError("source and forcing token batch dimensions must match")
+        if source_tokens.shape[1] != self.num_source_tokens:
+            raise ValueError(
+                f"Expected {self.num_source_tokens} source tokens, "
+                f"got {source_tokens.shape[1]}."
+            )
+        if forcing_tokens.shape[1] != self.num_forcing_tokens:
+            raise ValueError(
+                f"Expected {self.num_forcing_tokens} forcing tokens, "
+                f"got {forcing_tokens.shape[1]}."
+            )
+        forcing_summary = torch.cat(
+            [
+                forcing_tokens.mean(dim=1),
+                forcing_tokens.amax(dim=1),
+            ],
+            dim=-1,
+        )
+        return TransitionEncoding(
+            memory_tokens=torch.cat([source_tokens, forcing_tokens], dim=1),
+            forcing_context=self.forcing_context_projection(forcing_summary),
+        )
+
+    def encode(
+        self,
+        u_forcing_segment: Tensor,
+        u_source: Tensor,
+    ) -> TransitionEncoding:
+        return self.fuse(
+            self.encode_source(u_source),
+            self.encode_forcing(u_forcing_segment),
+        )
+
+    def decode(
+        self,
+        encoding: TransitionEncoding,
+        u_source: Tensor,
+        coords: Tensor,
+        source_time: Tensor,
+        lead_time: Tensor,
+    ) -> Tensor:
+        batch_size = encoding.memory_tokens.shape[0]
+        if u_source.shape[0] != batch_size:
+            raise ValueError("encoding and u_source batch dimensions must match")
+        if coords.shape[0] == 1 and batch_size > 1:
+            coords = coords.expand(batch_size, -1, -1)
+        source_values, coords = sample_source_at_queries(
+            u_source,
+            coords,
+            tolerance=self.coord_tolerance,
+        )
+        source = _batch_scalar(
+            source_time, batch_size=batch_size, name="source_time",
+        ).to(device=coords.device, dtype=coords.dtype)
+        lead = _batch_scalar(
+            lead_time, batch_size=batch_size, name="lead_time",
+        ).to(device=coords.device, dtype=coords.dtype)
+        if bool((source < 0.0).any().item()):
+            raise ValueError("source_time must be non-negative")
+        if bool((lead < 0.0).any().item()):
+            raise ValueError("lead_time must be non-negative")
+        horizon = self.t_norm.to(device=source.device, dtype=source.dtype)
+        if bool((source + lead > horizon + 1.0e-7).any().item()):
+            raise ValueError(
+                "source_time + lead_time must not exceed t_final"
+            )
+        source_norm = source / horizon
+        lead_norm = lead / horizon
+        residual = self.decoder(
+            encoding,
+            coords,
+            source_norm,
+            lead_norm,
+        )
+        x = coords[..., 0:1]
+        return source_values + (1.0 - x) * lead_norm.unsqueeze(1) * residual
+
+    def forward(
+        self,
+        u_forcing_segment: Tensor,
+        u_source: Tensor,
+        coords: Tensor,
+        source_time: Tensor,
+        lead_time: Tensor,
+    ) -> Tensor:
+        return self.decode(
+            self.encode(u_forcing_segment, u_source),
+            u_source,
+            coords,
+            source_time,
+            lead_time,
+        )

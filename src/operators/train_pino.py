@@ -47,7 +47,13 @@ from problems.interfaces import (
     normalize_interface_scalars,
 )
 from src.operators.cvit import (
-    CViT, CViTEncoder, ForcingCViT, ForcingICCViT, InterfaceCViT,
+    CViT,
+    CViTEncoder,
+    ForcingCViT,
+    ForcingICCViT,
+    ForcingTransitionCViT,
+    InterfaceCViT,
+    TransitionEncoding,
 )
 from src.operators.losses import full_bc_physics_loss, region_balanced_fv_rate_loss
 from src.operators.train import (
@@ -93,6 +99,14 @@ from src.physics.pde_residual import (
     forcing_neumann_residual,
     ic_residual,
     neumann_residual,
+)
+from src.physics.one_step_objective import (
+    build_cn_tensors_from_geom,
+    defect_terms,
+    explicit_cn_rhs,
+    implicit_cn_action,
+    one_step_objective,
+    variational_objective,
 )
 
 # ---- Continuous ViT training on the diffusion benchmark suite ----------------
@@ -1088,6 +1102,311 @@ def build_forcing_image(
     return torch.from_numpy(img).to(device)
 
 
+def build_forcing_transition_image(
+    params: list[dict],
+    y_img: np.ndarray,
+    source_time: torch.Tensor | np.ndarray,
+    lead_time: torch.Tensor | np.ndarray,
+    nt_img: int,
+    a_ref: float,
+    device: torch.device,
+    t_ramp: float,
+    t_final: float,
+) -> torch.Tensor:
+    """Render a causal, source-relative forcing interval as three image channels."""
+    if float(a_ref) <= 0.0:
+        raise ValueError(f"a_ref must be > 0; got {a_ref}.")
+    if int(nt_img) < 2:
+        raise ValueError(f"nt_img must be at least 2; got {nt_img}.")
+    if float(t_final) <= 0.0:
+        raise ValueError(f"t_final must be > 0; got {t_final}.")
+    source = np.asarray(
+        torch.as_tensor(source_time).detach().cpu(), dtype=np.float64,
+    ).reshape(-1)
+    lead = np.asarray(
+        torch.as_tensor(lead_time).detach().cpu(), dtype=np.float64,
+    ).reshape(-1)
+    if source.shape != lead.shape or source.shape[0] != len(params):
+        raise ValueError(
+            "params, source_time, and lead_time must have matching batch sizes"
+        )
+    if (
+        not np.isfinite(source).all()
+        or not np.isfinite(lead).all()
+        or np.any(source < 0.0)
+        or np.any(lead < 0.0)
+        or np.any(source + lead > float(t_final) + 1.0e-7)
+    ):
+        raise ValueError(
+            "source and lead times must be finite and satisfy "
+            "0 <= source <= source + lead <= t_final"
+        )
+
+    relative = np.linspace(0.0, 1.0, int(nt_img), dtype=np.float64)
+    y_values = np.asarray(y_img, dtype=np.float64).reshape(-1)
+    image = np.empty(
+        (len(params), 3, y_values.size, int(nt_img)), dtype=np.float32,
+    )
+    image[:, 1] = relative[None, None, :]
+    for batch_index, p in enumerate(params):
+        absolute = source[batch_index] + relative * lead[batch_index]
+        forcing = reconstruct_qL(
+            p["temporal_family"],
+            p["temporal_params"],
+            p["spatial_family"],
+            p["spatial_params"],
+            t_ramp=t_ramp,
+        )
+        image[batch_index, 0] = np.asarray(
+            forcing.evaluate_grid(y_values, absolute), dtype=np.float32,
+        ) / float(a_ref)
+        image[batch_index, 2] = (
+            absolute[None, :] / float(t_final)
+        ).astype(np.float32)
+    return torch.from_numpy(image).to(device)
+
+
+def _snap_bin_value(value: float, edges: np.ndarray, tolerance: float) -> float:
+    nearest = int(np.argmin(np.abs(edges - value)))
+    if abs(float(edges[nearest]) - value) <= tolerance:
+        return float(edges[nearest])
+    return float(value)
+
+
+def _right_closed_bin(
+    value: float,
+    edges: np.ndarray,
+    tolerance: float,
+) -> int | None:
+    value = _snap_bin_value(value, edges, tolerance)
+    index = int(np.searchsorted(edges, value, side="left") - 1)
+    return index if 0 <= index < len(edges) - 1 else None
+
+
+def _left_closed_bin(
+    value: float,
+    edges: np.ndarray,
+    tolerance: float,
+    *,
+    include_final: bool,
+) -> int | None:
+    if include_final and abs(value - float(edges[-1])) <= tolerance:
+        return len(edges) - 2
+    index = int(np.searchsorted(edges, value, side="right") - 1)
+    return index if 0 <= index < len(edges) - 1 else None
+
+
+class TransitionPairSchedule:
+    """Index-only transition strata shared by training and validation."""
+
+    def __init__(
+        self,
+        t_grid: np.ndarray,
+        n_snapshots: int | None,
+        lead_edges: list[float] | tuple[float, ...],
+        source_edges: list[float] | tuple[float, ...],
+        target_edges: list[float] | tuple[float, ...] | None = None,
+    ):
+        self.t_grid = np.asarray(t_grid, dtype=np.float64)
+        if self.t_grid.ndim != 1 or self.t_grid.size < 2:
+            raise ValueError("t_grid must be one-dimensional with at least two points")
+        if not np.all(np.diff(self.t_grid) > 0.0):
+            raise ValueError("t_grid must be strictly increasing")
+        if n_snapshots is not None and int(n_snapshots) < self.t_grid.size:
+            if int(n_snapshots) < 2:
+                raise ValueError("n_snapshots must be at least two")
+            self.snapshot_indices = np.unique(
+                np.round(
+                    np.linspace(0, self.t_grid.size - 1, int(n_snapshots))
+                ).astype(int)
+            )
+        else:
+            self.snapshot_indices = np.arange(self.t_grid.size, dtype=int)
+        self.lead_edges = self._validate_edges(lead_edges, "lead_edges")
+        self.source_edges = self._validate_edges(source_edges, "source_edges")
+        self.target_edges = self._validate_edges(
+            source_edges if target_edges is None else target_edges,
+            "target_edges",
+        )
+        self.tolerance = 0.5 * float(np.min(np.diff(self.t_grid)))
+        self.cells: dict[
+            tuple[int, int], dict[int, tuple[int, ...]]
+        ] = {}
+        mutable: dict[tuple[int, int], dict[int, list[int]]] = {}
+        for position, source_index in enumerate(self.snapshot_indices[:-1]):
+            source_time = float(self.t_grid[source_index])
+            source_bin = _left_closed_bin(
+                source_time,
+                self.source_edges,
+                self.tolerance,
+                include_final=False,
+            )
+            if source_bin is None:
+                continue
+            for target_index in self.snapshot_indices[position + 1:]:
+                lead = float(
+                    self.t_grid[target_index] - self.t_grid[source_index]
+                )
+                lead_bin = _right_closed_bin(
+                    lead, self.lead_edges, self.tolerance,
+                )
+                if lead_bin is None:
+                    continue
+                mutable.setdefault((source_bin, lead_bin), {}).setdefault(
+                    int(source_index), []
+                ).append(int(target_index))
+        self.cells = {
+            cell: {
+                source_index: tuple(targets)
+                for source_index, targets in sources.items()
+            }
+            for cell, sources in mutable.items()
+        }
+        self.eligible_lead_bins = tuple(
+            sorted({lead_bin for _, lead_bin in self.cells})
+        )
+        if not self.eligible_lead_bins:
+            raise ValueError("the transition bin configuration contains no valid pairs")
+
+    @staticmethod
+    def _validate_edges(values, name: str) -> np.ndarray:
+        edges = np.asarray(values, dtype=np.float64)
+        if (
+            edges.ndim != 1
+            or edges.size < 2
+            or not np.isfinite(edges).all()
+            or not np.all(np.diff(edges) > 0.0)
+        ):
+            raise ValueError(f"{name} must be a finite, strictly increasing sequence")
+        return edges
+
+    def cell_for_pair(
+        self,
+        source_index: int,
+        target_index: int,
+    ) -> tuple[int, int, int]:
+        source = float(self.t_grid[int(source_index)])
+        target = float(self.t_grid[int(target_index)])
+        source_bin = _left_closed_bin(
+            source, self.source_edges, self.tolerance, include_final=False,
+        )
+        lead_bin = _right_closed_bin(
+            target - source, self.lead_edges, self.tolerance,
+        )
+        target_bin = _left_closed_bin(
+            target, self.target_edges, self.tolerance, include_final=True,
+        )
+        if source_bin is None or lead_bin is None or target_bin is None:
+            raise ValueError("pair lies outside the configured transition bins")
+        return source_bin, lead_bin, target_bin
+
+    def sample_pair(
+        self,
+        base_seed: int,
+        epoch: int,
+        sim_id: int,
+    ) -> tuple[int, int, int, int]:
+        rng = np.random.default_rng(
+            np.random.SeedSequence(
+                [int(base_seed), int(epoch), int(sim_id), 0],
+            )
+        )
+        lead_bin = int(rng.choice(self.eligible_lead_bins))
+        source_bins = tuple(
+            sorted(
+                source_bin
+                for source_bin, candidate_lead in self.cells
+                if candidate_lead == lead_bin
+            )
+        )
+        source_bin = int(rng.choice(source_bins))
+        sources = self.cells[(source_bin, lead_bin)]
+        source_index = int(rng.choice(tuple(sorted(sources))))
+        target_index = int(rng.choice(sources[source_index]))
+        return source_index, target_index, source_bin, lead_bin
+
+    def validation_records(
+        self,
+        sim_ids: np.ndarray,
+        *,
+        pairs_per_cell: int,
+        base_seed: int,
+    ) -> list[dict[str, int]]:
+        if pairs_per_cell <= 0:
+            raise ValueError("pairs_per_cell must be positive")
+        records: list[dict[str, int]] = []
+        for sim_id in np.asarray(sim_ids, dtype=int):
+            for source_bin, lead_bin in sorted(self.cells):
+                pairs = [
+                    (source_index, target_index)
+                    for source_index, targets in self.cells[
+                        (source_bin, lead_bin)
+                    ].items()
+                    for target_index in targets
+                ]
+                rng = np.random.default_rng(
+                    np.random.SeedSequence(
+                        [
+                            int(base_seed),
+                            int(sim_id),
+                            int(source_bin),
+                            int(lead_bin),
+                            1,
+                        ]
+                    )
+                )
+                count = min(int(pairs_per_cell), len(pairs))
+                chosen = rng.choice(len(pairs), size=count, replace=False)
+                for pair_index in np.atleast_1d(chosen):
+                    source_index, target_index = pairs[int(pair_index)]
+                    _, _, target_bin = self.cell_for_pair(
+                        source_index, target_index,
+                    )
+                    records.append({
+                        "sim_id": int(sim_id),
+                        "source_index": int(source_index),
+                        "target_index": int(target_index),
+                        "source_bin": int(source_bin),
+                        "lead_bin": int(lead_bin),
+                        "target_bin": int(target_bin),
+                    })
+        return records
+
+
+def transition_epoch_order(
+    sim_ids: np.ndarray,
+    *,
+    base_seed: int,
+    epoch: int,
+) -> np.ndarray:
+    ids = np.asarray(sim_ids, dtype=int)
+    rng = np.random.default_rng(
+        np.random.SeedSequence([int(base_seed), int(epoch), 2]),
+    )
+    return rng.permutation(ids)
+
+
+def transition_manifest_hash(records: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        records, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_transition_manifest(
+    path: Path,
+    records: list[dict[str, Any]],
+) -> str:
+    digest = transition_manifest_hash(records)
+    payload = {
+        "schema_version": 1,
+        "sha256": digest,
+        "records": records,
+    }
+    _atomic_text(json.dumps(payload, indent=2) + "\n", Path(path))
+    return digest
+
+
 def left_wall_qL(
     params: list[dict],
     y_pts: torch.Tensor,
@@ -1935,7 +2254,7 @@ def build_cvit(
     grid_size: tuple[int, int],
     t_final: float = 1.0,
     variant: str = "cvit",
-) -> CViT | InterfaceCViT | ForcingICCViT:
+) -> CViT | InterfaceCViT | ForcingICCViT | ForcingTransitionCViT:
     """Construct the PINO surrogate. ``variant="cvit"`` (default) builds the
     diffusion :class:`CViT` conditioned on the IC field over ``grid_size =
     (Nx, Ny)``. ``variant="forcing"`` builds a :class:`ForcingCViT` whose encoder
@@ -1949,7 +2268,75 @@ def build_cvit(
     IC data grid ``grid_size = (Nx, Ny)`` plus the forcing space-time image
     ``(Ny_img, Nt_img)`` read from ``training.pino.forcing``; it reads
     ``model.forcing_ic_cvit`` when present, falling back to ``model.cvit``.
+    ``variant="forcing_transition"`` builds the causal transition operator over
+    an arbitrary source snapshot and its source-relative forcing interval.
     """
+    if variant == "forcing_transition":
+        c = {
+            **config["model"]["cvit"],
+            **(config["model"].get("forcing_transition_cvit", {}) or {}),
+        }
+        forcing_cfg = (
+            config.get("training", {}).get("pino", {}).get("forcing", {}) or {}
+        )
+        ny_img = int(
+            forcing_cfg.get("ny_img")
+            if forcing_cfg.get("ny_img") is not None
+            else grid_size[1]
+        )
+        nt_img = int(
+            forcing_cfg.get("nt_img")
+            if forcing_cfg.get("nt_img") is not None
+            else 128
+        )
+        t_norm = float(
+            c.get("t_final", None)
+            if c.get("t_final", None) is not None
+            else t_final
+        )
+        default_time_freq = (
+            c.get("fourier_freq_t")
+            if c.get("fourier_freq_t") is not None
+            else c.get("fourier_freq", 1.0)
+        )
+        return ForcingTransitionCViT(
+            forcing_in_ch=int(c.get("forcing_in_ch", 3)),
+            source_in_ch=int(c.get("source_in_ch", 1)),
+            out_dim=int(c.get("out_dim", 1)),
+            emb_dim=int(c.get("emb_dim", 256)),
+            dec_emb_dim=c.get("dec_emb_dim", None),
+            source_patch_size=int(
+                c.get("source_patch_size", c.get("patch_size", 10))
+            ),
+            source_grid_size=grid_size,
+            forcing_patch_size=int(c.get("forcing_patch_size", 8)),
+            forcing_grid_size=(ny_img, nt_img),
+            depth_enc=int(c.get("depth_enc", 4)),
+            depth_dec=int(c.get("depth_dec", 2)),
+            num_heads=int(c.get("num_heads", 8)),
+            mlp_ratio=float(c.get("mlp_ratio", 2.0)),
+            fourier_freq=float(c.get("fourier_freq", 1.0)),
+            fourier_freq_source=float(
+                c.get("fourier_freq_source", default_time_freq)
+            ),
+            fourier_freq_lead=float(
+                c.get("fourier_freq_lead", default_time_freq)
+            ),
+            activation=str(c.get("activation", "gelu")),
+            film_hidden_layers=int(c.get("film_hidden_layers", 2)),
+            film_activation=str(c.get("film_activation", "silu")),
+            head_hidden_layers=int(c.get("head_hidden_layers", 1)),
+            head_activation=str(c.get("head_activation", "gelu")),
+            query_time_conditioning=bool(
+                c.get("query_time_conditioning", True)
+            ),
+            film_time_conditioning=bool(
+                c.get("film_time_conditioning", True)
+            ),
+            film_init_std=float(c.get("film_init_std", 1.0e-3)),
+            coord_tolerance=float(c.get("coord_tolerance", 1.0e-6)),
+            t_final=t_norm,
+        )
     if variant == "forcing_ic":
         c = {**config["model"]["cvit"], **(config["model"].get("forcing_ic_cvit", {}) or {})}
         forcing_cfg = config.get("training", {}).get("pino", {}).get("forcing", {}) or {}
@@ -4120,7 +4507,7 @@ def _forcing_ic_fv_losses(
     causal_cfg: dict,
     causal_eps: float,
     chunk_r: int,
-) -> dict[str, torch.Tensor | bool]:
+) -> dict[str, Any]:
     Nx, Ny = int(x_grid.numel()), int(y_grid.numel())
     mesh = _full_grid_query_mesh(x_grid, y_grid)
     Nq = Nx * Ny
@@ -10227,6 +10614,2642 @@ def run_one_seed_interfaces_one_step_pino(
     return summary
 
 
+def _decode_transition_in_chunks(
+    model: ForcingTransitionCViT,
+    encoding: TransitionEncoding,
+    source: torch.Tensor,
+    coords: torch.Tensor,
+    source_time: torch.Tensor,
+    lead_time: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    if chunk_size <= 0 or coords.shape[1] <= chunk_size:
+        return model.decode(
+            encoding, source, coords, source_time, lead_time,
+        )
+    return torch.cat(
+        [
+            model.decode(
+                encoding,
+                source,
+                coords[:, start:start + chunk_size],
+                source_time,
+                lead_time,
+            )
+            for start in range(0, coords.shape[1], chunk_size)
+        ],
+        dim=1,
+    )
+
+
+def _transition_source_batch(
+    trajectories: np.ndarray,
+    records: list[dict[str, int]],
+    mu: float,
+    sigma: float,
+    device: torch.device,
+) -> torch.Tensor:
+    source = np.stack(
+        [
+            np.asarray(
+                trajectories[record["sim_id"], record["source_index"]],
+                dtype=np.float32,
+            )
+            for record in records
+        ]
+    )
+    source = (source - np.float32(mu)) / np.float32(sigma)
+    return torch.from_numpy(source).unsqueeze(1).to(device)
+
+
+def _transition_batch_loss(
+    model: ForcingTransitionCViT,
+    records: list[dict[str, int]],
+    *,
+    sim_params: np.ndarray,
+    trajectories: np.ndarray,
+    t_grid: np.ndarray,
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    y_img: np.ndarray,
+    nt_img: int,
+    a_ref: float,
+    t_ramp: float,
+    t_final: float,
+    mu: float,
+    sigma: float,
+    n_queries: int,
+    query_chunk: int,
+    base_seed: int,
+    epoch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if not records:
+        raise ValueError("transition training batch must not be empty")
+    if n_queries <= 0:
+        raise ValueError("transition n_queries must be positive")
+    source_time_np = np.asarray(
+        [t_grid[record["source_index"]] for record in records],
+        dtype=np.float32,
+    )
+    target_time_np = np.asarray(
+        [t_grid[record["target_index"]] for record in records],
+        dtype=np.float32,
+    )
+    lead_time_np = target_time_np - source_time_np
+    params = [dict(sim_params[record["sim_id"]]) for record in records]
+    source = _transition_source_batch(
+        trajectories, records, mu, sigma, device,
+    )
+    forcing = build_forcing_transition_image(
+        params,
+        y_img,
+        source_time_np,
+        lead_time_np,
+        nt_img,
+        a_ref,
+        device,
+        t_ramp,
+        t_final,
+    )
+
+    nx, ny = int(x_grid.numel()), int(y_grid.numel())
+    ix = np.empty((len(records), n_queries), dtype=np.int64)
+    iy = np.empty_like(ix)
+    for batch_index, record in enumerate(records):
+        rng = np.random.default_rng(
+            np.random.SeedSequence(
+                [
+                    int(base_seed),
+                    int(epoch),
+                    int(record["sim_id"]),
+                    3,
+                ]
+            )
+        )
+        ix[batch_index] = rng.integers(0, nx, size=n_queries)
+        iy[batch_index] = rng.integers(0, ny, size=n_queries)
+    ix_t = torch.from_numpy(ix).to(device)
+    iy_t = torch.from_numpy(iy).to(device)
+    coords = torch.stack([x_grid[ix_t], y_grid[iy_t]], dim=-1)
+
+    truth = np.empty((len(records), n_queries), dtype=np.float32)
+    for batch_index, record in enumerate(records):
+        truth[batch_index] = np.asarray(
+            trajectories[
+                record["sim_id"],
+                record["target_index"],
+                ix[batch_index],
+                iy[batch_index],
+            ],
+            dtype=np.float32,
+        )
+    truth = (truth - np.float32(mu)) / np.float32(sigma)
+    source_time = torch.from_numpy(source_time_np).to(device).unsqueeze(-1)
+    lead_time = torch.from_numpy(lead_time_np).to(device).unsqueeze(-1)
+    encoding = model.encode(forcing, source)
+    prediction = _decode_transition_in_chunks(
+        model,
+        encoding,
+        source,
+        coords,
+        source_time,
+        lead_time,
+        query_chunk,
+    )
+    target = torch.from_numpy(truth).to(device).unsqueeze(-1)
+    return (prediction - target).square().mean()
+
+
+def transition_pair_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    sigma_global: float,
+    signal_floor_fraction: float,
+) -> dict[str, float | bool | None]:
+    if (
+        prediction.shape != target.shape
+        or prediction.shape != source.shape
+        or prediction.ndim < 1
+    ):
+        raise ValueError("prediction, target, and source must have matching shapes")
+    if sigma_global <= 0.0 or signal_floor_fraction < 0.0:
+        raise ValueError("metric scales must be positive/non-negative")
+    error_rms = torch.sqrt((prediction - target).square().mean())
+    increment_rms = torch.sqrt((target - source).square().mean())
+    gated = bool(
+        (increment_rms >= float(signal_floor_fraction)).detach().cpu().item()
+    )
+    relative = None
+    copy_skill = None
+    if gated:
+        error_l2 = torch.linalg.vector_norm(prediction - target)
+        increment_l2 = torch.linalg.vector_norm(target - source)
+        relative = float((error_l2 / increment_l2).detach().cpu())
+        copy_skill = 1.0 - relative ** 2
+    return {
+        "target_rmse_K": float(error_rms.detach().cpu()) * float(sigma_global),
+        "target_gnrmse": float(error_rms.detach().cpu()),
+        "copy_rmse_K": float(increment_rms.detach().cpu()) * float(sigma_global),
+        "copy_gnrmse": float(increment_rms.detach().cpu()),
+        "increment_signal_rms_K": (
+            float(increment_rms.detach().cpu()) * float(sigma_global)
+        ),
+        "increment_gated": gated,
+        "increment_rel_l2": relative,
+        "copy_skill": copy_skill,
+    }
+
+
+def _mean_finite(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [
+        float(row[key])
+        for row in rows
+        if row.get(key) is not None and math.isfinite(float(row[key]))
+    ]
+    return float(np.mean(values)) if values else None
+
+
+def aggregate_transition_metrics(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("cannot aggregate an empty transition validation set")
+    cells: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = f"s{int(row['source_bin'])}_l{int(row['lead_bin'])}"
+        cells.setdefault(key, []).append(row)
+    cell_gnrmse = {
+        key: float(np.mean([float(row["target_gnrmse"]) for row in group]))
+        for key, group in cells.items()
+    }
+    gated_count = sum(bool(row["increment_gated"]) for row in rows)
+    out: dict[str, Any] = {
+        "num_pairs": len(rows),
+        "target_rmse_K": float(
+            np.mean([float(row["target_rmse_K"]) for row in rows])
+        ),
+        "target_gnrmse": float(
+            np.mean([float(row["target_gnrmse"]) for row in rows])
+        ),
+        "copy_rmse_K": _mean_finite(rows, "copy_rmse_K"),
+        "copy_gnrmse": _mean_finite(rows, "copy_gnrmse"),
+        "macro_cell_gnrmse": float(np.mean(list(cell_gnrmse.values()))),
+        "increment_rel_l2": _mean_finite(rows, "increment_rel_l2"),
+        "copy_skill": _mean_finite(rows, "copy_skill"),
+        "low_frequency_error_fraction": _mean_finite(
+            rows, "low_frequency_error_fraction",
+        ),
+        "gated_coverage": gated_count / len(rows),
+        "cell_gnrmse": cell_gnrmse,
+    }
+    for field in (
+        "source_bin",
+        "lead_bin",
+        "target_bin",
+        "source_lead_cell",
+        "ic_family",
+        "forcing_amplitude_tercile",
+    ):
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            groups.setdefault(str(row[field]), []).append(row)
+        out[f"by_{field}"] = {
+            key: {
+                "count": len(group),
+                "target_gnrmse": float(
+                    np.mean(
+                        [float(item["target_gnrmse"]) for item in group]
+                    )
+                ),
+                "copy_gnrmse": _mean_finite(group, "copy_gnrmse"),
+                "increment_rel_l2": _mean_finite(
+                    group, "increment_rel_l2",
+                ),
+                "copy_skill": _mean_finite(group, "copy_skill"),
+                "low_frequency_error_fraction": _mean_finite(
+                    group, "low_frequency_error_fraction",
+                ),
+                "gated_coverage": (
+                    sum(bool(item["increment_gated"]) for item in group)
+                    / len(group)
+                ),
+            }
+            for key, group in groups.items()
+        }
+    return out
+
+
+def _write_transition_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    with open(path, "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@torch.no_grad()
+def validate_forcing_transition(
+    model: ForcingTransitionCViT,
+    data: dict[str, Any],
+    sim_params: np.ndarray,
+    records: list[dict[str, int]],
+    *,
+    y_img: np.ndarray,
+    nt_img: int,
+    a_ref: float,
+    t_ramp: float,
+    device: torch.device,
+    sim_batch: int,
+    query_chunk: int,
+    signal_floor_fraction: float,
+    pair_csv_path: Path | None = None,
+) -> dict[str, Any]:
+    if sim_batch <= 0 or query_chunk < 0:
+        raise ValueError("validation batch must be positive and chunk non-negative")
+    x_grid = torch.as_tensor(
+        data["x_grid"], dtype=torch.float32, device=device,
+    )
+    y_grid = torch.as_tensor(
+        data["y_grid"], dtype=torch.float32, device=device,
+    )
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    mesh = torch.stack(
+        [gx.reshape(-1), gy.reshape(-1)], dim=-1,
+    ).unsqueeze(0)
+    trajectories = data["trajectories"]
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    mu = float(data["mu_global"])
+    sigma = float(data["sigma_global"])
+    t_final = float(t_grid[-1])
+    rows: list[dict[str, Any]] = []
+
+    amplitudes: list[float] = []
+    for record in records:
+        source_time = float(t_grid[record["source_index"]])
+        lead_time = float(
+            t_grid[record["target_index"]] - source_time
+        )
+        image = build_forcing_transition_image(
+            [dict(sim_params[record["sim_id"]])],
+            y_img,
+            [source_time],
+            [lead_time],
+            nt_img,
+            a_ref,
+            torch.device("cpu"),
+            t_ramp,
+            t_final,
+        )
+        amplitudes.append(float(image[:, 0].abs().max()) * float(a_ref))
+    if len(amplitudes) >= 3:
+        amp_low, amp_high = np.quantile(amplitudes, [1.0 / 3.0, 2.0 / 3.0])
+    else:
+        amp_low = amp_high = float(np.median(amplitudes))
+
+    for start in range(0, len(records), sim_batch):
+        batch_records = records[start:start + sim_batch]
+        params = [
+            dict(sim_params[record["sim_id"]]) for record in batch_records
+        ]
+        source_time_np = np.asarray(
+            [t_grid[record["source_index"]] for record in batch_records],
+            dtype=np.float32,
+        )
+        target_time_np = np.asarray(
+            [t_grid[record["target_index"]] for record in batch_records],
+            dtype=np.float32,
+        )
+        lead_time_np = target_time_np - source_time_np
+        source = _transition_source_batch(
+            trajectories, batch_records, mu, sigma, device,
+        )
+        forcing = build_forcing_transition_image(
+            params,
+            y_img,
+            source_time_np,
+            lead_time_np,
+            nt_img,
+            a_ref,
+            device,
+            t_ramp,
+            t_final,
+        )
+        batch_size = len(batch_records)
+        coords = mesh.expand(batch_size, -1, -1)
+        source_time = torch.from_numpy(source_time_np).to(device).unsqueeze(-1)
+        lead_time = torch.from_numpy(lead_time_np).to(device).unsqueeze(-1)
+        encoding = model.encode(forcing, source)
+        prediction = _decode_transition_in_chunks(
+            model,
+            encoding,
+            source,
+            coords,
+            source_time,
+            lead_time,
+            query_chunk,
+        )[..., 0]
+        target_np = np.stack(
+            [
+                np.asarray(
+                    trajectories[
+                        record["sim_id"], record["target_index"]
+                    ],
+                    dtype=np.float32,
+                )
+                for record in batch_records
+            ]
+        )
+        target = torch.from_numpy(
+            (target_np - np.float32(mu)) / np.float32(sigma)
+        ).to(device).reshape(batch_size, -1)
+        source_queries = source[:, 0].reshape(batch_size, -1)
+        for batch_index, record in enumerate(batch_records):
+            metrics = transition_pair_metrics(
+                prediction[batch_index],
+                target[batch_index],
+                source_queries[batch_index],
+                sigma_global=sigma,
+                signal_floor_fraction=signal_floor_fraction,
+            )
+            error_field = (
+                prediction[batch_index] - target[batch_index]
+            ).reshape(int(x_grid.numel()), int(y_grid.numel()))
+            spectrum = torch.fft.fft2(error_field, norm="ortho")
+            total_spectral_error = spectrum.abs().square().sum()
+            low_spectral_error = spectrum[:4, :4].abs().square().sum()
+            metrics["low_frequency_error_fraction"] = float(
+                (
+                    low_spectral_error
+                    / total_spectral_error.clamp_min(
+                        torch.finfo(total_spectral_error.dtype).tiny
+                    )
+                ).detach().cpu()
+            )
+            amplitude = amplitudes[start + batch_index]
+            if amplitude <= amp_low:
+                tercile = "low"
+            elif amplitude <= amp_high:
+                tercile = "mid"
+            else:
+                tercile = "high"
+            rows.append({
+                **record,
+                "source_time": float(source_time_np[batch_index]),
+                "lead_time": float(lead_time_np[batch_index]),
+                "target_time": float(target_time_np[batch_index]),
+                "source_lead_cell": (
+                    f"s{record['source_bin']}_l{record['lead_bin']}"
+                ),
+                "ic_family": str(
+                    sim_params[record["sim_id"]].get("ic_family", "")
+                ),
+                "forcing_amplitude": amplitude,
+                "forcing_amplitude_tercile": tercile,
+                **metrics,
+            })
+    if pair_csv_path is not None:
+        _write_transition_rows(Path(pair_csv_path), rows)
+    result = aggregate_transition_metrics(rows)
+    result["manifest_hash"] = transition_manifest_hash(records)
+    return result
+
+
+def _ic_balanced_subset(
+    ids: np.ndarray,
+    sim_params: np.ndarray,
+    *,
+    limit: int,
+    seed: int,
+) -> np.ndarray:
+    ids = np.asarray(ids, dtype=int)
+    if limit <= 0 or limit >= len(ids):
+        return ids.copy()
+    groups: dict[str, list[int]] = {}
+    for sim_id in ids:
+        family = str(sim_params[int(sim_id)].get("ic_family", ""))
+        groups.setdefault(family, []).append(int(sim_id))
+    rng = np.random.default_rng(np.random.SeedSequence([int(seed), 4]))
+    for values in groups.values():
+        rng.shuffle(values)
+    selected: list[int] = []
+    names = sorted(groups)
+    position = 0
+    while len(selected) < limit:
+        progressed = False
+        for name in names:
+            if position < len(groups[name]) and len(selected) < limit:
+                selected.append(groups[name][position])
+                progressed = True
+        if not progressed:
+            break
+        position += 1
+    return np.asarray(selected, dtype=int)
+
+
+def _transition_checkpoint_compatibility(
+    config: dict,
+    *,
+    nx: int,
+    ny: int,
+    ny_img: int,
+    nt_img: int,
+    a_ref: float,
+    t_final: float,
+    schedule: TransitionPairSchedule,
+) -> dict[str, Any]:
+    c = {
+        **config["model"]["cvit"],
+        **(config["model"].get("forcing_transition_cvit", {}) or {}),
+    }
+    default_time_freq = (
+        c.get("fourier_freq_t")
+        if c.get("fourier_freq_t") is not None
+        else c.get("fourier_freq", 1.0)
+    )
+    return {
+        "variant": "forcing_transition",
+        "forcing_channels": 3,
+        "forcing_resolution": [int(ny_img), int(nt_img)],
+        "source_resolution": [int(nx), int(ny)],
+        "forcing_patch_size": int(c.get("forcing_patch_size", 8)),
+        "source_patch_size": int(
+            c.get("source_patch_size", c.get("patch_size", 10))
+        ),
+        "a_ref": float(a_ref),
+        "t_final": float(t_final),
+        "fourier_freq_source": float(
+            c.get("fourier_freq_source", default_time_freq)
+        ),
+        "fourier_freq_lead": float(
+            c.get("fourier_freq_lead", default_time_freq)
+        ),
+        "source_edges": schedule.source_edges.tolist(),
+        "lead_edges": schedule.lead_edges.tolist(),
+        "target_edges": schedule.target_edges.tolist(),
+        "coordinate_tolerance": float(c.get("coord_tolerance", 1.0e-6)),
+        "align_corners": True,
+        "query_time_conditioning": bool(
+            c.get("query_time_conditioning", True)
+        ),
+        "film_time_conditioning": bool(
+            c.get("film_time_conditioning", True)
+        ),
+        "film_initialization": {
+            "distribution": "normal",
+            "mean": 0.0,
+            "std": float(c.get("film_init_std", 1.0e-3)),
+            "bias": 0.0,
+            "convention": "(1+gamma)*h+beta",
+        },
+        "residual_gate": "(1-x)*(lead_time/t_final)",
+    }
+
+
+@torch.no_grad()
+def transition_counterfactual_diagnostics(
+    model: ForcingTransitionCViT,
+    data: dict[str, Any],
+    sim_params: np.ndarray,
+    records: list[dict[str, int]],
+    *,
+    y_img: np.ndarray,
+    nt_img: int,
+    a_ref: float,
+    t_ramp: float,
+    device: torch.device,
+    query_chunk: int,
+) -> dict[str, float | None]:
+    if len({record["sim_id"] for record in records}) < 2:
+        return {
+            "source_state_swap_rms_K": None,
+            "in_window_forcing_swap_rms_K": None,
+            "source_departure_ratio": None,
+            "forcing_response_ratio": None,
+        }
+    first = records[0]
+    second = next(
+        record for record in records
+        if record["sim_id"] != first["sim_id"]
+    )
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    source_time = float(t_grid[first["source_index"]])
+    lead_time = float(t_grid[first["target_index"]] - source_time)
+    source_records = [
+        first,
+        {
+            **first,
+            "sim_id": int(second["sim_id"]),
+            "source_index": int(first["source_index"]),
+            "target_index": int(first["target_index"]),
+        },
+    ]
+    source = _transition_source_batch(
+        data["trajectories"],
+        source_records,
+        float(data["mu_global"]),
+        float(data["sigma_global"]),
+        device,
+    )
+    forcing = build_forcing_transition_image(
+        [dict(sim_params[first["sim_id"]])] * 2,
+        y_img,
+        [source_time, source_time],
+        [lead_time, lead_time],
+        nt_img,
+        a_ref,
+        device,
+        t_ramp,
+        float(t_grid[-1]),
+    )
+    x_grid = torch.as_tensor(
+        data["x_grid"], dtype=torch.float32, device=device,
+    )
+    y_grid = torch.as_tensor(
+        data["y_grid"], dtype=torch.float32, device=device,
+    )
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    coords = torch.stack(
+        [gx.reshape(-1), gy.reshape(-1)], dim=-1,
+    ).unsqueeze(0).expand(2, -1, -1)
+    source_times = torch.full((2, 1), source_time, device=device)
+    lead_times = torch.full((2, 1), lead_time, device=device)
+    source_prediction = _decode_transition_in_chunks(
+        model,
+        model.encode(forcing, source),
+        source,
+        coords,
+        source_times,
+        lead_times,
+        query_chunk,
+    )
+    source_sensitivity = torch.sqrt(
+        (source_prediction[0] - source_prediction[1]).square().mean()
+    )
+
+    forcing_swap = build_forcing_transition_image(
+        [
+            dict(sim_params[first["sim_id"]]),
+            dict(sim_params[second["sim_id"]]),
+        ],
+        y_img,
+        [source_time, source_time],
+        [lead_time, lead_time],
+        nt_img,
+        a_ref,
+        device,
+        t_ramp,
+        float(t_grid[-1]),
+    )
+    repeated_source = source[0:1].expand(2, -1, -1, -1)
+    forcing_prediction = _decode_transition_in_chunks(
+        model,
+        model.encode(forcing_swap, repeated_source),
+        repeated_source,
+        coords,
+        source_times,
+        lead_times,
+        query_chunk,
+    )
+    forcing_sensitivity = torch.sqrt(
+        (forcing_prediction[0] - forcing_prediction[1]).square().mean()
+    )
+    target_np = np.asarray(
+        data["trajectories"][first["sim_id"], first["target_index"]],
+        dtype=np.float32,
+    )
+    target = torch.from_numpy(
+        (target_np - np.float32(data["mu_global"]))
+        / np.float32(data["sigma_global"])
+    ).to(device).reshape(-1, 1)
+    source_query = source[0, 0].reshape(-1, 1)
+    true_increment = torch.sqrt((target - source_query).square().mean())
+    predicted_departure = torch.sqrt(
+        (source_prediction[0] - source_query).square().mean()
+    )
+    denominator = float(true_increment.cpu())
+    sigma = float(data["sigma_global"])
+    return {
+        "source_state_swap_rms_K": float(source_sensitivity.cpu()) * sigma,
+        "in_window_forcing_swap_rms_K": (
+            float(forcing_sensitivity.cpu()) * sigma
+        ),
+        "source_departure_ratio": (
+            None if denominator == 0.0
+            else float(predicted_departure.cpu()) / denominator
+        ),
+        "forcing_response_ratio": (
+            None if denominator == 0.0
+            else float(forcing_sensitivity.cpu()) / denominator
+        ),
+    }
+
+
+def load_verified_transition_gate(
+    path: str | Path,
+    *,
+    expected_stage: str,
+    require_passed: bool = True,
+) -> tuple[dict[str, Any], str]:
+    gate_path = Path(path).expanduser().resolve()
+    with gate_path.open() as stream:
+        summary = json.load(stream)
+    recorded = str(summary.get("gate_sha256", ""))
+    unhashed = copy.deepcopy(summary)
+    unhashed.pop("gate_sha256", None)
+    canonical = json.dumps(unhashed, sort_keys=True, separators=(",", ":"))
+    computed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if not recorded or computed != recorded:
+        raise ValueError(f"gate summary hash mismatch: {gate_path}")
+    if str(summary.get("stage")) != str(expected_stage):
+        raise ValueError(
+            f"expected gate stage {expected_stage!r}, got "
+            f"{summary.get('stage')!r}"
+        )
+    if require_passed and not bool(summary.get("passed", False)):
+        raise ValueError(f"gate did not pass: {gate_path}")
+    return summary, recorded
+
+
+def transition_screen_skill(
+    error: float,
+    floor_error: float,
+    copy_error: float,
+    *,
+    separation: float = 1.0e3,
+) -> float:
+    values = np.asarray(
+        [error, floor_error, copy_error], dtype=np.float64,
+    )
+    if not np.isfinite(values).all() or np.any(values < 0.0):
+        raise ValueError("screen errors must be finite and non-negative")
+    if copy_error < float(separation) * floor_error:
+        raise ValueError("copy-to-floor separation prerequisite failed")
+    denominator = copy_error - floor_error
+    if denominator <= 0.0:
+        raise ValueError("copy error must exceed the reconstruction floor")
+    return float(1.0 - (error - floor_error) / denominator)
+
+
+def transition_consecutive_interval_trigger(
+    *,
+    overall_passed: bool,
+    longest_passed: bool,
+    copy_skills: list[float] | tuple[float, ...],
+    forcing_response_ratio: float,
+    source_departure_ratio: float,
+    finite_and_defect_passed: bool,
+    low_frequency_fractions: list[float] | tuple[float, ...],
+) -> bool:
+    fractions = np.asarray(low_frequency_fractions, dtype=np.float64)
+    skills = np.asarray(copy_skills, dtype=np.float64)
+    if fractions.size < 3 or skills.size == 0:
+        return False
+    last = fractions[-3:]
+    monotone = bool(np.all(last[1:] >= 0.95 * last[:-1]))
+    drift = bool(fractions[-1] >= 2.0 * fractions[0])
+    return bool(
+        overall_passed
+        and not longest_passed
+        and np.isfinite(skills).all()
+        and bool(np.all(skills > 0.0))
+        and float(forcing_response_ratio) >= 0.10
+        and float(source_departure_ratio) >= 0.10
+        and finite_and_defect_passed
+        and np.isfinite(fractions).all()
+        and monotone
+        and drift
+    )
+
+
+def transition_production_screen_decision(
+    records: dict[int, dict[str, float]],
+    *,
+    minimum_improvement: float = 0.10,
+) -> dict[str, Any]:
+    required = (500, 750, 1000, 1500, 1750, 2000)
+    missing = [update for update in required if update not in records]
+    if missing:
+        raise ValueError(f"production screen is missing updates {missing}")
+
+    def combined(update: int) -> float:
+        record = records[update]
+        return 0.5 * (
+            float(record["overall_skill"]) + float(record["long_skill"])
+        )
+
+    early = float(np.median([combined(update) for update in required[:3]]))
+    late = float(np.median([combined(update) for update in required[3:]]))
+    final = records[2000]
+    finite = bool(
+        all(
+            np.isfinite(float(value))
+            for record in records.values()
+            for value in record.values()
+        )
+    )
+    progress = bool(
+        finite
+        and float(final["overall_skill"]) > 0.0
+        and float(final["long_skill"]) > 0.0
+        and late - early >= float(minimum_improvement)
+    )
+    return {
+        "early_combined_skill": early,
+        "late_combined_skill": late,
+        "skill_improvement": late - early,
+        "finite": finite,
+        "passed": progress,
+    }
+
+
+def sample_transition_source_steps(
+    rng: np.random.Generator,
+    *,
+    batch_size: int,
+    dt: float,
+    t_final: float,
+    source_edges: list[float] | tuple[float, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    edges = np.asarray(source_edges, dtype=np.float64)
+    lattice = np.arange(
+        int(round(float(t_final) / float(dt))), dtype=np.int64,
+    )
+    times = lattice.astype(np.float64) * float(dt)
+    groups = [
+        lattice[
+            (times >= edges[index] - 1.0e-12)
+            & (times < edges[index + 1] - 1.0e-12)
+        ]
+        for index in range(len(edges) - 1)
+    ]
+    eligible = [index for index, values in enumerate(groups) if values.size]
+    if not eligible:
+        raise ValueError("source-time bins contain no feasible lattice points")
+    requested = np.resize(np.asarray(eligible, dtype=np.int64), int(batch_size))
+    rng.shuffle(requested)
+    steps = np.asarray(
+        [int(rng.choice(groups[int(index)])) for index in requested],
+        dtype=np.int64,
+    )
+    return steps, requested
+
+
+def transition_curriculum_max_lead(
+    completed_updates: int,
+    total_updates: int,
+    feasible_horizon: float,
+) -> float:
+    if total_updates <= 0:
+        raise ValueError("total_updates must be positive")
+    fraction = (int(completed_updates) + 1) / int(total_updates)
+    if fraction <= 0.10:
+        requested = 0.05
+    elif fraction <= 0.25:
+        requested = 0.10
+    elif fraction <= 0.50:
+        requested = 0.20
+    else:
+        requested = 0.30
+    return min(float(requested), float(feasible_horizon))
+
+
+def sample_transition_physics_intervals(
+    rng: np.random.Generator,
+    *,
+    source_steps: np.ndarray,
+    dt: float,
+    t_final: float,
+    lead_edges: list[float] | tuple[float, ...],
+    include_anchor_interval: bool,
+    intervals_per_cell: int,
+    consecutive_intervals: dict[str, Any] | None = None,
+) -> dict[str, torch.Tensor]:
+    if int(intervals_per_cell) <= 0:
+        raise ValueError("intervals_per_cell must be positive")
+    edges = np.asarray(lead_edges, dtype=np.float64)
+    total_steps = int(round(float(t_final) / float(dt)))
+    cfg = dict(consecutive_intervals or {})
+    enabled = bool(cfg.get("enabled", False))
+    probability = float(cfg.get("probability", 0.25))
+    min_length = int(cfg.get("min_length", 2))
+    max_length = int(cfg.get("max_length", 4))
+    if (
+        not 0.0 <= probability <= 1.0
+        or min_length < 2
+        or max_length < min_length
+    ):
+        raise ValueError("invalid consecutive_intervals configuration")
+
+    rows: list[tuple[int, int, int, bool]] = []
+    for sim_local, source_step in enumerate(
+        np.asarray(source_steps, dtype=np.int64),
+    ):
+        feasible = total_steps - int(source_step)
+        if feasible <= 0:
+            continue
+        if include_anchor_interval:
+            rows.append((sim_local, 0, 0, True))
+        end_steps = np.arange(1, feasible + 1, dtype=np.int64)
+        leads = end_steps.astype(np.float64) * float(dt)
+        for lead_bin in range(len(edges) - 1):
+            candidates = end_steps[
+                (leads > edges[lead_bin] + 1.0e-12)
+                & (leads <= edges[lead_bin + 1] + 1.0e-12)
+            ]
+            if candidates.size == 0:
+                continue
+            for _ in range(int(intervals_per_cell)):
+                end_step = int(rng.choice(candidates))
+                start = end_step - 1
+                rows.append((sim_local, start, lead_bin, start == 0))
+                if enabled and rng.random() < probability:
+                    length = int(rng.integers(min_length, max_length + 1))
+                    first = min(start, max(0, feasible - length))
+                    for offset in range(length):
+                        interval = first + offset
+                        if interval < feasible:
+                            endpoint_lead = float(interval + 1) * float(dt)
+                            bundle_bin = int(
+                                np.searchsorted(
+                                    edges, endpoint_lead, side="left",
+                                ) - 1
+                            )
+                            bundle_bin = min(
+                                max(bundle_bin, 0), len(edges) - 2,
+                            )
+                            rows.append(
+                                (
+                                    sim_local,
+                                    interval,
+                                    bundle_bin,
+                                    interval == 0,
+                                )
+                            )
+    unique = list(dict.fromkeys(rows))
+    if not unique:
+        raise ValueError("no feasible transition physics intervals")
+    return {
+        "sim_local": torch.tensor(
+            [row[0] for row in unique], dtype=torch.long,
+        ),
+        "start_step": torch.tensor(
+            [row[1] for row in unique], dtype=torch.long,
+        ),
+        "lead_bin": torch.tensor(
+            [row[2] for row in unique], dtype=torch.long,
+        ),
+        "is_anchor": torch.tensor(
+            [row[3] for row in unique], dtype=torch.bool,
+        ),
+    }
+
+
+def _macro_transition_cell_mean(
+    values: torch.Tensor,
+    source_bins: torch.Tensor,
+    lead_bins: torch.Tensor,
+    physical_defect: torch.Tensor,
+    *,
+    causal_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    unique_leads = torch.unique(lead_bins, sorted=True)
+    lead_defects = torch.stack([
+        physical_defect[lead_bins == lead].mean()
+        for lead in unique_leads
+    ])
+    lead_weights = _causal_weights(
+        lead_defects.detach(), float(causal_epsilon),
+    )
+    sample_weights = torch.ones_like(values)
+    for index, lead in enumerate(unique_leads):
+        sample_weights[lead_bins == lead] = lead_weights[index]
+    cells = torch.stack((source_bins, lead_bins), dim=1)
+    unique_cells = torch.unique(cells, dim=0)
+    cell_values = []
+    for cell in unique_cells:
+        mask = (cells == cell).all(dim=1)
+        cell_values.append((sample_weights[mask] * values[mask]).mean())
+    return torch.stack(cell_values).mean(), lead_defects
+
+
+def forcing_transition_physics_loss(
+    *,
+    model: ForcingTransitionCViT,
+    source_fields: torch.Tensor,
+    params: list[dict],
+    source_steps: np.ndarray,
+    source_bins: np.ndarray,
+    intervals: dict[str, torch.Tensor],
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    y_img: np.ndarray,
+    nt_img: int,
+    a_ref: float,
+    t_ramp: float,
+    t_final: float,
+    dt: float,
+    sigma_global: float,
+    right_value: float,
+    objective: str,
+    causal_epsilon: float,
+    query_chunk: int,
+    defect_sweeps: int = 1,
+    defect_omega: float = 2.0 / 3.0,
+) -> dict[str, torch.Tensor | bool]:
+    device = source_fields.device
+    dtype = source_fields.dtype
+    if source_fields.ndim != 4 or source_fields.shape[1] != 1:
+        raise ValueError("source_fields must have shape (B,1,Nx,Ny)")
+    sim_local = intervals["sim_local"].to(device=device, dtype=torch.long)
+    start_step = intervals["start_step"].to(device=device, dtype=torch.long)
+    lead_bins = intervals["lead_bin"].to(device=device, dtype=torch.long)
+    M = int(sim_local.numel())
+    if M == 0:
+        raise ValueError("transition physics batch is empty")
+    Nx, Ny = int(source_fields.shape[-2]), int(source_fields.shape[-1])
+    mesh = _full_grid_query_mesh(x_grid, y_grid).expand(M * 2, -1, -1)
+    endpoint_sim = torch.cat((sim_local, sim_local), dim=0)
+    endpoint_steps = torch.cat((start_step, start_step + 1), dim=0)
+    positive = endpoint_steps > 0
+    predictions: list[torch.Tensor | None] = [None] * (2 * M)
+    for index in torch.nonzero(~positive, as_tuple=False).flatten().tolist():
+        predictions[index] = source_fields[int(endpoint_sim[index]), 0]
+
+    if bool(positive.any().item()):
+        selected = torch.nonzero(positive, as_tuple=False).flatten()
+        selected_sim = endpoint_sim.index_select(0, selected)
+        selected_steps = endpoint_steps.index_select(0, selected)
+        source_times = torch.as_tensor(
+            np.asarray(source_steps, dtype=np.float64) * float(dt),
+            device=device,
+            dtype=dtype,
+        ).index_select(0, selected_sim)
+        lead_times = selected_steps.to(dtype=dtype) * float(dt)
+        selected_params = [params[int(index)] for index in selected_sim.cpu()]
+        forcing = build_forcing_transition_image(
+            selected_params,
+            y_img,
+            source_times,
+            lead_times,
+            int(nt_img),
+            float(a_ref),
+            device,
+            float(t_ramp),
+            float(t_final),
+        ).to(dtype=dtype)
+        source_tokens = model.encode_source(source_fields)
+        forcing_tokens = model.encode_forcing(forcing)
+        encoding = model.fuse(
+            source_tokens.index_select(0, selected_sim),
+            forcing_tokens,
+        )
+        decoded = model.decode(
+            encoding,
+            source_fields.index_select(0, selected_sim),
+            mesh.index_select(0, selected),
+            source_times,
+            lead_times,
+        )[..., 0].reshape(-1, Nx, Ny)
+        for local, index in enumerate(selected.tolist()):
+            predictions[index] = decoded[local]
+    if any(value is None for value in predictions):
+        raise AssertionError("not every direct endpoint was decoded")
+    T_n = torch.stack(
+        [value for value in predictions[:M] if value is not None],
+    )
+    T_np1 = torch.stack(
+        [value for value in predictions[M:] if value is not None],
+    )
+
+    source_time_values = (
+        np.asarray(source_steps, dtype=np.float64)[sim_local.cpu().numpy()]
+        * float(dt)
+    )
+    start_values = start_step.cpu().numpy()
+    qn = np.empty((M, Ny), dtype=np.float64)
+    qnp1 = np.empty((M, Ny), dtype=np.float64)
+    qint = np.empty((M, Ny), dtype=np.float64)
+    y_values = np.asarray(y_img, dtype=np.float64)
+    if y_values.size != Ny or not np.allclose(
+        y_values, y_grid.detach().cpu().numpy(), rtol=0.0, atol=1.0e-12,
+    ):
+        forcing_y = y_grid.detach().cpu().numpy()
+    else:
+        forcing_y = y_values
+    for row in range(M):
+        record = params[int(sim_local[row])]
+        forcing = reconstruct_qL(
+            record["temporal_family"],
+            record["temporal_params"],
+            record["spatial_family"],
+            record["spatial_params"],
+            t_ramp=float(t_ramp),
+        )
+        absolute_n = (
+            source_time_values[row] + float(start_values[row]) * float(dt)
+        )
+        absolute_np1 = absolute_n + float(dt)
+        qn[row] = forcing.evaluate_points(forcing_y, absolute_n)
+        qnp1[row] = forcing.evaluate_points(forcing_y, absolute_np1)
+        qint[row] = forcing.integral(
+            forcing_y, absolute_n, absolute_np1,
+        )
+
+    geom = build_homogeneous_cn_geom(
+        x_grid.detach().cpu().numpy(),
+        y_grid.detach().cpu().numpy(),
+        K_SLAB,
+        float(dt),
+        sigma_global=float(sigma_global),
+        rho=1.0,
+        cp=1.0,
+        device=device,
+        dtype=dtype,
+    )
+    forcing_increment = (
+        2.0 * qint / (float(geom.hx) * float(sigma_global))
+    )
+    cn = build_cn_tensors_from_geom(
+        geom,
+        torch.from_numpy(forcing_increment).to(device=device, dtype=dtype),
+    )
+    if objective == "raw_ls":
+        bc = FullBCData(
+            T_right_tilde=torch.as_tensor(
+                float(right_value),
+                device=device,
+                dtype=dtype,
+            ),
+            qL_n=torch.from_numpy(qn).to(device=device, dtype=dtype),
+            qL_np1=torch.from_numpy(qnp1).to(device=device, dtype=dtype),
+            qL_int=torch.from_numpy(qint).to(device=device, dtype=dtype),
+        )
+        phys = full_bc_physics_loss(
+            T_n,
+            T_np1,
+            geom,
+            bc,
+            per_sample=True,
+            dirichlet_both_ends=True,
+        )
+        raw_per_sample = {
+            "interior": phys["interior_per_sample"],
+            "left_neumann": phys["left_neumann_per_sample"],
+            "topbot_adiabatic": phys["topbot_adiabatic_per_sample"],
+            "right_dirichlet": phys["right_dirichlet_per_sample"],
+        }
+        per_sample = sum(raw_per_sample.values())
+        physical_defect = phys["physics_loss_allcell_mean"].new_empty(M)
+        deviation_np1 = T_np1 - float(right_value)
+        deviation_n = T_n - float(right_value)
+        implicit = implicit_cn_action(deviation_np1, cn)
+        rhs = explicit_cn_rhs(
+            deviation_n,
+            torch.arange(M, device=device, dtype=torch.long),
+            {**cn, "forcing": cn["forcing"]},
+        )
+        physical_defect = (implicit - rhs).square().flatten(1).mean(dim=1)
+    elif objective in {"variational", "defect"}:
+        if objective == "variational":
+            per_sample, residual = variational_objective(
+                T_np1, T_n, cn, right_value=float(right_value),
+            )
+        else:
+            per_sample, residual = defect_terms(
+                T_np1,
+                T_n,
+                cn,
+                right_value=float(right_value),
+                sweeps=int(defect_sweeps),
+                omega=float(defect_omega),
+            )
+        physical_defect = residual.square().flatten(1).mean(dim=1)
+    else:
+        raise ValueError(
+            "transition physics objective must be raw_ls, variational, or defect"
+        )
+    interval_source_bins = torch.as_tensor(
+        np.asarray(source_bins, dtype=np.int64),
+        device=device,
+        dtype=torch.long,
+    ).index_select(0, sim_local)
+    loss, lead_defects = _macro_transition_cell_mean(
+        per_sample,
+        interval_source_bins,
+        lead_bins,
+        physical_defect,
+        causal_epsilon=float(causal_epsilon),
+    )
+    out: dict[str, torch.Tensor | bool | dict[str, torch.Tensor]] = {
+        "loss": loss,
+        "physical_defect_mse": physical_defect.mean().detach(),
+        "lead_defect_mse": lead_defects,
+        "finite": bool(
+            torch.isfinite(loss).item()
+            and torch.isfinite(T_n).all().item()
+            and torch.isfinite(T_np1).all().item()
+        ),
+        "no_rollout": True,
+        "previous_endpoint_detached": objective != "raw_ls",
+        "decoded_endpoint_count": torch.tensor(
+            int(positive.sum().item()), device=device,
+        ),
+    }
+    if objective == "raw_ls":
+        out["raw_terms"] = {
+            name: _macro_transition_cell_mean(
+                values,
+                interval_source_bins,
+                lead_bins,
+                physical_defect,
+                causal_epsilon=float(causal_epsilon),
+            )[0]
+            for name, values in raw_per_sample.items()
+        }
+    return out
+
+
+def run_one_seed_forcing_transition(
+    config: dict,
+    seed: int,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Supervised causal transition training for ``diffusion_forcing_single``."""
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = run_dir / "cvit_latest.pt"
+    best_path = run_dir / "cvit_best.pt"
+    final_path = run_dir / "cvit_final.pt"
+    complete_path = run_dir / "RUN_COMPLETE"
+    summary_path = run_dir / "final_metrics.json"
+
+    training = config["training"]
+    pino = training["pino"]
+    transition = pino.get("transition", {}) or {}
+    forcing_cfg = pino.get("forcing", {}) or {}
+    if float(training.get("noise_std", 0.0) or 0.0) != 0.0:
+        raise ValueError(
+            "forcing_transition V1 does not support source noise or denoising"
+        )
+    if float(transition.get("source_noise_std", 0.0) or 0.0) != 0.0:
+        raise ValueError(
+            "forcing_transition V1 does not support source noise or denoising"
+        )
+    extend_completed = bool(transition.get("extend_completed", False))
+    if complete_path.exists() and not extend_completed:
+        if summary_path.exists():
+            with open(summary_path) as stream:
+                return json.load(stream)
+        return {"seed": seed, "status": "complete", "run_dir": str(run_dir)}
+
+    device = resolve_device(training.get("device", "auto"))
+    data = load_diffusion_data(config)
+    trajectory_path = Path(config["data"]["trajectories.npy"])
+    sim_params = np.load(
+        trajectory_path.parent / "sim_params.npy", allow_pickle=True,
+    )
+    data_signature = validate_forcing_ic_supervised_dataset(
+        config, data, sim_params,
+    )
+    trajectories = data["trajectories"]
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    nx, ny = int(len(data["x_grid"])), int(len(data["y_grid"]))
+    t_final = float(t_grid[-1])
+    mu = float(data["mu_global"])
+    sigma = float(data["sigma_global"])
+    n_snapshots = training.get("n_snapshots", None)
+    schedule = TransitionPairSchedule(
+        t_grid,
+        None if n_snapshots is None else int(n_snapshots),
+        transition.get("lead_edges", [0.0, 0.05, 0.10, 0.20, 0.30]),
+        transition.get(
+            "source_edges", [0.0, 0.075, 0.15, 0.225, 0.30],
+        ),
+        transition.get(
+            "target_edges", [0.0, 0.075, 0.15, 0.225, 0.30],
+        ),
+    )
+
+    stored_ramp = float(data_signature["ramp_seconds"])
+    configured_ramp = forcing_cfg.get("ramp_seconds", None)
+    t_ramp = (
+        stored_ramp if configured_ramp is None else float(configured_ramp)
+    )
+    if not math.isclose(
+        t_ramp, stored_ramp, rel_tol=0.0, abs_tol=1.0e-12,
+    ):
+        raise ValueError(
+            "training.pino.forcing.ramp_seconds must match the saved dataset"
+        )
+    a_ref = float(forcing_cfg.get("a_ref") or A_AMP_REF)
+    ny_img = int(
+        forcing_cfg.get("ny_img")
+        if forcing_cfg.get("ny_img") is not None
+        else ny
+    )
+    nt_img = int(
+        forcing_cfg.get("nt_img")
+        if forcing_cfg.get("nt_img") is not None
+        else 128
+    )
+    y_img = np.linspace(
+        float(data["y_grid"][0]),
+        float(data["y_grid"][-1]),
+        ny_img,
+        dtype=np.float64,
+    )
+    sim_batch = int(transition.get("sim_batch", pino.get("sim_batch", 16)))
+    n_queries = int(
+        transition.get("n_queries", pino.get("n_data_pts", 1024))
+    )
+    query_chunk = int(transition.get("query_chunk", 0) or 0)
+    val_batch = int(
+        transition.get(
+            "validation_batch_size",
+            forcing_cfg.get("val_sim_batch", 8),
+        )
+    )
+    val_chunk = int(
+        transition.get(
+            "validation_query_chunk",
+            forcing_cfg.get("val_query_chunk", 2048),
+        )
+        or 0
+    )
+    if (
+        sim_batch <= 0
+        or n_queries <= 0
+        or query_chunk < 0
+        or val_batch <= 0
+        or val_chunk < 0
+    ):
+        raise ValueError("transition batch/query settings are invalid")
+
+    fast_ids = _ic_balanced_subset(
+        data["val_ids"],
+        sim_params,
+        limit=int(transition.get("fast_val_max_sims", 64)),
+        seed=seed,
+    )
+    fast_records = schedule.validation_records(
+        fast_ids,
+        pairs_per_cell=int(
+            transition.get("fast_val_pairs_per_cell", 1)
+        ),
+        base_seed=seed + 10_000,
+    )
+    final_records = schedule.validation_records(
+        data["val_ids"],
+        pairs_per_cell=int(
+            transition.get("final_val_pairs_per_cell", 2)
+        ),
+        base_seed=seed + 20_000,
+    )
+    fast_hash = write_transition_manifest(
+        run_dir / "fast_validation_manifest.json", fast_records,
+    )
+    final_hash = write_transition_manifest(
+        run_dir / "final_validation_manifest.json", final_records,
+    )
+
+    model = build_cvit(
+        config,
+        mu,
+        sigma,
+        grid_size=(nx, ny),
+        t_final=t_final,
+        variant="forcing_transition",
+    ).to(device)
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+    compatibility = _transition_checkpoint_compatibility(
+        config,
+        nx=nx,
+        ny=ny,
+        ny_img=ny_img,
+        nt_img=nt_img,
+        a_ref=a_ref,
+        t_final=t_final,
+        schedule=schedule,
+    )
+    resume_config = {
+        "compatibility": compatibility,
+        "optimizer": training.get("optimizer"),
+        "learning_rate": training.get("learning_rate"),
+        "weight_decay": training.get("weight_decay"),
+        "scheduler": copy.deepcopy(training.get("scheduler")),
+        "n_snapshots": n_snapshots,
+        "sim_batch": sim_batch,
+        "n_queries": n_queries,
+        "query_chunk": query_chunk,
+        "fast_manifest_hash": fast_hash,
+        "final_manifest_hash": final_hash,
+    }
+
+    epochs = int(training["epochs"])
+    validate_every = int(training.get("validate_every", 10))
+    save_every = max(
+        1, int(transition.get("save_latest_every_updates", 25)),
+    )
+    signal_floor = float(
+        transition.get("increment_signal_floor_sigma", 0.01)
+    )
+    loss_weight = float(transition.get("loss_weight", 1.0))
+    grad_clip_value = training.get("grad_clip", None)
+    grad_clip = (
+        None if grad_clip_value is None else float(grad_clip_value)
+    )
+    if (
+        epochs <= 0
+        or validate_every <= 0
+        or signal_floor < 0.0
+        or loss_weight <= 0.0
+        or (grad_clip is not None and grad_clip <= 0.0)
+    ):
+        raise ValueError("transition training settings are invalid")
+    train_ids = np.asarray(data["train_ids"], dtype=int)
+    num_batches = int(math.ceil(len(train_ids) / sim_batch))
+    x_grid = torch.as_tensor(
+        data["x_grid"], dtype=torch.float32, device=device,
+    )
+    y_grid = torch.as_tensor(
+        data["y_grid"], dtype=torch.float32, device=device,
+    )
+    rng = np.random.default_rng(seed)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(seed + 1_000_003)
+
+    metrics_path = run_dir / "train_metrics.csv"
+    fieldnames = [
+        "epoch",
+        "completed_updates",
+        "loss",
+        "lr",
+        "fast_macro_cell_gnrmse",
+        "fast_target_gnrmse",
+        "fast_target_rmse_K",
+        "fast_increment_rel_l2",
+        "fast_copy_skill",
+        "fast_gated_coverage",
+    ]
+    start_epoch = 0
+    start_batch = 0
+    completed_updates = 0
+    last_csv_epoch = -1
+    partial_loss_sum = 0.0
+    partial_batches = 0
+    best_metric = float("inf")
+    best_epoch: int | None = None
+    best_validation: dict[str, Any] | None = None
+    resuming = latest_path.exists() and (
+        not complete_path.exists() or extend_completed
+    )
+    if resuming:
+        checkpoint = torch.load(
+            latest_path, map_location="cpu", weights_only=False,
+        )
+        if checkpoint.get("resume_config") != resume_config:
+            raise ValueError(
+                "Incompatible forcing-transition resume configuration; "
+                "use a fresh experiment name."
+            )
+        if checkpoint.get("data_signature") != data_signature:
+            raise ValueError(
+                "The forcing-transition dataset differs from the checkpoint."
+            )
+        saved_epochs = int(checkpoint["config"]["training"]["epochs"])
+        if epochs < int(checkpoint["next_epoch"]):
+            raise ValueError(
+                "training.epochs is below the transition checkpoint cursor"
+            )
+        if (
+            epochs != saved_epochs
+            and str(training["scheduler"]["type"])
+            not in {"PICViTExponential", "StepLR"}
+        ):
+            raise ValueError(
+                "Extending transition training requires a "
+                "horizon-independent scheduler"
+            )
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        start_epoch = int(checkpoint["next_epoch"])
+        start_batch = int(checkpoint["next_batch"])
+        completed_updates = int(checkpoint["completed_updates"])
+        last_csv_epoch = int(checkpoint["last_csv_epoch"])
+        partial_loss_sum = float(checkpoint.get("partial_loss_sum", 0.0))
+        partial_batches = int(checkpoint.get("partial_batches", 0))
+        best_metric = float(checkpoint["best_fast_validation_metric"])
+        best_epoch = checkpoint.get("best_checkpoint_epoch")
+        best_validation = copy.deepcopy(checkpoint.get("best_validation"))
+        _restore_forcing_rng(
+            checkpoint["stochastic_state"], rng, gen, eval_gen,
+        )
+        if metrics_path.exists():
+            with open(metrics_path, newline="") as stream:
+                rows = [
+                    row
+                    for row in csv.DictReader(stream)
+                    if int(row["epoch"]) <= last_csv_epoch
+                ]
+            with open(metrics_path, "w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        if complete_path.exists():
+            complete_path.unlink()
+    else:
+        with open(metrics_path, "w", newline="") as stream:
+            csv.DictWriter(stream, fieldnames=fieldnames).writeheader()
+
+    def checkpoint_payload(
+        *,
+        epoch_value: int,
+        next_epoch: int,
+        next_batch: int,
+        loss_sum: float,
+        batches_done: int,
+    ) -> dict[str, Any]:
+        return {
+            "objective": "supervised_transition",
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "mu_global": mu,
+            "sigma_global": sigma,
+            "config": config,
+            "resume_config": resume_config,
+            "checkpoint_compatibility": compatibility,
+            "data_signature": data_signature,
+            "epoch": int(epoch_value),
+            "next_epoch": int(next_epoch),
+            "next_batch": int(next_batch),
+            "completed_updates": int(completed_updates),
+            "last_csv_epoch": int(last_csv_epoch),
+            "partial_loss_sum": float(loss_sum),
+            "partial_batches": int(batches_done),
+            "best_fast_validation_metric": float(best_metric),
+            "best_checkpoint_epoch": best_epoch,
+            "best_validation": copy.deepcopy(best_validation),
+            "stochastic_state": _capture_forcing_rng(
+                rng, gen, eval_gen,
+            ),
+            "schedule_state": {
+                "base_seed": int(seed),
+                "epoch": int(next_epoch),
+                "next_batch": int(next_batch),
+                "num_batches": int(num_batches),
+            },
+            "validation_manifests": {
+                "fast": fast_hash,
+                "final": final_hash,
+            },
+        }
+
+    print(
+        f"[forcing-transition] seed={seed} device={device} epochs={epochs} "
+        f"sims/epoch={len(train_ids)} batches/epoch={num_batches} "
+        f"batch={sim_batch} queries={n_queries} img={ny_img}x{nt_img} "
+        f"resume={resuming}",
+        flush=True,
+    )
+    for epoch in range(start_epoch, epochs):
+        order = transition_epoch_order(
+            train_ids, base_seed=seed, epoch=epoch,
+        )
+        batch_begin = start_batch if epoch == start_epoch else 0
+        epoch_loss_sum = (
+            partial_loss_sum if epoch == start_epoch else 0.0
+        )
+        epoch_batches = (
+            partial_batches if epoch == start_epoch else 0
+        )
+        model.train()
+        lr = float(optimizer.param_groups[0]["lr"])
+        for batch_index in range(batch_begin, num_batches):
+            batch_ids = order[
+                batch_index * sim_batch:(batch_index + 1) * sim_batch
+            ]
+            records = []
+            for sim_id in batch_ids:
+                source_index, target_index, source_bin, lead_bin = (
+                    schedule.sample_pair(seed, epoch, int(sim_id))
+                )
+                _, _, target_bin = schedule.cell_for_pair(
+                    source_index, target_index,
+                )
+                records.append({
+                    "sim_id": int(sim_id),
+                    "source_index": int(source_index),
+                    "target_index": int(target_index),
+                    "source_bin": int(source_bin),
+                    "lead_bin": int(lead_bin),
+                    "target_bin": int(target_bin),
+                })
+            optimizer.zero_grad(set_to_none=True)
+            data_loss = _transition_batch_loss(
+                model,
+                records,
+                sim_params=sim_params,
+                trajectories=trajectories,
+                t_grid=t_grid,
+                x_grid=x_grid,
+                y_grid=y_grid,
+                y_img=y_img,
+                nt_img=nt_img,
+                a_ref=a_ref,
+                t_ramp=t_ramp,
+                t_final=t_final,
+                mu=mu,
+                sigma=sigma,
+                n_queries=n_queries,
+                query_chunk=query_chunk,
+                base_seed=seed,
+                epoch=epoch,
+                device=device,
+            )
+            loss = loss_weight * data_loss
+            if not bool(torch.isfinite(loss).item()):
+                raise FloatingPointError(
+                    f"non-finite transition loss at epoch {epoch}, "
+                    f"batch {batch_index}"
+                )
+            loss.backward()
+            if not all(
+                parameter.grad is None
+                or bool(torch.isfinite(parameter.grad).all().item())
+                for parameter in model.parameters()
+            ):
+                raise FloatingPointError(
+                    f"non-finite transition gradient at epoch {epoch}, "
+                    f"batch {batch_index}"
+                )
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=grad_clip,
+                )
+            lr = float(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            _advance_scheduler(
+                scheduler, unit="update", successful_updates=1,
+            )
+            completed_updates += 1
+            epoch_loss_sum += float(data_loss.detach().cpu())
+            epoch_batches += 1
+            next_batch = batch_index + 1
+            if (
+                completed_updates % save_every == 0
+                and next_batch < num_batches
+            ):
+                _atomic_torch_save(
+                    checkpoint_payload(
+                        epoch_value=epoch,
+                        next_epoch=epoch,
+                        next_batch=next_batch,
+                        loss_sum=epoch_loss_sum,
+                        batches_done=epoch_batches,
+                    ),
+                    latest_path,
+                )
+
+        _advance_scheduler(
+            scheduler, unit="epoch", successful_updates=1,
+        )
+        do_validation = (
+            epoch % validate_every == 0 or epoch == epochs - 1
+        )
+        validation: dict[str, Any] | None = None
+        is_best = False
+        if do_validation:
+            model.eval()
+            validation = validate_forcing_transition(
+                model,
+                data,
+                sim_params,
+                fast_records,
+                y_img=y_img,
+                nt_img=nt_img,
+                a_ref=a_ref,
+                t_ramp=t_ramp,
+                device=device,
+                sim_batch=val_batch,
+                query_chunk=val_chunk,
+                signal_floor_fraction=signal_floor,
+            )
+            metric = float(validation["macro_cell_gnrmse"])
+            is_best = metric < best_metric
+            if is_best:
+                best_metric = metric
+                best_epoch = epoch
+                best_validation = copy.deepcopy(validation)
+        row = {
+            "epoch": epoch,
+            "completed_updates": completed_updates,
+            "loss": epoch_loss_sum / epoch_batches,
+            "lr": lr,
+            "fast_macro_cell_gnrmse": (
+                "" if validation is None
+                else validation["macro_cell_gnrmse"]
+            ),
+            "fast_target_gnrmse": (
+                "" if validation is None else validation["target_gnrmse"]
+            ),
+            "fast_target_rmse_K": (
+                "" if validation is None else validation["target_rmse_K"]
+            ),
+            "fast_increment_rel_l2": (
+                "" if validation is None
+                else validation["increment_rel_l2"]
+            ),
+            "fast_copy_skill": (
+                "" if validation is None else validation["copy_skill"]
+            ),
+            "fast_gated_coverage": (
+                "" if validation is None
+                else validation["gated_coverage"]
+            ),
+        }
+        with open(metrics_path, "a", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writerow(row)
+            stream.flush()
+            os.fsync(stream.fileno())
+        last_csv_epoch = epoch
+        payload = checkpoint_payload(
+            epoch_value=epoch,
+            next_epoch=epoch + 1,
+            next_batch=0,
+            loss_sum=0.0,
+            batches_done=0,
+        )
+        if is_best:
+            _atomic_torch_save(payload, best_path)
+        _atomic_torch_save(payload, latest_path)
+        print(
+            f"Epoch {epoch}: loss={row['loss']:.6e} "
+            + (
+                f"macro_cell_gnrmse={100.0 * float(validation['macro_cell_gnrmse']):.4f}% "
+                f"copy_skill={validation['copy_skill']}"
+                if validation is not None
+                else f"lr={lr:.2e}"
+            ),
+            flush=True,
+        )
+        start_batch = 0
+        partial_loss_sum = 0.0
+        partial_batches = 0
+
+    if not best_path.exists():
+        raise RuntimeError("forcing-transition training produced no best checkpoint")
+    best_checkpoint = torch.load(
+        best_path, map_location="cpu", weights_only=False,
+    )
+    model.load_state_dict(best_checkpoint["model_state"])
+    model.eval()
+    final_validation = validate_forcing_transition(
+        model,
+        data,
+        sim_params,
+        final_records,
+        y_img=y_img,
+        nt_img=nt_img,
+        a_ref=a_ref,
+        t_ramp=t_ramp,
+        device=device,
+        sim_batch=val_batch,
+        query_chunk=val_chunk,
+        signal_floor_fraction=signal_floor,
+        pair_csv_path=run_dir / "final_val_pairs.csv",
+    )
+    diagnostics = transition_counterfactual_diagnostics(
+        model,
+        data,
+        sim_params,
+        final_records,
+        y_img=y_img,
+        nt_img=nt_img,
+        a_ref=a_ref,
+        t_ramp=t_ramp,
+        device=device,
+        query_chunk=val_chunk,
+    )
+    final_payload = copy.deepcopy(best_checkpoint)
+    final_payload["final_validation"] = copy.deepcopy(final_validation)
+    final_payload["counterfactual_diagnostics"] = diagnostics
+    _atomic_torch_save(final_payload, final_path)
+    summary = {
+        "seed": seed,
+        "objective": "supervised_transition",
+        "formulation": "forcing_transition",
+        "completed_updates": completed_updates,
+        "best_fast_validation_metric": best_metric,
+        "best_checkpoint_epoch": best_epoch,
+        "best_validation": best_validation,
+        "final_validation": final_validation,
+        "counterfactual_diagnostics": diagnostics,
+        "fast_validation_manifest_hash": fast_hash,
+        "final_validation_manifest_hash": final_hash,
+        "training_sigma_global": sigma,
+        "test_set_evaluated": False,
+        "comparison_scope": (
+            "legacy CViT versus transition CViT is a formulation comparison"
+        ),
+    }
+    _atomic_text(json.dumps(summary, indent=2) + "\n", summary_path)
+    _atomic_text("complete\n", complete_path)
+    return summary
+
+
+def _transition_gate_floor(
+    direct_gate: dict[str, Any],
+    metric: str,
+    *,
+    sigma_global: float,
+) -> float:
+    values = [
+        float(case["floor_metrics"][metric])
+        for case in direct_gate["cases"]
+        if metric in case.get("floor_metrics", {})
+    ]
+    if not values:
+        raise ValueError(f"direct-state gate has no floor metric {metric!r}")
+    return max(values) / float(sigma_global)
+
+
+def _transition_validation_screen_metrics(
+    validation: dict[str, Any],
+    direct_gate: dict[str, Any],
+    *,
+    sigma_global: float,
+    anti_collapse_passed: bool,
+    defect_passed: bool,
+) -> dict[str, Any]:
+    lead_groups = validation["by_lead_bin"]
+    lead_keys = sorted(lead_groups, key=lambda value: int(value))
+    if not lead_keys:
+        raise ValueError("transition validation has no populated lead bins")
+    longest = lead_groups[lead_keys[-1]]
+    overall_floor = _transition_gate_floor(
+        direct_gate, "overall_field", sigma_global=sigma_global,
+    )
+    long_floor = _transition_gate_floor(
+        direct_gate, "longest_lead", sigma_global=sigma_global,
+    )
+    overall_skill = transition_screen_skill(
+        float(validation["target_gnrmse"]),
+        overall_floor,
+        float(validation["copy_gnrmse"]),
+    )
+    long_skill = transition_screen_skill(
+        float(longest["target_gnrmse"]),
+        long_floor,
+        float(longest["copy_gnrmse"]),
+    )
+    low_fractions = [
+        float(lead_groups[key]["low_frequency_error_fraction"])
+        for key in lead_keys
+        if lead_groups[key]["low_frequency_error_fraction"] is not None
+    ]
+    drift = bool(
+        len(low_fractions) >= 3
+        and all(
+            low_fractions[index + 1] >= 0.95 * low_fractions[index]
+            for index in range(len(low_fractions) - 3, len(low_fractions) - 1)
+        )
+        and low_fractions[-1] >= 2.0 * low_fractions[0]
+        and overall_skill > 0.0
+        and long_skill <= 0.0
+        and bool(anti_collapse_passed)
+        and bool(defect_passed)
+    )
+    return {
+        "overall_skill": overall_skill,
+        "long_skill": long_skill,
+        "overall_floor_gnrmse": overall_floor,
+        "long_floor_gnrmse": long_floor,
+        "low_frequency_fractions": low_fractions,
+        "low_frequency_long_lead_drift": drift,
+    }
+
+
+def _transition_source_coverage(
+    online_source: np.ndarray,
+    data: dict[str, Any],
+    validation_records: list[dict[str, int]],
+    *,
+    max_sources: int = 16,
+) -> dict[str, float]:
+    online = np.asarray(online_source, dtype=np.float64)[:max_sources]
+    unique_records = []
+    seen = set()
+    for record in validation_records:
+        key = (int(record["sim_id"]), int(record["source_index"]))
+        if key not in seen:
+            seen.add(key)
+            unique_records.append(record)
+        if len(unique_records) >= max_sources:
+            break
+    validation = np.stack([
+        np.asarray(
+            data["trajectories"][
+                int(record["sim_id"]), int(record["source_index"])
+            ],
+            dtype=np.float64,
+        )
+        for record in unique_records
+    ])
+    online_flat = online.reshape(len(online), -1)
+    validation_flat = validation.reshape(len(validation), -1)
+    distances = np.sqrt(np.mean(
+        (
+            validation_flat[:, None, :]
+            - online_flat[None, :, :]
+        ) ** 2,
+        axis=-1,
+    ))
+    nearest = distances.min(axis=1)
+    return {
+        "validation_to_online_nearest_rmse_K_mean": float(nearest.mean()),
+        "validation_to_online_nearest_rmse_K_max": float(nearest.max()),
+        "online_sources": int(len(online)),
+        "validation_sources": int(len(validation)),
+    }
+
+
+def run_one_seed_forcing_transition_physics(
+    config: dict,
+    seed: int,
+    run_dir: Path,
+) -> dict[str, Any]:
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = run_dir / "cvit_latest.pt"
+    best_path = run_dir / "cvit_best.pt"
+    final_path = run_dir / "cvit_final.pt"
+    complete_path = run_dir / "RUN_COMPLETE"
+    summary_path = run_dir / "final_metrics.json"
+
+    training = config["training"]
+    pino = training["pino"]
+    transition = dict(pino.get("transition", {}) or {})
+    physics_cfg = dict(transition.get("physics", {}) or {})
+    if str(transition.get("objective", "supervised")) != "physics_only":
+        raise ValueError(
+            "physics transition runner requires "
+            "training.pino.transition.objective=physics_only"
+        )
+    for key, expected in (
+        ("residual_method", "finite_volume"),
+        ("source_state_mode", "online_local_ivp"),
+        ("time_bundle", "lead_bins"),
+    ):
+        if str(physics_cfg.get(key)) != expected:
+            raise ValueError(
+                f"training.pino.transition.physics.{key} must be {expected!r}"
+            )
+    if not bool(physics_cfg.get("include_anchor_interval", True)):
+        raise ValueError("physics-only transition training requires the anchor interval")
+    legacy_curriculum = dict(pino.get("curriculum", {}) or {})
+    if (
+        bool(legacy_curriculum.get("enabled", False))
+        and str(legacy_curriculum.get("mode", "ic_only")) == "ic_only"
+        and int(legacy_curriculum.get("ic_only_epochs", 0)) > 0
+    ):
+        raise ValueError(
+            "IC-only curricula are incompatible with the hard transition anchor"
+        )
+    if float(training.get("noise_std", 0.0) or 0.0) != 0.0:
+        raise ValueError("physics-only transition V1 does not support denoising")
+
+    gate_path = physics_cfg.get("gate_summary")
+    network_path = physics_cfg.get("network_gate_summary")
+    if gate_path is None or network_path is None:
+        raise ValueError(
+            "physics-only transition training requires both gate summary paths"
+        )
+    direct_gate, direct_hash = load_verified_transition_gate(
+        gate_path, expected_stage="dense_direct_state_gate",
+    )
+    network_gate, network_hash = load_verified_transition_gate(
+        network_path, expected_stage="single_instance_network_gate",
+    )
+    if str(network_gate.get("direct_state_gate_sha256")) != direct_hash:
+        raise ValueError("network gate was not authorized by the supplied direct gate")
+    selected_objective = str(network_gate["selected_objective"])
+    configured_objective = physics_cfg.get("objective")
+    if configured_objective is not None and str(configured_objective) != selected_objective:
+        raise ValueError(
+            "configured physics objective differs from the network-gate selection"
+        )
+    if selected_objective not in {"raw_ls", "variational", "defect"}:
+        raise ValueError("network gate selected an unsupported objective")
+    consecutive = dict(physics_cfg.get("consecutive_intervals", {}) or {})
+    if consecutive != dict(network_gate.get("consecutive_intervals", {})):
+        raise ValueError(
+            "production consecutive-interval policy differs from the network gate"
+        )
+
+    extend_completed = bool(transition.get("extend_completed", False))
+    if complete_path.exists() and not extend_completed:
+        if summary_path.exists():
+            with summary_path.open() as stream:
+                return json.load(stream)
+        return {"seed": seed, "status": "complete", "run_dir": str(run_dir)}
+    device = resolve_device(training.get("device", "auto"))
+    data = load_diffusion_data(config)
+    mu = float(data["mu_global"])
+    sigma = float(data["sigma_global"])
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("physics-only transition requires a positive normalizer")
+    gate_sigma = direct_gate.get("configuration", {}).get(
+        "resolved_sigma_global",
+    )
+    if gate_sigma is not None and not math.isclose(
+        float(gate_sigma), sigma, rel_tol=1.0e-7, abs_tol=1.0e-10,
+    ):
+        raise ValueError(
+            "direct-state gate used a different training normalizer"
+        )
+    sim_params = np.load(
+        Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy",
+        allow_pickle=True,
+    )
+    data_signature = validate_forcing_ic_supervised_dataset(
+        config, data, sim_params,
+    )
+    problem = problem_from_config(config)
+    x_np = np.asarray(data["x_grid"], dtype=np.float64)
+    y_np = np.asarray(data["y_grid"], dtype=np.float64)
+    X, Y = np.meshgrid(x_np, y_np, indexing="ij")
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    t_final = float(t_grid[-1])
+    dt_cfg = physics_cfg.get("dt")
+    dt = (
+        float(dt_cfg)
+        if dt_cfg is not None
+        else float(load_solver_dt(config["data"]["t_grid_path"]))
+    )
+    n_steps = int(round(t_final / dt))
+    if not math.isclose(
+        n_steps * dt, t_final, rel_tol=1.0e-6, abs_tol=1.0e-8,
+    ):
+        raise ValueError("physics transition dt must divide t_final")
+
+    forcing_cfg = dict(pino.get("forcing", {}) or {})
+    t_ramp = forcing_cfg.get("ramp_seconds")
+    if t_ramp is None:
+        t_ramp = data_signature["ramp_seconds"]
+    t_ramp = float(t_ramp)
+    a_ref = float(forcing_cfg.get("a_ref") or A_AMP_REF)
+    ny_img = int(
+        forcing_cfg.get("ny_img")
+        if forcing_cfg.get("ny_img") is not None else len(y_np)
+    )
+    nt_img = int(
+        forcing_cfg.get("nt_img")
+        if forcing_cfg.get("nt_img") is not None else 128
+    )
+    y_img = np.linspace(y_np[0], y_np[-1], ny_img, dtype=np.float64)
+    x_grid = torch.as_tensor(x_np, dtype=torch.float32, device=device)
+    y_grid = torch.as_tensor(y_np, dtype=torch.float32, device=device)
+    right_value = (300.0 - mu) / sigma
+
+    schedule = TransitionPairSchedule(
+        t_grid,
+        training.get("n_snapshots"),
+        transition.get("lead_edges", [0.0, 0.05, 0.10, 0.20, 0.30]),
+        transition.get(
+            "source_edges", [0.0, 0.075, 0.15, 0.225, 0.30],
+        ),
+        transition.get(
+            "target_edges", [0.0, 0.075, 0.15, 0.225, 0.30],
+        ),
+    )
+    fast_ids = _ic_balanced_subset(
+        data["val_ids"],
+        sim_params,
+        limit=int(transition.get("fast_val_max_sims", 64)),
+        seed=seed,
+    )
+    fast_records = schedule.validation_records(
+        fast_ids,
+        pairs_per_cell=int(
+            transition.get("fast_val_pairs_per_cell", 1)
+        ),
+        base_seed=seed + 10_000,
+    )
+    fast_hash = write_transition_manifest(
+        run_dir / "fast_validation_manifest.json", fast_records,
+    )
+
+    model = build_cvit(
+        config,
+        mu,
+        sigma,
+        grid_size=(len(x_np), len(y_np)),
+        t_final=t_final,
+        variant="forcing_transition",
+    ).to(device)
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+    causal_cfg = _resolve_forcing_causal(pino.get("causal", {}))
+    causal_epsilon = (
+        float(causal_cfg["initial_eps"]) if causal_cfg["enabled"] else 0.0
+    )
+    warmup = _forcing_warmup_config(forcing_cfg)
+    raw_gradnorm = (
+        build_gradnorm(
+            config,
+            term_weights={
+                "interior": 1.0,
+                "left_neumann": 1.0,
+                "topbot_adiabatic": 1.0,
+                "right_dirichlet": 1.0,
+            },
+        )
+        if selected_objective == "raw_ls" else None
+    )
+    gradnorm_inert = bool(
+        selected_objective != "raw_ls"
+        and bool((training.get("gradnorm", {}) or {}).get("enabled", False))
+    )
+
+    screen_cfg = dict(physics_cfg.get("production_screen", {}) or {})
+    screen_enabled = bool(screen_cfg.get("enabled", True))
+    registered_screen_updates = int(screen_cfg.get("updates", 2000))
+    updates_per_epoch = physics_cfg.get("updates_per_epoch")
+    updates_per_epoch = (
+        1 if updates_per_epoch is None else int(updates_per_epoch)
+    )
+    total_updates = (
+        registered_screen_updates
+        if screen_enabled
+        else int(training["epochs"]) * updates_per_epoch
+    )
+    if screen_enabled and registered_screen_updates != 2000:
+        raise ValueError("the production screen budget is preregistered at 2000")
+    validate_every = int(screen_cfg.get("validate_every", 250))
+    anti_collapse_every = int(screen_cfg.get("anti_collapse_every", 100))
+    collapse_update = int(screen_cfg.get("collapse_update", 500))
+    minimum_skill_improvement = float(
+        screen_cfg.get("minimum_skill_improvement", 0.10)
+    )
+    if screen_enabled and (
+        validate_every != 250
+        or anti_collapse_every != 100
+        or collapse_update != 500
+        or not math.isclose(
+            minimum_skill_improvement, 0.10, rel_tol=0.0, abs_tol=1.0e-12,
+        )
+    ):
+        raise ValueError(
+            "production screen cadence and skill threshold are preregistered"
+        )
+    if (
+        total_updates <= 0
+        or validate_every <= 0
+        or anti_collapse_every <= 0
+    ):
+        raise ValueError("invalid physics transition update schedule")
+    sim_batch = int(transition.get("sim_batch", pino.get("sim_batch", 16)))
+    val_batch = int(transition.get("validation_batch_size", 8))
+    query_chunk = int(
+        transition.get("validation_query_chunk", 2048) or 0
+    )
+    intervals_per_cell = int(physics_cfg.get("intervals_per_cell", 1))
+    grad_clip_cfg = training.get("grad_clip")
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    save_every = max(
+        1, int(transition.get("save_latest_every_updates", 25)),
+    )
+
+    online_rngs = OnlineSamplerRNGs.create(seed, device)
+    compatibility = {
+        "direct_gate_sha256": direct_hash,
+        "network_gate_sha256": network_hash,
+        "selected_objective": selected_objective,
+        "network_gate_budget": int(network_gate["matched_budget"]),
+        "consecutive_intervals": consecutive,
+        "dt": dt,
+        "source_state_mode": "online_local_ivp",
+        "time_bundle": "lead_bins",
+        "include_anchor_interval": True,
+        "intervals_per_cell": intervals_per_cell,
+        "total_updates": total_updates,
+        "updates_per_epoch": updates_per_epoch,
+        "production_screen": copy.deepcopy(screen_cfg),
+        "fast_manifest_hash": fast_hash,
+        "optimizer": training.get("optimizer"),
+        "scheduler": copy.deepcopy(training.get("scheduler")),
+        "causal": causal_cfg,
+        "warmup": warmup,
+        "gradnorm_mode": (
+            "raw_multi_term" if raw_gradnorm is not None
+            else "inert_single_term" if gradnorm_inert else "disabled"
+        ),
+    }
+    metrics_path = run_dir / "train_metrics.csv"
+    fields = [
+        "update", "loss", "physical_defect_mse", "lr",
+        "fast_target_gnrmse", "fast_copy_gnrmse",
+        "overall_skill", "long_skill", "copy_skill",
+        "forcing_swap_rms_K", "source_swap_rms_K",
+        "forcing_response_ratio", "source_departure_ratio",
+        "low_frequency_long_lead_drift",
+    ]
+    completed_updates = 0
+    best_metric = float("inf")
+    best_update = None
+    best_validation = None
+    screen_records: dict[int, dict[str, float]] = {}
+    active_descriptors = None
+    active_source_steps = None
+    active_source_bins = None
+    active_intervals = None
+    source_coverage = None
+    collapse_detected_at_500 = False
+    resuming = latest_path.exists() and (
+        not complete_path.exists() or extend_completed
+    )
+    if resuming:
+        checkpoint = torch.load(
+            latest_path, map_location="cpu", weights_only=False,
+        )
+        if checkpoint["resume_config"] != compatibility:
+            raise ValueError("incompatible physics transition resume configuration")
+        if checkpoint.get("data_signature") != data_signature:
+            raise ValueError("physics transition dataset differs from checkpoint")
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        if raw_gradnorm is not None:
+            raw_gradnorm.load_state_dict(checkpoint["gradnorm_state"])
+        online_rngs.load_state_dict(checkpoint["online_rng_state"])
+        completed_updates = int(checkpoint["completed_updates"])
+        best_metric = float(checkpoint["best_metric"])
+        best_update = checkpoint.get("best_update")
+        best_validation = copy.deepcopy(checkpoint.get("best_validation"))
+        screen_records = {
+            int(key): value
+            for key, value in checkpoint.get("screen_records", {}).items()
+        }
+        active_descriptors = checkpoint.get("active_descriptors")
+        active_source_steps = checkpoint.get("active_source_steps")
+        active_source_bins = checkpoint.get("active_source_bins")
+        packed_intervals = checkpoint.get("active_intervals")
+        if packed_intervals is not None:
+            active_intervals = {
+                key: torch.as_tensor(value)
+                for key, value in packed_intervals.items()
+            }
+        source_coverage = checkpoint.get("source_coverage")
+        collapse_detected_at_500 = bool(
+            checkpoint.get("collapse_detected_at_500", False)
+        )
+    else:
+        with metrics_path.open("w", newline="") as stream:
+            csv.DictWriter(stream, fieldnames=fields).writeheader()
+
+    def checkpoint_payload() -> dict[str, Any]:
+        return {
+            "objective": "physics_only_transition",
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "gradnorm_state": (
+                None if raw_gradnorm is None else raw_gradnorm.state_dict()
+            ),
+            "mu_global": mu,
+            "sigma_global": sigma,
+            "config": config,
+            "resume_config": compatibility,
+            "data_signature": data_signature,
+            "completed_updates": completed_updates,
+            "best_metric": best_metric,
+            "best_update": best_update,
+            "best_validation": copy.deepcopy(best_validation),
+            "screen_records": copy.deepcopy(screen_records),
+            "online_rng_state": online_rngs.state_dict(),
+            "active_descriptors": copy.deepcopy(active_descriptors),
+            "active_source_steps": active_source_steps,
+            "active_source_bins": active_source_bins,
+            "active_intervals": (
+                None if active_intervals is None
+                else {
+                    key: value.detach().cpu()
+                    for key, value in active_intervals.items()
+                }
+            ),
+            "source_coverage": copy.deepcopy(source_coverage),
+            "collapse_detected_at_500": collapse_detected_at_500,
+            "provenance": {
+                "optimization_uses_solution_fields": False,
+                "normalization_uses_training_trajectories": True,
+                "checkpoint_selection_uses_validation_targets": True,
+                "direct_state_gate_uses_fv_reference_solutions": True,
+                "network_gate_uses_supervised_capacity_baseline": True,
+                "physics_only_claim_scope": "optimization_objective",
+            },
+        }
+
+    grids = {
+        "X": X,
+        "Y": Y,
+        "x_grid": x_np,
+        "y_grid": y_np,
+    }
+    time_cfg = {
+        "dt": dt,
+        "t_final": t_final,
+        "T_right": 300.0,
+        "a": float(x_np[0]),
+        "b": float(x_np[-1]),
+        "c": float(y_np[0]),
+        "d": float(y_np[-1]),
+        "t_on": float(forcing_cfg.get("t_on", 0.0)),
+        "t_off": float(forcing_cfg.get("t_off", 0.2)),
+        "phase": float(forcing_cfg.get("phase", 0.0)),
+        "tukey_alpha": float(forcing_cfg.get("tukey_alpha", 0.5)),
+    }
+    source_edges = transition.get(
+        "source_edges", [0.0, 0.075, 0.15, 0.225, 0.30],
+    )
+    lead_edges = transition.get(
+        "lead_edges", [0.0, 0.05, 0.10, 0.20, 0.30],
+    )
+    last_loss = float("nan")
+    last_defect = float("nan")
+    latest_counterfactual = {
+        "in_window_forcing_swap_rms_K": float("nan"),
+        "source_state_swap_rms_K": float("nan"),
+        "forcing_response_ratio": float("nan"),
+        "source_departure_ratio": float("nan"),
+    }
+    while completed_updates < total_updates:
+        should_resample = (
+            active_descriptors is None
+            or _should_resample_online_batch(
+                completed_updates,
+                int(warmup["steps"]),
+                int(warmup["resample_every"]),
+            )
+        )
+        if should_resample:
+            active_descriptors = _sample_online_problem_descriptors(
+                problem,
+                online_rngs,
+                sim_batch,
+                grids,
+                time_cfg,
+            )
+            active_source_steps, active_source_bins = (
+                sample_transition_source_steps(
+                    online_rngs.numpy["fv_intervals"],
+                    batch_size=sim_batch,
+                    dt=dt,
+                    t_final=t_final,
+                    source_edges=source_edges,
+                )
+            )
+            active_intervals = sample_transition_physics_intervals(
+                online_rngs.numpy["fv_intervals"],
+                source_steps=active_source_steps,
+                dt=dt,
+                t_final=t_final,
+                lead_edges=lead_edges,
+                include_anchor_interval=True,
+                intervals_per_cell=intervals_per_cell,
+                consecutive_intervals=consecutive,
+            )
+        records = _materialize_online_records(
+            active_descriptors, X, Y, T_right=300.0, b=float(x_np[-1]),
+        )
+        physical_source, normalized, _ = _normalized_online_ic_buffer(
+            records, mu, sigma,
+        )
+        if source_coverage is None:
+            source_coverage = _transition_source_coverage(
+                physical_source, data, fast_records,
+            )
+        source_fields = torch.from_numpy(normalized).unsqueeze(1).to(device)
+        optimizer.zero_grad(set_to_none=True)
+        max_lead = transition_curriculum_max_lead(
+            completed_updates, total_updates, t_final,
+        )
+        interval_mask = (
+            (active_intervals["start_step"] + 1).to(dtype=torch.float64)
+            * float(dt)
+            <= max_lead + 1.0e-12
+        )
+        training_intervals = {
+            key: value[interval_mask]
+            for key, value in active_intervals.items()
+        }
+        result = forcing_transition_physics_loss(
+            model=model,
+            source_fields=source_fields,
+            params=records,
+            source_steps=np.asarray(active_source_steps, dtype=np.int64),
+            source_bins=np.asarray(active_source_bins, dtype=np.int64),
+            intervals=training_intervals,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            y_img=y_img,
+            nt_img=nt_img,
+            a_ref=a_ref,
+            t_ramp=t_ramp,
+            t_final=t_final,
+            dt=dt,
+            sigma_global=sigma,
+            right_value=right_value,
+            objective=selected_objective,
+            causal_epsilon=causal_epsilon,
+            query_chunk=query_chunk,
+        )
+        if not bool(result["finite"]):
+            _atomic_torch_save(checkpoint_payload(), run_dir / "failed_batch.pt")
+            raise FloatingPointError("non-finite physics transition objective")
+        if raw_gradnorm is not None:
+            raw_terms = result["raw_terms"]
+            multipliers = raw_gradnorm.maybe_update(
+                raw_terms, model.parameters(),
+            )
+            loss = sum(
+                float(multipliers[name]) * raw_terms[name]
+                for name in raw_terms
+            )
+        else:
+            loss = result["loss"]
+        loss.backward()
+        if not all(
+            parameter.grad is None
+            or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        ):
+            _atomic_torch_save(checkpoint_payload(), run_dir / "failed_batch.pt")
+            raise FloatingPointError("non-finite physics transition gradient")
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=grad_clip,
+            )
+        optimizer.step()
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        completed_updates += 1
+        if completed_updates % updates_per_epoch == 0:
+            _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        last_loss = float(loss.detach().cpu())
+        last_defect = float(result["physical_defect_mse"].detach().cpu())
+
+        do_counterfactual = (
+            completed_updates % anti_collapse_every == 0
+            or completed_updates == total_updates
+        )
+        if do_counterfactual:
+            model.eval()
+            latest_counterfactual = transition_counterfactual_diagnostics(
+                model,
+                data,
+                sim_params,
+                fast_records,
+                y_img=y_img,
+                nt_img=nt_img,
+                a_ref=a_ref,
+                t_ramp=t_ramp,
+                device=device,
+                query_chunk=query_chunk,
+            )
+        do_validation = (
+            completed_updates % validate_every == 0
+            or completed_updates == total_updates
+        )
+        validation = None
+        screen_metrics = None
+        if do_validation:
+            model.eval()
+            validation = validate_forcing_transition(
+                model,
+                data,
+                sim_params,
+                fast_records,
+                y_img=y_img,
+                nt_img=nt_img,
+                a_ref=a_ref,
+                t_ramp=t_ramp,
+                device=device,
+                sim_batch=val_batch,
+                query_chunk=query_chunk,
+                signal_floor_fraction=float(
+                    transition.get("increment_signal_floor_sigma", 0.01)
+                ),
+            )
+            screen_metrics = _transition_validation_screen_metrics(
+                validation,
+                direct_gate,
+                sigma_global=sigma,
+                anti_collapse_passed=bool(
+                    latest_counterfactual["forcing_response_ratio"] is not None
+                    and latest_counterfactual["source_departure_ratio"] is not None
+                    and float(latest_counterfactual[
+                        "forcing_response_ratio"
+                    ]) >= 0.10
+                    and float(latest_counterfactual[
+                        "source_departure_ratio"
+                    ]) >= 0.10
+                ),
+                defect_passed=math.isfinite(last_defect),
+            )
+            screen_records[completed_updates] = {
+                "overall_skill": float(screen_metrics["overall_skill"]),
+                "long_skill": float(screen_metrics["long_skill"]),
+            }
+            metric = float(validation["macro_cell_gnrmse"])
+            if metric < best_metric:
+                best_metric = metric
+                best_update = completed_updates
+                best_validation = copy.deepcopy(validation)
+                _atomic_torch_save(checkpoint_payload(), best_path)
+            if completed_updates == collapse_update:
+                collapse_detected_at_500 = bool(
+                    screen_metrics["overall_skill"] <= 0.0
+                    or screen_metrics["long_skill"] <= 0.0
+                    or validation.get("copy_skill") is None
+                    or float(validation["copy_skill"]) <= 0.0
+                    or not math.isfinite(
+                        float(latest_counterfactual[
+                            "in_window_forcing_swap_rms_K"
+                        ])
+                    )
+                    or float(latest_counterfactual[
+                        "in_window_forcing_swap_rms_K"
+                    ]) <= 0.0
+                    or latest_counterfactual["forcing_response_ratio"] is None
+                    or float(latest_counterfactual[
+                        "forcing_response_ratio"
+                    ]) < 0.10
+                    or latest_counterfactual["source_departure_ratio"] is None
+                    or float(latest_counterfactual[
+                        "source_departure_ratio"
+                    ]) < 0.10
+                )
+        row = {
+            "update": completed_updates,
+            "loss": last_loss,
+            "physical_defect_mse": last_defect,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "fast_target_gnrmse": (
+                "" if validation is None else validation["target_gnrmse"]
+            ),
+            "fast_copy_gnrmse": (
+                "" if validation is None else validation["copy_gnrmse"]
+            ),
+            "overall_skill": (
+                "" if screen_metrics is None
+                else screen_metrics["overall_skill"]
+            ),
+            "long_skill": (
+                "" if screen_metrics is None else screen_metrics["long_skill"]
+            ),
+            "copy_skill": (
+                "" if validation is None else validation["copy_skill"]
+            ),
+            "forcing_swap_rms_K": latest_counterfactual[
+                "in_window_forcing_swap_rms_K"
+            ],
+            "source_swap_rms_K": latest_counterfactual[
+                "source_state_swap_rms_K"
+            ],
+            "forcing_response_ratio": latest_counterfactual[
+                "forcing_response_ratio"
+            ],
+            "source_departure_ratio": latest_counterfactual[
+                "source_departure_ratio"
+            ],
+            "low_frequency_long_lead_drift": (
+                "" if screen_metrics is None
+                else screen_metrics["low_frequency_long_lead_drift"]
+            ),
+        }
+        with metrics_path.open("a", newline="") as stream:
+            csv.DictWriter(stream, fieldnames=fields).writerow(row)
+        if (
+            completed_updates % save_every == 0
+            or completed_updates == total_updates
+        ):
+            _atomic_torch_save(checkpoint_payload(), latest_path)
+        if collapse_detected_at_500:
+            _atomic_torch_save(checkpoint_payload(), latest_path)
+            break
+
+    screen_decision = None
+    if screen_enabled:
+        if collapse_detected_at_500:
+            screen_decision = {
+                "passed": False,
+                "reason": "collapse_at_update_500",
+                "finite": True,
+            }
+        else:
+            screen_decision = transition_production_screen_decision(
+                screen_records,
+                minimum_improvement=minimum_skill_improvement,
+            )
+    if not best_path.exists():
+        _atomic_torch_save(checkpoint_payload(), best_path)
+    best_checkpoint = torch.load(
+        best_path, map_location="cpu", weights_only=False,
+    )
+    model.load_state_dict(best_checkpoint["model_state"])
+    final_payload = checkpoint_payload()
+    final_payload["screen_decision"] = screen_decision
+    _atomic_torch_save(final_payload, final_path)
+    unexpected_failure = bool(
+        screen_decision is not None and not screen_decision["passed"]
+    )
+    summary = {
+        "seed": seed,
+        "stage": "production_distribution_screen",
+        "objective": "physics_only_transition",
+        "selected_physics_objective": selected_objective,
+        "completed_updates": completed_updates,
+        "best_fast_validation_metric": best_metric,
+        "best_checkpoint_update": best_update,
+        "best_validation": best_validation,
+        "screen_decision": screen_decision,
+        "unexpected_screen_failure": unexpected_failure,
+        "collapse_detected_at_500": collapse_detected_at_500,
+        "next_action": (
+            "run_20x20_16_source_mini_operator"
+            if unexpected_failure else "production_screen_passed"
+        ),
+        "source_distribution_coverage": source_coverage,
+        "counterfactual_diagnostics": latest_counterfactual,
+        "direct_state_gate_sha256": direct_hash,
+        "network_gate_sha256": network_hash,
+        "network_gate_budget": int(network_gate["matched_budget"]),
+        "consecutive_intervals": consecutive,
+        "gradnorm_mode": compatibility["gradnorm_mode"],
+        "optimization_uses_solution_fields": False,
+        "normalization_uses_training_trajectories": True,
+        "checkpoint_selection_uses_validation_targets": True,
+        "direct_state_gate_uses_fv_reference_solutions": True,
+        "network_gate_uses_supervised_capacity_baseline": True,
+        "physics_only_claim_scope": "optimization_objective",
+        "test_set_evaluated": False,
+    }
+    _atomic_text(json.dumps(summary, indent=2) + "\n", summary_path)
+    _atomic_text("complete\n", complete_path)
+    return summary
+
+
 def run_config_seeds_pino(
     config: dict, base_run_dir: Path, seeds: list[int]
 ) -> dict[str, Any]:
@@ -10235,28 +13258,39 @@ def run_config_seeds_pino(
     # InterfaceCViT paths; the constant-IC single-material forcing benchmark
     # (diffusion_forcing) trains a ForcingCViT on an
     # online-sampled forcing image; the varying-IC single-slab benchmark
-    # (diffusion_forcing_single) trains a two-branch ForcingICCViT that also
-    # encodes the sampled IC field. Its active loss weights select either online
-    # physics or saved-data-only supervision; every other benchmark uses the
-    # IC-conditioned diffusion CViT path.
+    # (diffusion_forcing_single) defaults to the two-branch ForcingICCViT and
+    # exposes the causal transition variant as an explicit opt-in; every other
+    # benchmark uses the IC-conditioned diffusion CViT path.
     bench = str(config.get("benchmark", {}).get("name", "diffusion"))
     if bench == "diffusion_forcing_single":
-        # The runner hardcodes variant="forcing_ic"; an old ForcingCViT config
-        # (variant "forcing") routed here would silently ignore the varying IC.
-        # Refuse any explicitly declared variant that is not "forcing_ic".
         declared = (config.get("training", {}).get("pino", {}) or {}).get("variant")
-        if declared is not None and str(declared) != "forcing_ic":
+        declared = "forcing_ic" if declared is None else str(declared)
+        if declared not in {"forcing_ic", "forcing_transition"}:
             raise ValueError(
-                "benchmark=diffusion_forcing_single trains a two-branch "
-                "ForcingICCViT (varying IC); training.pino.variant must be "
-                f"'forcing_ic' but the config declares {declared!r}. An old "
-                "ForcingCViT ('forcing') config would ignore the sampled IC."
+                "benchmark=diffusion_forcing_single requires "
+                "training.pino.variant='forcing_ic' or "
+                f"'forcing_transition', got {declared!r}."
             )
-        forcing_ic_mode, _ = _forcing_ic_training_mode(
-            config["training"]["pino"],
-        )
+        if declared == "forcing_transition":
+            forcing_ic_mode = "transition"
+            transition_objective = str(
+                (
+                    config["training"]["pino"].get("transition", {}) or {}
+                ).get("objective", "supervised")
+            )
+            if transition_objective not in {"supervised", "physics_only"}:
+                raise ValueError(
+                    "training.pino.transition.objective must be "
+                    "'supervised' or 'physics_only'"
+                )
+        else:
+            forcing_ic_mode, _ = _forcing_ic_training_mode(
+                config["training"]["pino"],
+            )
+            transition_objective = None
     else:
         forcing_ic_mode = None
+        transition_objective = None
     pino_cfg = (config.get("training", {}).get("pino", {}) or {})
     interfaces_mode = str(pino_cfg.get("mode", "collapse"))
     if bench == "interfaces" and interfaces_mode not in ("collapse", "one_step"):
@@ -10278,9 +13312,17 @@ def run_config_seeds_pino(
         run_one_seed_forcing_interface_pino if bench == "forcing"
         else interfaces_runner if bench == "interfaces"
         else (
-            run_one_seed_forcing_ic_supervised
-            if forcing_ic_mode == "supervised"
-            else run_one_seed_forcing_ic_pino
+            (
+                run_one_seed_forcing_transition_physics
+                if transition_objective == "physics_only"
+                else run_one_seed_forcing_transition
+            )
+            if forcing_ic_mode == "transition"
+            else (
+                run_one_seed_forcing_ic_supervised
+                if forcing_ic_mode == "supervised"
+                else run_one_seed_forcing_ic_pino
+            )
         ) if bench == "diffusion_forcing_single"
         else run_one_seed_forcing_pino if bench == "diffusion_forcing"
         else run_one_seed_pino
@@ -10300,6 +13342,19 @@ __all__ = [
     "sample_collocation",
     "sample_forcing_params",
     "build_forcing_image",
+    "build_forcing_transition_image",
+    "load_verified_transition_gate",
+    "transition_screen_skill",
+    "transition_consecutive_interval_trigger",
+    "transition_production_screen_decision",
+    "sample_transition_source_steps",
+    "transition_curriculum_max_lead",
+    "sample_transition_physics_intervals",
+    "forcing_transition_physics_loss",
+    "TransitionPairSchedule",
+    "transition_epoch_order",
+    "transition_manifest_hash",
+    "write_transition_manifest",
     "left_wall_qL",
     "load_diffusion_data",
     "build_ic_batch",
@@ -10317,12 +13372,18 @@ __all__ = [
     "validate_forcing_ic_supervised_dataset",
     "build_cvit",
     "forcing_ic_supervised_data_loss",
+    "transition_pair_metrics",
+    "aggregate_transition_metrics",
+    "validate_forcing_transition",
+    "transition_counterfactual_diagnostics",
     "load_interface_cvit_checkpoint",
     "run_one_seed_forcing_interface_pino",
     "run_one_seed_pino",
     "run_one_seed_forcing_pino",
     "run_one_seed_forcing_ic_pino",
     "run_one_seed_forcing_ic_supervised",
+    "run_one_seed_forcing_transition",
+    "run_one_seed_forcing_transition_physics",
     "run_one_seed_interfaces_pino",
     "run_one_seed_interfaces_one_step_pino",
     "validate_interfaces_one_step_gnrmse",

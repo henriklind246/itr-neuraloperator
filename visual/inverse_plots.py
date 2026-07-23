@@ -1,12 +1,13 @@
 """Inverse-problem paper figures (registry group ``inverse``).
 
-A single generic template renders a coherent "Core 4" set for *both* inversion
+A single generic template renders a coherent "Core 4" set for the inversion
 benchmarks so they read as siblings (same layout / style / palette), differing
 only in parameter dimensionality and the lead deliverable:
 
 - ``forcing``    — scalar interface resistance ``R_c`` (theta_dim=1; lead = R_c).
+- ``forcing_itr`` — forcing plus a Gaussian spatial ITR profile.
 - ``source_itr`` — Gaussian-void profile ``(R_base, R_amp, y0, sigma)``
-  (theta_dim=4; lead = ``excess_int`` = void severity). ``R_amp``/``sigma`` are
+  (theta_dim=4; lead = ``S_R`` = integrated excess resistance). ``R_amp``/``sigma`` are
   individually non-identifiable; severity is the well-conditioned quantity.
 
 The four functions branch only on the :class:`InversePlotSpec` (column names,
@@ -23,7 +24,7 @@ units (``0.5*mean((a-b)^2)``); Fig 3 plots ``RMS = sqrt(2*half-MSE)``.
 """
 
 import csv as _csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -39,6 +40,7 @@ from visual._common import PLOT_STYLE, _save_figure
 # Okabe-Ito, matched to visual/paper_plots.py so a benchmark keeps its color.
 _BENCHMARK_COLORS = {
     "forcing": "#0072B2",     # blue
+    "forcing_itr": "#D55E00", # vermillion
     "source_itr": "#CC79A7",  # reddish purple
 }
 
@@ -151,7 +153,7 @@ SOURCE_ITR_SPEC = InversePlotSpec(
         "R_base": "R_base_abserr", "R_amp": "R_amp_abserr",
         "y0": "y0_abserr", "sigma": "sigma_abserr",
     },
-    lead_name="excess_int",
+    lead_name="S_R",
     lead_hat_col="excess_int_hat",
     lead_true_col="excess_int_true",
     lead_abserr_col="excess_int_abserr",
@@ -184,7 +186,17 @@ SOURCE_ITR_SPEC = InversePlotSpec(
 )
 
 
-_SPECS = {"forcing": FORCING_SPEC, "source_itr": SOURCE_ITR_SPEC}
+FORCING_ITR_SPEC = replace(
+    SOURCE_ITR_SPEC,
+    benchmark="forcing_itr",
+    color=_BENCHMARK_COLORS["forcing_itr"],
+)
+
+_SPECS = {
+    "forcing": FORCING_SPEC,
+    "forcing_itr": FORCING_ITR_SPEC,
+    "source_itr": SOURCE_ITR_SPEC,
+}
 
 
 def spec_for(benchmark: str) -> InversePlotSpec:

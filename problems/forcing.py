@@ -421,10 +421,16 @@ class ForcingProblem(ProblemSpec):
             profiles[int(sim_id)] = np.asarray(s_vec, dtype=np.float32)
         ds.s_y_profiles = profiles
 
-    def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
+    def _build_item_with_resistance(
+        self,
+        ds,
+        sid: int,
+        s: int,
+        j: int,
+        R_c: float,
+    ) -> dict[str, np.ndarray]:
         sid = int(sid)
         params = ds.sim_params[sid]
-        R_c = float(params["R_c"])
         spatial_family = params["spatial_family"]
         spatial_params = params["spatial_params"]
 
@@ -498,6 +504,12 @@ class ForcingProblem(ProblemSpec):
             "Y": Y,
             "T_stats": T_stats,
         }
+
+    def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
+        params = ds.sim_params[int(sid)]
+        return self._build_item_with_resistance(
+            ds, sid, s, j, R_c=float(params["R_c"])
+        )
 
     # ---- val-pair logging ----
 

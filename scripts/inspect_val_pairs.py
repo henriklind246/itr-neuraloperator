@@ -35,6 +35,7 @@ LEAD_BINS = 12
 BASE_COND_COLS = ["t_s", "t_bar", "R_c"]
 BENCHMARK_COND_COLS = {
     "forcing": [],
+    "forcing_itr": ["R_c_amp", "R_c_sigma", "S_R"],
     "interfaces": ["interface_x"],
     "source": ["x_h", "y_h", "A"],
     "source_itr": ["x_h", "y_h", "A"],
@@ -192,7 +193,9 @@ def report_xh_deciles(latest: pd.DataFrame, benchmark: str) -> None:
 
 def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
     print(f"\n=== 4. Structure breakdown for benchmark={benchmark!r} (final epoch) ===")
-    if benchmark == "forcing" and {"temporal_family", "spatial_family"} <= set(latest.columns):
+    if benchmark in ("forcing", "forcing_itr") and {
+        "temporal_family", "spatial_family"
+    } <= set(latest.columns):
         agg = latest.groupby(["temporal_family", "spatial_family"])["rel_l2"].agg(
             ["mean", "median", "count"]
         )
@@ -465,7 +468,7 @@ def plot_interface_ratio(latest: pd.DataFrame, out: Path) -> None:
 
 def plot_structure(latest: pd.DataFrame, benchmark: str, out: Path) -> None:
     """Benchmark-specific final plot (the 5th figure)."""
-    if benchmark == "forcing":
+    if benchmark in ("forcing", "forcing_itr"):
         _plot_ic_family_heatmap(latest, out)
     elif benchmark == "interfaces":
         _plot_error_vs_interface_x(latest, out)

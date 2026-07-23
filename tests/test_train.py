@@ -354,6 +354,7 @@ class TestValidate:
             "R_c_amp",
             "R_c_y0",
             "R_c_sigma",
+            "S_R",
             "ic_family",
         }
         assert {int(row["epoch"]) for row in rows} == {7}

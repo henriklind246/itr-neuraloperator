@@ -23,6 +23,7 @@ from src.physics.internal_source import (
     RC_MIN,
     RC_VOID_RANGES,
     R_PEAK_MAX,
+    interface_control_volume_weights,
     make_rc_void_profile,
     make_sin2_pulse,
 )
@@ -115,21 +116,19 @@ def build_cond_vector_itr(
 def _void_unit_severity(y0: float, sigma: float, y_grid: np.ndarray) -> float:
     """Integrated unit void shape int exp(-((y - y0)/sigma)^2) dy over `y_grid`.
 
-    Trapezoidal on the actual cell-center grid so the integral matches the
-    discretization the solver sees (a tiny sigma is honestly under-integrated at
-    coarse Ny rather than evaluated against an idealized continuum). The result
-    is strictly positive for sigma > 0, so it is a safe denominator when solving
-    R_amp to hold integrated severity fixed.
+    Uses the FV interface control-volume weights, so boundary-inclusive and
+    cell-centered grids both match the resistance entries seen by the solver.
     """
     y = np.asarray(y_grid, dtype=np.float64)
     shape = np.exp(-(((y - float(y0)) / float(sigma)) ** 2))
-    return float(np.trapz(shape, y))
+    weights = interface_control_volume_weights(y, (0.0, 1.0))
+    return float(np.sum(weights * shape))
 
 
 def _void_severity(
     R_amp: float, y0: float, sigma: float, y_grid: np.ndarray,
 ) -> float:
-    """Integrated void conductance deficit R_amp * int exp(...) dy on `y_grid`."""
+    """Integrated excess resistance R_amp * int exp(...) dy on `y_grid`."""
     return float(R_amp) * _void_unit_severity(y0, sigma, y_grid)
 
 

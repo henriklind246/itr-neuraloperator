@@ -9,14 +9,9 @@
 # initial condition is sampled per sim across all four IC families (uniform_2d,
 # random_sinusoid_2d, grf_2d, hot_spot_2d) instead of a fixed uniform 300 K field.
 #
-# A varying IC is invisible in the forcing image, so the surrogate is a two-branch
-# ForcingICCViT (variant forcing_ic): one encoder over the forcing space-time
-# image, a second over the per-sim IC field, fused in the decoder cross-attention.
-# The default remains physics-only (PINO), with a selectable autodiff or
-# finite-volume residual and an IC anchor targeting the SAMPLED T0. A strict
-# supervised-only runner is selected when lambda_data > 0 and every physics
-# weight is zero; it trains from the saved single-family FV trajectories and
-# never invokes the online sampler.
+# The default surrogate remains the two-branch ForcingICCViT (variant
+# forcing_ic). The supervised causal transition operator is an explicit opt-in
+# via variant forcing_transition.
 
 benchmark:
   name: diffusion_forcing_single
@@ -47,9 +42,8 @@ training:
     # targets from the same transferred normalized IC buffer seen by the encoder.
     n_ic_points: 1024
   pino:
-    # The two-branch ForcingICCViT is the only compatible surrogate; the dispatch
-    # asserts this so an old ForcingCViT ("forcing") config cannot silently ignore
-    # the varying IC.
+    # Backward-compatible default. Set forcing_transition explicitly for the
+    # supervised source-state transition formulation.
     variant: forcing_ic
     # Select "finite_volume" for full-grid solver-lattice CN collocation.
     residual_method: autodiff
@@ -57,6 +51,7 @@ training:
     # it with the two homogeneous adiabatic walls.
     lambda_bc_left: 1.0
     forcing:
+      ny_img: 96
       # Lock the online training sampler to the single sin/uniform family so it
       # matches the pinned single-family FV validation set.
       temporal_family: sin

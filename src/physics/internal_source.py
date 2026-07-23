@@ -157,7 +157,7 @@ def make_rc_void_profile(
 ) -> np.ndarray:
     """Return the (Ny,) Gaussian-void interface-resistance profile R_c(y).
 
-    Evaluated at the cell-center coordinates `y_grid`:
+    Evaluated at the interface-row coordinates `y_grid`:
         R_c(y) = R_base + R_amp * exp(-((y - y0) / sigma)^2).
     With R_amp = 0 this returns a flat R_base profile (used by the parity /
     regression tests). Returns float64 so it feeds the solver's series-resistance
@@ -167,3 +167,62 @@ def make_rc_void_profile(
         raise ValueError(f"sigma must be positive, got {sigma}.")
     y = np.asarray(y_grid, dtype=np.float64)
     return R_base + R_amp * np.exp(-(((y - y0) / sigma) ** 2))
+
+
+def interface_control_volume_weights(
+    y_grid: np.ndarray,
+    bounds: tuple[float, float],
+) -> np.ndarray:
+    """Return FV dual-control-volume widths associated with interface rows."""
+    y = np.asarray(y_grid, dtype=np.float64)
+    c, d = map(float, bounds)
+    if y.ndim != 1 or y.size < 2:
+        raise ValueError("y_grid must be a one-dimensional array with at least two entries.")
+    if not np.all(np.diff(y) > 0.0):
+        raise ValueError("y_grid must be strictly increasing.")
+    if y[0] < c or y[-1] > d:
+        raise ValueError("y_grid entries must lie inside the supplied domain bounds.")
+
+    edges = np.empty(y.size + 1, dtype=np.float64)
+    edges[1:-1] = 0.5 * (y[:-1] + y[1:])
+    edges[0] = c
+    edges[-1] = d
+    weights = np.diff(edges)
+    if np.any(weights <= 0.0):
+        raise ValueError("y_grid and bounds do not define positive control-volume widths.")
+    return weights
+
+
+def integrated_excess_resistance(
+    y_grid: np.ndarray,
+    Rc_profile: np.ndarray,
+    R_base: float,
+    *,
+    bounds: tuple[float, float],
+) -> float:
+    """FV-quadrature estimate of the integrated excess resistance S_R."""
+    Rc = np.asarray(Rc_profile, dtype=np.float64)
+    weights = interface_control_volume_weights(y_grid, bounds)
+    if Rc.shape != weights.shape:
+        raise ValueError(
+            f"Rc_profile must have shape {weights.shape}, got {Rc.shape}."
+        )
+    return float(np.sum(weights * (Rc - float(R_base))))
+
+
+def equivalent_scalar_resistance(
+    y_grid: np.ndarray,
+    Rc_profile: np.ndarray,
+    *,
+    bounds: tuple[float, float],
+) -> float:
+    """Conductance-matched scalar resistance on a general y-domain."""
+    Rc = np.asarray(Rc_profile, dtype=np.float64)
+    weights = interface_control_volume_weights(y_grid, bounds)
+    if Rc.shape != weights.shape:
+        raise ValueError(
+            f"Rc_profile must have shape {weights.shape}, got {Rc.shape}."
+        )
+    if np.any(Rc <= 0.0):
+        raise ValueError("Rc_profile must be strictly positive.")
+    return float(np.sum(weights) / np.sum(weights / Rc))

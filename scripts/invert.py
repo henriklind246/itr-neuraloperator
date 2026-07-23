@@ -1,4 +1,4 @@
-"""Benchmark-adapter inverse solver for source_itr and forcing.
+"""Benchmark-adapter inverse solver for source_itr, forcing, and forcing_itr.
 
 For a real forcing checkpoint + held-out sims, run:
 
@@ -7,7 +7,7 @@ For a real forcing checkpoint + held-out sims, run:
 Use the *frozen forward FNO* as a
 differentiable surrogate to recover inverse parameters
 
-    source_itr: theta = (R_base, R_amp, y0, sigma)
+    source_itr / forcing_itr: theta = (R_base, R_amp, y0, sigma)
     forcing:    theta = (R_c,)
 
 from observed temperatures, via a MAP / least-squares fit. The forward code is
@@ -33,16 +33,15 @@ What Stages 1-5 do (deliberately narrow):
     estimate ``theta_hat`` with the **real** ``FVSolver2D`` (rebuilt via
     ``ds.problem.configure_solver`` so the operator is bit-identical to data
     generation: k=3/35 layers, q_left=0, the patch source, ``interface_R=[Rc(y)]``),
-    report the FV sensor residual and the **theta-local** FNO-vs-FV discrepancy
-    ``C_FNO(theta_hat)`` (a single-point, signal-correlated surrogate error — used
-    for conservative interval *inflation* later, not a calibrated covariance, and
-    never a population diagonal), and optionally **polish** ``theta_hat`` against
+    report the FV sensor residual and the theta-local FNO-vs-FV discrepancy as a
+    post-hoc diagnostic only, and optionally **polish** ``theta_hat`` against
     the FV sensor residual with derivative-free Nelder-Mead (the FV solve is not
     autodiff). Cheap because it starts from the FNO MAP.
   * measurement noise + uncertainty quantification (Stage 5): iid Gaussian
-    sensor noise is added to the observations, and the per-scalar measurement
-    variance is inflated to ``C_total = C_meas + C_FNO(theta_hat)`` (the Stage-4
-    theta-local discrepancy). UQ is led by an interval on the well-conditioned
+    sensor noise is added once to the observations, and every likelihood stage
+    uses the same frozen validation-calibrated variance
+    ``sigma_eff^2 = sigma_meas^2 + sigma_FNO,cal^2``. UQ is led by an interval on
+    the well-conditioned
     integrated void *severity* (excess-resistance integral), via two primary
     routes: a **profile likelihood** (frequentist, Wilks interval over the
     R_amp/sigma ridge or the R_amp~0 boundary) and a **short RW-Metropolis
@@ -65,12 +64,10 @@ real ``problem.build_item(ds, sid, s=0, j=n)`` so the scaffolding cannot drift
 from training. Only channel 4 and cond[2:6] are replaced by torch functions of
 theta, so autograd produces dT/dtheta through the frozen model.
 
-Honesty caveats that the writeup must keep: the profile / MCMC intervals are
-*conditional on* the inflated ``C_total``, which is a single-/few-point,
-signal-correlated surrogate-error estimate, not a calibrated covariance; and the
-recoverable quantity under sparse / far-field sensing is the integrated severity,
-not the individual R_amp/sigma shape scalars (the Laplace diagnostic exists to
-make that degeneracy explicit rather than hide it).
+The profile / MCMC intervals are conditional on one frozen global calibration
+scale, not a test-case oracle covariance. The recoverable quantity under sparse
+sensing is the integrated excess resistance S_R, not necessarily the individual
+R_amp/sigma shape scalars.
 """
 
 from __future__ import annotations
@@ -78,6 +75,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -103,6 +101,8 @@ from scripts.inverse_adapters import (  # noqa: E402
 from src.operators.fno2d import FNO2d  # noqa: E402
 
 _SOURCE_ITR_ADAPTER = SourceItrAdapter()
+PAPER_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
+PAPER_SENSOR_Y = tuple(np.linspace(0.1, 0.9, 8))
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +136,97 @@ def theta_to_rc_channel(
 # Sensor operator M (Stage 2): a sparse, interface-proximal pixel mask.
 # ---------------------------------------------------------------------------
 
+def resolve_observation_times(
+    t_grid: np.ndarray,
+    requested_times: list[float] | tuple[float, ...],
+    *,
+    atol: float = 1e-8,
+) -> tuple[list[int], np.ndarray]:
+    """Resolve physical observation times without interpolation or substitution."""
+    grid = np.asarray(t_grid, dtype=np.float64)
+    indices: list[int] = []
+    resolved: list[float] = []
+    for requested in requested_times:
+        matches = np.flatnonzero(
+            np.isclose(grid, float(requested), rtol=0.0, atol=float(atol))
+        )
+        if matches.size != 1:
+            nearest = float(grid[int(np.argmin(np.abs(grid - float(requested))))])
+            raise ValueError(
+                f"requested observation time {float(requested):g} is not uniquely "
+                f"present in t_grid within atol={atol:g}; nearest is {nearest:g}."
+            )
+        idx = int(matches[0])
+        if idx == 0:
+            raise ValueError("observation times must be later than the source IC time.")
+        indices.append(idx)
+        resolved.append(float(grid[idx]))
+    return indices, np.asarray(resolved, dtype=np.float64)
+
+
+def resolve_sensor_y(
+    y_grid: np.ndarray,
+    requested_y: list[float] | tuple[float, ...] | np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve requested physical y coordinates to the nearest grid entries."""
+    y = np.asarray(y_grid, dtype=np.float64)
+    requested = np.asarray(requested_y, dtype=np.float64)
+    indices = np.empty(requested.size, dtype=np.int64)
+    resolved = np.empty(requested.size, dtype=np.float64)
+    for k, value in enumerate(requested):
+        idx = int(np.argmin(np.abs(y - value)))
+        if idx == 0:
+            local = y[1] - y[0]
+        elif idx == y.size - 1:
+            local = y[-1] - y[-2]
+        else:
+            local = min(y[idx] - y[idx - 1], y[idx + 1] - y[idx])
+        if abs(float(y[idx]) - float(value)) > 0.5 * float(local) + 1e-12:
+            raise ValueError(
+                f"requested sensor y={value:g} is farther than half a local grid "
+                f"spacing from the nearest location {float(y[idx]):g}."
+            )
+        indices[k] = idx
+        resolved[k] = y[idx]
+    if np.unique(indices).size != indices.size:
+        raise ValueError("requested y sensors resolve to duplicate grid locations.")
+    return indices, resolved
+
+
+def interface_pair_columns(
+    x_grid: np.ndarray, interface_x: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the grid indices and coordinates immediately bracketing an interface."""
+    x = np.asarray(x_grid, dtype=np.float64)
+    left = np.flatnonzero(x < float(interface_x))
+    right = np.flatnonzero(x > float(interface_x))
+    if left.size == 0 or right.size == 0:
+        raise ValueError("interface must lie strictly between two x-grid locations.")
+    indices = np.array([int(left[-1]), int(right[0])], dtype=np.int64)
+    return indices, x[indices]
+
+
+def build_interface_pair_mask(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    *,
+    interface_x: float = 0.5,
+    requested_y: list[float] | tuple[float, ...] | np.ndarray = PAPER_SENSOR_Y,
+) -> tuple[torch.Tensor, dict[str, np.ndarray]]:
+    """Build the paired left/right interface-adjacent physical sensor mask."""
+    x_indices, resolved_x = interface_pair_columns(x_grid, interface_x)
+    y_indices, resolved_y = resolve_sensor_y(y_grid, requested_y)
+    mask = np.zeros((len(x_grid), len(y_grid)), dtype=bool)
+    mask[np.ix_(x_indices, y_indices)] = True
+    metadata = {
+        "requested_y": np.asarray(requested_y, dtype=np.float64),
+        "resolved_y": resolved_y,
+        "y_indices": y_indices,
+        "x_indices": x_indices,
+        "resolved_x": resolved_x,
+    }
+    return torch.from_numpy(mask), metadata
+
 def build_interface_sensor_mask(
     x_grid: np.ndarray,
     y_grid: np.ndarray,
@@ -143,6 +234,7 @@ def build_interface_sensor_mask(
     interface_x: float = 0.5,
     x_halfwidth: float = 0.05,
     n_y: int = 8,
+    requested_y: Optional[list[float] | tuple[float, ...] | np.ndarray] = None,
 ) -> torch.Tensor:
     """Boolean ``(Nx, Ny)`` mask of interface-proximal sensor pixels.
 
@@ -164,7 +256,9 @@ def build_interface_sensor_mask(
         col_sel = np.zeros(Nx, dtype=bool)
         col_sel[int(np.argmin(np.abs(x - interface_x)))] = True
 
-    if n_y >= Ny:
+    if requested_y is not None:
+        row_idx, _ = resolve_sensor_y(y, requested_y)
+    elif n_y >= Ny:
         row_idx = np.arange(Ny)
     else:
         row_idx = np.unique(np.linspace(0, Ny - 1, n_y).round().astype(int))
@@ -294,6 +388,9 @@ def build_dataset_from_dir(
         ramp_seconds=ramp_seconds,
     )
     ds._split_ids = {"train": train_ids, "val": val_ids, "test": test_ids}
+    required_times = getattr(problem, "required_observation_times", ())
+    if required_times:
+        resolve_observation_times(ds.t_grid, required_times)
     return ds
 
 
@@ -321,6 +418,16 @@ class ObservationSet:
     Nx: int
     theta_true: Optional[torch.Tensor] = None  # (theta_dim,) physical, if known
     mask: Optional[torch.Tensor] = None  # bool (Nx, Ny) sensor pixels; None=full-field
+    observation_times: Optional[np.ndarray] = None
+    sensor_layout: str = "full_field"
+    requested_y: Optional[np.ndarray] = None
+    resolved_y: Optional[np.ndarray] = None
+    y_indices: Optional[np.ndarray] = None
+    resolved_x: Optional[np.ndarray] = None
+    interface_x: float = 0.5
+    sensor_x_halfwidth: Optional[float] = None
+    noise_seed: Optional[int] = None
+    noise_std: float = 0.0
 
 
 def build_observation_set(
@@ -333,6 +440,9 @@ def build_observation_set(
     interface_x: float = 0.5,
     sensor_x_halfwidth: Optional[float] = None,
     sensor_n_y: int = 8,
+    sensor_layout: Optional[str] = None,
+    sensor_y: Optional[list[float] | tuple[float, ...] | np.ndarray] = None,
+    observation_times: Optional[np.ndarray] = None,
 ) -> ObservationSet:
     """Assemble direct-from-IC observations for ``sid`` at the given time indices.
 
@@ -362,15 +472,49 @@ def build_observation_set(
     target = torch.stack(targets).to(device)
     y_grid = torch.from_numpy(np.asarray(ds.y_grid, dtype=np.float32)).to(device)
 
+    layout = sensor_layout
+    if layout is None:
+        layout = "interface_band" if sensor_x_halfwidth is not None else "full_field"
+    requested_y = None if sensor_y is None else np.asarray(sensor_y, dtype=np.float64)
     mask = None
-    if sensor_x_halfwidth is not None:
+    resolved_y = y_indices = resolved_x = None
+    if layout == "interface_pair":
+        if requested_y is None:
+            requested_y = np.asarray(PAPER_SENSOR_Y, dtype=np.float64)
+        mask, sensor_meta = build_interface_pair_mask(
+            np.asarray(ds.x_grid),
+            np.asarray(ds.y_grid),
+            interface_x=interface_x,
+            requested_y=requested_y,
+        )
+        resolved_y = sensor_meta["resolved_y"]
+        y_indices = sensor_meta["y_indices"]
+        resolved_x = sensor_meta["resolved_x"]
+        mask = mask.to(device)
+    elif layout == "interface_band":
+        if requested_y is None:
+            requested_y = np.linspace(
+                float(ds.y_grid[0]), float(ds.y_grid[-1]), int(sensor_n_y)
+            )
         mask = build_interface_sensor_mask(
             np.asarray(ds.x_grid),
             np.asarray(ds.y_grid),
             interface_x=interface_x,
-            x_halfwidth=float(sensor_x_halfwidth),
+            x_halfwidth=(
+                0.05 if sensor_x_halfwidth is None else float(sensor_x_halfwidth)
+            ),
             n_y=int(sensor_n_y),
+            requested_y=requested_y,
         ).to(device)
+        y_indices, resolved_y = resolve_sensor_y(ds.y_grid, requested_y)
+        resolved_x = np.asarray(ds.x_grid, dtype=np.float64)[
+            np.flatnonzero(mask.detach().cpu().numpy().any(axis=1))
+        ]
+    elif layout != "full_field":
+        raise ValueError(
+            f"Unknown sensor layout {layout!r}; expected full_field, "
+            "interface_band, or interface_pair."
+        )
 
     params = ds.sim_params[int(sid)]
     theta_true = adapter.theta_from_sim_params(
@@ -387,6 +531,18 @@ def build_observation_set(
         Nx=spatial.shape[1],
         theta_true=theta_true,
         mask=mask,
+        observation_times=(
+            np.asarray(observation_times, dtype=np.float64)
+            if observation_times is not None
+            else np.asarray(ds.t_grid, dtype=np.float64)[list(time_indices)]
+        ),
+        sensor_layout=layout,
+        requested_y=requested_y,
+        resolved_y=resolved_y,
+        y_indices=y_indices,
+        resolved_x=resolved_x,
+        interface_x=float(interface_x),
+        sensor_x_halfwidth=sensor_x_halfwidth,
     )
 
 
@@ -681,15 +837,15 @@ def _default_time_indices(Nt: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: FV refinement + theta-local surrogate error.
+# Stage 4: FV refinement + post-hoc theta-local surrogate diagnostic.
 #
 # The FNO is the *exploration / sensitivity* engine; the conservative FV solver
 # is the *accuracy* engine. We rebuild the EXACT data-generation operator via
 # ``ds.problem.configure_solver`` (k=3/35 layers, q_left=0, the patch source,
 # ``interface_R=[Rc(y)]``) and re-evaluate the FNO MAP estimate with it. We
 # report the FV sensor residual and the theta-local FNO-vs-FV discrepancy
-# ``C_FNO(theta_hat)``, and optionally polish theta_hat against the FV residual
-# with derivative-free Nelder-Mead (FV is not autodiff). No UQ here (Stage 5).
+# local discrepancy, and optionally polish theta_hat against the FV residual
+# with derivative-free Nelder-Mead (FV is not autodiff). It never sets UQ width.
 # ---------------------------------------------------------------------------
 
 def build_fv_base_kwargs(ds: SnapshotPairDataset) -> dict:
@@ -703,6 +859,43 @@ def _theta_to_numpy(theta) -> np.ndarray:
     return np.asarray(theta, dtype=np.float64)
 
 
+def sensor_mask_for_grid(
+    obs: ObservationSet,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+) -> Optional[torch.Tensor]:
+    """Resolve an observation's physical sensor definition on a numerical grid."""
+    if obs.sensor_layout == "full_field":
+        return None
+    if obs.sensor_layout == "interface_pair":
+        mask, _ = build_interface_pair_mask(
+            x_grid,
+            y_grid,
+            interface_x=obs.interface_x,
+            requested_y=(
+                PAPER_SENSOR_Y if obs.requested_y is None else obs.requested_y
+            ),
+        )
+        return mask
+    if obs.sensor_layout == "interface_band":
+        requested_x = (
+            np.asarray(obs.resolved_x, dtype=np.float64)
+            if obs.resolved_x is not None
+            else np.asarray([obs.interface_x], dtype=np.float64)
+        )
+        x_indices, _ = resolve_sensor_y(x_grid, requested_x)
+        requested_y = (
+            np.asarray(obs.requested_y, dtype=np.float64)
+            if obs.requested_y is not None
+            else np.asarray(obs.resolved_y, dtype=np.float64)
+        )
+        y_indices, _ = resolve_sensor_y(y_grid, requested_y)
+        mask = np.zeros((len(x_grid), len(y_grid)), dtype=bool)
+        mask[np.ix_(x_indices, y_indices)] = True
+        return torch.from_numpy(mask)
+    raise ValueError(f"Unknown observation sensor layout {obs.sensor_layout!r}.")
+
+
 def fv_predict_masked(
     ds: SnapshotPairDataset,
     base_kwargs: dict,
@@ -714,6 +907,7 @@ def fv_predict_masked(
     sigma_global: float,
     mask: Optional[torch.Tensor],
     adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    obs: Optional[ObservationSet] = None,
 ) -> torch.Tensor:
     """FV forward of ``theta`` at the observation sensors/times (normalized).
 
@@ -727,17 +921,22 @@ def fv_predict_masked(
     params = dict(ds.sim_params[int(sid)])
     updated = adapter.inject_theta_into_sim_params(params, theta)
     solver = ds.problem.configure_solver(updated, base_kwargs)
-    T0 = np.asarray(updated["T0"], dtype=np.float64)
+    T0 = adapter.fv_initial_condition(ds, updated, solver)
     t_solver, _x, _y, T_hist = solver.solve(T0=T0, store_trajectory=True)
 
-    t_obs = np.asarray(ds.t_grid, dtype=np.float64)[list(time_indices)]
+    t_obs = (
+        np.asarray(obs.observation_times, dtype=np.float64)
+        if obs is not None and obs.observation_times is not None
+        else np.asarray(ds.t_grid, dtype=np.float64)[list(time_indices)]
+    )
     t_solver = np.asarray(t_solver, dtype=np.float64)
-    sel = [int(np.argmin(np.abs(t_solver - tt))) for tt in t_obs]
+    sel, _ = resolve_observation_times(t_solver, t_obs, atol=1e-8)
 
     T_sel = np.asarray(T_hist)[sel]  # (N, Nx, Ny) physical Kelvin
     T_norm = (T_sel - mu_global) / (sigma_global + T_EPS)
     field = torch.from_numpy(T_norm.astype(np.float32)).unsqueeze(-1)  # (N,Nx,Ny,1)
-    return apply_sensor_mask(field, mask)
+    resolved_mask = sensor_mask_for_grid(obs, _x, _y) if obs is not None else mask
+    return apply_sensor_mask(field, resolved_mask)
 
 
 def _masked_half_mse(pred_obs: torch.Tensor, target_obs: torch.Tensor) -> float:
@@ -758,6 +957,83 @@ class FVRefineResult:
     theta_fv_polish: Optional[torch.Tensor] = None
     fv_polish_resid: Optional[float] = None
     fv_polish_evals: Optional[int] = None
+
+
+def _solve_scalar_fv_masked(
+    ds: SnapshotPairDataset,
+    base_kwargs: dict,
+    obs: ObservationSet,
+    resistance: float,
+    *,
+    mu_global: float,
+    sigma_global: float,
+    adapter: InverseAdapter,
+) -> torch.Tensor:
+    params = dict(ds.sim_params[int(obs.sid)])
+    solver = adapter.build_scalar_fv_solver(
+        ds, params, float(resistance), base_kwargs
+    )
+    T0 = adapter.fv_initial_condition(ds, params, solver)
+    t_solver, x_grid, y_grid, T_hist = solver.solve(
+        T0=T0, store_trajectory=True
+    )
+    indices, _ = resolve_observation_times(
+        np.asarray(t_solver, dtype=np.float64),
+        np.asarray(obs.observation_times, dtype=np.float64),
+    )
+    field = torch.from_numpy(
+        (
+            (np.asarray(T_hist)[indices] - mu_global)
+            / (sigma_global + T_EPS)
+        ).astype(np.float32)
+    ).unsqueeze(-1)
+    return apply_sensor_mask(
+        field, sensor_mask_for_grid(obs, x_grid, y_grid)
+    )
+
+
+def equivalent_scalar_fv_summary(
+    ds: SnapshotPairDataset,
+    base_kwargs: dict,
+    obs: ObservationSet,
+    theta: torch.Tensor,
+    *,
+    mu_global: float,
+    sigma_global: float,
+    adapter: InverseAdapter,
+) -> dict:
+    """Compare a spatial profile with base- and conductance-matched scalar FV cases."""
+    if not adapter.supports_equivalent_scalar:
+        raise ValueError(
+            f"{type(adapter).__name__} does not support equivalent-scalar FV checks."
+        )
+    profile_obs = fv_predict_masked(
+        ds, base_kwargs, obs.sid, theta, obs.time_indices,
+        mu_global=mu_global, sigma_global=sigma_global,
+        mask=None if obs.mask is None else obs.mask.cpu(),
+        adapter=adapter, obs=obs,
+    )
+    R_base, R_eq = adapter.equivalent_scalar_values(
+        theta,
+        torch.as_tensor(base_kwargs["y_grid"], dtype=theta.dtype),
+    )
+    base_obs = _solve_scalar_fv_masked(
+        ds, base_kwargs, obs, R_base,
+        mu_global=mu_global, sigma_global=sigma_global, adapter=adapter,
+    )
+    req_obs = _solve_scalar_fv_masked(
+        ds, base_kwargs, obs, R_eq,
+        mu_global=mu_global, sigma_global=sigma_global, adapter=adapter,
+    )
+    return {
+        "R_eq": R_eq,
+        "fv_base_match_vs_profile_rms": float(
+            torch.sqrt(torch.mean((base_obs - profile_obs) ** 2))
+        ),
+        "fv_req_match_vs_profile_rms": float(
+            torch.sqrt(torch.mean((req_obs - profile_obs) ** 2))
+        ),
+    }
 
 
 def fv_polish(
@@ -790,7 +1066,7 @@ def fv_polish(
         pred_obs = fv_predict_masked(
             ds, base_kwargs, obs.sid, theta, obs.time_indices,
             mu_global=mu_global, sigma_global=sigma_global, mask=mask_cpu,
-            adapter=adapter,
+            adapter=adapter, obs=obs,
         )
         return _masked_half_mse(pred_obs, target_obs)
 
@@ -829,7 +1105,7 @@ def fv_refine_report(
     fv_obs = fv_predict_masked(
         ds, base_kwargs, obs.sid, theta_hat, obs.time_indices,
         mu_global=mu_global, sigma_global=sigma_global, mask=mask_cpu,
-        adapter=adapter,
+        adapter=adapter, obs=obs,
     )
 
     out = FVRefineResult(
@@ -871,11 +1147,8 @@ def fv_refine_summary(
 #     degeneracy *diagnostic*: its eigen-spectrum identifies the coupled
 #     R_amp/sigma ridge and the R_amp~0 boundary, where a Gaussian-around-MAP is
 #     least trustworthy. We never report final intervals from it.
-#   * The surrogate error is theta-local: the per-scalar measurement variance is
-#     C_total = C_meas + C_FNO(theta_hat), with C_meas = noise_std^2 and the FNO
-#     error variance = 2 * fno_vs_fv_resid (fno_vs_fv_resid is a half-MSE). This
-#     inflates intervals conservatively; it is not claimed to be a calibrated
-#     covariance.
+#   * The surrogate scale is calibrated once on validation sensors and frozen
+#     before test inversion. Test-local FNO/FV discrepancies are diagnostics only.
 # ---------------------------------------------------------------------------
 
 # Wilks thresholds on (NLL - NLL_min): 0.5 * chi2_inv(level, df=1). A profile
@@ -884,16 +1157,24 @@ def fv_refine_summary(
 _CHI2_HALF_THRESH = {0.68: 0.5, 0.90: 1.352772, 0.95: 1.920729, 0.99: 3.317448}
 
 
-def effective_sigma2(noise_std: float, c_fno: float = 0.0) -> float:
-    """Per-scalar effective measurement variance ``C_total = C_meas + C_FNO``.
+def effective_sigma2(
+    noise_std: float,
+    c_fno: float = 0.0,
+    *,
+    sigma_fno_cal: Optional[float] = None,
+) -> float:
+    """Effective normalized variance from measurement and frozen FNO scales.
 
-    ``C_meas = noise_std**2`` is the iid Gaussian sensor noise variance (in
-    normalized temperature units). ``c_fno`` is the Stage-4 half-MSE
-    ``fno_vs_fv_resid`` (``0.5*mean (FNO-FV)^2``), so the FNO error *variance* is
-    ``2*c_fno``. Both are in the same normalized units as the residual, so the
-    Gaussian NLL below is consistent.
+    ``sigma_fno_cal`` is the validation-calibrated RMS scale used by production
+    inversion. The legacy ``c_fno`` half-MSE argument remains available for
+    old callers, but the CLI never uses a test-local discrepancy for UQ.
     """
-    return float(noise_std) ** 2 + 2.0 * float(c_fno)
+    fno_variance = (
+        float(sigma_fno_cal) ** 2
+        if sigma_fno_cal is not None
+        else 2.0 * float(c_fno)
+    )
+    return float(noise_std) ** 2 + fno_variance
 
 
 def _masked_residual(
@@ -940,10 +1221,14 @@ def add_measurement_noise(
     reproducibility across a sweep (callers pass ``noise_seed + sid``).
     """
     if noise_std is None or noise_std <= 0:
+        obs.noise_seed = int(seed)
+        obs.noise_std = float(noise_std or 0.0)
         return
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
     noise = torch.randn(obs.targets.shape, generator=gen, dtype=torch.float32)
     obs.targets = obs.targets + (noise * float(noise_std)).to(obs.targets)
+    obs.noise_seed = int(seed)
+    obs.noise_std = float(noise_std)
 
 
 def theta_logabsdet_du(u: torch.Tensor) -> torch.Tensor:
@@ -1343,20 +1628,90 @@ def mcmc_summary(
 # (opt-in via --artifact-dir) we write one self-describing NPZ per sim.
 # ---------------------------------------------------------------------------
 
-_ARTIFACT_SCHEMA_VERSION = 1
+_ARTIFACT_SCHEMA_VERSION = 2
 
 
 def _dataset_fingerprint(ds: SnapshotPairDataset) -> str:
-    """Stable short hash of the corpus shape + the test-split ids.
-
-    Hard evidence against train/test leakage: pins which sims the inversion used
-    to a given dataset shape and split, persisted in every artifact.
-    """
+    """Stable hash of corpus geometry, split IDs, metadata, and sampled states."""
     h = hashlib.sha256()
     h.update(np.asarray(ds.trajectories.shape, dtype=np.int64).tobytes())
-    test_ids = np.asarray(ds._split_ids.get("test", []), dtype=np.int64)
-    h.update(test_ids.tobytes())
+    h.update(str(ds.trajectories.dtype).encode())
+    for array in (ds.x_grid, ds.y_grid, ds.t_grid):
+        h.update(np.asarray(array).tobytes())
+    for split in ("train", "val", "test"):
+        h.update(split.encode())
+        h.update(np.asarray(ds._split_ids.get(split, []), dtype=np.int64).tobytes())
+    for params in ds.sim_params:
+        metadata = {
+            key: value
+            for key, value in dict(params).items()
+            if key != "T0"
+        }
+        h.update(
+            json.dumps(
+                metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=lambda value: (
+                    np.asarray(value).tolist()
+                    if isinstance(value, np.ndarray)
+                    else float(value)
+                    if isinstance(value, np.floating)
+                    else int(value)
+                    if isinstance(value, np.integer)
+                    else str(value)
+                ),
+            ).encode()
+        )
+    trajectories = np.asarray(ds.trajectories)
+    sample_ids = np.unique(
+        np.linspace(0, trajectories.shape[0] - 1, min(7, trajectories.shape[0]))
+        .round()
+        .astype(int)
+    )
+    h.update(np.ascontiguousarray(trajectories[sample_ids]).tobytes())
     return h.hexdigest()[:16]
+
+
+def _checkpoint_fingerprint(checkpoint_path: str) -> str:
+    h = hashlib.sha256()
+    with open(checkpoint_path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()[:16]
+
+
+def _observation_fingerprint(
+    *,
+    sensor_layout: str,
+    observation_times: np.ndarray,
+    requested_y: Optional[np.ndarray],
+    interface_x: float,
+    sensor_x_halfwidth: Optional[float],
+) -> str:
+    payload = {
+        "sensor_layout": str(sensor_layout),
+        "observation_times": [
+            format(float(value), ".17g") for value in observation_times
+        ],
+        "requested_y": (
+            []
+            if requested_y is None
+            else [format(float(value), ".17g") for value in requested_y]
+        ),
+        "interface_x": format(float(interface_x), ".17g"),
+        "sensor_x_halfwidth": (
+            None
+            if sensor_x_halfwidth is None
+            else format(float(sensor_x_halfwidth), ".17g")
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
 
 
 def _split_name_for(ds: SnapshotPairDataset, sid: int) -> str:
@@ -1365,6 +1720,199 @@ def _split_name_for(ds: SnapshotPairDataset, sid: int) -> str:
         if int(sid) in {int(i) for i in ids}:
             return name
     return "unknown"
+
+
+_CALIBRATION_SCHEMA_VERSION = 1
+
+
+def build_surrogate_calibration(
+    model: FNO2d,
+    ds: SnapshotPairDataset,
+    adapter: InverseAdapter,
+    *,
+    time_indices: list[int],
+    observation_times: np.ndarray,
+    sensor_layout: str,
+    sensor_y: Optional[np.ndarray],
+    interface_x: float,
+    sensor_x_halfwidth: Optional[float],
+    sensor_n_y: int,
+    mu_global: float,
+    sigma_global: float,
+    noise_std_norm: float,
+    checkpoint_fingerprint: str,
+    dataset_fingerprint: str,
+    device: str,
+) -> dict[str, object]:
+    """Estimate one frozen sensor-scale FNO residual on the validation split."""
+    if float(ds.noise_std) != 0.0:
+        raise ValueError("surrogate calibration requires dataset source-noise disabled.")
+    val_ids = np.asarray(ds._split_ids["val"], dtype=np.int64)
+    if val_ids.size == 0:
+        raise ValueError("validation split is empty; cannot calibrate surrogate error.")
+
+    squared_residuals: list[np.ndarray] = []
+    sensor_rms_norm: list[float] = []
+    jump_rms_k: list[float] = []
+    theta_values: list[np.ndarray] = []
+    severity_values: list[float] = []
+    first_obs: Optional[ObservationSet] = None
+    for sid in val_ids:
+        obs = build_observation_set(
+            ds, int(sid), time_indices, device=device, adapter=adapter,
+            interface_x=interface_x,
+            sensor_x_halfwidth=sensor_x_halfwidth,
+            sensor_n_y=sensor_n_y,
+            sensor_layout=sensor_layout,
+            sensor_y=sensor_y,
+            observation_times=observation_times,
+        )
+        if first_obs is None:
+            first_obs = obs
+        theta_values.append(obs.theta_true.detach().cpu().numpy().astype(np.float64))
+        if adapter.reports_spatial_severity:
+            severity_values.append(adapter.uq_quantity(obs.theta_true, obs.y_grid))
+        with torch.no_grad():
+            prediction = predict_fullfield(
+                model, obs, obs.theta_true, adapter
+            )
+        pred_obs = apply_sensor_mask(prediction, obs.mask)
+        true_obs = apply_sensor_mask(obs.targets, obs.mask)
+        residual = (
+            pred_obs.detach().cpu().numpy()
+            - true_obs.detach().cpu().numpy()
+        ).astype(np.float64)
+        squared_residuals.append(np.square(residual).reshape(-1))
+        sensor_rms_norm.append(float(np.sqrt(np.mean(np.square(residual)))))
+        if sensor_layout == "interface_pair":
+            n_y = (
+                len(obs.requested_y)
+                if obs.requested_y is not None
+                else len(PAPER_SENSOR_Y)
+            )
+            pred_jump = pred_obs[:, n_y:, :] - pred_obs[:, :n_y, :]
+            true_jump = true_obs[:, n_y:, :] - true_obs[:, :n_y, :]
+            jump_rms_k.append(
+                float(
+                    torch.sqrt(torch.mean((pred_jump - true_jump) ** 2))
+                    * float(sigma_global)
+                )
+            )
+
+    all_squared = np.concatenate(squared_residuals)
+    sigma_fno_norm = float(np.sqrt(np.mean(all_squared)))
+    rms_norm = np.asarray(sensor_rms_norm, dtype=np.float64)
+    rms_k = rms_norm * float(sigma_global)
+    sigma_meas_k = float(noise_std_norm) * float(sigma_global)
+    median_k = float(np.median(rms_k))
+    p90_k = float(np.percentile(rms_k, 90.0))
+    gate_pass = bool(
+        noise_std_norm > 0.0
+        and median_k <= sigma_meas_k
+        and p90_k <= 2.0 * sigma_meas_k
+    )
+    assert first_obs is not None
+    observation_fingerprint = _observation_fingerprint(
+        sensor_layout=sensor_layout,
+        observation_times=observation_times,
+        requested_y=first_obs.requested_y,
+        interface_x=interface_x,
+        sensor_x_halfwidth=sensor_x_halfwidth,
+    )
+    return {
+        "calibration_schema_version": np.int64(_CALIBRATION_SCHEMA_VERSION),
+        "benchmark": np.str_(adapter.benchmark),
+        "split": np.str_("val"),
+        "sigma_fno_norm": np.float64(sigma_fno_norm),
+        "sigma_fno_K": np.float64(sigma_fno_norm * float(sigma_global)),
+        "sigma_global_K": np.float64(sigma_global),
+        "noise_std_norm": np.float64(noise_std_norm),
+        "sigma_meas_K": np.float64(sigma_meas_k),
+        "checkpoint_fingerprint": np.str_(checkpoint_fingerprint),
+        "dataset_fingerprint": np.str_(dataset_fingerprint),
+        "observation_fingerprint": np.str_(observation_fingerprint),
+        "observation_times": np.asarray(observation_times, dtype=np.float64),
+        "sensor_layout": np.str_(sensor_layout),
+        "requested_y": (
+            np.empty(0, dtype=np.float64)
+            if first_obs.requested_y is None
+            else np.asarray(first_obs.requested_y, dtype=np.float64)
+        ),
+        "resolved_y": (
+            np.empty(0, dtype=np.float64)
+            if first_obs.resolved_y is None
+            else np.asarray(first_obs.resolved_y, dtype=np.float64)
+        ),
+        "y_indices": (
+            np.empty(0, dtype=np.int64)
+            if first_obs.y_indices is None
+            else np.asarray(first_obs.y_indices, dtype=np.int64)
+        ),
+        "resolved_x": (
+            np.empty(0, dtype=np.float64)
+            if first_obs.resolved_x is None
+            else np.asarray(first_obs.resolved_x, dtype=np.float64)
+        ),
+        "sample_count": np.int64(all_squared.size),
+        "simulation_count": np.int64(val_ids.size),
+        "simulation_ids": val_ids,
+        "param_names": np.asarray(adapter.param_names, dtype="U32"),
+        "theta_true": np.asarray(theta_values, dtype=np.float64),
+        "S_R": np.asarray(severity_values, dtype=np.float64),
+        "sensor_rms_norm": rms_norm,
+        "sensor_rms_K": rms_k,
+        "interface_jump_rms_K": np.asarray(jump_rms_k, dtype=np.float64),
+        "sensor_rms_median_K": np.float64(median_k),
+        "sensor_rms_p90_K": np.float64(p90_k),
+        "local_gate_pass": np.bool_(gate_pass),
+    }
+
+
+def write_surrogate_calibration(path: str, calibration: dict[str, object]) -> str:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    np.savez_compressed(path, **calibration)
+    return path
+
+
+def load_surrogate_calibration(
+    path: str,
+    *,
+    benchmark: str,
+    checkpoint_fingerprint: str,
+    dataset_fingerprint: str,
+    observation_fingerprint: str,
+    noise_std_norm: float,
+) -> dict[str, object]:
+    """Load a frozen calibration artifact and reject protocol mismatches."""
+    with np.load(path, allow_pickle=False) as stored:
+        calibration = {key: stored[key] for key in stored.files}
+    checks = {
+        "benchmark": benchmark,
+        "checkpoint_fingerprint": checkpoint_fingerprint,
+        "dataset_fingerprint": dataset_fingerprint,
+        "observation_fingerprint": observation_fingerprint,
+        "split": "val",
+    }
+    for key, expected in checks.items():
+        actual = str(calibration.get(key, ""))
+        if actual != str(expected):
+            raise ValueError(
+                f"calibration {key} mismatch: artifact={actual!r}, "
+                f"current={str(expected)!r}."
+            )
+    version = int(calibration.get("calibration_schema_version", -1))
+    if version != _CALIBRATION_SCHEMA_VERSION:
+        raise ValueError(
+            f"calibration schema version {version} is unsupported; "
+            f"expected {_CALIBRATION_SCHEMA_VERSION}."
+        )
+    stored_noise = float(calibration["noise_std_norm"])
+    if not np.isclose(stored_noise, float(noise_std_norm), rtol=0.0, atol=1e-12):
+        raise ValueError(
+            f"calibration noise_std_norm={stored_noise:g} does not match "
+            f"requested {float(noise_std_norm):g}."
+        )
+    return calibration
 
 
 def _write_sim_artifact(
@@ -1387,6 +1935,8 @@ def _write_sim_artifact(
     dataset_fingerprint: str,
     split_seed: int,
     split_name: str,
+    calibration_fingerprint: Optional[str] = None,
+    sigma_fno_cal: Optional[float] = None,
 ) -> str:
     """Write one ``sim_{sid:05d}.npz`` with the raw inverse-problem arrays.
 
@@ -1427,7 +1977,39 @@ def _write_sim_artifact(
         "dataset_fingerprint": np.str_(dataset_fingerprint),
         "split_seed": np.int64(int(split_seed)),
         "split_name": np.str_(split_name),
+        "time_indices": np.asarray(obs.time_indices, dtype=np.int64),
+        "observation_times": (
+            np.empty(0, dtype=np.float64)
+            if obs.observation_times is None
+            else np.asarray(obs.observation_times, dtype=np.float64)
+        ),
+        "sensor_layout": np.str_(obs.sensor_layout),
+        "requested_y": (
+            np.empty(0, dtype=np.float64)
+            if obs.requested_y is None
+            else np.asarray(obs.requested_y, dtype=np.float64)
+        ),
+        "resolved_y": (
+            np.empty(0, dtype=np.float64)
+            if obs.resolved_y is None
+            else np.asarray(obs.resolved_y, dtype=np.float64)
+        ),
+        "y_indices": (
+            np.empty(0, dtype=np.int64)
+            if obs.y_indices is None
+            else np.asarray(obs.y_indices, dtype=np.int64)
+        ),
+        "resolved_x": (
+            np.empty(0, dtype=np.float64)
+            if obs.resolved_x is None
+            else np.asarray(obs.resolved_x, dtype=np.float64)
+        ),
+        "noise_seed": np.int64(-1 if obs.noise_seed is None else obs.noise_seed),
     }
+    if calibration_fingerprint is not None:
+        payload["calibration_fingerprint"] = np.str_(calibration_fingerprint)
+    if sigma_fno_cal is not None:
+        payload["sigma_fno_cal"] = np.float64(sigma_fno_cal)
 
     if report is not None:
         payload["singular_values"] = np.asarray(report["singular_values"], dtype=np.float64)
@@ -1490,8 +2072,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--sim-ids", type=int, nargs="*", default=None,
                     help="Sim ids to invert (default: first few test-split sims)")
     ap.add_argument("--n-sims", type=int, default=3, help="How many test sims if --sim-ids omitted")
-    ap.add_argument("--time-indices", type=int, nargs="*", default=None,
-                    help="Observation time indices (default: early/mid/late)")
+    time_group = ap.add_mutually_exclusive_group()
+    time_group.add_argument("--time-indices", type=int, nargs="*", default=None,
+                            help="Legacy observation snapshot indices")
+    time_group.add_argument(
+        "--observation-times", type=float, nargs="+", default=None,
+        help="Exact physical observation times; no interpolation or nearest substitution",
+    )
     ap.add_argument("--n-starts", type=int, default=8)
     ap.add_argument("--adam-steps", type=int, default=400)
     ap.add_argument("--adam-lr", type=float, default=0.05)
@@ -1507,6 +2094,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="Number of y sensor rows in the interface band")
     ap.add_argument("--interface-x", type=float, default=0.5,
                     help="Interface x location for sensor placement (source_itr: 0.5)")
+    ap.add_argument(
+        "--sensor-layout",
+        choices=["full_field", "interface_band", "interface_pair"],
+        default="interface_pair",
+        help="Physical observation layout (default: paired interface-adjacent nodes)",
+    )
+    ap.add_argument(
+        "--sensor-y", type=float, nargs="+", default=None,
+        help="Requested physical y sensor coordinates (default: linspace(0.1,0.9,8) for interface_pair)",
+    )
     ap.add_argument("--self-consistency", action="store_true",
                     help="Invert against the FNO's own output at theta_true "
                          "(isolates operator wiring from surrogate accuracy)")
@@ -1525,12 +2122,33 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "against the FV sensor residual (implies --fv-refine)")
     ap.add_argument("--fv-polish-maxiter", type=int, default=60,
                     help="Max Nelder-Mead iterations for --fv-polish (default 60)")
+    ap.add_argument(
+        "--fv-grid-size", type=int, default=None,
+        help="Optional square FV grid size for refinement; sensors are re-resolved physically",
+    )
+    ap.add_argument(
+        "--fv-equivalent-scalar", action="store_true",
+        help="forcing_itr only: FV comparison with base- and conductance-matched scalar resistance",
+    )
     # Stage 5: measurement noise + uncertainty quantification.
     ap.add_argument("--noise-std", type=float, default=0.0,
                     help="Std of iid Gaussian sensor noise (normalized temp units); "
                          "0 disables noise")
     ap.add_argument("--noise-seed", type=int, default=0,
                     help="Base seed for measurement noise (per-sim seed = noise-seed + sim_id)")
+    calibration_group = ap.add_mutually_exclusive_group()
+    calibration_group.add_argument(
+        "--calibration-out", default=None,
+        help="Estimate validation-only surrogate error and write a frozen NPZ artifact, then exit",
+    )
+    calibration_group.add_argument(
+        "--calibration-artifact", default=None,
+        help="Frozen validation calibration NPZ required by likelihood-based test inversion",
+    )
+    ap.add_argument(
+        "--allow-surrogate-limited", action="store_true",
+        help="Allow diagnostic inversion when the frozen local sensor gate failed",
+    )
     ap.add_argument("--uq-level", type=float, default=0.95,
                     help="Confidence/credible level for profile + MCMC intervals")
     ap.add_argument("--profile", action="store_true",
@@ -1564,7 +2182,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     profile_index = (
         args.profile_index
         if args.profile_index is not None
-        else (1 if adapter.benchmark == "source_itr" else 0)
+        else adapter.default_profile_index
     )
     ds = build_dataset_from_dir(
         args.data_dir, loaded.config,
@@ -1572,12 +2190,85 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     adapter.validate_dataset(ds)
 
+    if args.observation_times is not None:
+        requested_times = np.asarray(args.observation_times, dtype=np.float64)
+        time_indices, observation_times = resolve_observation_times(
+            ds.t_grid, requested_times
+        )
+    elif args.time_indices is not None:
+        time_indices = list(args.time_indices)
+        if any(index <= 0 or index >= ds.Nt for index in time_indices):
+            raise ValueError(
+                f"time indices must lie in [1, {ds.Nt - 1}], got {time_indices}."
+            )
+        observation_times = np.asarray(ds.t_grid, dtype=np.float64)[time_indices]
+    else:
+        time_indices, observation_times = resolve_observation_times(
+            ds.t_grid, PAPER_OBSERVATION_TIMES
+        )
+
+    sensor_y = (
+        np.asarray(args.sensor_y, dtype=np.float64)
+        if args.sensor_y is not None
+        else np.asarray(PAPER_SENSOR_Y, dtype=np.float64)
+        if args.sensor_layout == "interface_pair"
+        else np.linspace(
+            float(ds.y_grid[0]), float(ds.y_grid[-1]), int(args.sensor_n_y)
+        )
+        if args.sensor_layout == "interface_band"
+        else None
+    )
+    if (
+        args.fv_grid_size is not None
+        and args.sensor_layout == "full_field"
+        and int(args.fv_grid_size) != int(ds.Nx)
+    ):
+        raise ValueError(
+            "cross-grid FV checks require coordinate-defined sparse sensors; "
+            "full_field observations have grid-dependent cardinality."
+        )
+    checkpoint_fingerprint = _checkpoint_fingerprint(args.checkpoint)
+    dataset_fingerprint = _dataset_fingerprint(ds)
+    observation_fingerprint = _observation_fingerprint(
+        sensor_layout=args.sensor_layout,
+        observation_times=observation_times,
+        requested_y=sensor_y,
+        interface_x=args.interface_x,
+        sensor_x_halfwidth=args.sensor_x_halfwidth,
+    )
+
+    if args.calibration_out:
+        calibration = build_surrogate_calibration(
+            loaded.model, ds, adapter,
+            time_indices=time_indices,
+            observation_times=observation_times,
+            sensor_layout=args.sensor_layout,
+            sensor_y=sensor_y,
+            interface_x=args.interface_x,
+            sensor_x_halfwidth=args.sensor_x_halfwidth,
+            sensor_n_y=args.sensor_n_y,
+            mu_global=loaded.mu_global,
+            sigma_global=loaded.sigma_global,
+            noise_std_norm=args.noise_std,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            dataset_fingerprint=dataset_fingerprint,
+            device=args.device,
+        )
+        write_surrogate_calibration(args.calibration_out, calibration)
+        print(
+            f"Wrote validation calibration to {args.calibration_out}: "
+            f"sigma_FNO={float(calibration['sigma_fno_norm']):.6g} normalized "
+            f"({float(calibration['sigma_fno_K']):.6g} K), "
+            f"median={float(calibration['sensor_rms_median_K']):.6g} K, "
+            f"p90={float(calibration['sensor_rms_p90_K']):.6g} K, "
+            f"gate_pass={bool(calibration['local_gate_pass'])}"
+        )
+        return 0
+
     if args.sim_ids is not None:
         sim_ids = list(args.sim_ids)
     else:
         sim_ids = list(ds._split_ids["test"][: args.n_sims])
-
-    time_indices = args.time_indices or _default_time_indices(ds.Nt)
     cfg = InversionConfig(
         n_starts=args.n_starts, adam_steps=args.adam_steps, adam_lr=args.adam_lr,
         lbfgs_steps=args.lbfgs_steps, reg_weight=args.reg_weight, seed=args.seed,
@@ -1585,10 +2276,41 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     do_uq = args.profile or args.laplace or args.mcmc
-    do_fv = args.fv_refine or args.fv_polish
-    fv_base_kwargs = adapter.fv_base_kwargs(ds) if do_fv else None
-
-    dataset_fingerprint = _dataset_fingerprint(ds) if args.artifact_dir else ""
+    do_fv = args.fv_refine or args.fv_polish or args.fv_equivalent_scalar
+    fv_base_kwargs = (
+        adapter.fv_base_kwargs(ds, grid_size=args.fv_grid_size)
+        if do_fv else None
+    )
+    calibration = None
+    sigma_fno_cal = None
+    calibration_fingerprint = None
+    if do_uq:
+        if args.calibration_artifact is None:
+            ap.error(
+                "likelihood-based stages require --calibration-artifact from "
+                "the held-out validation split"
+            )
+        calibration = load_surrogate_calibration(
+            args.calibration_artifact,
+            benchmark=adapter.benchmark,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            dataset_fingerprint=dataset_fingerprint,
+            observation_fingerprint=observation_fingerprint,
+            noise_std_norm=args.noise_std,
+        )
+        if (
+            not bool(calibration["local_gate_pass"])
+            and not args.allow_surrogate_limited
+        ):
+            raise ValueError(
+                "frozen validation calibration failed the median/p90 local "
+                "sensor gate; pass --allow-surrogate-limited only for a labeled "
+                "diagnostic run."
+            )
+        sigma_fno_cal = float(calibration["sigma_fno_norm"])
+        calibration_fingerprint = _checkpoint_fingerprint(
+            args.calibration_artifact
+        )
 
     rows = []
     for sid in sim_ids:
@@ -1601,19 +2323,46 @@ def main(argv: Optional[list[str]] = None) -> int:
             interface_x=args.interface_x,
             sensor_x_halfwidth=args.sensor_x_halfwidth,
             sensor_n_y=args.sensor_n_y,
+            sensor_layout=args.sensor_layout,
+            sensor_y=sensor_y,
+            observation_times=observation_times,
         )
         if args.self_consistency:
             with torch.no_grad():
                 obs.targets = predict_fullfield(
                     loaded.model, obs, obs.theta_true, adapter
                 ).detach()
-        if args.noise_std > 0:
-            add_measurement_noise(obs, args.noise_std, seed=args.noise_seed + int(sid))
+        add_measurement_noise(
+            obs, args.noise_std, seed=args.noise_seed + int(sid)
+        )
         result = invert_sim(loaded.model, obs, cfg, adapter)
         theta_hat = result.theta_hat.to(args.device)
         summary = summarize(result, obs.y_grid, adapter)
+        summary["benchmark"] = adapter.benchmark
         summary["sim_id"] = int(sid)
         summary["time_indices"] = ";".join(str(t) for t in time_indices)
+        summary["observation_times"] = ";".join(
+            format(float(t), ".8g") for t in observation_times
+        )
+        summary["sensor_layout"] = obs.sensor_layout
+        summary["requested_y"] = (
+            ""
+            if obs.requested_y is None
+            else ";".join(format(float(v), ".8g") for v in obs.requested_y)
+        )
+        summary["resolved_y"] = (
+            ""
+            if obs.resolved_y is None
+            else ";".join(format(float(v), ".8g") for v in obs.resolved_y)
+        )
+        summary["resolved_x"] = (
+            ""
+            if obs.resolved_x is None
+            else ";".join(format(float(v), ".8g") for v in obs.resolved_x)
+        )
+        summary["noise_std_norm"] = float(args.noise_std)
+        summary["noise_std_K"] = float(args.noise_std) * loaded.sigma_global
+        summary["noise_seed"] = int(args.noise_seed + int(sid))
         n_sensors = (
             int(obs.spatial.shape[1] * obs.spatial.shape[2])
             if obs.mask is None
@@ -1631,14 +2380,43 @@ def main(argv: Optional[list[str]] = None) -> int:
                 polish=args.fv_polish, polish_maxiter=args.fv_polish_maxiter,
                 adapter=adapter,
             )
-            summary.update(fv_refine_summary(fv_res, obs, obs.y_grid, adapter))
+            summary.update(
+                fv_refine_summary(
+                    fv_res,
+                    obs,
+                    torch.as_tensor(
+                        fv_base_kwargs["y_grid"], dtype=obs.y_grid.dtype
+                    ),
+                    adapter,
+                )
+            )
+        if args.fv_equivalent_scalar:
+            if not adapter.supports_equivalent_scalar:
+                raise ValueError(
+                    "--fv-equivalent-scalar is only available for adapters "
+                    "with a spatial-ITR scalar comparison."
+                )
+            summary.update(
+                equivalent_scalar_fv_summary(
+                    ds, fv_base_kwargs, obs, obs.theta_true,
+                    mu_global=loaded.mu_global,
+                    sigma_global=loaded.sigma_global,
+                    adapter=adapter,
+                )
+            )
         if do_uq:
-            # theta-local surrogate error C_FNO(theta_hat) from Stage 4 (0 if FV
-            # refinement was not run); C_total = C_meas + C_FNO.
             c_fno = float(summary.get("fno_vs_fv_resid", 0.0))
-            sigma_eff2 = effective_sigma2(args.noise_std, c_fno)
+            sigma_eff2 = effective_sigma2(
+                args.noise_std, sigma_fno_cal=sigma_fno_cal
+            )
             summary["uq_sigma_eff2"] = sigma_eff2
-            summary["uq_c_fno"] = 2.0 * c_fno
+            summary["uq_sigma_fno_cal"] = float(sigma_fno_cal)
+            summary["oracle_test_fno_variance"] = 2.0 * c_fno
+            summary["map_neg_log_likelihood"] = float(
+                neg_log_likelihood(
+                    loaded.model, obs, theta_hat, sigma_eff2, adapter
+                )
+            )
             if sigma_eff2 <= 0:
                 print(
                     f"[sim {sid}] UQ skipped: sigma_eff2<=0 "
@@ -1682,6 +2460,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 dataset_fingerprint=dataset_fingerprint,
                 split_seed=0,
                 split_name=_split_name_for(ds, int(sid)),
+                calibration_fingerprint=calibration_fingerprint,
+                sigma_fno_cal=sigma_fno_cal,
             )
         rows.append(summary)
         param_parts = []
@@ -1694,7 +2474,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             param_parts.append(f"{name} {hat:.3f}/{true:.3f}")
         quantity_part = ""
-        if adapter.benchmark == "source_itr":
+        if adapter.reports_spatial_severity:
             quantity_part = (
                 f"  excess_int {summary['excess_int_hat']:.4f}/"
                 f"{summary.get('excess_int_true', float('nan')):.4f}"

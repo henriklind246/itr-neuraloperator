@@ -5,6 +5,7 @@ from problems.diffusion import DiffusionProblem
 from problems.diffusion_forcing import DiffusionForcingProblem
 from problems.diffusion_forcing_single import DiffusionForcingSingleProblem
 from problems.forcing import ForcingProblem
+from problems.forcing_itr import ForcingItrProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
 from problems.source_itr import SourceItrProblem
@@ -15,6 +16,7 @@ REGISTRY: dict[str, type[ProblemSpec]] = {
     "diffusion_forcing": DiffusionForcingProblem,
     "diffusion_forcing_single": DiffusionForcingSingleProblem,
     "forcing": ForcingProblem,
+    "forcing_itr": ForcingItrProblem,
     "interfaces": InterfacesProblem,
     "source": SourceProblem,
     "source_itr": SourceItrProblem,

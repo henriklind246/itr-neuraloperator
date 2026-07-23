@@ -1,0 +1,14 @@
+# @package _global_
+
+benchmark:
+  name: forcing_itr
+  rc_channel_mode: broadcast
+
+training:
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.05
+    interface_weight: 15.0
+    per_sample_interface_x: false
+  physics:
+    collocation_source: val

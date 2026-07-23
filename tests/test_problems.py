@@ -6,6 +6,7 @@ from problems.registry import get_problem
 from problems.diffusion import DiffusionProblem
 from problems.diffusion_forcing_single import DiffusionForcingSingleProblem
 from problems.forcing import FORCING_TEMPORAL_SAMPLES, ForcingProblem
+from problems.forcing_itr import ForcingItrProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
 from problems.source_itr import SourceItrProblem
@@ -23,6 +24,14 @@ CONTRACTS = {
     ),
     ("forcing", "bins"): dict(
         in_ch=20, cond=11, has_fseq=False, token=2, t_stats=2,
+        encoder=False, s_y=3, aug=False,
+    ),
+    ("forcing_itr", "temporal_encoder"): dict(
+        in_ch=5, cond=14, has_fseq=True, token=2, t_stats=2,
+        encoder=True, s_y=3, aug=True,
+    ),
+    ("forcing_itr", "bins"): dict(
+        in_ch=21, cond=14, has_fseq=False, token=2, t_stats=2,
         encoder=False, s_y=3, aug=False,
     ),
     ("source", "temporal_encoder"): dict(
@@ -144,6 +153,9 @@ def source_itr_dataset(synthetic_trajectories):
 class TestRegistry:
     def test_forcing_registered(self):
         assert isinstance(get_problem("forcing"), ForcingProblem)
+
+    def test_forcing_itr_registered(self):
+        assert isinstance(get_problem("forcing_itr"), ForcingItrProblem)
 
     def test_interfaces_registered(self):
         assert isinstance(get_problem("interfaces"), InterfacesProblem)
@@ -855,7 +867,12 @@ class TestSourceItrValPairRow:
 class TestProblemFromConfig:
     @pytest.mark.parametrize(
         "name,cls",
-        [("forcing", ForcingProblem), ("interfaces", InterfacesProblem), ("source", SourceProblem)],
+        [
+            ("forcing", ForcingProblem),
+            ("forcing_itr", ForcingItrProblem),
+            ("interfaces", InterfacesProblem),
+            ("source", SourceProblem),
+        ],
     )
     def test_resolves_active_benchmark(self, name, cls):
         spec = problem_from_config({"benchmark": {"name": name}})

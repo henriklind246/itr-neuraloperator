@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from problems.forcing import RC_RANGE
+from problems.forcing import ForcingProblem
 from problems.registry import get_problem
 from problems.source_itr import RC_Y_CHANNEL
 from src.physics.fv_solver_2d import Layer2D
@@ -14,6 +15,9 @@ from src.physics.internal_source import (
     RC_MIN,
     RC_VOID_RANGES,
     R_PEAK_MAX,
+    equivalent_scalar_resistance,
+    integrated_excess_resistance,
+    make_rc_void_profile,
 )
 
 
@@ -88,13 +92,30 @@ class InverseAdapter(ABC):
     def from_config(cls, config: dict) -> "InverseAdapter":
         bench = config.get("benchmark", {})
         name = bench.get("name", "forcing") if isinstance(bench, dict) else str(bench)
-        if name == "source_itr":
-            return SourceItrAdapter()
-        if name == "forcing":
-            return ForcingAdapter()
+        adapters = {
+            "source_itr": SourceItrAdapter,
+            "forcing": ForcingAdapter,
+            "forcing_itr": ForcingItrAdapter,
+        }
+        adapter_cls = adapters.get(name)
+        if adapter_cls is not None:
+            return adapter_cls()
         raise ValueError(
-            f"Unsupported inverse benchmark {name!r}; expected 'source_itr' or 'forcing'."
+            f"Unsupported inverse benchmark {name!r}; expected one of "
+            f"{sorted(adapters)}."
         )
+
+    @property
+    def default_profile_index(self) -> int:
+        return 0
+
+    @property
+    def reports_spatial_severity(self) -> bool:
+        return False
+
+    @property
+    def supports_equivalent_scalar(self) -> bool:
+        return False
 
     @abstractmethod
     def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
@@ -145,8 +166,30 @@ class InverseAdapter(ABC):
         ...
 
     @abstractmethod
-    def fv_base_kwargs(self, ds) -> dict:
+    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
         ...
+
+    def fv_initial_condition(self, ds, sim_params: dict, solver) -> np.ndarray:
+        T0 = np.asarray(sim_params["T0"], dtype=np.float64)
+        shape = (int(solver.Nx), int(solver.Ny))
+        if T0.shape == shape:
+            return T0
+        if np.allclose(T0, T0.flat[0]):
+            return np.full(shape, float(T0.flat[0]), dtype=np.float64)
+        raise ValueError(
+            "Refined FV inversion requires a grid-independent initial-condition "
+            "builder for nonuniform T0."
+        )
+
+    def equivalent_scalar_values(
+        self, theta: torch.Tensor, y_grid: torch.Tensor
+    ) -> tuple[float, float]:
+        raise ValueError(f"{type(self).__name__} has no equivalent-scalar diagnostic.")
+
+    def build_scalar_fv_solver(
+        self, ds, sim_params: dict, resistance: float, base_kwargs: dict
+    ):
+        raise ValueError(f"{type(self).__name__} has no scalar FV comparison.")
 
     def build_fv_solver(self, ds, sim_params: dict, theta):
         updated = self.inject_theta_into_sim_params(sim_params, theta)
@@ -262,6 +305,14 @@ class SourceItrAdapter(InverseAdapter):
     theta_dim = 4
     param_names = VOID_PARAM_NAMES
 
+    @property
+    def default_profile_index(self) -> int:
+        return 1
+
+    @property
+    def reports_spatial_severity(self) -> bool:
+        return True
+
     def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
         base_lo, base_hi = RC_VOID_RANGES["R_base"]
         y0_lo, y0_hi = RC_VOID_RANGES["y0"]
@@ -372,17 +423,21 @@ class SourceItrAdapter(InverseAdapter):
         params["R_c"] = float(th[0])
         return params
 
-    def fv_base_kwargs(self, ds) -> dict:
+    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
+        size = int(grid_size) if grid_size is not None else int(ds.Nx)
+        y_grid = np.linspace(
+            _GEN_DOMAIN["c"], _GEN_DOMAIN["d"], size, dtype=np.float64
+        )
         return dict(
             a=_GEN_DOMAIN["a"], b=_GEN_DOMAIN["b"],
             c=_GEN_DOMAIN["c"], d=_GEN_DOMAIN["d"],
-            Nx=int(ds.Nx), Ny=int(ds.Ny),
+            Nx=size, Ny=size,
             lam_target=_GEN_LAM_TARGET,
             t_final=_snap_t_final(ds),
             flux_f=_GEN_FLUX_F, flux_A=_GEN_FLUX_A,
             t_on=_GEN_T_ON, phase=_GEN_PHASE,
             dt=float(ds.dt), tukey_alpha=_GEN_TUKEY_ALPHA,
-            y_grid=np.asarray(ds.y_grid, dtype=np.float64),
+            y_grid=y_grid,
         )
 
     def validate_dataset(self, ds) -> None:
@@ -454,9 +509,11 @@ class SourceItrAdapter(InverseAdapter):
     def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
         R_base, R_amp, y0, sigma = (theta[i].item() for i in range(4))
         y = y_grid.detach().cpu().numpy().astype(np.float64)
-        excess = R_amp * np.exp(-(((y - y0) / sigma) ** 2))
-        trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-        return float(trapz(excess, y))
+        profile = make_rc_void_profile(y, R_base, R_amp, y0, sigma)
+        return integrated_excess_resistance(
+            y, profile, R_base,
+            bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"]),
+        )
 
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
         out = {
@@ -628,23 +685,26 @@ class ForcingAdapter(InverseAdapter):
         params["R_c"] = float(th[0])
         return params
 
-    def fv_base_kwargs(self, ds) -> dict:
+    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
         a, b = _GEN_DOMAIN["a"], _GEN_DOMAIN["b"]
         x_mid = 0.5 * (a + b)
+        size = int(grid_size) if grid_size is not None else int(ds.Nx)
         layers = [
             Layer2D(x_left=a, x_right=x_mid, rho=1.0, cp=1.0, k=2.0),
             Layer2D(x_left=x_mid, x_right=b, rho=1.0, cp=1.0, k=1.0),
         ]
         return dict(
             a=a, b=b, c=_GEN_DOMAIN["c"], d=_GEN_DOMAIN["d"],
-            Nx=int(ds.Nx), Ny=int(ds.Ny),
+            Nx=size, Ny=size,
             lam_target=_GEN_LAM_TARGET,
             layers=layers,
             t_final=_snap_t_final(ds),
             flux_f=_GEN_FLUX_F, flux_A=_GEN_FLUX_A,
             t_on=_GEN_T_ON, t_off=_GEN_T_OFF, phase=_GEN_PHASE,
             dt=float(ds.dt), tukey_alpha=_GEN_TUKEY_ALPHA,
-            y_grid=np.asarray(ds.y_grid, dtype=np.float64),
+            y_grid=np.linspace(
+                _GEN_DOMAIN["c"], _GEN_DOMAIN["d"], size, dtype=np.float64
+            ),
             ramp_seconds=getattr(ds, "ramp_seconds", None),
         )
 
@@ -756,3 +816,60 @@ class ForcingAdapter(InverseAdapter):
         if obs.theta_true is not None:
             out["mcmc_R_c_covered"] = bool(lo <= float(obs.theta_true[0]) <= hi)
         return out
+
+
+class ForcingItrAdapter(SourceItrAdapter):
+    benchmark = "forcing_itr"
+
+    @property
+    def supports_equivalent_scalar(self) -> bool:
+        return True
+
+    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
+        return ForcingAdapter().fv_base_kwargs(ds, grid_size=grid_size)
+
+    def validate_dataset(self, ds) -> None:
+        if getattr(ds.problem, "name", None) != self.benchmark:
+            raise ValueError(
+                f"ForcingItrAdapter expected dataset benchmark 'forcing_itr', got "
+                f"{getattr(ds.problem, 'name', None)!r}."
+            )
+        if getattr(ds.problem, "rc_channel_mode", None) != "broadcast":
+            raise ValueError(
+                "forcing_itr inversion only supports rc_channel_mode='broadcast'."
+            )
+        first_sid = int(ds.sim_ids[0])
+        sample = ds.problem.build_item(ds, first_sid, 0, min(1, ds.Nt - 1))
+        if int(sample["spatial"].shape[-1]) != ds.problem.dims.in_channels:
+            raise ValueError("forcing_itr dataset spatial schema does not match its spec.")
+        required = {
+            "R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma",
+            "temporal_family", "temporal_params", "spatial_family", "spatial_params",
+        }
+        missing = required - set(dict(ds.sim_params[first_sid]))
+        if missing:
+            raise ValueError(f"forcing_itr sim_params missing keys: {sorted(missing)}")
+
+    def equivalent_scalar_values(
+        self, theta: torch.Tensor, y_grid: torch.Tensor
+    ) -> tuple[float, float]:
+        values = _to_numpy_theta(theta, self.theta_dim)
+        y = y_grid.detach().cpu().numpy().astype(np.float64)
+        profile = make_rc_void_profile(y, *values)
+        req = equivalent_scalar_resistance(
+            y, profile, bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
+        )
+        return float(values[0]), req
+
+    def build_scalar_fv_solver(
+        self, ds, sim_params: dict, resistance: float, base_kwargs: dict
+    ):
+        params = dict(sim_params)
+        params["R_c"] = float(resistance)
+        return ForcingProblem(self._representation(ds)).configure_solver(
+            params, base_kwargs
+        )
+
+    @staticmethod
+    def _representation(ds) -> str:
+        return str(getattr(ds.problem, "representation", "temporal_encoder"))

@@ -49,6 +49,8 @@ from src.physics.internal_source import (
     PATCH_W,
     RC_VOID_RANGES,
     build_patch_source,
+    interface_control_volume_weights,
+    integrated_excess_resistance,
     integrate_sin2_pulse,
     make_rc_void_profile,
     make_patch_indicator,
@@ -2132,8 +2134,12 @@ def _void_severity_arrays(
         G_y = _interface_conductance_profile(
             y, Rc_y, x_grid=x_grid, interface_x=float(p.get("interface_x", INTERFACE_X))
         )
-        excess_integral[i] = float(np.trapezoid(Rc_y - float(p["R_c_base"]), y))
-        conductance_deficit[i] = float(np.trapezoid(G_base - G_y, y))
+        bounds = (0.0, 1.0)
+        weights = interface_control_volume_weights(y, bounds)
+        excess_integral[i] = integrated_excess_resistance(
+            y, Rc_y, float(p["R_c_base"]), bounds=bounds
+        )
+        conductance_deficit[i] = float(np.sum(weights * (G_base - G_y)))
 
     arrs["R_c_excess_integral"] = excess_integral
     arrs["conductance_deficit"] = conductance_deficit
