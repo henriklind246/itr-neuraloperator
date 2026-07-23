@@ -14,12 +14,11 @@ from observed temperatures, via a MAP / least-squares fit. The forward code is
 untouched; this script only *imports* it.
 
 What Stages 1-5 do (deliberately narrow):
-  * direct-from-IC observation operator (known uniform-300 K IC, known source
-    patch / amplitude, so G_theta is a pure function of theta),
+  * direct-from-IC observation operator with every non-theta input held fixed,
   * observations at several times spanning early/mid/late, either full-field
     (Stage 1) or through a masked interface-proximal *sensor operator* M
-    (Stage 2 — a band of x-columns near x = 0.5 crossed with a subset of y
-    rows; full-field is the all-pixels special case),
+    (Stage 2 — paired interface-adjacent nodes or a finite interface band
+    crossed with physical y coordinates; full-field is the all-pixels case),
   * LHS multistart Adam -> L-BFGS over an unconstrained reparameterization that
     keeps every iterate inside the physical box and honors the R_base-dependent
     R_amp ceiling (so the FNO is never queried out-of-distribution) (Stage 3),
@@ -31,8 +30,8 @@ What Stages 1-5 do (deliberately narrow):
     *exploration and sensitivity engine*, but the conservative Crank-Nicolson
     finite-volume solver is the *accuracy engine*. We re-evaluate the FNO MAP
     estimate ``theta_hat`` with the **real** ``FVSolver2D`` (rebuilt via
-    ``ds.problem.configure_solver`` so the operator is bit-identical to data
-    generation: k=3/35 layers, q_left=0, the patch source, ``interface_R=[Rc(y)]``),
+    ``ds.problem.configure_solver`` so the active benchmark operator is
+    identical to data generation),
     report the FV sensor residual and the theta-local FNO-vs-FV discrepancy as a
     post-hoc diagnostic only, and optionally **polish** ``theta_hat`` against
     the FV sensor residual with derivative-free Nelder-Mead (the FV solve is not
@@ -53,13 +52,12 @@ What Stages 1-5 do (deliberately narrow):
 theta enters the FNO in *two* places, and both must agree with the data
 pipeline exactly:
   1. ``cond_static[2:6]`` — linear-normalized over ``RC_VOID_RANGES``
-     (mirrors ``problems.source_itr.build_cond_vector_itr``).
+     (mirrors the active spatial-ITR condition builder).
   2. spatial channel ``RC_Y_CHANNEL`` (=4) — ``rc_log_norm(make_rc_void_profile(...))``
-     broadcast across x (mirrors ``problems.source_itr._rc_channel`` in
-     ``broadcast`` mode).
+     broadcast across x.
 
-Everything Stage 1 needs that is *not* theta (IC snapshot, x/y channels, patch
-mask, forcing sequence, the cond time/patch slots) is taken verbatim from the
+Everything Stage 1 needs that is *not* theta (IC snapshot, x/y channels, known
+forcing/source fields, forcing sequence, and non-ITR condition slots) is taken verbatim from the
 real ``problem.build_item(ds, sid, s=0, j=n)`` so the scaffolding cannot drift
 from training. Only channel 4 and cond[2:6] are replaced by torch functions of
 theta, so autograd produces dT/dtheta through the frozen model.
@@ -2089,11 +2087,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--out-csv", default=None)
     # Stage 2 sensor operator. Omit --sensor-x-halfwidth for full-field (Stage 1).
     ap.add_argument("--sensor-x-halfwidth", type=float, default=None,
-                    help="Half-width of the x-band around the interface; omit for full-field")
+                    help="Half-width used only by the interface_band layout")
     ap.add_argument("--sensor-n-y", type=int, default=8,
                     help="Number of y sensor rows in the interface band")
     ap.add_argument("--interface-x", type=float, default=0.5,
-                    help="Interface x location for sensor placement (source_itr: 0.5)")
+                    help="Physical interface x location for sensor placement")
     ap.add_argument(
         "--sensor-layout",
         choices=["full_field", "interface_band", "interface_pair"],
@@ -2112,7 +2110,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="Multistart sampling over the theta-box (default: lhs)")
     ap.add_argument("--sensitivity", action="store_true",
                     help="Report dG/dtheta SVD identifiability at theta_hat "
-                         "(condition number; source_itr also reports R_amp/sigma ridge alignment)")
+                         "(spatial-ITR adapters also report R_amp/sigma ridge alignment)")
     # Stage 4: FV refinement. The FNO MAP is re-checked against the real solver.
     ap.add_argument("--fv-refine", action="store_true",
                     help="Re-evaluate theta_hat with the real FVSolver2D and "
@@ -2152,10 +2150,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--uq-level", type=float, default=0.95,
                     help="Confidence/credible level for profile + MCMC intervals")
     ap.add_argument("--profile", action="store_true",
-                    help="Profile-likelihood UQ. Needs a noise model "
-                         "(--noise-std or --fv-refine)")
+                    help="Profile-likelihood UQ using --calibration-artifact")
     ap.add_argument("--profile-index", type=int, default=None,
-                    help="Parameter index to profile. source_itr default 1=R_amp; forcing uses 0=R_c.")
+                    help="Parameter index to profile (adapter default: R_amp for spatial ITR, R_c for scalar forcing)")
     ap.add_argument("--profile-grid", type=int, default=11,
                     help="Number of pinned grid points for --profile (default 11)")
     ap.add_argument("--profile-span", type=float, default=0.6,
@@ -2165,7 +2162,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "not reported as an interval)")
     ap.add_argument("--mcmc", action="store_true",
                     help="Short RW-Metropolis MCMC UQ (primary, uniform-theta prior). "
-                         "Needs a noise model (--noise-std or --fv-refine)")
+                         "Uses --calibration-artifact.")
     ap.add_argument("--mcmc-samples", type=int, default=2000)
     ap.add_argument("--mcmc-burn", type=int, default=500)
     ap.add_argument("--mcmc-step", type=float, default=0.05,

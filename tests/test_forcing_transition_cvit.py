@@ -774,6 +774,40 @@ def test_tiny_physics_only_transition_end_to_end(tmp_path):
     assert summary["gradnorm_mode"] == "inert_single_term"
 
 
+def test_tiny_physics_only_transition_without_gate_artifacts(tmp_path):
+    _write_transition_dataset(tmp_path)
+    config, _, _ = _physics_runner_config(tmp_path)
+    physics = config["training"]["pino"]["transition"]["physics"]
+    physics["gate_summary"] = None
+    physics["network_gate_summary"] = None
+    summary = run_one_seed_forcing_transition_physics(
+        config, seed=29, run_dir=tmp_path / "physics_run_ungated",
+    )
+    assert summary["selected_physics_objective"] == "variational"
+    assert summary["direct_state_gate_sha256"] is None
+    assert summary["network_gate_sha256"] is None
+    assert summary["network_gate_budget"] is None
+    assert summary["screen_floor_source"] == "zero"
+    assert not summary["direct_state_gate_uses_fv_reference_solutions"]
+    assert not summary["network_gate_uses_supervised_capacity_baseline"]
+
+
+def test_ungated_physics_transition_requires_explicit_objective(tmp_path):
+    _write_transition_dataset(tmp_path)
+    config, _, _ = _physics_runner_config(tmp_path)
+    physics = config["training"]["pino"]["transition"]["physics"]
+    physics["gate_summary"] = None
+    physics["network_gate_summary"] = None
+    physics["objective"] = None
+    with pytest.raises(
+        ValueError,
+        match="objective is required when no network gate",
+    ):
+        run_one_seed_forcing_transition_physics(
+            config, seed=31, run_dir=tmp_path / "physics_run_no_objective",
+        )
+
+
 def test_physics_transition_exact_resume(tmp_path, monkeypatch):
     _write_transition_dataset(tmp_path)
     config, _, _ = _physics_runner_config(tmp_path, epochs=2)

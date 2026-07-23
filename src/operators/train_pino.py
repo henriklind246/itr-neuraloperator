@@ -12426,7 +12426,7 @@ def _transition_gate_floor(
 
 def _transition_validation_screen_metrics(
     validation: dict[str, Any],
-    direct_gate: dict[str, Any],
+    direct_gate: dict[str, Any] | None,
     *,
     sigma_global: float,
     anti_collapse_passed: bool,
@@ -12437,12 +12437,16 @@ def _transition_validation_screen_metrics(
     if not lead_keys:
         raise ValueError("transition validation has no populated lead bins")
     longest = lead_groups[lead_keys[-1]]
-    overall_floor = _transition_gate_floor(
-        direct_gate, "overall_field", sigma_global=sigma_global,
-    )
-    long_floor = _transition_gate_floor(
-        direct_gate, "longest_lead", sigma_global=sigma_global,
-    )
+    if direct_gate is None:
+        overall_floor = 0.0
+        long_floor = 0.0
+    else:
+        overall_floor = _transition_gate_floor(
+            direct_gate, "overall_field", sigma_global=sigma_global,
+        )
+        long_floor = _transition_gate_floor(
+            direct_gate, "longest_lead", sigma_global=sigma_global,
+        )
     overall_skill = transition_screen_skill(
         float(validation["target_gnrmse"]),
         overall_floor,
@@ -12475,6 +12479,9 @@ def _transition_validation_screen_metrics(
         "long_skill": long_skill,
         "overall_floor_gnrmse": overall_floor,
         "long_floor_gnrmse": long_floor,
+        "floor_source": (
+            "zero" if direct_gate is None else "dense_direct_state_gate"
+        ),
         "low_frequency_fractions": low_fractions,
         "low_frequency_long_lead_drift": drift,
     }
@@ -12572,30 +12579,71 @@ def run_one_seed_forcing_transition_physics(
 
     gate_path = physics_cfg.get("gate_summary")
     network_path = physics_cfg.get("network_gate_summary")
-    if gate_path is None or network_path is None:
-        raise ValueError(
-            "physics-only transition training requires both gate summary paths"
+    direct_gate = None
+    direct_hash = None
+    if gate_path not in (None, ""):
+        direct_gate, direct_hash = load_verified_transition_gate(
+            gate_path, expected_stage="dense_direct_state_gate",
         )
-    direct_gate, direct_hash = load_verified_transition_gate(
-        gate_path, expected_stage="dense_direct_state_gate",
-    )
-    network_gate, network_hash = load_verified_transition_gate(
-        network_path, expected_stage="single_instance_network_gate",
-    )
-    if str(network_gate.get("direct_state_gate_sha256")) != direct_hash:
-        raise ValueError("network gate was not authorized by the supplied direct gate")
-    selected_objective = str(network_gate["selected_objective"])
+    network_gate = None
+    network_hash = None
+    if network_path not in (None, ""):
+        network_gate, network_hash = load_verified_transition_gate(
+            network_path, expected_stage="single_instance_network_gate",
+        )
+    if (
+        direct_gate is not None
+        and network_gate is not None
+        and str(network_gate.get("direct_state_gate_sha256")) != direct_hash
+    ):
+        raise ValueError(
+            "network gate was not authorized by the supplied direct gate"
+        )
     configured_objective = physics_cfg.get("objective")
-    if configured_objective is not None and str(configured_objective) != selected_objective:
-        raise ValueError(
-            "configured physics objective differs from the network-gate selection"
+    if network_gate is None:
+        if configured_objective is None:
+            raise ValueError(
+                "training.pino.transition.physics.objective is required when "
+                "no network gate summary is supplied"
+            )
+        selected_objective = str(configured_objective)
+        if direct_gate is not None:
+            qualified = tuple(direct_gate.get("qualified_objectives", ()))
+            if qualified and selected_objective not in qualified:
+                raise ValueError(
+                    "configured physics objective was not qualified by the "
+                    "supplied direct-state gate"
+                )
+        print(
+            "[pino-transition] network gate not supplied; using configured "
+            f"objective={selected_objective!r}",
+            flush=True,
         )
+    else:
+        selected_objective = str(network_gate["selected_objective"])
+        if (
+            configured_objective is not None
+            and str(configured_objective) != selected_objective
+        ):
+            raise ValueError(
+                "configured physics objective differs from the network-gate "
+                "selection"
+            )
     if selected_objective not in {"raw_ls", "variational", "defect"}:
-        raise ValueError("network gate selected an unsupported objective")
+        raise ValueError("physics transition objective is unsupported")
     consecutive = dict(physics_cfg.get("consecutive_intervals", {}) or {})
-    if consecutive != dict(network_gate.get("consecutive_intervals", {})):
+    if (
+        network_gate is not None
+        and consecutive != dict(network_gate.get("consecutive_intervals", {}))
+    ):
         raise ValueError(
             "production consecutive-interval policy differs from the network gate"
+        )
+    if direct_gate is None:
+        print(
+            "[pino-transition] direct-state gate not supplied; production "
+            "screen skills use a zero numerical floor",
+            flush=True,
         )
 
     extend_completed = bool(transition.get("extend_completed", False))
@@ -12610,8 +12658,12 @@ def run_one_seed_forcing_transition_physics(
     sigma = float(data["sigma_global"])
     if not math.isfinite(sigma) or sigma <= 0.0:
         raise ValueError("physics-only transition requires a positive normalizer")
-    gate_sigma = direct_gate.get("configuration", {}).get(
-        "resolved_sigma_global",
+    gate_sigma = (
+        None
+        if direct_gate is None
+        else direct_gate.get("configuration", {}).get(
+            "resolved_sigma_global",
+        )
     )
     if gate_sigma is not None and not math.isclose(
         float(gate_sigma), sigma, rel_tol=1.0e-7, abs_tol=1.0e-10,
@@ -12777,7 +12829,14 @@ def run_one_seed_forcing_transition_physics(
         "direct_gate_sha256": direct_hash,
         "network_gate_sha256": network_hash,
         "selected_objective": selected_objective,
-        "network_gate_budget": int(network_gate["matched_budget"]),
+        "network_gate_budget": (
+            None
+            if network_gate is None
+            else int(network_gate["matched_budget"])
+        ),
+        "screen_floor_source": (
+            "zero" if direct_gate is None else "dense_direct_state_gate"
+        ),
         "consecutive_intervals": consecutive,
         "dt": dt,
         "source_state_mode": "online_local_ivp",
@@ -12895,8 +12954,12 @@ def run_one_seed_forcing_transition_physics(
                 "optimization_uses_solution_fields": False,
                 "normalization_uses_training_trajectories": True,
                 "checkpoint_selection_uses_validation_targets": True,
-                "direct_state_gate_uses_fv_reference_solutions": True,
-                "network_gate_uses_supervised_capacity_baseline": True,
+                "direct_state_gate_uses_fv_reference_solutions": (
+                    direct_gate is not None
+                ),
+                "network_gate_uses_supervised_capacity_baseline": (
+                    network_gate is not None
+                ),
                 "physics_only_claim_scope": "optimization_objective",
             },
         }
@@ -13234,14 +13297,19 @@ def run_one_seed_forcing_transition_physics(
         "counterfactual_diagnostics": latest_counterfactual,
         "direct_state_gate_sha256": direct_hash,
         "network_gate_sha256": network_hash,
-        "network_gate_budget": int(network_gate["matched_budget"]),
+        "network_gate_budget": (
+            None
+            if network_gate is None
+            else int(network_gate["matched_budget"])
+        ),
         "consecutive_intervals": consecutive,
+        "screen_floor_source": compatibility["screen_floor_source"],
         "gradnorm_mode": compatibility["gradnorm_mode"],
         "optimization_uses_solution_fields": False,
         "normalization_uses_training_trajectories": True,
         "checkpoint_selection_uses_validation_targets": True,
-        "direct_state_gate_uses_fv_reference_solutions": True,
-        "network_gate_uses_supervised_capacity_baseline": True,
+        "direct_state_gate_uses_fv_reference_solutions": direct_gate is not None,
+        "network_gate_uses_supervised_capacity_baseline": network_gate is not None,
         "physics_only_claim_scope": "optimization_objective",
         "test_set_evaluated": False,
     }

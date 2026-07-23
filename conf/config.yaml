@@ -500,9 +500,13 @@ training:
       save_latest_every_updates: 25
       extend_completed: false
       physics:
+        # Optional qualification artifacts. When omitted, set objective
+        # explicitly; production-screen skill then uses a zero numerical floor.
+        # Supplied artifacts remain hash-verified and constrain the objective /
+        # consecutive-interval policy as before.
         gate_summary: null
         network_gate_summary: null
-        objective: null
+        objective: null  # required when network_gate_summary is omitted
         residual_method: finite_volume
         dt: null
         updates_per_epoch: null
