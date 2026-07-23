@@ -34,3 +34,7 @@ training:
     # OFF by default so a data-only smoke run stays pure data. Set =1.0 on the CLI
     # for any physics/anchor run to anchor the fixed 300 K IC.
     lambda_ic: 0.0
+  pino:
+    # Keep the inhomogeneous forcing wall separate from the two homogeneous
+    # adiabatic walls; averaging all three diluted the only forcing signal.
+    lambda_bc_left: 1.0

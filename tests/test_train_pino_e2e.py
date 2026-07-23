@@ -39,8 +39,11 @@ from src.operators.train_pino import (
     build_cvit,
     build_forcing_image,
     build_ic_batch,
+    forcing_ic_supervised_data_loss,
     load_diffusion_data,
     load_interface_cvit_checkpoint,
+    run_config_seeds_pino,
+    run_one_seed_forcing_ic_supervised,
     run_one_seed_forcing_ic_pino,
     run_one_seed_forcing_pino,
     run_one_seed_interfaces_pino,
@@ -549,6 +552,8 @@ def test_e2e_staged_pipeline_and_diagnostics(tmp_path):
     for r in rows:
         for col in ("loss", "loss_r", "loss_ic", "loss_bc"):
             assert math.isfinite(float(r[col]))
+        assert math.isfinite(float(r["causal_eps"]))
+        assert r["causal_action"] in {"increase", "decrease", "hold", "hold_empty"}
     # grad-norm diagnostics logged on every (validate_every=1) epoch.
     for r in rows:
         for col in ("grad_norm_r", "grad_norm_ic", "grad_norm_bc"):
@@ -831,7 +836,6 @@ def _forcing_config(tmp_path):
                 "activation": "gelu",
                 "hard_right_dirichlet": True,
                 "hard_right_dirichlet_t_right": 300.0,
-                "hard_left_flux": True,
             }
         },
         "training": {
@@ -1115,6 +1119,8 @@ def _write_synthetic_forcing_ic(tmp_path, num_sims=24, Nt=6, Nx=20, Ny=20):
     )
     for i, r in enumerate(records):
         r["ic_family"] = _IC_FAMILIES[i % len(_IC_FAMILIES)]
+        r["ic_params"] = {}
+        r["T0"] = traj[i, 0].copy()
     sim_params = np.array(records, dtype=object)
 
     meta = {
@@ -1130,6 +1136,7 @@ def _write_synthetic_forcing_ic(tmp_path, num_sims=24, Nt=6, Nx=20, Ny=20):
     np.save(tmp_path / "sim_params.npy", sim_params)
     np.save(tmp_path / "meta.npy", np.array(meta, dtype=object), allow_pickle=True)
     np.save(tmp_path / "dt.npy", np.array(float(t_grid[1] - t_grid[0])))
+    np.save(tmp_path / "ramp_seconds.npy", np.array(0.003))
     return traj, sim_params
 
 
@@ -1214,6 +1221,203 @@ def _forcing_ic_config(tmp_path):
             },
         },
     }
+
+
+def _forcing_ic_supervised_config(tmp_path, epochs=2):
+    config = _forcing_ic_config(tmp_path)
+    config["training"].update({
+        "epochs": int(epochs),
+        "optimizer": "AdamW",
+        "grad_clip": 1.0,
+    })
+    config["training"]["pino"].update({
+        "lambda_data": 1.0,
+        "lambda_r": 0.0,
+        "lambda_ic": 0.0,
+        "lambda_bc": 0.0,
+        "lambda_bc_left": 0.0,
+        "n_data_sims": 2,
+        "n_data_pts": 16,
+        "data_query_chunk": 0,
+    })
+    config["training"]["pino"]["forcing"].update({
+        "val_sim_batch": 2,
+        "val_query_chunk": 64,
+        "save_latest_every": 1,
+    })
+    return config
+
+
+def test_forcing_ic_supervised_rejects_mixed_objective(tmp_path):
+    config = _forcing_ic_supervised_config(tmp_path)
+    config["training"]["pino"]["lambda_r"] = 1.0
+    with pytest.raises(ValueError, match="not a mixed"):
+        train_pino_mod._forcing_ic_training_mode(
+            config["training"]["pino"],
+        )
+
+
+def test_forcing_ic_supervised_loss_uses_train_ids_and_all_model_branches(tmp_path):
+    _write_synthetic_forcing_ic(tmp_path, num_sims=32)
+    config = _forcing_ic_supervised_config(tmp_path)
+    data = load_diffusion_data(config)
+    sim_params = np.load(tmp_path / "sim_params.npy", allow_pickle=True)
+    model = build_cvit(
+        config,
+        data["mu_global"],
+        data["sigma_global"],
+        grid_size=(20, 20),
+        t_final=float(data["t_grid"][-1]),
+        variant="forcing_ic",
+    )
+    x_grid = torch.as_tensor(data["x_grid"], dtype=torch.float32)
+    y_grid = torch.as_tensor(data["y_grid"], dtype=torch.float32)
+    y_img = np.linspace(0.0, 1.0, 16)
+    t_img = np.linspace(0.0, float(data["t_grid"][-1]), 20)
+
+    def calculate(trajectories):
+        return forcing_ic_supervised_data_loss(
+            model,
+            sim_params,
+            trajectories,
+            data["train_ids"],
+            y_img=y_img,
+            t_img=t_img,
+            a_ref=300.0,
+            t_ramp=0.003,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            t_grid=data["t_grid"],
+            mu=data["mu_global"],
+            sigma=data["sigma_global"],
+            n_sims=2,
+            n_pts=16,
+            query_chunk=0,
+            device=torch.device("cpu"),
+            rng=np.random.default_rng(7),
+            gen=torch.Generator().manual_seed(11),
+        )
+
+    loss, sampled_ids = calculate(data["trajectories"])
+    assert set(sampled_ids).issubset(set(data["train_ids"]))
+    assert torch.isfinite(loss) and loss.requires_grad
+    loss.backward()
+    for module in (model.forcing_encoder, model.ic_encoder, model.decoder):
+        assert any(
+            parameter.grad is not None
+            and torch.isfinite(parameter.grad).all()
+            and parameter.grad.abs().sum() > 0
+            for parameter in module.parameters()
+        )
+
+    shifted = np.asarray(data["trajectories"]).copy()
+    shifted[:, 1:] += 25.0
+    shifted_loss, shifted_ids = calculate(shifted)
+    np.testing.assert_array_equal(sampled_ids, shifted_ids)
+    assert not torch.allclose(loss.detach(), shifted_loss.detach(), atol=1e-6)
+
+
+def test_forcing_ic_supervised_e2e_skips_every_physics_path(tmp_path, monkeypatch):
+    _write_synthetic_forcing_ic(tmp_path, num_sims=32)
+    config = _forcing_ic_supervised_config(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("supervised training invoked a physics/online path")
+
+    for name in (
+        "_sample_online_problem_descriptors",
+        "sample_collocation",
+        "pino_losses",
+        "_forcing_ic_fv_losses",
+    ):
+        monkeypatch.setattr(train_pino_mod, name, forbidden)
+
+    base_dir = tmp_path / "supervised_dispatch"
+    run_config_seeds_pino(config, base_run_dir=base_dir, seeds=[3])
+    run_dir = base_dir / "seed3"
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+    train_ids = set(load_diffusion_data(config)["train_ids"])
+    for row in rows:
+        assert row["objective"] == "supervised"
+        assert math.isfinite(float(row["loss_data"]))
+        assert math.isfinite(float(row["val_gnrmse"]))
+        assert set(json.loads(row["data_sim_ids"])).issubset(train_ids)
+    assert any(
+        row.get("gnrmse_fam_uniform_2d") not in ("", None)
+        for row in rows
+    )
+    for artifact in (
+        "cvit_best.pt", "cvit_latest.pt", "cvit_final.pt",
+        "final_metrics.json", "RUN_COMPLETE",
+    ):
+        assert (run_dir / artifact).exists()
+    checkpoint = torch.load(
+        run_dir / "cvit_best.pt", map_location="cpu", weights_only=False,
+    )
+    assert checkpoint["objective"] == "supervised"
+    assert checkpoint["best_validation"]["val_gnrmse"] >= 0.0
+    summary = json.loads((run_dir / "final_metrics.json").read_text())
+    assert summary["test_set_evaluated"] is False
+    assert summary["data_signature"]["problem_version"] == (
+        "forcing_single_varying_ic_v1"
+    )
+
+
+def test_forcing_ic_supervised_resume_is_exact(tmp_path, monkeypatch):
+    _write_synthetic_forcing_ic(tmp_path, num_sims=32)
+
+    monkeypatch.setattr(
+        train_pino_mod,
+        "validate_forcing_ic_gnrmse",
+        lambda *args, **kwargs: {"val_gnrmse": 1.0, "val_rmse_K": 1.0},
+    )
+    full_dir = tmp_path / "supervised_full"
+    run_one_seed_forcing_ic_supervised(
+        _forcing_ic_supervised_config(tmp_path, epochs=3),
+        seed=9,
+        run_dir=full_dir,
+    )
+
+    split_dir = tmp_path / "supervised_split"
+    run_one_seed_forcing_ic_supervised(
+        _forcing_ic_supervised_config(tmp_path, epochs=1),
+        seed=9,
+        run_dir=split_dir,
+    )
+    resumed = _forcing_ic_supervised_config(tmp_path, epochs=3)
+    resumed["training"]["pino"]["forcing"]["extend_completed"] = True
+    run_one_seed_forcing_ic_supervised(resumed, seed=9, run_dir=split_dir)
+
+    full = torch.load(
+        full_dir / "cvit_final.pt", map_location="cpu", weights_only=False,
+    )
+    split = torch.load(
+        split_dir / "cvit_final.pt", map_location="cpu", weights_only=False,
+    )
+    assert full["completed_updates"] == split["completed_updates"] == 3
+    for name, value in full["model_state"].items():
+        torch.testing.assert_close(
+            value, split["model_state"][name], rtol=1e-7, atol=1e-8,
+        )
+    assert [
+        row["data_sim_ids"] for row in _rows(full_dir)
+    ] == [
+        row["data_sim_ids"] for row in _rows(split_dir)
+    ]
+
+
+def test_forcing_ic_supervised_preflight_rejects_wrong_fixed_family(tmp_path):
+    _write_synthetic_forcing_ic(tmp_path, num_sims=32)
+    config = _forcing_ic_supervised_config(tmp_path)
+    data = load_diffusion_data(config)
+    sim_params = np.load(tmp_path / "sim_params.npy", allow_pickle=True)
+    sim_params[0] = dict(sim_params[0])
+    sim_params[0]["temporal_family"] = "exp"
+    with pytest.raises(ValueError, match="only 'sin'"):
+        train_pino_mod.validate_forcing_ic_supervised_dataset(
+            config, data, sim_params,
+        )
 
 
 def test_online_warmup_resample_boundary():

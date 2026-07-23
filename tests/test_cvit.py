@@ -1,6 +1,14 @@
+import numpy as np
+import pytest
 import torch
+import torch.nn as nn
 
-from src.operators.cvit import CViT, ForcingCViT
+from src.operators.cvit import (
+    CViT,
+    ForcingCViT,
+    FourierEmbed,
+    _sincos_pos_embed_2d,
+)
 from src.physics.pde_residual import forcing_neumann_residual
 
 
@@ -82,6 +90,77 @@ def test_fourier_freq_t_none_matches_spatial_scale():
     sx = m.decoder.fourier_x.kernel.std().item()
     st = m.decoder.fourier_t.kernel.std().item()
     assert 0.5 < (st / sx) < 2.0
+
+
+def test_reference_port_trainable_arrays_and_mlp_contract():
+    m = _tiny()
+    parameters = dict(m.named_parameters())
+    assert "encoder.pos_emb" in parameters
+    assert "decoder.fourier_x.kernel" in parameters
+    assert "decoder.fourier_t.kernel" in parameters
+
+    film_linears = [x for x in m.decoder.time_film.net if isinstance(x, nn.Linear)]
+    film_activations = [x for x in m.decoder.time_film.net if isinstance(x, nn.SiLU)]
+    head_linears = [x for x in m.decoder.head.net if isinstance(x, nn.Linear)]
+    head_activations = [x for x in m.decoder.head.net if isinstance(x, nn.GELU)]
+    assert len(film_linears) == 3
+    assert len(film_activations) == 2
+    assert len(head_linears) == 2
+    assert len(head_activations) == 1
+    assert head_activations[0].approximate == "tanh"
+
+
+def test_reference_fourier_and_position_equations():
+    fourier = FourierEmbed(2, 4, 1.0)
+    with torch.no_grad():
+        fourier.kernel.copy_(torch.tensor([[1.0, -2.0], [0.5, 3.0]]))
+    x = torch.tensor([[0.2, -0.4], [1.0, 0.25]])
+    projection = x.numpy() @ fourier.kernel.detach().numpy()
+    expected = np.concatenate([np.cos(projection), np.sin(projection)], axis=-1)
+    np.testing.assert_allclose(fourier(x).detach().numpy(), expected, rtol=1e-6, atol=1e-6)
+
+    emb_dim, height, width = 8, 2, 3
+    grid_h, grid_w = np.meshgrid(
+        np.arange(height, dtype=np.float32),
+        np.arange(width, dtype=np.float32),
+        indexing="ij",
+    )
+    omega = 1.0 / 10000.0 ** (
+        np.arange(emb_dim // 4, dtype=np.float32) / float(emb_dim // 4)
+    )
+
+    def reference_1d(values):
+        phase = values.reshape(-1, 1) * omega.reshape(1, -1)
+        return np.concatenate([np.sin(phase), np.cos(phase)], axis=-1)
+
+    expected_pos = np.concatenate(
+        [reference_1d(grid_h), reference_1d(grid_w)], axis=-1
+    )
+    np.testing.assert_allclose(
+        _sincos_pos_embed_2d(emb_dim, height, width).numpy(),
+        expected_pos,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_reference_trainable_coordinate_arrays_receive_gradients():
+    torch.manual_seed(2)
+    m = _tiny()
+    with torch.no_grad():
+        m.decoder.time_film.net[-1].weight.normal_(0.0, 0.1)
+    u = torch.randn(2, 1, 20, 20)
+    coords = torch.rand(2, 12, 2)
+    t = torch.rand(2, 12, 1) * 0.3
+    m(u, coords, t).square().mean().backward()
+    for parameter in (
+        m.encoder.pos_emb,
+        m.decoder.fourier_x.kernel,
+        m.decoder.fourier_t.kernel,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
 
 
 def test_higher_fourier_freq_t_increases_time_sensitivity():
@@ -206,63 +285,9 @@ def test_hard_left_flux_off_ignores_q_left():
     assert torch.allclose(out_q, out_none, atol=0)
 
 
-def test_hard_left_flux_preserves_right_dirichlet():
-    # With the lifting on, x=1 must still collapse to t_right: g*(x-1) and
-    # (1 - x^2)*raw both vanish there, so the right Dirichlet wall is untouched.
-    m = _tiny_forcing(t_right_tilde=0.4, hard_left_flux=True, left_flux_scale=0.2)
-    u = torch.randn(2, 1, 16, 20)
-    coords = torch.rand(2, 32, 2)
-    coords[..., 0] = 1.0
-    t = torch.rand(2, 32, 1) * 0.3
-    q_left = torch.rand(2, 32, 1)
-    out = m(u, coords, t, q_left=q_left)
-    assert torch.allclose(out, torch.full_like(out, 0.4), atol=1e-5)
-
-
-def test_hard_left_flux_none_preserves_right_dirichlet():
-    # IC / eval path passes q_left=None -> g=0; x=1 stays pinned to t_right.
-    m = _tiny_forcing(t_right_tilde=0.3, hard_left_flux=True, left_flux_scale=0.2)
-    u = torch.randn(1, 1, 16, 20)
-    coords = torch.rand(1, 16, 2)
-    coords[..., 0] = 1.0
-    t = torch.rand(1, 16, 1) * 0.3
-    out = m(u, coords, t, q_left=None)
-    assert torch.allclose(out, torch.full_like(out, 0.3), atol=1e-5)
-
-
-def test_hard_left_flux_collapses_bc_left_to_forcing_independent():
-    # left_flux_scale = 1/(k*sigma): the lifting's -q_L/(k*sigma)*(x-1) term makes
-    # the left-wall residual dT_tilde/dx + q_L/(k*sigma) reduce to raw_x(0), which
-    # does not depend on q_L. Two different q_L over the SAME (x=0, y, t) leaves
-    # must give the same residual.
-    sigma, k = 5.0, 1.0
-    m = _tiny_forcing(hard_left_flux=True, left_flux_scale=1.0 / (k * sigma))
-    u = torch.randn(2, 1, 16, 20)
-    x = torch.zeros(2, 8, 1, requires_grad=True)
-    y = torch.rand(2, 8, 1, requires_grad=True)
-    t = (torch.rand(2, 8, 1) * 0.3).requires_grad_(True)
-    q1 = torch.rand(2, 8, 1)
-    q2 = q1 + 0.5
-    r1 = forcing_neumann_residual(m, u, x, y, t, q_L=q1, sigma=sigma, k=k)
-    r2 = forcing_neumann_residual(m, u, x, y, t, q_L=q2, sigma=sigma, k=k)
-    assert torch.allclose(r1, r2, atol=1e-5)
-
-
-def test_hard_left_flux_double_backward_left_neumann():
-    # The collapsed left residual must remain twice differentiable (grad w.r.t. x
-    # for the Neumann term, then w.r.t. params through the loss).
-    sigma, k = 5.0, 1.0
-    m = _tiny_forcing(hard_left_flux=True, left_flux_scale=1.0 / (k * sigma))
-    u = torch.randn(2, 1, 16, 20)
-    x = torch.zeros(2, 8, 1, requires_grad=True)
-    y = torch.rand(2, 8, 1, requires_grad=True)
-    t = (torch.rand(2, 8, 1) * 0.3).requires_grad_(True)
-    q_L = torch.rand(2, 8, 1)
-    r = forcing_neumann_residual(m, u, x, y, t, q_L=q_L, sigma=sigma, k=k)
-    r.pow(2).mean().backward()
-    grads = [p.grad for p in m.parameters() if p.grad is not None]
-    assert grads, "no parameter received a gradient"
-    assert all(torch.isfinite(g).all() for g in grads)
+def test_invalid_global_hard_left_flux_lift_is_rejected():
+    with pytest.raises(ValueError, match="interior PDE residual"):
+        _tiny_forcing(hard_left_flux=True, left_flux_scale=0.2)
 
 
 def test_forcing_double_backward_left_neumann():

@@ -164,7 +164,7 @@ def test_recover_config_uses_forcing_image_block(tmp_path):
     assert isinstance(rc, CkptConfig)
     assert rc.grid_size == (16, 20)
     assert rc.a_ref == pytest.approx(A_AMP_REF)
-    assert rc.hard_left_flux is True
+    assert rc.hard_left_flux is False
     assert rc.provenance["ny_img"] == "checkpoint"
     assert rc.warnings == ()
 

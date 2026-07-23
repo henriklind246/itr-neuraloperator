@@ -18,7 +18,7 @@ DATA_FILE_NAMES = {
 
 # Overrides that select a config GROUP (merged inside load_config via env var)
 # rather than a leaf value; consumed before load_config, not applied as dotted
-# paths. model.type is descriptive-only for the PINO path (always CViT).
+# paths. model.type is descriptive-only for this CViT training path.
 GROUP_ENV = {"benchmark": "BENCHMARK", "representation": "REPRESENTATION"}
 
 
@@ -66,7 +66,10 @@ def _resolve_run_dir(config: dict) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Physics-only (PINO) CViT training on the diffusion benchmark."
+        description=(
+            "CViT training for diffusion benchmarks, including PINO and the "
+            "saved-data-only diffusion_forcing_single objective."
+        )
     )
     parser.add_argument("overrides", nargs="*", help="Config overrides in dotted key=value form.")
     args = parser.parse_args()
@@ -84,7 +87,7 @@ def main() -> int:
         if key in GROUP_ENV:
             os.environ[GROUP_ENV[key]] = val
         elif key == "model.type":
-            continue  # PINO path is always CViT; kept for CLI symmetry
+            continue  # This path is always CViT; kept for CLI symmetry.
         else:
             dotted.append(raw)
 

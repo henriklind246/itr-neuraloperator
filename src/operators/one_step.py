@@ -47,6 +47,80 @@ __all__ = [
 ]
 
 
+def _one_step_candidate(
+    decoded: torch.Tensor,
+    state: torch.Tensor,
+    right_value: torch.Tensor,
+    dt: float,
+    mode: str,
+) -> torch.Tensor:
+    mode = str(mode)
+    if mode == "absolute":
+        return decoded
+    signal = decoded - right_value.to(device=decoded.device, dtype=decoded.dtype)
+    if mode == "deviation":
+        return right_value.to(device=decoded.device, dtype=decoded.dtype) + signal
+    if mode == "increment":
+        return state + signal
+    if mode == "rate":
+        return state + float(dt) * signal
+    raise ValueError(
+        "output_parameterization must be 'rate', 'increment', 'deviation', or "
+        f"'absolute'; got {mode!r}."
+    )
+
+
+def _remove_current_contact_jump(
+    state: torch.Tensor,
+    coords: torch.Tensor,
+    interface_x: torch.Tensor,
+    jump_scale: torch.Tensor,
+    geom,
+    sigma: float,
+    q_ref: float,
+) -> torch.Tensor:
+    face = int(geom.face_idx.reshape(-1)[0].item())
+    conductance = geom.G_x.to(state)
+    if conductance.dim() == 2:
+        conductance = conductance[face].unsqueeze(0).expand(state.shape[0], -1)
+    else:
+        conductance = conductance[:, face]
+    q_normalized = (
+        conductance
+        * float(sigma)
+        * (state[:, face] - state[:, face + 1])
+        / float(q_ref)
+    )
+    aligned_flux = q_normalized[:, None].expand_as(state)
+    return moving_interface_jump_enrichment(
+        state.reshape(state.shape[0], -1, 1),
+        coords,
+        -aligned_flux.reshape(state.shape[0], -1, 1),
+        interface_x,
+        jump_scale,
+    )[..., 0].view_as(state)
+
+
+def _current_contact_flux_normalized(
+    state: torch.Tensor,
+    geom,
+    sigma: float,
+    q_ref: float,
+) -> torch.Tensor:
+    face = int(geom.face_idx.reshape(-1)[0].item())
+    conductance = geom.G_x.to(state)
+    if conductance.dim() == 2:
+        conductance = conductance[face].unsqueeze(0).expand(state.shape[0], -1)
+    else:
+        conductance = conductance[:, face]
+    return (
+        conductance
+        * float(sigma)
+        * (state[:, face] - state[:, face + 1])
+        / float(q_ref)
+    )
+
+
 def predict_one_step_field(
     model,
     state: torch.Tensor,
@@ -57,6 +131,7 @@ def predict_one_step_field(
     *,
     dt: float,
     query_chunk: int,
+    output_parameterization: str = "absolute",
     interface_x: torch.Tensor | None = None,
     jump_scale: torch.Tensor | None = None,
     closure_geom=None,
@@ -80,18 +155,81 @@ def predict_one_step_field(
     time_query = torch.full(
         (state.shape[0], coords.shape[1], 1), float(dt), device=state.device
     )
-    if not bool(getattr(model, "jump_enrichment", False)):
-        prediction = _decode_in_chunks(
-            model, latent, coords, time_query, int(query_chunk)
-        )[..., 0].view(state.shape[0], state.shape[1], state.shape[2])
+    decoded = _decode_in_chunks(
+        model, latent, coords, time_query, int(query_chunk)
+    )[..., 0].view(state.shape[0], state.shape[1], state.shape[2])
+    if bool(getattr(model, "interface_aligned_domains", False)):
+        if output_parameterization != "rate":
+            raise ValueError(
+                "aligned InterfaceCViT is a constrained rate operator"
+            )
+        prediction = _one_step_candidate(
+            decoded, state, model.t_right_tilde, dt, output_parameterization
+        )
+        if return_storage_projection:
+            raise RuntimeError(
+                "storage projection is incompatible with aligned InterfaceCViT"
+            )
+        if not return_interface_flux:
+            return prediction
+        if closure_geom is None or sigma is None or q_ref is None:
+            raise ValueError(
+                "aligned interface-flux diagnostics require geometry, sigma, and q_ref"
+            )
+        flux_rates = []
+        chunk = int(query_chunk) if int(query_chunk) > 0 else coords.shape[1]
+        for start in range(0, coords.shape[1], chunk):
+            stop = min(start + chunk, coords.shape[1])
+            flux_rates.append(model.decode_interface_flux(
+                latent,
+                coords[:, start:stop, 1:2],
+                time_query[:, start:stop],
+            ))
+        flux_rate = torch.cat(flux_rates, dim=1)[..., 0].view_as(prediction)[:, 0]
+        current_flux = _current_contact_flux_normalized(
+            state, closure_geom, float(sigma), float(q_ref)
+        )
+        return prediction, current_flux + float(dt) * flux_rate
+    has_jump = bool(getattr(model, "jump_enrichment", False))
+    parameterization_state = state
+    if has_jump and str(output_parameterization) in {"rate", "increment"}:
+        if any(value is None for value in (
+            interface_x, jump_scale, closure_geom, sigma, q_ref
+        )):
+            raise ValueError(
+                "rate/increment parameterization with jump enrichment requires "
+                "interface geometry, jump scale, sigma, and q_ref"
+            )
+        parameterization_state = _remove_current_contact_jump(
+            state,
+            coords,
+            interface_x,
+            jump_scale,
+            closure_geom,
+            float(sigma),
+            float(q_ref),
+        )
+    smooth = _one_step_candidate(
+        decoded,
+        parameterization_state,
+        model.t_right_tilde,
+        dt,
+        output_parameterization,
+    )
+    if not has_jump:
         if return_interface_flux:
             raise RuntimeError("interface flux requested without jump enrichment")
         if return_storage_projection:
             raise RuntimeError("storage projection requested without jump enrichment")
-        return prediction
+        return smooth
     if interface_x is None or jump_scale is None:
         raise ValueError("jump enrichment requires interface_x and jump_scale")
     flux_mode = str(getattr(model, "jump_flux_mode", "learned"))
+    if return_storage_projection and flux_mode != "conservative_storage_projection":
+        raise RuntimeError(
+            "storage-projection diagnostics require "
+            "jump_flux_mode='conservative_storage_projection'"
+        )
     if flux_mode in {
         "left_energy_closure",
         "two_sided_energy_closure",
@@ -101,9 +239,6 @@ def predict_one_step_field(
             closure_geom, q_left_integral, resistance, sigma, q_ref
         )):
             raise ValueError("left-energy closure inputs are incomplete")
-        smooth = _decode_in_chunks(
-            model, latent, coords, time_query, int(query_chunk)
-        )[..., 0].view(state.shape[0], state.shape[1], state.shape[2])
         if flux_mode == "left_energy_closure":
             q_physical = left_energy_interface_flux_closure(
                 state,
@@ -150,30 +285,29 @@ def predict_one_step_field(
         if return_interface_flux:
             return enriched, q_normalized
         return enriched
-    outputs = []
     fluxes = []
     chunk = int(query_chunk)
     for start in range(0, coords.shape[1], chunk):
         stop = min(start + chunk, coords.shape[1])
-        output, flux = model.decode_enriched(
+        flux = model.decode_interface_flux(
             latent,
-            coords[:, start:stop],
+            coords[:, start:stop, 1:2],
             time_query[:, start:stop],
-            interface_x,
-            jump_scale,
         )
-        outputs.append(output)
         fluxes.append(flux)
-    prediction = torch.cat(outputs, dim=1)[..., 0].view(
+    flux = torch.cat(fluxes, dim=1)
+    prediction = moving_interface_jump_enrichment(
+        smooth.reshape(state.shape[0], -1, 1),
+        coords,
+        flux,
+        interface_x,
+        jump_scale,
+    )[..., 0].view(
         state.shape[0], state.shape[1], state.shape[2]
     )
     if not return_interface_flux:
         return prediction
-    flux_grid = torch.cat(fluxes, dim=1)[..., 0].view_as(prediction)
-    if return_storage_projection:
-        zeros = prediction.new_zeros(prediction.shape)
-        gap = prediction.new_zeros((prediction.shape[0],))
-        return prediction, flux_grid[:, 0], zeros, gap
+    flux_grid = flux[..., 0].view_as(prediction)
     return prediction, flux_grid[:, 0]
 
 
@@ -187,6 +321,7 @@ def rollout_field(
     *,
     dt: float,
     query_chunk: int,
+    output_parameterization: str = "absolute",
     steps: int,
     interface_x: torch.Tensor | None = None,
     jump_scale: torch.Tensor | None = None,
@@ -222,6 +357,7 @@ def rollout_field(
                 coords,
                 dt=dt,
                 query_chunk=query_chunk,
+                output_parameterization=output_parameterization,
                 interface_x=interface_x,
                 jump_scale=jump_scale,
                 closure_geom=closure_geom,

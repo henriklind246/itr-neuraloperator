@@ -28,11 +28,15 @@ from problems.interfaces import K_LEFT, K_RIGHT
 from src.physics.boundary_forcing import A_REF_FLUX
 from src.operators.train_pino import (
     T_RIGHT,
+    _fixed_interval_indices,
+    _resolve_interfaces_one_step_config,
     _through_origin_slope,
     anti_collapse_eligible,
     build_cvit,
     interfaces_one_step_response_slopes,
+    load_interface_cvit_checkpoint,
     load_diffusion_data,
+    run_one_seed_interfaces_pino,
     run_one_seed_interfaces_one_step_pino,
     validate_interfaces_one_step_gnrmse,
 )
@@ -40,6 +44,8 @@ import src.operators.one_step as one_step_mod
 from src.operators.one_step import (
     OneStepCase,
     OneStepStatePool,
+    _one_step_candidate,
+    _remove_current_contact_jump,
     predict_one_step_field,
     prepare_interfaces_one_step_case,
 )
@@ -141,6 +147,8 @@ def _one_step_config(tmp_path, *, objective="variational", n_cases=2):
                     "state_pool_replace_per_update": 2,
                     "max_uses_per_case": 4,
                     "time_mixture": {"uniform": 1.0},
+                    "output_parameterization": "absolute",
+                    "conservation": "learned",
                     "updates": 2,
                     "validate_every": 1,
                     "fast_validation_cases": 3,
@@ -161,13 +169,143 @@ VAL_KEYS = (
     "E_model", "E_zero", "rollout_max_stepwise_gnrmse",
     "rollout_final_gnrmse", "rollout_teacher_ratio",
     "rollout_max_abs_T_K", "rollout_nonfinite",
+    "hard_storage_active",
     "gnrmse_Rc_low", "gnrmse_Rc_mid", "gnrmse_Rc_high",
     "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
 )
 
 
+def test_one_step_config_is_authoritative_for_enrichment_mode(tmp_path):
+    config = _one_step_config(tmp_path)
+    config["training"]["pino"]["one_step"].update({
+        "output_parameterization": "rate",
+        "conservation": "conservative_storage_projection",
+    })
+    resolved = _resolve_interfaces_one_step_config(config)
+    interface = resolved["model"]["interface_cvit"]
+    assert interface["jump_enrichment"] is True
+    assert interface["jump_flux_mode"] == "conservative_storage_projection"
+    assert config["model"]["interface_cvit"].get("jump_enrichment") is None
+
+
+def test_one_step_default_uses_y_dependent_learned_flux(tmp_path):
+    config = _one_step_config(tmp_path)
+    del config["training"]["pino"]["one_step"]["conservation"]
+    resolved = _resolve_interfaces_one_step_config(config)
+    interface = resolved["model"]["interface_cvit"]
+    assert resolved["training"]["pino"]["one_step"]["conservation"] == "learned"
+    assert interface["jump_enrichment"] is True
+    assert interface["jump_flux_mode"] == "learned"
+
+
+def test_aligned_domains_require_learned_rate_operator(tmp_path):
+    config = _one_step_config(tmp_path)
+    config["model"]["interface_cvit"]["interface_aligned_domains"] = True
+    with pytest.raises(ValueError, match="requires output_parameterization='rate'"):
+        _resolve_interfaces_one_step_config(config)
+    config["training"]["pino"]["one_step"]["output_parameterization"] = "rate"
+    resolved = _resolve_interfaces_one_step_config(config)
+    assert resolved["model"]["interface_cvit"]["jump_enrichment"] is True
+
+
+def test_aligned_domain_runner_smoke(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    config = _one_step_config(tmp_path, objective="defect", n_cases=1)
+    config["model"]["interface_cvit"]["interface_aligned_domains"] = True
+    one_step = config["training"]["pino"]["one_step"]
+    one_step.update({
+        "output_parameterization": "rate",
+        "updates": 1,
+        "fast_validation_cases": 1,
+        "probe_pairs": 1,
+    })
+    run_dir = tmp_path / "aligned_domains"
+    summary = run_one_seed_interfaces_one_step_pino(
+        config, seed=3, run_dir=run_dir
+    )
+    checkpoint = torch.load(
+        run_dir / "cvit_last.pt", map_location="cpu", weights_only=False
+    )
+    assert summary["objective"] == "defect"
+    assert checkpoint["config"]["model"]["interface_cvit"][
+        "interface_aligned_domains"
+    ] is True
+    architecture = json.loads((run_dir / "architecture.json").read_text())
+    assert architecture["interface_aligned_domains"] is True
+    restored, _ = load_interface_cvit_checkpoint(run_dir / "cvit_last.pt")
+    assert restored.interface_aligned_domains is True
+
+
+def test_collapse_runner_rejects_disconnected_jump_enrichment():
+    config = {"model": {"interface_cvit": {"jump_enrichment": True}}}
+    with pytest.raises(ValueError, match="not consumed by the collapse"):
+        run_one_seed_interfaces_pino(config, seed=0, run_dir="unused")
+
+
+def test_rate_parameterization_removes_current_jump_before_residual_update(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    env = _build_env(_one_step_config(tmp_path), "cpu")
+    case = env["make_case"](0, np.random.default_rng(3))
+    state = case.truth_states[1:2]
+    base = _remove_current_contact_jump(
+        state,
+        env["coords"],
+        case.interface_x,
+        case.jump_scale,
+        case.geom,
+        env["sigma"],
+        env["a_ref"],
+    )
+    face = int(case.geom.face_idx.reshape(-1)[0])
+    conductance = case.geom.G_x[:, face]
+    q_norm = conductance * env["sigma"] * (
+        state[:, face] - state[:, face + 1]
+    ) / env["a_ref"]
+    left = (
+        env["coords"][..., 0].view_as(state)
+        < case.interface_x.reshape(-1, 1, 1)
+    ).to(state)
+    reconstructed = base + left * case.jump_scale[:, None, None] * q_norm[:, None]
+    assert torch.allclose(reconstructed, state, atol=1e-6, rtol=1e-6)
+
+    right = torch.tensor(env["t_right_tilde"])
+    zero_rate_decoded = torch.full_like(state, right)
+    assert torch.allclose(
+        _one_step_candidate(zero_rate_decoded, base, right, env["dt"], "rate"),
+        base,
+        atol=0,
+    )
+
+
+def test_learned_flux_rejects_storage_projection_diagnostic(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    config = _resolve_interfaces_one_step_config(_one_step_config(tmp_path))
+    env = _build_env(config, "cpu")
+    case = env["make_case"](0, np.random.default_rng(4))
+    with pytest.raises(RuntimeError, match="storage-projection diagnostics"):
+        predict_one_step_field(
+            env["model"],
+            case.truth_states[0:1],
+            case.interval_images[0:1],
+            case.scalars,
+            case.fixed_channels,
+            env["coords"],
+            dt=env["dt"],
+            query_chunk=env["chunk_r"],
+            interface_x=case.interface_x,
+            jump_scale=case.jump_scale,
+            closure_geom=case.geom,
+            q_left_integral=case.q_left_integrals[0:1],
+            resistance=case.resistance,
+            sigma=env["sigma"],
+            q_ref=env["a_ref"],
+            return_storage_projection=True,
+        )
+
+
 def _build_env(config, device):
     """Replicate the runner's model + case setup for the unit-level tests."""
+    config = _resolve_interfaces_one_step_config(config)
     dev = torch.device(device)
     data = load_diffusion_data(config)
     mu, sigma = data["mu_global"], data["sigma_global"]
@@ -274,6 +412,25 @@ def test_one_step_runner_smoke_variational(tmp_path):
         run_one_seed_interfaces_one_step_pino(config, seed=0, run_dir=run_dir)
 
 
+def test_rate_parameterization_with_storage_projection_runs(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    config = _one_step_config(tmp_path, objective="variational", n_cases=1)
+    one_step = config["training"]["pino"]["one_step"]
+    one_step.update({
+        "updates": 1,
+        "fast_validation_cases": 1,
+        "probe_pairs": 1,
+        "output_parameterization": "rate",
+        "conservation": "conservative_storage_projection",
+    })
+    run_dir = tmp_path / "one_step_rate_projection"
+    run_one_seed_interfaces_one_step_pino(config, seed=0, run_dir=run_dir)
+    row = _rows(run_dir)[0]
+    assert float(row["hard_storage_active"]) == 1.0
+    assert math.isfinite(float(row["hard_global_storage_error"]))
+    assert float(row["hard_global_storage_error"]) < 1e-5
+
+
 def test_one_step_runner_defect_objective(tmp_path):
     _write_synthetic_interfaces(tmp_path)
     config = _one_step_config(tmp_path, objective="defect")
@@ -288,6 +445,139 @@ def test_one_step_runner_defect_objective(tmp_path):
             assert math.isfinite(float(r[col])), (col, r[col])
     assert summary["objective"] == "defect"
     assert math.isfinite(summary["best_val_gnrmse"])
+
+
+def test_fixed_interval_indices_span_the_fv_trajectory():
+    assert _fixed_interval_indices(60, 1) == [0]
+    indices = _fixed_interval_indices(60, 16)
+    assert indices[0] == 0
+    assert indices[-1] == 59
+    assert len(indices) == len(set(indices)) == 16
+    with pytest.raises(ValueError, match="cannot exceed"):
+        _fixed_interval_indices(3, 4)
+
+
+def test_one_step_fixed_simulation_trains_multiple_states(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    config = _one_step_config(tmp_path, objective="defect")
+    one_step = config["training"]["pino"]["one_step"]
+    one_step.update({
+        "fixed_simulation": {"enabled": True, "num_states": 3},
+        "updates": 2,
+        "validate_every": 1,
+        "fast_validation_cases": 1,
+        "probe_pairs": 1,
+    })
+    run_dir = tmp_path / "fixed_multistate"
+
+    summary = run_one_seed_interfaces_one_step_pino(
+        config, seed=3, run_dir=run_dir
+    )
+
+    rows = _rows(run_dir)
+    assert len(rows) == 2
+    for row in rows:
+        assert float(row["pool_distinct_keys"]) == 1.0
+        assert float(row["pool_size"]) == 1.0
+        assert math.isfinite(float(row["fixed_train_rmse_K"]))
+        assert math.isfinite(float(row["fixed_train_transition_rel"]))
+    with (run_dir / "fixed_state_metrics.csv").open(newline="") as f:
+        state_rows = list(csv.DictReader(f))
+    assert len(state_rows) == 2 * 3
+    assert {int(float(row["interval"])) for row in state_rows} == {0, 2, 3}
+    assert (run_dir / "cvit_best_fixed.pt").exists()
+    assert summary["fixed_simulation"] is True
+    assert summary["fixed_intervals"] == [0, 2, 3]
+    assert math.isfinite(summary["best_fixed_transition_rel"])
+
+
+def test_fixed_set_trains_multiple_simulations(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+    config = _one_step_config(tmp_path, objective="defect")
+    one_step = config["training"]["pino"]["one_step"]
+    one_step.update({
+        "fixed_simulation": {
+            "enabled": True,
+            "num_simulations": 2,
+            "num_states": 2,
+            "normalize_per_state_defect": True,
+        },
+        "updates": 1,
+        "validate_every": 1,
+        "fast_validation_cases": 1,
+        "probe_pairs": 1,
+    })
+    run_dir = tmp_path / "fixed_multi_simulation"
+
+    summary = run_one_seed_interfaces_one_step_pino(
+        config, seed=8, run_dir=run_dir
+    )
+
+    row = _rows(run_dir)[0]
+    assert float(row["pool_distinct_keys"]) == 2.0
+    assert float(row["pool_size"]) == 2.0
+    with (run_dir / "fixed_state_metrics.csv").open(newline="") as f:
+        state_rows = list(csv.DictReader(f))
+    assert len(state_rows) == 2 * 2
+    assert {int(row["simulation"]) for row in state_rows} == {0, 1}
+    checkpoint = torch.load(
+        run_dir / "cvit_last.pt", map_location="cpu", weights_only=False
+    )
+    assert len(checkpoint["fixed_simulation_state"]["case_params"]) == 2
+    assert tuple(checkpoint["fixed_case_weights"].shape) == (2, 2)
+    assert summary["fixed_num_simulations"] == 2
+
+
+def test_fixed_simulation_warm_start_reuses_states_and_freezes_weights(tmp_path):
+    _write_synthetic_interfaces(tmp_path)
+
+    source_config = _one_step_config(tmp_path, objective="defect")
+    source_one_step = source_config["training"]["pino"]["one_step"]
+    source_one_step.update({
+        "fixed_simulation": {"enabled": True, "num_states": 3},
+        "updates": 1,
+        "validate_every": 1,
+        "fast_validation_cases": 1,
+        "probe_pairs": 1,
+    })
+    source_dir = tmp_path / "fixed_source"
+    run_one_seed_interfaces_one_step_pino(
+        source_config, seed=4, run_dir=source_dir
+    )
+    source_path = source_dir / "cvit_best_fixed.pt"
+    source = torch.load(source_path, map_location="cpu", weights_only=False)
+
+    continuation = copy.deepcopy(source_config)
+    continuation["training"]["learning_rate"] = 1.0e-4
+    continuation_one_step = continuation["training"]["pino"]["one_step"]
+    continuation_one_step["init_from_checkpoint"] = str(source_path)
+    continuation_one_step["fixed_simulation"].update({
+        "normalize_per_state_defect": True,
+        "normalization_floor_fraction": 0.01,
+    })
+    continuation_dir = tmp_path / "fixed_continuation"
+    summary = run_one_seed_interfaces_one_step_pino(
+        continuation, seed=99, run_dir=continuation_dir
+    )
+
+    continued = torch.load(
+        continuation_dir / "cvit_last.pt", map_location="cpu", weights_only=False
+    )
+    np.testing.assert_array_equal(
+        continued["fixed_simulation_state"]["params"]["T0"],
+        source["fixed_simulation_state"]["params"]["T0"],
+    )
+    assert continued["fixed_simulation_state"]["intervals"] == [0, 2, 3]
+    weights = continued["fixed_case_weights"].numpy()
+    assert np.isfinite(weights).all()
+    assert (weights > 0.0).all()
+    assert float(weights.mean()) == pytest.approx(1.0)
+    weight_rows = json.loads(
+        (continuation_dir / "fixed_state_weights.json").read_text()
+    )
+    assert [row["interval"] for row in weight_rows] == [0, 2, 3]
+    assert summary["fixed_state_defect_normalization"] is True
+    assert summary["source_checkpoint"] == str(source_path.resolve())
 
 
 def test_one_step_runner_rejects_step_stride(tmp_path):
@@ -326,6 +616,8 @@ def test_validation_emits_all_required_keys(tmp_path):
     )
     for key in VAL_KEYS:
         assert key in out, key
+    assert "hard_global_storage_error" in out
+    assert math.isnan(out["hard_global_storage_error"])
     # val_gnrmse mirrors the rollout gate; teacher-forced is a separate scalar
     assert out["val_gnrmse"] == out["val_gnrmse_rollout"]
     assert math.isfinite(out["val_gnrmse"])
@@ -479,10 +771,23 @@ def test_anti_collapse_gate_rejects_collapse_accepts_transport():
         "val_gnrmse": 0.05,
         "rollout_max_abs_T_K": 350.0,
         "hard_global_storage_error": 1e-9,
+        "hard_storage_active": 1.0,
     }
     assert anti_collapse_eligible(
         healthy, forcing_slope_min=0.25, jump_slope_min=0.10,
         max_abs_T_K=1000.0, hard_storage_tol=1e-6, require_finite=True,
+    )
+
+    inactive_storage = {
+        **healthy,
+        "hard_storage_active": 0.0,
+        "hard_global_storage_error": float("nan"),
+    }
+    assert anti_collapse_eligible(
+        inactive_storage,
+        forcing_slope_min=0.25,
+        jump_slope_min=0.10,
+        hard_storage_tol=1e-6,
     )
 
     # 300 K constant-field collapse: no forcing/jump response
@@ -571,7 +876,7 @@ def test_runner_logs_anti_collapse_columns(tmp_path):
     rows = _rows(run_dir)
     assert rows
     gate_cols = (
-        "hard_global_storage_error", "forcing_response_slope",
+        "hard_storage_active", "hard_global_storage_error", "forcing_response_slope",
         "jump_response_slope", "jump_rmse_K", "jump_correlation",
         "jump_sign_fraction", "anti_collapse_eligible",
     )
@@ -580,8 +885,9 @@ def test_runner_logs_anti_collapse_columns(tmp_path):
             assert col in r, col
             assert r[col] not in ("", None), col
         assert int(r["anti_collapse_eligible"]) in (0, 1)
-        # learned jump-flux mode: no structural storage projection -> 0.0
-        assert float(r["hard_global_storage_error"]) == 0.0
+        # learned jump-flux mode has no structural storage projection.
+        assert float(r["hard_storage_active"]) == 0.0
+        assert math.isnan(float(r["hard_global_storage_error"]))
 
 
 # --------------------------------------------------------------------------- #

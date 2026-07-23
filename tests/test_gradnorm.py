@@ -54,7 +54,7 @@ def test_100x_imbalance_equalizes():
     y = m(torch.ones(1, 1))
     term_a = (10.0 * y).sum()   # grad norm 10
     term_b = (0.1 * y).sum()    # grad norm 0.1
-    gn = GradNormBalancer(["a", "b"], alpha_w=0.0, update_every=1)
+    gn = GradNormBalancer(["a", "b"], alpha_w=1.0, update_every=1)
     mults = gn.maybe_update(
         {"a": term_a, "b": term_b}, list(m.parameters()), dist_info=None
     )
@@ -76,6 +76,25 @@ def test_equal_norms_give_unit_multipliers():
     assert mults["b"] == pytest.approx(1.0)
 
 
+def test_alpha_w_is_new_target_fraction():
+    m = _lin()
+    y = m(torch.ones(1, 1))
+    held = GradNormBalancer(["a", "b"], alpha_w=0.0, update_every=1)
+    assert held.maybe_update(
+        {"a": (10.0 * y).sum(), "b": (0.1 * y).sum()}, list(m.parameters())
+    ) == {"a": 1.0, "b": 1.0}
+
+    y = m(torch.ones(1, 1))
+    updated = GradNormBalancer(["a", "b"], alpha_w=1.0, update_every=1)
+    weights = updated.maybe_update(
+        {"a": (10.0 * y).sum(), "b": (0.1 * y).sum()}, list(m.parameters())
+    )
+    assert weights["b"] / weights["a"] == pytest.approx(100.0, rel=1e-4)
+
+    with pytest.raises(ValueError, match="alpha_w"):
+        GradNormBalancer(["a"], alpha_w=1.1)
+
+
 def test_clamp_bounds_near_zero_grad_term():
     """A term with grad norm below ``eps`` is clamped (not divided-by-~0), so its
     multiplier stays finite and larger than a well-conditioned term's."""
@@ -83,7 +102,7 @@ def test_clamp_bounds_near_zero_grad_term():
     y = m(torch.ones(1, 1))
     term_a = (10.0 * y).sum()
     term_small = (1e-12 * y).sum()   # grad norm 1e-12 < eps
-    gn = GradNormBalancer(["a", "small"], alpha_w=0.0, update_every=1, eps=1e-8)
+    gn = GradNormBalancer(["a", "small"], alpha_w=1.0, update_every=1, eps=1e-8)
     mults = gn.maybe_update(
         {"a": term_a, "small": term_small}, list(m.parameters())
     )
@@ -100,7 +119,7 @@ def test_disconnected_term_is_held():
     term_a = (10.0 * y).sum()
     term_b = (0.1 * y).sum()
     term_c = torch.tensor(3.0, requires_grad=True)  # independent leaf
-    gn = GradNormBalancer(["a", "b", "c"], alpha_w=0.0, update_every=1)
+    gn = GradNormBalancer(["a", "b", "c"], alpha_w=1.0, update_every=1)
     mults = gn.maybe_update(
         {"a": term_a, "b": term_b, "c": term_c}, list(m.parameters())
     )
@@ -112,7 +131,7 @@ def test_update_every_cadence():
     """Multipliers refresh only every ``update_every`` calls; intervening calls
     return the last committed values unchanged."""
     m = _lin()
-    gn = GradNormBalancer(["a", "b"], alpha_w=0.0, update_every=2)
+    gn = GradNormBalancer(["a", "b"], alpha_w=1.0, update_every=2)
 
     def _step():
         y = m(torch.ones(1, 1))
@@ -124,7 +143,7 @@ def test_update_every_cadence():
     m2 = _step()  # step 1 -> hold
     assert m2 == m1
     m3 = _step()  # step 2 -> update
-    # An update ran; with alpha_w=0 the target is identical here, so equality is
+    # An update ran; with alpha_w=1 the target is identical here, so equality is
     # expected — assert the cadence via the internal step counter instead.
     assert gn._step == 3
     assert m3 == pytest.approx({"a": m1["a"], "b": m1["b"]}, rel=1e-9)
@@ -233,9 +252,9 @@ def test_no_bounds_default_is_exact_noop():
 
 def test_w_max_caps_tiny_grad_term():
     """The small-gradient term's target overshoots; ``w_max`` caps the STORED
-    weight (alpha_w=0 -> stored == clamped target) and records one max hit."""
+    weight (alpha_w=1 -> stored == clamped target) and records one max hit."""
     gn = GradNormBalancer(
-        ["a", "small"], alpha_w=0.0, update_every=1, w_max=1.5,
+        ["a", "small"], alpha_w=1.0, update_every=1, w_max=1.5,
     )
     mults = _imbalanced_step(gn)
     assert mults["small"] == pytest.approx(1.5)
@@ -252,8 +271,8 @@ def test_floor_holds_post_ema_when_prior_below_floor():
     gn.multipliers["big"] = 0.0  # simulate a prior weight below the floor
     m2 = _lin()
     y = m2(torch.ones(1, 1))
-    # big has grad norm 100 -> tiny raw target, floored to 0.25; EMA with prev=0
-    # gives 0.025, which the POST-EMA floor lifts back to exactly 0.25.
+    # big has grad norm 100 -> tiny raw target, floored to 0.25; blending 90%
+    # toward it from prev=0 gives 0.225, which the post-blend floor restores.
     mults = gn.maybe_update(
         {"a": (1.0 * y).sum(), "big": (100.0 * y).sum()}, list(m2.parameters())
     )
@@ -277,7 +296,7 @@ def test_zero_gradient_term_held_no_bound_hit():
     m = _lin()
     y = m(torch.ones(1, 1))
     gn = GradNormBalancer(
-        ["a", "zero"], alpha_w=0.0, update_every=1, w_min=0.1, w_max=5.0,
+        ["a", "zero"], alpha_w=1.0, update_every=1, w_min=0.1, w_max=5.0,
     )
     mults = gn.maybe_update(
         {"a": (10.0 * y).sum(), "zero": (0.0 * y).sum()}, list(m.parameters())
@@ -519,7 +538,7 @@ def _gradnorm_ddp_worker(rank, world_size, port, result_queue):
         torch.manual_seed(0)  # identical init on both ranks
         model = _TinyModel()
         ddp = DistributedDataParallel(model, static_graph=True)
-        gn = GradNormBalancer(["a", "b"], alpha_w=0.0, update_every=1)
+        gn = GradNormBalancer(["a", "b"], alpha_w=1.0, update_every=1)
 
         # Rank-dependent scales -> different per-rank grad norms pre-reduce; the
         # SUM all-reduce then yields identical averaged norms on both ranks.

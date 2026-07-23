@@ -830,7 +830,7 @@ def test_forcing_runner_two_group_gradnorm_and_energy_are_logged(tmp_path):
     _write_forcing_dataset(tmp_path, num_sims=8, nt=4, nx=8, ny=8)
     config = _forcing_config(tmp_path, "hybrid")
     config["training"]["gradnorm"] = {
-        "enabled": True, "alpha_w": 0.0, "update_every": 1,
+        "enabled": True, "alpha_w": 1.0, "update_every": 1,
         "eps": 1e-8, "w_min": 0.1, "w_max": 10.0, "floor": {},
     }
     config["training"]["pino"]["energy"] = {

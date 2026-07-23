@@ -49,6 +49,15 @@ def _model(**kw):
     return m.eval()
 
 
+def _aligned_model(**kw):
+    return _model(
+        jump_enrichment=True,
+        interface_aligned_domains=True,
+        interface_flux_gradient_scale=30.0,
+        **kw,
+    )
+
+
 def _inputs(B=2, Nq=7, seed=0):
     g = torch.Generator().manual_seed(seed)
     u = torch.randn(B, 3, *GRID, generator=g)
@@ -66,6 +75,81 @@ def test_model_smoke_shapes():
     assert out.shape == (2, 7, 1)
     lat = m.encode(u, forcing_image, params)
     assert lat.shape == (2, 4 + 8 + 1, EMB)
+
+
+def test_aligned_spatial_input_places_every_interface_at_fixed_face():
+    model = _aligned_model()
+    nx, ny = GRID
+    interfaces = torch.tensor([
+        (6.5 / (nx - 1)),
+        (12.5 / (nx - 1)),
+    ])
+    params = torch.stack((
+        (interfaces - 0.2) / 0.6,
+        torch.full_like(interfaces, (0.5 - 0.05) / 0.95),
+    ), dim=1)
+    spatial = torch.zeros(2, 3, nx, ny)
+    for batch, interface_x in enumerate(interfaces):
+        split = int(round(float(interface_x) * (nx - 1) + 0.5))
+        spatial[batch, 0, :split] = 1.0
+        spatial[batch, 0, split:] = 3.0
+    physical_x, _ = model._physical_interface_scalars(params)
+    aligned = model._align_spatial_input(spatial, physical_x)
+    assert torch.equal(aligned[:, 0, : nx // 2], torch.ones(2, nx // 2, ny))
+    assert torch.equal(aligned[:, 0, nx // 2 :], torch.full((2, nx // 2, ny), 3.0))
+    assert torch.equal(aligned[0, 1:], aligned[1, 1:])
+    assert torch.all(aligned[:, 1, : nx // 2] == 1.0)
+    assert torch.all(aligned[:, 1, nx // 2 :] == -1.0)
+
+
+def test_aligned_rate_ansatz_enforces_jump_flux_and_right_wall():
+    model = _aligned_model().double()
+    with torch.no_grad():
+        model.decoder["interface"].head.net[-1].bias.copy_(
+            torch.tensor([0.2, 0.4], dtype=torch.float64)
+        )
+    u, forcing_image, _, _, _ = _inputs(B=1, Nq=1)
+    params = torch.tensor(
+        [[0.5, (0.5 - 0.05) / 0.95]], dtype=torch.float64
+    )
+    latent = model.encode(u.double(), forcing_image.double(), params)
+    interface_x = float(latent["interface_x"])
+    epsilon = 1.0e-8
+    left_x = torch.tensor([[[interface_x - epsilon]]], dtype=torch.float64, requires_grad=True)
+    right_x = torch.tensor([[[interface_x]]], dtype=torch.float64, requires_grad=True)
+    y = torch.tensor([[[0.3]]], dtype=torch.float64)
+    t = torch.tensor([[[0.1]]], dtype=torch.float64)
+    left = model.decode(latent, torch.cat((left_x, y), dim=-1), t)
+    right = model.decode(latent, torch.cat((right_x, y), dim=-1), t)
+    left_grad = torch.autograd.grad(left, left_x, torch.ones_like(left))[0]
+    right_grad = torch.autograd.grad(right, right_x, torch.ones_like(right))[0]
+    expected_jump = float(latent["jump_scale"] * 0.4)
+    assert float(left - right) == pytest.approx(expected_jump, abs=1e-6)
+    assert float(-2.0 * left_grad) == pytest.approx(30.0 * 0.4, abs=1e-6)
+    assert float(-right_grad) == pytest.approx(30.0 * 0.4, abs=1e-6)
+    wall = torch.tensor([[[1.0, 0.3]]], dtype=torch.float64)
+    assert float(model.decode(latent, wall, t)) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_aligned_zero_initialized_rate_is_identity_one_step():
+    from src.operators.one_step import predict_one_step_field
+
+    model = _aligned_model()
+    state = torch.randn(1, *GRID)
+    state[:, -1] = 0.0
+    fixed = torch.zeros(1, 2, *GRID)
+    forcing = torch.zeros(1, 1, *FORCING_GRID)
+    scalars = torch.tensor([[0.5, (0.5 - 0.05) / 0.95]])
+    x = torch.linspace(0.0, 1.0, GRID[0])
+    y = torch.linspace(0.0, 1.0, GRID[1])
+    xx, yy = torch.meshgrid(x, y, indexing="ij")
+    coords = torch.stack((xx, yy), dim=-1).view(1, -1, 2)
+    prediction = predict_one_step_field(
+        model, state, forcing, scalars, fixed, coords,
+        dt=0.005, query_chunk=GRID[0] * GRID[1],
+        output_parameterization="rate",
+    )
+    torch.testing.assert_close(prediction, state, rtol=0.0, atol=0.0)
 
 
 def test_moving_jump_enrichment_shifts_only_dynamic_left_side():
@@ -92,6 +176,19 @@ def test_jump_flux_head_is_zero_initialized_and_reaches_parameters():
     loss.backward()
     last = model.interface_flux_decoder.head.net[-1]
     assert float(last.weight.grad.abs().sum()) > 0.0
+
+
+def test_learned_jump_flux_can_vary_along_interface():
+    torch.manual_seed(8)
+    model = _model(jump_enrichment=True).eval()
+    with torch.no_grad():
+        model.interface_flux_decoder.head.net[-1].weight.normal_(0.0, 0.2)
+    u, forcing_image, params, _, _ = _inputs(B=1, Nq=9, seed=9)
+    latent = model.encode(u, forcing_image, params)
+    y = torch.linspace(0.0, 1.0, 9).view(1, 9, 1)
+    t = torch.full_like(y, 0.1)
+    flux = model.decode_interface_flux(latent, y, t)
+    assert float(flux.std()) > 1e-6
 
 
 def test_state_param_flux_head_is_invariant_to_forcing_tokens():

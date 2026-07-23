@@ -326,7 +326,7 @@ def test_conservative_storage_projection_satisfies_both_layer_balances():
     )
     assert float(terms["left_energy_rms"]) < 1e-12
     assert float(terms["right_energy_rms"]) < 1e-12
-    assert float(implied_flux_gap.abs()) > 0.0
+    assert torch.allclose(implied_flux_gap, torch.zeros_like(implied_flux_gap), atol=1e-5)
     gradient = torch.autograd.grad(projected.sum(), smooth, retain_graph=True)[0]
     assert torch.isfinite(gradient).all()
     penalty_gradient = torch.autograd.grad(correction.square().mean(), smooth)[0]

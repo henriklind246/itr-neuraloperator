@@ -83,6 +83,7 @@ from src.physics.fv_residual import (
 )
 from src.physics.init_conditions import (
     IC_BUILDER_SCHEMA_VERSION,
+    IC_FAMILIES,
     ONLINE_IC_SAMPLER_VERSION,
     balanced_ic_family_assignments,
     build_ic,
@@ -94,20 +95,20 @@ from src.physics.pde_residual import (
     neumann_residual,
 )
 
-# ---- Physics-only (PINO) training of a CViT on the diffusion benchmark -------
+# ---- Continuous ViT training on the diffusion benchmark suite ----------------
 #
 # Self-contained trainer: it reuses the data loaders, optimizer/scheduler
-# builders, and seeding from the FNO path by import, but never constructs an
-# FNO or a SnapshotPairDataset. The objective is purely physical — interior heat
-# residual + soft zero-Neumann walls + an IC anchor — so no paired (source,
-# target) snapshots are used; validation compares against the saved trajectories.
+# builders, and seeding from the FNO path by import, but never constructs an FNO
+# or a SnapshotPairDataset. Most runners are physics-only; the versioned
+# diffusion_forcing_single benchmark can instead use saved trajectory values
+# through its explicitly isolated supervised runner.
 
 WALLS = ("left", "top", "bottom")
 
 # Architecture-version stamp for the one-step interfaces PINO run. Bump when the
 # encoder/decoder contract of the production InterfaceCViT changes so recorded
 # run metadata and the SLURM preflight can reject a mismatched checkpoint.
-ONE_STEP_ARCH_VERSION = 1
+ONE_STEP_ARCH_VERSION = 3
 
 _ONLINE_NUMPY_STREAMS = (
     "ic_family",
@@ -870,6 +871,126 @@ def build_ic_batch(
     return torch.from_numpy(normalized).unsqueeze(1).to(device)
 
 
+def validate_forcing_ic_supervised_dataset(
+    config: dict,
+    data: dict[str, Any],
+    sim_params: np.ndarray,
+) -> dict[str, Any]:
+    """Validate the saved-data contract before a supervised model is allocated."""
+    data_cfg = config["data"]
+    trajectory_path = Path(data_cfg["trajectories.npy"])
+    t_grid_path = Path(data_cfg["t_grid_path"])
+    required = {
+        "trajectories": trajectory_path,
+        "x_grid": Path(data_cfg["x_grid_path"]),
+        "y_grid": Path(data_cfg["y_grid_path"]),
+        "t_grid": t_grid_path,
+        "sim_params": trajectory_path.parent / "sim_params.npy",
+        "meta": t_grid_path.parent / "meta.npy",
+        "ramp_seconds": t_grid_path.parent / "ramp_seconds.npy",
+    }
+    missing = [f"{name}={path}" for name, path in required.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "diffusion_forcing_single supervised training requires the complete "
+            f"saved dataset; missing {missing}."
+        )
+
+    meta = load_dataset_meta(t_grid_path)
+    problem = problem_from_config(config)
+    expected_version = getattr(problem, "problem_version", None)
+    if meta is None or meta.get("problem_version") != expected_version:
+        found = None if meta is None else meta.get("problem_version")
+        raise ValueError(
+            f"Dataset problem_version={found!r} != expected "
+            f"{expected_version!r} for supervised forcing-IC training."
+        )
+    if meta.get("ic_mode") != "varying":
+        raise ValueError("supervised forcing-IC data must declare ic_mode='varying'")
+
+    ramp_value = np.asarray(np.load(required["ramp_seconds"]))
+    if ramp_value.ndim != 0:
+        raise ValueError(f"{required['ramp_seconds']} must contain a scalar")
+    ramp_seconds = float(ramp_value)
+    if not math.isfinite(ramp_seconds) or ramp_seconds <= 0.0:
+        raise ValueError("ramp_seconds.npy must contain a finite positive value")
+
+    trajectories = data["trajectories"]
+    num_sims, Nt, Nx, Ny = (int(v) for v in trajectories.shape)
+    if len(sim_params) != num_sims:
+        raise ValueError(
+            f"sim_params length {len(sim_params)} != num_sims {num_sims}."
+        )
+    if (
+        len(data["t_grid"]) != Nt
+        or len(data["x_grid"]) != Nx
+        or len(data["y_grid"]) != Ny
+    ):
+        raise ValueError("trajectory and grid shapes disagree")
+    if not (
+        np.all(np.diff(data["t_grid"]) > 0.0)
+        and np.all(np.diff(data["x_grid"]) > 0.0)
+        and np.all(np.diff(data["y_grid"]) > 0.0)
+    ):
+        raise ValueError("saved x/y/t grids must be strictly increasing")
+    if not math.isfinite(float(data["sigma_global"])) or float(data["sigma_global"]) <= 0.0:
+        raise ValueError("training-only sigma_global must be finite and positive")
+
+    all_ids = np.arange(num_sims, dtype=int)
+    problem.validate_schema(sim_params, all_ids)
+    expected_families = tuple(IC_FAMILIES)
+    labels = np.asarray([str(p["ic_family"]) for p in sim_params])
+    found_families = set(labels.tolist())
+    if found_families != set(expected_families):
+        raise ValueError(
+            "supervised forcing-IC data must contain all and only the configured "
+            f"IC families; found {sorted(found_families)}."
+        )
+    for sid, params in enumerate(sim_params):
+        if np.asarray(params["T0"]).shape != (Nx, Ny):
+            raise ValueError(
+                f"sim_params[{sid}]['T0'] shape "
+                f"{np.asarray(params['T0']).shape} != {(Nx, Ny)}."
+            )
+
+    split_names = ("train_ids", "val_ids", "test_ids")
+    split_ids = [np.asarray(data[name], dtype=int) for name in split_names]
+    expected_sizes = (
+        int(0.70 * num_sims),
+        int(0.15 * num_sims),
+        num_sims - int(0.70 * num_sims) - int(0.15 * num_sims),
+    )
+    if tuple(len(ids) for ids in split_ids) != expected_sizes:
+        raise ValueError(
+            "saved-data split sizes are not the fixed 70/15/15 contract"
+        )
+    concatenated = np.concatenate(split_ids)
+    if (
+        len(np.unique(concatenated)) != num_sims
+        or not np.array_equal(np.sort(concatenated), all_ids)
+    ):
+        raise ValueError("train/val/test simulation IDs must be disjoint and exhaustive")
+    for name, ids in zip(split_names, split_ids):
+        counts = [int(np.count_nonzero(labels[ids] == family)) for family in expected_families]
+        if max(counts, default=0) - min(counts, default=0) > 1:
+            raise ValueError(f"{name} is not stratified by IC family: {counts}")
+
+    return {
+        "problem_version": expected_version,
+        "ic_mode": "varying",
+        "shape": [num_sims, Nt, Nx, Ny],
+        "dtype": str(trajectories.dtype),
+        "split_sizes": list(expected_sizes),
+        "ramp_seconds": ramp_seconds,
+        "grid_key": _content_key({
+            "x": np.asarray(data["x_grid"]),
+            "y": np.asarray(data["y_grid"]),
+            "t": np.asarray(data["t_grid"]),
+        }),
+        "sim_params_key": _content_key([dict(p) for p in sim_params]),
+    }
+
+
 def _ic_targets(
     trajectories: np.ndarray,
     ids: np.ndarray,
@@ -1342,8 +1463,8 @@ def build_gradnorm(
 ):
     """GradNormBalancer over the active PINO terms, or None when disabled.
 
-    Reuses the FNO path's balancer (inverse gradient-norm multipliers, EMA
-    smoothed). ``term_weights`` gives an explicit ordered term -> static-weight map
+    Reuses the FNO path's balancer (inverse gradient-norm multipliers, blended
+    toward each new target by ``alpha_w``). ``term_weights`` gives an explicit ordered term -> static-weight map
     (its insertion order fixes ``term_names``); the forcing trainer passes the split
     set ``{r, ic, bc_left, bc_hom}`` so the left forcing wall is isolated from the
     near-satisfied adiabatic walls. When ``term_weights`` is None the legacy generic
@@ -1361,7 +1482,7 @@ def build_gradnorm(
     floor_cfg = gn_cfg.get("floor", {}) or {}
     return GradNormBalancer(
         terms,
-        alpha_w=float(gn_cfg.get("alpha_w", 0.9)),
+        alpha_w=float(gn_cfg.get("alpha_w", 1.0)),
         update_every=int(gn_cfg.get("update_every", 10)),
         eps=float(gn_cfg.get("eps", 1.0e-8)),
         w_min=None if gn_cfg.get("w_min") is None else float(gn_cfg["w_min"]),
@@ -1605,14 +1726,6 @@ def validate_forcing_gnrmse(
 
     gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
     mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
-    # For hard_left_flux the ansatz carries the forcing via the analytic term
-    # g*(x-1), g = -q_L(y,t)/(k*sigma). It is dropped when q_left is None, so the
-    # eval MUST feed q_L at every query point or it scores an insulated wall
-    # (T_x(0)=raw_x(0)~0) and looks catastrophically wrong regardless of family.
-    use_left_flux = bool(getattr(model, "hard_left_flux", False))
-    y_grid_np = np.asarray(data["y_grid"], dtype=np.float64)
-    M = Nx * Ny
-
     ids = np.asarray(ids)
     per_sim_rmse: list[float] = []
     per_sim_amp: list[float] = []
@@ -1623,28 +1736,10 @@ def validate_forcing_gnrmse(
         u = build_forcing_image(params, y_img, t_img, a_ref, device, t_ramp)
         B = u.shape[0]
         coords = mesh.expand(B, -1, -1)
-        q_all = None
-        if use_left_flux:
-            # g depends on (y, t) only, so evaluate q_L on the distinct (Ny x Nt)
-            # grid with the vectorized q_image (one reconstruct per sim), then tile
-            # across x into mesh order (flat index = ix*Ny + iy, y fastest). This
-            # avoids the Nx-redundant pointwise Nt*Nx*Ny evaluation.
-            q_np = np.empty((B, Nt, M), dtype=np.float32)
-            for b, p in enumerate(params):
-                forcing = reconstruct_qL(
-                    p["temporal_family"], p["temporal_params"],
-                    p["spatial_family"], p["spatial_params"], t_ramp=t_ramp,
-                )
-                qg = np.asarray(
-                    forcing.evaluate_grid(y_grid_np, t_grid), dtype=np.float32
-                )
-                q_np[b] = np.tile(qg.T, (1, Nx))  # (Nt, M), y fastest
-            q_all = torch.from_numpy(q_np).unsqueeze(-1).to(device)  # (B,Nt,M,1)
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
         for k in range(Nt):
             tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
-            q_left = q_all[:, k] if use_left_flux else None
-            out = model(u, coords, tk, q_left=q_left)
+            out = model(u, coords, tk)
             pred[:, k] = out[..., 0].view(B, Nx, Ny)
         pred_K = pred * sigma + mu
         truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)
@@ -1720,8 +1815,7 @@ def forcing_data_loss(
     the sim batch (normalized-space MSE). It is a plain value penalty -- no
     autodiff through the output -- so it directly pins the field level the
     derivative BC cannot, giving the reference benchmarks' value-supervised
-    conditioning. Intended for the soft path (``hard_left_flux=false``); the
-    ansatz's analytic forcing term is not needed, so ``q_left`` is left ``None``.
+    conditioning.
     """
     ids = np.asarray(ids)
     k = min(int(n_sims), int(len(ids)))
@@ -1749,6 +1843,87 @@ def forcing_data_loss(
 
     pred = model(u, coords, t)  # (B, n_pts, 1)
     return ((pred - truth_t) ** 2).mean()
+
+
+def forcing_ic_supervised_data_loss(
+    model: ForcingICCViT,
+    sim_params: np.ndarray,
+    trajectories: np.ndarray,
+    train_ids: np.ndarray,
+    *,
+    y_img: np.ndarray,
+    t_img: np.ndarray,
+    a_ref: float,
+    t_ramp: float,
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    t_grid: np.ndarray,
+    mu: float,
+    sigma: float,
+    n_sims: int,
+    n_pts: int,
+    query_chunk: int,
+    device: torch.device,
+    rng: np.random.Generator,
+    gen: torch.Generator,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Supervised ``(T0, q_L) -> T(x,y,t)`` loss on saved training simulations."""
+    ids = np.asarray(train_ids, dtype=int)
+    if ids.ndim != 1 or len(ids) == 0:
+        raise ValueError("train_ids must be a non-empty one-dimensional array")
+    if n_sims <= 0 or n_sims > len(ids):
+        raise ValueError(
+            f"n_data_sims must be in [1, {len(ids)}], got {n_sims}."
+        )
+    if n_pts <= 0:
+        raise ValueError("n_data_pts must be positive")
+    if not math.isfinite(float(sigma)) or float(sigma) <= 0.0:
+        raise ValueError("sigma_global must be finite and positive")
+    if query_chunk < 0:
+        raise ValueError("data_query_chunk must be non-negative")
+
+    batch_ids = np.asarray(
+        rng.choice(ids, size=int(n_sims), replace=False), dtype=int,
+    )
+    params = [dict(sim_params[int(i)]) for i in batch_ids]
+    u_forcing = build_forcing_image(
+        params, y_img, t_img, a_ref, device, t_ramp,
+    )
+    u_ic = build_ic_batch(trajectories, batch_ids, mu, sigma, device)
+
+    B = len(batch_ids)
+    Nt = int(len(t_grid))
+    Nx = int(x_grid.numel())
+    Ny = int(y_grid.numel())
+    it = torch.randint(
+        0, Nt, (B, n_pts), device=device, generator=gen,
+    )
+    ix = torch.randint(
+        0, Nx, (B, n_pts), device=device, generator=gen,
+    )
+    iy = torch.randint(
+        0, Ny, (B, n_pts), device=device, generator=gen,
+    )
+    coords = torch.stack([x_grid[ix], y_grid[iy]], dim=-1)
+    t_values = torch.as_tensor(t_grid, dtype=torch.float32, device=device)
+    query_t = t_values[it].unsqueeze(-1)
+
+    trajectory_batch = np.asarray(trajectories[batch_ids], dtype=np.float32)
+    it_np = it.detach().cpu().numpy()
+    ix_np = ix.detach().cpu().numpy()
+    iy_np = iy.detach().cpu().numpy()
+    batch_np = np.arange(B, dtype=int)[:, None]
+    truth = trajectory_batch[batch_np, it_np, ix_np, iy_np]
+    truth = (truth - np.float32(mu)) / np.float32(sigma)
+    truth_t = torch.from_numpy(np.asarray(truth, dtype=np.float32)).to(
+        device,
+    ).unsqueeze(-1)
+
+    latent = model.encode(u_forcing, u_ic)
+    prediction = _decode_in_chunks(
+        model, latent, coords, query_t, int(query_chunk),
+    )
+    return (prediction - truth_t).square().mean(), batch_ids
 
 
 # --------- single-seed training ---------
@@ -1806,6 +1981,10 @@ def build_cvit(
                 else float(c["fourier_freq_t"])
             ),
             activation=str(c.get("activation", "gelu")),
+            film_hidden_layers=int(c.get("film_hidden_layers", 2)),
+            film_activation=str(c.get("film_activation", "silu")),
+            head_hidden_layers=int(c.get("head_hidden_layers", 1)),
+            head_activation=str(c.get("head_activation", "gelu")),
             hard_right_dirichlet=hard_rd,
             t_right_tilde=t_right_tilde,
             t_final=t_norm,
@@ -1858,6 +2037,10 @@ def build_cvit(
                 else float(c["fourier_freq_t"])
             ),
             activation=str(c.get("activation", "gelu")),
+            film_hidden_layers=int(c.get("film_hidden_layers", 2)),
+            film_activation=str(c.get("film_activation", "silu")),
+            head_hidden_layers=int(c.get("head_hidden_layers", 1)),
+            head_activation=str(c.get("head_activation", "gelu")),
             hard_right_dirichlet=hard_rd,
             t_right_tilde=t_right_tilde,
             t_final=t_norm,
@@ -1868,6 +2051,15 @@ def build_cvit(
             jump_flux_depth=int(c.get("jump_flux_depth", 1)),
             jump_flux_conditioning=str(c.get("jump_flux_conditioning", "all")),
             jump_flux_mode=str(c.get("jump_flux_mode", "learned")),
+            interface_aligned_domains=bool(
+                c.get("interface_aligned_domains", False)
+            ),
+            interface_flux_gradient_scale=float(forcing_cfg.get("a_ref", 300.0))
+            / (float(sigma) + 1.0e-8),
+            k_left=K_LEFT,
+            k_right=K_RIGHT,
+            interface_x_range=INTERFACE_X_RANGE,
+            resistance_range=RC_RANGE,
         )
     if variant == "forcing":
         c = {**config["model"]["cvit"], **config["model"].get("forcing_cvit", {})}
@@ -1879,11 +2071,6 @@ def build_cvit(
     # Decoder time normalization horizon. Default to the data-derived t_final so
     # the temporal Fourier features live on [0, 1]; a config override wins.
     t_norm = float(c.get("t_final", None) if c.get("t_final", None) is not None else t_final)
-    # Hard left-flux lifting (opt-in): converts the inward flux q_L into the
-    # normalized slope it must produce via left_flux_scale = 1/(k*sigma). Only
-    # meaningful for the forcing variant, which carries the q_L signal.
-    hard_lf = bool(c.get("hard_left_flux", False))
-    left_flux_scale = 1.0 / (float(K_SLAB) * (float(sigma) + 1e-8))
     cls = ForcingCViT if variant == "forcing" else CViT
     return cls(
         in_ch=int(c.get("in_ch", 1)),
@@ -1902,11 +2089,13 @@ def build_cvit(
             else float(c["fourier_freq_t"])
         ),
         activation=str(c.get("activation", "gelu")),
+        film_hidden_layers=int(c.get("film_hidden_layers", 2)),
+        film_activation=str(c.get("film_activation", "silu")),
+        head_hidden_layers=int(c.get("head_hidden_layers", 1)),
+        head_activation=str(c.get("head_activation", "gelu")),
         hard_right_dirichlet=hard_rd,
         t_right_tilde=t_right_tilde,
         t_final=t_norm,
-        hard_left_flux=hard_lf,
-        left_flux_scale=left_flux_scale,
     )
 
 
@@ -1917,17 +2106,21 @@ def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
             "space-time image specification. Legacy waveform-token checkpoints "
             "cannot be loaded; start a fresh experiment."
         )
+    one_step_spec = isinstance(spec.get("one_step"), dict)
     expected = {
         "representation": "space_time_image",
         "version": 1,
         "forcing_schema_version": FORCING_SCHEMA_VERSION,
-        "axis_order": "channel_y_time",
-        "dtype": "float32",
-        "include_endpoints": True,
-        "sign_convention": "positive_inward_left_flux",
-        "normalization": "fixed_division",
-        "clipping": False,
     }
+    if not one_step_spec:
+        expected.update({
+            "axis_order": "channel_y_time",
+            "dtype": "float32",
+            "include_endpoints": True,
+            "sign_convention": "positive_inward_left_flux",
+            "normalization": "fixed_division",
+            "clipping": False,
+        })
     for key, value in expected.items():
         if spec.get(key) != value:
             raise RuntimeError(
@@ -1935,8 +2128,12 @@ def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
                 f"{key}={spec.get(key)!r}, expected {value!r}."
             )
     required = (
-        "ny_img", "nt_img", "patch_size", "y_min", "y_max", "t_min",
-        "t_final", "a_ref", "ramp", "spatial_grid_size",
+        ("ny_img", "nt_img", "a_ref", "ramp", "spatial_grid_size")
+        if one_step_spec else
+        (
+            "ny_img", "nt_img", "patch_size", "y_min", "y_max", "t_min",
+            "t_final", "a_ref", "ramp", "spatial_grid_size",
+        )
     )
     missing = [key for key in required if key not in spec]
     if missing:
@@ -1946,7 +2143,10 @@ def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
             + "."
         )
     ramp = spec["ramp"]
-    if not isinstance(ramp, dict) or ramp.get("type") != "cubic_smoothstep" or int(
+    valid_ramp_type = isinstance(ramp, dict) and (
+        one_step_spec or ramp.get("type") == "cubic_smoothstep"
+    )
+    if not valid_ramp_type or int(
         ramp.get("version", -1)
     ) != RAMP_SCHEMA_VERSION or "duration" not in ramp:
         raise RuntimeError(
@@ -1954,7 +2154,11 @@ def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
             "cubic_smoothstep version 1 with a persisted duration."
         )
     ny_img, nt_img = int(spec["ny_img"]), int(spec["nt_img"])
-    patch_size = int(spec["patch_size"])
+    model_cfg = config.get("model", {}).get("interface_cvit", {}) or {}
+    patch_size = int(
+        model_cfg.get("forcing_patch_size", 0)
+        if one_step_spec else spec["patch_size"]
+    )
     if ny_img < 2 or nt_img < 2 or patch_size <= 0:
         raise RuntimeError(
             "Invalid InterfaceCViT checkpoint image dimensions or patch size; "
@@ -1969,7 +2173,6 @@ def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
         raise RuntimeError("Invalid InterfaceCViT checkpoint: a_ref must be positive.")
 
     forcing_cfg = config.get("training", {}).get("pino", {}).get("forcing", {}) or {}
-    model_cfg = config.get("model", {}).get("interface_cvit", {}) or {}
     comparisons = (
         ("training.pino.forcing.ny_img", forcing_cfg.get("ny_img"), ny_img),
         ("training.pino.forcing.nt_img", forcing_cfg.get("nt_img"), nt_img),
@@ -1984,6 +2187,12 @@ def _validate_interface_image_spec(config: dict, spec: Any) -> dict:
                 "InterfaceCViT checkpoint config/image-spec mismatch: "
                 f"{name}={configured!r}, image specification requires {saved!r}."
             )
+    if one_step_spec and ("patch_size" not in spec or "t_final" not in spec):
+        spec = {
+            **spec,
+            "patch_size": patch_size,
+            "t_final": float(spec.get("t_final", 1.0)),
+        }
     return spec
 
 
@@ -2038,6 +2247,10 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     n_bc = int(pino["n_bc"])
     sim_batch = int(pino["sim_batch"])
     alpha = float(pino.get("alpha", 1.0))
+    grad_clip_cfg = config["training"].get("grad_clip", None)
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    if grad_clip is not None and grad_clip <= 0.0:
+        raise ValueError("training.grad_clip must be null or > 0")
 
     # IC term norm: "mse" (raw normalized MSE, legacy) or "rel" (per-sim relative
     # L2 vs the constant-300 K deviation). The relative form makes the IC anchor
@@ -2069,10 +2282,9 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
 
     dense_ic = bool(pino.get("dense_ic", False))
     resample_every = max(1, int(pino.get("resample_every", 1)))
-    causal_cfg = dict(pino.get("causal", {}) or {})
-    causal_on = bool(causal_cfg.get("enabled", False))
-    if causal_on:
-        causal_cfg["eps_causal"] = _resolve_forcing_causal(causal_cfg)["initial_eps"]
+    causal_cfg = _resolve_forcing_causal(pino.get("causal", {}))
+    causal_on = bool(causal_cfg["enabled"])
+    causal_eps = float(causal_cfg["initial_eps"])
     res_n_bins = (
         int(causal_cfg.get("n_bins", 16)) if causal_on
         else int(pino.get("diag_time_bins", 16))
@@ -2112,6 +2324,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
     fieldnames = [
         "epoch", "loss", "loss_r", "loss_ic", "loss_bc",
         "w_r", "w_ic", "w_bc", "grad_norm_r", "grad_norm_ic", "grad_norm_bc",
+        "causal_eps", "causal_action",
         "val_rel_l2", "val_rmse_K", "val_t0_rel_l2",
     ] + band_cols
     with open(metrics_path, "w", newline="") as f:
@@ -2160,7 +2373,7 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
         f"on(terms={gradnorm.term_names})" if gradnorm is not None else "off"
     )
     causal_desc = (
-        f"on(n_bins={res_n_bins},eps={float(causal_cfg.get('eps_causal', 1.0))})"
+        f"on(n_bins={res_n_bins},eps={causal_eps})"
         if causal_on else "off"
     )
     print(
@@ -2202,9 +2415,11 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             ic_den = d_sim_all[torch.as_tensor(batch_ids, device=device)]
 
         optimizer.zero_grad(set_to_none=True)
+        eps_used = causal_eps
+        causal_step_cfg = {**causal_cfg, "current_eps": eps_used}
         losses = pino_losses(
             model, u, coll, ic_target, alpha,
-            causal_cfg=causal_cfg, t_final=t_final,
+            causal_cfg=causal_step_cfg, t_final=t_final,
             res_bins=(res_n_bins if do_val else 0),
             ic_loss=ic_loss, t_right_tilde=t_right_tilde_ic, ic_eps=ic_eps,
             ic_den=ic_den, compute_r=compute_r, compute_bc=compute_bc,
@@ -2238,11 +2453,28 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             + w_eff["ic"] * losses["ic"]
             + w_eff["bc"] * losses["bc"]
         )
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(f"Non-finite PINO loss at epoch {epoch}")
         loss.backward()
+        for parameter in model.parameters():
+            if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item()):
+                raise FloatingPointError(f"Non-finite PINO gradient at epoch {epoch}")
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=grad_clip
+            )
         lr = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
         _advance_scheduler(scheduler, unit="update", successful_updates=1)
         _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        causal_action = "off"
+        if causal_on and "causal_weights" in losses:
+            causal_eps, causal_action = _adapt_causal_eps(
+                causal_eps,
+                losses["causal_weights"],
+                causal_cfg,
+                populated=bool(losses["causal_populated"]),
+            )
 
         row = {
             "epoch": epoch,
@@ -2256,6 +2488,8 @@ def run_one_seed_pino(config: dict, seed: int, run_dir: Path) -> dict[str, Any]:
             "grad_norm_r": gnorms.get("r", ""),
             "grad_norm_ic": gnorms.get("ic", ""),
             "grad_norm_bc": gnorms.get("bc", ""),
+            "causal_eps": eps_used if causal_on else "",
+            "causal_action": causal_action,
             "val_rel_l2": "",
             "val_rmse_K": "",
             "val_t0_rel_l2": "",
@@ -2585,6 +2819,8 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
     warmup = _forcing_warmup_config(fcfg)
     save_latest_every = max(1, int(fcfg.get("save_latest_every", 25)))
     grad_clip_cfg = fcfg.get("grad_clip", None)
+    if grad_clip_cfg is None:
+        grad_clip_cfg = config["training"].get("grad_clip", None)
     grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
     if grad_clip is not None and grad_clip <= 0.0:
         raise ValueError("training.pino.forcing.grad_clip must be null or > 0")
@@ -2787,7 +3023,6 @@ def run_one_seed_forcing_pino(config: dict, seed: int, run_dir: Path) -> dict[st
         f"sampler={sampler} coll_bias={coll_bias} | lambda_r={lam_r} lambda_ic={lam_ic} "
         f"lambda_bc={lam_bc} lambda_bc_left={lam_bc_left} "
         f"lambda_data={lam_data} (n_data_sims={n_data_sims},n_data_pts={n_data_pts}) "
-        f"hard_left_flux={bool(getattr(model, 'hard_left_flux', False))} | "
         f"n_r={n_r} n_ic={n_ic} n_bc={n_bc} "
         f"sim_batch={sim_batch} alpha={alpha} k_slab={K_SLAB} | "
         f"causal={causal_cfg} | warmup={warmup} grad_clip={grad_clip} "
@@ -3109,6 +3344,7 @@ def validate_forcing_ic_gnrmse(
     t_ramp: float,
     device: torch.device,
     query_batch: int = 8,
+    query_chunk: int = 0,
 ) -> dict[str, float]:
     """Two-branch deviation-field gnRMSE for the varying-IC single-slab benchmark.
 
@@ -3127,6 +3363,10 @@ def validate_forcing_ic_gnrmse(
     t_grid = np.asarray(data["t_grid"], dtype=np.float64)
     mu, sigma = data["mu_global"], data["sigma_global"]
     Nx, Ny, Nt = x_grid.numel(), y_grid.numel(), len(t_grid)
+    if query_batch <= 0:
+        raise ValueError("validation query_batch must be positive")
+    if query_chunk < 0:
+        raise ValueError("validation query_chunk must be non-negative")
 
     gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
     mesh = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1).unsqueeze(0)
@@ -3146,7 +3386,7 @@ def validate_forcing_ic_gnrmse(
         pred = torch.empty((B, Nt, Nx, Ny), device=device)
         for k in range(Nt):
             tk = torch.full((B, Nx * Ny, 1), float(t_grid[k]), device=device)
-            out = model.decode(latent, coords, tk)
+            out = _decode_in_chunks(model, latent, coords, tk, query_chunk)
             pred[:, k] = out[..., 0].view(B, Nx, Ny)
         pred_K = pred * sigma + mu
         truth = np.asarray(data["trajectories"][chunk], dtype=np.float32)
@@ -3187,6 +3427,412 @@ def validate_forcing_ic_gnrmse(
     for fam in np.unique(fam_arr):
         out[f"gnrmse_fam_{fam}"] = float(gnrmse[fam_arr == fam].mean())
     return out
+
+
+def _forcing_ic_training_mode(pino: dict) -> tuple[str, dict[str, float]]:
+    left = pino.get("lambda_bc_left", None)
+    weights = {
+        "data": float(pino.get("lambda_data", 0.0)),
+        "r": float(pino.get("lambda_r", 0.0)),
+        "ic": float(pino.get("lambda_ic", 0.0)),
+        "bc": float(pino.get("lambda_bc", 0.0)),
+        "bc_left": 0.0 if left is None else float(left),
+    }
+    if any(not math.isfinite(value) or value < 0.0 for value in weights.values()):
+        raise ValueError("forcing_ic objective weights must be finite and non-negative")
+    data_active = weights["data"] > 0.0
+    physics_active = any(weights[name] > 0.0 for name in ("r", "ic", "bc", "bc_left"))
+    if data_active and physics_active:
+        raise ValueError(
+            "diffusion_forcing_single supports supervised-only or physics-only "
+            "training, not a mixed data-plus-physics objective"
+        )
+    if data_active:
+        return "supervised", weights
+    if physics_active:
+        return "physics", weights
+    raise ValueError("diffusion_forcing_single has no active training objective")
+
+
+def _forcing_ic_supervised_resume_config(config: dict) -> dict[str, Any]:
+    training = config["training"]
+    pino = training["pino"]
+    forcing = pino.get("forcing", {}) or {}
+    return {
+        "benchmark": copy.deepcopy(config.get("benchmark")),
+        "model": copy.deepcopy(config["model"]),
+        "training": {
+            "learning_rate": training.get("learning_rate"),
+            "weight_decay": training.get("weight_decay"),
+            "optimizer": training.get("optimizer"),
+            "soap": copy.deepcopy(training.get("soap")),
+            "scheduler": copy.deepcopy(training.get("scheduler")),
+            "grad_clip": training.get("grad_clip"),
+            "pino": {
+                "variant": pino.get("variant"),
+                "lambda_data": pino.get("lambda_data"),
+                "lambda_r": pino.get("lambda_r"),
+                "lambda_ic": pino.get("lambda_ic"),
+                "lambda_bc": pino.get("lambda_bc"),
+                "lambda_bc_left": pino.get("lambda_bc_left"),
+                "n_data_sims": pino.get("n_data_sims"),
+                "n_data_pts": pino.get("n_data_pts"),
+                "data_query_chunk": pino.get("data_query_chunk", 0),
+                "forcing": {
+                    key: forcing.get(key)
+                    for key in (
+                        "ny_img", "nt_img", "a_ref", "ramp_seconds",
+                        "val_sim_batch", "val_query_chunk",
+                    )
+                },
+            },
+        },
+    }
+
+
+def run_one_seed_forcing_ic_supervised(
+    config: dict,
+    seed: int,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Saved-data-only training of ``ForcingICCViT`` on varying-IC trajectories."""
+    set_seed(seed)
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = run_dir / "cvit_latest.pt"
+    best_path = run_dir / "cvit_best.pt"
+    final_path = run_dir / "cvit_final.pt"
+    complete_path = run_dir / "RUN_COMPLETE"
+
+    pino = config["training"]["pino"]
+    mode, weights = _forcing_ic_training_mode(pino)
+    if mode != "supervised":
+        raise ValueError("the supervised runner requires a data-only objective")
+
+    fcfg = pino.get("forcing", {}) or {}
+    extend_completed = bool(fcfg.get("extend_completed", False))
+    if complete_path.exists() and not extend_completed:
+        summary_path = run_dir / "final_metrics.json"
+        if summary_path.exists():
+            with open(summary_path) as stream:
+                return json.load(stream)
+        return {"seed": seed, "status": "complete", "run_dir": str(run_dir)}
+    resuming = latest_path.exists() and (not complete_path.exists() or extend_completed)
+
+    device = resolve_device(config["training"].get("device", "auto"))
+    data = load_diffusion_data(config)
+    trajectory_path = Path(config["data"]["trajectories.npy"])
+    sim_params = np.load(
+        trajectory_path.parent / "sim_params.npy", allow_pickle=True,
+    )
+    data_signature = validate_forcing_ic_supervised_dataset(
+        config, data, sim_params,
+    )
+    mu = float(data["mu_global"])
+    sigma = float(data["sigma_global"])
+    Nx = int(len(data["x_grid"]))
+    Ny = int(len(data["y_grid"]))
+    t_final = float(data["t_grid"][-1])
+
+    stored_ramp = float(data_signature["ramp_seconds"])
+    configured_ramp = fcfg.get("ramp_seconds", None)
+    t_ramp = stored_ramp if configured_ramp is None else float(configured_ramp)
+    if not math.isclose(t_ramp, stored_ramp, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError(
+            "training.pino.forcing.ramp_seconds must match the saved "
+            f"ramp_seconds.npy value {stored_ramp}"
+        )
+    a_ref = float(fcfg.get("a_ref") or A_AMP_REF)
+    ny_img = int(fcfg.get("ny_img") if fcfg.get("ny_img") is not None else Ny)
+    nt_img = int(fcfg.get("nt_img") if fcfg.get("nt_img") is not None else 128)
+    y_img = np.linspace(
+        float(data["y_grid"][0]), float(data["y_grid"][-1]),
+        ny_img, dtype=np.float64,
+    )
+    t_img = np.linspace(0.0, t_final, nt_img, dtype=np.float64)
+
+    n_data_sims = int(pino.get("n_data_sims", 8))
+    n_data_pts = int(pino.get("n_data_pts", 1024))
+    data_query_chunk = int(pino.get("data_query_chunk", 0) or 0)
+    val_sim_batch = int(fcfg.get("val_sim_batch", 8))
+    val_query_chunk = int(fcfg.get("val_query_chunk", 0) or 0)
+    if val_sim_batch <= 0 or val_query_chunk < 0:
+        raise ValueError(
+            "forcing.val_sim_batch must be positive and val_query_chunk non-negative"
+        )
+
+    model = build_cvit(
+        config, mu, sigma, grid_size=(Nx, Ny), t_final=t_final,
+        variant="forcing_ic",
+    ).to(device)
+    optimizer = build_optimizer(config, model.parameters())
+    scheduler = build_scheduler(config, optimizer)
+
+    epochs = int(config["training"]["epochs"])
+    validate_every = int(config["training"].get("validate_every", 10))
+    if epochs <= 0 or validate_every <= 0:
+        raise ValueError("training.epochs and validate_every must be positive")
+    save_latest_every = max(1, int(fcfg.get("save_latest_every", 25)))
+    grad_clip_cfg = config["training"].get("grad_clip", None)
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    if grad_clip is not None and grad_clip <= 0.0:
+        raise ValueError("training.grad_clip must be null or positive")
+
+    x_grid = torch.as_tensor(
+        data["x_grid"], dtype=torch.float32, device=device,
+    )
+    y_grid = torch.as_tensor(
+        data["y_grid"], dtype=torch.float32, device=device,
+    )
+    t_grid = np.asarray(data["t_grid"], dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    eval_gen = torch.Generator(device=device)
+    eval_gen.manual_seed(seed + 1_000_003)
+
+    family_columns = [f"gnrmse_fam_{family}" for family in IC_FAMILIES]
+    fieldnames = [
+        "epoch", "completed_updates", "objective", "lr",
+        "loss", "loss_data", "w_data", "data_sim_ids",
+        "val_gnrmse", "val_rmse_K",
+        "gnrmse_amp_low", "gnrmse_amp_mid", "gnrmse_amp_high",
+        *family_columns,
+    ]
+    metrics_path = run_dir / "train_metrics.csv"
+    start_epoch = 0
+    completed_updates = 0
+    last_csv_update = 0
+    best_val = float("inf")
+    best_validation: dict[str, float] | None = None
+    last_validation: dict[str, float] | None = None
+    resume_config = _forcing_ic_supervised_resume_config(config)
+
+    if resuming:
+        checkpoint = torch.load(
+            latest_path, map_location="cpu", weights_only=False,
+        )
+        if checkpoint.get("objective") != "supervised":
+            raise ValueError("resume checkpoint is not a supervised forcing-IC run")
+        if checkpoint.get("resume_config") != resume_config:
+            raise ValueError(
+                "Incompatible supervised forcing-IC resume configuration; "
+                "use a fresh experiment name."
+            )
+        if checkpoint.get("data_signature") != data_signature:
+            raise ValueError(
+                "The supervised forcing-IC dataset differs from the checkpoint."
+            )
+        saved_epochs = int(checkpoint["config"]["training"]["epochs"])
+        if epochs < int(checkpoint["next_epoch"]):
+            raise ValueError("training.epochs is below the checkpoint next_epoch")
+        if epochs != saved_epochs:
+            scheduler_type = str(config["training"]["scheduler"]["type"])
+            if scheduler_type not in {"PICViTExponential", "StepLR"}:
+                raise ValueError(
+                    "Extending updates requires a horizon-independent scheduler"
+                )
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        start_epoch = int(checkpoint["next_epoch"])
+        completed_updates = int(checkpoint["completed_updates"])
+        last_csv_update = int(checkpoint["last_csv_update"])
+        best_val = float(checkpoint["best_val"])
+        best_validation = copy.deepcopy(checkpoint.get("best_validation"))
+        last_validation = copy.deepcopy(checkpoint.get("last_validation"))
+        _restore_forcing_rng(
+            checkpoint["rng_state"], rng, gen, eval_gen,
+        )
+        _reconcile_forcing_metrics(
+            metrics_path, fieldnames, last_csv_update,
+        )
+        if complete_path.exists():
+            complete_path.unlink()
+    else:
+        with open(metrics_path, "w", newline="") as stream:
+            csv.DictWriter(stream, fieldnames=fieldnames).writeheader()
+
+    print(
+        f"[supervised-forcing-ic] seed={seed} device={device} "
+        f"updates={epochs} validate_every={validate_every} "
+        f"grid={Nx}x{Ny} img={ny_img}x{nt_img} "
+        f"n_data_sims={n_data_sims} n_data_pts={n_data_pts} "
+        f"data_chunk={data_query_chunk} val_batch={val_sim_batch} "
+        f"val_chunk={val_query_chunk} resume={resuming}",
+        flush=True,
+    )
+
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        data_loss, sampled_ids = forcing_ic_supervised_data_loss(
+            model,
+            sim_params,
+            data["trajectories"],
+            data["train_ids"],
+            y_img=y_img,
+            t_img=t_img,
+            a_ref=a_ref,
+            t_ramp=t_ramp,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            t_grid=t_grid,
+            mu=mu,
+            sigma=sigma,
+            n_sims=n_data_sims,
+            n_pts=n_data_pts,
+            query_chunk=data_query_chunk,
+            device=device,
+            rng=rng,
+            gen=gen,
+        )
+        loss = weights["data"] * data_loss
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(
+                f"Non-finite supervised forcing-IC loss at update {epoch}"
+            )
+        loss.backward()
+        if not all(
+            parameter.grad is None
+            or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        ):
+            raise FloatingPointError(
+                f"Non-finite supervised forcing-IC gradient at update {epoch}"
+            )
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=grad_clip,
+            )
+        lr = float(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        if not _all_finite(model.state_dict()) or not _all_finite(optimizer.state):
+            raise FloatingPointError(
+                f"Non-finite supervised forcing-IC state at update {epoch}"
+            )
+        _advance_scheduler(scheduler, unit="update", successful_updates=1)
+        _advance_scheduler(scheduler, unit="epoch", successful_updates=1)
+        completed_updates += 1
+
+        row: dict[str, Any] = {
+            "epoch": epoch,
+            "completed_updates": completed_updates,
+            "objective": "supervised",
+            "lr": lr,
+            "loss": float(loss.detach().cpu()),
+            "loss_data": float(data_loss.detach().cpu()),
+            "w_data": weights["data"],
+            "data_sim_ids": json.dumps([int(i) for i in sampled_ids]),
+            "val_gnrmse": "",
+            "val_rmse_K": "",
+            "gnrmse_amp_low": "",
+            "gnrmse_amp_mid": "",
+            "gnrmse_amp_high": "",
+            **{column: "" for column in family_columns},
+        }
+        do_validation = (
+            epoch % validate_every == 0 or epoch == epochs - 1
+        )
+        is_best = False
+        if do_validation:
+            model.eval()
+            validation = validate_forcing_ic_gnrmse(
+                model,
+                data,
+                data["val_ids"],
+                sim_params,
+                y_img,
+                t_img,
+                a_ref,
+                t_ramp,
+                device,
+                query_batch=val_sim_batch,
+                query_chunk=val_query_chunk,
+            )
+            last_validation = copy.deepcopy(validation)
+            for key, value in validation.items():
+                if key in row:
+                    row[key] = value
+            is_best = float(validation["val_gnrmse"]) < best_val
+            if is_best:
+                best_val = float(validation["val_gnrmse"])
+                best_validation = copy.deepcopy(validation)
+            print(
+                f"Update {epoch}: data_mse={row['loss_data']:.6e} "
+                f"val_gnrmse={100.0 * float(validation['val_gnrmse']):.4f}% "
+                f"val_rmse_K={float(validation['val_rmse_K']):.4f}K "
+                f"best={100.0 * best_val:.4f}%",
+                flush=True,
+            )
+        else:
+            print(
+                f"Update {epoch}: data_mse={row['loss_data']:.6e} lr={lr:.2e}",
+                flush=True,
+            )
+
+        with open(metrics_path, "a", newline="") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=fieldnames, extrasaction="ignore",
+            )
+            writer.writerow(row)
+            stream.flush()
+            os.fsync(stream.fileno())
+        last_csv_update = completed_updates
+
+        payload = {
+            "objective": "supervised",
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "mu_global": mu,
+            "sigma_global": sigma,
+            "config": config,
+            "resume_config": resume_config,
+            "data_signature": data_signature,
+            "epoch": epoch,
+            "next_epoch": epoch + 1,
+            "completed_updates": completed_updates,
+            "last_csv_update": last_csv_update,
+            "best_val": best_val,
+            "best_validation": copy.deepcopy(best_validation),
+            "last_validation": copy.deepcopy(last_validation),
+            "rng_state": _capture_forcing_rng(rng, gen, eval_gen),
+            "forcing_image": {
+                "ny_img": ny_img,
+                "nt_img": nt_img,
+                "a_ref": a_ref,
+                "t_ramp": t_ramp,
+                "t_final": t_final,
+            },
+        }
+        if is_best:
+            _atomic_torch_save(payload, best_path)
+        if completed_updates % save_latest_every == 0 or epoch == epochs - 1:
+            _atomic_torch_save(payload, latest_path)
+
+    final_payload = torch.load(
+        latest_path, map_location="cpu", weights_only=False,
+    )
+    _atomic_torch_save(final_payload, final_path)
+    summary = {
+        "seed": seed,
+        "objective": "supervised",
+        "completed_updates": completed_updates,
+        "best_val_gnrmse": best_val,
+        "best_validation": best_validation,
+        "last_validation": last_validation,
+        "data_signature": data_signature,
+        "n_data_sims": n_data_sims,
+        "n_data_pts": n_data_pts,
+        "test_set_evaluated": False,
+    }
+    _atomic_text(
+        json.dumps(summary, indent=2) + "\n",
+        run_dir / "final_metrics.json",
+    )
+    _atomic_text("complete\n", complete_path)
+    return summary
 
 
 def _resolve_forcing_residual_method(pino: dict) -> str:
@@ -3694,6 +4340,8 @@ def run_one_seed_forcing_ic_pino(config: dict, seed: int, run_dir: Path) -> dict
     warmup = _forcing_warmup_config(fcfg)
     save_latest_every = max(1, int(fcfg.get("save_latest_every", 25)))
     grad_clip_cfg = fcfg.get("grad_clip", None)
+    if grad_clip_cfg is None:
+        grad_clip_cfg = config["training"].get("grad_clip", None)
     grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
     if grad_clip is not None and grad_clip <= 0.0:
         raise ValueError("training.pino.forcing.grad_clip must be null or > 0")
@@ -7183,6 +7831,15 @@ def run_one_seed_interfaces_pino(
     debug run. Validation uses :func:`validate_interfaces_gnrmse` and three
     checkpoints with a lexicographic jump gate (plan Section 6).
     """
+    if bool(
+        (config.get("model", {}).get("interface_cvit", {}) or {}).get(
+            "jump_enrichment", False
+        )
+    ):
+        raise ValueError(
+            "jump_enrichment is not consumed by the collapse interfaces runner; "
+            "set training.pino.mode=one_step or disable the enrichment."
+        )
     set_seed(seed)
     run_dir = Path(run_dir)
     stale_artifacts = [
@@ -8053,6 +8710,101 @@ def run_one_seed_interfaces_pino(
     return summary
 
 
+def _fixed_interval_indices(n_intervals: int, num_states: int) -> list[int]:
+    if int(num_states) < 1:
+        raise ValueError("fixed_simulation.num_states must be >= 1")
+    if int(num_states) > int(n_intervals):
+        raise ValueError(
+            "fixed_simulation.num_states cannot exceed the number of FV intervals "
+            f"({n_intervals}); got {num_states}."
+        )
+    return np.rint(
+        np.linspace(0, int(n_intervals) - 1, int(num_states))
+    ).astype(np.int64).tolist()
+
+
+def _evaluate_interfaces_fixed_states(
+    model: InterfaceCViT,
+    case,
+    interval_indices: list[int],
+    *,
+    sigma: float,
+    dt: float,
+    coords: torch.Tensor,
+    query_chunk: int,
+    output_parameterization: str,
+    a_ref: float,
+    device: torch.device,
+) -> tuple[dict[str, float], list[dict[str, float]]]:
+    """Evaluate only the frozen training states; FV targets never enter training."""
+    from src.operators.one_step import predict_one_step_field
+
+    was_training = model.training
+    model.eval()
+    steps = torch.as_tensor(interval_indices, dtype=torch.long)
+    state_n = case.truth_states.index_select(0, steps).to(device)
+    truth_np1 = case.truth_states.index_select(0, steps + 1).to(device)
+    batch_size = int(steps.numel())
+    fixed_channels = case.fixed_channels.expand(batch_size, -1, -1, -1)
+    scalars = case.scalars.expand(batch_size, -1)
+    interface_x = case.interface_x.expand(batch_size)
+    jump_scale = case.jump_scale.expand(batch_size)
+
+    with torch.no_grad():
+        prediction = predict_one_step_field(
+            model,
+            state_n,
+            case.interval_images.index_select(0, steps.to(case.interval_images.device)),
+            scalars,
+            fixed_channels,
+            coords,
+            dt=dt,
+            query_chunk=int(query_chunk),
+            output_parameterization=output_parameterization,
+            interface_x=interface_x,
+            jump_scale=jump_scale,
+            closure_geom=case.geom,
+            q_left_integral=case.q_left_integrals.index_select(
+                0, steps.to(case.q_left_integrals.device)
+            ),
+            resistance=case.resistance,
+            sigma=sigma,
+            q_ref=a_ref,
+        )
+
+    error = prediction - truth_np1
+    transition = truth_np1 - state_n
+    error_ssq = error.square().reshape(batch_size, -1).sum(dim=1)
+    transition_ssq = transition.square().reshape(batch_size, -1).sum(dim=1)
+    counts = error[0].numel()
+    rmse_K = (error_ssq / counts).sqrt() * float(sigma)
+    transition_rel = (error_ssq / transition_ssq.clamp_min(1.0e-20)).sqrt()
+    aggregate = {
+        "fixed_train_rmse_K": float(
+            (error_ssq.sum() / (batch_size * counts)).sqrt().cpu() * float(sigma)
+        ),
+        "fixed_train_transition_rel": float(
+            (error_ssq.sum() / transition_ssq.sum().clamp_min(1.0e-20)).sqrt().cpu()
+        ),
+        "fixed_train_max_rmse_K": float(rmse_K.max().cpu()),
+        "fixed_train_max_transition_rel": float(transition_rel.max().cpu()),
+        "_error_ssq": float(error_ssq.sum().cpu()),
+        "_transition_ssq": float(transition_ssq.sum().cpu()),
+        "_value_count": float(batch_size * counts),
+    }
+    rows = [
+        {
+            "interval": float(step),
+            "t_n": float(step) * float(dt),
+            "rmse_K": float(rmse_K[index].cpu()),
+            "transition_rel": float(transition_rel[index].cpu()),
+        }
+        for index, step in enumerate(interval_indices)
+    ]
+    model.train(was_training)
+    return aggregate, rows
+
+
 def validate_interfaces_one_step_gnrmse(
     model: InterfaceCViT,
     cases: list,
@@ -8063,6 +8815,7 @@ def validate_interfaces_one_step_gnrmse(
     dt: float,
     coords: torch.Tensor,
     query_chunk: int,
+    output_parameterization: str = "absolute",
     a_ref: float,
     right_value: float,
     device: torch.device,
@@ -8091,8 +8844,8 @@ def validate_interfaces_one_step_gnrmse(
     model.eval()
 
     # The hard global-storage residual is only defined when the conservative
-    # storage-projection head is active; the learned/closure heads do not
-    # structurally enforce it, so it is reported as 0.0 there (plan Section 6).
+    # storage-projection head is active; the learned/closure heads report NaN so
+    # an inactive constraint cannot look numerically satisfied.
     want_storage = (
         str(getattr(model, "jump_flux_mode", "learned"))
         == "conservative_storage_projection"
@@ -8109,7 +8862,7 @@ def validate_interfaces_one_step_gnrmse(
     jump_cnt = 0
     max_abs_T_K = 0.0
     nonfinite = 0
-    hard_storage_error = 0.0
+    hard_storage_error = 0.0 if want_storage else float("nan")
 
     with torch.no_grad():
         for case in cases:
@@ -8131,6 +8884,7 @@ def validate_interfaces_one_step_gnrmse(
                     coords,
                     dt=dt,
                     query_chunk=int(query_chunk),
+                    output_parameterization=output_parameterization,
                     interface_x=case.interface_x,
                     jump_scale=case.jump_scale,
                     closure_geom=case.geom,
@@ -8153,6 +8907,7 @@ def validate_interfaces_one_step_gnrmse(
                 coords,
                 dt=dt,
                 query_chunk=int(query_chunk),
+                output_parameterization=output_parameterization,
                 steps=n_intervals,
                 interface_x=case.interface_x,
                 jump_scale=case.jump_scale,
@@ -8222,6 +8977,7 @@ def validate_interfaces_one_step_gnrmse(
         ),
         "rollout_max_abs_T_K": max_abs_T_K,
         "rollout_nonfinite": float(nonfinite),
+        "hard_storage_active": float(want_storage),
         "hard_global_storage_error": float(hard_storage_error),
     }
     for tag, arr in (("Rc", rc_arr), ("ix", ix_arr)):
@@ -8263,6 +9019,7 @@ def interfaces_one_step_response_slopes(
     dt: float,
     coords: torch.Tensor,
     query_chunk: int,
+    output_parameterization: str = "absolute",
     a_ref: float,
     sigma: float,
     device: torch.device,
@@ -8312,6 +9069,7 @@ def interfaces_one_step_response_slopes(
                     coords,
                     dt=dt,
                     query_chunk=int(query_chunk),
+                    output_parameterization=output_parameterization,
                     interface_x=case.interface_x,
                     jump_scale=case.jump_scale,
                     closure_geom=case.geom,
@@ -8406,11 +9164,50 @@ def anti_collapse_eligible(
         max_T = float(metrics.get("rollout_max_abs_T_K", float("inf")))
         if not (math.isfinite(max_T) and max_T <= float(max_abs_T_K)):
             return False
-    if hard_storage_tol is not None:
+    if hard_storage_tol is not None and bool(metrics.get("hard_storage_active", False)):
         err = float(metrics.get("hard_global_storage_error", float("inf")))
         if not (math.isfinite(err) and err <= float(hard_storage_tol)):
             return False
     return True
+
+
+def _resolve_interfaces_one_step_config(config: dict) -> dict:
+    resolved = copy.deepcopy(config)
+    os_cfg = resolved["training"]["pino"].setdefault("one_step", {})
+    output_parameterization = str(os_cfg.get("output_parameterization", "rate"))
+    if output_parameterization not in {"rate", "increment", "deviation", "absolute"}:
+        raise ValueError(
+            "training.pino.one_step.output_parameterization must be 'rate', "
+            "'increment', 'deviation', or 'absolute'."
+        )
+    conservation = str(os_cfg.get("conservation", "learned"))
+    allowed = {
+        "none",
+        "learned",
+        "left_energy_closure",
+        "two_sided_energy_closure",
+        "conservative_storage_projection",
+    }
+    if conservation not in allowed:
+        raise ValueError(
+            "training.pino.one_step.conservation must be one of "
+            f"{sorted(allowed)}; got {conservation!r}."
+        )
+    interface_cfg = resolved["model"].setdefault("interface_cvit", {})
+    interface_cfg["jump_enrichment"] = conservation != "none"
+    interface_cfg["jump_flux_mode"] = (
+        "learned" if conservation == "none" else conservation
+    )
+    os_cfg["output_parameterization"] = output_parameterization
+    os_cfg["conservation"] = conservation
+    if bool(interface_cfg.get("interface_aligned_domains", False)) and (
+        output_parameterization != "rate" or conservation != "learned"
+    ):
+        raise ValueError(
+            "interface_aligned_domains requires output_parameterization='rate' "
+            "and conservation='learned'"
+        )
+    return resolved
 
 
 def run_one_seed_interfaces_one_step_pino(
@@ -8435,6 +9232,7 @@ def run_one_seed_interfaces_one_step_pino(
     )
     from src.physics.one_step_objective import one_step_objective
 
+    config = _resolve_interfaces_one_step_config(config)
     set_seed(seed)
     run_dir = Path(run_dir)
     resume_requested = bool(
@@ -8513,6 +9311,7 @@ def run_one_seed_interfaces_one_step_pino(
             "(one model step == one FV CN step); a coarse saved-output interval "
             f"is not a single CN interval. Got {step_stride}."
         )
+    output_parameterization = str(os_cfg["output_parameterization"])
 
     kind = str(os_cfg.get("objective", "variational"))
     if kind not in ("variational", "defect"):
@@ -8526,6 +9325,32 @@ def run_one_seed_interfaces_one_step_pino(
     pool_size = int(os_cfg.get("state_pool_size", 128))
     replace_per_update = int(os_cfg.get("state_pool_replace_per_update", 2))
     max_uses_per_case = int(os_cfg.get("max_uses_per_case", 8))
+    fixed_cfg = dict(os_cfg.get("fixed_simulation", {}) or {})
+    fixed_enabled = bool(fixed_cfg.get("enabled", False))
+    fixed_num_simulations = int(fixed_cfg.get("num_simulations", 1))
+    if fixed_num_simulations < 1:
+        raise ValueError("fixed_simulation.num_simulations must be >= 1")
+    fixed_num_states = int(fixed_cfg.get("num_states", 16))
+    normalize_fixed_defect = bool(
+        fixed_cfg.get("normalize_per_state_defect", False)
+    )
+    normalization_floor_fraction = float(
+        fixed_cfg.get("normalization_floor_fraction", 0.01)
+    )
+    if normalization_floor_fraction <= 0.0:
+        raise ValueError(
+            "fixed_simulation.normalization_floor_fraction must be > 0"
+        )
+    if normalize_fixed_defect and (not fixed_enabled or kind != "defect"):
+        raise ValueError(
+            "fixed-simulation per-state normalization requires "
+            "fixed_simulation.enabled=true and objective=defect"
+        )
+    init_checkpoint_cfg = os_cfg.get("init_from_checkpoint", None)
+    init_checkpoint_path = (
+        None if init_checkpoint_cfg is None
+        else Path(str(init_checkpoint_cfg)).expanduser().resolve()
+    )
     time_mixture = dict(os_cfg.get("time_mixture", {}) or {
         "uniform": 0.5, "active_forcing": 0.25, "high_change": 0.25
     })
@@ -8533,6 +9358,10 @@ def run_one_seed_interfaces_one_step_pino(
     validate_every = int(os_cfg.get("validate_every", config["training"].get("validate_every", 500)))
     fast_validation_cases = int(os_cfg.get("fast_validation_cases", 16))
     chunk_r = int(pino.get("chunk_r", 0)) or Nq
+    grad_clip_cfg = os_cfg.get("grad_clip", config["training"].get("grad_clip"))
+    grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
+    if grad_clip is not None and grad_clip <= 0.0:
+        raise ValueError("training.pino.one_step.grad_clip must be null or > 0")
 
     # Anti-collapse checkpoint gate (plan Section 6). The response-slope minima
     # reject the 300 K constant-field collapse; ``None`` thresholds skip that
@@ -8586,6 +9415,28 @@ def run_one_seed_interfaces_one_step_pino(
             f"{expected_forcing_tokens} for forcing_grid_size=({ny_img}, "
             f"{nt_img}) patch={forcing_patch_size}; got {num_forcing_tokens}."
         )
+    init_checkpoint = None
+    init_fixed_state = None
+    if init_checkpoint_path is not None:
+        if not init_checkpoint_path.exists():
+            raise FileNotFoundError(init_checkpoint_path)
+        init_checkpoint = torch.load(
+            init_checkpoint_path, map_location="cpu", weights_only=False
+        )
+        for name, current in (("mu_global", mu), ("sigma_global", sigma)):
+            source = float(init_checkpoint[name])
+            if not math.isclose(source, float(current), rel_tol=1e-7, abs_tol=1e-7):
+                raise ValueError(
+                    f"one-step warm start {name} mismatch: source={source}, "
+                    f"current={current}"
+                )
+        model.load_state_dict(init_checkpoint["model_state"], strict=True)
+        init_fixed_state = init_checkpoint.get("fixed_simulation_state")
+        if fixed_enabled and init_fixed_state is None:
+            raise ValueError(
+                "fixed-simulation warm start requires a checkpoint containing "
+                "fixed_simulation_state"
+            )
     optimizer = build_optimizer(config, model.parameters())
     scheduler = build_scheduler(config, optimizer)
 
@@ -8634,13 +9485,61 @@ def run_one_seed_interfaces_one_step_pino(
         return build_case_from_params(key, params)
 
     pool_rng = np.random.default_rng(seed + 101)
-    pool = OneStepStatePool(
-        lambda key: make_case(key, pool_rng),
-        pool_size=pool_size, n_cases=n_cases,
-        replace_per_update=replace_per_update,
-        max_uses_per_case=max_uses_per_case,
-        time_mixture=time_mixture, rng=np.random.default_rng(seed + 202),
-    )
+    fixed_cases = []
+    fixed_case = None
+    fixed_intervals: list[int] = []
+    pool = None
+    if fixed_enabled:
+        if init_fixed_state is None:
+            fixed_params = online_spec.sample_online_params(
+                pool_rng,
+                fixed_num_simulations,
+                online_grids,
+                online_time_cfg,
+            )
+            fixed_cases = [
+                build_case_from_params(key, params)
+                for key, params in enumerate(fixed_params)
+            ]
+            fixed_case = fixed_cases[0]
+            fixed_intervals = _fixed_interval_indices(
+                fixed_case.n_intervals, fixed_num_states
+            )
+        else:
+            saved_params = init_fixed_state.get(
+                "case_params", [init_fixed_state["params"]]
+            )
+            if len(saved_params) != fixed_num_simulations:
+                raise ValueError(
+                    "fixed-simulation warm start descriptor count mismatch: "
+                    f"checkpoint={len(saved_params)}, "
+                    f"config={fixed_num_simulations}"
+                )
+            fixed_cases = [
+                build_case_from_params(key, params)
+                for key, params in enumerate(saved_params)
+            ]
+            fixed_case = fixed_cases[0]
+            fixed_intervals = [int(i) for i in init_fixed_state["intervals"]]
+            if len(fixed_intervals) != fixed_num_states:
+                raise ValueError(
+                    "fixed-simulation warm start interval count mismatch: "
+                    f"checkpoint={len(fixed_intervals)}, config={fixed_num_states}"
+                )
+        if any(
+            max(fixed_intervals) >= case.n_intervals for case in fixed_cases
+        ):
+            raise ValueError(
+                "fixed-simulation interval selection exceeds a case trajectory"
+            )
+    else:
+        pool = OneStepStatePool(
+            lambda key: make_case(key, pool_rng),
+            pool_size=pool_size, n_cases=n_cases,
+            replace_per_update=replace_per_update,
+            max_uses_per_case=max_uses_per_case,
+            time_mixture=time_mixture, rng=np.random.default_rng(seed + 202),
+        )
 
     # Frozen validation cases (never sampled for training; plan Section 6).
     val_rng = np.random.default_rng(seed + 777)
@@ -8699,23 +9598,39 @@ def run_one_seed_interfaces_one_step_pino(
         "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
         "rollout_max_stepwise_gnrmse", "rollout_final_gnrmse",
         "rollout_teacher_ratio", "rollout_max_abs_T_K", "rollout_nonfinite",
-        "hard_global_storage_error",
+        "hard_storage_active", "hard_global_storage_error",
         "forcing_response_slope", "jump_response_slope",
         "jump_rmse_K", "jump_correlation", "jump_sign_fraction",
         "anti_collapse_eligible",
         "pool_distinct_keys", "pool_size", "pool_mean_uses", "pool_max_age",
+        "fixed_train_rmse_K", "fixed_train_transition_rel",
+        "fixed_train_max_rmse_K", "fixed_train_max_transition_rel",
     ]
     if not resuming:
         with open(metrics_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writeheader()
+    fixed_metrics_path = run_dir / "fixed_state_metrics.csv"
+    fixed_metric_fields = [
+        "update", "simulation", "interval", "t_n", "rmse_K", "transition_rel"
+    ]
+    if fixed_enabled and not resuming:
+        with open(fixed_metrics_path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fixed_metric_fields).writeheader()
 
     print(
         f"[pino-interfaces-one-step] seed={seed} device={device} "
         f"updates={updates} validate_every={validate_every} | grid={Nx}x{Ny} "
         f"t_final={t_final:.4f} dt={dt:.4g} t_ramp={t_ramp:.4g} "
         f"forcing_image={ny_img}x{nt_img} a_ref={a_ref} | objective={kind} "
-        f"n_cases={n_cases} pool={pool_size}(replace={replace_per_update},"
-        f"max_uses={max_uses_per_case}) | k=({K_LEFT},{K_RIGHT}) "
+        + (
+            f"fixed_simulation=on(simulations={len(fixed_cases)},"
+            f"states={len(fixed_intervals)},"
+            f"intervals={fixed_intervals})"
+            if fixed_enabled else
+            f"n_cases={n_cases} pool={pool_size}(replace={replace_per_update},"
+            f"max_uses={max_uses_per_case})"
+        )
+        + f" | k=({K_LEFT},{K_RIGHT}) "
         f"sigma_dT_train={sigma_dT_train:.4g} jump_flux={getattr(model, 'jump_flux_mode', 'learned')}",
         flush=True,
     )
@@ -8724,11 +9639,40 @@ def run_one_seed_interfaces_one_step_pino(
         "representation": "space_time_image",
         "version": 1,
         "forcing_schema_version": FORCING_SCHEMA_VERSION,
+        "axis_order": "channel_y_time",
+        "dtype": "float32",
         "ny_img": ny_img, "nt_img": nt_img,
+        "patch_size": forcing_patch_size,
+        "include_endpoints": True,
+        "y_min": float(y_grid_np[0]), "y_max": float(y_grid_np[-1]),
+        "t_min": 0.0, "t_final": float(t_final),
+        "sign_convention": "positive_inward_left_flux",
+        "normalization": "fixed_division",
+        "clipping": False,
         "a_ref": a_ref, "fv_dt": float(dt),
-        "ramp": {"version": RAMP_SCHEMA_VERSION, "duration": float(t_ramp)},
+        "ramp": {
+            "type": "cubic_smoothstep",
+            "version": RAMP_SCHEMA_VERSION,
+            "duration": float(t_ramp),
+        },
         "spatial_grid_size": [Nx, Ny],
-        "one_step": {"objective": kind, "step_stride": step_stride},
+        "one_step": {
+            "objective": kind,
+            "step_stride": step_stride,
+            "output_parameterization": output_parameterization,
+            "conservation": os_cfg["conservation"],
+            "fixed_simulation": {
+                "enabled": fixed_enabled,
+                "num_simulations": len(fixed_cases),
+                "num_states": len(fixed_intervals),
+                "intervals": fixed_intervals,
+                "normalize_per_state_defect": normalize_fixed_defect,
+                "normalization_floor_fraction": normalization_floor_fraction,
+            },
+            "init_from_checkpoint": (
+                None if init_checkpoint_path is None else str(init_checkpoint_path)
+            ),
+        },
         # Concrete encoder class + architecture version (plan Section 10) so the
         # SLURM preflight and any resumed checkpoint can reject a run that was not
         # produced by the current 2D forcing-image InterfaceCViT.
@@ -8739,6 +9683,9 @@ def run_one_seed_interfaces_one_step_pino(
             "forcing_grid_size": [ny_img, nt_img],
             "forcing_patch_size": forcing_patch_size,
             "num_forcing_tokens": num_forcing_tokens,
+            "interface_aligned_domains": bool(
+                getattr(model, "interface_aligned_domains", False)
+            ),
         },
     }
     with open(run_dir / "architecture.json", "w") as f:
@@ -8746,6 +9693,10 @@ def run_one_seed_interfaces_one_step_pino(
 
     best_eligible = float("inf")
     best_ungated = float("inf")
+    best_fixed = float("inf")
+    final_fixed_metrics: dict[str, float] = {}
+    fixed_case_weights: torch.Tensor | None = None
+    fixed_reference_energy: torch.Tensor | None = None
     any_eligible = False
     eligible_dir = run_dir / "eligible"
     eligible_top: list[dict[str, Any]] = []  # top-k eligible: val_gnrmse ascending
@@ -8766,13 +9717,31 @@ def run_one_seed_interfaces_one_step_pino(
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
-                "pool_state": pool.state_dict(),
+                "pool_state": None if pool is None else pool.state_dict(),
+                "fixed_simulation_state": (
+                    {
+                        "params": fixed_case.params,
+                        "case_params": [case.params for case in fixed_cases],
+                        "intervals": fixed_intervals,
+                    }
+                    if fixed_case is not None else None
+                ),
                 "pool_factory_rng": pool_rng.bit_generator.state,
                 "torch_rng": torch.get_rng_state(),
                 "numpy_rng": np.random.get_state(),
                 "python_rng": random.getstate(),
                 "best_eligible": best_eligible,
                 "best_ungated": best_ungated,
+                "best_fixed": best_fixed,
+                "final_fixed_metrics": final_fixed_metrics,
+                "fixed_case_weights": (
+                    None if fixed_case_weights is None
+                    else fixed_case_weights.detach().cpu()
+                ),
+                "fixed_reference_energy": (
+                    None if fixed_reference_energy is None
+                    else fixed_reference_energy.detach().cpu()
+                ),
                 "any_eligible": any_eligible,
                 "eligible_top": eligible_top,
                 "objective": kind,
@@ -8785,13 +9754,40 @@ def run_one_seed_interfaces_one_step_pino(
         model.load_state_dict(rs["model_state"])
         optimizer.load_state_dict(rs["optimizer_state"])
         scheduler.load_state_dict(rs["scheduler_state"])
-        pool.load_state_dict(rs["pool_state"], build_case_from_params)
+        if fixed_enabled:
+            fixed_state = rs.get("fixed_simulation_state")
+            if fixed_state is None:
+                raise ValueError(
+                    "resume checkpoint does not contain fixed-simulation state"
+                )
+            saved_params = fixed_state.get(
+                "case_params", [fixed_state["params"]]
+            )
+            if len(saved_params) != fixed_num_simulations:
+                raise ValueError(
+                    "resume fixed-simulation descriptor count mismatch: "
+                    f"checkpoint={len(saved_params)}, "
+                    f"config={fixed_num_simulations}"
+                )
+            fixed_cases = [
+                build_case_from_params(key, params)
+                for key, params in enumerate(saved_params)
+            ]
+            fixed_case = fixed_cases[0]
+            fixed_intervals = [int(i) for i in fixed_state["intervals"]]
+        else:
+            pool.load_state_dict(rs["pool_state"], build_case_from_params)
         pool_rng.bit_generator.state = rs["pool_factory_rng"]
         torch.set_rng_state(rs["torch_rng"])
         np.random.set_state(rs["numpy_rng"])
         random.setstate(rs["python_rng"])
         best_eligible = float(rs["best_eligible"])
         best_ungated = float(rs["best_ungated"])
+        best_fixed = float(rs.get("best_fixed", float("inf")))
+        final_fixed_metrics = dict(rs.get("final_fixed_metrics", {}) or {})
+        if rs.get("fixed_case_weights") is not None:
+            fixed_case_weights = rs["fixed_case_weights"].to(device)
+            fixed_reference_energy = rs["fixed_reference_energy"].to(device)
         any_eligible = bool(rs["any_eligible"])
         eligible_top = list(rs["eligible_top"])
         completed_updates = int(rs["completed_updates"])
@@ -8802,40 +9798,182 @@ def run_one_seed_interfaces_one_step_pino(
             flush=True,
         )
 
+    if normalize_fixed_defect and fixed_case_weights is None:
+        model.eval()
+        steps = torch.as_tensor(fixed_intervals, dtype=torch.long)
+        batch_size = int(steps.numel())
+        references = []
+        with torch.no_grad():
+            for case in fixed_cases:
+                state_n = case.truth_states.index_select(0, steps).to(device)
+                prediction = predict_one_step_field(
+                    model,
+                    state_n,
+                    case.interval_images.index_select(
+                        0, steps.to(case.interval_images.device)
+                    ),
+                    case.scalars.expand(batch_size, -1),
+                    case.fixed_channels.expand(batch_size, -1, -1, -1),
+                    coords,
+                    dt=dt,
+                    query_chunk=chunk_r,
+                    output_parameterization=output_parameterization,
+                    interface_x=case.interface_x.expand(batch_size),
+                    jump_scale=case.jump_scale.expand(batch_size),
+                    closure_geom=case.geom,
+                    q_left_integral=case.q_left_integrals.index_select(
+                        0, steps.to(case.q_left_integrals.device)
+                    ),
+                    resistance=case.resistance,
+                    sigma=sigma,
+                    q_ref=a_ref,
+                )
+                cn_batch = {
+                    **case.cn,
+                    "forcing": case.cn["forcing"].index_select(
+                        0, steps.to(case.cn["forcing"].device)
+                    ),
+                }
+                _, reference = one_step_objective(
+                    kind,
+                    prediction,
+                    state_n,
+                    cn_batch,
+                    right_value=t_right_tilde,
+                    defect_sweeps=defect_sweeps,
+                    defect_omega=defect_omega,
+                )
+                references.append(reference["energy_per_case"].to(device))
+        fixed_reference_energy = torch.stack(references)
+        median = fixed_reference_energy.median().clamp_min(1.0e-20)
+        scale = fixed_reference_energy.clamp_min(
+            median * normalization_floor_fraction
+        )
+        inverse = scale.reciprocal()
+        fixed_case_weights = inverse / inverse.mean()
+        weight_rows = [
+            {
+                "simulation": simulation,
+                "interval": int(step),
+                "reference_energy": float(
+                    fixed_reference_energy[simulation, index].cpu()
+                ),
+                "weight": float(fixed_case_weights[simulation, index].cpu()),
+            }
+            for simulation in range(len(fixed_cases))
+            for index, step in enumerate(fixed_intervals)
+        ]
+        with open(run_dir / "fixed_state_weights.json", "w") as f:
+            json.dump(weight_rows, f, indent=2)
+        print(
+            "[pino-interfaces-one-step] frozen per-state defect weights "
+            f"range=({fixed_case_weights.min().item():.4g}, "
+            f"{fixed_case_weights.max().item():.4g})",
+            flush=True,
+        )
+
     for update in range(start_update, updates):
         model.train()
-        pool.refresh()
-        selection = pool.select()
         optimizer.zero_grad(set_to_none=True)
-        loss_sum = 0.0
-        energy_sum = 0.0
-        defect_sum = 0.0
-        for case, step in selection:
-            state_n = case.truth_states[step : step + 1].to(device)
-            pred = predict_one_step_field(
-                model, state_n,
-                case.interval_images[step : step + 1],
-                case.scalars, case.fixed_channels, coords,
-                dt=dt, query_chunk=chunk_r,
-                interface_x=case.interface_x, jump_scale=case.jump_scale,
-                closure_geom=case.geom,
-                q_left_integral=case.q_left_integrals[step : step + 1],
-                resistance=case.resistance, sigma=sigma, q_ref=a_ref,
-            )
-            cn_step = {**case.cn, "forcing": case.cn["forcing"][step : step + 1]}
-            loss_c, m = one_step_objective(
-                kind, pred, state_n.detach(), cn_step,
-                right_value=t_right_tilde,
-                defect_sweeps=defect_sweeps, defect_omega=defect_omega,
-            )
-            (loss_c / n_cases).backward()
-            loss_sum += float(loss_c.detach().cpu()) / n_cases
-            energy_sum += float(m["energy"].cpu()) / n_cases
-            defect_sum += float(m["defect_rms"].cpu()) / n_cases
+        if fixed_enabled:
+            steps = torch.as_tensor(fixed_intervals, dtype=torch.long)
+            batch_size = int(steps.numel())
+            loss_sum = 0.0
+            energy_sum = 0.0
+            defect_sum = 0.0
+            for simulation, case in enumerate(fixed_cases):
+                state_n = case.truth_states.index_select(0, steps).to(device)
+                pred = predict_one_step_field(
+                    model, state_n,
+                    case.interval_images.index_select(
+                        0, steps.to(case.interval_images.device)
+                    ),
+                    case.scalars.expand(batch_size, -1),
+                    case.fixed_channels.expand(batch_size, -1, -1, -1),
+                    coords,
+                    dt=dt, query_chunk=chunk_r,
+                    output_parameterization=output_parameterization,
+                    interface_x=case.interface_x.expand(batch_size),
+                    jump_scale=case.jump_scale.expand(batch_size),
+                    closure_geom=case.geom,
+                    q_left_integral=case.q_left_integrals.index_select(
+                        0, steps.to(case.q_left_integrals.device)
+                    ),
+                    resistance=case.resistance, sigma=sigma, q_ref=a_ref,
+                )
+                cn_batch = {
+                    **case.cn,
+                    "forcing": case.cn["forcing"].index_select(
+                        0, steps.to(case.cn["forcing"].device)
+                    ),
+                }
+                weights = (
+                    None if fixed_case_weights is None
+                    else fixed_case_weights[simulation]
+                )
+                loss, m = one_step_objective(
+                    kind, pred, state_n.detach(), cn_batch,
+                    right_value=t_right_tilde,
+                    defect_sweeps=defect_sweeps, defect_omega=defect_omega,
+                    case_weights=weights,
+                )
+                (loss / len(fixed_cases)).backward()
+                loss_sum += float(loss.detach().cpu()) / len(fixed_cases)
+                energy_sum += float(m["energy"].cpu()) / len(fixed_cases)
+                defect_sum += float(m["defect_rms"].cpu()) / len(fixed_cases)
+            diversity = {
+                "pool_distinct_keys": float(len(fixed_cases)),
+                "pool_size": float(len(fixed_cases)),
+                "pool_mean_uses": float(completed_updates + 1),
+                "pool_max_age": float(completed_updates + 1),
+            }
+        else:
+            pool.refresh()
+            selection = pool.select()
+            loss_sum = 0.0
+            energy_sum = 0.0
+            defect_sum = 0.0
+            for case, step in selection:
+                state_n = case.truth_states[step : step + 1].to(device)
+                pred = predict_one_step_field(
+                    model, state_n,
+                    case.interval_images[step : step + 1],
+                    case.scalars, case.fixed_channels, coords,
+                    dt=dt, query_chunk=chunk_r,
+                    output_parameterization=output_parameterization,
+                    interface_x=case.interface_x, jump_scale=case.jump_scale,
+                    closure_geom=case.geom,
+                    q_left_integral=case.q_left_integrals[step : step + 1],
+                    resistance=case.resistance, sigma=sigma, q_ref=a_ref,
+                )
+                cn_step = {
+                    **case.cn, "forcing": case.cn["forcing"][step : step + 1]
+                }
+                loss_c, m = one_step_objective(
+                    kind, pred, state_n.detach(), cn_step,
+                    right_value=t_right_tilde,
+                    defect_sweeps=defect_sweeps, defect_omega=defect_omega,
+                )
+                (loss_c / n_cases).backward()
+                loss_sum += float(loss_c.detach().cpu()) / n_cases
+                energy_sum += float(m["energy"].cpu()) / n_cases
+                defect_sum += float(m["defect_rms"].cpu()) / n_cases
+            diversity = pool.diversity_stats()
         if not math.isfinite(loss_sum):
             raise FloatingPointError(
                 f"Non-finite one-step objective at update {update}"
             )
+        gradients_finite = all(
+            parameter.grad is None
+            or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        )
+        if not gradients_finite:
+            raise FloatingPointError(
+                f"Non-finite one-step gradient at update {update}"
+            )
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         _advance_scheduler(scheduler, unit="update", successful_updates=1)
         completed_updates += 1
@@ -8846,7 +9984,7 @@ def run_one_seed_interfaces_one_step_pino(
             "loss": loss_sum,
             "energy": energy_sum,
             "defect_rms": defect_sum,
-            **pool.diversity_stats(),
+            **diversity,
         }
 
         do_val = (update % validate_every == 0) or (update == updates - 1)
@@ -8855,14 +9993,66 @@ def run_one_seed_interfaces_one_step_pino(
                 model, val_cases,
                 mu=mu, sigma=sigma, sigma_dT_train=sigma_dT_train,
                 dt=dt, coords=coords, query_chunk=chunk_r,
+                output_parameterization=output_parameterization,
                 a_ref=a_ref, right_value=t_right_tilde, device=device,
             )
             slopes = interfaces_one_step_response_slopes(
                 model, probe_pairs,
                 dt=dt, coords=coords, query_chunk=chunk_r,
+                output_parameterization=output_parameterization,
                 a_ref=a_ref, sigma=sigma, device=device,
             )
             val.update(slopes)
+            fixed_rows: list[dict[str, float]] = []
+            if fixed_enabled:
+                per_simulation_metrics = []
+                for simulation, case in enumerate(fixed_cases):
+                    metrics, simulation_rows = _evaluate_interfaces_fixed_states(
+                        model,
+                        case,
+                        fixed_intervals,
+                        sigma=sigma,
+                        dt=dt,
+                        coords=coords,
+                        query_chunk=chunk_r,
+                        output_parameterization=output_parameterization,
+                        a_ref=a_ref,
+                        device=device,
+                    )
+                    per_simulation_metrics.append(metrics)
+                    fixed_rows.extend(
+                        {"simulation": simulation, **simulation_row}
+                        for simulation_row in simulation_rows
+                    )
+                error_ssq = sum(m["_error_ssq"] for m in per_simulation_metrics)
+                transition_ssq = sum(
+                    m["_transition_ssq"] for m in per_simulation_metrics
+                )
+                value_count = sum(
+                    m["_value_count"] for m in per_simulation_metrics
+                )
+                fixed_metrics = {
+                    "fixed_train_rmse_K": (
+                        math.sqrt(error_ssq / max(value_count, 1.0)) * float(sigma)
+                    ),
+                    "fixed_train_transition_rel": math.sqrt(
+                        error_ssq / max(transition_ssq, 1.0e-20)
+                    ),
+                    "fixed_train_max_rmse_K": max(
+                        m["fixed_train_max_rmse_K"]
+                        for m in per_simulation_metrics
+                    ),
+                    "fixed_train_max_transition_rel": max(
+                        m["fixed_train_max_transition_rel"]
+                        for m in per_simulation_metrics
+                    ),
+                }
+                row.update(fixed_metrics)
+                final_fixed_metrics = dict(fixed_metrics)
+                with open(fixed_metrics_path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fixed_metric_fields)
+                    for fixed_row in fixed_rows:
+                        writer.writerow({"update": update, **fixed_row})
             eligible = anti_collapse_eligible(
                 val,
                 forcing_slope_min=forcing_slope_min,
@@ -8879,7 +10069,7 @@ def run_one_seed_interfaces_one_step_pino(
                 "gnrmse_ix_low", "gnrmse_ix_mid", "gnrmse_ix_high",
                 "rollout_max_stepwise_gnrmse", "rollout_final_gnrmse",
                 "rollout_teacher_ratio", "rollout_max_abs_T_K",
-                "rollout_nonfinite", "hard_global_storage_error",
+                "rollout_nonfinite", "hard_storage_active", "hard_global_storage_error",
                 "forcing_response_slope", "jump_response_slope",
                 "jump_rmse_K", "jump_correlation", "jump_sign_fraction",
             ):
@@ -8897,9 +10087,30 @@ def run_one_seed_interfaces_one_step_pino(
                 "hard_global_storage_error": val["hard_global_storage_error"],
                 "sigma_dT_train": sigma_dT_train,
                 "interface_forcing": copy.deepcopy(image_spec),
+                "fixed_simulation_metrics": copy.deepcopy(final_fixed_metrics),
+                "fixed_simulation_state": (
+                    {
+                        "params": fixed_case.params,
+                        "case_params": [case.params for case in fixed_cases],
+                        "intervals": fixed_intervals,
+                    }
+                    if fixed_case is not None else None
+                ),
+                "source_checkpoint": (
+                    None if init_checkpoint_path is None else str(init_checkpoint_path)
+                ),
+                "fixed_case_weights": (
+                    None if fixed_case_weights is None
+                    else fixed_case_weights.detach().cpu()
+                ),
             }
             v = float(val["val_gnrmse"])
             saved_best = False
+            if fixed_enabled:
+                fixed_score = float(final_fixed_metrics["fixed_train_transition_rel"])
+                if math.isfinite(fixed_score) and fixed_score < best_fixed:
+                    best_fixed = fixed_score
+                    _atomic_torch_save(ckpt, run_dir / "cvit_best_fixed.pt")
             if eligible and math.isfinite(v):
                 # Eligible checkpoints take over cvit_best_global.pt; the top-k
                 # eligible pool feeds the deterministic selection (plan Section 6).
@@ -8940,6 +10151,11 @@ def run_one_seed_interfaces_one_step_pino(
                 f"jslope={val['jump_response_slope']:.3f} "
                 f"storage={val['hard_global_storage_error']:.2e} "
                 f"elig={int(eligible)}"
+                + (
+                    f" fixed_rmse={final_fixed_metrics['fixed_train_rmse_K']:.6f}K"
+                    f" fixed_transition={100.0 * final_fixed_metrics['fixed_train_transition_rel']:.4f}%"
+                    if fixed_enabled else ""
+                )
                 + ("  [best]" if saved_best else ""),
                 flush=True,
             )
@@ -8964,6 +10180,22 @@ def run_one_seed_interfaces_one_step_pino(
             "config": config, "update": updates - 1,
             "sigma_dT_train": sigma_dT_train,
             "interface_forcing": copy.deepcopy(image_spec),
+            "fixed_simulation_metrics": copy.deepcopy(final_fixed_metrics),
+            "fixed_simulation_state": (
+                {
+                    "params": fixed_case.params,
+                    "case_params": [case.params for case in fixed_cases],
+                    "intervals": fixed_intervals,
+                }
+                if fixed_case is not None else None
+            ),
+            "source_checkpoint": (
+                None if init_checkpoint_path is None else str(init_checkpoint_path)
+            ),
+            "fixed_case_weights": (
+                None if fixed_case_weights is None
+                else fixed_case_weights.detach().cpu()
+            ),
         },
         run_dir / "cvit_last.pt",
     )
@@ -8978,6 +10210,17 @@ def run_one_seed_interfaces_one_step_pino(
         "sigma_dT_train": sigma_dT_train,
         "updates": updates,
         "objective": kind,
+        "fixed_simulation": fixed_enabled,
+        "fixed_num_simulations": len(fixed_cases),
+        "fixed_intervals": fixed_intervals,
+        "fixed_state_defect_normalization": normalize_fixed_defect,
+        "source_checkpoint": (
+            None if init_checkpoint_path is None else str(init_checkpoint_path)
+        ),
+        "best_fixed_transition_rel": (
+            best_fixed if fixed_enabled and math.isfinite(best_fixed) else None
+        ),
+        **final_fixed_metrics,
     }
     with open(run_dir / "final_metrics.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -8993,8 +10236,9 @@ def run_config_seeds_pino(
     # (diffusion_forcing) trains a ForcingCViT on an
     # online-sampled forcing image; the varying-IC single-slab benchmark
     # (diffusion_forcing_single) trains a two-branch ForcingICCViT that also
-    # encodes the sampled IC field; every other benchmark uses the IC-conditioned
-    # diffusion CViT path.
+    # encodes the sampled IC field. Its active loss weights select either online
+    # physics or saved-data-only supervision; every other benchmark uses the
+    # IC-conditioned diffusion CViT path.
     bench = str(config.get("benchmark", {}).get("name", "diffusion"))
     if bench == "diffusion_forcing_single":
         # The runner hardcodes variant="forcing_ic"; an old ForcingCViT config
@@ -9008,6 +10252,11 @@ def run_config_seeds_pino(
                 f"'forcing_ic' but the config declares {declared!r}. An old "
                 "ForcingCViT ('forcing') config would ignore the sampled IC."
             )
+        forcing_ic_mode, _ = _forcing_ic_training_mode(
+            config["training"]["pino"],
+        )
+    else:
+        forcing_ic_mode = None
     pino_cfg = (config.get("training", {}).get("pino", {}) or {})
     interfaces_mode = str(pino_cfg.get("mode", "collapse"))
     if bench == "interfaces" and interfaces_mode not in ("collapse", "one_step"):
@@ -9021,12 +10270,18 @@ def run_config_seeds_pino(
             if interfaces_mode == "one_step"
             else run_one_seed_interfaces_pino
         )
+        if interfaces_mode == "one_step":
+            config = _resolve_interfaces_one_step_config(config)
     else:
         interfaces_runner = run_one_seed_interfaces_pino
     runner = (
         run_one_seed_forcing_interface_pino if bench == "forcing"
         else interfaces_runner if bench == "interfaces"
-        else run_one_seed_forcing_ic_pino if bench == "diffusion_forcing_single"
+        else (
+            run_one_seed_forcing_ic_supervised
+            if forcing_ic_mode == "supervised"
+            else run_one_seed_forcing_ic_pino
+        ) if bench == "diffusion_forcing_single"
         else run_one_seed_forcing_pino if bench == "diffusion_forcing"
         else run_one_seed_pino
     )
@@ -9059,12 +10314,15 @@ __all__ = [
     "validate_rel_l2",
     "validate_forcing_gnrmse",
     "validate_forcing_ic_gnrmse",
+    "validate_forcing_ic_supervised_dataset",
     "build_cvit",
+    "forcing_ic_supervised_data_loss",
     "load_interface_cvit_checkpoint",
     "run_one_seed_forcing_interface_pino",
     "run_one_seed_pino",
     "run_one_seed_forcing_pino",
     "run_one_seed_forcing_ic_pino",
+    "run_one_seed_forcing_ic_supervised",
     "run_one_seed_interfaces_pino",
     "run_one_seed_interfaces_one_step_pino",
     "validate_interfaces_one_step_gnrmse",

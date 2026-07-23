@@ -38,7 +38,7 @@ class Snake(nn.Module):
 
     def __init__(self, dim: int, alpha_init: float = 1.0):
         super().__init__()
-        self.alpha = nn.Parameter(torch.full((dim,), float(alpha_init)))
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = self.alpha
@@ -48,7 +48,7 @@ class Snake(nn.Module):
 def _make_activation(name: str, dim: int) -> nn.Module:
     name = str(name).lower()
     if name == "gelu":
-        return nn.GELU()
+        return nn.GELU(approximate="tanh")
     if name == "silu" or name == "swish":
         return nn.SiLU()
     if name == "tanh":
@@ -61,7 +61,7 @@ def _make_activation(name: str, dim: int) -> nn.Module:
 # --------- 2D sin-cos positional embedding ---------
 
 def _sincos_pos_embed_2d(emb_dim: int, grid_h: int, grid_w: int) -> torch.Tensor:
-    """Return a (grid_h*grid_w, emb_dim) fixed 2D sin-cos positional embedding."""
+    """Return the reference-initialized 2D sin-cos positional embedding."""
     if emb_dim % 4 != 0:
         raise ValueError(
             f"emb_dim must be divisible by 4 for 2D sin-cos pos-embed, got {emb_dim}."
@@ -191,9 +191,8 @@ class PatchEmbed2d(nn.Module):
 class FourierEmbed(nn.Module):
     """Random Fourier features: x -> [cos(x @ B), sin(x @ B)].
 
-    The projection ``B`` is a frozen random matrix; ``freq_scale`` sets its
-    standard deviation and is a real hyperparameter (it controls the spectral
-    bias of the coordinate embedding). ``out_dim`` must be even.
+    ``freq_scale`` initializes the trainable projection ``B`` and therefore sets
+    the decoder's initial spectral bias. ``out_dim`` must be even.
     """
 
     def __init__(self, in_dim: int, out_dim: int, freq_scale: float):
@@ -201,7 +200,7 @@ class FourierEmbed(nn.Module):
         if out_dim % 2 != 0:
             raise ValueError(f"FourierEmbed out_dim must be even, got {out_dim}.")
         kernel = torch.randn(in_dim, out_dim // 2) * float(freq_scale)
-        self.register_buffer("kernel", kernel)
+        self.kernel = nn.Parameter(kernel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         proj = x @ self.kernel  # (..., out_dim//2)
@@ -280,7 +279,9 @@ class CViTEncoder(nn.Module):
         grid_h = grid_size[0] // patch_size
         grid_w = grid_size[1] // patch_size
         pos = _sincos_pos_embed_2d(emb_dim, grid_h, grid_w)  # (N, emb_dim)
-        self.register_buffer("pos_emb", pos.unsqueeze(0))    # (1, N, emb_dim)
+        # Equinox optimizes every array leaf in the reference model, including
+        # the sin-cos-initialized position array.
+        self.pos_emb = nn.Parameter(pos.unsqueeze(0))        # (1, N, emb_dim)
         self.blocks = nn.ModuleList(
             [SelfAttnBlock(emb_dim, num_heads, mlp_ratio, activation) for _ in range(depth)]
         )
@@ -304,10 +305,15 @@ class CViTDecoder(nn.Module):
         mlp_ratio: float,
         fourier_freq: float,
         activation: str,
-        head_layers: int = 2,
         fourier_freq_t: float | None = None,
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
     ):
         super().__init__()
+        if film_hidden_layers < 0 or head_hidden_layers < 0:
+            raise ValueError("FiLM and head hidden-layer counts must be non-negative.")
         self.depth = depth
         self.dec_emb_dim = dec_emb_dim
         # Spatial (x, y in [0, 1]) and temporal (t in [0, t_final]) coordinates
@@ -324,8 +330,8 @@ class CViTDecoder(nn.Module):
             in_dim=dec_emb_dim,
             hidden_dim=dec_emb_dim,
             out_dim=depth * 2 * dec_emb_dim,
-            num_layers=2,
-            activation=activation,
+            num_layers=film_hidden_layers + 1,
+            activation=film_activation,
             zero_init_last=True,
         )
         self.proj_kv = nn.Linear(enc_emb_dim, dec_emb_dim)
@@ -333,7 +339,13 @@ class CViTDecoder(nn.Module):
             [CrossAttnBlock(dec_emb_dim, num_heads, mlp_ratio, activation) for _ in range(depth)]
         )
         self.norm = nn.LayerNorm(dec_emb_dim)
-        self.head = MLP(dec_emb_dim, dec_emb_dim, out_dim, head_layers, activation)
+        self.head = MLP(
+            dec_emb_dim,
+            dec_emb_dim,
+            out_dim,
+            head_hidden_layers + 1,
+            head_activation,
+        )
 
     def forward(
         self, tokens: torch.Tensor, coords: torch.Tensor, t: torch.Tensor
@@ -402,6 +414,10 @@ class CViT(nn.Module):
         fourier_freq: float = 1.0,
         fourier_freq_t: float | None = None,
         activation: str = "gelu",
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
@@ -411,7 +427,13 @@ class CViT(nn.Module):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
         self.hard_right_dirichlet = bool(hard_right_dirichlet)
-        self.hard_left_flux = bool(hard_left_flux)
+        if hard_left_flux:
+            raise ValueError(
+                "hard_left_flux was removed because its global forcing lift was "
+                "not consistent with the interior PDE residual; use the soft "
+                "forcing-Neumann residual."
+            )
+        self.hard_left_flux = False
         self.encoder = CViTEncoder(
             in_ch=in_ch,
             emb_dim=emb_dim,
@@ -432,6 +454,10 @@ class CViT(nn.Module):
             fourier_freq=fourier_freq,
             fourier_freq_t=fourier_freq_t,
             activation=activation,
+            film_hidden_layers=film_hidden_layers,
+            film_activation=film_activation,
+            head_hidden_layers=head_hidden_layers,
+            head_activation=head_activation,
         )
         self.register_buffer(
             "t_right_tilde", torch.tensor(float(t_right_tilde), dtype=torch.float32)
@@ -447,13 +473,6 @@ class CViT(nn.Module):
         # 1.0 is a no-op, preserving legacy behavior.
         self.register_buffer(
             "t_norm", torch.tensor(float(t_final), dtype=torch.float32)
-        )
-        # 1 / (k * sigma): converts an inward left-wall flux q_L into the
-        # normalized-temperature slope dT_tilde/dx it must produce. Only read
-        # when hard_left_flux is on.
-        self.register_buffer(
-            "left_flux_scale",
-            torch.tensor(float(left_flux_scale), dtype=torch.float32),
         )
 
     def forward(
@@ -475,16 +494,6 @@ class CViT(nn.Module):
         if not self.hard_right_dirichlet:
             return raw
         x = coords[..., 0:1]
-        if self.hard_left_flux:
-            # T = t_right + g*(x - 1) + (1 - x^2)*raw, with g = -q_L/(k*sigma).
-            # x=1: both added terms vanish, so the right-Dirichlet wall is kept.
-            # x=0: T_x = g + raw_x(0), so the inhomogeneous left-flux condition
-            # T_x(0) = g is met by construction and the bc_left residual collapses
-            # to the forcing-independent raw_x(0). q_left is a detached, coords-
-            # aligned (B, Nq, 1) tensor (None -> g=0, e.g. the t=0 IC where the
-            # ramp gives q_L=0), so autograd sees g only as an x-linear term.
-            g = torch.zeros_like(x) if q_left is None else -q_left * self.left_flux_scale
-            return self.t_right_tilde + g * (x - 1.0) + (1.0 - x * x) * raw
         return self.t_right_tilde + (1.0 - x) * raw
 
 
@@ -531,6 +540,10 @@ class ForcingCViT(CViT):
         fourier_freq: float = 1.0,
         fourier_freq_t: float | None = None,
         activation: str = "gelu",
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
@@ -554,6 +567,10 @@ class ForcingCViT(CViT):
             fourier_freq=fourier_freq,
             fourier_freq_t=fourier_freq_t,
             activation=activation,
+            film_hidden_layers=film_hidden_layers,
+            film_activation=film_activation,
+            head_hidden_layers=head_hidden_layers,
+            head_activation=head_activation,
             hard_right_dirichlet=hard_right_dirichlet,
             t_right_tilde=t_right_tilde,
             t_final=t_final,
@@ -640,6 +657,10 @@ class InterfaceCViT(nn.Module):
         fourier_freq: float = 1.0,
         fourier_freq_t: float | None = None,
         activation: str = "gelu",
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
@@ -650,6 +671,12 @@ class InterfaceCViT(nn.Module):
         jump_flux_depth: int = 1,
         jump_flux_conditioning: str = "all",
         jump_flux_mode: str = "learned",
+        interface_aligned_domains: bool = False,
+        interface_flux_gradient_scale: float = 1.0,
+        k_left: float = 2.0,
+        k_right: float = 1.0,
+        interface_x_range: tuple[float, float] = (0.2, 0.8),
+        resistance_range: tuple[float, float] = (0.05, 1.0),
     ):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
@@ -672,6 +699,31 @@ class InterfaceCViT(nn.Module):
                 "'two_sided_energy_closure', or "
                 "'conservative_storage_projection'"
             )
+        self.interface_aligned_domains = bool(interface_aligned_domains)
+        if self.interface_aligned_domains and (
+            not self.jump_enrichment or self.jump_flux_mode != "learned"
+        ):
+            raise ValueError(
+                "interface_aligned_domains requires learned jump enrichment"
+            )
+        if self.interface_aligned_domains and (
+            int(spatial_in_ch) != 3 or int(out_dim) != 1
+        ):
+            raise ValueError(
+                "interface_aligned_domains requires spatial_in_ch=3 and out_dim=1"
+            )
+        if self.interface_aligned_domains and not self.hard_right_dirichlet:
+            raise ValueError(
+                "interface_aligned_domains requires the hard right Dirichlet boundary"
+            )
+        if float(interface_flux_gradient_scale) <= 0.0:
+            raise ValueError("interface_flux_gradient_scale must be positive")
+        if float(k_left) <= 0.0 or float(k_right) <= 0.0:
+            raise ValueError("interface conductivities must be positive")
+        x_min, x_max = (float(v) for v in interface_x_range)
+        r_min, r_max = (float(v) for v in resistance_range)
+        if not x_min < x_max or not r_min < r_max:
+            raise ValueError("interface and resistance ranges must be increasing")
         if int(forcing_in_ch) != 1 or int(n_param_scalars) != 2:
             raise ValueError(
                 "InterfaceCViT requires one forcing-image channel and exactly "
@@ -729,18 +781,40 @@ class InterfaceCViT(nn.Module):
         # Learned 3-way modality embedding (spatial / forcing / param) so the
         # decoder can tell the heterogeneous token streams apart.
         self.modality = nn.Parameter(torch.randn(3, emb_dim) * 0.02)
-        self.decoder = CViTDecoder(
-            enc_emb_dim=emb_dim,
-            dec_emb_dim=dec_emb_dim,
-            out_dim=out_dim,
-            depth=depth_dec,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            fourier_freq=fourier_freq,
-            fourier_freq_t=fourier_freq_t,
-            activation=activation,
-        )
-        if self.jump_enrichment and self.jump_flux_mode == "learned":
+        decoder_kwargs = {
+            "enc_emb_dim": emb_dim,
+            "dec_emb_dim": dec_emb_dim,
+            "depth": depth_dec,
+            "num_heads": num_heads,
+            "mlp_ratio": mlp_ratio,
+            "fourier_freq": fourier_freq,
+            "fourier_freq_t": fourier_freq_t,
+            "activation": activation,
+            "film_hidden_layers": film_hidden_layers,
+            "film_activation": film_activation,
+            "head_hidden_layers": head_hidden_layers,
+            "head_activation": head_activation,
+        }
+        if self.interface_aligned_domains:
+            self.decoder = nn.ModuleDict({
+                "left": CViTDecoder(out_dim=1, **decoder_kwargs),
+                "right": CViTDecoder(out_dim=1, **decoder_kwargs),
+                "interface": CViTDecoder(
+                    out_dim=2, depth=int(jump_flux_depth),
+                    **{k: v for k, v in decoder_kwargs.items() if k != "depth"},
+                ),
+            })
+            for decoder in self.decoder.values():
+                last = decoder.head.net[-1]
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+        else:
+            self.decoder = CViTDecoder(out_dim=out_dim, **decoder_kwargs)
+        if (
+            self.jump_enrichment
+            and self.jump_flux_mode == "learned"
+            and not self.interface_aligned_domains
+        ):
             self.interface_flux_decoder = CViTDecoder(
                 enc_emb_dim=emb_dim,
                 dec_emb_dim=dec_emb_dim,
@@ -751,10 +825,25 @@ class InterfaceCViT(nn.Module):
                 fourier_freq=fourier_freq,
                 fourier_freq_t=fourier_freq_t,
                 activation=activation,
+                film_hidden_layers=film_hidden_layers,
+                film_activation=film_activation,
+                head_hidden_layers=head_hidden_layers,
+                head_activation=head_activation,
             )
             last = self.interface_flux_decoder.head.net[-1]
             nn.init.zeros_(last.weight)
             nn.init.zeros_(last.bias)
+        if self.interface_aligned_domains:
+            self.register_buffer(
+                "interface_flux_gradient_scale",
+                torch.tensor(float(interface_flux_gradient_scale), dtype=torch.float32),
+            )
+            self.register_buffer("k_left", torch.tensor(float(k_left), dtype=torch.float32))
+            self.register_buffer("k_right", torch.tensor(float(k_right), dtype=torch.float32))
+            self.register_buffer("interface_x_min", torch.tensor(x_min, dtype=torch.float32))
+            self.register_buffer("interface_x_max", torch.tensor(x_max, dtype=torch.float32))
+            self.register_buffer("resistance_min", torch.tensor(r_min, dtype=torch.float32))
+            self.register_buffer("resistance_max", torch.tensor(r_max, dtype=torch.float32))
         self.register_buffer(
             "t_right_tilde", torch.tensor(float(t_right_tilde), dtype=torch.float32)
         )
@@ -767,7 +856,7 @@ class InterfaceCViT(nn.Module):
         u_spatial: torch.Tensor,
         forcing_image: torch.Tensor,
         params: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Build the cached latent token set; shape ``(B, N_s+N_f+N_p, emb_dim)``.
 
         u_spatial:(B, spatial_in_ch, Nx, Ny); forcing_image:(B, 1, Ny_img, Nt_img);
@@ -785,6 +874,9 @@ class InterfaceCViT(nn.Module):
                 "params must have shape (B, 2) = [normalized interface_x, "
                 f"normalized R_c]; got {tuple(params.shape)}."
             )
+        if self.interface_aligned_domains:
+            interface_x, jump_scale = self._physical_interface_scalars(params)
+            u_spatial = self._align_spatial_input(u_spatial, interface_x)
         z_s = self.spatial_encoder(u_spatial) + self.modality[0]
         z_f = self.forcing_encoder(forcing_image) + self.modality[1]
         if z_f.shape[1] != self.num_forcing_tokens:
@@ -792,7 +884,133 @@ class InterfaceCViT(nn.Module):
                 f"Expected {self.num_forcing_tokens} forcing tokens, got {z_f.shape[1]}."
             )
         z_p = self.param_encoder(params) + self.modality[2]
-        return torch.cat([z_s, z_f, z_p], dim=1)
+        tokens = torch.cat([z_s, z_f, z_p], dim=1)
+        if not self.interface_aligned_domains:
+            return tokens
+        return {
+            "tokens": tokens,
+            "interface_x": interface_x,
+            "jump_scale": jump_scale,
+        }
+
+    def _physical_interface_scalars(
+        self, params: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        interface_x = self.interface_x_min + params[:, 0] * (
+            self.interface_x_max - self.interface_x_min
+        )
+        resistance = self.resistance_min + params[:, 1] * (
+            self.resistance_max - self.resistance_min
+        )
+        jump_scale = resistance * self.interface_flux_gradient_scale
+        return interface_x, jump_scale
+
+    def _align_spatial_input(
+        self, u_spatial: torch.Tensor, interface_x: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size, channels, nx, ny = u_spatial.shape
+        if channels != 3 or nx % 2:
+            raise ValueError(
+                "interface alignment requires three spatial channels and an even x grid"
+            )
+        left_size = nx // 2
+        temperatures = []
+        for batch in range(batch_size):
+            split = int(round(float(interface_x[batch].detach().cpu()) * (nx - 1) + 0.5))
+            if split < 2 or nx - split < 2:
+                raise ValueError("interface alignment requires at least two nodes per domain")
+            left = F.interpolate(
+                u_spatial[batch : batch + 1, 0:1, :split],
+                size=(left_size, ny), mode="bilinear", align_corners=True,
+            )
+            right = F.interpolate(
+                u_spatial[batch : batch + 1, 0:1, split:],
+                size=(nx - left_size, ny), mode="bilinear", align_corners=True,
+            )
+            temperatures.append(torch.cat((left, right), dim=2))
+        temperature = torch.cat(temperatures, dim=0)
+        material = torch.ones_like(temperature)
+        material[:, :, left_size:] = -1.0
+        left_distance = torch.linspace(
+            -1.0, -1.0 / left_size, left_size,
+            device=u_spatial.device, dtype=u_spatial.dtype,
+        )
+        right_size = nx - left_size
+        right_distance = torch.linspace(
+            1.0 / right_size, 1.0, right_size,
+            device=u_spatial.device, dtype=u_spatial.dtype,
+        )
+        distance = torch.cat((left_distance, right_distance)).view(1, 1, nx, 1)
+        distance = distance.expand(batch_size, 1, nx, ny)
+        return torch.cat((temperature, material, distance), dim=1)
+
+    def _interface_head_output(
+        self,
+        latent: dict[str, torch.Tensor],
+        y: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = latent["tokens"]
+        batch_size = tokens.shape[0]
+        if y.shape[0] == 1 and batch_size > 1:
+            y = y.expand(batch_size, -1, -1)
+        if t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size, -1, -1)
+        if self.jump_flux_conditioning == "state_param":
+            forcing_stop = self.num_spatial_tokens + self.num_forcing_tokens
+            tokens = torch.cat(
+                (tokens[:, : self.num_spatial_tokens], tokens[:, forcing_stop:]),
+                dim=1,
+            )
+        interface_coords = torch.cat((torch.zeros_like(y), y), dim=-1)
+        return self.decoder["interface"](tokens, interface_coords, t / self.t_norm)
+
+    def _decode_aligned_rate(
+        self,
+        latent: dict[str, torch.Tensor],
+        coords: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = latent["tokens"]
+        batch_size = tokens.shape[0]
+        if coords.shape[0] == 1 and batch_size > 1:
+            coords = coords.expand(batch_size, -1, -1)
+        if t.shape[0] == 1 and batch_size > 1:
+            t = t.expand(batch_size, -1, -1)
+        interface_x = latent["interface_x"].to(coords).view(batch_size, 1, 1)
+        jump_scale = latent["jump_scale"].to(coords).view(batch_size, 1, 1)
+        x = coords[..., 0:1]
+        y = coords[..., 1:2]
+        left_x = (x / interface_x).clamp(0.0, 1.0)
+        right_length = 1.0 - interface_x
+        right_x = ((x - interface_x) / right_length).clamp(0.0, 1.0)
+        left_raw = self.decoder["left"](
+            tokens, torch.cat((left_x, y), dim=-1), t / self.t_norm
+        )
+        right_raw = self.decoder["right"](
+            tokens, torch.cat((right_x, y), dim=-1), t / self.t_norm
+        )
+        trace_rate, flux_rate = self._interface_head_output(latent, y, t).split(1, dim=-1)
+        distance = x - interface_x
+        left_slope = -flux_rate * self.interface_flux_gradient_scale / self.k_left
+        right_slope = -flux_rate * self.interface_flux_gradient_scale / self.k_right
+        trace = self.t_right_tilde + trace_rate
+        left = (
+            trace
+            + jump_scale * flux_rate
+            + left_slope * distance
+            + distance.square() * left_raw
+        )
+        right_quadratic = (
+            self.t_right_tilde - trace - right_slope * right_length
+        ) / right_length.square()
+        right = (
+            trace
+            + right_slope * distance
+            + right_quadratic * distance.square()
+            + distance.square() * (right_length - distance) * right_raw
+        )
+        return torch.where(x < interface_x, left, right)
 
     def load_state_dict(self, state_dict, strict: bool = True):
         legacy = any(
@@ -810,7 +1028,10 @@ class InterfaceCViT(nn.Module):
         return super().load_state_dict(state_dict, strict=strict)
 
     def decode(
-        self, latent: torch.Tensor, coords: torch.Tensor, t: torch.Tensor
+        self,
+        latent: torch.Tensor | dict[str, torch.Tensor],
+        coords: torch.Tensor,
+        t: torch.Tensor,
     ) -> torch.Tensor:
         """Pure coordinate+time query against a cached latent; ``(B, Nq, out_dim)``.
 
@@ -819,6 +1040,12 @@ class InterfaceCViT(nn.Module):
         ``(1, Nq, .)`` coordinate/time sets are expanded to the sim minibatch
         (torch attention does not broadcast batch dims).
         """
+        if self.interface_aligned_domains:
+            if not isinstance(latent, dict):
+                raise TypeError("aligned InterfaceCViT requires its encoded latent mapping")
+            return self._decode_aligned_rate(latent, coords, t)
+        if not isinstance(latent, torch.Tensor):
+            raise TypeError("standard InterfaceCViT requires a tensor latent")
         B = latent.shape[0]
         if coords.shape[0] == 1 and B > 1:
             coords = coords.expand(B, -1, -1)
@@ -831,11 +1058,20 @@ class InterfaceCViT(nn.Module):
         return self.t_right_tilde + (1.0 - x) * raw
 
     def decode_interface_flux(
-        self, latent: torch.Tensor, y: torch.Tensor, t: torch.Tensor
+        self,
+        latent: torch.Tensor | dict[str, torch.Tensor],
+        y: torch.Tensor,
+        t: torch.Tensor,
     ) -> torch.Tensor:
-        """Query the auxiliary interface flux ``q_Gamma/q_ref`` along ``y``."""
+        """Query interface flux, or its rate in the aligned-rate variant."""
         if not self.jump_enrichment or self.jump_flux_mode != "learned":
             raise RuntimeError("interface flux decoder is disabled")
+        if self.interface_aligned_domains:
+            if not isinstance(latent, dict):
+                raise TypeError("aligned InterfaceCViT requires its encoded latent mapping")
+            return self._interface_head_output(latent, y, t)[..., 1:2]
+        if not isinstance(latent, torch.Tensor):
+            raise TypeError("standard InterfaceCViT requires a tensor latent")
         batch_size = latent.shape[0]
         if y.shape[0] == 1 and batch_size > 1:
             y = y.expand(batch_size, -1, -1)
@@ -864,6 +1100,8 @@ class InterfaceCViT(nn.Module):
         """Return enriched temperature and its aligned ``q_Gamma/q_ref`` field."""
         if not self.jump_enrichment or self.jump_flux_mode != "learned":
             raise RuntimeError("jump enrichment is disabled")
+        if self.interface_aligned_domains:
+            raise RuntimeError("aligned InterfaceCViT embeds its interface constraints in decode")
         batch_size = latent.shape[0]
         if coords.shape[0] == 1 and batch_size > 1:
             coords = coords.expand(batch_size, -1, -1)
@@ -939,6 +1177,10 @@ class ForcingICCViT(nn.Module):
         fourier_freq: float = 1.0,
         fourier_freq_t: float | None = None,
         activation: str = "gelu",
+        film_hidden_layers: int = 2,
+        film_activation: str = "silu",
+        head_hidden_layers: int = 1,
+        head_activation: str = "gelu",
         hard_right_dirichlet: bool = True,
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
@@ -1030,6 +1272,10 @@ class ForcingICCViT(nn.Module):
             fourier_freq=fourier_freq,
             fourier_freq_t=fourier_freq_t,
             activation=activation,
+            film_hidden_layers=film_hidden_layers,
+            film_activation=film_activation,
+            head_hidden_layers=head_hidden_layers,
+            head_activation=head_activation,
         )
         self.register_buffer(
             "t_right_tilde", torch.tensor(float(t_right_tilde), dtype=torch.float32)

@@ -1,10 +1,10 @@
 import numpy as np
+import pytest
 import torch
 
 from src.operators.cvit import ForcingCViT
 from src.operators.train_pino import (
     forcing_data_loss,
-    left_wall_qL,
     pino_losses,
     sample_collocation,
     sample_forcing_params,
@@ -61,27 +61,14 @@ def test_bc_bucket_is_left_plus_two_hom_over_three():
     assert torch.allclose(losses["bc"], expected, atol=1e-6)
 
 
-def test_lifting_makes_bc_left_forcing_independent_in_losses():
-    # With the lifting on and left_flux_scale = 1/(k*sigma), the reported bc_left
-    # collapses to a forcing-independent term, so scaling q_L leaves it unchanged.
-    # The cancellation is per-sim and holds at batch>1 because the residual now
-    # expands the shared collocation leaf to per-sim leaves (no batch-sum).
-    sigma, k = 5.0, 1.0
-    model, u, coll, ic_target, q_L = _setup(
-        batch=2, hard_left_flux=True, left_flux_scale=1.0 / (k * sigma)
-    )
-    kw = dict(alpha=1.0, t_final=0.3, sigma=sigma, k_slab=k)
-    l1 = pino_losses(model, u, coll, ic_target, left_qL=q_L, **kw)
-    l2 = pino_losses(model, u, coll, ic_target, left_qL=q_L + 0.5, **kw)
-    assert torch.allclose(l1["bc_left"], l2["bc_left"], atol=1e-5)
+def test_invalid_global_left_flux_lift_is_rejected():
+    with pytest.raises(ValueError, match="interior PDE residual"):
+        _setup(batch=2, hard_left_flux=True, left_flux_scale=0.2)
 
 
 def test_soft_left_bc_is_forcing_dependent_in_losses():
-    # Complement to the lifting test: with hard_left_flux OFF the left wall is a
-    # genuine soft Neumann penalty (dT_tilde/dx|_0 + q_L/(k*sigma))^2 on the raw
-    # field, so bc_left MUST move when q_L is scaled. This forcing->field coupling
-    # is exactly what the lifting cancels; the diffusion_forcing benchmark depends
-    # on it, so a broken re-enable of the ansatz must fail here.
+    # The left wall is a genuine soft Neumann penalty
+    # (dT_tilde/dx|_0 + q_L/(k*sigma))^2, so it must move with q_L.
     sigma, k = 5.0, 1.0
     model, u, coll, ic_target, q_L = _setup(batch=2, hard_left_flux=False)
     kw = dict(alpha=1.0, t_final=0.3, sigma=sigma, k_slab=k)
@@ -149,9 +136,8 @@ def test_forcing_data_loss_is_differentiable_and_truth_dependent():
 class _SpyModel(torch.nn.Module):
     """Records the ``q_left`` each forward receives; returns a zero field."""
 
-    def __init__(self, hard_left_flux: bool):
+    def __init__(self):
         super().__init__()
-        self.hard_left_flux = hard_left_flux
         self.seen: list = []
 
     def forward(self, u, coords, t, q_left=None):
@@ -174,38 +160,9 @@ def _val_data(Nx=6, Ny=5, Nt=4, n_sims=3):
     return data, sim_params, np.arange(n_sims)
 
 
-def test_validation_feeds_q_left_when_hard_left_flux():
-    # Regression: with hard_left_flux the eval MUST pass q_L into the ansatz.
-    # A None q_left drops the analytic g*(x-1) forcing term and scores an
-    # insulated wall, which looks catastrophic across every forcing family.
+def test_validation_never_injects_boundary_flux_into_field_ansatz():
     data, sim_params, ids = _val_data()
-    y_img = data["y_grid"].copy()
-    t_img = data["t_grid"].copy()
-    model = _SpyModel(hard_left_flux=True)
-    validate_forcing_gnrmse(
-        model, data, ids, sim_params, y_img, t_img,
-        a_ref=300.0, t_ramp=0.02, device=torch.device("cpu"),
-    )
-    assert model.seen, "model was never queried"
-    assert all(q is not None for q in model.seen)
-    Nx, Ny = data["x_grid"].size, data["y_grid"].size
-    for q in model.seen:
-        assert q.shape == (len(ids), Nx * Ny, 1)
-
-    # The passed q_L must equal the shared reconstruction at the mesh y for the
-    # first slice time (t_grid[0]); this ties eval to the training residual path.
-    gx, gy = np.meshgrid(data["x_grid"], data["y_grid"], indexing="ij")
-    mesh_y = torch.as_tensor(gy.reshape(-1), dtype=torch.float32)
-    params = [dict(sim_params[int(i)]) for i in ids]
-    t_pts = torch.full_like(mesh_y, float(data["t_grid"][0]))
-    expected0 = left_wall_qL(params, mesh_y, t_pts, torch.device("cpu"), 0.02)
-    assert torch.allclose(model.seen[0], expected0, atol=1e-5)
-
-
-def test_validation_omits_q_left_when_flux_off():
-    # The cheap legacy path is preserved: hard_left_flux=False never builds q_L.
-    data, sim_params, ids = _val_data()
-    model = _SpyModel(hard_left_flux=False)
+    model = _SpyModel()
     validate_forcing_gnrmse(
         model, data, ids, sim_params, data["y_grid"].copy(),
         data["t_grid"].copy(), a_ref=300.0, t_ramp=0.02,

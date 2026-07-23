@@ -65,15 +65,13 @@ model:
     t_final: null                # decoder time-normalization horizon; null -> data t_grid[-1].
                                  # t is divided by this INSIDE forward (in-graph), so the PDE
                                  # residual still differentiates the physical time leaf exactly.
-    activation: gelu
+    activation: gelu              # transformer FFN activation
+    film_hidden_layers: 2         # PI-CViT film_depth: hidden layers before output
+    film_activation: silu
+    head_hidden_layers: 1         # PI-CViT num_mlp_layers
+    head_activation: gelu
     hard_right_dirichlet: true
     hard_right_dirichlet_t_right: 300.0
-    # Opt-in hard left-flux lifting (forcing PINO only). false -> legacy
-    # (1 - x) * raw ansatz. true -> T = t_right + g*(x - 1) + (1 - x^2)*raw with
-    # g = -q_L/(k*sigma), so the inhomogeneous left-wall Neumann flux is met by
-    # construction and the bc_left residual collapses to the forcing-independent
-    # raw_x(0). Detached q_L (autograd only); has no effect without a forcing q_L.
-    hard_left_flux: false
 
   # ---- ForcingCViT (single-slab forcing PINO path) ----
   # Read ONLY by train_pino.run_one_seed_forcing_pino (benchmark=diffusion_forcing).
@@ -126,6 +124,7 @@ model:
     jump_flux_depth: 1
     jump_flux_conditioning: "all"
     jump_flux_mode: "learned"
+    interface_aligned_domains: false
 
 training:
   device: "auto"
@@ -235,17 +234,25 @@ training:
     # CN interval). Validation autoregresses the full held-out trajectory.
     one_step:
       step_stride: 1
-      one_step_dt: solver_dt
       objective: variational          # variational | defect
       defect_sweeps: 1                 # multi-sweep only after single-sweep parity
       defect_omega: 0.6667
       n_cases: 8
-      state_source: fv_solve
       state_pool_size: 128
       state_pool_replace_per_update: 2
       max_uses_per_case: 8
+      # Diagnostic override: solve one descriptor once and batch evenly spaced
+      # on-manifold T_n states every update. FV T_{n+1} is evaluation-only.
+      fixed_simulation:
+        enabled: false
+        num_simulations: 1
+        num_states: 16
+        normalize_per_state_defect: false
+        normalization_floor_fraction: 0.01
+      # Weights-only continuation for the one-step CViT. When the source is a
+      # fixed-simulation checkpoint, its exact descriptor/intervals are reused.
+      init_from_checkpoint: null
       output_parameterization: rate    # rate | increment | deviation | absolute
-      sample_time_index: mixture
       time_mixture: { uniform: 0.5, active_forcing: 0.25, high_change: 0.25 }
       updates: 8000
       # Exact-resume: when true and a resume_state.pt exists in the run dir, the
@@ -253,14 +260,11 @@ training:
       # the online stream identically (plan Section 9). Default false so a fresh
       # experiment name is still required for a new run.
       resume: false
-      conservation: conservative_storage_projection
-      lambda_trace: 0.0
-      lambda_flux: 0.0
+      # learned is y-dependent and valid for the benchmark's nonuniform ICs.
+      # The scalar storage projection is only suitable for y-uniform flux studies.
+      conservation: learned
       fast_validation_cases: 16
-      full_validation_cases: 96
-      final_test_cases: 96
       validate_every: 500
-      full_validate_every: 2000
       keep_top_k_eligible: 5
       # Paired-amplitude anti-collapse probes: n frozen descriptors, each run at
       # forcing amplitude A and probe_amp_ratio * A, sharing the IC so the
@@ -289,18 +293,18 @@ training:
     # pulled out and weighted by lambda_bc_left while the homogeneous top/bottom
     # stay on lambda_bc, removing that dilution.
     lambda_bc_left: null
-    # ---- Lever #1: interior data supervision (forcing PINO only) ----
-    # Optional supervised MSE matching model(u, x, y, t) to the saved FV forcing
-    # trajectories at n_data_pts grid nodes over n_data_sims saved TRAIN sims.
-    # 0.0 (default) = pure physics (off). The pure-physics forcing objective
-    # couples q_L to the field ONLY through the soft left-wall Neumann residual,
-    # which competes with the flat-300 K basin that minimizes every other term;
-    # this value penalty pins the field level the derivative BC cannot, matching
-    # the reference benchmarks' value-supervised conditioning. Intended with
-    # hard_left_flux=false (the soft path); q_left is left None in the data term.
+    # ---- Saved-trajectory supervision (forcing CViT paths) ----
+    # diffusion_forcing uses this as an optional value term alongside PINO.
+    # diffusion_forcing_single additionally supports a strict supervised-only
+    # mode when lambda_data > 0 and lambda_r/lambda_ic/lambda_bc/
+    # lambda_bc_left are all zero. That path samples n_data_sims saved TRAIN
+    # simulations per update, draws n_data_pts independent grid/time queries per
+    # simulation, and never invokes online sampling or a physics residual.
     lambda_data: 0.0
     n_data_sims: 8
     n_data_pts: 1024
+    # Query-axis chunk for the supervised ForcingICCViT decoder. 0 = one decode.
+    data_query_chunk: 0
     n_r: 4096
     n_ic: 1024
     n_bc: 512
@@ -515,8 +519,13 @@ training:
         bc_left_mult: 1.0
         bc_hom_mult: 1.0
         resample_every: 1
-      # Forcing-only update controls. null clipping preserves the legacy path.
+      # Forcing-only override; null inherits training.grad_clip.
       grad_clip: null
+      # Full held-out trajectory validation controls for ForcingICCViT. The
+      # simulation batch controls encoder batching; query_chunk bounds decoder
+      # cross-attention memory over the Nx*Ny grid. 0 = one full-grid decode.
+      val_sim_batch: 8
+      val_query_chunk: 2048
       save_latest_every: 25
       extend_completed: false
     # Option-2 reachability falsifier for the forcing/hybrid path. The five
@@ -546,20 +555,19 @@ training:
   # (interior CN residual, left-Neumann, top/bottom adiabatic, right-Dirichlet,
   # IC, optional data). Each active term (positive static coefficient) gets a
   # multiplier w_t = mean(g)/g_t from its own gradient norm on the current step's
-  # graph, EMA-smoothed by alpha_w and refreshed every update_every optimizer
+  # graph, blended toward the new target by alpha_w and refreshed every update_every optimizer
   # steps. enabled: false is a TRUE no-op (multipliers stay 1.0, total is
   # bit-identical to the plain statically-weighted sum). Applies to both the
   # diffusion and forcing collocation physics-only regimes.
   gradnorm:
     enabled: false
-    alpha_w: 0.9
+    alpha_w: 1.0
     update_every: 10
     eps: 1.0e-8
     # Optional guardrails (all default to no-ops). w_min / w_max clamp every
     # multiplier; floor is a per-term MULTIPLIER floor (NOT an effective-weight
     # floor) so the effective weight of a floored term is >= lambda_term * floor.
-    # Example enabled forcing screen: w_min: 0.1, w_max: 5.0, floor: {bc_left: 0.25}
-    # (with lambda_bc_left=6 the effective left weight stays >= 1.5).
+    # Example enabled forcing screen: w_min: 0.1, w_max: 5.0, floor: {bc_left: 0.25}.
     w_min: null
     w_max: null
     floor: {}

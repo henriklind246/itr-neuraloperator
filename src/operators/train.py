@@ -1206,7 +1206,8 @@ class GradNormBalancer:
     graph via ``torch.autograd.grad(term, unwrapped_params, retain_graph=True,
     allow_unused=True)`` -- against the UNWRAPPED module params so it never fires the
     DDP reducer (which only triggers on ``.backward()``) -- then sets
-    ``w_t = mean(g_valid) / g_t`` (EMA-smoothed). The static ``lambda_*`` /
+    ``w_t = mean(g_valid) / g_t`` (blended toward the new target by ``alpha_w``).
+    The static ``lambda_*`` /
     region-weight coefficients are applied separately at the compose site, so
     GradNorm rebalances the raw magnitudes without cancelling those coefficients.
 
@@ -1230,11 +1231,13 @@ class GradNormBalancer:
     """
 
     def __init__(
-        self, term_names, *, alpha_w=0.9, update_every=10, eps=1.0e-8,
+        self, term_names, *, alpha_w=1.0, update_every=10, eps=1.0e-8,
         w_min=None, w_max=None, floors=None,
     ):
         self.term_names = list(term_names)
         self.alpha_w = float(alpha_w)
+        if not 0.0 <= self.alpha_w <= 1.0:
+            raise ValueError("GradNormBalancer alpha_w must be in [0, 1].")
         self.update_every = max(1, int(update_every))
         self.eps = float(eps)
         self.w_min = None if w_min is None else float(w_min)
@@ -1370,7 +1373,7 @@ class GradNormBalancer:
         self.last_target_multipliers = dict(target)
         for name in valid:
             prev = float(self.multipliers.get(name, 1.0))
-            blended = self.alpha_w * prev + (1.0 - self.alpha_w) * target[name]
+            blended = self.alpha_w * target[name] + (1.0 - self.alpha_w) * prev
             # Clamp/floor the STORED weight again (do NOT renormalize afterwards:
             # renormalizing could re-violate the bounds).
             final_v = self._apply_bounds(name, blended)
@@ -3811,7 +3814,7 @@ def run_one_seed(
             gn_terms = _active_physics_terms(gn_coeffs)
             gradnorm = GradNormBalancer(
                 gn_terms,
-                alpha_w=float(gradnorm_cfg.get("alpha_w", 0.9)),
+                alpha_w=float(gradnorm_cfg.get("alpha_w", 1.0)),
                 update_every=int(gradnorm_cfg.get("update_every", 10)),
                 eps=float(gradnorm_cfg.get("eps", 1.0e-8)),
             )

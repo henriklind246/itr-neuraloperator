@@ -35,10 +35,6 @@ def model_xyt(
 
     x, y, t are each (B, Nq, 1). They are concatenated to coords=(B, Nq, 2) and
     passed through unchanged so autograd sees x and y as distinct inputs.
-    ``q_left`` is forwarded to the model's hard-left-flux lifting when set; it is
-    a detached, coords-aligned (B, Nq, 1) tensor and is ignored unless the model
-    was built with ``hard_left_flux=True``.
-
     ``predict`` is an optional decode closure ``predict(coords, t, q_left=None)``
     over a pre-encoded latent (the two-branch :class:`ForcingICCViT` path): when
     given, ``model``/``u`` are unused for the query and the latent is reused
@@ -173,11 +169,6 @@ def forcing_neumann_residual(
     through ``q_L``. Queries are in physical units (x in [0, 1]) so no coordinate
     rescale enters ``T_tilde_x``.
 
-    ``q_L`` is also forwarded to the model as ``q_left`` so that, when the model
-    uses the hard-left-flux lifting, the ``-q_L/(k*sigma) * (x - 1)`` particular
-    term is present and this residual collapses to the forcing-independent
-    ``raw_x(0)``. It is inert when the model has no lifting.
-
     Shared collocation leaves are expanded per-sim so ``dT/dx`` is not summed
     over the batch; ``q_L`` is already ``(B, Nq, 1)`` and aligns row-for-row.
     """
@@ -185,7 +176,7 @@ def forcing_neumann_residual(
     x = _as_batch_leaf(x, B)
     y = _as_batch_leaf(y, B)
     t = _as_batch_leaf(t, B)
-    T = model_xyt(model, u, x, y, t, q_left=q_L, predict=predict)
+    T = model_xyt(model, u, x, y, t, predict=predict)
     T_x = _grad(T, x, create_graph=True)
     return T_x + q_L / (float(k) * float(sigma))
 

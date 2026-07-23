@@ -395,13 +395,16 @@ def one_step_objective(
     right_value: float,
     defect_sweeps: int = 1,
     defect_omega: float = 2.0 / 3.0,
+    case_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Dispatch to the ``variational`` or ``defect`` one-step objective.
 
     Returns ``(loss_scalar, metrics)`` where ``loss_scalar`` is the batch-mean
     objective and ``metrics`` carries the detached per-sample energy, the
     physical CN defect norm (RMS of ``A u - b``), and the per-case energy vector
-    for gradient-domination diagnostics.
+    for gradient-domination diagnostics. Optional detached positive
+    ``case_weights`` recondition a shared multi-state optimization without
+    changing any individual state's physical minimizer.
     """
     if kind == "variational":
         energy, residual = variational_objective(
@@ -420,7 +423,18 @@ def one_step_objective(
         raise ValueError(
             f"one_step_objective kind must be 'variational' or 'defect'; got {kind!r}"
         )
-    loss = energy.mean()
+    if case_weights is None:
+        loss = energy.mean()
+    else:
+        weights = case_weights.detach().to(device=energy.device, dtype=energy.dtype)
+        if weights.shape != energy.shape:
+            raise ValueError(
+                f"case_weights must have shape {tuple(energy.shape)}; got "
+                f"{tuple(weights.shape)}."
+            )
+        if not bool(torch.isfinite(weights).all()) or bool((weights <= 0.0).any()):
+            raise ValueError("case_weights must be finite and strictly positive")
+        loss = (weights * energy).mean()
     metrics = {
         "energy_per_case": energy.detach(),
         "energy": energy.detach().mean(),
@@ -634,8 +648,9 @@ def conservative_energy_storage_projection(
         half_step_area * flux - target_right
     ) / storage_sensitivity.clamp_min(1.0e-12)
     correction = amplitude[:, None, None] * bubble
-    right_implied_flux = target_right / half_step_area.clamp_min(1.0e-12)
-    return flux, smooth_np1 + correction, correction, flux - right_implied_flux
+    corrected_target_right = target_right + storage_sensitivity * amplitude
+    storage_residual = flux - corrected_target_right / half_step_area.clamp_min(1.0e-12)
+    return flux, smooth_np1 + correction, correction, storage_residual
 
 
 # --------------------------------------------------------------------------- #
