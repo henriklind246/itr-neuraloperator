@@ -11288,6 +11288,258 @@ def transition_counterfactual_diagnostics(
     }
 
 
+def _transition_parameter_group_norm(
+    model: torch.nn.Module,
+    prefixes: tuple[str, ...],
+    *,
+    gradients: bool,
+) -> float:
+    squares = []
+    for name, parameter in model.named_parameters():
+        if not name.startswith(prefixes):
+            continue
+        value = parameter.grad if gradients else parameter
+        if value is not None:
+            squares.append(value.detach().double().square().sum())
+    if not squares:
+        return 0.0
+    return float(torch.stack(squares).sum().sqrt().cpu())
+
+
+def _transition_initial_parameters(
+    model: torch.nn.Module,
+    prefixes: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith(prefixes)
+    }
+
+
+def _transition_parameter_displacement(
+    model: torch.nn.Module,
+    initial: dict[str, torch.Tensor],
+) -> tuple[float, float]:
+    current = dict(model.named_parameters())
+    displacement_sq = 0.0
+    initial_sq = 0.0
+    for name, reference in initial.items():
+        delta = current[name].detach().cpu().double() - reference.double()
+        displacement_sq += float(delta.square().sum())
+        initial_sq += float(reference.double().square().sum())
+    displacement = math.sqrt(displacement_sq)
+    relative = displacement / max(math.sqrt(initial_sq), np.finfo(float).tiny)
+    return displacement, relative
+
+
+def _build_transition_forcing_probe(
+    problem,
+    *,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    dt: float,
+    t_final: float,
+    t_ramp: float,
+    time_cfg: dict[str, float],
+    mu: float,
+    sigma: float,
+) -> dict[str, Any]:
+    common = {
+        "t_on": float(time_cfg["t_on"]),
+        "t_off": float(time_cfg["t_off"]),
+        "phase": float(time_cfg["phase"]),
+        "tukey_alpha": float(time_cfg["tukey_alpha"]),
+        "rectified": True,
+    }
+    cases = [
+        ("zero", 0.0, 4.0),
+        ("low", 75.0, 2.0),
+        ("high", 250.0, 12.0),
+    ]
+    solver_steps = int(round(float(t_final) / float(dt)))
+    solver_t_final = solver_steps * float(dt)
+    target_steps = sorted({
+        max(1, min(int(round(value / dt)), solver_steps))
+        for value in (0.05, 0.10, 0.20, t_final)
+    })
+    source_K = np.full(
+        (len(x_grid), len(y_grid)), 300.0, dtype=np.float64,
+    )
+    base_kwargs = {
+        "a": float(x_grid[0]),
+        "b": float(x_grid[-1]),
+        "c": float(y_grid[0]),
+        "d": float(y_grid[-1]),
+        "Nx": int(len(x_grid)),
+        "Ny": int(len(y_grid)),
+        "lam_target": 0.5,
+        "t_final": solver_t_final,
+        "flux_f": 0.0,
+        "t_on": float(time_cfg["t_on"]),
+        "t_off": float(time_cfg["t_off"]),
+        "phase": float(time_cfg["phase"]),
+        "dt": float(dt),
+        "tukey_alpha": float(time_cfg["tukey_alpha"]),
+        "y_grid": np.asarray(y_grid, dtype=np.float64),
+        "ramp_seconds": float(t_ramp),
+    }
+    records = []
+    for name, amplitude, frequency in cases:
+        params = {
+            "temporal_family": "sin",
+            "temporal_params": {
+                "A": amplitude,
+                "f": frequency,
+                **common,
+            },
+            "spatial_family": "uniform",
+            "spatial_params": {},
+        }
+        solver = problem.configure_solver(params, base_kwargs)
+        _, _, _, trajectory_K = solver.solve(
+            T0=source_K, store_trajectory=True,
+        )
+        truth = (
+            np.asarray(trajectory_K, dtype=np.float64)[target_steps]
+            - float(mu)
+        ) / float(sigma)
+        records.append({
+            "name": name,
+            "params": params,
+            "truth": truth,
+        })
+    return {
+        "source": (source_K - float(mu)) / float(sigma),
+        "target_steps": target_steps,
+        "lead_times": np.asarray(target_steps, dtype=np.float32) * float(dt),
+        "cases": records,
+    }
+
+
+@torch.no_grad()
+def transition_designed_forcing_diagnostics(
+    model: ForcingTransitionCViT,
+    probe: dict[str, Any],
+    *,
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    y_img: np.ndarray,
+    nt_img: int,
+    a_ref: float,
+    t_ramp: float,
+    t_final: float,
+    sigma: float,
+    device: torch.device,
+    query_chunk: int,
+) -> dict[str, float]:
+    cases = list(probe["cases"])
+    leads = np.asarray(probe["lead_times"], dtype=np.float32)
+    num_cases = len(cases)
+    num_leads = len(leads)
+    params = [
+        case["params"]
+        for case in cases
+        for _ in range(num_leads)
+    ]
+    lead_values = np.tile(leads, num_cases)
+    source_times = np.zeros_like(lead_values)
+    forcing = build_forcing_transition_image(
+        params,
+        y_img,
+        source_times,
+        lead_values,
+        nt_img,
+        a_ref,
+        device,
+        t_ramp,
+        t_final,
+    )
+    zero_forcing = forcing.clone()
+    zero_forcing[:, 0] = 0.0
+    shuffled_forcing = (
+        forcing.reshape(
+            num_cases, num_leads, *forcing.shape[1:],
+        )
+        .roll(shifts=1, dims=0)
+        .reshape_as(forcing)
+    )
+    source = torch.as_tensor(
+        probe["source"], dtype=torch.float32, device=device,
+    ).unsqueeze(0).unsqueeze(0)
+    source = source.expand(
+        num_cases * num_leads, -1, -1, -1,
+    ).contiguous()
+    gx, gy = torch.meshgrid(x_grid, y_grid, indexing="ij")
+    mesh = torch.stack(
+        [gx.reshape(-1), gy.reshape(-1)], dim=-1,
+    ).unsqueeze(0).expand(num_cases * num_leads, -1, -1)
+    source_time = torch.zeros(
+        num_cases * num_leads, 1, device=device,
+    )
+    lead_time = torch.from_numpy(lead_values).to(device).unsqueeze(-1)
+
+    def predict(image: torch.Tensor) -> torch.Tensor:
+        prediction = _decode_transition_in_chunks(
+            model,
+            model.encode(image, source),
+            source,
+            mesh,
+            source_time,
+            lead_time,
+            query_chunk,
+        )[..., 0]
+        return prediction.reshape(
+            num_cases, num_leads, len(x_grid), len(y_grid),
+        )
+
+    correct = predict(forcing)
+    zeroed = predict(zero_forcing)
+    shuffled = predict(shuffled_forcing)
+    truth = torch.as_tensor(
+        np.stack([case["truth"] for case in cases]),
+        dtype=correct.dtype,
+        device=device,
+    )
+    nonzero = slice(1, None)
+
+    def rmse_K(prediction: torch.Tensor) -> float:
+        return float(
+            torch.sqrt(
+                (prediction[nonzero] - truth[nonzero]).square().mean()
+            ).cpu()
+        ) * float(sigma)
+
+    predicted_response = correct[2] - correct[0]
+    true_response = truth[2] - truth[0]
+    predicted_norm = torch.linalg.vector_norm(predicted_response)
+    true_norm = torch.linalg.vector_norm(true_response)
+    denominator = true_norm.clamp_min(torch.finfo(true_norm.dtype).tiny)
+    cosine_denominator = (
+        predicted_norm * true_norm
+    ).clamp_min(torch.finfo(true_norm.dtype).tiny)
+    return {
+        "correct_forcing_rmse_K": rmse_K(correct),
+        "zero_forcing_rmse_K": rmse_K(zeroed),
+        "shuffled_forcing_rmse_K": rmse_K(shuffled),
+        "designed_response_gain": float(
+            (predicted_norm / denominator).cpu()
+        ),
+        "designed_response_cosine": float(
+            (
+                (predicted_response * true_response).sum()
+                / cosine_denominator
+            ).cpu()
+        ),
+        "predicted_response_rms_K": float(
+            torch.sqrt(predicted_response.square().mean()).cpu()
+        ) * float(sigma),
+        "true_response_rms_K": float(
+            torch.sqrt(true_response.square().mean()).cpu()
+        ) * float(sigma),
+    }
+
+
 def load_verified_transition_gate(
     path: str | Path,
     *,
@@ -11673,6 +11925,7 @@ def forcing_transition_physics_loss(
     qn = np.empty((M, Ny), dtype=np.float64)
     qnp1 = np.empty((M, Ny), dtype=np.float64)
     qint = np.empty((M, Ny), dtype=np.float64)
+    history_active = np.empty(M, dtype=bool)
     y_values = np.asarray(y_img, dtype=np.float64)
     if y_values.size != Ny or not np.allclose(
         y_values, y_grid.detach().cpu().numpy(), rtol=0.0, atol=1.0e-12,
@@ -11697,6 +11950,12 @@ def forcing_transition_physics_loss(
         qnp1[row] = forcing.evaluate_points(forcing_y, absolute_np1)
         qint[row] = forcing.integral(
             forcing_y, absolute_n, absolute_np1,
+        )
+        history_integral = forcing.integral(
+            forcing_y, source_time_values[row], absolute_np1,
+        )
+        history_active[row] = bool(
+            np.max(np.abs(history_integral)) > 1.0e-12
         )
 
     geom = build_homogeneous_cn_geom(
@@ -11752,7 +12011,8 @@ def forcing_transition_physics_loss(
             torch.arange(M, device=device, dtype=torch.long),
             {**cn, "forcing": cn["forcing"]},
         )
-        physical_defect = (implicit - rhs).square().flatten(1).mean(dim=1)
+        residual = implicit - rhs
+        physical_defect = residual.square().flatten(1).mean(dim=1)
     elif objective in {"variational", "defect"}:
         if objective == "variational":
             per_sample, residual = variational_objective(
@@ -11784,9 +12044,41 @@ def forcing_transition_physics_loss(
         physical_defect,
         causal_epsilon=float(causal_epsilon),
     )
+    local_active = torch.from_numpy(
+        np.max(np.abs(qint), axis=1) > 1.0e-12
+    ).to(device=device)
+    history_active_tensor = torch.from_numpy(history_active).to(device=device)
+    detached_objective = per_sample.detach()
+
+    def masked_mean(
+        values: torch.Tensor, mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if bool(mask.any().item()):
+            return values[mask].mean()
+        return values.new_tensor(float("nan"))
+
+    defect_squared = residual.detach().square()
+    boundary_defect = defect_squared[:, 0, :].mean()
+    interior_defect = (
+        defect_squared[:, 1:, :].mean()
+        if defect_squared.shape[-2] > 1
+        else defect_squared.new_tensor(float("nan"))
+    )
     out: dict[str, torch.Tensor | bool | dict[str, torch.Tensor]] = {
         "loss": loss,
         "physical_defect_mse": physical_defect.mean().detach(),
+        "boundary_defect_mse": boundary_defect,
+        "interior_defect_mse": interior_defect,
+        "local_forcing_active_fraction": local_active.float().mean(),
+        "history_forcing_active_fraction": (
+            history_active_tensor.float().mean()
+        ),
+        "active_forcing_objective": masked_mean(
+            detached_objective, local_active,
+        ),
+        "inactive_forcing_objective": masked_mean(
+            detached_objective, ~local_active,
+        ),
         "lead_defect_mse": lead_defects,
         "finite": bool(
             torch.isfinite(loss).item()
@@ -12544,8 +12836,12 @@ def run_one_seed_forcing_transition_physics(
     final_path = run_dir / "cvit_final.pt"
     complete_path = run_dir / "RUN_COMPLETE"
     summary_path = run_dir / "final_metrics.json"
+    forcing_init_path = run_dir / "cvit_forcing_init.pt"
 
     training = config["training"]
+    compact_stdout = bool(
+        (training.get("run", {}) or {}).get("compact_stdout", False)
+    )
     pino = training["pino"]
     transition = dict(pino.get("transition", {}) or {})
     physics_cfg = dict(transition.get("physics", {}) or {})
@@ -12614,11 +12910,12 @@ def run_one_seed_forcing_transition_physics(
                     "configured physics objective was not qualified by the "
                     "supplied direct-state gate"
                 )
-        print(
-            "[pino-transition] network gate not supplied; using configured "
-            f"objective={selected_objective!r}",
-            flush=True,
-        )
+        if not compact_stdout:
+            print(
+                "[pino-transition] network gate not supplied; using configured "
+                f"objective={selected_objective!r}",
+                flush=True,
+            )
     else:
         selected_objective = str(network_gate["selected_objective"])
         if (
@@ -12639,7 +12936,7 @@ def run_one_seed_forcing_transition_physics(
         raise ValueError(
             "production consecutive-interval policy differs from the network gate"
         )
-    if direct_gate is None:
+    if direct_gate is None and not compact_stdout:
         print(
             "[pino-transition] direct-state gate not supplied; production "
             "screen skills use a zero numerical floor",
@@ -12751,6 +13048,22 @@ def run_one_seed_forcing_transition_physics(
         t_final=t_final,
         variant="forcing_transition",
     ).to(device)
+    source_prefixes = ("source_encoder.",)
+    forcing_prefixes = (
+        "forcing_encoder.",
+        "forcing_context_projection.",
+    )
+    initial_forcing_parameters = _transition_initial_parameters(
+        model, forcing_prefixes,
+    )
+    if latest_path.exists() and forcing_init_path.exists():
+        initial_forcing_parameters = torch.load(
+            forcing_init_path, map_location="cpu", weights_only=True,
+        )
+    else:
+        _atomic_torch_save(
+            initial_forcing_parameters, forcing_init_path,
+        )
     optimizer = build_optimizer(config, model.parameters())
     scheduler = build_scheduler(config, optimizer)
     causal_cfg = _resolve_forcing_causal(pino.get("causal", {}))
@@ -12855,8 +13168,10 @@ def run_one_seed_forcing_transition_physics(
             "raw_multi_term" if raw_gradnorm is not None
             else "inert_single_term" if gradnorm_inert else "disabled"
         ),
+        "phase1_diagnostics_schema": 1,
     }
     metrics_path = run_dir / "train_metrics.csv"
+    diagnostics_path = run_dir / "diagnostics.csv"
     fields = [
         "update", "loss", "physical_defect_mse", "lr",
         "fast_target_gnrmse", "fast_copy_gnrmse",
@@ -12864,6 +13179,33 @@ def run_one_seed_forcing_transition_physics(
         "forcing_swap_rms_K", "source_swap_rms_K",
         "forcing_response_ratio", "source_departure_ratio",
         "low_frequency_long_lead_drift",
+    ]
+    designed_probe_fields = [
+        "correct_forcing_rmse_K",
+        "zero_forcing_rmse_K",
+        "shuffled_forcing_rmse_K",
+        "designed_response_gain",
+        "designed_response_cosine",
+        "predicted_response_rms_K",
+        "true_response_rms_K",
+    ]
+    diagnostic_fields = [
+        "update",
+        "source_encoder_grad_norm",
+        "forcing_encoder_grad_norm",
+        "forcing_context_grad_norm",
+        "forcing_branch_grad_norm",
+        "forcing_to_source_grad_ratio",
+        "forcing_parameter_displacement_l2",
+        "forcing_parameter_relative_displacement",
+        "local_forcing_active_fraction",
+        "history_forcing_active_fraction",
+        "active_forcing_objective",
+        "inactive_forcing_objective",
+        "boundary_defect_mse",
+        "interior_defect_mse",
+        "boundary_to_interior_defect_ratio",
+        *designed_probe_fields,
     ]
     completed_updates = 0
     best_metric = float("inf")
@@ -12876,6 +13218,15 @@ def run_one_seed_forcing_transition_physics(
     active_intervals = None
     source_coverage = None
     collapse_detected_at_500 = False
+    latest_counterfactual = {
+        "in_window_forcing_swap_rms_K": float("nan"),
+        "source_state_swap_rms_K": float("nan"),
+        "forcing_response_ratio": float("nan"),
+        "source_departure_ratio": float("nan"),
+    }
+    latest_designed_probe = {
+        key: float("nan") for key in designed_probe_fields
+    }
     resuming = latest_path.exists() and (
         not complete_path.exists() or extend_completed
     )
@@ -12914,9 +13265,24 @@ def run_one_seed_forcing_transition_physics(
         collapse_detected_at_500 = bool(
             checkpoint.get("collapse_detected_at_500", False)
         )
+        latest_counterfactual = copy.deepcopy(
+            checkpoint.get("latest_counterfactual", latest_counterfactual)
+        )
+        latest_designed_probe = copy.deepcopy(
+            checkpoint.get("latest_designed_probe", latest_designed_probe)
+        )
+        if not diagnostics_path.exists():
+            with diagnostics_path.open("w", newline="") as stream:
+                csv.DictWriter(
+                    stream, fieldnames=diagnostic_fields,
+                ).writeheader()
     else:
         with metrics_path.open("w", newline="") as stream:
             csv.DictWriter(stream, fieldnames=fields).writeheader()
+        with diagnostics_path.open("w", newline="") as stream:
+            csv.DictWriter(
+                stream, fieldnames=diagnostic_fields,
+            ).writeheader()
 
     def checkpoint_payload() -> dict[str, Any]:
         return {
@@ -12950,6 +13316,8 @@ def run_one_seed_forcing_transition_physics(
             ),
             "source_coverage": copy.deepcopy(source_coverage),
             "collapse_detected_at_500": collapse_detected_at_500,
+            "latest_counterfactual": copy.deepcopy(latest_counterfactual),
+            "latest_designed_probe": copy.deepcopy(latest_designed_probe),
             "provenance": {
                 "optimization_uses_solution_fields": False,
                 "normalization_uses_training_trajectories": True,
@@ -12960,6 +13328,7 @@ def run_one_seed_forcing_transition_physics(
                 "network_gate_uses_supervised_capacity_baseline": (
                     network_gate is not None
                 ),
+                "diagnostics_use_fv_reference_solutions": True,
                 "physics_only_claim_scope": "optimization_objective",
             },
         }
@@ -12989,14 +13358,19 @@ def run_one_seed_forcing_transition_physics(
     lead_edges = transition.get(
         "lead_edges", [0.0, 0.05, 0.10, 0.20, 0.30],
     )
+    designed_probe = _build_transition_forcing_probe(
+        problem,
+        x_grid=x_np,
+        y_grid=y_np,
+        dt=dt,
+        t_final=t_final,
+        t_ramp=t_ramp,
+        time_cfg=time_cfg,
+        mu=mu,
+        sigma=sigma,
+    )
     last_loss = float("nan")
     last_defect = float("nan")
-    latest_counterfactual = {
-        "in_window_forcing_swap_rms_K": float("nan"),
-        "source_state_swap_rms_K": float("nan"),
-        "forcing_response_ratio": float("nan"),
-        "source_departure_ratio": float("nan"),
-    }
     while completed_updates < total_updates:
         should_resample = (
             active_descriptors is None
@@ -13044,6 +13418,7 @@ def run_one_seed_forcing_transition_physics(
                 physical_source, data, fast_records,
             )
         source_fields = torch.from_numpy(normalized).unsqueeze(1).to(device)
+        model.train()
         optimizer.zero_grad(set_to_none=True)
         max_lead = transition_curriculum_max_lead(
             completed_updates, total_updates, t_final,
@@ -13100,6 +13475,23 @@ def run_one_seed_forcing_transition_physics(
         ):
             _atomic_torch_save(checkpoint_payload(), run_dir / "failed_batch.pt")
             raise FloatingPointError("non-finite physics transition gradient")
+        do_counterfactual = (
+            (completed_updates + 1) % anti_collapse_every == 0
+            or completed_updates + 1 == total_updates
+        )
+        if do_counterfactual:
+            source_grad_norm = _transition_parameter_group_norm(
+                model, source_prefixes, gradients=True,
+            )
+            forcing_encoder_grad_norm = _transition_parameter_group_norm(
+                model, ("forcing_encoder.",), gradients=True,
+            )
+            forcing_context_grad_norm = _transition_parameter_group_norm(
+                model, ("forcing_context_projection.",), gradients=True,
+            )
+            forcing_grad_norm = _transition_parameter_group_norm(
+                model, forcing_prefixes, gradients=True,
+            )
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=grad_clip,
@@ -13112,10 +13504,6 @@ def run_one_seed_forcing_transition_physics(
         last_loss = float(loss.detach().cpu())
         last_defect = float(result["physical_defect_mse"].detach().cpu())
 
-        do_counterfactual = (
-            completed_updates % anti_collapse_every == 0
-            or completed_updates == total_updates
-        )
         if do_counterfactual:
             model.eval()
             latest_counterfactual = transition_counterfactual_diagnostics(
@@ -13130,6 +13518,69 @@ def run_one_seed_forcing_transition_physics(
                 device=device,
                 query_chunk=query_chunk,
             )
+            latest_designed_probe = transition_designed_forcing_diagnostics(
+                model,
+                designed_probe,
+                x_grid=x_grid,
+                y_grid=y_grid,
+                y_img=y_img,
+                nt_img=nt_img,
+                a_ref=a_ref,
+                t_ramp=t_ramp,
+                t_final=t_final,
+                sigma=sigma,
+                device=device,
+                query_chunk=query_chunk,
+            )
+            displacement, relative_displacement = (
+                _transition_parameter_displacement(
+                    model, initial_forcing_parameters,
+                )
+            )
+            boundary_defect = float(
+                result["boundary_defect_mse"].detach().cpu()
+            )
+            interior_defect = float(
+                result["interior_defect_mse"].detach().cpu()
+            )
+            diagnostic_row = {
+                "update": completed_updates,
+                "source_encoder_grad_norm": source_grad_norm,
+                "forcing_encoder_grad_norm": forcing_encoder_grad_norm,
+                "forcing_context_grad_norm": forcing_context_grad_norm,
+                "forcing_branch_grad_norm": forcing_grad_norm,
+                "forcing_to_source_grad_ratio": (
+                    forcing_grad_norm
+                    / max(source_grad_norm, np.finfo(float).tiny)
+                ),
+                "forcing_parameter_displacement_l2": displacement,
+                "forcing_parameter_relative_displacement": (
+                    relative_displacement
+                ),
+                "local_forcing_active_fraction": float(
+                    result["local_forcing_active_fraction"].detach().cpu()
+                ),
+                "history_forcing_active_fraction": float(
+                    result["history_forcing_active_fraction"].detach().cpu()
+                ),
+                "active_forcing_objective": float(
+                    result["active_forcing_objective"].detach().cpu()
+                ),
+                "inactive_forcing_objective": float(
+                    result["inactive_forcing_objective"].detach().cpu()
+                ),
+                "boundary_defect_mse": boundary_defect,
+                "interior_defect_mse": interior_defect,
+                "boundary_to_interior_defect_ratio": (
+                    boundary_defect
+                    / max(interior_defect, np.finfo(float).tiny)
+                ),
+                **latest_designed_probe,
+            }
+            with diagnostics_path.open("a", newline="") as stream:
+                csv.DictWriter(
+                    stream, fieldnames=diagnostic_fields,
+                ).writerow(diagnostic_row)
         do_validation = (
             completed_updates % validate_every == 0
             or completed_updates == total_updates
@@ -13243,6 +13694,19 @@ def run_one_seed_forcing_transition_physics(
         }
         with metrics_path.open("a", newline="") as stream:
             csv.DictWriter(stream, fieldnames=fields).writerow(row)
+        print(
+            f"Update {completed_updates}: loss={last_loss:.6e}",
+            flush=True,
+        )
+        if validation is not None:
+            print(
+                f"Validation for update {completed_updates}: "
+                f"val_gnrmse="
+                f"{100.0 * float(validation['macro_cell_gnrmse']):.4f}% "
+                f"val_rmse_K={float(validation['target_rmse_K']):.4f}K "
+                f"(best={100.0 * best_metric:.4f}%)",
+                flush=True,
+            )
         if (
             completed_updates % save_every == 0
             or completed_updates == total_updates
@@ -13295,6 +13759,9 @@ def run_one_seed_forcing_transition_physics(
         ),
         "source_distribution_coverage": source_coverage,
         "counterfactual_diagnostics": latest_counterfactual,
+        "designed_forcing_diagnostics": latest_designed_probe,
+        "diagnostics_path": str(diagnostics_path),
+        "phase1_diagnostics_schema": 1,
         "direct_state_gate_sha256": direct_hash,
         "network_gate_sha256": network_hash,
         "network_gate_budget": (
@@ -13310,6 +13777,7 @@ def run_one_seed_forcing_transition_physics(
         "checkpoint_selection_uses_validation_targets": True,
         "direct_state_gate_uses_fv_reference_solutions": direct_gate is not None,
         "network_gate_uses_supervised_capacity_baseline": network_gate is not None,
+        "diagnostics_use_fv_reference_solutions": True,
         "physics_only_claim_scope": "optimization_objective",
         "test_set_evaluated": False,
     }

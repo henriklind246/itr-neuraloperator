@@ -15,6 +15,12 @@ from scripts.diagnose_fv_direct_state import (
     preregistered_max_lead,
     sequential_exact_trajectory,
 )
+from scripts.diagnose_fv_variational_cvit import (
+    _contrast_metrics,
+    repeat_transition_intervals,
+    transition_multiforcing_probe_params,
+    transition_multisource_multiforcing_specs,
+)
 from src.physics.one_step_objective import build_cn_tensors
 from src.operators.cvit import ForcingTransitionCViT
 from src.operators.train_pino import (
@@ -176,6 +182,82 @@ def test_two_dimensional_interval_sampling_is_deterministic_and_direct():
         )
 
 
+def test_multiforcing_probe_is_adversarial_and_synchronizes_endpoints():
+    specs = transition_multiforcing_probe_params()
+    assert [spec["name"] for spec in specs] == [
+        "zero_uniform",
+        "sin_low_uniform",
+        "sin_high_uniform",
+        "pulse_early_uniform",
+        "pulse_late_uniform",
+        "sin_high_gaussian",
+    ]
+    intervals = {
+        "sim_local": torch.zeros(3, dtype=torch.long),
+        "start_step": torch.tensor([0, 7, 19]),
+        "lead_bin": torch.tensor([0, 1, 2]),
+        "is_anchor": torch.tensor([True, False, False]),
+    }
+    repeated = repeat_transition_intervals(intervals, 4)
+    assert repeated["sim_local"].tolist() == [
+        0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3,
+    ]
+    for sim_local in range(4):
+        mask = repeated["sim_local"] == sim_local
+        torch.testing.assert_close(
+            repeated["start_step"][mask], intervals["start_step"],
+        )
+        torch.testing.assert_close(
+            repeated["lead_bin"][mask], intervals["lead_bin"],
+        )
+
+
+def test_multisource_multiforcing_specs_form_complete_cartesian_product():
+    specs = transition_multisource_multiforcing_specs()
+    assert len(specs) == 24
+    sources = {
+        "uniform_2d",
+        "random_sinusoid_2d",
+        "grf_2d",
+        "hot_spot_2d",
+    }
+    forcings = {
+        "zero_uniform",
+        "sin_low_uniform",
+        "sin_high_uniform",
+        "pulse_early_uniform",
+        "pulse_late_uniform",
+        "sin_high_gaussian",
+    }
+    assert {row["source_family"] for row in specs} == sources
+    assert {row["forcing_name"] for row in specs} == forcings
+    assert {
+        (row["source_family"], row["forcing_name"]) for row in specs
+    } == {
+        (source, forcing)
+        for source in sources
+        for forcing in forcings
+    }
+
+
+def test_multiforcing_contrast_metrics_detect_blind_and_correct_response():
+    truth_a = np.zeros((3, 2, 2))
+    truth_b = np.ones((3, 2, 2))
+    perfect = _contrast_metrics(
+        truth_a, truth_b, truth_a, truth_b, sigma=2.0,
+    )
+    assert perfect["response_gain"] == pytest.approx(1.0)
+    assert perfect["relative_contrast_error"] == pytest.approx(0.0)
+    assert perfect["response_cosine"] == pytest.approx(1.0)
+
+    forcing_blind = _contrast_metrics(
+        truth_a, truth_a, truth_a, truth_b, sigma=2.0,
+    )
+    assert forcing_blind["response_gain"] == pytest.approx(0.0)
+    assert forcing_blind["relative_contrast_error"] == pytest.approx(1.0)
+    assert forcing_blind["response_cosine"] == pytest.approx(0.0)
+
+
 def test_screen_skill_progress_and_consecutive_trigger_are_operational():
     assert transition_screen_skill(0.4, 0.0, 1.0) == pytest.approx(0.6)
     with pytest.raises(ValueError, match="separation"):
@@ -276,6 +358,10 @@ def test_transition_physics_loss_has_direct_endpoints_and_gradients(
     assert result["no_rollout"]
     assert result["previous_endpoint_detached"] is detached
     assert int(result["decoded_endpoint_count"]) == 3
+    assert 0.0 <= float(result["local_forcing_active_fraction"]) <= 1.0
+    assert 0.0 <= float(result["history_forcing_active_fraction"]) <= 1.0
+    assert torch.isfinite(result["boundary_defect_mse"])
+    assert torch.isfinite(result["interior_defect_mse"])
     if objective == "raw_ls":
         assert set(result["raw_terms"]) == {
             "interior",

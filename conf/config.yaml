@@ -619,6 +619,9 @@ training:
       resume_checkpoint: null
   run:
     run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
+    # Keep local/debug launches verbose by default. MSI opts into the compact
+    # loss/validation-only stream in slurm/train_cvit_pino_msi.sbatch.
+    compact_stdout: false
   # GradNorm-style adaptive balancing of the RAW per-component physics losses
   # (interior CN residual, left-Neumann, top/bottom adiabatic, right-Dirichlet,
   # IC, optional data). Each active term (positive static coefficient) gets a

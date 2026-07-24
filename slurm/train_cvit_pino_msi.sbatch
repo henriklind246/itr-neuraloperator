@@ -99,6 +99,7 @@ export PYTHONUNBUFFERED=1
 python -u scripts/run_train_pino.py \
     training.optimizer=SOAP \
     training.pino.lambda_ic=1.0 \
+    training.run.compact_stdout=true \
     "$@"
 
 echo "Job $SLURM_JOB_ID finished at $(date)"

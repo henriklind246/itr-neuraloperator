@@ -12,6 +12,7 @@ import math
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -57,7 +58,8 @@ from src.operators.train_pino import (
 )
 from src.operators.cvit import ForcingTransitionCViT
 from src.operators.utils import resolve_device
-from src.physics.boundary_forcing import default_ramp_seconds
+from src.physics.boundary_forcing import default_ramp_seconds, reconstruct_qL
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 from src.physics.one_step_objective import (
     build_cn_tensors,
     causal_variational_terms,
@@ -140,6 +142,195 @@ def _transition_probe_params(metadata: dict) -> dict:
         "spatial_params": forcing["spatial_params"],
         "ic_family": metadata["family"],
         "ic_params": metadata["ic_params"],
+    }
+
+
+def transition_multiforcing_probe_params() -> list[dict[str, Any]]:
+    sin_common = {
+        "f": 4.0,
+        "t_on": 0.0,
+        "t_off": 0.2,
+        "phase": 0.0,
+        "tukey_alpha": 0.5,
+        "rectified": True,
+    }
+    uniform: dict[str, float] = {}
+    return [
+        {
+            "name": "zero_uniform",
+            "params": {
+                "temporal_family": "pulse_train",
+                "temporal_params": {
+                    "Np": 1,
+                    "A_list": [0.0],
+                    "t_list": [0.0],
+                    "dt_list": [0.3],
+                },
+                "spatial_family": "uniform",
+                "spatial_params": uniform,
+            },
+        },
+        {
+            "name": "sin_low_uniform",
+            "params": {
+                "temporal_family": "sin",
+                "temporal_params": {"A": 75.0, **sin_common},
+                "spatial_family": "uniform",
+                "spatial_params": uniform,
+            },
+        },
+        {
+            "name": "sin_high_uniform",
+            "params": {
+                "temporal_family": "sin",
+                "temporal_params": {"A": 250.0, **sin_common},
+                "spatial_family": "uniform",
+                "spatial_params": uniform,
+            },
+        },
+        {
+            "name": "pulse_early_uniform",
+            "params": {
+                "temporal_family": "pulse_train",
+                "temporal_params": {
+                    "Np": 1,
+                    "A_list": [180.0],
+                    "t_list": [0.025],
+                    "dt_list": [0.06],
+                },
+                "spatial_family": "uniform",
+                "spatial_params": uniform,
+            },
+        },
+        {
+            "name": "pulse_late_uniform",
+            "params": {
+                "temporal_family": "pulse_train",
+                "temporal_params": {
+                    "Np": 1,
+                    "A_list": [180.0],
+                    "t_list": [0.135],
+                    "dt_list": [0.06],
+                },
+                "spatial_family": "uniform",
+                "spatial_params": uniform,
+            },
+        },
+        {
+            "name": "sin_high_gaussian",
+            "params": {
+                "temporal_family": "sin",
+                "temporal_params": {"A": 250.0, **sin_common},
+                "spatial_family": "gaussian",
+                "spatial_params": {"y_c": 0.30, "sigma_y": 0.10},
+            },
+        },
+    ]
+
+
+def transition_multisource_multiforcing_specs() -> list[dict[str, Any]]:
+    families = (
+        "uniform_2d",
+        "random_sinusoid_2d",
+        "grf_2d",
+        "hot_spot_2d",
+    )
+    return [
+        {
+            "source_family": family,
+            "forcing_name": forcing["name"],
+            "params": copy.deepcopy(forcing["params"]),
+        }
+        for family in families
+        for forcing in transition_multiforcing_probe_params()
+    ]
+
+
+def _transition_multiforcing_heldout_params() -> dict[str, Any]:
+    return {
+        "name": "sin_mid_uniform_heldout",
+        "params": {
+            "temporal_family": "sin",
+            "temporal_params": {
+                "A": 160.0,
+                "f": 4.0,
+                "t_on": 0.0,
+                "t_off": 0.2,
+                "phase": 0.0,
+                "tukey_alpha": 0.5,
+                "rectified": True,
+            },
+            "spatial_family": "uniform",
+            "spatial_params": {},
+        },
+    }
+
+
+def _build_multiforcing_case(
+    source_normalized: np.ndarray,
+    params: dict[str, Any],
+    *,
+    sigma: float,
+    dt: float = 0.005,
+) -> tuple[FVSolver2D, np.ndarray]:
+    source = 300.0 + float(sigma) * np.asarray(
+        source_normalized, dtype=np.float64,
+    )
+    grid_size = int(source.shape[0])
+    if source.shape != (grid_size, grid_size):
+        raise ValueError("multi-forcing source must be a square 2D field")
+    axis = np.linspace(0.0, 1.0, grid_size, dtype=np.float64)
+    forcing = reconstruct_qL(
+        params["temporal_family"],
+        params["temporal_params"],
+        params["spatial_family"],
+        params["spatial_params"],
+        t_ramp=2.0 * float(dt),
+    )
+
+    def q_local(tau: float) -> np.ndarray:
+        return forcing.evaluate_points(axis, float(tau))
+
+    def q_integral_local(tau_lo: float, tau_hi: float) -> np.ndarray:
+        return forcing.integral(axis, float(tau_lo), float(tau_hi))
+
+    solver = FVSolver2D(
+        a=0.0,
+        b=1.0,
+        c=0.0,
+        d=1.0,
+        Nx=grid_size,
+        Ny=grid_size,
+        lam_target=0.5,
+        layers=[Layer2D(0.0, 1.0, rho=1.0, cp=1.0, k=1.0)],
+        t_final=0.3,
+        flux_f=0.0,
+        flux_A=0.0,
+        t_on=0.0,
+        t_off=0.3,
+        phase=0.0,
+        dt=float(dt),
+        q_left_fn=q_local,
+        q_left_integral_fn=q_integral_local,
+        interface_R=None,
+    )
+    _, _, _, truth_K = solver.solve(T0=source, store_trajectory=True)
+    truth = (np.asarray(truth_K, dtype=np.float64) - 300.0) / float(sigma)
+    return solver, truth
+
+
+def repeat_transition_intervals(
+    intervals: dict[str, torch.Tensor],
+    batch_size: int,
+) -> dict[str, torch.Tensor]:
+    count = int(intervals["start_step"].numel())
+    return {
+        "sim_local": torch.arange(
+            int(batch_size), dtype=torch.long,
+        ).repeat_interleave(count),
+        "start_step": intervals["start_step"].repeat(int(batch_size)),
+        "lead_bin": intervals["lead_bin"].repeat(int(batch_size)),
+        "is_anchor": intervals["is_anchor"].repeat(int(batch_size)),
     }
 
 
@@ -457,6 +648,1152 @@ def _train_transition_physics_probe(
             ),
         }
     return last
+
+
+def _contrast_metrics(
+    prediction_a: np.ndarray,
+    prediction_b: np.ndarray,
+    truth_a: np.ndarray,
+    truth_b: np.ndarray,
+    *,
+    sigma: float,
+) -> dict[str, float]:
+    predicted = float(sigma) * (
+        np.asarray(prediction_a[1:]) - np.asarray(prediction_b[1:])
+    )
+    expected = float(sigma) * (
+        np.asarray(truth_a[1:]) - np.asarray(truth_b[1:])
+    )
+    predicted_rms = float(np.sqrt(np.mean(predicted**2)))
+    expected_rms = float(np.sqrt(np.mean(expected**2)))
+    denominator = max(expected_rms, np.finfo(float).tiny)
+    predicted_flat = predicted.reshape(-1)
+    expected_flat = expected.reshape(-1)
+    cosine = float(
+        np.dot(predicted_flat, expected_flat)
+        / max(
+            np.linalg.norm(predicted_flat) * np.linalg.norm(expected_flat),
+            np.finfo(float).tiny,
+        )
+    )
+    return {
+        "predicted_contrast_rms_K": predicted_rms,
+        "true_contrast_rms_K": expected_rms,
+        "response_gain": predicted_rms / denominator,
+        "relative_contrast_error": float(
+            np.sqrt(np.mean((predicted - expected) ** 2)) / denominator
+        ),
+        "response_cosine": cosine,
+    }
+
+
+@torch.no_grad()
+def evaluate_transition_multiforcing_overfit(
+    model: ForcingTransitionCViT,
+    source: torch.Tensor,
+    cases: list[dict[str, Any]],
+    mesh: torch.Tensor,
+    y_img: np.ndarray,
+    *,
+    sigma: float,
+    query_chunk: int,
+    include_permutation: bool = True,
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    model.eval()
+    predictions: dict[str, np.ndarray] = {}
+    truths: dict[str, np.ndarray] = {}
+    per_case: dict[str, dict[str, float]] = {}
+    for case in cases:
+        sim = case["sim"]
+        truth = np.asarray(case["truth"], dtype=np.float64)
+        steps = torch.arange(
+            1, len(sim.t), device=source.device, dtype=torch.long,
+        )
+        future = _predict_transition_probe_steps(
+            model,
+            source,
+            case["params"],
+            steps,
+            mesh,
+            y_img,
+            dt=float(sim.dt),
+            t_ramp=2.0 * float(sim.dt),
+            query_chunk=int(query_chunk),
+        ).detach().cpu().numpy()
+        prediction = np.empty_like(truth)
+        prediction[0] = source[0, 0].detach().cpu().numpy()
+        prediction[1:] = future
+        copy_prediction = np.broadcast_to(truth[0], truth.shape).copy()
+        metrics = trajectory_gate_metrics(
+            prediction, truth, sim, sigma=float(sigma),
+        )
+        copy_metrics = trajectory_gate_metrics(
+            copy_prediction, truth, sim, sigma=float(sigma),
+        )
+        departure_true = float(np.sqrt(np.mean(
+            (float(sigma) * (truth[1:] - truth[0])) ** 2
+        )))
+        departure_predicted = float(np.sqrt(np.mean(
+            (float(sigma) * (prediction[1:] - prediction[0])) ** 2
+        )))
+        per_case[case["name"]] = {
+            **metrics,
+            "copy_overall_field": copy_metrics["overall_field"],
+            "copy_longest_lead": copy_metrics["longest_lead"],
+            "signal_bearing": bool(
+                copy_metrics["overall_field"] >= 0.01 * float(sigma)
+            ),
+            "copy_skill": 1.0 - (
+                metrics["overall_field"]
+                / max(copy_metrics["overall_field"], np.finfo(float).tiny)
+            ) ** 2,
+            "source_departure_ratio": (
+                departure_predicted
+                / max(departure_true, np.finfo(float).tiny)
+            ),
+        }
+        predictions[case["name"]] = prediction
+        truths[case["name"]] = truth
+
+    designed_pairs = (
+        ("zero_uniform", "sin_high_uniform"),
+        ("sin_low_uniform", "sin_high_uniform"),
+        ("pulse_early_uniform", "pulse_late_uniform"),
+        ("sin_high_uniform", "sin_high_gaussian"),
+    )
+    contrasts = {
+        f"{left}__vs__{right}": _contrast_metrics(
+            predictions[left],
+            predictions[right],
+            truths[left],
+            truths[right],
+            sigma=float(sigma),
+        )
+        for left, right in designed_pairs
+    }
+    all_contrasts = []
+    names = [case["name"] for case in cases]
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1:]:
+            all_contrasts.append(_contrast_metrics(
+                predictions[left],
+                predictions[right],
+                truths[left],
+                truths[right],
+                sigma=float(sigma),
+            ))
+
+    correct_rmse = float(np.sqrt(np.mean([
+        per_case[name]["overall_field"] ** 2 for name in names
+    ])))
+    shuffled_rmse = float("nan")
+    if include_permutation:
+        shuffled_errors = []
+        for index, case in enumerate(cases):
+            sim = case["sim"]
+            wrong = cases[(index + 1) % len(cases)]["params"]
+            steps = torch.arange(
+                1, len(sim.t), device=source.device, dtype=torch.long,
+            )
+            prediction = _predict_transition_probe_steps(
+                model,
+                source,
+                wrong,
+                steps,
+                mesh,
+                y_img,
+                dt=float(sim.dt),
+                t_ramp=2.0 * float(sim.dt),
+                query_chunk=int(query_chunk),
+            ).detach().cpu().numpy()
+            error_K = float(sigma) * (
+                prediction - np.asarray(case["truth"])[1:]
+            )
+            shuffled_errors.append(error_K.reshape(-1))
+        shuffled_rmse = float(np.sqrt(np.mean(
+            np.concatenate(shuffled_errors) ** 2
+        )))
+
+    copy_skills = [
+        row["copy_skill"]
+        for row in per_case.values()
+        if row["signal_bearing"]
+    ]
+    gains = [row["response_gain"] for row in all_contrasts]
+    cosines = [row["response_cosine"] for row in contrasts.values()]
+    attribution_improvement = (
+        float("nan")
+        if not np.isfinite(shuffled_rmse)
+        else 1.0 - correct_rmse / max(shuffled_rmse, np.finfo(float).tiny)
+    )
+    metrics = {
+        "finite": bool(all(
+            np.isfinite(value).all() for value in predictions.values()
+        )),
+        "per_case": per_case,
+        "signal_bearing_case_count": len(copy_skills),
+        "designed_contrasts": contrasts,
+        "positive_copy_skill_cases": int(sum(
+            float(value) > 0.0 for value in copy_skills
+        )),
+        "median_copy_skill": float(np.median(copy_skills)),
+        "worst_copy_skill": float(np.min(copy_skills)),
+        "median_pairwise_response_gain": float(np.median(gains)),
+        "minimum_designed_response_cosine": float(np.min(cosines)),
+        "median_designed_response_cosine": float(np.median(cosines)),
+        "correct_forcing_rmse_K": correct_rmse,
+        "permuted_forcing_rmse_K": shuffled_rmse,
+        "forcing_attribution_improvement": attribution_improvement,
+    }
+    return metrics, {"prediction": predictions, "truth": truths}
+
+
+@torch.no_grad()
+def evaluate_transition_multisource_multiforcing_overfit(
+    model: ForcingTransitionCViT,
+    sources: torch.Tensor,
+    source_cases: list[dict[str, Any]],
+    mesh: torch.Tensor,
+    y_img: np.ndarray,
+    *,
+    sigma: float,
+    query_chunk: int,
+    include_source_permutation: bool = False,
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    per_source: dict[str, dict[str, Any]] = {}
+    all_predictions: dict[str, np.ndarray] = {}
+    all_truths: dict[str, np.ndarray] = {}
+    copy_skills = []
+    response_gains = []
+    response_cosines = []
+    correct_rmse = []
+    forcing_permuted_rmse = []
+    designed_pair_names: set[str] = set()
+    for source_index, record in enumerate(source_cases):
+        family = str(record["family"])
+        metrics, arrays = evaluate_transition_multiforcing_overfit(
+            model,
+            sources[source_index:source_index + 1],
+            record["cases"],
+            mesh,
+            y_img,
+            sigma=float(sigma),
+            query_chunk=int(query_chunk),
+        )
+        per_source[family] = metrics
+        correct_rmse.append(float(metrics["correct_forcing_rmse_K"]))
+        forcing_permuted_rmse.append(float(
+            metrics["permuted_forcing_rmse_K"]
+        ))
+        for forcing_name, row in metrics["per_case"].items():
+            key = f"{family}__{forcing_name}"
+            if bool(row["signal_bearing"]):
+                copy_skills.append(float(row["copy_skill"]))
+            all_predictions[key] = arrays["prediction"][forcing_name]
+            all_truths[key] = arrays["truth"][forcing_name]
+        for contrast_name, row in metrics["designed_contrasts"].items():
+            designed_pair_names.add(contrast_name)
+            response_gains.append(float(row["response_gain"]))
+            response_cosines.append(float(row["response_cosine"]))
+
+    forcing_spread: dict[str, dict[str, float]] = {}
+    for contrast_name in sorted(designed_pair_names):
+        left, right = contrast_name.split("__vs__")
+        predicted = np.stack([
+            all_predictions[f"{record['family']}__{left}"][1:]
+            - all_predictions[f"{record['family']}__{right}"][1:]
+            for record in source_cases
+        ])
+        expected = np.stack([
+            all_truths[f"{record['family']}__{left}"][1:]
+            - all_truths[f"{record['family']}__{right}"][1:]
+            for record in source_cases
+        ])
+        predicted_mean = predicted.mean(axis=0)
+        expected_mean = expected.mean(axis=0)
+        reference = max(
+            float(sigma) * float(np.sqrt(np.mean(expected_mean**2))),
+            np.finfo(float).tiny,
+        )
+        forcing_spread[contrast_name] = {
+            "predicted_cross_source_spread_rms_K": (
+                float(sigma)
+                * float(np.sqrt(np.mean(
+                    (predicted - predicted_mean[None]) ** 2
+                )))
+            ),
+            "true_cross_source_spread_rms_K": (
+                float(sigma)
+                * float(np.sqrt(np.mean(
+                    (expected - expected_mean[None]) ** 2
+                )))
+            ),
+            "relative_predicted_cross_source_spread": (
+                float(sigma)
+                * float(np.sqrt(np.mean(
+                    (predicted - predicted_mean[None]) ** 2
+                )))
+                / reference
+            ),
+        }
+
+    source_permuted_rmse = float("nan")
+    if include_source_permutation:
+        errors = []
+        for source_index, record in enumerate(source_cases):
+            wrong_source = sources[
+                (source_index + 1) % len(source_cases):
+                (source_index + 1) % len(source_cases) + 1
+            ]
+            for case in record["cases"]:
+                sim = case["sim"]
+                steps = torch.arange(
+                    1, len(sim.t), device=sources.device, dtype=torch.long,
+                )
+                prediction = _predict_transition_probe_steps(
+                    model,
+                    wrong_source,
+                    case["params"],
+                    steps,
+                    mesh,
+                    y_img,
+                    dt=float(sim.dt),
+                    t_ramp=2.0 * float(sim.dt),
+                    query_chunk=int(query_chunk),
+                ).detach().cpu().numpy()
+                errors.append(
+                    (
+                        float(sigma)
+                        * (prediction - np.asarray(case["truth"])[1:])
+                    ).reshape(-1)
+                )
+        source_permuted_rmse = float(np.sqrt(np.mean(
+            np.concatenate(errors) ** 2
+        )))
+
+    correct = float(np.sqrt(np.mean(np.square(correct_rmse))))
+    forcing_permuted = float(np.sqrt(np.mean(
+        np.square(forcing_permuted_rmse)
+    )))
+    source_attribution = (
+        float("nan")
+        if not np.isfinite(source_permuted_rmse)
+        else 1.0 - correct / max(
+            source_permuted_rmse, np.finfo(float).tiny,
+        )
+    )
+    metrics = {
+        "finite": bool(
+            all(row["finite"] for row in per_source.values())
+            and np.isfinite(copy_skills).all()
+        ),
+        "per_source": per_source,
+        "signal_bearing_case_count": len(copy_skills),
+        "positive_copy_skill_cases": int(sum(
+            value > 0.0 for value in copy_skills
+        )),
+        "median_copy_skill": float(np.median(copy_skills)),
+        "worst_copy_skill": float(np.min(copy_skills)),
+        "minimum_source_median_copy_skill": float(min(
+            row["median_copy_skill"] for row in per_source.values()
+        )),
+        "median_designed_response_gain": float(np.median(response_gains)),
+        "minimum_designed_response_cosine": float(np.min(response_cosines)),
+        "correct_forcing_rmse_K": correct,
+        "forcing_permuted_rmse_K": forcing_permuted,
+        "forcing_attribution_improvement": (
+            1.0 - correct / max(forcing_permuted, np.finfo(float).tiny)
+        ),
+        "source_permuted_rmse_K": source_permuted_rmse,
+        "source_attribution_improvement": source_attribution,
+        "forcing_response_cross_source_spread": forcing_spread,
+        "maximum_relative_cross_source_forcing_spread": float(max(
+            row["relative_predicted_cross_source_spread"]
+            for row in forcing_spread.values()
+        )),
+    }
+    return metrics, {
+        "prediction": all_predictions,
+        "truth": all_truths,
+    }
+
+
+def _parameter_group_norm(
+    model: ForcingTransitionCViT,
+    *,
+    gradients: bool,
+    prefix: str,
+) -> float:
+    squares = []
+    for name, parameter in model.named_parameters():
+        if not name.startswith(prefix):
+            continue
+        value = parameter.grad if gradients else parameter
+        if value is not None:
+            squares.append(value.detach().double().square().sum())
+    if not squares:
+        return 0.0
+    return float(torch.stack(squares).sum().sqrt().cpu())
+
+
+def run_transition_multiforcing_overfit(args: argparse.Namespace) -> dict[str, Any]:
+    if args.gate_summary is not None:
+        direct_gate, direct_hash = load_verified_transition_gate(
+            args.gate_summary,
+            expected_stage="dense_direct_state_gate",
+            require_passed=not args.smoke,
+        )
+        sigma = float(
+            direct_gate.get("configuration", {}).get(
+                "resolved_sigma_global",
+                direct_gate.get("configuration", {}).get("sigma", 10.0),
+            )
+        )
+    else:
+        direct_hash = None
+        sigma = float(10.0 if args.sigma is None else args.sigma)
+    if args.sigma is not None and not math.isclose(
+        float(args.sigma), sigma, rel_tol=0.0, abs_tol=1.0e-12,
+    ):
+        raise ValueError("multi-forcing sigma differs from the direct-state gate")
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    device = resolve_device(args.device)
+    _, base_truth, _ = build_homogeneous_gate_case(
+        family="grf_2d",
+        source_time=0.0,
+        grid_size=20,
+        dt=0.005,
+        sigma=float(sigma),
+        seed=int(args.case_seed),
+    )
+    source_normalized = np.asarray(base_truth[0], dtype=np.float64)
+    case_specs = transition_multiforcing_probe_params()
+    cases = []
+    for spec in case_specs:
+        sim, truth = _build_multiforcing_case(
+            source_normalized,
+            spec["params"],
+            sigma=float(sigma),
+        )
+        cases.append({
+            "name": spec["name"],
+            "params": spec["params"],
+            "sim": sim,
+            "truth": truth,
+        })
+    heldout_spec = _transition_multiforcing_heldout_params()
+    heldout_sim, heldout_truth = _build_multiforcing_case(
+        source_normalized,
+        heldout_spec["params"],
+        sigma=float(sigma),
+    )
+    heldout_case = {
+        "name": heldout_spec["name"],
+        "params": heldout_spec["params"],
+        "sim": heldout_sim,
+        "truth": heldout_truth,
+    }
+
+    model = _transition_probe_model(int(args.seed), device)
+    optimizer = build_optimizer(
+        {
+            "training": {
+                "optimizer": str(args.optimizer),
+                "learning_rate": float(args.learning_rate),
+                "weight_decay": float(args.weight_decay),
+            },
+        },
+        model.parameters(),
+    )
+    initial_forcing = {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith("forcing_encoder")
+        or name.startswith("forcing_context_projection")
+    }
+    x_grid, y_grid, mesh, y_img = _transition_probe_mesh(
+        cases[0]["sim"], device,
+    )
+    source = torch.as_tensor(
+        source_normalized, dtype=torch.float32, device=device,
+    ).unsqueeze(0).unsqueeze(0)
+    source_batch = source.expand(len(cases), -1, -1, -1).contiguous()
+    params = [case["params"] for case in cases]
+    source_steps = np.zeros(len(cases), dtype=np.int64)
+    source_bins = np.zeros(len(cases), dtype=np.int64)
+    rng = np.random.default_rng(int(args.case_seed) + 60_001)
+    updates = int(args.updates)
+    validate_every = int(args.validate_every)
+    rows = []
+    last_result: dict[str, Any] = {}
+    started = time.perf_counter()
+
+    initial_metrics, _ = evaluate_transition_multiforcing_overfit(
+        model,
+        source,
+        cases,
+        mesh,
+        y_img,
+        sigma=float(sigma),
+        query_chunk=int(args.query_chunk),
+    )
+    for update in range(updates):
+        base_intervals = sample_transition_physics_intervals(
+            rng,
+            source_steps=np.asarray([0], dtype=np.int64),
+            dt=0.005,
+            t_final=0.3,
+            lead_edges=[0.0, 0.05, 0.10, 0.20, 0.30],
+            include_anchor_interval=True,
+            intervals_per_cell=1,
+            consecutive_intervals={"enabled": False},
+        )
+        max_lead = preregistered_max_lead(update, updates, 0.3)
+        mask = (
+            (base_intervals["start_step"] + 1).to(dtype=torch.float64)
+            * 0.005
+            <= max_lead + 1.0e-12
+        )
+        base_intervals = {
+            key: value[mask] for key, value in base_intervals.items()
+        }
+        intervals = repeat_transition_intervals(
+            base_intervals, len(cases),
+        )
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        result = forcing_transition_physics_loss(
+            model=model,
+            source_fields=source_batch,
+            params=params,
+            source_steps=source_steps,
+            source_bins=source_bins,
+            intervals=intervals,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            y_img=y_img,
+            nt_img=32,
+            a_ref=300.0,
+            t_ramp=0.01,
+            t_final=0.3,
+            dt=0.005,
+            sigma_global=float(sigma),
+            right_value=0.0,
+            objective=str(args.objective),
+            causal_epsilon=0.01,
+            query_chunk=int(args.query_chunk),
+        )
+        loss = result["loss"]
+        if not bool(result["finite"]) or not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(
+                f"non-finite multi-forcing loss at update {update + 1}"
+            )
+        loss.backward()
+        forcing_gradient_norm = math.sqrt(
+            _parameter_group_norm(
+                model, gradients=True, prefix="forcing_encoder",
+            ) ** 2
+            + _parameter_group_norm(
+                model,
+                gradients=True,
+                prefix="forcing_context_projection",
+            ) ** 2
+        )
+        source_gradient_norm = _parameter_group_norm(
+            model, gradients=True, prefix="source_encoder",
+        )
+        if not all(
+            parameter.grad is None
+            or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        ):
+            raise FloatingPointError(
+                f"non-finite multi-forcing gradient at update {update + 1}"
+            )
+        optimizer.step()
+        last_result = {
+            "loss": float(loss.detach().cpu()),
+            "physical_defect_mse": float(
+                result["physical_defect_mse"].detach().cpu()
+            ),
+            "forcing_gradient_norm": forcing_gradient_norm,
+            "source_gradient_norm": source_gradient_norm,
+        }
+        completed = update + 1
+        if completed % validate_every == 0 or completed == updates:
+            metrics, _ = evaluate_transition_multiforcing_overfit(
+                model,
+                source,
+                cases,
+                mesh,
+                y_img,
+                sigma=float(sigma),
+                query_chunk=int(args.query_chunk),
+            )
+            row = {
+                "update": completed,
+                **last_result,
+                "signal_bearing_case_count": metrics[
+                    "signal_bearing_case_count"
+                ],
+                "positive_copy_skill_cases": metrics[
+                    "positive_copy_skill_cases"
+                ],
+                "median_copy_skill": metrics["median_copy_skill"],
+                "worst_copy_skill": metrics["worst_copy_skill"],
+                "median_pairwise_response_gain": metrics[
+                    "median_pairwise_response_gain"
+                ],
+                "minimum_designed_response_cosine": metrics[
+                    "minimum_designed_response_cosine"
+                ],
+                "forcing_attribution_improvement": metrics[
+                    "forcing_attribution_improvement"
+                ],
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+            rows.append(row)
+            print(json.dumps(row, sort_keys=True), flush=True)
+
+    final_metrics, arrays = evaluate_transition_multiforcing_overfit(
+        model,
+        source,
+        cases,
+        mesh,
+        y_img,
+        sigma=float(sigma),
+        query_chunk=int(args.query_chunk),
+    )
+    heldout_metrics, heldout_arrays = evaluate_transition_multiforcing_overfit(
+        model,
+        source,
+        [
+            cases[0],
+            cases[1],
+            heldout_case,
+            cases[2],
+            cases[3],
+            cases[4],
+            cases[5],
+        ],
+        mesh,
+        y_img,
+        sigma=float(sigma),
+        query_chunk=int(args.query_chunk),
+        include_permutation=False,
+    )
+    heldout_row = heldout_metrics["per_case"][heldout_case["name"]]
+    forcing_displacement = 0.0
+    for name, initial in initial_forcing.items():
+        current = dict(model.named_parameters())[name].detach().cpu()
+        forcing_displacement += float((current - initial).double().square().sum())
+    forcing_displacement = math.sqrt(forcing_displacement)
+    criteria = {
+        "finite": bool(final_metrics["finite"]),
+        "at_least_five_positive_copy_skills": bool(
+            final_metrics["positive_copy_skill_cases"] >= 5
+        ),
+        "forcing_response_gain": bool(
+            final_metrics["median_pairwise_response_gain"] >= 0.10
+        ),
+        "forcing_response_alignment": bool(
+            final_metrics["minimum_designed_response_cosine"] >= 0.50
+        ),
+        "forcing_attribution": bool(
+            final_metrics["forcing_attribution_improvement"] >= 0.05
+        ),
+        "forcing_parameters_updated": bool(forcing_displacement > 0.0),
+    }
+    summary = {
+        "schema_version": 1,
+        "stage": "multi_forcing_physics_overfit",
+        "passed": bool(all(criteria.values())),
+        "objective": str(args.objective),
+        "optimizer": str(args.optimizer),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "updates": updates,
+        "grid_size": 20,
+        "model_seed": int(args.seed),
+        "case_seed": int(args.case_seed),
+        "training_cases": [case["name"] for case in cases],
+        "shared_source_state": True,
+        "shared_source_time": 0.0,
+        "synchronized_endpoint_sampling": True,
+        "solution_fields_used_for_optimization": False,
+        "fv_solutions_used_for_diagnostics_only": True,
+        "direct_state_gate_sha256": direct_hash,
+        "sigma_global": float(sigma),
+        "initial_metrics": initial_metrics,
+        "final_metrics": final_metrics,
+        "heldout_interpolation_case": {
+            "name": heldout_case["name"],
+            "metrics": heldout_row,
+        },
+        "forcing_parameter_displacement_l2": forcing_displacement,
+        "last_training": last_result,
+        "criteria": criteria,
+        "blind_spots_tested": {
+            "source_time_shortcut": (
+                "all forcing cases share the same source and endpoint times"
+            ),
+            "amplitude": "sin_low_uniform versus sin_high_uniform",
+            "temporal_order": "pulse_early_uniform versus pulse_late_uniform",
+            "spatial_localization": (
+                "sin_high_uniform versus sin_high_gaussian"
+            ),
+            "forcing_attribution": "correct versus cyclically permuted forcing",
+            "forcing_path_optimization": (
+                "forcing gradient and parameter-displacement diagnostics"
+            ),
+            "interpolation": "untrained intermediate sinusoid amplitude",
+        },
+        "wall_seconds": time.perf_counter() - started,
+    }
+    with (output_dir / "metrics.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    np.savez_compressed(
+        output_dir / "predictions.npz",
+        **{
+            f"prediction__{name}": value
+            for name, value in arrays["prediction"].items()
+        },
+        **{
+            f"truth__{name}": value
+            for name, value in arrays["truth"].items()
+        },
+        prediction__sin_mid_uniform_heldout=heldout_arrays["prediction"][
+            heldout_case["name"]
+        ],
+        truth__sin_mid_uniform_heldout=heldout_arrays["truth"][
+            heldout_case["name"]
+        ],
+        t_grid=cases[0]["sim"].t,
+    )
+    canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    summary["experiment_sha256"] = hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "summary": summary,
+        },
+        output_dir / "multiforcing_overfit.pt",
+    )
+    with (output_dir / "summary.json").open("w") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+    return summary
+
+
+def run_transition_multisource_multiforcing_overfit(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if args.gate_summary is not None:
+        direct_gate, direct_hash = load_verified_transition_gate(
+            args.gate_summary,
+            expected_stage="dense_direct_state_gate",
+            require_passed=not args.smoke,
+        )
+        sigma = float(
+            direct_gate.get("configuration", {}).get(
+                "resolved_sigma_global",
+                direct_gate.get("configuration", {}).get("sigma", 10.0),
+            )
+        )
+    else:
+        direct_hash = None
+        sigma = float(10.0 if args.sigma is None else args.sigma)
+    if args.sigma is not None and not math.isclose(
+        float(args.sigma), sigma, rel_tol=0.0, abs_tol=1.0e-12,
+    ):
+        raise ValueError(
+            "multi-source/multi-forcing sigma differs from the direct-state gate"
+        )
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    device = resolve_device(args.device)
+    forcing_specs = transition_multiforcing_probe_params()
+    source_families = tuple(dict.fromkeys(
+        row["source_family"]
+        for row in transition_multisource_multiforcing_specs()
+    ))
+    source_records: list[dict[str, Any]] = []
+    source_arrays = []
+    for source_index, family in enumerate(source_families):
+        _, base_truth, _ = build_homogeneous_gate_case(
+            family=family,
+            source_time=0.0,
+            grid_size=20,
+            dt=0.005,
+            sigma=float(sigma),
+            seed=int(args.case_seed) + 100 * source_index,
+        )
+        source_normalized = np.asarray(base_truth[0], dtype=np.float64)
+        source_arrays.append(source_normalized)
+        cases = []
+        for forcing in forcing_specs:
+            sim, truth = _build_multiforcing_case(
+                source_normalized,
+                forcing["params"],
+                sigma=float(sigma),
+            )
+            cases.append({
+                "name": forcing["name"],
+                "params": forcing["params"],
+                "sim": sim,
+                "truth": truth,
+            })
+        source_records.append({
+            "family": family,
+            "cases": cases,
+            "source_normalized": source_normalized,
+        })
+
+    model = _transition_probe_model(int(args.seed), device)
+    optimizer = build_optimizer(
+        {
+            "training": {
+                "optimizer": str(args.optimizer),
+                "learning_rate": float(args.learning_rate),
+                "weight_decay": float(args.weight_decay),
+            },
+        },
+        model.parameters(),
+    )
+    initial_forcing = {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith("forcing_encoder")
+        or name.startswith("forcing_context_projection")
+    }
+    x_grid, y_grid, mesh, y_img = _transition_probe_mesh(
+        source_records[0]["cases"][0]["sim"], device,
+    )
+    sources = torch.as_tensor(
+        np.stack(source_arrays), dtype=torch.float32, device=device,
+    ).unsqueeze(1)
+    forcing_count = len(forcing_specs)
+    case_source_indices = torch.arange(
+        len(source_records), device=device, dtype=torch.long,
+    ).repeat_interleave(forcing_count)
+    source_fields = sources.index_select(0, case_source_indices)
+    flat_cases = [
+        case
+        for record in source_records
+        for case in record["cases"]
+    ]
+    params = [case["params"] for case in flat_cases]
+    source_steps = np.zeros(len(flat_cases), dtype=np.int64)
+    source_bins = np.zeros(len(flat_cases), dtype=np.int64)
+    rng = np.random.default_rng(int(args.case_seed) + 70_001)
+    updates = int(args.updates)
+    validate_every = int(args.validate_every)
+    rows = []
+    last_result: dict[str, Any] = {}
+    started = time.perf_counter()
+
+    initial_metrics, _ = (
+        evaluate_transition_multisource_multiforcing_overfit(
+            model,
+            sources,
+            source_records,
+            mesh,
+            y_img,
+            sigma=float(sigma),
+            query_chunk=int(args.query_chunk),
+        )
+    )
+    for update in range(updates):
+        base_intervals = sample_transition_physics_intervals(
+            rng,
+            source_steps=np.asarray([0], dtype=np.int64),
+            dt=0.005,
+            t_final=0.3,
+            lead_edges=[0.0, 0.05, 0.10, 0.20, 0.30],
+            include_anchor_interval=True,
+            intervals_per_cell=1,
+            consecutive_intervals={"enabled": False},
+        )
+        max_lead = preregistered_max_lead(update, updates, 0.3)
+        mask = (
+            (base_intervals["start_step"] + 1).to(dtype=torch.float64)
+            * 0.005
+            <= max_lead + 1.0e-12
+        )
+        base_intervals = {
+            key: value[mask] for key, value in base_intervals.items()
+        }
+        intervals = repeat_transition_intervals(
+            base_intervals, len(flat_cases),
+        )
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        result = forcing_transition_physics_loss(
+            model=model,
+            source_fields=source_fields,
+            params=params,
+            source_steps=source_steps,
+            source_bins=source_bins,
+            intervals=intervals,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            y_img=y_img,
+            nt_img=32,
+            a_ref=300.0,
+            t_ramp=0.01,
+            t_final=0.3,
+            dt=0.005,
+            sigma_global=float(sigma),
+            right_value=0.0,
+            objective=str(args.objective),
+            causal_epsilon=0.01,
+            query_chunk=int(args.query_chunk),
+        )
+        loss = result["loss"]
+        if not bool(result["finite"]) or not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(
+                f"non-finite cross-product loss at update {update + 1}"
+            )
+        loss.backward()
+        forcing_gradient_norm = math.sqrt(
+            _parameter_group_norm(
+                model, gradients=True, prefix="forcing_encoder",
+            ) ** 2
+            + _parameter_group_norm(
+                model,
+                gradients=True,
+                prefix="forcing_context_projection",
+            ) ** 2
+        )
+        source_gradient_norm = _parameter_group_norm(
+            model, gradients=True, prefix="source_encoder",
+        )
+        if not all(
+            parameter.grad is None
+            or bool(torch.isfinite(parameter.grad).all().item())
+            for parameter in model.parameters()
+        ):
+            raise FloatingPointError(
+                f"non-finite cross-product gradient at update {update + 1}"
+            )
+        optimizer.step()
+        last_result = {
+            "loss": float(loss.detach().cpu()),
+            "physical_defect_mse": float(
+                result["physical_defect_mse"].detach().cpu()
+            ),
+            "forcing_gradient_norm": forcing_gradient_norm,
+            "source_gradient_norm": source_gradient_norm,
+        }
+        completed = update + 1
+        if completed % validate_every == 0 or completed == updates:
+            metrics, _ = (
+                evaluate_transition_multisource_multiforcing_overfit(
+                    model,
+                    sources,
+                    source_records,
+                    mesh,
+                    y_img,
+                    sigma=float(sigma),
+                    query_chunk=int(args.query_chunk),
+                )
+            )
+            row = {
+                "update": completed,
+                **last_result,
+                "signal_bearing_case_count": metrics[
+                    "signal_bearing_case_count"
+                ],
+                "positive_copy_skill_cases": metrics[
+                    "positive_copy_skill_cases"
+                ],
+                "median_copy_skill": metrics["median_copy_skill"],
+                "worst_copy_skill": metrics["worst_copy_skill"],
+                "minimum_source_median_copy_skill": metrics[
+                    "minimum_source_median_copy_skill"
+                ],
+                "median_designed_response_gain": metrics[
+                    "median_designed_response_gain"
+                ],
+                "minimum_designed_response_cosine": metrics[
+                    "minimum_designed_response_cosine"
+                ],
+                "forcing_attribution_improvement": metrics[
+                    "forcing_attribution_improvement"
+                ],
+                "maximum_relative_cross_source_forcing_spread": metrics[
+                    "maximum_relative_cross_source_forcing_spread"
+                ],
+                "elapsed_seconds": time.perf_counter() - started,
+            }
+            rows.append(row)
+            print(json.dumps(row, sort_keys=True), flush=True)
+
+    final_metrics, arrays = (
+        evaluate_transition_multisource_multiforcing_overfit(
+            model,
+            sources,
+            source_records,
+            mesh,
+            y_img,
+            sigma=float(sigma),
+            query_chunk=int(args.query_chunk),
+            include_source_permutation=True,
+        )
+    )
+    heldout_spec = _transition_multiforcing_heldout_params()
+    heldout_rows = {}
+    for source_index, record in enumerate(source_records):
+        heldout_sim, heldout_truth = _build_multiforcing_case(
+            record["source_normalized"],
+            heldout_spec["params"],
+            sigma=float(sigma),
+        )
+        heldout_case = {
+            "name": heldout_spec["name"],
+            "params": heldout_spec["params"],
+            "sim": heldout_sim,
+            "truth": heldout_truth,
+        }
+        metrics, heldout_arrays = evaluate_transition_multiforcing_overfit(
+            model,
+            sources[source_index:source_index + 1],
+            [*record["cases"], heldout_case],
+            mesh,
+            y_img,
+            sigma=float(sigma),
+            query_chunk=int(args.query_chunk),
+            include_permutation=False,
+        )
+        heldout_rows[record["family"]] = metrics["per_case"][
+            heldout_case["name"]
+        ]
+        arrays["prediction"][
+            f"{record['family']}__{heldout_case['name']}"
+        ] = heldout_arrays["prediction"][heldout_case["name"]]
+        arrays["truth"][
+            f"{record['family']}__{heldout_case['name']}"
+        ] = heldout_arrays["truth"][heldout_case["name"]]
+
+    forcing_displacement = 0.0
+    for name, initial in initial_forcing.items():
+        current = dict(model.named_parameters())[name].detach().cpu()
+        forcing_displacement += float(
+            (current - initial).double().square().sum()
+        )
+    forcing_displacement = math.sqrt(forcing_displacement)
+    criteria = {
+        "finite": bool(final_metrics["finite"]),
+        "all_signal_bearing_cases_have_positive_copy_skill": bool(
+            final_metrics["positive_copy_skill_cases"]
+            == final_metrics["signal_bearing_case_count"]
+        ),
+        "every_source_has_positive_median_copy_skill": bool(
+            final_metrics["minimum_source_median_copy_skill"] > 0.0
+        ),
+        "forcing_response_gain": bool(
+            final_metrics["median_designed_response_gain"] >= 0.10
+        ),
+        "forcing_response_alignment": bool(
+            final_metrics["minimum_designed_response_cosine"] >= 0.50
+        ),
+        "forcing_attribution": bool(
+            final_metrics["forcing_attribution_improvement"] >= 0.05
+        ),
+        "source_attribution": bool(
+            final_metrics["source_attribution_improvement"] >= 0.05
+        ),
+        "forcing_parameters_updated": bool(forcing_displacement > 0.0),
+    }
+    summary = {
+        "schema_version": 1,
+        "stage": "multi_source_multi_forcing_physics_overfit",
+        "passed": bool(all(criteria.values())),
+        "objective": str(args.objective),
+        "optimizer": str(args.optimizer),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "updates": updates,
+        "grid_size": 20,
+        "source_families": list(source_families),
+        "forcing_cases": [row["name"] for row in forcing_specs],
+        "training_case_count": len(flat_cases),
+        "model_seed": int(args.seed),
+        "case_seed": int(args.case_seed),
+        "shared_source_time": 0.0,
+        "forcing_bank_repeated_for_every_source": True,
+        "synchronized_endpoint_sampling": True,
+        "solution_fields_used_for_optimization": False,
+        "fv_solutions_used_for_diagnostics_only": True,
+        "direct_state_gate_sha256": direct_hash,
+        "sigma_global": float(sigma),
+        "initial_metrics": initial_metrics,
+        "final_metrics": final_metrics,
+        "heldout_interpolation_by_source": heldout_rows,
+        "forcing_parameter_displacement_l2": forcing_displacement,
+        "last_training": last_result,
+        "criteria": criteria,
+        "blind_spots_tested": {
+            "cross_source_gradient_interference": (
+                "one shared update jointly averages all 24 source/forcing cases"
+            ),
+            "source_shortcut": (
+                "each forcing is paired with every source and every endpoint"
+            ),
+            "forcing_shortcut": (
+                "each source is paired with all six contradictory forcings"
+            ),
+            "source_attribution": (
+                "correct source versus cyclically permuted source"
+            ),
+            "forcing_attribution": (
+                "correct forcing versus cyclically permuted forcing"
+            ),
+            "linear_superposition": (
+                "forcing-response spread across four source states"
+            ),
+            "interpolation": (
+                "untrained intermediate sinusoid amplitude for every source"
+            ),
+        },
+        "wall_seconds": time.perf_counter() - started,
+    }
+    with (output_dir / "metrics.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    np.savez_compressed(
+        output_dir / "predictions.npz",
+        **{
+            f"prediction__{name}": value
+            for name, value in arrays["prediction"].items()
+        },
+        **{
+            f"truth__{name}": value
+            for name, value in arrays["truth"].items()
+        },
+        t_grid=source_records[0]["cases"][0]["sim"].t,
+    )
+    canonical = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    summary["experiment_sha256"] = hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "summary": summary,
+        },
+        output_dir / "multisource_multiforcing_overfit.pt",
+    )
+    with (output_dir / "summary.json").open("w") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+    return summary
 
 
 def run_transition_gate(args: argparse.Namespace) -> dict:
@@ -1436,7 +2773,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode", choices=(
-            "interface", "forcing_transition", "forcing_transition_mini",
+            "interface",
+            "forcing_transition",
+            "forcing_transition_mini",
+            "forcing_transition_multiforcing",
+            "forcing_transition_multisource_multiforcing",
         ),
         default="interface",
     )
@@ -1464,6 +2805,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--supervised-budget", type=int, default=4000)
     parser.add_argument("--capacity-ceiling", type=int, default=8000)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
+    parser.add_argument(
+        "--optimizer", choices=("Adam", "SOAP"), default="Adam",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--objective",
+        choices=("raw_ls", "variational", "defect"),
+        default="defect",
+    )
     parser.add_argument("--mini-updates", type=int, default=4000)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument(
@@ -1493,5 +2843,9 @@ if __name__ == "__main__":
         run_transition_gate(parsed)
     elif parsed.mode == "forcing_transition_mini":
         run_transition_mini_operator(parsed)
+    elif parsed.mode == "forcing_transition_multiforcing":
+        run_transition_multiforcing_overfit(parsed)
+    elif parsed.mode == "forcing_transition_multisource_multiforcing":
+        run_transition_multisource_multiforcing_overfit(parsed)
     else:
         run(parsed)

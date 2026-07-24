@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 
 import src.operators.train_pino as train_pino
+import scripts.run_train_pino as run_train_pino
 from src.operators.cvit import (
     ForcingTransitionCViT,
     TransitionEncoding,
@@ -759,12 +761,19 @@ def _physics_runner_config(path, epochs=1):
     return config, direct, network
 
 
-def test_tiny_physics_only_transition_end_to_end(tmp_path):
+def test_tiny_physics_only_transition_end_to_end(tmp_path, capsys):
     _write_transition_dataset(tmp_path)
     config, direct, network = _physics_runner_config(tmp_path)
+    config["training"]["run"] = {"compact_stdout": True}
+    run_dir = tmp_path / "physics_run"
     summary = run_one_seed_forcing_transition_physics(
-        config, seed=19, run_dir=tmp_path / "physics_run",
+        config, seed=19, run_dir=run_dir,
     )
+    output = capsys.readouterr().out
+    assert "Update 1: loss=" in output
+    assert "Validation for update 1: val_gnrmse=" in output
+    assert "forcing_response_ratio" not in output
+    assert "source_distribution_coverage" not in output
     assert summary["objective"] == "physics_only_transition"
     assert summary["completed_updates"] == 1
     assert summary["selected_physics_objective"] == "variational"
@@ -772,6 +781,63 @@ def test_tiny_physics_only_transition_end_to_end(tmp_path):
     assert summary["direct_state_gate_sha256"] == direct["gate_sha256"]
     assert summary["network_gate_sha256"] == network["gate_sha256"]
     assert summary["gradnorm_mode"] == "inert_single_term"
+    assert summary["phase1_diagnostics_schema"] == 1
+    assert summary["diagnostics_use_fv_reference_solutions"]
+    assert math.isfinite(
+        summary["designed_forcing_diagnostics"]["designed_response_gain"]
+    )
+    assert (run_dir / "cvit_forcing_init.pt").exists()
+    with (run_dir / "diagnostics.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert set(rows[0]) >= {
+        "source_encoder_grad_norm",
+        "forcing_encoder_grad_norm",
+        "forcing_context_grad_norm",
+        "forcing_branch_grad_norm",
+        "forcing_parameter_displacement_l2",
+        "local_forcing_active_fraction",
+        "history_forcing_active_fraction",
+        "boundary_defect_mse",
+        "interior_defect_mse",
+        "correct_forcing_rmse_K",
+        "zero_forcing_rmse_K",
+        "shuffled_forcing_rmse_K",
+        "designed_response_gain",
+        "designed_response_cosine",
+    }
+
+
+def test_compact_pino_entrypoint_omits_overrides_and_nested_summary(
+    tmp_path, monkeypatch, capsys,
+):
+    config = {
+        "paths": {"runs_root": str(tmp_path)},
+        "experiment": {"name": "compact"},
+        "config_id": 0,
+        "training": {
+            "seeds": [3],
+            "run": {"compact_stdout": True},
+        },
+    }
+    monkeypatch.setattr(run_train_pino, "load_config", lambda: config)
+    monkeypatch.setattr(
+        run_train_pino,
+        "run_config_seeds_pino",
+        lambda *args, **kwargs: {"seeds": {"3": {"large": "summary"}}},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_train_pino.py",
+            "training.run.compact_stdout=true",
+        ],
+    )
+    monkeypatch.setenv("BENCHMARK", "diffusion_forcing_single")
+    monkeypatch.setenv("REPRESENTATION", "temporal_encoder")
+    assert run_train_pino.main() == 0
+    output = capsys.readouterr().out
+    assert output.strip() == "[cvit] diffusion_forcing_single compact/config0"
 
 
 def test_tiny_physics_only_transition_without_gate_artifacts(tmp_path):

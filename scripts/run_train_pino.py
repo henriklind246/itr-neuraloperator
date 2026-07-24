@@ -118,19 +118,28 @@ def main() -> int:
     run_dir = _resolve_run_dir(config)
     config.setdefault("training", {}).setdefault("run", {})
     config["training"]["run"]["run_dir"] = str(run_dir)
+    compact_stdout = bool(config["training"]["run"].get("compact_stdout", False))
 
-    print(f"Benchmark: {os.environ['BENCHMARK']} / {os.environ['REPRESENTATION']}")
-    print(f"Experiment: {experiment_name}  config{config['config_id']}")
-    print(f"Run directory: {run_dir}")
-    if applied:
-        print("Applied overrides:")
-        for key, value in applied:
-            print(f"  {key}={value!r}")
+    if compact_stdout:
+        print(
+            f"[cvit] {os.environ['BENCHMARK']} "
+            f"{experiment_name}/config{config['config_id']}",
+            flush=True,
+        )
+    else:
+        print(f"Benchmark: {os.environ['BENCHMARK']} / {os.environ['REPRESENTATION']}")
+        print(f"Experiment: {experiment_name}  config{config['config_id']}")
+        print(f"Run directory: {run_dir}")
+        if applied:
+            print("Applied overrides:")
+            for key, value in applied:
+                print(f"  {key}={value!r}")
 
     summary = run_config_seeds_pino(
         config, base_run_dir=run_dir, seeds=[int(s) for s in seeds]
     )
-    print(json.dumps(summary, indent=2))
+    if not compact_stdout:
+        print(json.dumps(summary, indent=2))
     return 0
 
 
