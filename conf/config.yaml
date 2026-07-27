@@ -514,6 +514,12 @@ training:
         time_bundle: lead_bins
         include_anchor_interval: true
         intervals_per_cell: 1
+        # sim_batch remains the total number of transition cases. Cases are
+        # partitioned into equal-sized groups that share one IC/source time and
+        # receive independently sampled future forcings with synchronized leads.
+        # The production default is 2; set 1 only for the matched one-to-one
+        # ablation. The value must divide transition.sim_batch.
+        forcing_continuations_per_source: 2
         consecutive_intervals:
           enabled: false
           probability: 0.25

@@ -748,6 +748,7 @@ def _physics_runner_config(path, epochs=1):
         "time_bundle": "lead_bins",
         "include_anchor_interval": True,
         "intervals_per_cell": 1,
+        "forcing_continuations_per_source": 2,
         "consecutive_intervals": network["consecutive_intervals"],
         "production_screen": {
             "enabled": False,
@@ -782,9 +783,18 @@ def test_tiny_physics_only_transition_end_to_end(tmp_path, capsys):
     assert summary["network_gate_sha256"] == network["gate_sha256"]
     assert summary["gradnorm_mode"] == "inert_single_term"
     assert summary["phase1_diagnostics_schema"] == 1
+    assert summary["forcing_continuations_per_source"] == 2
+    assert summary["source_states_per_batch"] == 2
+    assert summary["transition_cases_per_batch"] == 4
+    assert summary["pairing_strategy"] == "multi_continuation"
     assert summary["diagnostics_use_fv_reference_solutions"]
     assert math.isfinite(
         summary["designed_forcing_diagnostics"]["designed_response_gain"]
+    )
+    forcing_diagnostics = summary["designed_forcing_diagnostics"]
+    assert forcing_diagnostics["forcing_permutation_gap_K"] == pytest.approx(
+        forcing_diagnostics["shuffled_forcing_rmse_K"]
+        - forcing_diagnostics["correct_forcing_rmse_K"]
     )
     assert (run_dir / "cvit_forcing_init.pt").exists()
     with (run_dir / "diagnostics.csv").open(newline="") as stream:
@@ -803,9 +813,36 @@ def test_tiny_physics_only_transition_end_to_end(tmp_path, capsys):
         "correct_forcing_rmse_K",
         "zero_forcing_rmse_K",
         "shuffled_forcing_rmse_K",
+        "forcing_permutation_gap_K",
         "designed_response_gain",
         "designed_response_cosine",
     }
+    checkpoint = torch.load(
+        run_dir / "cvit_latest.pt", map_location="cpu", weights_only=False,
+    )
+    for start in (0, 2):
+        first, second = checkpoint["active_descriptors"][start:start + 2]
+        assert first["T0_sha256"] == second["T0_sha256"]
+    assert checkpoint["active_source_steps"][0] == (
+        checkpoint["active_source_steps"][1]
+    )
+    assert checkpoint["active_source_steps"][2] == (
+        checkpoint["active_source_steps"][3]
+    )
+
+
+def test_tiny_physics_only_transition_supports_one_to_one_control(tmp_path):
+    _write_transition_dataset(tmp_path)
+    config, _, _ = _physics_runner_config(tmp_path)
+    physics = config["training"]["pino"]["transition"]["physics"]
+    physics["forcing_continuations_per_source"] = 1
+    summary = run_one_seed_forcing_transition_physics(
+        config, seed=47, run_dir=tmp_path / "physics_run_control",
+    )
+    assert summary["pairing_strategy"] == "one_to_one_control"
+    assert summary["forcing_continuations_per_source"] == 1
+    assert summary["source_states_per_batch"] == 4
+    assert summary["transition_cases_per_batch"] == 4
 
 
 def test_compact_pino_entrypoint_omits_overrides_and_nested_summary(

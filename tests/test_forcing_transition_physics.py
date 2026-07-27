@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import src.operators.train_pino as train_pino
+from problems.diffusion_forcing_single import DiffusionForcingSingleProblem
 from scripts.diagnose_fv_direct_state import (
     _dense_table_loss,
     _table_from_free,
@@ -179,6 +180,127 @@ def test_two_dimensional_interval_sampling_is_deterministic_and_direct():
         assert any(
             row[0] == sim_local and row[1] == 0 and row[3]
             for row in rows
+        )
+
+
+def test_production_multicontinuation_batch_breaks_source_forcing_pairing():
+    axis = np.linspace(0.0, 1.0, 8)
+    X, Y = np.meshgrid(axis, axis, indexing="ij")
+    grids = {"X": X, "Y": Y, "x_grid": axis, "y_grid": axis}
+    time_cfg = {
+        "dt": 0.005,
+        "t_final": 0.3,
+        "T_right": 300.0,
+        "b": 1.0,
+        "t_on": 0.0,
+        "t_off": 0.2,
+        "phase": 0.0,
+        "tukey_alpha": 0.5,
+    }
+    descriptors = train_pino._sample_transition_multicontinuation_descriptors(
+        DiffusionForcingSingleProblem(),
+        train_pino.OnlineSamplerRNGs.create(37, torch.device("cpu")),
+        batch_size=4,
+        continuations_per_source=2,
+        grids=grids,
+        time_cfg=time_cfg,
+    )
+    assert len(descriptors) == 4
+    for start in (0, 2):
+        first, second = descriptors[start:start + 2]
+        assert first["T0_sha256"] == second["T0_sha256"]
+        assert first["ic_family"] == second["ic_family"]
+        assert train_pino._content_key(first["ic_params"]) == (
+            train_pino._content_key(second["ic_params"])
+        )
+        assert train_pino._content_key({
+            "temporal": first["temporal_params"],
+            "spatial": first["spatial_params"],
+        }) != train_pino._content_key({
+            "temporal": second["temporal_params"],
+            "spatial": second["spatial_params"],
+        })
+
+    source_intervals = sample_transition_physics_intervals(
+        np.random.default_rng(41),
+        source_steps=np.asarray([0, 12]),
+        dt=0.005,
+        t_final=0.3,
+        lead_edges=[0.0, 0.05, 0.10, 0.20, 0.30],
+        include_anchor_interval=True,
+        intervals_per_cell=1,
+        consecutive_intervals={"enabled": False},
+    )
+    expanded = train_pino._repeat_transition_intervals_by_continuation(
+        source_intervals, 2,
+    )
+    for first_sim, second_sim in ((0, 1), (2, 3)):
+        first_mask = expanded["sim_local"] == first_sim
+        second_mask = expanded["sim_local"] == second_sim
+        for key in ("start_step", "lead_bin", "is_anchor"):
+            torch.testing.assert_close(
+                expanded[key][first_mask],
+                expanded[key][second_mask],
+            )
+
+
+def test_one_to_one_control_matches_legacy_online_sampler():
+    axis = np.linspace(0.0, 1.0, 8)
+    X, Y = np.meshgrid(axis, axis, indexing="ij")
+    grids = {"X": X, "Y": Y, "x_grid": axis, "y_grid": axis}
+    time_cfg = {
+        "dt": 0.005,
+        "t_final": 0.3,
+        "T_right": 300.0,
+        "b": 1.0,
+        "t_on": 0.0,
+        "t_off": 0.2,
+        "phase": 0.0,
+        "tukey_alpha": 0.5,
+    }
+    problem = DiffusionForcingSingleProblem()
+    legacy = train_pino._sample_online_problem_descriptors(
+        problem,
+        train_pino.OnlineSamplerRNGs.create(53, torch.device("cpu")),
+        batch_size=4,
+        grids=grids,
+        time_cfg=time_cfg,
+    )
+    control = train_pino._sample_transition_multicontinuation_descriptors(
+        problem,
+        train_pino.OnlineSamplerRNGs.create(53, torch.device("cpu")),
+        batch_size=4,
+        continuations_per_source=1,
+        grids=grids,
+        time_cfg=time_cfg,
+    )
+    assert [record["problem_key"] for record in control] == [
+        record["problem_key"] for record in legacy
+    ]
+
+
+def test_production_multicontinuation_batch_supports_matched_control():
+    intervals = {
+        "sim_local": torch.tensor([0]),
+        "start_step": torch.tensor([0]),
+        "lead_bin": torch.tensor([0]),
+        "is_anchor": torch.tensor([True]),
+    }
+    control = train_pino._repeat_transition_intervals_by_continuation(
+        intervals, 1,
+    )
+    for key in intervals:
+        torch.testing.assert_close(control[key], intervals[key])
+    with pytest.raises(ValueError, match="positive"):
+        train_pino._repeat_transition_intervals_by_continuation(intervals, 0)
+    with pytest.raises(ValueError, match="must divide"):
+        train_pino._sample_transition_multicontinuation_descriptors(
+            DiffusionForcingSingleProblem(),
+            train_pino.OnlineSamplerRNGs.create(43, torch.device("cpu")),
+            batch_size=5,
+            continuations_per_source=2,
+            grids={},
+            time_cfg={},
         )
 
 

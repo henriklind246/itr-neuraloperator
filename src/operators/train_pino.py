@@ -4254,6 +4254,51 @@ def _sample_online_problem_descriptors(
     return descriptors
 
 
+def _sample_transition_multicontinuation_descriptors(
+    problem,
+    rngs: OnlineSamplerRNGs,
+    batch_size: int,
+    continuations_per_source: int,
+    grids: dict[str, np.ndarray],
+    time_cfg: dict[str, Any],
+) -> list[dict]:
+    batch_size = int(batch_size)
+    continuations_per_source = int(continuations_per_source)
+    if continuations_per_source < 1:
+        raise ValueError(
+            "forcing_continuations_per_source must be positive"
+        )
+    if batch_size % continuations_per_source != 0:
+        raise ValueError(
+            "forcing_continuations_per_source must divide transition.sim_batch"
+        )
+    source_count = batch_size // continuations_per_source
+    source_assignments = balanced_ic_family_assignments(
+        rngs.numpy["ic_family"], source_count,
+    )
+    assignments = [
+        family
+        for family in source_assignments
+        for _ in range(continuations_per_source)
+    ]
+    records = problem.sample_online_params(
+        rngs.numpy["ic_params"], batch_size, grids, time_cfg,
+        rng_profile=rngs.numpy["forcing_params"],
+        rng_streams=rngs.numpy,
+        ic_family_assignment=assignments,
+    )
+    source_keys = ("T0", "ic_family", "ic_params")
+    for start in range(0, batch_size, continuations_per_source):
+        source = records[start]
+        for index in range(start + 1, start + continuations_per_source):
+            for key in source_keys:
+                records[index][key] = copy.deepcopy(source[key])
+    descriptors = [_online_record_descriptor(record) for record in records]
+    if [str(record["ic_family"]) for record in descriptors] != assignments:
+        raise AssertionError("ProblemSpec changed the explicit IC-family assignment")
+    return descriptors
+
+
 def _should_resample_online_batch(
     completed_updates: int, warmup_updates: int, resample_every: int,
 ) -> bool:
@@ -11518,10 +11563,14 @@ def transition_designed_forcing_diagnostics(
     cosine_denominator = (
         predicted_norm * true_norm
     ).clamp_min(torch.finfo(true_norm.dtype).tiny)
+    correct_rmse = rmse_K(correct)
+    zero_rmse = rmse_K(zeroed)
+    shuffled_rmse = rmse_K(shuffled)
     return {
-        "correct_forcing_rmse_K": rmse_K(correct),
-        "zero_forcing_rmse_K": rmse_K(zeroed),
-        "shuffled_forcing_rmse_K": rmse_K(shuffled),
+        "correct_forcing_rmse_K": correct_rmse,
+        "zero_forcing_rmse_K": zero_rmse,
+        "shuffled_forcing_rmse_K": shuffled_rmse,
+        "forcing_permutation_gap_K": shuffled_rmse - correct_rmse,
         "designed_response_gain": float(
             (predicted_norm / denominator).cpu()
         ),
@@ -11798,6 +11847,40 @@ def sample_transition_physics_intervals(
             [row[3] for row in unique], dtype=torch.bool,
         ),
     }
+
+
+def _repeat_transition_intervals_by_continuation(
+    intervals: dict[str, torch.Tensor],
+    continuations_per_source: int,
+) -> dict[str, torch.Tensor]:
+    continuations_per_source = int(continuations_per_source)
+    if continuations_per_source < 1:
+        raise ValueError(
+            "forcing_continuations_per_source must be positive"
+        )
+    sim_local = intervals["sim_local"]
+    count = int(sim_local.numel())
+    for value in intervals.values():
+        if value.ndim != 1 or int(value.numel()) != count:
+            raise ValueError("transition interval fields must be aligned vectors")
+    offsets = torch.arange(
+        continuations_per_source,
+        dtype=sim_local.dtype,
+        device=sim_local.device,
+    ).repeat(count)
+    expanded = {
+        "sim_local": (
+            sim_local.repeat_interleave(continuations_per_source)
+            * continuations_per_source
+            + offsets
+        ),
+    }
+    expanded.update({
+        key: value.repeat_interleave(continuations_per_source)
+        for key, value in intervals.items()
+        if key != "sim_local"
+    })
+    return expanded
 
 
 def _macro_transition_cell_mean(
@@ -13131,6 +13214,23 @@ def run_one_seed_forcing_transition_physics(
         transition.get("validation_query_chunk", 2048) or 0
     )
     intervals_per_cell = int(physics_cfg.get("intervals_per_cell", 1))
+    continuations_per_source = int(
+        physics_cfg.get("forcing_continuations_per_source", 2)
+    )
+    if continuations_per_source < 1:
+        raise ValueError(
+            "forcing_continuations_per_source must be positive"
+        )
+    if sim_batch % continuations_per_source != 0:
+        raise ValueError(
+            "forcing_continuations_per_source must divide transition.sim_batch"
+        )
+    source_states_per_batch = sim_batch // continuations_per_source
+    pairing_strategy = (
+        "multi_continuation"
+        if continuations_per_source > 1
+        else "one_to_one_control"
+    )
     grad_clip_cfg = training.get("grad_clip")
     grad_clip = None if grad_clip_cfg is None else float(grad_clip_cfg)
     save_every = max(
@@ -13156,6 +13256,9 @@ def run_one_seed_forcing_transition_physics(
         "time_bundle": "lead_bins",
         "include_anchor_interval": True,
         "intervals_per_cell": intervals_per_cell,
+        "forcing_continuations_per_source": continuations_per_source,
+        "source_states_per_batch": source_states_per_batch,
+        "pairing_strategy": pairing_strategy,
         "total_updates": total_updates,
         "updates_per_epoch": updates_per_epoch,
         "production_screen": copy.deepcopy(screen_cfg),
@@ -13184,6 +13287,7 @@ def run_one_seed_forcing_transition_physics(
         "correct_forcing_rmse_K",
         "zero_forcing_rmse_K",
         "shuffled_forcing_rmse_K",
+        "forcing_permutation_gap_K",
         "designed_response_gain",
         "designed_response_cosine",
         "predicted_response_rms_K",
@@ -13381,31 +13485,41 @@ def run_one_seed_forcing_transition_physics(
             )
         )
         if should_resample:
-            active_descriptors = _sample_online_problem_descriptors(
+            active_descriptors = _sample_transition_multicontinuation_descriptors(
                 problem,
                 online_rngs,
                 sim_batch,
+                continuations_per_source,
                 grids,
                 time_cfg,
             )
-            active_source_steps, active_source_bins = (
+            source_steps, source_bins = (
                 sample_transition_source_steps(
                     online_rngs.numpy["fv_intervals"],
-                    batch_size=sim_batch,
+                    batch_size=source_states_per_batch,
                     dt=dt,
                     t_final=t_final,
                     source_edges=source_edges,
                 )
             )
-            active_intervals = sample_transition_physics_intervals(
+            source_intervals = sample_transition_physics_intervals(
                 online_rngs.numpy["fv_intervals"],
-                source_steps=active_source_steps,
+                source_steps=source_steps,
                 dt=dt,
                 t_final=t_final,
                 lead_edges=lead_edges,
                 include_anchor_interval=True,
                 intervals_per_cell=intervals_per_cell,
                 consecutive_intervals=consecutive,
+            )
+            active_source_steps = np.repeat(
+                source_steps, continuations_per_source,
+            )
+            active_source_bins = np.repeat(
+                source_bins, continuations_per_source,
+            )
+            active_intervals = _repeat_transition_intervals_by_continuation(
+                source_intervals, continuations_per_source,
             )
         records = _materialize_online_records(
             active_descriptors, X, Y, T_right=300.0, b=float(x_np[-1]),
@@ -13415,7 +13529,9 @@ def run_one_seed_forcing_transition_physics(
         )
         if source_coverage is None:
             source_coverage = _transition_source_coverage(
-                physical_source, data, fast_records,
+                physical_source[::continuations_per_source],
+                data,
+                fast_records,
             )
         source_fields = torch.from_numpy(normalized).unsqueeze(1).to(device)
         model.train()
@@ -13770,6 +13886,10 @@ def run_one_seed_forcing_transition_physics(
             else int(network_gate["matched_budget"])
         ),
         "consecutive_intervals": consecutive,
+        "forcing_continuations_per_source": continuations_per_source,
+        "source_states_per_batch": source_states_per_batch,
+        "transition_cases_per_batch": sim_batch,
+        "pairing_strategy": pairing_strategy,
         "screen_floor_source": compatibility["screen_floor_source"],
         "gradnorm_mode": compatibility["gradnorm_mode"],
         "optimization_uses_solution_fields": False,
