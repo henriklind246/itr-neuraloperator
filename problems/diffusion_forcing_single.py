@@ -24,7 +24,7 @@ FIXED_SPATIAL_FAMILY = "uniform"
 # In-place editing keeps the benchmark name and tensor shapes identical to the
 # old fixed-300 K set, so this string is the only signal that distinguishes a
 # varying-IC dataset from a stale fixed-IC one; bump it on any breaking change.
-PROBLEM_VERSION = "forcing_single_varying_ic_v1"
+PROBLEM_VERSION = "forcing_single_varying_ic_v2"
 IC_MODE = "varying"
 
 
@@ -66,7 +66,6 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
     ) -> list[dict]:
         X = grids["X"]
         Y = grids["Y"]
-        Nx, Ny = X.shape[0], X.shape[1]
         y_grid = grids.get("y_grid")
         if y_grid is None:
             c, d = float(np.min(Y)), float(np.max(Y))
@@ -105,7 +104,7 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
                     f"ic_family {ic_family!r} for sim {i} is not a known family "
                     f"{tuple(IC_FAMILIES)}."
                 )
-            ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+            ic_params = IC_SAMPLERS[ic_family](rng)
             T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
 
             temporal_family = FIXED_TEMPORAL_FAMILY
@@ -145,7 +144,6 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
         )
         X = np.asarray(grids["X"], dtype=np.float64)
         Y = np.asarray(grids["Y"], dtype=np.float64)
-        Nx, Ny = X.shape
         y_grid = np.asarray(grids.get("y_grid", Y[0]), dtype=np.float64)
         c, d = float(y_grid[0]), float(y_grid[-1])
         dt = float(time_cfg["dt"])
@@ -173,7 +171,7 @@ class DiffusionForcingSingleProblem(DiffusionForcingProblem):
             if family not in IC_FAMILIES:
                 raise ValueError(f"unknown IC family {family!r}")
             ic_params = canonical_ic_params(
-                family, IC_SAMPLERS[family](ic_param_rng, Nx=Nx, Ny=Ny),
+                family, IC_SAMPLERS[family](ic_param_rng),
             )
             temporal_params = TEMPORAL_SAMPLERS[FIXED_TEMPORAL_FAMILY](
                 forcing_rng, dt=dt, t_final=t_final, **temporal_window,

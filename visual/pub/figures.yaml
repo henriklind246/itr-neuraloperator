@@ -1,0 +1,297 @@
+# What each publication figure requires. Version controlled.
+#
+# This file is the requirement side only. Which concrete runs satisfy a
+# requirement set is declared in manifest.yaml (user supplied); how a figure is
+# drawn is declared in registry.py. `python -m visual.pub --verify` joins the
+# three and prints the satisfiability table.
+#
+# kind: test_records | train_metrics | ood_per_sim | inverse_csv | checkpoint
+#       | json_report | none
+
+version: 1
+
+requirement_sets:
+
+  # ---------------------------------------------------------------- forward
+  forcing_records:
+    kind: test_records
+    benchmarks: [forcing]
+    representation: temporal_encoder
+    split: test
+    min_seeds: 3
+    schema_min: 2
+    regenerate: >-
+      python scripts/run_train_fixed.py experiment.name=pub_forcing
+      benchmark=forcing representation=temporal_encoder ; then
+      python scripts/write_test_records.py runs/pub_forcing/config0 --seed <s>
+
+  source_records:
+    kind: test_records
+    benchmarks: [source]
+    representation: temporal_encoder
+    split: test
+    min_seeds: 3
+    schema_min: 2
+    regenerate: >-
+      python scripts/run_train_fixed.py experiment.name=pub_source
+      benchmark=source representation=temporal_encoder ; then
+      python scripts/write_test_records.py runs/pub_source/config0 --seed <s>
+
+  source_itr_records:
+    kind: test_records
+    benchmarks: [source_itr]
+    representation: temporal_encoder
+    split: test
+    min_seeds: 3
+    schema_min: 2
+    regenerate: >-
+      python scripts/run_train_fixed.py experiment.name=pub_source_itr
+      benchmark=source_itr representation=temporal_encoder ; then
+      python scripts/write_test_records.py runs/pub_source_itr/config0 --seed <s>
+
+  interfaces_records:
+    kind: test_records
+    benchmarks: [interfaces]
+    representation: temporal_encoder
+    split: test
+    min_seeds: 3
+    schema_min: 2
+    regenerate: >-
+      python scripts/run_train_fixed.py experiment.name=pub_interfaces
+      benchmark=interfaces representation=temporal_encoder ; then
+      python scripts/write_test_records.py runs/pub_interfaces/config0 --seed <s>
+
+  # ---------------------------------------------------------------- training
+  forcing_train:
+    kind: train_metrics
+    benchmarks: [forcing]
+    min_seeds: 3
+    note: normalized-space metrics only; never co-plotted with Kelvin.
+
+  source_train:
+    kind: train_metrics
+    benchmarks: [source]
+    min_seeds: 3
+
+  source_itr_train:
+    kind: train_metrics
+    benchmarks: [source_itr]
+    min_seeds: 3
+
+  interfaces_train:
+    kind: train_metrics
+    benchmarks: [interfaces]
+    min_seeds: 3
+
+  # ---------------------------------------------------------- field rendering
+  forcing_checkpoint:
+    kind: checkpoint
+    benchmarks: [forcing]
+    min_seeds: 1
+
+  source_checkpoint:
+    kind: checkpoint
+    benchmarks: [source]
+    min_seeds: 1
+
+  source_itr_checkpoint:
+    kind: checkpoint
+    benchmarks: [source_itr]
+    min_seeds: 1
+    note: >-
+      needed to render predicted fields and the contact jump; the signature
+      figure evaluates the model, it does not read a precomputed field.
+
+  interfaces_checkpoint:
+    kind: checkpoint
+    benchmarks: [interfaces]
+    min_seeds: 1
+
+  # ----------------------------------------------------------------- inverse
+  inverse_forcing:
+    kind: inverse_csv
+    benchmarks: [forcing]
+    min_seeds: 1
+    schema_min: 0
+    required_columns: [sim_id, n_sensors]
+    regenerate: python scripts/invert.py --benchmark forcing ...
+
+  inverse_forcing_itr:
+    kind: inverse_csv
+    benchmarks: [forcing_itr]
+    min_seeds: 1
+    schema_min: 0
+    required_columns: [sim_id]
+    regenerate: python scripts/invert.py --benchmark forcing_itr ...
+
+  inverse_sensor_sweep:
+    kind: inverse_csv
+    min_seeds: 1
+    schema_min: 0
+    required_columns: [sim_id, n_sensors, noise_seed, init_seed]
+    note: >-
+      requires >= 2 distinct n_sensors values with identical simulations, noise
+      realizations, and initialization seeds paired across counts.
+    regenerate: >-
+      sweep driver over scripts/invert.py --sensor-n-y {4,8,16,32,64} with a
+      fixed (sim, noise_seed, init_seed) grid
+
+  # --------------------------------------------------------------------- ood
+  ood_time:
+    kind: ood_per_sim
+    min_seeds: 3
+    schema_min: 0
+    required_columns: [protocol, sim_id]
+    regenerate: python scripts/run_ood_suite.py ...   # once per model seed
+
+  ood_transfer:
+    kind: ood_per_sim
+    min_seeds: 3
+    schema_min: 0
+    required_columns: [ood_axis, ood_value, sim_id]
+    regenerate: python scripts/run_ood_suite.py ...   # once per model seed
+
+  # ------------------------------------------------------------- conditional
+  rollout_records:
+    kind: test_records
+    min_seeds: 1
+    schema_min: 2
+    note: >-
+      evaluation.rollout.enabled is false in every surviving config; rollout
+      partition records do not exist yet.
+    regenerate: python scripts/run_eval.py <run_dir> evaluation.rollout.enabled=true
+
+  resinv_reports:
+    kind: json_report
+    min_seeds: 1
+    schema_min: 0
+    note: seed_report_r*.json across resolutions, plus the FV drift baseline.
+    regenerate: >-
+      python scripts/fv_convergence_baseline.py ... and the per-resolution
+      seed reports consumed by visual/resinv_plots.py
+
+figures:
+
+  F01_problem_schematic:
+    requires: []
+    metric_space: none
+
+  F02_architecture:
+    requires: []
+    metric_space: none
+
+  F03_learning_curves:
+    requires: [forcing_train, source_train, source_itr_train, interfaces_train]
+    metric_space: normalized
+
+  F04_headline_accuracy:
+    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    # mixed: three Kelvin panels plus one normalized panel carrying the 1%
+    # target line. The target is defined on relative L2, so it cannot be drawn
+    # on a Kelvin axis; each panel is a single metric and is labelled with its
+    # own space.
+    metric_space: mixed
+
+  F05_truth_pred_residual:
+    requires:
+      - forcing_records
+      - source_records
+      - source_itr_records
+      - interfaces_records
+      - forcing_checkpoint
+      - source_checkpoint
+      - source_itr_checkpoint
+      - interfaces_checkpoint
+    metric_space: kelvin
+
+  # interfaces, not source_itr: the signature figure shares one temperature
+  # scale across truth and prediction, and under a localized internal source the
+  # right slab never rises past ~9% of the left, so half of every source /
+  # source_itr panel would be one flat block. See PREFERRED in fig_signature.py.
+  F06_signature:
+    requires: [interfaces_records, interfaces_checkpoint]
+    metric_space: kelvin
+
+  F07_jump_vs_lead:
+    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    metric_space: mixed
+
+  F08_forcing_difficulty:
+    requires: [forcing_records]
+    metric_space: kelvin
+
+  F09_forcing_cases:
+    requires: [forcing_records, forcing_checkpoint]
+    metric_space: kelvin
+
+  F10_source_difficulty:
+    requires: [source_records]
+    metric_space: kelvin
+
+  F11_source_cases:
+    requires: [source_records, source_checkpoint]
+    metric_space: kelvin
+
+  F12_source_itr_void:
+    requires: [source_itr_records]
+    metric_space: kelvin
+
+  F13_source_itr_cases:
+    requires: [source_itr_records, source_itr_checkpoint]
+    metric_space: kelvin
+
+  F14_interfaces_difficulty:
+    requires: [interfaces_records]
+    metric_space: kelvin
+
+  F15_interfaces_profiles:
+    requires: [interfaces_records, interfaces_checkpoint]
+    metric_space: kelvin
+
+  F16_inverse_forcing_recovery:
+    requires: [inverse_forcing]
+    metric_space: mixed
+
+  F17_inverse_forcing_itr:
+    requires: [inverse_forcing_itr]
+    metric_space: mixed
+
+  F18_sensor_count:
+    requires: [inverse_sensor_sweep]
+    metric_space: mixed
+
+  F19_ood_time_protocols:
+    requires: [ood_time]
+    # mixed: relative L2 carries the protocol comparison across two orders of
+    # magnitude, where a Kelvin axis compresses the two controlled protocols
+    # onto the baseline; the interface panel is Kelvin. Each panel is a single
+    # metric and is labelled with its own space.
+    metric_space: mixed
+
+  F20_ood_transfer:
+    requires: [ood_transfer]
+    # relative L2 throughout, defined as a ratio of Kelvin sums, so the three
+    # shift axes stay comparable despite different absolute temperature scales.
+    metric_space: normalized
+
+  F21_tail_reliability:
+    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    # mixed: Kelvin order statistics plus the exceedance of the 1% relative
+    # target, which is the only threshold the project has actually declared.
+    metric_space: mixed
+
+  F22_surrogate_fidelity:
+    requires: [inverse_forcing]
+    metric_space: mixed
+
+  F23_direct_vs_autoregressive:
+    requires: [rollout_records]
+    metric_space: kelvin
+
+  F24_resolution_invariance:
+    requires: [resinv_reports]
+    metric_space: kelvin
+
+  F25_mms_convergence:
+    requires: []
+    metric_space: none

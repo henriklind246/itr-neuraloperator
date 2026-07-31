@@ -13,7 +13,13 @@ from problems.forcing import (
     _sample_a,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
-from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
+from src.physics.init_conditions import (
+    IC_BUILDER_SCHEMA_VERSION,
+    IC_SAMPLERS,
+    ONLINE_IC_SAMPLER_VERSION,
+    build_ic,
+    sample_ic_family,
+)
 
 # ----- representation constants (canonical home for the diffusion benchmark) ----
 
@@ -22,9 +28,13 @@ from src.physics.init_conditions import IC_SAMPLERS, build_ic, sample_ic_family
 K_SLAB = 1.0
 
 # Right Dirichlet wall temperature (K). The IC builder pins the right column to
-# this and tapers the deviation to zero slope at every edge, so sampled ICs are
-# BC-compatible (right Dirichlet 300, left/top/bottom zero-Neumann).
+# this and tapers the deviation into that wall; the left/top/bottom zero-Neumann
+# conditions are satisfied by the builders themselves.
 T_RIGHT = 300.0
+
+# Bump whenever the sampled IC distribution changes; stale datasets then hard
+# fail instead of silently mixing distributions.
+PROBLEM_VERSION = "diffusion_neumann_ic_v1"
 
 COND_STATIC_DIM = 2  # [t_bar_norm, t_s_norm]; no material/forcing conditioning
 
@@ -54,6 +64,9 @@ class DiffusionProblem(ProblemSpec):
     """
 
     name = "diffusion"
+    problem_version = PROBLEM_VERSION
+    online_sampler_version = ONLINE_IC_SAMPLER_VERSION
+    ic_builder_version = IC_BUILDER_SCHEMA_VERSION
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -84,7 +97,6 @@ class DiffusionProblem(ProblemSpec):
     ) -> list[dict]:
         X = grids["X"]
         Y = grids["Y"]
-        Nx, Ny = X.shape[0], X.shape[1]
         b_temp = float(time_cfg.get("b", 1.0))
         T_right = float(time_cfg.get("T_right", T_RIGHT))
         num_sims = int(time_cfg["num_sims"])
@@ -92,7 +104,7 @@ class DiffusionProblem(ProblemSpec):
         sim_params = []
         for _ in range(num_sims):
             ic_family = sample_ic_family(rng)
-            ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+            ic_params = IC_SAMPLERS[ic_family](rng)
             T0 = build_ic(
                 ic_family, ic_params, X, Y,
                 T_right=T_right, b=b_temp,

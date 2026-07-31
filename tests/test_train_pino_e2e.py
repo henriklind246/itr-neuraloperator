@@ -22,7 +22,16 @@ import numpy as np
 import pytest
 import torch
 import src.operators.train_pino as train_pino_mod
-from src.physics.init_conditions import IC_BUILDER_SCHEMA_VERSION, IC_SAMPLERS, build_ic
+from problems.diffusion_forcing_single import (
+    PROBLEM_VERSION as FORCING_IC_PROBLEM_VERSION,
+)
+from problems.interfaces import PROBLEM_VERSION as INTERFACES_PROBLEM_VERSION
+from src.physics.init_conditions import (
+    IC_BUILDER_SCHEMA_VERSION,
+    IC_SAMPLERS,
+    ONLINE_IC_SAMPLER_VERSION,
+    build_ic,
+)
 
 from src.operators.train_pino import (
     _adapt_causal_eps,
@@ -66,6 +75,14 @@ def _write_synthetic_diffusion(tmp_path, num_sims=16, Nt=6, Nx=20, Ny=20):
     np.save(tmp_path / "t_grid.npy", t_grid)
     np.save(tmp_path / "dt.npy", np.array(float(t_grid[1] - t_grid[0])))
     return traj
+
+
+def _write_meta(tmp_path, problem_version):
+    np.save(
+        tmp_path / "meta.npy",
+        np.asarray({"problem_version": problem_version}, dtype=object),
+        allow_pickle=True,
+    )
 
 
 def _config(tmp_path):
@@ -128,10 +145,12 @@ def _write_synthetic_interfaces(tmp_path, num_sims=12, Nt=3, Nx=20, Ny=20):
     traj = _write_synthetic_diffusion(tmp_path, num_sims, Nt, Nx, Ny)
     x_grid = np.load(tmp_path / "x_grid.npy")
     faces = [(x_grid[8] + x_grid[9]) / 2.0, (x_grid[10] + x_grid[11]) / 2.0]
+    families = sorted(IC_SAMPLERS)
     sim_params = []
     for i in range(num_sims):
         sim_params.append({
             "T0": traj[i, 0].copy(),
+            "ic_family": families[i % len(families)],
             "interface_x": float(faces[i % 2]),
             "R_c": 0.2 if i % 2 == 0 else 0.7,
             "temporal_family": "sin",
@@ -143,6 +162,7 @@ def _write_synthetic_interfaces(tmp_path, num_sims=12, Nt=3, Nx=20, Ny=20):
             "spatial_params": {},
         })
     np.save(tmp_path / "sim_params.npy", np.asarray(sim_params, dtype=object))
+    _write_meta(tmp_path, INTERFACES_PROBLEM_VERSION)
 
 
 def _interface_config(tmp_path):
@@ -1124,7 +1144,7 @@ def _write_synthetic_forcing_ic(tmp_path, num_sims=24, Nt=6, Nx=20, Ny=20):
     sim_params = np.array(records, dtype=object)
 
     meta = {
-        "problem_version": "forcing_single_varying_ic_v1",
+        "problem_version": FORCING_IC_PROBLEM_VERSION,
         "ic_mode": "varying",
         "ic_families": list(_IC_FAMILIES),
     }
@@ -1359,9 +1379,7 @@ def test_forcing_ic_supervised_e2e_skips_every_physics_path(tmp_path, monkeypatc
     assert checkpoint["best_validation"]["val_gnrmse"] >= 0.0
     summary = json.loads((run_dir / "final_metrics.json").read_text())
     assert summary["test_set_evaluated"] is False
-    assert summary["data_signature"]["problem_version"] == (
-        "forcing_single_varying_ic_v1"
-    )
+    assert summary["data_signature"]["problem_version"] == FORCING_IC_PROBLEM_VERSION
 
 
 def test_forcing_ic_supervised_resume_is_exact(tmp_path, monkeypatch):
@@ -1458,7 +1476,7 @@ def test_canonical_online_keys_ignore_layout_order_and_runtime_fields():
 def test_online_descriptor_roundtrip_and_normalized_target_identity(tmp_path):
     x = np.linspace(0.0, 1.0, 12)
     X, Y = np.meshgrid(x, x, indexing="ij")
-    params = IC_SAMPLERS["grf_2d"](np.random.default_rng(4), Nx=12, Ny=12)
+    params = IC_SAMPLERS["grf_2d"](np.random.default_rng(4))
     raw = {
         "T0": build_ic("grf_2d", params, X, Y, T_right=300.0),
         "ic_family": "grf_2d",
@@ -1568,7 +1586,10 @@ def test_e2e_forcing_ic_smoke_finite(tmp_path):
     assert float(ckpt["sigma_global"]) > 0.0
     # The two-branch runner carries independent online streams and descriptors.
     assert ckpt.get("ic_rng_state") is not None
-    assert ckpt["online_sampling_signature"]["sampler_version"] == "online_balanced_ic_v1"
+    assert (
+        ckpt["online_sampling_signature"]["sampler_version"]
+        == ONLINE_IC_SAMPLER_VERSION
+    )
     assert ckpt.get("online_rng_state") is not None
     assert ckpt["online_cache"]["batch_key"]
     assert all("T0" not in record for record in ckpt["online_cache"]["records"])

@@ -1,0 +1,45 @@
+# Which runs and tables satisfy the requirement sets declared in figures.yaml.
+#
+# The four forward runs pair an MSI-trained checkpoint with a locally generated
+# evaluation set drawn from RNG family 7 (data/pub_eval/*/meta.npy). Family 0 is
+# what the checkpoints trained on, and the two families share no latent draw, so
+# these sets are genuinely held out. This is not the same thing as the MSI test
+# split, and the sidecars say so.
+#
+# Known, deliberate gaps -- every one of these surfaces as a Degradation rather
+# than being papered over:
+#   * one seed per benchmark, so no across-seed spread (TOO_FEW_SEEDS)
+#   * source_itr is a `bins` checkpoint while figures.yaml requires
+#     temporal_encoder (REPRESENTATION_MISMATCH); to be retrained before
+#     publication
+#   * no *_train entries: learning curves are produced from the real MSI
+#     training metrics, not from these checkpoints
+
+sources:
+  forcing_records:
+    - run: runs/pub_forcing/config0/seed32
+  source_records:
+    - run: runs/pub_source/config0/seed32
+  source_itr_records:
+    - run: runs/pub_source_itr/config0/seed42
+  interfaces_records:
+    - run: runs/pub_interfaces/config0/seed32
+
+  forcing_checkpoint:
+    - run: runs/pub_forcing/config0/seed32
+  source_checkpoint:
+    - run: runs/pub_source/config0/seed32
+  source_itr_checkpoint:
+    - run: runs/pub_source_itr/config0/seed42
+  interfaces_checkpoint:
+    - run: runs/pub_interfaces/config0/seed32
+
+  inverse_forcing:
+    - table: results_inverse.csv
+  inverse_forcing_itr:
+    - table: runs/inverse_forcing_itr_checkpoint12/inverse_forcing_itr_10.csv
+
+  ood_time:
+    - table: visual/ood/forcing_time/ood_per_sim.csv
+  ood_transfer:
+    - table: visual/ood/interfaces/ood_per_sim.csv

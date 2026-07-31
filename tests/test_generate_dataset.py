@@ -1,10 +1,12 @@
 import numpy as np
 
 from data.generate_dataset import (
+    IC_ASSIGN_SEED,
     build_sim_params,
     generate_sim_data,
     generate_lhs_samples,
     main as generate_main,
+    resolve_seed_streams,
 )
 from src.physics.boundary_forcing import TEMPORAL_FAMILIES
 
@@ -248,3 +250,101 @@ class TestGenerateSimData:
             assert entry["ic_params"] == {"T0_offset": 0.0}
             assert entry["T0"].shape == (100, 100)
             np.testing.assert_allclose(entry["T0"], 300.0)
+
+
+def _forcing_latents(sim_params) -> list[tuple]:
+    """Forcing/IC identity of each sim, ignoring the LHS-drawn R_c."""
+    return [
+        (
+            entry["temporal_family"],
+            tuple(sorted((k, float(np.asarray(v).ravel()[0]))
+                         for k, v in entry["temporal_params"].items()
+                         if np.isscalar(v) or np.asarray(v).size)),
+            entry["spatial_family"],
+        )
+        for entry in sim_params
+    ]
+
+
+def _generate(tmp_path, name, **kwargs):
+    out = tmp_path / name
+    generate_sim_data(num_sims=kwargs.pop("num_sims", 3), save_stride=2,
+                      nx=12, ny=12, save_dir=out, **kwargs)
+    return np.load(out / "sim_params.npy", allow_pickle=True), out
+
+
+class TestResolveSeedStreams:
+    def test_family_zero_reproduces_the_historical_seeds(self):
+        assert resolve_seed_streams(0) == {
+            "ic_params": 0, "forcing_profile": 1, "lhs": 0,
+            "ic_assign": IC_ASSIGN_SEED,
+        }
+
+    def test_distinct_families_share_no_seed(self):
+        a = set(resolve_seed_streams(0).values())
+        b = set(resolve_seed_streams(7).values())
+        assert not (a & b)
+
+    def test_main_forwards_the_flag(self, tmp_path):
+        calls = {}
+        generate_main(["--rng-seed", "7", "--save-dir", str(tmp_path)],
+                      generate_fn=lambda **kw: calls.update(kw))
+        assert calls["rng_seed"] == 7
+
+    def test_flag_defaults_to_the_historical_family(self, tmp_path):
+        calls = {}
+        generate_main(["--save-dir", str(tmp_path)],
+                      generate_fn=lambda **kw: calls.update(kw))
+        assert calls["rng_seed"] == 0
+
+
+class TestDrawFamilyDisjointness:
+    def test_default_family_repeats_forcing_draws_across_set_sizes(self, tmp_path):
+        """Why --rng-seed exists.
+
+        The per-sim forcing/IC streams are consumed sequentially, so sim i of a
+        small default-family set is the same forcing draw as sim i of the large
+        default-family training set. Regenerating locally at a different
+        num_sims therefore does NOT produce held-out simulations.
+        """
+        small, _ = _generate(tmp_path, "small", num_sims=3)
+        large, _ = _generate(tmp_path, "large", num_sims=6)
+        assert _forcing_latents(small) == _forcing_latents(large)[:3]
+
+    def test_non_default_family_shares_no_forcing_draw(self, tmp_path):
+        base, _ = _generate(tmp_path, "base", num_sims=4, rng_seed=0)
+        held, _ = _generate(tmp_path, "held", num_sims=4, rng_seed=7)
+        overlap = set(_forcing_latents(base)) & set(_forcing_latents(held))
+        assert not overlap
+
+    def test_non_default_family_shares_no_R_c(self, tmp_path):
+        base, _ = _generate(tmp_path, "base", num_sims=4, rng_seed=0)
+        held, _ = _generate(tmp_path, "held", num_sims=4, rng_seed=7)
+        assert not (
+            {round(float(e["R_c"]), 9) for e in base}
+            & {round(float(e["R_c"]), 9) for e in held}
+        )
+
+    def test_a_family_is_reproducible(self, tmp_path):
+        a, _ = _generate(tmp_path, "a", num_sims=3, rng_seed=7)
+        b, _ = _generate(tmp_path, "b", num_sims=3, rng_seed=7)
+        assert _forcing_latents(a) == _forcing_latents(b)
+        np.testing.assert_allclose([e["R_c"] for e in a], [e["R_c"] for e in b])
+
+    def test_R_c_stays_in_range_off_the_default_family(self, tmp_path):
+        held, _ = _generate(tmp_path, "held", num_sims=8, rng_seed=7)
+        values = np.array([float(e["R_c"]) for e in held])
+        assert values.min() >= RC_RANGE[0]
+        assert values.max() <= RC_RANGE[1]
+
+
+class TestSeedProvenance:
+    def test_non_default_family_records_its_seed(self, tmp_path):
+        _, out = _generate(tmp_path, "held", num_sims=2, rng_seed=7)
+        meta = np.load(out / "meta.npy", allow_pickle=True).item()
+        assert meta["rng_seed"] == 7
+        assert meta["seed_streams"] == resolve_seed_streams(7)
+
+    def test_default_family_writes_no_meta_for_an_unversioned_spec(self, tmp_path):
+        _, out = _generate(tmp_path, "base", num_sims=2, rng_seed=0)
+        assert not (out / "meta.npy").exists()

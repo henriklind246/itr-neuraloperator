@@ -1,9 +1,9 @@
 """Core-computation tests for scripts/diffusion_ic_boundary_compat.py.
 
 Covers the finite-difference wall-normal derivatives, the sign convention of the
-left-wall mismatch, and that the real IC builders (with their boundary taper)
-produce t=0 fields whose wall-normal derivatives are ~0 -- consistent with the
-ramp guaranteeing q_L(y, 0) = 0.
+left-wall mismatch, and that the real IC builders (even about the three Neumann
+walls by construction) produce t=0 fields whose wall-normal derivatives are ~0 --
+consistent with the ramp guaranteeing q_L(y, 0) = 0.
 """
 
 from __future__ import annotations
@@ -107,24 +107,25 @@ def test_qL_at_t0_nonzero_without_ramp():
 
 @pytest.mark.parametrize("family", _FAMILIES)
 def test_real_ic_builder_normal_derivative_converges(family):
-    # The boundary taper (boundary_taper in init_conditions.py) drives every
-    # deviation's value AND wall-normal derivative to zero CONTINUOUSLY at each
-    # wall. The one-sided finite difference therefore does not vanish on a finite
-    # grid -- it picks up the near-wall curvature -- but it must SHRINK as the
-    # grid refines (the continuous derivative it approximates is 0). Refining the
-    # grid must reduce the top/bottom/left wall-normal derivative magnitudes.
+    # Every builder is even about x=0, y=0, y=1 (exactly for the cosine families,
+    # to ~1e-9 per unit |A| for the truncated hot-spot images), so the CONTINUOUS
+    # wall-normal derivative is 0 there. The taper is x-only and identically 1
+    # near x=0, so it does not contribute. What this script measures is a
+    # ONE-SIDED difference, whose error is h/2 * f''(wall) -- first order in h.
+    # Refining 51 -> 201 nodes quarters h, so the mismatch must drop by ~4x.
     def wall_maxes(n: int) -> dict[str, float]:
         x, y = _grid(n)
         X, Y = np.meshgrid(x, y, indexing="ij")
         rng = np.random.default_rng(0)
-        params = IC_SAMPLERS[family](rng, Nx=n, Ny=n)
+        params = IC_SAMPLERS[family](rng)
         T0 = build_ic(family, params, X, Y, T_right=300.0)
-        m = ic_boundary_mismatch(T0, x, y, np.zeros(n), k=1.0)
-        return m
+        return ic_boundary_mismatch(T0, x, y, np.zeros(n), k=1.0)
 
     coarse = wall_maxes(51)
     fine = wall_maxes(201)
     for wall in ("top", "bottom", "left"):
-        # uniform_2d has a constant deviation whose tapered top/bottom derivative
-        # is already tiny; require monotone non-increase with a small tolerance.
-        assert fine[wall] <= coarse[wall] * 0.9 + 1e-6
+        # uniform_2d's deviation is constant, so its mismatch is already at
+        # round-off and cannot shrink further; the additive floor covers that.
+        assert fine[wall] <= 0.5 * coarse[wall] + 1e-6, (
+            family, wall, coarse[wall], fine[wall],
+        )

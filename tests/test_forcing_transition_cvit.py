@@ -9,6 +9,9 @@ import torch.nn as nn
 
 import src.operators.train_pino as train_pino
 import scripts.run_train_pino as run_train_pino
+from problems.diffusion_forcing_single import (
+    PROBLEM_VERSION as FORCING_IC_PROBLEM_VERSION,
+)
 from src.operators.cvit import (
     ForcingTransitionCViT,
     TransitionEncoding,
@@ -573,7 +576,7 @@ def _write_transition_dataset(path, num_sims=16):
         path / "meta.npy",
         np.asarray(
             {
-                "problem_version": "forcing_single_varying_ic_v1",
+                "problem_version": FORCING_IC_PROBLEM_VERSION,
                 "ic_mode": "varying",
                 "ic_families": list(IC_FAMILIES),
             },

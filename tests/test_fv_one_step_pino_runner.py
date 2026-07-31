@@ -24,8 +24,13 @@ import numpy as np
 import pytest
 import torch
 
-from problems.interfaces import K_LEFT, K_RIGHT
+from problems.interfaces import (
+    K_LEFT,
+    K_RIGHT,
+    PROBLEM_VERSION as INTERFACES_PROBLEM_VERSION,
+)
 from src.physics.boundary_forcing import A_REF_FLUX
+from src.physics.init_conditions import IC_SAMPLERS
 from src.operators.train_pino import (
     T_RIGHT,
     _fixed_interval_indices,
@@ -67,11 +72,18 @@ def _write_synthetic_interfaces(tmp_path, num_sims=8, Nt=6, Nx=20, Ny=20, t_fina
     np.save(tmp_path / "y_grid.npy", y_grid)
     np.save(tmp_path / "t_grid.npy", t_grid)
     np.save(tmp_path / "dt.npy", np.array(float(t_grid[1] - t_grid[0])))
+    np.save(
+        tmp_path / "meta.npy",
+        np.asarray({"problem_version": INTERFACES_PROBLEM_VERSION}, dtype=object),
+        allow_pickle=True,
+    )
     faces = [(x_grid[8] + x_grid[9]) / 2.0, (x_grid[10] + x_grid[11]) / 2.0]
+    families = sorted(IC_SAMPLERS)
     sim_params = []
     for i in range(num_sims):
         sim_params.append({
             "T0": traj[i, 0].copy(),
+            "ic_family": families[i % len(families)],
             "interface_x": float(faces[i % 2]),
             "R_c": 0.2 if i % 2 == 0 else 0.7,
             "temporal_family": "sin",

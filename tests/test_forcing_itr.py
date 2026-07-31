@@ -217,6 +217,16 @@ def test_physical_time_and_interface_pair_resolution_cross_grid():
     with pytest.raises(ValueError, match="not uniquely present"):
         invert.resolve_observation_times(t_grid, [0.08])
 
+    t_grid_float32 = np.array([0.0, 0.07, 0.15, 0.30], dtype=np.float32)
+    indices, resolved_float32 = invert.resolve_observation_times(
+        t_grid_float32, [0.07, 0.15, 0.30]
+    )
+    assert indices == [1, 2, 3]
+    indices, _ = invert.resolve_observation_times(
+        t_grid, resolved_float32
+    )
+    assert indices == [1, 2, 3]
+
     requested_y = np.linspace(0.1, 0.9, 8)
     mask_a, meta_a = invert.build_interface_pair_mask(
         np.linspace(0.0, 1.0, 100),

@@ -21,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from visual import inverse_plots as ip
+from visual._common import _plots_for_group
 from visual.cli import _parse_benchmark_path_tokens
 
 
@@ -296,6 +297,16 @@ def test_forcing_itr_four_plots_render_with_artifacts(
     )
     for path in paths:
         assert path.exists() and path.stat().st_size > 0
+
+
+def test_forcing_itr_plots_are_registered_for_inverse_group():
+    names = set(_plots_for_group("inverse"))
+    assert {
+        "forcing_itr_parameter_recovery",
+        "forcing_itr_identifiability",
+        "forcing_itr_surrogate_fidelity",
+        "forcing_itr_uncertainty",
+    } <= names
 
 
 def test_source_itr_identifiability_falls_back_without_artifacts(tmp_path,

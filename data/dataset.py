@@ -795,6 +795,33 @@ def load_dataset_meta(t_grid_path: str | Path) -> dict | None:
     return dict(np.load(meta_path, allow_pickle=True).item())
 
 
+def assert_dataset_problem_version(spec, t_grid_path: str | Path) -> dict | None:
+    """Fail loudly when a versioned benchmark is pointed at a stale dataset.
+
+    Benchmarks whose sampled distribution changed in place keep the same name and
+    tensor shapes, so ``problem_version`` in ``meta.npy`` is the only signal that
+    distinguishes a regenerated dataset from an old one. Specs without the
+    attribute are unversioned and pass through.
+    """
+    expected = getattr(spec, "problem_version", None)
+    meta = load_dataset_meta(t_grid_path)
+    if expected is None:
+        return meta
+    name = getattr(spec, "name", "?")
+    if meta is None:
+        raise ValueError(
+            f"Benchmark {name!r} expects problem_version={expected!r} but the "
+            f"dataset has no meta.npy; regenerate it with data/generate_dataset.py."
+        )
+    found = meta.get("problem_version")
+    if found != expected:
+        raise ValueError(
+            f"Dataset problem_version={found!r} != expected {expected!r} for "
+            f"benchmark {name!r}; the dataset is stale — regenerate it."
+        )
+    return meta
+
+
 # ------- GLOBAL NORMALIZATION STATISTICS -------
 
 def compute_global_stats(

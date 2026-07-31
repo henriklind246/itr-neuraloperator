@@ -463,15 +463,12 @@ def preregistered_max_lead(
 def _fixed_gate_parameters(
     family: str,
     *,
-    grid_size: int,
     dt: float,
     seed: int,
 ) -> tuple[dict, dict]:
     ic_rng = np.random.default_rng(int(seed))
     forcing_rng = np.random.default_rng(int(seed) + 10_000)
-    ic_params = IC_SAMPLERS[family](
-        ic_rng, Nx=int(grid_size), Ny=int(grid_size),
-    )
+    ic_params = IC_SAMPLERS[family](ic_rng)
     forcing_params = TEMPORAL_SAMPLERS["sin"](
         forcing_rng,
         dt=float(dt),
@@ -502,7 +499,7 @@ def build_homogeneous_gate_case(
     axis = np.linspace(0.0, 1.0, int(grid_size), dtype=np.float64)
     X, Y = np.meshgrid(axis, axis, indexing="ij")
     ic_params, forcing_params = _fixed_gate_parameters(
-        family, grid_size=grid_size, dt=dt, seed=seed,
+        family, dt=dt, seed=seed,
     )
     source = np.asarray(
         build_ic(family, ic_params, X, Y, T_right=300.0),

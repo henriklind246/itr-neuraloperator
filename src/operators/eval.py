@@ -872,6 +872,7 @@ def write_test_records(
     time_norm_horizon: float | None = None,
     target_times: list[float] | None = None,
     protocols: list[str] | None = None,
+    device: str | None = None,
 ) -> Path:
     """Write one per-(sim_id, s, j) test-pair record row for paper figures.
 
@@ -885,7 +886,11 @@ def write_test_records(
     """
     seed_dir, ckpt = _select_seed_checkpoint(Path(run_root), seed)
     config = ckpt["conf"]
-    device = resolve_device(config.get("training", {}).get("device", "auto"))
+    # The checkpoint bakes in the device it trained on, and "auto" resolves to
+    # CPU off CUDA, so re-scoring a checkpoint on a workstation needs an
+    # override to reach an available accelerator.
+    device_str = device if device is not None else config.get("training", {}).get("device", "auto")
+    device = resolve_device(device_str)
     rollout_options = rollout_options_from_config(
         config,
         enabled=rollout_enabled,

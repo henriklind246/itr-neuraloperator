@@ -38,6 +38,10 @@ from src.physics.init_conditions import (
 RC_RANGE = (0.05, 1.0)
 INTERFACE_X_RANGE = (0.2, 0.8)
 
+# Bump whenever the sampled IC distribution changes; stale datasets then hard
+# fail instead of silently mixing distributions.
+PROBLEM_VERSION = "interfaces_neumann_ic_v1"
+
 COND_STATIC_DIM = 4
 A_AMP_REF = float(SIN_AMP_RANGE[1])
 K_LEFT = 2.0
@@ -161,6 +165,7 @@ class InterfacesProblem(ProblemSpec):
     """
 
     name = "interfaces"
+    problem_version = PROBLEM_VERSION
     online_sampler_version = ONLINE_IC_SAMPLER_VERSION
     ic_builder_version = IC_BUILDER_SCHEMA_VERSION
 
@@ -206,7 +211,7 @@ class InterfacesProblem(ProblemSpec):
         Y = grids["Y"]
         x_grid = grids["x_grid"]
         y_grid = grids["y_grid"]
-        Nx, Ny = X.shape[0], X.shape[1]
+        Nx = X.shape[0]
         a = float(x_grid[0])
         b = float(x_grid[-1])
         c = float(y_grid[0])
@@ -233,7 +238,7 @@ class InterfacesProblem(ProblemSpec):
         return [
             self._build_sim_param(
                 float(R_c_values[i]), float(interface_x_values[i]),
-                rng, rng_profile, X, Y, Nx=Nx, Ny=Ny, dt=dt, t_final=t_final,
+                rng, rng_profile, X, Y, dt=dt, t_final=t_final,
                 b_temp=b_temp, T_right=T_right, c=c, d=d,
                 temporal_window=temporal_window,
             )
@@ -249,8 +254,6 @@ class InterfacesProblem(ProblemSpec):
         X: np.ndarray,
         Y: np.ndarray,
         *,
-        Nx: int,
-        Ny: int,
         dt: float,
         t_final: float,
         b_temp: float,
@@ -266,7 +269,7 @@ class InterfacesProblem(ProblemSpec):
         the IC family, forcing family, and RNG consumption order stay identical.
         """
         ic_family = sample_ic_family(rng) if ic_family is None else str(ic_family)
-        ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+        ic_params = IC_SAMPLERS[ic_family](rng)
         if canonical_params:
             ic_params = canonical_ic_params(ic_family, ic_params)
         T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
@@ -325,7 +328,7 @@ class InterfacesProblem(ProblemSpec):
         Y = grids["Y"]
         x_grid = grids["x_grid"]
         y_grid = grids["y_grid"]
-        Nx, Ny = X.shape[0], X.shape[1]
+        Nx = X.shape[0]
         a = float(x_grid[0])
         b = float(x_grid[-1])
         c = float(y_grid[0])
@@ -357,7 +360,7 @@ class InterfacesProblem(ProblemSpec):
             self._build_sim_param(
                 float(R_c_values[i]), float(interface_x_values[i]),
                 ic_param_rng, forcing_rng, X, Y,
-                Nx=Nx, Ny=Ny, dt=dt, t_final=t_final,
+                dt=dt, t_final=t_final,
                 b_temp=b_temp, T_right=T_right, c=c, d=d,
                 temporal_window=temporal_window,
                 ic_family=(
@@ -624,7 +627,7 @@ class InterfacesProblem(ProblemSpec):
         # Shared background reused by every swept value of this repeat.
         R_c = float(rng.uniform(*RC_RANGE))
         ic_family = sample_ic_family(rng)
-        ic_params = IC_SAMPLERS[ic_family](rng, Nx=Nx, Ny=Ny)
+        ic_params = IC_SAMPLERS[ic_family](rng)
         T0 = build_ic(ic_family, ic_params, X, Y, T_right=T_right, b=b_temp)
 
         x_lo, x_hi = INTERFACE_X_RANGE

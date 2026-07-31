@@ -1437,12 +1437,11 @@ def plot_ic_uniform_progression(save_path: str | Path | None = None) -> None:
 
 
 def plot_ic_random_sinusoid_progression(save_path: str | Path | None = None) -> None:
-    """Random-sinusoid IC at low / mean / high amplitude (fixed wavenumbers/phases)."""
+    """Random-sinusoid IC at low / mean / high amplitude (fixed wavenumbers)."""
     rng = np.random.default_rng(_IC_PROG_FIXED_SEED)
     N = 4
-    nx_list = [int(v) for v in rng.integers(1, SINU_KMAX + 1, size=N)]
+    nx_list = [float(v) for v in rng.uniform(1.0, SINU_KMAX, size=N)]
     ny_list = [int(v) for v in rng.integers(1, SINU_KMAX + 1, size=N)]
-    phi_list = [float(v) for v in rng.uniform(0.0, 2.0 * np.pi, size=N)]
 
     lo, hi = SINU_AMP_RANGE
     amplitudes = [float(lo), 0.5 * (lo + hi), float(hi)]
@@ -1452,7 +1451,6 @@ def plot_ic_random_sinusoid_progression(save_path: str | Path | None = None) -> 
             "A_list": [scale] * N,
             "nx_list": nx_list,
             "ny_list": ny_list,
-            "phi_list": phi_list,
         }
 
     panels = [(f"A = {amp:.1f}", make_params(amp)) for amp in amplitudes]
@@ -1465,7 +1463,7 @@ def plot_ic_random_sinusoid_progression(save_path: str | Path | None = None) -> 
 
 
 def plot_ic_grf_progression(save_path: str | Path | None = None) -> None:
-    """GRF IC at low / log-mean / high correlation length (fixed sigma, wn_seed)."""
+    """Random-field IC at low / log-mean / high correlation length (fixed sigma, wn_seed)."""
     lo, hi = GRF_ELL_RANGE
     sigma_fixed = 10.0
     wn_seed = _IC_PROG_FIXED_SEED
@@ -1478,7 +1476,10 @@ def plot_ic_grf_progression(save_path: str | Path | None = None) -> None:
     _render_ic_progression(
         "grf_2d", panels,
         name="ic_grf_progression",
-        suptitle=f"GRF IC progression — correlation length sweep (sigma={sigma_fixed:.1f})",
+        suptitle=(
+            "Random-field IC progression — correlation length sweep "
+            f"(sigma={sigma_fixed:.1f})"
+        ),
         save_path=save_path,
     )
 

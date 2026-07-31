@@ -22,6 +22,7 @@ import torch
 from omegaconf import OmegaConf
 
 from data.dataset import (
+    assert_dataset_problem_version,
     compute_global_stats,
     load_dataset_meta,
     load_ramp_seconds,
@@ -823,20 +824,7 @@ def load_diffusion_data(config: dict) -> dict[str, Any]:
     spec = problem_from_config(config)
     expected_version = getattr(spec, "problem_version", None)
     if expected_version is not None:
-        meta = load_dataset_meta(config["data"]["t_grid_path"])
-        if meta is None:
-            raise ValueError(
-                f"Benchmark {getattr(spec, 'name', '?')!r} expects "
-                f"problem_version={expected_version!r} but the dataset has no "
-                f"meta.npy; regenerate it with data/generate_dataset.py."
-            )
-        found_version = meta.get("problem_version")
-        if found_version != expected_version:
-            raise ValueError(
-                f"Dataset problem_version={found_version!r} != expected "
-                f"{expected_version!r} for benchmark {getattr(spec, 'name', '?')!r}; "
-                f"the dataset is stale — regenerate it."
-            )
+        assert_dataset_problem_version(spec, config["data"]["t_grid_path"])
         sim_params = np.load(
             Path(config["data"]["trajectories.npy"]).parent / "sim_params.npy",
             allow_pickle=True,

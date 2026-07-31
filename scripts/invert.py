@@ -141,18 +141,28 @@ def resolve_observation_times(
     atol: float = 1e-8,
 ) -> tuple[list[int], np.ndarray]:
     """Resolve physical observation times without interpolation or substitution."""
-    grid = np.asarray(t_grid, dtype=np.float64)
+    stored_grid = np.asarray(t_grid)
+    grid = stored_grid.astype(np.float64, copy=False)
+    scale = max(
+        1.0,
+        float(np.max(np.abs(grid))),
+        max((abs(float(value)) for value in requested_times), default=0.0),
+    )
+    effective_atol = max(
+        float(atol), 0.5 * np.finfo(np.float32).eps * scale
+    )
     indices: list[int] = []
     resolved: list[float] = []
     for requested in requested_times:
         matches = np.flatnonzero(
-            np.isclose(grid, float(requested), rtol=0.0, atol=float(atol))
+            np.isclose(grid, float(requested), rtol=0.0, atol=effective_atol)
         )
         if matches.size != 1:
             nearest = float(grid[int(np.argmin(np.abs(grid - float(requested))))])
             raise ValueError(
                 f"requested observation time {float(requested):g} is not uniquely "
-                f"present in t_grid within atol={atol:g}; nearest is {nearest:g}."
+                f"present in t_grid within atol={effective_atol:g}; "
+                f"nearest is {nearest:g}."
             )
         idx = int(matches[0])
         if idx == 0:
@@ -1292,9 +1302,11 @@ def _profile_refit(
     lbfgs.step(closure)
 
     with torch.no_grad():
-        theta = adapter.theta_profile(u, fixed_index, fixed_value).detach().cpu()
-        final = float(neg_log_likelihood(model, obs, theta, sigma_eff2, adapter))
-    return final, theta
+        theta_device = adapter.theta_profile(u, fixed_index, fixed_value)
+        final = float(
+            neg_log_likelihood(model, obs, theta_device, sigma_eff2, adapter)
+        )
+    return final, theta_device.detach().cpu()
 
 
 @dataclass

@@ -14,10 +14,19 @@ Because the startup ramp is a smoothstep with ``ramp_envelope(0)=0`` whenever
 ``t_ramp>0``, ``q_L(y,0)`` is expected to be identically 0; this script checks
 that explicitly, so the left-wall condition then reduces to ``d_x T0|_{x=0} ~ 0``.
 
-The IC builders taper every deviation to zero (value AND normal derivative) at all
-four walls (``boundary_taper`` in src/physics/init_conditions.py), so all three
-mismatches should be small and no family should stand out. This diagnostic is the
-empirical check that the sampled fields actually honor that.
+The IC builders are even about the three Neumann walls (x=0, y=0, y=1) by
+construction, and only the right Dirichlet wall is tapered
+(``dirichlet_edge_taper`` in src/physics/init_conditions.py), so the CONTINUOUS
+wall-normal derivative is exactly 0 there.
+
+What this script measures is a ONE-SIDED difference on the dataset grid, whose
+error is ``h/2 * d2T0/dn2`` at the wall -- first order in ``h``. The reported
+numbers are therefore that truncation error, not a boundary-condition violation,
+and they scale with each family's curvature: rougher families (small-``ell``
+``grf_2d``, small-``sigma`` ``hot_spot_2d``) legitimately report an order of
+magnitude more than smooth ones, and ``uniform_2d`` reports exactly 0. The
+meaningful check is that every family's residual HALVES when the grid is
+refined; a family that plateaus is genuinely incompatible.
 
 Usage:
   PYTHONPATH=. python scripts/diffusion_ic_boundary_compat.py \

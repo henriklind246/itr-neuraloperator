@@ -1,0 +1,771 @@
+"""Axes-level renderers shared by publication figures.
+
+Every function here draws into an axes that the caller owns. Nothing in this
+module reads a file or reduces a records frame: loading belongs to
+``visual/pub/records.py`` and every statistic comes from ``visual/pub/stats.py``.
+A panel receives values already computed and only decides how they look.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field as _field
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+
+from visual.pub import style
+
+# ============================================================
+# Schematic primitives
+# ============================================================
+
+
+def blank_canvas(ax, *, xlim: tuple[float, float] = (0.0, 1.0),
+                 ylim: tuple[float, float] = (0.0, 1.0),
+                 equal: bool = False) -> None:
+    """Turn an axes into a bare drawing surface for a schematic."""
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    if equal:
+        ax.set_aspect("equal")
+
+
+def schematic_box(ax, xy: tuple[float, float], width: float, height: float,
+                  label: str = "", *, facecolor: str = "0.93",
+                  edgecolor: str = "0.35", fontsize: float = 6.5,
+                  radius: float = 0.02, zorder: float = 2
+                  ) -> tuple[float, float]:
+    """Draw a rounded labelled box; return its center."""
+    box = mpl.patches.FancyBboxPatch(
+        (xy[0], xy[1]), width, height,
+        boxstyle=mpl.patches.BoxStyle("Round", pad=0.0, rounding_size=radius),
+        facecolor=facecolor, edgecolor=edgecolor, linewidth=0.8, zorder=zorder,
+    )
+    ax.add_patch(box)
+    center = (xy[0] + width / 2.0, xy[1] + height / 2.0)
+    if label:
+        ax.text(center[0], center[1], label, ha="center", va="center",
+                fontsize=fontsize, zorder=zorder + 1, linespacing=1.25)
+    return center
+
+
+def schematic_arrow(ax, start: tuple[float, float], end: tuple[float, float],
+                    *, label: str = "", color: str = "0.35",
+                    linewidth: float = 0.9, fontsize: float = 6.0,
+                    style_str: str = "-|>", connection: str = "arc3,rad=0.0",
+                    label_offset: tuple[float, float] = (0.0, 0.02)) -> None:
+    """Draw a labelled arrow between two points in axes data coordinates."""
+    ax.annotate("", xy=end, xytext=start,
+                arrowprops=dict(arrowstyle=style_str, color=color,
+                                linewidth=linewidth,
+                                connectionstyle=connection,
+                                shrinkA=1.0, shrinkB=1.0), zorder=3)
+    if label:
+        mid = ((start[0] + end[0]) / 2.0 + label_offset[0],
+               (start[1] + end[1]) / 2.0 + label_offset[1])
+        ax.text(mid[0], mid[1], label, ha="center", va="bottom",
+                fontsize=fontsize, color=color, zorder=4)
+
+
+# ============================================================
+# Field maps
+# ============================================================
+
+
+def field_map(ax, field: np.ndarray, limits: style.ColorLimits, *,
+              extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+              interface_x: float | None = None, title: str = "",
+              xlabel: str = "", ylabel: str = ""):
+    """Render an ``(Nx, Ny)`` field with x horizontal and y vertical.
+
+    Trajectory arrays are indexed ``[x, y]``, so the array is transposed once,
+    here, rather than at every call site.
+
+    The aspect ratio is locked to the extent. The domain is physically square
+    and an anisotropic stretch is not a neutral choice: it changes the apparent
+    shape of a heating patch and the apparent angle at which a front meets the
+    interface, which are the things these panels exist to show.
+    """
+    arr = np.asarray(field, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"field_map expects a 2-D (Nx, Ny) array, got {arr.shape}")
+    im = ax.imshow(arr.T, origin="lower", extent=extent, aspect="equal",
+                   **limits.imshow_kwargs())
+    # Prune the upper tick on both axes. Field maps are tiled edge to edge, and
+    # the default locator puts a label at the very end of each axis, so the last
+    # label of one panel lands on the first label of its neighbour and reads as
+    # "1.000.00". Pruning costs one tick and removes the collision outright.
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(mpl.ticker.MaxNLocator(nbins=4, prune="upper"))
+    if interface_x is not None:
+        ax.axvline(interface_x, color="w", linewidth=0.8, alpha=0.85)
+        ax.axvline(interface_x, color="k", linewidth=0.4, alpha=0.6)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    return im
+
+
+def attach_colorbar(fig, mappable, ax, label: str, *, pad: float = 0.02,
+                    fraction: float = 0.046, cax=None,
+                    label_x: float | None = None):
+    """Attach a thin labelled colorbar, either beside ``ax`` or into ``cax``.
+
+    Passing ``cax`` is the form to use next to field maps. The ``ax=`` form
+    takes its width *out of* the axes it is attached to, so in a grid of maps
+    the column carrying a colorbar ends up narrower than its neighbours -- which
+    is exactly the misalignment a reader sees as sloppy typesetting.
+
+    ``label_x`` is for a bar that has a *neighbour* to its right. Matplotlib
+    places the rotated label past the tick labels, so its position is a function
+    of the data range: a bar reading ``300.20`` pushes the label a third of an
+    inch further out than one reading ``302``, and once it clears the reserved
+    gap the label is drawn on top of the next map. Pass
+    :attr:`MapGrid.cbar_label_x` to pin it inside the gap instead.
+    """
+    if cax is not None:
+        cbar = fig.colorbar(mappable, cax=cax)
+    else:
+        cbar = fig.colorbar(mappable, ax=ax, pad=pad, fraction=fraction)
+    cbar.set_label(label, fontsize=7)
+    cbar.ax.tick_params(labelsize=6)
+    cbar.outline.set_linewidth(0.6)
+    if label_x is not None:
+        cbar.ax.yaxis.set_label_coords(label_x, 0.5)
+    return cbar
+
+
+# ------------------------------------------------------------ grids of maps
+
+# Absolute inch margins for a grid of square field maps. These are measured
+# against rendered output, not derived: they are the smallest values that keep
+# the row label, the tick labels and the colorbar labels clear of each other at
+# 300 dpi and 7 pt type.
+_LEFT_IN = 0.72        # two-line row label + y tick labels
+_TOP_IN = 0.46         # suptitle + column titles
+_BOTTOM_IN = 0.58      # x tick labels + x label + the provenance footer
+_ROW_GAP_IN = 0.14
+_COL_GAP_IN = 0.10
+_CBAR_W_IN = 0.075
+_CBAR_GAP_IN = 0.05    # map -> its own colorbar
+_CBAR_LABEL_IN = 0.50  # colorbar tick labels + rotated label + breathing room
+_CBAR_LABEL_W_IN = 0.16   # a rotated 7 pt label plus its right-hand margin
+_EXTRA_ROW_GAP_IN = 0.34   # last map row's x tick labels + x label
+
+
+@dataclass(frozen=True)
+class MapGrid:
+    """Axes for a grid of square field maps, placed at absolute inch offsets."""
+
+    fig: object
+    maps: list = _field(default_factory=list)     # maps[row][col]
+    # colorbars[map_column] -> one axes per row group that column's bar serves.
+    colorbars: dict = _field(default_factory=dict)
+    rows: list = _field(default_factory=list)     # trailing rows[r][col]
+    map_size_in: float = 0.0
+    # The realized figure width, which is below the requested one when
+    # ``max_map_in`` bound the map size.
+    width_in: float = 0.0
+    # Pass to attach_colorbar(label_x=...) for a bar that has a map to its
+    # right; see that function for why the automatic placement is not safe.
+    cbar_label_x: float = 0.0
+
+
+def map_grid(width_in: float, n_rows: int, *, n_maps: int = 3,
+             colorbar_after: tuple[int, ...] = (1, 2),
+             colorbar_span: tuple[int, ...] = (),
+             colorbar_rows: dict | None = None,
+             extra_rows: int = 0, extra_row_height: float = 1.0,
+             extra_row_inset_in: float = 0.0,
+             max_map_in: float | None = None,
+             left_in: float = _LEFT_IN, right_in: float = 0.10,
+             top_in: float = _TOP_IN,
+             bottom_in: float = _BOTTOM_IN,
+             cbar_label_in: float = _CBAR_LABEL_IN) -> MapGrid:
+    """Lay out ``n_rows x n_maps`` square field maps with dedicated colorbars.
+
+    ``tight_layout`` cannot do this. It distributes *residual* space after the
+    fact, and an ``aspect="equal"`` image does not fill the axes it was given,
+    so the constrained dimension collapses toward the panels and the rest of the
+    row opens up as whitespace. The result is the ragged, loosely-packed look
+    these figures had. Solving the geometry up front -- map width from the
+    figure width, then figure height from the map width -- is the only way the
+    maps come out both square and flush.
+
+    ``colorbar_after`` names the map columns that carry a colorbar in a column
+    of its own, so every map stays the same width. Which rows each bar serves is
+    the caller's statement about which panels share a scale:
+
+    - by default one bar per row, i.e. a per-row scale;
+    - ``colorbar_span`` names columns whose scale is shared down the whole grid,
+      drawn once as a single tall bar;
+    - ``colorbar_rows`` maps a column to explicit row groups, for the case where
+      *some* rows share a scale -- ``{2: ((0, 1), (2,))}`` is "rows 0 and 1
+      share one bar; row 2 gets its own".
+
+    ``extra_rows`` appends full-width rows of panels below the maps, each
+    ``extra_row_height`` map-widths tall.
+
+    ``extra_row_inset_in`` narrows those rows from the left by that many inches,
+    the same amount in every column so they stay equal in width. Maps need no
+    room between columns because only the first carries tick labels; a line plot
+    whose columns are on different y scales needs labels on all of them, and
+    ``_COL_GAP_IN`` alone would run them into the neighbouring panel.
+
+    ``max_map_in`` caps the solved map size and narrows the figure to match.
+    Map size falls out of the width divided by the column count, so the same
+    call that is well proportioned at four columns produces page-tall maps at
+    two; the cap turns a fixed width into a maximum one for the sparse case.
+
+    ``cbar_label_in`` is the space reserved to the right of each bar for its
+    tick labels and its rotated label. The default suits a bar reading two or
+    three significant figures; a grid whose bars carry six-character ticks
+    (``300.20``) needs more, or the label lands on the next map.
+    """
+    cbars = tuple(sorted(set(colorbar_after)))
+    unknown = set(colorbar_span) - set(cbars)
+    if unknown:
+        raise ValueError(f"colorbar_span columns {sorted(unknown)} are not in "
+                         f"colorbar_after {list(cbars)}")
+    unknown = set(colorbar_rows or {}) - set(cbars)
+    if unknown:
+        raise ValueError(f"colorbar_rows columns {sorted(unknown)} are not in "
+                         f"colorbar_after {list(cbars)}")
+
+    every_row = tuple(range(n_rows))
+    groups: dict[int, tuple[tuple[int, ...], ...]] = {}
+    for col in cbars:
+        if colorbar_rows and col in colorbar_rows:
+            groups[col] = tuple(tuple(g) for g in colorbar_rows[col])
+        elif col in colorbar_span:
+            groups[col] = (every_row,)
+        else:
+            groups[col] = tuple((r,) for r in every_row)
+
+    # A column plan in two currencies: inches for anything of fixed size, and
+    # "map widths" for the flexible columns. Solve for the map width, then read
+    # the plan back to place the axes.
+    plan: list[tuple[str, float]] = []
+    for col in range(n_maps):
+        if col:
+            # A colorbar's label gap already separates the previous map from
+            # this one; adding the usual column gap on top double-spaces it.
+            plan.append(("gap", 0.0 if (col - 1) in cbars else _COL_GAP_IN))
+        plan.append(("map", 1.0))
+        if col in cbars:
+            plan.append(("gap", _CBAR_GAP_IN))
+            plan.append(("cbar", _CBAR_W_IN))
+            plan.append(("gap", cbar_label_in))
+
+    fixed = left_in + right_in + sum(v for kind, v in plan
+                                     if kind in ("gap", "cbar"))
+    units = sum(v for kind, v in plan if kind == "map")
+    size = (width_in - fixed) / units
+    if size <= 0.0:
+        raise ValueError(
+            f"map_grid: {n_maps} maps plus fixed furniture need more than "
+            f"{width_in:.2f} in of width")
+    if max_map_in is not None and size > max_map_in:
+        size = max_map_in
+        width_in = fixed + units * size
+
+    tail = 0.0
+    if extra_rows:
+        tail = (_EXTRA_ROW_GAP_IN + extra_rows * size * extra_row_height
+                + (extra_rows - 1) * _ROW_GAP_IN)
+    height_in = (top_in + bottom_in + n_rows * size
+                 + (n_rows - 1) * _ROW_GAP_IN + tail)
+    fig = plt.figure(figsize=(width_in, height_in))
+
+    def rect(x_in, y_in, w_in, h_in):
+        return [x_in / width_in, y_in / height_in,
+                w_in / width_in, h_in / height_in]
+
+    def row_bottom(row: int) -> float:
+        # Rows run top-down; matplotlib measures from the bottom.
+        return height_in - top_in - (row + 1) * size - row * _ROW_GAP_IN
+
+    # x offsets are the same on every row, so walk the plan once.
+    x = left_in
+    map_x: list[float] = []
+    cbar_x: list[float] = []
+    for kind, value in plan:
+        if kind == "gap":
+            x += value
+        elif kind == "cbar":
+            cbar_x.append(x)
+            x += value
+        else:
+            map_x.append(x)
+            x += size * value
+
+    maps = [[fig.add_axes(rect(mx, row_bottom(row), size, size))
+             for mx in map_x] for row in range(n_rows)]
+
+    colorbars: dict[int, list] = {}
+    for col, cx in zip(cbars, cbar_x):
+        bars = []
+        for group in groups[col]:
+            bottom = row_bottom(max(group))
+            top = row_bottom(min(group)) + size
+            bars.append(fig.add_axes(rect(cx, bottom, _CBAR_W_IN, top - bottom)))
+        colorbars[col] = bars
+
+    rows: list[list] = []
+    base = row_bottom(n_rows - 1) - _EXTRA_ROW_GAP_IN
+    inset = min(max(extra_row_inset_in, 0.0), 0.5 * size)
+    for r in range(extra_rows):
+        h = size * extra_row_height
+        y = base - (r + 1) * h - r * _ROW_GAP_IN
+        rows.append([fig.add_axes(rect(mx + inset, y, size - inset, h))
+                     for mx in map_x])
+
+    # set_label_coords anchors the rotated label's left edge, so subtracting a
+    # label width puts its far edge at the far edge of the reserved gap.
+    label_x = 1.0 + (cbar_label_in - _CBAR_LABEL_W_IN) / _CBAR_W_IN
+    return MapGrid(fig=fig, maps=maps, colorbars=colorbars, rows=rows,
+                   map_size_in=size, width_in=width_in, cbar_label_x=label_x)
+
+
+# ============================================================
+# Convergence panels
+# ============================================================
+
+
+@dataclass(frozen=True)
+class ConvergenceFit:
+    """The log-log regression a convergence panel drew."""
+
+    slope: float
+    intercept: float
+
+
+def convergence_loglog(ax, steps, errors, *, xlabel: str,
+                       reference_order: int = 2, title: str = "",
+                       color: str = "#0072B2", reference_symbol: str = "h",
+                       ylabel: str = "$L_2$ error") -> ConvergenceFit:
+    """Plot ``error`` against ``step`` in log-log with a fitted slope.
+
+    The fitted slope is the observed order of accuracy; the dashed line is the
+    theoretical ``O(h^reference_order)`` anchored at the finest step, so a
+    second-order scheme shows two parallel lines.
+    """
+    steps = np.asarray(steps, dtype=float)
+    errors = np.asarray(errors, dtype=float)
+    if steps.size != errors.size or steps.size < 2:
+        raise ValueError("convergence_loglog needs >= 2 matched (step, error) values")
+
+    log_s, log_e = np.log10(steps), np.log10(errors)
+    slope, intercept = np.polyfit(log_s, log_e, 1)
+
+    ax.loglog(steps, errors, "o", color="k", markersize=3.2, zorder=3,
+              label="MMS")
+    ax.loglog(steps, 10 ** np.polyval([slope, intercept], log_s), "-",
+              color=color, linewidth=1.1, zorder=2,
+              label=f"fit $p$ = {slope:.2f}")
+    ref = errors[-1] * (steps / steps[-1]) ** reference_order
+    ax.loglog(steps, ref, "--", color="0.4", linewidth=0.8, zorder=1,
+              label=f"$O({reference_symbol}^{reference_order})$")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, which="both")
+    ax.legend(fontsize=5.5, loc="best")
+    return ConvergenceFit(slope=float(slope), intercept=float(intercept))
+
+
+def order_estimates(ax, midpoints, orders, *, xlabel: str, target: float = 2.0,
+                    title: str = "", color: str = "#0072B2",
+                    ylabel: str = "observed order $p$") -> None:
+    """Plot pairwise observed orders against a horizontal design order."""
+    midpoints = np.asarray(midpoints, dtype=float)
+    orders = np.asarray(orders, dtype=float)
+    ax.semilogx(midpoints, orders, "o-", color=color, markersize=3.2,
+                linewidth=1.0, zorder=3)
+    ax.axhline(target, color="0.4", linestyle="--", linewidth=0.8, zorder=1)
+    ax.text(0.02, target, f"design $p$ = {target:g}", transform=ax.get_yaxis_transform(),
+            ha="left", va="top", fontsize=5.5, color="0.4")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, which="both")
+    # A converged scheme puts every estimate within a hair of the design order,
+    # which autoscales into a misleadingly dramatic axis; hold a floor on the
+    # range so the reader sees "flat at p" rather than a magnified wiggle.
+    lo = min(float(np.min(orders)), target)
+    hi = max(float(np.max(orders)), target)
+    if hi - lo < 0.4:
+        mid = 0.5 * (lo + hi)
+        lo, hi = mid - 0.2, mid + 0.2
+    ax.set_ylim(lo - 0.05, hi + 0.05)
+    ax.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+
+
+def pairwise_orders(steps, errors) -> tuple[np.ndarray, np.ndarray]:
+    """Geometric-mean step midpoints and the order between consecutive levels.
+
+    A local convergence rate, not a statistic over a sample; it lives here
+    rather than in ``stats.py`` because it reduces nothing across replicates.
+    """
+    steps = np.asarray(steps, dtype=float)
+    errors = np.asarray(errors, dtype=float)
+    mids = np.sqrt(steps[:-1] * steps[1:])
+    orders = np.log(errors[:-1] / errors[1:]) / np.log(steps[:-1] / steps[1:])
+    return mids, orders
+
+
+# ============================================================
+# Distribution panels
+# ============================================================
+
+
+def _finite(values) -> np.ndarray:
+    arr = np.asarray(list(values), dtype=float)
+    return arr[np.isfinite(arr)]
+
+
+def summary_points(ax, summaries, *, labels=None, color: str = "#0072B2",
+                   connect: bool = False, marker: str = "o",
+                   ylabel: str = "", xlabel: str = "", title: str = "",
+                   logy: bool = False, offset: float = 0.0,
+                   label: str = "", show_ci: bool = True,
+                   rotate_xticks: float = 0.0, x=None) -> np.ndarray:
+    """Draw an ordered sequence of :class:`~visual.pub.stats.Summary` objects.
+
+    Each entry gets a median marker, a thin IQR whisker, and a thick confidence
+    bar. The CI is drawn only when the bootstrap actually produced one -- below
+    :data:`~visual.pub.stats.MIN_SIMS_FOR_CI` simulations ``ci_method`` is
+    ``"none"`` and no bar is drawn, so the reader cannot mistake an
+    unestimated interval for a narrow one.
+
+    ``x`` places the entries at given numeric coordinates instead of at
+    successive integers. Use it whenever the stratum is a real quantity -- a
+    time, a resistance, an interface position -- because evenly spacing unevenly
+    sampled values distorts every slope the reader takes off the plot.
+
+    Returns the x positions, so a caller can overlay seed dots or a second
+    series at the same positions.
+    """
+    summaries = list(summaries)
+    numeric_x = x is not None
+    if numeric_x:
+        x = np.asarray(x, dtype=float) + offset
+        if x.size != len(summaries):
+            raise ValueError("x must have one coordinate per summary")
+    else:
+        x = np.arange(len(summaries), dtype=float) + offset
+
+    for xi, s in zip(x, summaries):
+        if not np.isfinite(s.median):
+            continue
+        ax.vlines(xi, s.q25, s.q75, color=color, linewidth=0.9, alpha=0.55,
+                  zorder=2)
+        if show_ci and s.ci_method != "none" and np.isfinite(s.ci_lo):
+            ax.vlines(xi, s.ci_lo, s.ci_hi, color=color, linewidth=2.6,
+                      alpha=0.9, zorder=3)
+
+    medians = np.array([s.median for s in summaries], dtype=float)
+    if connect:
+        ax.plot(x, medians, "-", color=color, linewidth=1.0, alpha=0.8, zorder=3)
+    ax.plot(x, medians, marker, color=color, markersize=4.0,
+            markeredgecolor="k", markeredgewidth=0.4, zorder=4,
+            label=label or None)
+
+    if labels is not None:
+        ax.set_xticks(x if numeric_x else np.arange(len(summaries), dtype=float))
+        ax.set_xticklabels(list(labels),
+                           rotation=rotate_xticks,
+                           ha="right" if rotate_xticks else "center")
+    if not numeric_x:
+        ax.set_xlim(-0.6, len(summaries) - 0.4)
+    if logy:
+        ax.set_yscale("log")
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, axis="y", alpha=0.25)
+    return x
+
+
+def seed_dots(ax, positions, values_by_position, *, color: str = "k",
+              spread: float = 0.13, marker: str = "d",
+              label: str = "") -> None:
+    """Overlay one dot per model seed at each categorical position.
+
+    Seed spread is shown as the individual values rather than as an error bar:
+    with fewer than three seeds a standard error is not estimable, and this is
+    the honest display in either case.
+    """
+    drawn = False
+    for xi, values in zip(positions, values_by_position):
+        vals = _finite(values)
+        if vals.size == 0:
+            continue
+        if vals.size == 1:
+            xs = np.array([xi])
+        else:
+            xs = xi + np.linspace(-spread, spread, vals.size)
+        ax.plot(xs, vals, marker, color=color, markersize=2.6,
+                markerfacecolor="none", markeredgewidth=0.7, linestyle="none",
+                zorder=5, label=(label if not drawn else None))
+        drawn = True
+
+
+def ecdf_curves(ax, series, *, colors=None, xlabel: str = "",
+                ylabel: str = "fraction of simulations", title: str = "",
+                logx: bool = False, reference: float | None = None,
+                reference_label: str = "") -> None:
+    """Empirical CDFs over **per-simulation** values, one curve per group.
+
+    An ECDF replaces the long-tail histograms of the current paper figures:
+    a histogram of a heavy-tailed error distribution crushes the body to
+    display the tail, while the ECDF shows both at full resolution and makes
+    the exceedance fraction at any threshold directly readable.
+    """
+    from visual.pub import stats as _stats
+
+    colors = colors or {}
+    for name, values in series.items():
+        x, f = _stats.ecdf(values)
+        if x.size == 0:
+            continue
+        ax.step(x, f, where="post", linewidth=1.1,
+                color=colors.get(name, None), label=f"{name} (n={x.size})")
+    if reference is not None:
+        ax.axvline(reference, color="0.4", linestyle="--", linewidth=0.8,
+                   zorder=1)
+        if reference_label:
+            ax.text(reference, 0.02, f" {reference_label}", fontsize=5.5,
+                    color="0.4", ha="left", va="bottom")
+    if logx:
+        ax.set_xscale("log")
+    ax.set_ylim(0.0, 1.02)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    # Upper left, not lower right: an ECDF leaves that corner empty, and the
+    # lower right is where the reference-threshold label sits.
+    ax.legend(fontsize=5.5, loc="upper left")
+
+
+def recovery_scatter(ax, truth, estimate, *, polish=None, failed=None,
+                     color: str = "#0072B2", xlabel: str = "",
+                     ylabel: str = "", title: str = "", logscale: bool = False
+                     ) -> None:
+    """Recovered parameter against its true value, with the identity line.
+
+    ``failed`` marks non-converged inversions, which are drawn as open red
+    circles rather than dropped: reporting only the cases that worked would
+    report the accuracy of a set selected on the outcome.
+    """
+    truth = np.asarray(truth, dtype=float)
+    estimate = np.asarray(estimate, dtype=float)
+    ok = np.isfinite(truth) & np.isfinite(estimate)
+    bad = np.zeros(truth.shape, dtype=bool) if failed is None else \
+        np.asarray(failed, dtype=bool)
+
+    ax.scatter(truth[ok & ~bad], estimate[ok & ~bad], s=14, color=color,
+               edgecolor="k", linewidth=0.3, zorder=3, label="MAP")
+    drawn = [truth[ok], estimate[ok]]
+    if polish is not None:
+        polish = np.asarray(polish, dtype=float)
+        good = ok & np.isfinite(polish)
+        ax.scatter(truth[good], polish[good], s=10, facecolor="none",
+                   edgecolor="0.3", linewidth=0.6, zorder=4, label="FV polish")
+        # The polish estimate sets the limits too; leaving it out clips markers
+        # against the frame, which reads as a missing case rather than a large
+        # error.
+        drawn.append(polish[good])
+    if bad.any():
+        ax.scatter(truth[ok & bad], estimate[ok & bad], s=18, facecolor="none",
+                   edgecolor="#D55E00", linewidth=0.8, zorder=5,
+                   label="not converged")
+
+    finite = np.concatenate(drawn)
+    if finite.size:
+        lo, hi = float(finite.min()), float(finite.max())
+        pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.08
+        span = (lo - pad, hi + pad)
+        ax.plot(span, span, color="0.5", linewidth=0.7, linestyle="--",
+                zorder=1)
+        ax.set_xlim(*span)
+        ax.set_ylim(*span)
+    if logscale:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _spans_a_decade(values: np.ndarray) -> bool:
+    """Whether the positive values cover more than one order of magnitude."""
+    v = values[np.isfinite(values) & (values > 0)]
+    return bool(v.size and v.max() / v.min() > 10.0)
+
+
+def association_scatter(ax, x, y, *, correlation=None, color: str = "#0072B2",
+                        xlabel: str = "", ylabel: str = "", title: str = "",
+                        logx="auto", logy: bool = False) -> None:
+    """One point per case, annotated with a rank correlation and its interval.
+
+    No fitted line: the claim under test is monotone association, and a least
+    squares line drawn through ten heavy-tailed points would suggest a
+    functional form the data does not support.
+
+    ``logx="auto"`` takes a log axis only when the values span more than a
+    decade. Forcing one on a narrower range yields a strip of overlapping minor
+    tick labels that reads as noise.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    ax.scatter(x[ok], y[ok], s=16, color=color, edgecolor="k", linewidth=0.3,
+               zorder=3)
+    if logx == "auto":
+        logx = _spans_a_decade(x[ok])
+    if logx:
+        ax.set_xscale("log")
+    if logy:
+        ax.set_yscale("log")
+    if correlation is not None:
+        text = f"Spearman $\\rho$ = {correlation.rho:.2f}"
+        if np.isfinite(correlation.ci_lo):
+            text += f"\n[{correlation.ci_lo:.2f}, {correlation.ci_hi:.2f}]"
+        else:
+            text += "\n(no interval)"
+        text += f"\nn = {correlation.n}"
+        ax.text(0.97, 0.97, text, transform=ax.transAxes, ha="right", va="top",
+                fontsize=5.5, color="0.25")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+
+
+def component_bars(ax, weights, *, colors=None, xticklabels=None,
+                   ylabel: str = "", title: str = "", xlabel: str = "") -> None:
+    """Stacked non-negative components, one bar per case.
+
+    ``weights`` is a mapping of component name to a per-case sequence. The
+    intended use is the squared components of a unit direction vector, which
+    sum to one, so a bar reaching the top with a single colour says the whole
+    direction lies along that one parameter.
+    """
+    names = list(weights)
+    n = len(next(iter(weights.values())))
+    x = np.arange(n, dtype=float)
+    colors = colors or {}
+    bottom = np.zeros(n, dtype=float)
+    for name in names:
+        w = np.asarray(weights[name], dtype=float)
+        ax.bar(x, w, bottom=bottom, width=0.72, label=name, zorder=2,
+               color=colors.get(name, None), edgecolor="k", linewidth=0.3)
+        bottom = bottom + w
+    ax.set_xticks(x)
+    if xticklabels is not None:
+        ax.set_xticklabels(xticklabels, fontsize=5.0, rotation=90)
+    ax.set_xlim(-0.7, n - 0.3)
+    ax.set_ylabel(ylabel)
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, axis="y", alpha=0.25)
+    # Stacked bars fill the axes, so the legend needs an opaque backing to stay
+    # readable; it sits over the bottom of the stack, which is flat by
+    # construction and carries no detail.
+    ax.legend(fontsize=5.5, loc="lower left", ncol=2, frameon=True,
+              framealpha=0.9, facecolor="w", edgecolor="0.7")
+
+
+def rate_bars(ax, rates, *, labels=None, colors=None, ylabel: str = "",
+              title: str = "", threshold_label: str = "",
+              rotate_xticks: float = 0.0) -> None:
+    """Exceedance rates with Wilson score intervals, one bar per group.
+
+    ``rates`` is an ordered mapping of label to
+    :class:`~visual.pub.stats.RateCI`. The interval is Wilson rather than
+    normal because at these sample sizes a rate near 0 would otherwise be given
+    a symmetric interval crossing zero.
+    """
+    rates = dict(rates)
+    names = list(rates)
+    x = np.arange(len(names), dtype=float)
+    colors = colors or {}
+    values = np.array([rates[n].rate for n in names], dtype=float)
+
+    ax.bar(x, values, width=0.6, zorder=2,
+           color=[colors.get(n, "#0072B2") for n in names],
+           edgecolor="k", linewidth=0.5, alpha=0.85)
+    for xi, name in zip(x, names):
+        r = rates[name]
+        if np.isfinite(r.lo):
+            ax.vlines(xi, r.lo, r.hi, color="k", linewidth=1.0, zorder=4)
+        ax.text(xi, max(r.hi if np.isfinite(r.hi) else r.rate, r.rate) + 0.015,
+                f"{r.k}/{r.n}", ha="center", va="bottom", fontsize=5.5,
+                color="0.25", zorder=5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels if labels is not None else names,
+                       rotation=rotate_xticks,
+                       ha="right" if rotate_xticks else "center")
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    if threshold_label:
+        ax.text(0.98, 0.95, threshold_label, transform=ax.transAxes, ha="right",
+                va="top", fontsize=5.5, color="0.35")
+    ax.set_ylim(0.0, None)
+    ax.grid(True, axis="y", alpha=0.25)
+
+
+def annotate_counts(ax, positions, summaries, *, y: float = 0.01,
+                    fontsize: float = 5.0) -> None:
+    """Print the simulation count under each categorical position.
+
+    The replication count is the whole point of the statistical redesign, so it
+    is drawn on the figure rather than left in the sidecar.
+    """
+    for xi, s in zip(positions, summaries):
+        ax.text(xi, y, f"{s.n_sims}", transform=ax.get_xaxis_transform(),
+                ha="center", va="bottom", fontsize=fontsize, color="0.45")
+
+
+__all__ = [
+    "ConvergenceFit",
+    "annotate_counts",
+    "association_scatter",
+    "attach_colorbar",
+    "blank_canvas",
+    "component_bars",
+    "convergence_loglog",
+    "ecdf_curves",
+    "field_map",
+    "order_estimates",
+    "pairwise_orders",
+    "rate_bars",
+    "recovery_scatter",
+    "schematic_arrow",
+    "schematic_box",
+    "seed_dots",
+    "summary_points",
+]

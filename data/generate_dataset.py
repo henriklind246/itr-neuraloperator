@@ -34,6 +34,29 @@ DATA_DIR = Path(__file__).resolve().parent
 # balancing never perturbs the forcing-parameter sequence.
 IC_ASSIGN_SEED = 2
 
+# Stride between independent draw families selected by --rng-seed. The per-sim
+# forcing/IC streams are consumed sequentially, so two runs whose base seeds
+# differ produce sims that share no latent draw regardless of num_sims; the
+# stride keeps the four sub-streams from aliasing onto another family's seeds.
+RNG_SEED_STRIDE = 1000
+
+
+def resolve_seed_streams(rng_seed: int = 0) -> dict[str, int]:
+    """Return the four generator seeds for draw family ``rng_seed``.
+
+    ``rng_seed=0`` reproduces the historical dataset byte for byte. Any other
+    value yields a draw from the same distributions that is disjoint from the
+    default family, which is what makes a locally generated set usable as a
+    held-out test set against a checkpoint trained on the default family.
+    """
+    base = int(rng_seed) * RNG_SEED_STRIDE
+    return {
+        "ic_params": base + 0,
+        "forcing_profile": base + 1,
+        "lhs": base + 0,
+        "ic_assign": base + IC_ASSIGN_SEED,
+    }
+
 
 def build_balanced_ic_families(
     num_sims: int, allowed_families: list[str], seed: int = IC_ASSIGN_SEED
@@ -129,6 +152,7 @@ def build_base_setup(
     ramp_seconds: float | None = None,
     lhs_seed: int = 0,
     ic_families: list[str] | None = None,
+    forcing_profile_seed: int = 1,
 ) -> dict:
     """Build the fixed geometry/time scaffolding shared by every simulation.
 
@@ -168,7 +192,7 @@ def build_base_setup(
     grids = {"X": X, "Y": Y, "x_grid": x_grid, "y_grid": y_grid}
     time_cfg = dict(
         num_sims=num_sims, dt=dt, t_final=t_final, lhs_seed=lhs_seed,
-        forcing_profile_seed=1,
+        forcing_profile_seed=forcing_profile_seed,
         t_on=t_on, t_off=t_off, phase=phase, tukey_alpha=tukey_alpha,
         T_right=300.0, b=b, ic_families=ic_families,
     )
@@ -269,16 +293,19 @@ def generate_sim_data(
     ny: int = 100,
     ic_families: list[str] | None = None,
     ramp_seconds: float | None = None,
+    rng_seed: int = 0,
 ) -> None:
     benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
     spec = get_problem(benchmark)
 
-    rng = np.random.default_rng(0)
-    rng_profile = np.random.default_rng(1)
+    seeds = resolve_seed_streams(rng_seed)
+    rng = np.random.default_rng(seeds["ic_params"])
+    rng_profile = np.random.default_rng(seeds["forcing_profile"])
 
     setup = build_base_setup(
         num_sims=num_sims, save_stride=save_stride, nx=nx, ny=ny,
-        ramp_seconds=ramp_seconds, lhs_seed=0, ic_families=ic_families,
+        ramp_seconds=ramp_seconds, lhs_seed=seeds["lhs"], ic_families=ic_families,
+        forcing_profile_seed=seeds["forcing_profile"],
     )
 
     print(f"Benchmark: {benchmark}", flush=True)
@@ -291,7 +318,7 @@ def generate_sim_data(
     allowed_ic_families = ic_families if ic_families is not None else list(IC_FAMILIES.keys())
     if getattr(spec, "ic_mode", None) == "varying":
         setup["time_cfg"]["ic_family_assignment"] = build_balanced_ic_families(
-            num_sims=num_sims, allowed_families=allowed_ic_families, seed=IC_ASSIGN_SEED,
+            num_sims=num_sims, allowed_families=allowed_ic_families, seed=seeds["ic_assign"],
         )
 
     sim_params = spec.sample_sim_params(
@@ -317,13 +344,18 @@ def generate_sim_data(
     # Persist the dataset-format tag + IC provenance only when the spec declares a
     # version, so the load-time guard can reject a stale fixed-IC dataset that
     # shares this benchmark's name and shapes.
+    # A non-default draw family is also recorded, because "this set is disjoint
+    # from the set the checkpoint trained on" is only checkable if the seed that
+    # made it disjoint is stored beside the trajectories.
     meta = None
     problem_version = getattr(spec, "problem_version", None)
-    if problem_version is not None:
+    if problem_version is not None or rng_seed != 0:
         meta = {
             "problem_version": problem_version,
             "ic_mode": getattr(spec, "ic_mode", None),
             "ic_families": list(allowed_ic_families),
+            "rng_seed": int(rng_seed),
+            "seed_streams": seeds,
         }
 
     save_path = Path(save_dir) if save_dir is not None else DATA_DIR
@@ -376,9 +408,21 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         default=None,
         choices=list(IC_FAMILIES.keys()),
         help=(
-            "IC family to exclude from sampling (repeatable). "
-            "E.g. --exclude-ic grf_2d for the resolution-invariance test "
-            "(grf_2d cannot be reproduced across grids). Default: all families."
+            "IC family to exclude from sampling (repeatable). Useful for "
+            "ablating one family's contribution to a benchmark. "
+            "Default: all families."
+        ),
+    )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=0,
+        help=(
+            "Draw-family selector. 0 (default) reproduces the historical "
+            "dataset byte for byte. Any other value draws from the same "
+            "distributions with disjoint latents, so the set is genuinely "
+            "held out from a checkpoint trained on family 0. Recorded in "
+            "meta.npy."
         ),
     )
     args = parser.parse_args(argv)
@@ -400,6 +444,7 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         save_stride=args.save_stride,
         ic_families=ic_families,
         ramp_seconds=args.ramp_seconds,
+        rng_seed=args.rng_seed,
     )
     return 0
 

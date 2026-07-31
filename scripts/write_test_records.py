@@ -70,6 +70,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "Override the checkpoint's training device (cpu, mps, cuda, auto). "
+            "'auto' resolves to CPU without CUDA, so re-scoring a checkpoint on "
+            "a workstation needs this to reach an accelerator."
+        ),
+    )
+    parser.add_argument(
         "--protocol",
         action="append",
         default=None,
@@ -104,6 +113,7 @@ def main() -> int:
         time_norm_horizon=args.time_norm_horizon,
         target_times=target_times,
         protocols=args.protocol,
+        device=args.device,
     )
     return 0
 

@@ -139,16 +139,10 @@ def load_records(paths, seed_from_path: bool = True) -> pd.DataFrame:
     return df
 
 
-def _pooled_rmse(sse_sum: float, n_sum: float) -> float:
-    if not np.isfinite(sse_sum) or not np.isfinite(n_sum) or n_sum <= 0:
-        return float("nan")
-    return math.sqrt(sse_sum / n_sum)
-
-
-def _pooled_rel_l2_pct(sse_sum: float, target_sum: float) -> float:
-    if not np.isfinite(sse_sum) or not np.isfinite(target_sum) or target_sum <= 0:
-        return float("nan")
-    return math.sqrt(sse_sum / target_sum) * 100.0
+# The pooling identities live in visual/pub/stats.py so this script and the
+# publication figures cannot drift apart on what "per-simulation RMSE" means.
+from visual.pub.stats import pooled_rel_l2_pct as _pooled_rel_l2_pct  # noqa: E402
+from visual.pub.stats import pooled_rmse as _pooled_rmse  # noqa: E402
 
 
 def reduce_pairs_to_sims(df: pd.DataFrame) -> pd.DataFrame:

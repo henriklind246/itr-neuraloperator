@@ -20,6 +20,7 @@ from torch.optim import Adam, AdamW
 from data.dataset import (
     TEMPORAL_SAMPLES,
     SnapshotPairDataset,
+    assert_dataset_problem_version,
     collate_fn,
     compute_global_stats,
     create_dataloaders,
@@ -3476,6 +3477,7 @@ def run_one_seed(
         raise ValueError("train_loader_override and val_loader_override must be provided together.")
 
     if train_loader_override is None:
+        assert_dataset_problem_version(spec, config["data"]["t_grid_path"])
         trajectories, x_grid, y_grid, t_grid = load_sim_data(
             sim_traj_path=config["data"]["trajectories.npy"],
             x_grid_path=config["data"]["x_grid_path"],

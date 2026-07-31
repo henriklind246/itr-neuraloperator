@@ -277,13 +277,15 @@ Initial conditions are sampled from the registry in
 | Family | Description |
 |--------|-------------|
 | `uniform_2d` | Uniform offset around the right Dirichlet temperature |
-| `random_sinusoid_2d` | Sum of low-frequency sinusoidal modes |
-| `grf_2d` | Gaussian random field with sampled length scale and amplitude |
+| `random_sinusoid_2d` | Sum of low-frequency cosine modes |
+| `grf_2d` | Spectrally shaped random field with fixed RMS (legacy key; not a GRF) |
 | `hot_spot_2d` | Sum of Gaussian hot/cold spots |
 
-All IC families are added to `T_right = 300 K`, tapered smoothly near the right
+All IC families are added to `T_right = 300 K`, tapered smoothly into the right
 edge, and pinned exactly at `x = 1` so the initial field is consistent with the
-Dirichlet boundary.
+Dirichlet boundary. The three Neumann walls (`x = 0`, `y = 0`, `y = 1`) are not
+tapered: each builder is even about them by construction, so `dT/dn = 0` holds
+without suppressing the deviation there.
 
 ### Output Files
 
