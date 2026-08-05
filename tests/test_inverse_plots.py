@@ -11,6 +11,7 @@ written directly here rather than through the heavyweight ``invert.py`` pipeline
 
 import csv as _csv
 import warnings
+from pathlib import Path
 
 import matplotlib
 import numpy as np
@@ -115,11 +116,73 @@ def _source_itr_csv_columns(n=6):
     cols["profile_R_amp_covered"] = ["True"] * n
     cols["profile_excess_ci_low"] = (excess_h - 0.1).tolist()
     cols["profile_excess_ci_high"] = (excess_h + 0.1).tolist()
+    cols["profile_excess_covered"] = ["True"] * n
     cols["mcmc_excess_mean"] = excess_h.tolist()
     cols["mcmc_excess_ci_low"] = (excess_h - 0.12).tolist()
     cols["mcmc_excess_ci_high"] = (excess_h + 0.12).tolist()
     cols["mcmc_excess_covered"] = ["True", "False"] * (n // 2) + ["True"] * (n % 2)
     return cols
+
+
+def _sensor_sweep_columns(benchmark="forcing"):
+    counts = (8, 16, 32)
+    sim_ids = tuple(range(1, 9))
+    factors = np.array([0.5, 0.7, 0.8, 0.9, 1.0, 1.1, 1.3, 1.7])
+    errors = (0.1124837305, 0.07380207628, 0.0431657508)
+    profile_widths = (0.3700892713, 0.2493770319, 0.2063509481)
+    mcmc_widths = (0.2246758178, 0.1990697829, 0.1701742952)
+    profile_successes = (6, 7, 6)
+    mcmc_successes = (4, 5, 6)
+    columns = {
+        "benchmark": [],
+        "sim_id": [],
+        "n_sensors": [],
+        "noise_seed": [],
+        "init_seed": [],
+    }
+    if benchmark == "forcing":
+        names = {
+            "error": "R_c_abs_error",
+            "profile_low": "profile_R_c_ci_low",
+            "profile_high": "profile_R_c_ci_high",
+            "profile_covered": "profile_R_c_covered",
+            "mcmc_low": "mcmc_R_c_ci_low",
+            "mcmc_high": "mcmc_R_c_ci_high",
+            "mcmc_covered": "mcmc_R_c_covered",
+        }
+    else:
+        names = {
+            "error": "excess_int_abserr",
+            "profile_low": "profile_excess_ci_low",
+            "profile_high": "profile_excess_ci_high",
+            "profile_covered": "profile_excess_covered",
+            "mcmc_low": "mcmc_excess_ci_low",
+            "mcmc_high": "mcmc_excess_ci_high",
+            "mcmc_covered": "mcmc_excess_covered",
+        }
+    for column in names.values():
+        columns[column] = []
+    for count_index, count in enumerate(counts):
+        for case_index, sim_id in enumerate(sim_ids):
+            profile_width = profile_widths[count_index] * factors[case_index]
+            mcmc_width = mcmc_widths[count_index] * factors[case_index]
+            columns["benchmark"].append(benchmark)
+            columns["sim_id"].append(sim_id)
+            columns["n_sensors"].append(count)
+            columns["noise_seed"].append(sim_id)
+            columns["init_seed"].append(0)
+            columns[names["error"]].append(errors[count_index] * factors[case_index])
+            columns[names["profile_low"]].append(0.5 - profile_width / 2.0)
+            columns[names["profile_high"]].append(0.5 + profile_width / 2.0)
+            columns[names["profile_covered"]].append(
+                str(case_index < profile_successes[count_index])
+            )
+            columns[names["mcmc_low"]].append(0.5 - mcmc_width / 2.0)
+            columns[names["mcmc_high"]].append(0.5 + mcmc_width / 2.0)
+            columns[names["mcmc_covered"]].append(
+                str(case_index < mcmc_successes[count_index])
+            )
+    return columns
 
 
 def _write_forcing_artifact(art_dir, sid):
@@ -307,6 +370,80 @@ def test_forcing_itr_plots_are_registered_for_inverse_group():
         "forcing_itr_surrogate_fidelity",
         "forcing_itr_uncertainty",
     } <= names
+
+
+@pytest.mark.parametrize("benchmark", ["forcing", "forcing_itr"])
+def test_sensor_sweep_manuscript_plots_render_exact_size(tmp_path, benchmark):
+    csv_path = tmp_path / f"{benchmark}_sensor_sweep.csv"
+    _write_csv(csv_path, _sensor_sweep_columns(benchmark))
+    spec = ip.spec_for(benchmark)
+    out_dir = tmp_path / "plots"
+
+    recovery = ip.plot_sensor_sweep_recovery(csv_path, spec, out_dir=out_dir)
+    uncertainty = ip.plot_sensor_sweep_uq(csv_path, spec, out_dir=out_dir)
+
+    assert recovery["dimensions_inches"] == [3.42, 2.75]
+    assert uncertainty["dimensions_inches"] == [7.0, 2.75]
+    expected_pixels = {
+        "recovery": (825, 1026),
+        "uncertainty": (825, 2100),
+    }
+    for label, result in (("recovery", recovery), ("uncertainty", uncertainty)):
+        png = Path(result["files"]["png"])
+        pdf = Path(result["files"]["pdf"])
+        assert png.is_file() and png.stat().st_size > 0
+        assert pdf.is_file() and pdf.stat().st_size > 0
+        assert plt.imread(png).shape[:2] == expected_pixels[label]
+        assert pdf.read_bytes().startswith(b"%PDF")
+
+    assert recovery["statistics"]["n_cases"] == 8
+    assert recovery["statistics"]["mean_error"] == pytest.approx(
+        [0.1124837305, 0.07380207628, 0.0431657508]
+    )
+    assert recovery["statistics"]["q1_error"] == pytest.approx(
+        [0.0871748911, 0.0571966091, 0.0334534569]
+    )
+    assert recovery["statistics"]["q3_error"] == pytest.approx(
+        [0.1293562901, 0.0848723877, 0.0496406134]
+    )
+    assert recovery["statistics"]["improved_cases_8_to_32"] == 8
+    assert "IQR" in recovery["caption"]
+    uq_stats = uncertainty["statistics"]
+    assert uq_stats["coverage"]["profile"]["successes"] == [6, 7, 6]
+    assert uq_stats["coverage"]["mcmc"]["successes"] == [4, 5, 6]
+    assert uq_stats["interval_width"]["profile"]["mean"] == pytest.approx(
+        [0.3700892713, 0.2493770319, 0.2063509481]
+    )
+    assert uq_stats["interval_width"]["mcmc"]["mean"] == pytest.approx(
+        [0.2246758178, 0.1990697829, 0.1701742952]
+    )
+    assert "statistical significance" in uncertainty["caption"]
+
+
+def test_sensor_sweep_rejects_unpaired_or_nonfinite_rows(tmp_path):
+    spec = ip.spec_for("forcing")
+    columns = _sensor_sweep_columns("forcing")
+    columns["sim_id"][-1] = 99
+    unpaired = tmp_path / "unpaired.csv"
+    _write_csv(unpaired, columns)
+    with pytest.raises(ValueError, match="not paired"):
+        ip.plot_sensor_sweep_recovery(unpaired, spec, out_dir=tmp_path / "plots")
+
+    columns = _sensor_sweep_columns("forcing")
+    columns["R_c_abs_error"][0] = np.nan
+    nonfinite = tmp_path / "nonfinite.csv"
+    _write_csv(nonfinite, columns)
+    with pytest.raises(ValueError, match="non-finite"):
+        ip.plot_sensor_sweep_recovery(nonfinite, spec, out_dir=tmp_path / "plots")
+
+
+def test_sensor_sweep_jitter_is_deterministic_and_id_ordered():
+    ids = [8, 2, 5, 1]
+    first = ip._deterministic_jitter(ids)
+    second = ip._deterministic_jitter(ids)
+    assert np.array_equal(first, second)
+    by_id = dict(zip(ids, first))
+    assert [by_id[sid] for sid in sorted(ids)] == sorted(first)
 
 
 def test_source_itr_identifiability_falls_back_without_artifacts(tmp_path,

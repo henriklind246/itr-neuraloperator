@@ -42,7 +42,7 @@ INTERFACE_X_RANGE = (0.2, 0.8)
 # fail instead of silently mixing distributions.
 PROBLEM_VERSION = "interfaces_neumann_ic_v1"
 
-COND_STATIC_DIM = 4
+COND_STATIC_DIM = 3
 A_AMP_REF = float(SIN_AMP_RANGE[1])
 K_LEFT = 2.0
 K_RIGHT = 1.0
@@ -79,34 +79,19 @@ def _physical_interface_range(a: float, b: float) -> tuple[float, float]:
     )
 
 
-def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
+def build_cond_vector(t_bar_norm: float, R_c: float,
                       interface_x: float,
                       interface_x_range: tuple[float, float] = INTERFACE_X_RANGE) -> np.ndarray:
-    """Assemble the 4-dim static conditioning vector.
+    """Assemble the 3-dim static conditioning vector.
 
-    Layout: [t_bar_norm, t_s_norm, R_c_norm, interface_x_norm].
+    Layout: [t_bar_norm, R_c_norm, interface_x_norm].
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     x_lo, x_hi = map(float, interface_x_range)
     interface_x_norm = (interface_x - x_lo) / (x_hi - x_lo)
     return np.array(
-        [t_bar_norm, t_s_norm, R_c_norm, interface_x_norm], dtype=np.float32
+        [t_bar_norm, R_c_norm, interface_x_norm], dtype=np.float32
     )
-
-
-def normalize_interface_scalars(interface_x, R_c) -> np.ndarray:
-    """Linear ``[x_hat, Rc_hat]`` over ``INTERFACE_X_RANGE``/``RC_RANGE``.
-
-    Exactly the ``build_cond_vector`` convention (lines 78, 80), factored out so
-    the ``InterfaceCViT`` parameter-token branch (trainer + validation) shares one
-    normalization with the dataset cond vector and cannot drift. Accepts scalars
-    or arrays and broadcasts; returns ``[..., 2]`` float32.
-    """
-    x_lo, x_hi = map(float, INTERFACE_X_RANGE)
-    r_lo, r_hi = map(float, RC_RANGE)
-    x_hat = (np.asarray(interface_x, dtype=np.float32) - x_lo) / (x_hi - x_lo)
-    rc_hat = (np.asarray(R_c, dtype=np.float32) - r_lo) / (r_hi - r_lo)
-    return np.stack([x_hat, rc_hat], axis=-1).astype(np.float32)
 
 
 # ----- sampling helpers (bit-parity with vary-interfaces generate_dataset) -----
@@ -294,85 +279,6 @@ class InterfacesProblem(ProblemSpec):
             "spatial_params": spatial_params,
         }
 
-    def sample_online_params(
-        self,
-        rng: np.random.Generator,
-        n: int,
-        grids: dict[str, np.ndarray],
-        time_cfg: dict[str, Any],
-        rng_profile: np.random.Generator | None = None,
-        *,
-        rng_streams: dict[str, np.random.Generator] | None = None,
-        ic_family_assignment: list[str] | tuple[str, ...] | None = None,
-    ) -> list[dict]:
-        """Draw ``n`` fresh IID interface sims for `online` physics collocation.
-
-        Same row schema as :meth:`sample_sim_params`. Each call draws
-        ``(R_c, interface_x)`` IID from the marginal target ranges
-        (``RC_RANGE`` / ``INTERFACE_X_RANGE``) rather than placing them on the
-        fixed global LHS design used for the saved set: the marginals match, but
-        the joint coverage is IID, not the LHS grid, and successive minibatches
-        are independent. ``interface_x`` is jittered off grid nodes exactly as in
-        generation so the FV interface face is well-defined. IC family and the
-        fixed sin/uniform forcing are drawn through the same public samplers.
-        """
-        if rng_profile is None:
-            rng_profile = rng
-        streams = rng_streams or {}
-        ic_family_rng = streams.get("ic_family", rng)
-        ic_param_rng = streams.get("ic_params", rng)
-        forcing_rng = streams.get("forcing_params", rng_profile)
-        interface_rng = streams.get("interface_position", rng)
-        resistance_rng = streams.get("contact_resistance", rng)
-        X = grids["X"]
-        Y = grids["Y"]
-        x_grid = grids["x_grid"]
-        y_grid = grids["y_grid"]
-        Nx = X.shape[0]
-        a = float(x_grid[0])
-        b = float(x_grid[-1])
-        c = float(y_grid[0])
-        d = float(y_grid[-1])
-
-        dt = float(time_cfg["dt"])
-        t_final = float(time_cfg["t_final"])
-        b_temp = float(time_cfg.get("b", 1.0))
-        T_right = float(time_cfg.get("T_right", 300.0))
-        temporal_window = dict(
-            t_on=float(time_cfg.get("t_on", 0.0)),
-            t_off=float(time_cfg.get("t_off", 0.2)),
-            phase=float(time_cfg.get("phase", 0.0)),
-            tukey_alpha=float(time_cfg.get("tukey_alpha", 0.5)),
-        )
-
-        if ic_family_assignment is not None and len(ic_family_assignment) != int(n):
-            raise ValueError(
-                "ic_family_assignment length must equal the online batch size"
-            )
-        R_c_values = resistance_rng.uniform(RC_RANGE[0], RC_RANGE[1], size=n)
-        ix_frac = interface_rng.uniform(
-            INTERFACE_X_RANGE[0], INTERFACE_X_RANGE[1], size=n,
-        )
-        interface_x_values = (a + ix_frac * (b - a)).astype(np.float64)
-        interface_x_values = _jitter_off_node(interface_x_values, a=a, b=b, Nx=Nx)
-
-        return [
-            self._build_sim_param(
-                float(R_c_values[i]), float(interface_x_values[i]),
-                ic_param_rng, forcing_rng, X, Y,
-                dt=dt, t_final=t_final,
-                b_temp=b_temp, T_right=T_right, c=c, d=d,
-                temporal_window=temporal_window,
-                ic_family=(
-                    str(ic_family_assignment[i])
-                    if ic_family_assignment is not None
-                    else sample_ic_family(ic_family_rng)
-                ),
-                canonical_params=True,
-            )
-            for i in range(n)
-        ]
-
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
         y_grid = base_kwargs["y_grid"]
         a = float(base_kwargs["a"])
@@ -454,7 +360,6 @@ class InterfacesProblem(ProblemSpec):
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
         t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
-        t_s_norm = t_s_val / ds.time_norm_horizon
 
         s_y = ds.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
@@ -466,7 +371,6 @@ class InterfacesProblem(ProblemSpec):
 
         cond_static = build_cond_vector(
             t_bar_norm=float(t_bar_norm),
-            t_s_norm=float(t_s_norm),
             R_c=R_c,
             interface_x=interface_x,
             interface_x_range=_physical_interface_range(

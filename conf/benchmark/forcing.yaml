@@ -7,6 +7,12 @@
 
 benchmark:
   name: forcing
+  # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
+  # spatial channel intact; cond_static_dim is unchanged in every mode):
+  #   full                - baseline; nothing masked.
+  #   no_family           - zero the one-hot spatial-family label only.
+  #   spatial_field_only  - zero the whole spatial descriptor (family + params).
+  spatial_conditioning: full
 
 training:
   loss:
@@ -15,29 +21,3 @@ training:
     interface_weight: 10.0
     # Interface fixed at x = 0.5; use the static weight band/metric.
     per_sample_interface_x: false
-  physics:
-    # Pin the legacy transductive W2 source so forcing's collocation path stays
-    # byte-identical to before the diffusion benchmark added the `train` default.
-    collocation_source: val
-  pino:
-    residual_method: finite_volume
-    # Training problems are sampled online; saved records/trajectories are
-    # reserved for held-out validation.
-    collocation_source: online
-    lambda_r: 1.0
-    lambda_interface: 1.0
-    lambda_ic: 1.0
-    lambda_bc: 1.0
-    lambda_bc_left: 1.0
-    forcing:
-      ny_img: 96
-      nt_img: 256
-      # Fixed physical flux scale in W m^-2; independent of sampled profiles.
-      a_ref: 300.0
-    finite_volume:
-      interface_residual_weighting:
-        enabled: true
-    causal:
-      enabled: false
-    region_standardize:
-      enabled: false

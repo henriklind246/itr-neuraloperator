@@ -7,6 +7,12 @@
 
 benchmark:
   name: source
+  # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
+  # spatial channel intact; cond_static_dim unchanged). source has no one-hot
+  # family label, so no_family is a no-op (== full):
+  #   full                - baseline; nothing masked.
+  #   spatial_field_only  - zero the patch-geometry descriptor [x_h, y_h, w_h, h_h].
+  spatial_conditioning: full
 
 training:
   loss:

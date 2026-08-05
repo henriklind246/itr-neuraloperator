@@ -14,6 +14,12 @@ benchmark:
   rc_channel_mode: broadcast
   # x-localization length; only used when rc_channel_mode is localized.
   rc_ell: 0.05
+  # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
+  # spatial channel intact; cond_static_dim unchanged; ITR void params retained).
+  # No one-hot family label, so no_family is a no-op (== full):
+  #   full                - baseline; nothing masked.
+  #   spatial_field_only  - zero the patch-geometry descriptor [x_h, y_h, w_h, h_h].
+  spatial_conditioning: full
 
 training:
   loss:

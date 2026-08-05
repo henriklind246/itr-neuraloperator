@@ -4,7 +4,7 @@ The load-bearing checks are checkpoint-free: the torch reparameterization must
 reproduce the two theta injection points *bit-for-bit* (within float tolerance)
 against the real forward pipeline:
 
-  1. cond_static[2:6]  <- build_cond_vector_itr  (linear over RC_VOID_RANGES)
+  1. cond_static[1:5]  <- build_cond_vector_itr  (linear over RC_VOID_RANGES)
   2. spatial[..., 4]   <- _rc_channel            (rc_log_norm o make_rc_void_profile)
 
 A mismatch in either silently queries the FNO off-distribution and degrades
@@ -47,18 +47,18 @@ THETAS = [
 def test_cond_slice_matches_build_cond_vector_itr(theta):
     R_base, R_amp, y0, sigma = theta
     # Reference: the real cond builder. Patch slots are irrelevant here; we only
-    # compare the void slice cond[2:6], so any valid patch is fine.
+    # compare the void slice cond[1:5], so any valid patch is fine.
     x_lo, x_hi, y_lo, y_hi = 0.0, 1.0, 0.0, 1.0
     w_h = h_h = 0.1
     xcr, ycr = _patch_center_ranges(x_lo, x_hi, y_lo, y_hi, w_h, h_h)
     cond = build_cond_vector_itr(
-        t_bar_norm=0.3, t_s_norm=0.0,
+        t_bar_norm=0.3,
         R_base=R_base, R_amp=R_amp, y0=y0, sigma=sigma,
         x_h=0.5, y_h=0.5, w_h=w_h, h_h=h_h,
         x_center_range=xcr, y_center_range=ycr,
         x_length_scale=(x_hi - x_lo), y_length_scale=(y_hi - y_lo),
     )
-    ref_slice = cond[2:6]
+    ref_slice = cond[1:5]
 
     theta_t = torch.tensor(theta, dtype=torch.float64)
     got = inv.theta_to_cond_slice(theta_t).numpy()
@@ -146,7 +146,7 @@ def _fake_observation_set(Nx=16, Ny=16, N=3, M=128):
     spatial = torch.zeros(N, Nx, Ny, 5)
     spatial[..., 1] = torch.linspace(0, 1, Nx)[None, :, None]
     spatial[..., 2] = torch.linspace(0, 1, Ny)[None, None, :]
-    cond = torch.zeros(N, 10)
+    cond = torch.zeros(N, 9)
     cond[:, 0] = torch.linspace(0.3, 1.0, N)  # t_bar_norm early/mid/late
     forcing_seq = torch.zeros(N, M, 2)
     forcing_seq[..., 0] = torch.linspace(0, 1, M)
@@ -174,7 +174,7 @@ def test_predict_fullfield_injects_both_points_and_is_differentiable():
     loss = (pred ** 2).mean()
     loss.backward()
     # Gradient must flow back to all four unconstrained params through the two
-    # injection points (channel 4 + cond[2:6]).
+    # injection points (channel 4 + cond[1:5]).
     assert u.grad is not None
     assert torch.all(torch.isfinite(u.grad))
     assert torch.any(u.grad != 0)
@@ -910,7 +910,7 @@ def _tiny_forcing_model():
                 dtype=cond_full.dtype, device=cond_full.device,
             )
             out[:, 0, 0, 0] = 1.0
-            out[:, 0, 1, 0] = 5.0 * cond_full[:, 2]
+            out[:, 0, 1, 0] = 5.0 * cond_full[:, 1]
             return out
 
     model = FNO2d(
@@ -949,7 +949,7 @@ def _fake_forcing_observation_set(Nx=8, Ny=8, N=2, M=128):
     spatial[..., 1] = torch.linspace(0, 1, Nx)[None, :, None]
     spatial[..., 2] = torch.linspace(0, 1, Ny)[None, None, :]
     spatial[..., 3] = 1.0
-    cond = torch.zeros(N, 11)
+    cond = torch.zeros(N, 10)
     cond[:, 0] = torch.linspace(0.25, 0.75, N)
     forcing_seq = torch.zeros(N, M, 2)
     forcing_seq[..., 0] = torch.linspace(0, 1, M)
@@ -1048,7 +1048,6 @@ def test_forcing_adapter_cond_injection_matches_build_cond_vector(R_c):
     adapter = ForcingAdapter()
     cond = build_cond_vector(
         t_bar_norm=0.3,
-        t_s_norm=0.0,
         R_c=R_c,
         spatial_family="uniform",
         spatial_params={},
@@ -1056,7 +1055,7 @@ def test_forcing_adapter_cond_injection_matches_build_cond_vector(R_c):
     got = adapter.cond_slice_from_theta(
         torch.tensor([R_c], dtype=torch.float64)
     ).numpy()
-    np.testing.assert_allclose(got, cond[2:3], rtol=0, atol=1e-6)
+    np.testing.assert_allclose(got, cond[1:2], rtol=0, atol=1e-6)
 
 
 def test_forcing_adapter_no_spatial_channel_and_sim_param_copy():

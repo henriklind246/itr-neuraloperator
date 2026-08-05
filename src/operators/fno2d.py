@@ -8,7 +8,7 @@ import torch.nn.functional as F
 # Operator-learning task:
 # G(T(x, y, t_s), x, y, s_y, Q_y_bins, cond_static, forcing_seq) -> T(x, y, t_j)
 #
-# where t_bar = t_j - t_s is the lead time, t_s is the absolute source time, and
+# where t_bar = t_j - t_s is the lead time and
 # T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
 # spatial input carries 4 base channels + 16 fixed temporal-forcing integral bins
 # (Q_y_bins(x, y, k) = s_y(y) * ∫a(t)dt over the k-th subinterval of [t_s, t_j], /q_ref).
@@ -215,7 +215,7 @@ class FNO2d(nn.Module):
         model(spatial, cond_static, forcing_seq) → y_pred
 
     spatial      : (B, Nx, Ny, 20)       — T̃(x, y, t_s), x_norm, y_norm, s_y, Q_y_bin_0..Q_y_bin_15
-    cond_static  : (B, 15)               — t_bar_norm, t_s_norm, R_c_norm, spatial onehot+params, temporal onehot
+    cond_static  : (B, cond_static_dim)   — lead time and benchmark parameters
     forcing_seq  : (B, M, token_dim)     — 5-D tokens sampled from a(t) over [t_s, t_j]
     y_pred       : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
 
@@ -296,11 +296,11 @@ class FNO2d(nn.Module):
         if use_temporal_encoder:
             self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
 
-        # Time-augmented spatial forcing: fold [t_bar_norm, t_s_norm] into h_a before
+        # Time-augmented spatial forcing: fold t_bar_norm into h_a before
         # projecting to spatial-forcing weights, so the learned field can vary with lead.
         if use_temporal_encoder and use_forcing_time_aug:
             self.forcing_aug_mlp = nn.Sequential(
-                nn.Linear(forcing_embed_dim + 2, forcing_embed_dim),
+                nn.Linear(forcing_embed_dim + 1, forcing_embed_dim),
                 nn.GELU(),
                 nn.Linear(forcing_embed_dim, forcing_embed_dim),
             )
@@ -369,7 +369,7 @@ class FNO2d(nn.Module):
             # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}. The s_y channel
             # index is representation-specific (forcing/source: 3; interfaces: 5).
             if self.use_forcing_time_aug:
-                t_feats = cond_static[:, 0:2]                     # (B, 2) = [t_bar_norm, t_s_norm]
+                t_feats = cond_static[:, 0:1]                     # (B, 1) = [t_bar_norm]
                 h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
                 z_a = self.forcing_to_spatial(h_aug)              # (B, K)
             else:

@@ -281,8 +281,8 @@ class TestFNO2d:
             use_forcing_time_aug=True, s_y_channel=5,
         )
         assert hasattr(model, "forcing_aug_mlp")
-        # first linear folds [t_bar_norm, t_s_norm] into h_a: embed_dim + 2.
-        assert model.forcing_aug_mlp[0].in_features == 16 + 2
+        # The first linear folds normalized lead time into h_a.
+        assert model.forcing_aug_mlp[0].in_features == 16 + 1
 
         spatial = torch.randn(2, 11, 11, 6)
         cond_static = torch.randn(2, 4)

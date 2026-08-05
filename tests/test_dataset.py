@@ -33,7 +33,7 @@ from src.physics.boundary_forcing import (
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
 # Active dataset default = forcing benchmark, temporal_encoder representation:
-# 4 spatial channels [T_tilde, x, y, s_y], 11 static cond dims, (128, 2) tokens.
+# 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 2) tokens.
 # TEMPORAL_SAMPLES / TEMPORAL_TOKEN_DIM (64, 5) imported above stay scoped to the
 # legacy standalone build_forcing_seq / build_forcing_summary helper tests.
 SPATIAL_IN_CHANNELS = SPATIAL_CHANNELS_TEMPORAL
@@ -666,13 +666,13 @@ class TestSolverDatasetIntegration:
 # ===================== Static conditioning vector layout (11 dims) =====================
 
 # Slot offsets must match problems/forcing.py build_cond_vector.
-_OFF_SPATIAL_OH       = 3
-_OFF_SPATIAL_P        = 7
+_OFF_SPATIAL_OH       = 2
+_OFF_SPATIAL_P        = 6
 
 
 class TestCondStaticLayout:
-    """Verifies the 11-dim forcing static conditioning vector layout: base
-    (t_bar, t_s, R_c) + spatial one-hot (4) + spatial params (4). The forcing
+    """Verifies the 10-dim forcing static conditioning vector layout: base
+    (t_bar, R_c) + spatial one-hot (4) + spatial params (4). The forcing
     representation carries no temporal one-hot or forcing-summary dims."""
 
     def _make_dataset(self, spatial_family, spatial_params,

@@ -51,7 +51,7 @@ What Stages 1-5 do (deliberately narrow):
 
 theta enters the FNO in *two* places, and both must agree with the data
 pipeline exactly:
-  1. ``cond_static[2:6]`` — linear-normalized over ``RC_VOID_RANGES``
+  1. ``cond_static[1:5]`` — linear-normalized over ``RC_VOID_RANGES``
      (mirrors the active spatial-ITR condition builder).
   2. spatial channel ``RC_Y_CHANNEL`` (=4) — ``rc_log_norm(make_rc_void_profile(...))``
      broadcast across x.
@@ -59,7 +59,7 @@ pipeline exactly:
 Everything Stage 1 needs that is *not* theta (IC snapshot, x/y channels, known
 forcing/source fields, forcing sequence, and non-ITR condition slots) is taken verbatim from the
 real ``problem.build_item(ds, sid, s=0, j=n)`` so the scaffolding cannot drift
-from training. Only channel 4 and cond[2:6] are replaced by torch functions of
+from training. Only channel 4 and cond[1:5] are replaced by torch functions of
 theta, so autograd produces dT/dtheta through the frozen model.
 
 The profile / MCMC intervals are conditional on one frozen global calibration
@@ -413,7 +413,7 @@ class ObservationSet:
     Built once from ``problem.build_item(ds, sid, s=0, j=n)`` for each
     observation time index ``n``. ``spatial`` carries the four theta-independent
     channels verbatim; channel ``RC_Y_CHANNEL`` is overwritten per-theta in the
-    loss. ``cond`` carries the time/patch slots; columns 2:6 are overwritten.
+    loss. ``cond`` carries the lead/patch slots; columns 1:5 are overwritten.
     """
 
     sid: int
@@ -564,7 +564,7 @@ def predict_fullfield(
 
     ``theta`` is a single physical (4,) vector. Both injection points are
     rebuilt from theta and spliced into the (otherwise detached) scaffolding so
-    autograd flows only through cond[2:6] and channel RC_Y_CHANNEL.
+    autograd flows only through cond[1:5] and channel RC_Y_CHANNEL.
 
     The splice is done out-of-place (``torch.where`` / ``torch.cat`` rather than
     indexed assignment) so the function is safe under ``vmap`` — needed for the
@@ -2405,9 +2405,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "--fv-equivalent-scalar is only available for adapters "
                     "with a spatial-ITR scalar comparison."
                 )
+            # Must be the recovered profile, not obs.theta_true: the question is
+            # whether the *inferred* R_c(y) is distinguishable from a matched
+            # scalar. Ground truth makes this an oracle check, and one that is
+            # uncomputable on real data where theta_true does not exist.
             summary.update(
                 equivalent_scalar_fv_summary(
-                    ds, fv_base_kwargs, obs, obs.theta_true,
+                    ds, fv_base_kwargs, obs, theta_hat,
                     mu_global=loaded.mu_global,
                     sigma_global=loaded.sigma_global,
                     adapter=adapter,

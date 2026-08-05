@@ -209,274 +209,6 @@ def compute_interface_rel_l2(
     return rel_l2.item()
 
 
-def physics_residual_loss(
-    T_n: torch.Tensor,
-    T_np1: torch.Tensor,
-    geom,
-    extra_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Mean squared interior CN cell-balance residual (Stage 1, interior-only).
-
-    ``T_n`` / ``T_np1`` are normalized temperature fields one solver step ``dt``
-    apart in the training loss layout ``(B, Nx, Ny, 1)`` (a trailing channel of
-    1) or ``(B, Nx, Ny)``. The interior residual is the nondimensional per-step
-    (normalized) temperature residual directly (the r-coefficients fold in dt,
-    the CN 1/2, and the cell capacity), so the loss is ``mean(res^2)`` over the
-    interior-mask cells — no extra capacity-scale division on the interior path.
-
-    The mean is over masked cells only (zeroed boundary/Dirichlet cells are
-    excluded from the denominator) so the loss magnitude is independent of the
-    masked-out fraction.
-    """
-    from src.physics.fv_residual import interior_cn_residual
-
-    if T_n.dim() == 4:
-        T_n = T_n[..., 0]
-        T_np1 = T_np1[..., 0]
-    res, mask = interior_cn_residual(T_n, T_np1, geom, extra_mask=extra_mask)
-    denom = res.shape[0] * int(mask.sum())
-    return res.pow(2).sum() / denom
-
-
-_FULL_BC_REGIONS = ("interior", "left_neumann", "right_dirichlet", "topbot_adiabatic")
-
-
-def full_bc_physics_loss(
-    T_n: torch.Tensor,
-    T_np1: torch.Tensor,
-    geom,
-    bc,
-    region_weights: dict | None = None,
-    dirichlet_both_ends: bool = False,
-    per_sample: bool = False,
-    interface_band: bool = False,
-) -> dict:
-    """Region-partitioned full-BC physics loss for the Stage-2 ``full_bc`` path.
-
-    Computes the per-region mean-squared residual from
-    ``fv_residual.full_bc_cn_residual`` and returns a flat dict:
-
-      - ``phys_interior_mse``, ``phys_left_neumann_mse``,
-        ``phys_right_dirichlet_mse``, ``phys_topbot_adiabatic_mse`` — the
-        per-region diagnostics (mean over that region's cells, all four already
-        commensurate normalized per-step temperature errors).
-      - ``physics_loss_weighted`` — the gradient signal
-        ``sum_region w_region * region_mse`` with ``region_weights`` (default all
-        1.0, i.e. each REGION contributes equally, deliberately up-weighting the
-        few-celled boundary rows relative to a global all-cell mean).
-      - ``physics_loss_allcell_mean`` — the plain all-cell ``mean(r^2)`` over the
-        four-region partition (each cell once; unaffected by the weights), for
-        comparison against the raw residual behavior.
-
-    With ``dirichlet_both_ends`` the right-Dirichlet MSE averages the violation
-    at both model-output times (``T_n`` and ``T_np1``); ``physics_loss_allcell_mean``
-    still uses the single ``T_np1`` partition so it stays a true per-cell mean.
-
-    With ``per_sample`` the residual is kept batch-shaped and the dict also
-    carries the per-region per-sample means (each ``(B,)``):
-    ``interior_per_sample``, ``left_neumann_per_sample``,
-    ``topbot_adiabatic_per_sample``, ``right_dirichlet_per_sample`` (the
-    right-Dirichlet averages the ``n``/``np1`` halves under
-    ``dirichlet_both_ends``). The scalar keys are the batch means of these, so
-    they are numerically identical to the flattened default.
-
-    With ``interface_band`` (requires ``per_sample``; raises otherwise) the two
-    interior node columns flanking the interface face — full-grid columns
-    ``{face_idx, face_idx+1}`` = interior columns ``{face_idx-1, face_idx}`` from
-    ``geom.face_idx`` — are split off into a disjoint ``interface_band`` term.
-    ``interior_per_sample`` / ``phys_interior_mse`` then become **bulk-only**
-    (band columns removed) and two extra keys appear: ``interface_band_per_sample``
-    ``(B,)`` and ``phys_interface_band_mse`` (its batch mean). Fails loudly if
-    ``geom.face_idx`` is missing or a mapped column is out of range.
-    ``interface_band=False`` is byte-for-byte the legacy output.
-    """
-    from src.physics.fv_residual import full_bc_cn_residual
-
-    if T_n.dim() == 4:
-        T_n = T_n[..., 0]
-        T_np1 = T_np1[..., 0]
-
-    # Fail loudly: interface_band is a per-sample-only feature. Never silently
-    # fall back to a band-less loss (that would make a "band-enabled" run
-    # byte-identical to the baseline). Only interface_band=False is legacy-exact.
-    if interface_band and not per_sample:
-        raise ValueError(
-            "full_bc_physics_loss: interface_band=True requires per_sample=True "
-            "(the disjoint band split is defined on the batch-shaped interior "
-            "residual)."
-        )
-
-    if not per_sample:
-        parts = full_bc_cn_residual(
-            T_n, T_np1, geom, bc, dirichlet_both_ends=dirichlet_both_ends
-        )
-
-        region_mse = {name: parts[name].pow(2).mean() for name in _FULL_BC_REGIONS}
-        if dirichlet_both_ends:
-            region_mse["right_dirichlet"] = 0.5 * (
-                parts["right_dirichlet"].pow(2).mean()
-                + parts["right_dirichlet_n"].pow(2).mean()
-            )
-
-        weights = {name: 1.0 for name in _FULL_BC_REGIONS}
-        if region_weights:
-            for name, w in region_weights.items():
-                if name in weights:
-                    weights[name] = float(w)
-
-        weighted = sum(weights[name] * region_mse[name] for name in _FULL_BC_REGIONS)
-        allcell = torch.cat([parts[name] for name in _FULL_BC_REGIONS]).pow(2).mean()
-
-        return {
-            "physics_loss_weighted": weighted,
-            "physics_loss_allcell_mean": allcell,
-            "phys_interior_mse": region_mse["interior"],
-            "phys_left_neumann_mse": region_mse["left_neumann"],
-            "phys_right_dirichlet_mse": region_mse["right_dirichlet"],
-            "phys_topbot_adiabatic_mse": region_mse["topbot_adiabatic"],
-        }
-
-    parts = full_bc_cn_residual(
-        T_n, T_np1, geom, bc,
-        dirichlet_both_ends=dirichlet_both_ends, keep_batch=True,
-    )
-
-    # Per-region per-sample MSE (mean over the region's cells; leading batch dim
-    # kept). Region tensors are (B, ...); reduce every non-batch dim.
-    def _ps(t: torch.Tensor) -> torch.Tensor:
-        return t.pow(2).flatten(1).mean(dim=1)
-
-    interior_per_sample = _ps(parts["interior"])
-    interface_band_per_sample = None
-    if interface_band:
-        # (b) The band is derived from the per-sample interface face index; a
-        # scalar geom (face_idx is None) cannot supply it.
-        face_idx = getattr(geom, "face_idx", None)
-        if face_idx is None:
-            raise ValueError(
-                "full_bc_physics_loss: interface_band=True requires "
-                "geom.face_idx (per-sample interface face); got None. Build the "
-                "geometry with build_cn_geom_per_interface."
-            )
-        # parts["interior"] is (B, Nx-2, Ny-2). Full-grid column i maps to
-        # interior column k = i-1, so the interface-flanking full-grid columns
-        # {face_idx, face_idx+1} are interior columns {face_idx-1, face_idx}.
-        sq = parts["interior"].square()  # (B, Nx-2, Ny-2)
-        B, nx_int, ny_int = sq.shape
-        dev = sq.device
-        face_idx = face_idx.to(device=dev, dtype=torch.long)  # (B,)
-        band_idx = torch.stack([face_idx - 1, face_idx], dim=1)  # (B, 2)
-        # (c) Both mapped interior columns must be strictly inside [0, Nx-3].
-        if int(band_idx.min()) < 0 or int(band_idx.max()) > nx_int - 1:
-            raise ValueError(
-                "full_bc_physics_loss: interface band column out of range; "
-                f"mapped interior columns {{face_idx-1, face_idx}} must lie in "
-                f"[0, {nx_int - 1}] (Nx-3), got min={int(band_idx.min())} "
-                f"max={int(band_idx.max())}."
-            )
-        band_cols = torch.zeros(B, nx_int, dtype=torch.bool, device=dev)
-        rows = torch.arange(B, device=dev)[:, None].expand(-1, 2)
-        band_cols[rows, band_idx] = True  # (B, Nx-2) bool
-        band_mask = band_cols[:, :, None].expand_as(sq)  # (B, Nx-2, Ny-2)
-        band_count = band_mask.sum(dim=(1, 2))            # (B,) = 2*(Ny-2)
-        bulk_count = (~band_mask).sum(dim=(1, 2))         # (B,)
-        interface_band_per_sample = (sq * band_mask).sum(dim=(1, 2)) / band_count
-        interior_per_sample = (sq * ~band_mask).sum(dim=(1, 2)) / bulk_count
-
-    per = {
-        "interior": interior_per_sample,
-        "left_neumann": _ps(parts["left_neumann"]),
-        "topbot_adiabatic": _ps(parts["topbot_adiabatic"]),
-        "right_dirichlet": _ps(parts["right_dirichlet"]),
-    }
-    if dirichlet_both_ends:
-        per["right_dirichlet"] = 0.5 * (per["right_dirichlet"] + _ps(parts["right_dirichlet_n"]))
-
-    region_mse = {name: per[name].mean() for name in _FULL_BC_REGIONS}
-
-    weights = {name: 1.0 for name in _FULL_BC_REGIONS}
-    if region_weights:
-        for name, w in region_weights.items():
-            if name in weights:
-                weights[name] = float(w)
-
-    weighted = sum(weights[name] * region_mse[name] for name in _FULL_BC_REGIONS)
-    allcell = torch.cat(
-        [parts[name].flatten() for name in _FULL_BC_REGIONS]
-    ).pow(2).mean()
-
-    out = {
-        "physics_loss_weighted": weighted,
-        "physics_loss_allcell_mean": allcell,
-        "phys_interior_mse": region_mse["interior"],
-        "phys_left_neumann_mse": region_mse["left_neumann"],
-        "phys_right_dirichlet_mse": region_mse["right_dirichlet"],
-        "phys_topbot_adiabatic_mse": region_mse["topbot_adiabatic"],
-        "interior_per_sample": per["interior"],
-        "left_neumann_per_sample": per["left_neumann"],
-        "topbot_adiabatic_per_sample": per["topbot_adiabatic"],
-        "right_dirichlet_per_sample": per["right_dirichlet"],
-    }
-    if interface_band:
-        # interior_* above are now bulk-only (band columns removed); the two
-        # terms are disjoint and cell-count-weighted-recombine to the full
-        # interior mean-square.
-        out["interface_band_per_sample"] = interface_band_per_sample
-        out["phys_interface_band_mse"] = interface_band_per_sample.mean()
-    return out
-
-
-def region_balanced_fv_rate_loss(
-    T_n: torch.Tensor,
-    T_np1: torch.Tensor,
-    geom,
-    bc,
-    *,
-    t_ref: float,
-    dirichlet_both_ends: bool = False,
-) -> dict:
-    """Dimensionless, per-interval FV losses over disjoint physical regions."""
-    from src.physics.fv_residual import region_balanced_fv_rate_residual
-
-    if not math.isfinite(float(t_ref)) or float(t_ref) <= 0.0:
-        raise ValueError(f"t_ref must be finite and positive, got {t_ref!r}")
-    parts = region_balanced_fv_rate_residual(
-        T_n,
-        T_np1,
-        geom,
-        bc,
-        dirichlet_both_ends=dirichlet_both_ends,
-        keep_batch=True,
-    )
-
-    scale = float(t_ref)
-
-    def _rate_mse_per_interval(value: torch.Tensor) -> torch.Tensor:
-        return (scale * value).square().flatten(1).mean(dim=1)
-
-    per = {
-        "interior": _rate_mse_per_interval(parts["interior"]),
-        "interface": _rate_mse_per_interval(parts["interface"]),
-        "left_neumann": _rate_mse_per_interval(parts["left_neumann"]),
-        "top_adiabatic": _rate_mse_per_interval(parts["top_adiabatic"]),
-        "bottom_adiabatic": _rate_mse_per_interval(parts["bottom_adiabatic"]),
-    }
-    per["topbot_adiabatic"] = 0.5 * (
-        per["top_adiabatic"] + per["bottom_adiabatic"]
-    )
-    right = parts["right_dirichlet"].square().flatten(1).mean(dim=1)
-    if dirichlet_both_ends:
-        right = 0.5 * (
-            right
-            + parts["right_dirichlet_n"].square().flatten(1).mean(dim=1)
-        )
-    per["right_dirichlet"] = right
-
-    out = {f"{name}_per_sample": value for name, value in per.items()}
-    out.update({f"phys_{name}_mse": value.mean() for name, value in per.items()})
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Unified metric suite (per-sample, normalization-invariant headline + jump +
 # Kelvin + tails). Shared by train.py (train_one_epoch / validate) and
@@ -654,18 +386,22 @@ def per_sample_contact_jump_rmse(
 def tail_stats(values: torch.Tensor) -> dict:
     """Return distributional stats of a 1D tensor of per-pair metric values.
 
-    Keys: mean, p25, p50, p75, iqr, p90, p99, max. The p25/p50/p75/iqr keys are
-    additive; existing callers reading mean/p90/p99/max keep working unchanged.
+    Keys: mean, p25, p50, p75, iqr, p90, p95, p99, max. Existing callers
+    reading the older keys keep working unchanged.
     """
     v = values.detach().to(torch.float64).reshape(-1)
     if v.numel() == 0:
         return {
             "mean": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "iqr": 0.0,
-            "p90": 0.0, "p99": 0.0, "max": 0.0,
+            "p90": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0,
         }
     q = torch.quantile(
         v,
-        torch.tensor([0.25, 0.50, 0.75, 0.90, 0.99], dtype=v.dtype, device=v.device),
+        torch.tensor(
+            [0.25, 0.50, 0.75, 0.90, 0.95, 0.99],
+            dtype=v.dtype,
+            device=v.device,
+        ),
     )
     p25, p50, p75 = float(q[0]), float(q[1]), float(q[2])
     return {
@@ -675,6 +411,7 @@ def tail_stats(values: torch.Tensor) -> dict:
         "p75": p75,
         "iqr": p75 - p25,
         "p90": float(q[3]),
-        "p99": float(q[4]),
+        "p95": float(q[4]),
+        "p99": float(q[5]),
         "max": float(v.max()),
     }

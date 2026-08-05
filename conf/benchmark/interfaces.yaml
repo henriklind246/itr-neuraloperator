@@ -7,6 +7,10 @@
 
 benchmark:
   name: interfaces
+  # Spatial-descriptor conditioning ablation. interfaces carries no spatial
+  # descriptor in cond_static, so every mode is a no-op (regression control);
+  # the knob is declared only for provenance parity across benchmarks.
+  spatial_conditioning: full
 
 training:
   loss:
@@ -16,39 +20,3 @@ training:
     # interface_x varies per sim in [0.2, 0.8]; track each sample's location for
     # the weighted loss and interface metric instead of the fixed interface_x.
     per_sample_interface_x: true
-  # Physics-only (PINO) InterfaceCViT training reads training.pino; these pin the
-  # interface-path knobs (the rest fall back to conf/config.yaml). Online
-  # collocation draws interface_x / R_c / forcing / balanced IC descriptors
-  # afresh; saved_train remains available as an explicit diagnostic. The IC
-  # varies per problem, so lambda_ic > 0 anchors the varying initial field
-  # (unlike the constant-IC diffusion_forcing benchmark). Causal interior
-  # weighting stays OFF for the tiny fixed-parameter debug run; enable it (with
-  # stratified_time_sampling) for the 41-epoch screen onward.
-  pino:
-    # mode=collapse (default) trains the full-trajectory decoder. Set
-    # mode=one_step (CLI: training.pino.mode=one_step) to train the
-    # state-conditioned Markov operator; it reads training.pino.one_step from
-    # conf/config.yaml and reuses forcing.ny_img/nt_img (96 x 256) as the
-    # per-interval forcing-image resolution.
-    mode: collapse
-    collocation_source: online
-    lambda_r: 1.0
-    lambda_ic: 1.0
-    lambda_bc: 1.0
-    lambda_bc_left: null
-    forcing:
-      ny_img: 96
-      nt_img: 256
-      a_ref: 300.0
-    intervals_per_sim: 2
-    stratified_time_sampling: true
-    causal_num_bins: 6
-    finite_volume:
-      interface_residual_weighting:
-        enabled: false
-    region_standardize:
-      enabled: false
-      calibration_steps: 50
-      eps: 1.0e-8
-    causal:
-      enabled: false

@@ -530,7 +530,7 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
     """Load a checkpoint and reconstruct a 2D FNO model on CPU."""
     import torch
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     conf = ckpt["conf"]
     model_cfg = conf.get("model", {}).get("parameters", {})
     if "modes1" not in model_cfg or "modes2" not in model_cfg:

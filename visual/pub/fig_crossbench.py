@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
-from visual.pub import fields, panels, records, select, stats, style
+from visual.pub import fields, panels, records, select, stats, style, tables
 from visual.pub._blocked import blocked
 
 _RECORDS_NEEDED = (
@@ -163,84 +164,62 @@ def headline_accuracy(*, source=None, spec=None, requirement=None):
 
 
 def jump_vs_lead(*, source=None, spec=None, requirement=None):
-    """F07 -- interface error against lead time.
-
-    The first user of shared bin edges. Lead bins are computed once over the
-    pooled records of all four benchmarks and reused for every one of them;
-    binning each benchmark on its own quantiles would give each a different set
-    of edges and make the curves silently incommensurable.
-
-    Binning happens at pair level, aggregation at simulation level, and the
-    bootstrap resamples ``sim_id`` within a bin. Two panels: absolute Kelvin
-    jump error, and interface relative :math:`L_2`, so a benchmark is not
-    credited for merely having a larger temperature range.
-    """
-    metrics = ("node_jump_rmse_K", "iface_rel_l2_pct", "rmse_K")
-    frames, order, _ = _load(source, requirement, "F07_jump_vs_lead", metrics)
-
-    edges = stats.shared_bin_edges([frames[b].df for b in order], "lead_bin")
-    sims = {b: stats.per_sim(frames[b], strata=("lead_bin",), metrics=metrics,
-                             edges={"lead_bin": edges})
-            for b in order}
-
-    bin_labels = stats.stratum_order(sims[order[0]].df, "lead_bin")
-    for bench in order[1:]:
-        bin_labels = tuple(dict.fromkeys(
-            bin_labels + stats.stratum_order(sims[bench].df, "lead_bin")))
+    """F07 -- pair-weighted field and node-jump error at all exact leads."""
+    frames = records.records_by_benchmark(source)
+    if not frames:
+        blocked(requirement, _RECORDS_NEEDED, key="F07_jump_vs_lead")
+    order = benchmark_order(frames)
 
     width = spec.width if spec is not None else "two_col"
     fig, axes = plt.subplots(1, 2, figsize=style.figsize(width, row_height="std"))
 
-    all_degradations = []
-    for ax, metric in zip(axes, ("node_jump_rmse_K", "iface_rel_l2_pct")):
+    counts = {}
+    for ax, metric in zip(axes, ("field", "jump")):
         for bench in order:
-            pooled = stats.summarize(_pool_seeds(sims[bench]), metric,
-                                     strata=("lead_bin",))
-            ordered, present = [], []
-            for label in bin_labels:
-                summary = pooled.get((bench, label))
-                if summary is None or not np.isfinite(summary.median):
-                    continue
-                ordered.append(summary)
-                present.append(label)
-                all_degradations.extend(summary.degradations)
-            if not ordered:
-                continue
-            offsets = np.array([bin_labels.index(p) for p in present], dtype=float)
+            curve = tables.lead_time_curve(frames[bench].df, metric)
             colour = style.benchmark_color(bench)
-            for xi, summary in zip(offsets, ordered):
-                panels.summary_points(ax, [summary], color=colour, offset=xi)
-            ax.plot(offsets, [s.median for s in ordered], "-", color=colour,
-                    linewidth=1.0, alpha=0.85, label=bench)
-
-        ax.set_xticks(np.arange(len(bin_labels), dtype=float))
-        ax.set_xticklabels(bin_labels, fontsize=5.5, rotation=20, ha="right")
-        ax.set_xlim(-0.6, len(bin_labels) - 0.4)
-        ax.set_xlabel(r"lead-time bin (quantiles of $\bar{t}$, shared edges)")
-        ax.set_ylabel(style.axis_label(metric))
+            x = curve["t_bar"].to_numpy()
+            ax.fill_between(
+                x, curve["test_cluster_ci_lower"], curve["test_cluster_ci_upper"],
+                color=colour, alpha=0.10, linewidth=0,
+            )
+            ax.plot(x, curve["mean"], "-", color=colour, linewidth=1.0,
+                    label=bench)
+            ax.plot(x, curve["p95"], "--", color=colour, linewidth=0.8,
+                    alpha=0.8)
+            counts[bench] = curve[["t_bar", "n_pairs_per_seed"]].to_dict("records")
+        ax.set_xlabel(r"lead time $\bar{t}$")
+        metric_name = "rmse_K" if metric == "field" else "node_jump_rmse_K"
+        ax.set_ylabel(style.axis_label(metric_name))
         ax.set_yscale("log")
-        ax.set_title(stats.metric_spec(metric).label
-                     + f"  [{stats.metric_spec(metric).space}]", fontsize=7)
+        ax.set_title(
+            "Field RMSE" if metric == "field" else "Node-jump RMSE",
+            fontsize=7,
+        )
         ax.grid(True, axis="y", alpha=0.25)
 
-    axes[0].legend(fontsize=5.5, loc="best")
+    handles, labels = axes[0].get_legend_handles_labels()
+    handles.append(Line2D([0], [0], color="0.25", linestyle="--", linewidth=0.8))
+    labels.append("P95 error (95th percentile)")
+    axes[0].legend(handles, labels, fontsize=5.5, loc="best")
     style.panel_letters(axes)
     fig.tight_layout()
 
     metric_definition = {
-        "aggregation": "pair -> bin -> simulation -> median over simulations",
-        "replication_unit": "sim_id within a lead bin",
-        "binning": "quantile bins of t_bar, edges computed once over the pooled "
-                   "records of every benchmark and reused for all of them",
-        "bin_edges": [float(e) for e in edges],
-        "bin_labels": list(bin_labels),
-        "interval": "BCa bootstrap over simulations, 95%",
-        "metrics": {m: stats.metric_spec(m).label
-                    for m in ("node_jump_rmse_K", "iface_rel_l2_pct")},
-        "spaces": {m: stats.metric_spec(m).space
-                   for m in ("node_jump_rmse_K", "iface_rel_l2_pct")},
+        "aggregation": "pairwise mean and P95 at each exact positive lead; "
+                       "seed-specific statistics are averaged",
+        "replication_unit": "sim_id within each exact lead",
+        "lead_grid": "all 30 positive saved-snapshot lead times",
+        "interval": "95% simulation-cluster percentile bootstrap around the mean",
+        "interval_interpretation": "finite test-cohort uncertainty conditional "
+                                   "on the fixed trained models",
+        "line_encoding": "solid=mean with CI ribbon; dashed=P95 without ribbon",
+        "metrics": {"field": "Field RMSE", "jump": "Node-jump RMSE"},
+        "spaces": {"field": "kelvin", "jump": "kelvin"},
         "benchmarks": order,
-        "degradations": _degradation_codes(all_degradations),
+        "pair_counts_per_seed": counts,
+        "degradations": sorted({d.code for f in frames.values()
+                                 for d in f.degradations}),
     }
     return fig, None, metric_definition
 

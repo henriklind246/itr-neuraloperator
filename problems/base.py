@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import numpy as np
 
@@ -31,7 +31,7 @@ class ProblemDims:
     stats vector (2 = [mu, sigma]; 3 adds a per-benchmark scalar such as
     interface_x). `s_y_channel` is the spatial channel the model multiplies the
     learned forcing weights against; `use_forcing_time_aug` augments the temporal
-    embedding with the lead/start time before projecting those weights.
+    embedding with lead time before projecting those weights.
     """
 
     in_channels: int
@@ -45,6 +45,26 @@ class ProblemDims:
 
 
 OODKind = Literal["simulation_parameter", "evaluation_parameter", "compound"]
+
+
+#: Train/eval ablation of the global spatial descriptor in ``cond_static``.
+#:
+#: The spatial forcing profile ``s(y)`` (or, for source benchmarks, the internal
+#: source patch geometry) is visible to the model through two redundant paths:
+#: the spatial input channel it multiplies against, and the global
+#: ``cond_static`` descriptor (a one-hot family label plus continuous params for
+#: forcing/forcing_itr; patch-geometry params for source/source_itr). These
+#: modes zero out the descriptor entries in ``cond_static`` while leaving the
+#: spatial channel intact, so the model must recover the profile from the field
+#: alone. ``cond_static_dim`` is never changed, so the ConditioningMLP
+#: architecture and parameter count are identical across modes.
+#:
+#: - ``full`` -- baseline; nothing zeroed.
+#: - ``no_family`` -- zero only the one-hot family block (retain continuous
+#:   params). A no-op for benchmarks with no family label (source/source_itr).
+#: - ``spatial_field_only`` -- zero the whole spatial descriptor (family label +
+#:   params, or patch params).
+SpatialConditioningMode = Literal["full", "no_family", "spatial_field_only"]
 
 
 @dataclass(frozen=True)
@@ -110,6 +130,60 @@ class ProblemSpec(ABC):
 
     name: str
     dims: ProblemDims
+
+    # ---- spatial-descriptor conditioning ablation ----
+    #: Active ablation mode (see :data:`SpatialConditioningMode`). Set via
+    #: :meth:`set_spatial_conditioning`; ``full`` leaves ``cond_static`` untouched.
+    spatial_conditioning: str = "full"
+    #: ``cond_static`` slice holding the one-hot family label, zeroed under
+    #: ``no_family`` and ``spatial_field_only``. ``None`` for benchmarks with no
+    #: family label (an empty mask). Declared next to each spec's cond layout as
+    #: the single source of truth read by both the mask helper and the tests.
+    family_cond_slice: "slice | None" = None
+    #: ``cond_static`` slice holding the full spatial descriptor (family label +
+    #: continuous params, or patch-geometry params), zeroed under
+    #: ``spatial_field_only``. ``None`` for benchmarks with no descriptor.
+    spatial_descriptor_cond_slice: "slice | None" = None
+
+    def set_spatial_conditioning(self, mode: str) -> None:
+        """Validate and store the spatial-descriptor conditioning mode.
+
+        Raises immediately on an unknown mode so a bad config value fails at
+        spec-resolution time rather than surviving into item construction.
+        """
+        valid = get_args(SpatialConditioningMode)
+        if mode not in valid:
+            raise ValueError(
+                f"Unknown spatial_conditioning={mode!r}; "
+                f"expected one of {valid}."
+            )
+        self.spatial_conditioning = mode
+
+    def _apply_spatial_conditioning_mask(self, cond: np.ndarray) -> np.ndarray:
+        """Zero the declared descriptor slice(s) for the active ablation mode.
+
+        ``full`` returns ``cond`` unchanged. Ablated modes return a *copied*
+        array (never aliasing a reused dict or shared-memory tensor) with the
+        selected slice zeroed; a ``None`` slice is a no-op copy, so benchmarks
+        without the relevant descriptor (e.g. ``no_family`` on source, or any
+        mode on interfaces) are guaranteed no-ops.
+        """
+        mode = self.spatial_conditioning
+        if mode == "full":
+            return cond
+        out = np.asarray(cond).copy()
+        if mode == "no_family":
+            sl = self.family_cond_slice
+        elif mode == "spatial_field_only":
+            sl = self.spatial_descriptor_cond_slice
+        else:
+            raise ValueError(
+                f"Unknown spatial_conditioning={mode!r}; "
+                f"expected one of {get_args(SpatialConditioningMode)}."
+            )
+        if sl is not None:
+            out[sl] = 0.0
+        return out
 
     # ---- data generation ----
 
@@ -188,72 +262,6 @@ class ProblemSpec(ABC):
     def plot_label(self, params: dict) -> str:
         """Short human-readable label for a sim, used by visual modules."""
         return self.name
-
-    # ---- optional collocation hooks (W2 physics path; default off) ----
-
-    def collocation_geom_cfg(
-        self, ds, phys_cfg: dict, mu_global: float, sigma_global: float, dt: float,
-    ) -> dict[str, Any] | None:
-        """Geometry/closure config for the full_bc collocation residual.
-
-        Return a dict consumed by the training loop's collocation sampler
-        (including ``geometry_kind``, grids/materials, normalization, and the
-        forcing-quadrature identity). The default ``None`` makes the training
-        loop fall back to its built-in geometry block, so benchmarks that do not
-        opt in keep the existing behavior unchanged.
-        """
-        return None
-
-    def collocation_closure(
-        self, ds, sid: int, params: dict, t: float, t_dt: float,
-    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray | None] | None:
-        """Per-item boundary closure for a collocation pair.
-
-        Return ``(R_c, qL_n, qL_np1, qL_int)`` for the two collocation times, or
-        ``None`` to use the training loop's built-in closure. ``qL_int`` may be
-        ``None`` only when the geometry metadata explicitly selects endpoint CN
-        quadrature.
-        """
-        return None
-
-    def collocation_base_plan(self, ds, dt: float) -> dict[str, Any] | None:
-        """Plan describing how collocation pairs are drawn.
-
-        Return e.g. ``{"base_snapshot_index": 0, "on_grid_pairs": True}`` to pin
-        the source snapshot and draw consecutive on-grid conditioning times, or
-        ``None`` to use the training loop's built-in (random source / uniform
-        lead) sampling.
-        """
-        return None
-
-    def sample_online_params(
-        self,
-        rng: np.random.Generator,
-        n: int,
-        grids: dict[str, np.ndarray],
-        time_cfg: dict[str, Any],
-        rng_profile: np.random.Generator | None = None,
-        *,
-        rng_streams: dict[str, np.random.Generator] | None = None,
-        ic_family_assignment: list[str] | tuple[str, ...] | None = None,
-    ) -> list[dict]:
-        """Draw ``n`` fresh IID sim-param dicts for `online` physics collocation.
-
-        Same row schema as :meth:`sample_sim_params` (so the same channel/forcing
-        builders consume them), but each call draws parameters IID from the
-        benchmark's *target* distributions instead of a fixed global design.
-        ``rng_streams`` and ``ic_family_assignment`` let physics-only trainers
-        isolate logically independent draws and impose a batch-level family
-        balance. They are optional so existing callers retain the legacy
-        ``rng``/``rng_profile`` behavior. Benchmarks that support online
-        collocation override this; the default raises so an `online`
-        collocation source fails loudly rather than silently reusing saved
-        params.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support online collocation "
-            "sampling (sample_online_params)."
-        )
 
     # ---- optional OOD hooks (W3 out-of-distribution path; default off) ----
 

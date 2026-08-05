@@ -329,7 +329,7 @@ class TestPreInitOptunaStorage:
         study.add_trial(
             optuna.trial.create_trial(
                 params={"x": 1.0},
-                distributions={"x": optuna.distributions.FloatDistribution(0, 10)},
+                distributions={"x": optuna.distributions.UniformDistribution(0, 10)},
                 values=[0.5],
             )
         )

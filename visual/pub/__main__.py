@@ -42,6 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--figure", nargs="+", metavar="KEY",
                    help="figure keys to render")
+    p.add_argument(
+        "--table",
+        choices=("T01_primary_results", "T01_primary_results_descriptive"),
+                   help="publication table to write")
     p.add_argument("--all", action="store_true",
                    help="render every figure at or below --tier")
     p.add_argument("--tier", type=int, default=2, choices=(1, 2, 3),
@@ -174,6 +178,27 @@ def main(argv=None) -> int:
         return cmd_list(mf, args.format)
     if args.verify:
         return cmd_verify(mf, args.format)
+
+    if args.table:
+        try:
+            descriptive = args.table == "T01_primary_results_descriptive"
+            source = mf.resolve(
+                "F04_headline_accuracy",
+                strict=False if descriptive else args.strict,
+            )
+            from visual.pub.tables import (
+                write_descriptive_results,
+                write_primary_results,
+            )
+
+            writer = write_descriptive_results if descriptive else write_primary_results
+            paths = writer(source, args.out)
+        except ProvenanceError as exc:
+            print(f"FAILED {args.table}: {exc}", file=sys.stderr)
+            return EXIT_PROVENANCE
+        for path in paths:
+            print(f"Saved {args.table} -> {path}")
+        return EXIT_DEGRADED if source.is_degraded else EXIT_OK
 
     keys = _selected_keys(args)
     if not keys:

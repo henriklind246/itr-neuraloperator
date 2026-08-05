@@ -248,11 +248,14 @@ class TestStrictResolution:
     def test_three_good_seeds_resolve_clean(self, tmp_path):
         runs = [make_run(tmp_path, seed=s, version=2) for s in ("1", "2", "3")]
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [{"run": str(r.relative_to(tmp_path))}
-                                   for r in runs]})
+            "source_itr_records": [
+                {"run": str(r.relative_to(tmp_path)), "seed": int(r.name[4:])}
+                for r in runs
+            ]})
         source = mf.resolve("F12_source_itr_void", strict=True)
         assert not source.is_degraded
         assert source.n_seeds == 3
+        assert source.seeds == ("1", "2", "3")
         assert source.n_simulations == 9
         assert source.n_pairs == 36
         assert source.benchmarks == ("source_itr",)
@@ -285,6 +288,41 @@ class TestDegraded:
         codes = {d.code for d in source.degradations}
         assert "SCHEMA_BELOW_REQUIRED" in codes
         assert source.artifacts[0].schema_version == 1
+
+    def test_representation_mismatch_stays_with_its_requirement_set(self, tmp_path):
+        forcing_runs = [
+            make_run(
+                tmp_path, name="pub_forcing", seed=seed, benchmark="forcing"
+            )
+            for seed in ("1", "2", "3")
+        ]
+        source_itr_runs = [
+            make_run(
+                tmp_path,
+                name="pub_source_itr",
+                seed=seed,
+                benchmark="source_itr",
+                representation="bins",
+            )
+            for seed in ("1", "2", "3")
+        ]
+        mf = manifest_with(tmp_path, {
+            "forcing_records": [
+                {"run": str(run.relative_to(tmp_path))} for run in forcing_runs
+            ],
+            "source_itr_records": [
+                {"run": str(run.relative_to(tmp_path))} for run in source_itr_runs
+            ],
+        })
+        source = mf.resolve("F04_headline_accuracy", strict=False)
+        mismatches = [
+            degradation.detail
+            for degradation in source.degradations
+            if degradation.code == "REPRESENTATION_MISMATCH"
+        ]
+        assert len(mismatches) == 3
+        assert all("source_itr_records" in detail for detail in mismatches)
+        assert not any("forcing_records" in detail for detail in mismatches)
 
     def test_satisfiability_table_covers_every_figure(self, empty_manifest):
         rows = empty_manifest.satisfiability()

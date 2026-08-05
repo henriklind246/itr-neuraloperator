@@ -31,10 +31,18 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 # ----- representation constants (source_itr tensor contract) -------------------
 
-# cond_static: base [t_bar, t_s] + 4 void scalars [R_base, R_amp, y0, sigma]
+# cond_static: lead time + 4 void scalars [R_base, R_amp, y0, sigma]
 # + 4 patch scalars [x_h, y_h, w_h, h_h]. The single R_c slot of `source` is
 # expanded to the four Gaussian-void parameters; A still never conditions.
-COND_STATIC_DIM = 10
+COND_STATIC_DIM = 9
+
+# Spatial-descriptor conditioning ablation slice (single source of truth for the
+# mask helper and the tests). cond layout is [t_bar_norm, R_base_norm,
+# R_amp_norm, y0_norm, sigma_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm]; the
+# patch-geometry descriptor is [5:9], while the four void scalars [1:5] are
+# retained. No one-hot family label, so family_cond_slice stays None. This
+# overrides SourceProblem's [2:6] slice (source_itr's layout differs).
+SOURCE_ITR_SPATIAL_DESCRIPTOR_SLICE = slice(5, COND_STATIC_DIM)  # slice(5, 9)
 
 # Base spatial channels [T_tilde, x, y, S_h, Rc_y_norm]; bins mode appends the
 # 16 source integral bins after the base. S_h stays at index 3; the new
@@ -67,7 +75,6 @@ def rc_log_norm(Rc_y: np.ndarray) -> np.ndarray:
 
 def build_cond_vector_itr(
     t_bar_norm: float,
-    t_s_norm: float,
     R_base: float,
     R_amp: float,
     y0: float,
@@ -82,9 +89,9 @@ def build_cond_vector_itr(
     x_length_scale: float,
     y_length_scale: float,
 ) -> np.ndarray:
-    """Assemble the 10-dim static conditioning vector for source_itr.
+    """Assemble the 9-dim static conditioning vector for source_itr.
 
-    Layout: [t_bar_norm, t_s_norm, R_base_norm, R_amp_norm, y0_norm, sigma_norm,
+    Layout: [t_bar_norm, R_base_norm, R_amp_norm, y0_norm, sigma_norm,
     x_h_norm, y_h_norm, w_h_norm, h_h_norm]. Each void scalar is normalized over
     its own sampling range; the patch scalars match `source.build_cond_vector`.
     """
@@ -105,7 +112,7 @@ def build_cond_vector_itr(
 
     return np.array(
         [
-            t_bar_norm, t_s_norm,
+            t_bar_norm,
             R_base_norm, R_amp_norm, y0_norm, sigma_norm,
             x_h_norm, y_h_norm, w_h_norm, h_h_norm,
         ],
@@ -145,6 +152,9 @@ class SourceItrProblem(SourceProblem):
     """
 
     name = "source_itr"
+
+    # Override SourceProblem's [2:6] descriptor with source_itr's [5:9] layout.
+    spatial_descriptor_cond_slice = SOURCE_ITR_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -311,7 +321,6 @@ class SourceItrProblem(SourceProblem):
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
         t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
-        t_s_norm = t_s_val / ds.time_norm_horizon
 
         S_h = self._patch_mask(ds, sid)
         Rc_channel = self._rc_channel(ds, params)
@@ -325,7 +334,7 @@ class SourceItrProblem(SourceProblem):
             x_lo, x_hi, y_lo, y_hi, float(params["w_h"]), float(params["h_h"]),
         )
         cond_static = build_cond_vector_itr(
-            t_bar_norm=float(t_bar_norm), t_s_norm=float(t_s_norm),
+            t_bar_norm=float(t_bar_norm),
             R_base=float(params["R_c_base"]), R_amp=float(params["R_c_amp"]),
             y0=float(params["R_c_y0"]), sigma=float(params["R_c_sigma"]),
             x_h=float(params["x_h"]), y_h=float(params["y_h"]),
@@ -335,6 +344,7 @@ class SourceItrProblem(SourceProblem):
             x_length_scale=(x_hi - x_lo),
             y_length_scale=(y_hi - y_lo),
         )
+        cond_static = self._apply_spatial_conditioning_mask(cond_static)
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array(

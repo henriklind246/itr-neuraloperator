@@ -134,7 +134,7 @@ def _load(run_dir_str: str) -> RunBundle:
     model, config = _load_checkpoint_model(ckpt)
 
     import torch
-    mu_global = float(torch.load(ckpt, map_location="cpu", weights_only=False)
+    mu_global = float(torch.load(ckpt, map_location="cpu", weights_only=True)
                       .get("mu_global", 0.0))
 
     # The checkpoint carries the config of the machine it trained on, whose data

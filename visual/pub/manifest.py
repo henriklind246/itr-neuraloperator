@@ -112,8 +112,8 @@ class FigureSource:
 
     @property
     def seeds(self) -> tuple[str, ...]:
-        seen = {a.seed for a in self.artifacts if a.seed} | {
-            r.seed for r in self.runs if r.seed
+        seen = {str(a.seed) for a in self.artifacts if a.seed is not None} | {
+            str(r.seed) for r in self.runs if r.seed is not None
         }
         return tuple(sorted(seen))
 
@@ -397,7 +397,7 @@ def _inspect_artifact(path: Path, kind: str, *, seed: str | None) -> ArtifactRef
         schema_version=schema_version,
         n_rows=n_rows,
         n_simulations=n_simulations,
-        seed=seed,
+        seed=None if seed is None else str(seed),
         benchmarks=benchmarks,
     )
 
@@ -426,6 +426,26 @@ class Manifest:
     def _resolve_entry(self, entry: dict, decl: RequirementSet
                        ) -> tuple[RunSource | None, Path | None]:
         if "run" in entry:
+            status = str(entry.get("status", "completed"))
+            allowed = {
+                "completed", "infrastructure_invalid", "invalid_checkpoint",
+                "representation_incompatible", "pending_rerun",
+            }
+            if status not in allowed:
+                raise ProvenanceError(
+                    f"{decl.name}: unknown declared-run status {status!r}; "
+                    f"expected one of {sorted(allowed)}"
+                )
+            if status != "completed":
+                seed = entry.get("seed", "unspecified")
+                rerun = entry.get("rerun_of")
+                lineage = f"; rerun_of={rerun}" if rerun else ""
+                raise ProvenanceError(
+                    f"{decl.name}: declared seed {seed} has status {status}{lineage}. "
+                    "Infrastructure-invalid attempts may be rerun only with the "
+                    "same declared seed/configuration; completed poor runs may not "
+                    "be silently replaced."
+                )
             run_dir = self.root / entry["run"] if not Path(entry["run"]).is_absolute() \
                 else Path(entry["run"])
             if not run_dir.is_dir():
@@ -479,6 +499,7 @@ class Manifest:
                 continue
 
             set_artifacts: list[ArtifactRef] = []
+            set_runs: list[RunSource] = []
             for entry in entries:
                 try:
                     run, artifact_path = self._resolve_entry(entry, decl)
@@ -486,6 +507,7 @@ class Manifest:
                     self._fail(source, strict, "ARTIFACT_MISSING", str(exc))
                     continue
                 if run is not None:
+                    set_runs.append(run)
                     source.runs.append(run)
                 if artifact_path is None:
                     continue
@@ -496,7 +518,7 @@ class Manifest:
                 set_artifacts.append(ref)
                 source.artifacts.append(ref)
 
-            self._validate_set(source, decl, set_artifacts, strict)
+            self._validate_set(source, decl, set_artifacts, set_runs, strict)
 
         return source
 
@@ -506,7 +528,8 @@ class Manifest:
         source.add_degradation(code, detail)
 
     def _validate_set(self, source: FigureSource, decl: RequirementSet,
-                      artifacts: list[ArtifactRef], strict: bool) -> None:
+                      artifacts: list[ArtifactRef], runs: list[RunSource],
+                      strict: bool) -> None:
         if not artifacts:
             return
 
@@ -541,7 +564,7 @@ class Manifest:
                 self._fail(source, strict, "BENCHMARK_MISSING",
                            f"{decl.name} covers {sorted(present)}; missing {missing}")
 
-        for run in source.runs:
+        for run in runs:
             if run.representation and run.representation != decl.representation:
                 self._fail(
                     source, strict, "REPRESENTATION_MISMATCH",

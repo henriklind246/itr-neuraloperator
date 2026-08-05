@@ -997,7 +997,7 @@ class TestSourcePlots:
         self, small_source_fno2d_checkpoint
     ):
         model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        assert conf["model"]["parameters"]["cond_static_dim"] == 7
+        assert conf["model"]["parameters"]["cond_static_dim"] == 6
         assert getattr(model, "use_temporal_encoder") is False
 
     def test_patch_error_slices_smoke(
@@ -1740,7 +1740,7 @@ class TestWriteTestRecords:
         synthetic_trajectories,
         synthetic_sim_params,
     ):
-        from src.operators.eval import write_test_records
+        from src.operators.eval import _canonical_hash, write_test_records
 
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         traj_path = tmp_path / "trajectories.npy"
@@ -1776,7 +1776,7 @@ class TestWriteTestRecords:
                     "in_channels": 4,
                     "out_channels": 1,
                     "n_layers": 2,
-                    "cond_static_dim": 11,
+                    "cond_static_dim": 10,
                     "cond_hidden": 256,
                     "temporal_token_dim": 2,
                     "temporal_samples": 128,
@@ -1797,8 +1797,18 @@ class TestWriteTestRecords:
             },
             seed_dir / "fno2d_best.pt",
         )
+        normalization_sidecar = seed_dir / "normalization_provenance.json"
+        normalization_sidecar.write_text(json.dumps({
+            "normalization_definition": {"version": "test/v1"},
+            "normalization_definition_hash": "definition-hash",
+            "training_population_hash": "population-hash",
+            "training_population": {"train_ids": [0, 1]},
+        }))
 
         out_path = write_test_records(tmp_path)
+        batched_path = write_test_records(
+            tmp_path, out_name="test_records_batched.csv", inference_batch_size=2
+        )
         assert out_path.exists()
         with open(out_path, newline="") as f:
             reader = csv.reader(f)
@@ -1809,6 +1819,48 @@ class TestWriteTestRecords:
         records = paper_plots._load_test_records(out_path)
         assert np.all(records["benchmark"] == "forcing")
         assert np.all(np.isfinite(records["rel_l2_pct"]))
+
+        with open(out_path, newline="") as f:
+            record_rows = list(csv.DictReader(f))
+        with open(batched_path, newline="") as f:
+            batched_rows = list(csv.DictReader(f))
+        for row, batched_row in zip(record_rows, batched_rows, strict=True):
+            for key, value in row.items():
+                if key == "provenance_id":
+                    continue
+                try:
+                    expected = float(value)
+                    actual = float(batched_row[key])
+                except ValueError:
+                    assert batched_row[key] == value
+                else:
+                    assert actual == pytest.approx(expected, rel=1e-5, abs=1e-7)
+        assert all(np.isfinite(float(row["node_jump_abs_max_pred_K"])) for row in record_rows)
+        assert all(np.isfinite(float(row["node_jump_abs_max_true_K"])) for row in record_rows)
+
+        provenance_path = out_path.with_name(f"{out_path.stem}.provenance.json")
+        assert provenance_path.exists()
+        provenance = json.loads(provenance_path.read_text())
+        assert provenance["provenance_id"]
+        assert {row["provenance_id"] for row in record_rows} == {
+            provenance["provenance_id"]
+        }
+        assert provenance["normalization_standard_deviation_convention"] == (
+            "population (ddof=0)"
+        )
+        assert provenance["normalization_definition_hash"] == "definition-hash"
+        assert provenance["training_population_hash"] == "population-hash"
+        assert provenance["normalization_provenance_source"] == str(
+            normalization_sidecar
+        )
+        assert provenance["normalization_provenance_source_sha256"]
+        evaluation_population = provenance["evaluation_population"]
+        assert set(evaluation_population["dataset_file_hashes"]) == {
+            "sim_params", "t_grid", "trajectories", "x_grid", "y_grid"
+        }
+        assert provenance["evaluation_population_hash"] == _canonical_hash(
+            evaluation_population
+        )
 
 
 class TestBenchmarkOverview:

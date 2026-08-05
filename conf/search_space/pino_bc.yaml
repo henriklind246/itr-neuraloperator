@@ -1,7 +1,0 @@
-# @package search_space
-params:
-  # Per-term forcing-wall weight for the forcing PINO path. Pulls the
-  # inhomogeneous left wall out of the averaged bc bucket so the forcing residual
-  # is not diluted by 1/len(WALLS). Swept above lambda_bc (=1.0) since the forcing
-  # residual is the bottleneck term. Requires benchmark=diffusion_forcing.
-  training.pino.lambda_bc_left: tag(log, interval(1.0, 100.0))

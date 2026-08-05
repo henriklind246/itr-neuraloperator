@@ -117,7 +117,7 @@ def test_forcing_itr_inherits_exact_forcing_tensors(representation):
         spatial_item["spatial"][..., 5:], parent_item["spatial"][..., 4:]
     )
     np.testing.assert_array_equal(
-        spatial_item["cond_static"][6:], parent_item["cond_static"][3:]
+        spatial_item["cond_static"][5:], parent_item["cond_static"][2:]
     )
     expected_fseq = (
         (128, parent_ds.problem.dims.temporal_token_dim)
@@ -166,7 +166,7 @@ def test_forcing_itr_zero_amp_encoding_is_finite():
     item = ds.problem.build_item(ds, 0, 0, 3)
     assert np.all(np.isfinite(item["cond_static"]))
     assert np.all(np.isfinite(item["spatial"][..., 4]))
-    assert item["cond_static"][3] == pytest.approx(0.0)
+    assert item["cond_static"][2] == pytest.approx(0.0)
 
 
 def test_fv_weights_severity_continuous_limit_and_general_domain_req():
@@ -253,7 +253,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
     torch.manual_seed(4)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=14, temporal_token_dim=2,
+        n_layers=2, cond_static_dim=13, temporal_token_dim=2,
         temporal_hidden=16, forcing_embed_dim=16,
         use_temporal_encoder=True, use_forcing_time_aug=True, s_y_channel=3,
     ).eval()
@@ -261,7 +261,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
         parameter.requires_grad_(False)
     spatial = torch.zeros(3, 12, 12, 5)
     spatial[..., 3] = 1.0
-    cond = torch.zeros(3, 14)
+    cond = torch.zeros(3, 13)
     cond[:, 0] = torch.tensor([0.07, 0.15, 0.30])
     forcing_seq = torch.zeros(3, 128, 2)
     forcing_seq[..., 0] = torch.linspace(0.0, 1.0, 128)
@@ -332,7 +332,7 @@ def test_validation_calibration_artifact_construction():
     torch.manual_seed(5)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=14, temporal_token_dim=2,
+        n_layers=2, cond_static_dim=13, temporal_token_dim=2,
         temporal_hidden=16, forcing_embed_dim=16,
         use_temporal_encoder=True, use_forcing_time_aug=True, s_y_channel=3,
     ).eval()

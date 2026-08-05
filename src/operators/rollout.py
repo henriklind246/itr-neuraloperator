@@ -6,10 +6,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from problems import diffusion as diffusion_problem
 from problems import forcing as forcing_problem
 from problems import interfaces as interfaces_problem
 from problems import source as source_problem
+from problems import source_itr as source_itr_problem
 from problems.base import ProblemSpec, empty_forcing_seq
 from src.physics.boundary_forcing import (
     FORCING_BINS,
@@ -97,6 +97,17 @@ def _current_field(current_T_norm: np.ndarray | torch.Tensor) -> np.ndarray:
     return arr
 
 
+def _subinterval_lead_feature(ds, t_lo: float, t_hi: float) -> float:
+    """Return normalized lead time for one rollout subinterval.
+
+    Must use the same denominator as `ProblemSpec.build_item`, which normalizes
+    by `time_norm_horizon`, not `t_final`. The two coincide by default but
+    differ under OOD lead-time extrapolation.
+    """
+    horizon = float(ds.time_norm_horizon)
+    return (float(t_hi) - float(t_lo)) / horizon
+
+
 def _q_callable_for_boundary(ds, sid: int, params: dict):
     if not hasattr(ds, "_q_callables"):
         ds._q_callables = {}
@@ -121,11 +132,9 @@ def _build_forcing_rollout_item(
     params = ds.sim_params[sid]
     spatial = out["spatial"]
     spatial[..., 0] = current
-    t_bar_norm = (float(t_hi) - float(t_lo)) / float(ds.t_final)
-    t_s_norm = float(t_lo) / float(ds.t_final)
+    t_bar_norm = _subinterval_lead_feature(ds, t_lo, t_hi)
     out["cond_static"] = forcing_problem.build_cond_vector(
         t_bar_norm=t_bar_norm,
-        t_s_norm=t_s_norm,
         R_c=float(params["R_c"]),
         spatial_family=params["spatial_family"],
         spatial_params=params["spatial_params"],
@@ -171,11 +180,9 @@ def _build_interfaces_rollout_item(
     params = ds.sim_params[sid]
     spatial = out["spatial"]
     spatial[..., 0] = current
-    t_bar_norm = (float(t_hi) - float(t_lo)) / float(ds.t_final)
-    t_s_norm = float(t_lo) / float(ds.t_final)
+    t_bar_norm = _subinterval_lead_feature(ds, t_lo, t_hi)
     out["cond_static"] = interfaces_problem.build_cond_vector(
         t_bar_norm=t_bar_norm,
-        t_s_norm=t_s_norm,
         R_c=float(params["R_c"]),
         interface_x=float(params["interface_x"]),
         interface_x_range=interfaces_problem._physical_interface_range(
@@ -222,11 +229,9 @@ def _build_source_rollout_item(
     params = ds.sim_params[sid]
     spatial = out["spatial"]
     spatial[..., 0] = current
-    t_bar_norm = (float(t_hi) - float(t_lo)) / float(ds.t_final)
-    t_s_norm = float(t_lo) / float(ds.t_final)
+    t_bar_norm = _subinterval_lead_feature(ds, t_lo, t_hi)
     out["cond_static"] = source_problem.build_cond_vector(
         t_bar_norm=t_bar_norm,
-        t_s_norm=t_s_norm,
         R_c=float(params["R_c"]),
         x_h=float(params["x_h"]),
         y_h=float(params["y_h"]),
@@ -269,7 +274,7 @@ def _build_source_rollout_item(
     return out
 
 
-def _build_diffusion_rollout_item(
+def _build_source_itr_rollout_item(
     out: dict[str, np.ndarray],
     ds,
     problem,
@@ -278,18 +283,53 @@ def _build_diffusion_rollout_item(
     t_lo: float,
     t_hi: float,
 ) -> dict[str, np.ndarray]:
+    params = ds.sim_params[sid]
     spatial = out["spatial"]
     spatial[..., 0] = current
-    # Channels 1-3 (x_norm, y_norm, s_y_const) are static; leave them intact.
-    t_bar_norm = (float(t_hi) - float(t_lo)) / float(ds.t_final)
-    t_s_norm = float(t_lo) / float(ds.t_final)
-    out["cond_static"] = np.array([t_bar_norm, t_s_norm], dtype=np.float32)
-    t_samples, a_m = diffusion_problem._sample_a(
-        lambda t: 0.0, t_lo, t_hi, ds.temporal_samples
+    # The R_c(y) channel (index 4) depends only on params and ds.y_grid, so
+    # _copy_item already carries it forward unchanged.
+    t_bar_norm = _subinterval_lead_feature(ds, t_lo, t_hi)
+    x_center_range, y_center_range = source_problem._patch_center_ranges(
+        float(ds.x_grid[0]), float(ds.x_grid[-1]),
+        float(ds.y_grid[0]), float(ds.y_grid[-1]),
+        float(params["w_h"]), float(params["h_h"]),
     )
-    out["forcing_seq"] = diffusion_problem._forcing_seq_2tok_from_samples(
-        t_samples, a_m, A_amp_ref=diffusion_problem.A_AMP_REF,
+    out["cond_static"] = source_itr_problem.build_cond_vector_itr(
+        t_bar_norm=t_bar_norm,
+        R_base=float(params["R_c_base"]),
+        R_amp=float(params["R_c_amp"]),
+        y0=float(params["R_c_y0"]),
+        sigma=float(params["R_c_sigma"]),
+        x_h=float(params["x_h"]),
+        y_h=float(params["y_h"]),
+        w_h=float(params["w_h"]),
+        h_h=float(params["h_h"]),
+        x_center_range=x_center_range,
+        y_center_range=y_center_range,
+        x_length_scale=float(ds.x_grid[-1] - ds.x_grid[0]),
+        y_length_scale=float(ds.y_grid[-1] - ds.y_grid[0]),
     )
+
+    if problem.representation == "temporal_encoder":
+        if not hasattr(ds, "_q_callables"):
+            ds._q_callables = {}
+        if sid not in ds._q_callables:
+            ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
+        q = ds._q_callables[sid]
+        t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
+        out["forcing_seq"] = source_problem._forcing_seq_2tok_from_samples(
+            t_samples,
+            a_m,
+            A_amp_ref=ds.a_amp_ref,
+        )
+    else:
+        spatial[..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:] = problem._source_bin_channels(
+            ds,
+            sid,
+            float(t_lo),
+            float(t_hi),
+        )
+        out["forcing_seq"] = empty_forcing_seq()
     return out
 
 
@@ -323,8 +363,8 @@ def build_rollout_item_from_base(
         return _build_interfaces_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     if problem.name == "source":
         return _build_source_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
-    if problem.name == "diffusion":
-        return _build_diffusion_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
+    if problem.name == "source_itr":
+        return _build_source_itr_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     raise ValueError(f"Unsupported benchmark for rollout: {problem.name!r}")
 
 

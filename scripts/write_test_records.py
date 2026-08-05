@@ -21,6 +21,14 @@ def main() -> int:
         help="Seed to evaluate (e.g. 42 -> seed42/). Defaults to the lowest-best_val seed.",
     )
     parser.add_argument(
+        "--all-seeds",
+        action="store_true",
+        help=(
+            "Evaluate every declared seed*/fno2d_best.pt under run_root. "
+            "Use this for publication cohorts; it never selects a seed by test error."
+        ),
+    )
+    parser.add_argument(
         "--out-name",
         default="test_records.csv",
         help="Output CSV filename, written under the selected seed directory.",
@@ -79,6 +87,25 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of direct pairs forwarded together while preserving one "
+            "output row per pair. Keep at 1 for autoregressive rollout."
+        ),
+    )
+    parser.add_argument(
+        "--n-snapshots-test",
+        type=int,
+        default=None,
+        help=(
+            "Number of snapshots subsampled per simulation for the test split. "
+            "Pairs per simulation are S*(S-1)/2, so this governs runtime: "
+            "6 -> 15 pairs/sim, the config default 40 -> 780."
+        ),
+    )
+    parser.add_argument(
         "--protocol",
         action="append",
         default=None,
@@ -86,6 +113,9 @@ def main() -> int:
         help="OOD time pair protocol(s); repeatable.",
     )
     args = parser.parse_args()
+
+    if args.all_seeds and args.seed is not None:
+        parser.error("--all-seeds and --seed are mutually exclusive")
 
     run_root = Path(args.run_root).expanduser()
     if not run_root.is_dir():
@@ -102,19 +132,32 @@ def main() -> int:
     if args.target_times is not None:
         target_times = [float(t) for t in args.target_times.split(",") if t.strip()]
 
-    write_test_records(
-        str(run_root),
-        seed=args.seed,
-        out_name=args.out_name,
-        data_dir=args.data_dir,
-        rollout_enabled=rollout_enabled,
-        rollout_num_substeps=args.rollout_num_substeps,
-        eval_all_sims=args.eval_all_sims,
-        time_norm_horizon=args.time_norm_horizon,
-        target_times=target_times,
-        protocols=args.protocol,
-        device=args.device,
-    )
+    seeds = [args.seed]
+    if args.all_seeds:
+        seeds = [
+            path.name.removeprefix("seed")
+            for path in sorted(run_root.glob("seed*"))
+            if (path / "fno2d_best.pt").exists()
+        ]
+        if not seeds:
+            print(f"error: no seed*/fno2d_best.pt found under {run_root}", file=sys.stderr)
+            return 1
+    for seed in seeds:
+        write_test_records(
+            str(run_root),
+            seed=seed,
+            out_name=args.out_name,
+            data_dir=args.data_dir,
+            rollout_enabled=rollout_enabled,
+            rollout_num_substeps=args.rollout_num_substeps,
+            eval_all_sims=args.eval_all_sims,
+            time_norm_horizon=args.time_norm_horizon,
+            target_times=target_times,
+            protocols=args.protocol,
+            device=args.device,
+            inference_batch_size=args.inference_batch_size,
+            n_snapshots_test=args.n_snapshots_test,
+        )
     return 0
 
 

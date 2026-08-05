@@ -375,7 +375,7 @@ class SourceItrAdapter(InverseAdapter):
         )
 
     def cond_slice_indices(self) -> tuple[int, int]:
-        return (2, 6)
+        return (1, 5)
 
     def cond_slice_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
         base_lo, base_hi = RC_VOID_RANGES["R_base"]
@@ -664,7 +664,7 @@ class ForcingAdapter(InverseAdapter):
         return torch.tensor([float(sim_params["R_c"])], dtype=dtype, device=device)
 
     def cond_slice_indices(self) -> tuple[int, int]:
-        return (2, 3)
+        return (1, 2)
 
     def cond_slice_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
         lo, hi = RC_RANGE

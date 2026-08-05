@@ -5,8 +5,7 @@ Exercises the real ``run_one_seed`` on synthetic forcing data:
   (new peak LR, epoch 0) and a normalization-stats guard,
 - the step-0 reference pass logged as epoch -1 before any optimizer step,
 - post-cutoff checkpoint selection on ``val_rmse_K_lead_gt_tc`` plus the
-  no-forgetting guard,
-- the ``lambda_physics`` ramp schedule actually handed to ``train_one_epoch``.
+  no-forgetting guard.
 """
 
 import copy
@@ -17,10 +16,9 @@ import pytest
 import torch
 
 from src.operators.train import _selection_metric_value, run_one_seed
-import src.operators.train as train_mod
 
 _SPATIAL_IN_CHANNELS = 4
-_COND_STATIC_DIM = 11
+_COND_STATIC_DIM = 10
 _TEMPORAL_TOKEN_DIM = 2
 _TEMPORAL_SAMPLES = 128
 
@@ -230,38 +228,3 @@ class TestPostCutoffSelection:
         best = warm_dir / "fno2d_best.pt"
         assert best.exists(), "equality (pre_now == ref) must satisfy ratio=1.0 guard"
         assert _states_equal(base_state, _load_state(best))
-
-
-class TestLambdaPhysicsRamp:
-    def test_ramp_schedule_passed_to_train_one_epoch(
-        self, tmp_path, ll_config, monkeypatch
-    ):
-        """The per-epoch lambda_physics handed to train_one_epoch follows
-        lambda_physics * min(1, (epoch+1)/ramp_epochs)."""
-        # Keep physics machinery out of the way: no real physics loader is built,
-        # and the spy delegates to the real epoch (physics is skipped when the
-        # loader/collocation are absent), so only the ramp multiplier is observed.
-        monkeypatch.setattr(train_mod, "_build_physics_loader", lambda *a, **k: (None, {}))
-
-        seen = []
-        orig = train_mod.train_one_epoch
-
-        def spy(*args, **kwargs):
-            seen.append(float(kwargs["lambda_physics"]))
-            return orig(*args, **kwargs)
-
-        monkeypatch.setattr(train_mod, "train_one_epoch", spy)
-
-        cfg = copy.deepcopy(ll_config)
-        cfg["training"]["epochs"] = 4
-        cfg["training"]["physics"] = {
-            "lambda_data": 1.0,
-            "lambda_physics": 0.2,
-            "lambda_physics_ramp_epochs": 3,
-            "mode": "one_step",
-        }
-        run_one_seed(cfg, seed=0, run_dir=tmp_path / "ramp")
-
-        assert len(seen) == 4
-        expected = [0.2 * min(1.0, (e + 1) / 3) for e in range(4)]
-        np.testing.assert_allclose(seen, expected, rtol=1e-6)

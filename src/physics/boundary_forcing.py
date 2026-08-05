@@ -51,7 +51,7 @@ SIN_INTEGRAL_SAMPLES = 2049
 # Fixed flux scale shared by forcing representations. It is the predetermined
 # maximum sampled forcing amplitude, not the 300 K temperature baseline.
 A_REF_FLUX = 300.0
-# Retained for the FNO temporal representation; InterfaceCViT no longer uses it.
+# Used by the FNO temporal representation.
 FORCING_TEMPORAL_SAMPLES = 128
 FORCING_SCHEMA_VERSION = 1
 RAMP_SCHEMA_VERSION = 1

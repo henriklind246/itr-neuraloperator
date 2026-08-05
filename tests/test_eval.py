@@ -43,8 +43,8 @@ def eval_setup():
     forcing_seq = torch.randn(4, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
     Y = torch.randn(4, Nx, Ny, 1)
     T_stats = torch.stack([
-        torch.randn(4),             # mu_s
-        torch.abs(torch.randn(4)),  # sigma_s (positive)
+        torch.full((4,), 300.0),    # global training mean
+        torch.full((4,), 5.0),      # global population std
     ], dim=-1)  # (4, 2)
     loader = DataLoader(
         TensorDataset(x_spatial, cond_static, forcing_seq, Y, T_stats),
@@ -60,9 +60,9 @@ EXPECTED_METRIC_KEYS = {
     "iface_rel_l2_norm", "iface_rel_l2_phys",
     "boundary_rel_l2_norm", "boundary_rel_l2_phys",
     "nrmse", "nrmse_p50", "nrmse_iqr", "nrmse_p90", "nrmse_p99", "nrmse_max",
-    "rmse_K", "rmse_K_p90", "rmse_K_p99", "rmse_K_max",
-    "gnrmse_pct", "gnrmse_pct_p99", "max_err_K",
-    "node_jump_rmse_K",
+    "rmse_K", "rmse_K_p90", "rmse_K_p95", "rmse_K_p99", "rmse_K_max",
+    "gnrmse_pct", "gnrmse_pct_p99", "temperature_rise_scale_K", "max_err_K",
+    "node_jump_rmse_K", "node_jump_rmse_K_p95",
     "node_jump_nrmse", "node_jump_nrmse_p90",
     "node_jump_nrmse_p99", "node_jump_nrmse_max",
     "node_jump_gnrmse_pct", "node_jump_gnrmse_pct_p99",
@@ -112,9 +112,9 @@ class TestEvaluate:
         result = evaluate(model, loader, device)
         for k in (
             "nrmse", "nrmse_p50", "nrmse_iqr", "nrmse_p90", "nrmse_p99", "nrmse_max",
-            "rmse_K", "rmse_K_p90", "rmse_K_p99", "rmse_K_max",
-            "gnrmse_pct", "gnrmse_pct_p99", "max_err_K",
-            "node_jump_rmse_K",
+            "rmse_K", "rmse_K_p90", "rmse_K_p95", "rmse_K_p99", "rmse_K_max",
+            "gnrmse_pct", "gnrmse_pct_p99", "temperature_rise_scale_K", "max_err_K",
+            "node_jump_rmse_K", "node_jump_rmse_K_p95",
             "node_jump_nrmse", "node_jump_nrmse_p90",
             "node_jump_nrmse_p99", "node_jump_nrmse_max",
             "node_jump_gnrmse_pct", "node_jump_gnrmse_pct_p99",
@@ -133,7 +133,8 @@ class TestEvaluate:
 # ===================== evaluate nRMSE invariance / batching =====================
 
 
-def _fixed_eval_loader(sigma, n=8, Nx=11, Ny=11, batch_size=2, seed=0):
+def _fixed_eval_loader(sigma, n=8, Nx=11, Ny=11, batch_size=2, seed=0,
+                       mu=300.0):
     """Deterministic loader; T_stats sigma_s column set to `sigma` for Kelvin scaling."""
     g = torch.Generator().manual_seed(seed)
     x_spatial = torch.randn(n, Nx, Ny, SPATIAL_IN_CHANNELS, generator=g)
@@ -141,7 +142,7 @@ def _fixed_eval_loader(sigma, n=8, Nx=11, Ny=11, batch_size=2, seed=0):
     forcing_seq = torch.randn(n, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM, generator=g)
     Y = torch.randn(n, Nx, Ny, 1, generator=g)
     T_stats = torch.stack([
-        torch.zeros(n),
+        torch.full((n,), float(mu)),
         torch.full((n,), float(sigma)),
     ], dim=-1)
     return DataLoader(
@@ -169,16 +170,27 @@ class TestEvaluateNRMSEInvariance:
         b = evaluate(model, _fixed_eval_loader(7.5), device)
         assert b["rmse_K"] == pytest.approx(a["rmse_K"] * 7.5, rel=1e-5)
 
-    def test_gnrmse_pct_is_rmse_K_over_sigma(self, eval_setup):
-        """gnrmse_pct == rmse_K / sigma_global * 100 (dimensionless restatement)."""
+    def test_gnrmse_pct_uses_training_temperature_rise_scale(self, eval_setup):
         model, _, device = eval_setup
         model.eval()
         sigma = 7.5
-        r = evaluate(model, _fixed_eval_loader(sigma), device)
-        assert r["gnrmse_pct"] == pytest.approx(r["rmse_K"] / sigma * 100.0, rel=1e-5)
+        mu = 307.0
+        loader = _fixed_eval_loader(sigma, mu=mu)
+        r = evaluate(model, loader, device)
+        sse = cells = 0
+        with torch.no_grad():
+            for batch in loader:
+                pred = model(batch["spatial"], batch["cond_static"], batch["forcing_seq"])
+                sse += torch.sum(((pred - batch["Y"]) * sigma) ** 2).item()
+                cells += batch["Y"].numel()
+        expected_scale = math.sqrt(sigma ** 2 + (mu - 300.0) ** 2)
+        assert r["temperature_rise_scale_K"] == pytest.approx(expected_scale)
+        assert r["gnrmse_pct"] == pytest.approx(
+            100.0 * math.sqrt(sse / cells) / expected_scale, rel=1e-5
+        )
 
     def test_gnrmse_pct_invariant_to_sigma(self, eval_setup):
-        """gnrmse_pct is normalized (= rms*100), so independent of sigma_global."""
+        """With mu=300 K, error and training-rise scale both scale with sigma."""
         model, _, device = eval_setup
         model.eval()
         a = evaluate(model, _fixed_eval_loader(1.0), device)
@@ -418,3 +430,173 @@ class TestPrintSeedReport:
         results = [_seed_result(0, 0.5, 2.6, 0.06, 2.8, 0.08)]
         summary = print_seed_report(results)
         assert summary["num_seeds"] == 1
+
+    def test_best_seed_selected_on_val_not_test(self, capsys):
+        # seed 0 wins on test error, seed 1 wins on validation loss. Selecting
+        # on test would report a minimum over seeds as if it were a draw.
+        results = [
+            _seed_result(0, 0.50, 2.0, 0.04, 2.2, 0.05),
+            _seed_result(1, 0.30, 2.9, 0.09, 3.1, 0.10),
+        ]
+        print_seed_report(results)
+        line = next(
+            ln for ln in capsys.readouterr().out.splitlines() if "Best by" in ln
+        )
+        assert "validation loss" in line
+        assert "seed=1" in line
+
+
+# ===================== write_test_records =====================
+
+@pytest.fixture
+def records_run(tmp_path, synthetic_trajectories, synthetic_sim_params, small_fno2d):
+    """A minimal run_root + dataset that write_test_records can actually score.
+
+    forcing/temporal_encoder, because it is the only benchmark whose model
+    fixture already exists. `training.n_snapshots_test` is deliberately set to a
+    non-default value so the config-fallback path is distinguishable from both
+    the hardcoded 40 and the explicit override.
+    """
+    import numpy as np
+
+    trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    np.save(data_dir / "trajectories.npy", trajectories)
+    np.save(data_dir / "x_grid.npy", x_grid)
+    np.save(data_dir / "y_grid.npy", y_grid)
+    np.save(data_dir / "t_grid.npy", t_grid)
+    np.save(data_dir / "sim_params.npy", synthetic_sim_params, allow_pickle=True)
+
+    from tests.conftest import (
+        FORCING_COND_STATIC_DIM,
+        FORCING_IN_CHANNELS,
+        FORCING_TEMPORAL_SAMPLES,
+        FORCING_TEMPORAL_TOKEN_DIM,
+    )
+
+    config = {
+        "benchmark": {"name": "forcing", "representation": "temporal_encoder"},
+        "data": {
+            "trajectories.npy": str(data_dir / "trajectories.npy"),
+            "x_grid_path": str(data_dir / "x_grid.npy"),
+            "y_grid_path": str(data_dir / "y_grid.npy"),
+            "t_grid_path": str(data_dir / "t_grid.npy"),
+            "sim_params_path": str(data_dir / "sim_params.npy"),
+        },
+        "training": {"batch_size": 4, "device": "cpu", "n_snapshots_test": 4},
+        "model": {
+            "parameters": {
+                "modes1": 2,
+                "modes2": 2,
+                "width": 8,
+                "in_channels": FORCING_IN_CHANNELS,
+                "out_channels": 1,
+                "n_layers": 2,
+                "cond_static_dim": FORCING_COND_STATIC_DIM,
+                "cond_hidden": 256,
+                "temporal_token_dim": FORCING_TEMPORAL_TOKEN_DIM,
+                "temporal_samples": FORCING_TEMPORAL_SAMPLES,
+                "temporal_hidden": 16,
+                "forcing_embed_dim": 16,
+            }
+        },
+    }
+
+    run_root = tmp_path / "run"
+    seed_dir = run_root / "seed42"
+    seed_dir.mkdir(parents=True)
+    torch.save(
+        {
+            "model_state": small_fno2d.state_dict(),
+            "conf": config,
+            "mu_global": 300.0,
+            "sigma_global": 12.5,
+            "best_val": 1.0,
+        },
+        seed_dir / "fno2d_best.pt",
+    )
+    # split_sim_ids(20, 0.7, 0.15) -> 14 train / 3 val / 3 test.
+    return run_root, seed_dir, 3
+
+
+def _read_records(path):
+    import csv
+
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+class TestWriteTestRecordsSnapshotCount:
+    """n_snapshots_test governs the pair count, which governs study runtime.
+
+    Pairs per simulation are S*(S-1)/2, so this is the only lever that makes a
+    multi-arm rollout study affordable. Before it was exposed, the value was
+    read from config and could not be overridden per call.
+    """
+
+    def test_config_value_is_used_when_override_is_absent(self, records_run):
+        from src.operators.eval import write_test_records
+
+        run_root, _seed_dir, n_test_sims = records_run
+        out = write_test_records(str(run_root), seed="42", out_name="cfg.csv")
+        # config n_snapshots_test=4 -> 4*3/2 = 6 pairs per sim.
+        assert len(_read_records(out)) == n_test_sims * 6
+
+    def test_override_changes_the_pair_count(self, records_run):
+        from src.operators.eval import write_test_records
+
+        run_root, _seed_dir, n_test_sims = records_run
+        out = write_test_records(
+            str(run_root), seed="42", out_name="six.csv", n_snapshots_test=6
+        )
+        # 6*5/2 = 15 pairs per sim.
+        assert len(_read_records(out)) == n_test_sims * 15
+
+    def test_provenance_records_the_effective_snapshot_count(self, records_run):
+        import json
+
+        from src.operators.eval import write_test_records
+
+        run_root, seed_dir, n_test_sims = records_run
+        write_test_records(
+            str(run_root), seed="42", out_name="six.csv", n_snapshots_test=6
+        )
+        payload = json.loads((seed_dir / "six.provenance.json").read_text())
+        assert payload["n_snapshots_test"] == 6
+        assert payload["n_simulations"] == n_test_sims
+        assert payload["n_pairs"] == n_test_sims * 15
+
+
+class TestTestRecordSufficientStatistics:
+    """The pooled statistics must reconstruct the per-row metrics exactly.
+
+    A rollout study aggregates across pairs by summing sse_K2 / target_sse_K2 /
+    num_error_cells rather than averaging per-pair percentages. That is only
+    valid if these two identities hold, so they are pinned here rather than
+    inferred by reading _batch_metrics (which is a closure and cannot be
+    imported).
+    """
+
+    def test_row_statistics_reproduce_rmse_and_rel_l2(self, records_run):
+        from src.operators.eval import write_test_records
+
+        run_root, _seed_dir, _n = records_run
+        out = write_test_records(
+            str(run_root), seed="42", out_name="stats.csv", n_snapshots_test=4
+        )
+        rows = _read_records(out)
+        assert rows
+        for row in rows:
+            sse = float(row["sse_K2"])
+            target_sse = float(row["target_sse_K2"])
+            cells = float(row["num_error_cells"])
+            assert cells > 0
+            assert target_sse > 0
+            assert math.sqrt(sse / cells) == pytest.approx(
+                float(row["rmse_K"]), rel=1e-5
+            )
+            # sigma^2 cancels in the ratio, so this stays in normalized space.
+            assert 100.0 * math.sqrt(sse / target_sse) == pytest.approx(
+                float(row["rel_l2_pct"]), rel=1e-5
+            )

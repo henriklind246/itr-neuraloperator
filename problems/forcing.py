@@ -38,12 +38,19 @@ T_EPS = 1e-6
 
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
 
-_BASE_DIM = 3
+_BASE_DIM = 2
 _SPATIAL_ONEHOT_DIM = len(SPATIAL_FAMILY_ORDER)
 _SPATIAL_PARAM_DIM = 4
 COND_STATIC_DIM = (
     _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
-)  # 11 (forcing-agnostic: no temporal one-hot, no forcing summary)
+)  # 10 (forcing-agnostic: no temporal one-hot, no forcing summary)
+
+# Spatial-descriptor conditioning ablation slices (single source of truth for the
+# mask helper and the tests). cond layout is [t_bar_norm, R_c_norm,
+# spatial_onehot(4), spatial_params(4)], so the one-hot family label is [2:6] and
+# the full spatial descriptor (family label + continuous params) is [2:10].
+FORCING_FAMILY_SLICE = slice(_BASE_DIM, _BASE_DIM + _SPATIAL_ONEHOT_DIM)  # slice(2, 6)
+FORCING_SPATIAL_DESCRIPTOR_SLICE = slice(_BASE_DIM, COND_STATIC_DIM)  # slice(2, 10)
 
 # temporal_encoder mode: 128 samples x 2 tokens [r_m, a_m / A_ref].
 FORCING_TEMPORAL_SAMPLES = 128
@@ -82,18 +89,18 @@ def _normalize_y_length(length: float, y_bounds: tuple[float, float]) -> float:
     return float(length) / (y_hi - y_lo)
 
 
-def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
+def build_cond_vector(t_bar_norm: float, R_c: float,
                       spatial_family: str, spatial_params: dict,
                       y_bounds: tuple[float, float] = (0.0, 1.0)) -> np.ndarray:
-    """Assemble the 11-dim forcing-agnostic static conditioning vector.
+    """Assemble the 10-dim forcing-agnostic static conditioning vector.
 
-    Layout: [t_bar_norm, t_s_norm, R_c_norm, spatial_onehot(4),
+    Layout: [t_bar_norm, R_c_norm, spatial_onehot(4),
     spatial_params(4)]. Carries no temporal-family identity or forcing
     summary; in temporal_encoder mode the only temporal forcing information
     lives in forcing_seq, in bins mode it lives in the Q-bin spatial channels.
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    base = np.array([t_bar_norm, t_s_norm, R_c_norm], dtype=np.float32)
+    base = np.array([t_bar_norm, R_c_norm], dtype=np.float32)
 
     spatial_oh = np.zeros(_SPATIAL_ONEHOT_DIM, dtype=np.float32)
     spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
@@ -113,19 +120,6 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
     spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
 
     return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
-
-
-def normalize_interface_scalars(interface_x, R_c) -> np.ndarray:
-    """InterfaceCViT parameter tokens ``[fixed-interface, normalized R_c]``."""
-    interface = np.asarray(interface_x, dtype=np.float32)
-    if not np.allclose(interface, INTERFACE_X, rtol=0.0, atol=1e-7):
-        raise ValueError(
-            f"forcing InterfaceCViT requires interface_x={INTERFACE_X}"
-        )
-    rc = np.asarray(R_c, dtype=np.float32)
-    interface, rc = np.broadcast_arrays(interface, rc)
-    rc_hat = (rc - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    return np.stack([np.full_like(rc_hat, 0.5), rc_hat], axis=-1).astype(np.float32)
 
 
 def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
@@ -229,16 +223,19 @@ class ForcingProblem(ProblemSpec):
 
     Two representations over the same trajectories/sim_params:
 
-    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, s_y], 11
+    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, s_y], 10
       forcing-agnostic static dims, a (128, 2) forcing_seq [r_m, a_m / A_ref],
       temporal encoder on with time-augmented spatial injection.
     - ``bins``: 20 spatial channels [T_tilde, x, y, s_y, Q_y_bin_0..15], same
-      11 static dims, an empty forcing_seq, temporal encoder off.
+      10 static dims, an empty forcing_seq, temporal encoder off.
 
     Interface fixed at x = 0.5.
     """
 
     name = "forcing"
+
+    family_cond_slice = FORCING_FAMILY_SLICE
+    spatial_descriptor_cond_slice = FORCING_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -447,10 +444,9 @@ class ForcingProblem(ProblemSpec):
         t_j_val = float(ds.t_grid[j])
         t_bar = t_j_val - t_s_val
         # Temporal model-input features scale by the trained normalization horizon
-        # (defaults to t_final for non-OOD sets); a target past the trained
-        # horizon therefore yields t_bar_norm / t_s_norm > 1.0.
+        # (defaults to t_final for non-OOD sets); a lead past the trained horizon
+        # therefore yields t_bar_norm > 1.0.
         t_bar_norm = t_bar / ds.time_norm_horizon
-        t_s_norm = t_s_val / ds.time_norm_horizon
 
         s_y = ds.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
@@ -460,7 +456,6 @@ class ForcingProblem(ProblemSpec):
 
         cond_static = build_cond_vector(
             t_bar_norm=t_bar_norm,
-            t_s_norm=t_s_norm,
             R_c=R_c,
             spatial_family=spatial_family,
             spatial_params=spatial_params,
@@ -507,9 +502,13 @@ class ForcingProblem(ProblemSpec):
 
     def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
         params = ds.sim_params[int(sid)]
-        return self._build_item_with_resistance(
+        item = self._build_item_with_resistance(
             ds, sid, s, j, R_c=float(params["R_c"])
         )
+        item["cond_static"] = self._apply_spatial_conditioning_mask(
+            item["cond_static"]
+        )
+        return item
 
     # ---- val-pair logging ----
 

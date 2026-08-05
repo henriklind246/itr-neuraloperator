@@ -1,8 +1,10 @@
 import torch
+import numpy as np
 from data.dataset import (
     TEMPORAL_SAMPLES,
     T_EPS,
     apply_protocol_pairs,
+    assert_dataset_problem_version,
     build_protocol_pairs,
     compute_global_stats,
     create_dataloaders,
@@ -16,6 +18,7 @@ from data.dataset import (
 from src.operators.fno2d import FNO2d
 from src.operators.losses import (
     EPS_JUMP,
+    EPS_STD,
     build_boundary_mask,
     build_interface_band,
     build_interface_mask,
@@ -37,9 +40,10 @@ from src.operators.rollout import (
 from src.operators.utils import resolve_device
 from pathlib import Path
 import csv
+import hashlib
 import math
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 """File loads checkpoint, runs test metrics in normalized AND physical space, outputs seed_report.json.
 
@@ -88,9 +92,12 @@ def build_test_loader(
     time_norm_horizon=None,
     target_times=None,
     protocols=None,
+    n_snapshots_test=None,
 ):
     import numpy as np
 
+    problem = problem_from_config(config)
+    assert_dataset_problem_version(problem, config["data"]["t_grid_path"])
     trajectories, x_grid, y_grid, t_grid = load_sim_data(
         sim_traj_path=config["data"]["trajectories.npy"],
         x_grid_path=config["data"]["x_grid_path"],
@@ -120,13 +127,17 @@ def build_test_loader(
         mu_global=mu_global,
         sigma_global=sigma_global,
         n_snapshots=10,
-        n_snapshots_test=config.get("training", {}).get("n_snapshots_test", 40),
+        n_snapshots_test=(
+            n_snapshots_test
+            if n_snapshots_test is not None
+            else config.get("training", {}).get("n_snapshots_test", 40)
+        ),
         dt=solver_dt,
         time_norm_horizon=time_norm_horizon,
         ramp_seconds=ramp_seconds,
         num_workers=0,
         temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
-        problem=problem_from_config(config),
+        problem=problem,
     )
 
     # OOD time protocols take precedence over long_lead_only: install the tagged
@@ -191,6 +202,7 @@ def evaluate(
     interface_half_width: float = 0.05,
     use_per_sample_interface: bool = False,
     interface_x: float = 0.5,
+    temperature_reference_K: float = 300.0,
 ):
     """Return a dict of test metrics in both normalized and physical space.
 
@@ -235,6 +247,9 @@ def evaluate(
         sst_norm = 0.0
         sse_phys = 0.0
         sst_phys = 0.0
+        num_error_cells = 0
+        training_mu_values: list[torch.Tensor] = []
+        training_sigma_values: list[torch.Tensor] = []
         iface_rel_l2_norm = 0.0
         iface_rel_l2_phys = 0.0
         boundary_rel_l2_norm = 0.0
@@ -243,7 +258,6 @@ def evaluate(
         # Unified per-sample metric accumulators (mean-over-pairs convention).
         nrmse_all: list[torch.Tensor] = []
         rmse_K_all: list[torch.Tensor] = []
-        gnrmse_all: list[torch.Tensor] = []
         node_jump_rmse_K_all: list[torch.Tensor] = []
         node_jump_nrmse_all: list[torch.Tensor] = []
         node_jump_gnrmse_all: list[torch.Tensor] = []
@@ -269,6 +283,9 @@ def evaluate(
             y_true_phys = y_batch * (sigma_s[:, None, None, None] + T_EPS) + mu_s[:, None, None, None]
             sse_phys += torch.sum((y_pred_phys - y_true_phys) ** 2).item()
             sst_phys += torch.sum(y_true_phys ** 2).item()
+            num_error_cells += int(y_true_phys.numel())
+            training_mu_values.append(mu_s.detach().cpu())
+            training_sigma_values.append(sigma_s.detach().cpu())
 
             # --- Unified per-sample metrics (nRMSE is normalization-invariant;
             # Kelvin metrics scale by the per-sample sigma). ---
@@ -276,7 +293,6 @@ def evaluate(
             rms_i = per_sample_sq_rms(y_pred, y_batch)
             nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
             rmse_K_all.append((rms_i * sig).cpu())
-            gnrmse_all.append(rms_i.cpu())
             max_err_K = max(
                 max_err_K,
                 torch.max(torch.abs(y_pred_phys - y_true_phys)).item(),
@@ -322,14 +338,33 @@ def evaluate(
 
     nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
     rmse_K_stats = tail_stats(torch.cat(rmse_K_all)) if rmse_K_all else tail_stats(torch.empty(0))
-    gnrmse_stats = tail_stats(torch.cat(gnrmse_all)) if gnrmse_all else tail_stats(torch.empty(0))
+    if training_mu_values and num_error_cells > 0:
+        mu_values = torch.cat(training_mu_values).to(torch.float64)
+        sigma_values = torch.cat(training_sigma_values).to(torch.float64)
+        mu_train = float(mu_values[0])
+        sigma_train = float(sigma_values[0])
+        if not torch.allclose(mu_values, mu_values[:1], rtol=1e-6, atol=1e-8):
+            raise ValueError("evaluate requires one training mean across the test loader")
+        if not torch.allclose(sigma_values, sigma_values[:1], rtol=1e-6, atol=1e-8):
+            raise ValueError("evaluate requires one training scale across the test loader")
+        temperature_rise_scale_K = math.sqrt(
+            sigma_train ** 2 + (mu_train - float(temperature_reference_K)) ** 2
+        )
+        pooled_rmse_K = math.sqrt(sse_phys / num_error_cells)
+        field_gnrmse_pct = (
+            100.0 * pooled_rmse_K / temperature_rise_scale_K
+            if temperature_rise_scale_K > 0.0 else float("nan")
+        )
+    else:
+        temperature_rise_scale_K = float("nan")
+        field_gnrmse_pct = float("nan")
     if node_jump_nrmse_all:
         jump_nrmse_stats = tail_stats(torch.cat(node_jump_nrmse_all))
-        node_jump_rmse_K_mean = float(torch.cat(node_jump_rmse_K_all).mean())
+        node_jump_rmse_K_stats = tail_stats(torch.cat(node_jump_rmse_K_all))
         node_jump_gnrmse_stats = tail_stats(torch.cat(node_jump_gnrmse_all))
     else:
         jump_nrmse_stats = tail_stats(torch.empty(0))
-        node_jump_rmse_K_mean = 0.0
+        node_jump_rmse_K_stats = tail_stats(torch.empty(0))
         node_jump_gnrmse_stats = tail_stats(torch.empty(0))
 
     return {
@@ -347,12 +382,18 @@ def evaluate(
         "nrmse_max": nrmse_stats["max"] * 100.0,
         "rmse_K": rmse_K_stats["mean"],
         "rmse_K_p90": rmse_K_stats["p90"],
+        "rmse_K_p95": rmse_K_stats["p95"],
         "rmse_K_p99": rmse_K_stats["p99"],
         "rmse_K_max": rmse_K_stats["max"],
-        "gnrmse_pct": gnrmse_stats["mean"] * 100.0,
-        "gnrmse_pct_p99": gnrmse_stats["p99"] * 100.0,
+        "gnrmse_pct": field_gnrmse_pct,
+        "gnrmse_pct_p99": (
+            100.0 * rmse_K_stats["p99"] / temperature_rise_scale_K
+            if temperature_rise_scale_K > 0.0 else float("nan")
+        ),
+        "temperature_rise_scale_K": temperature_rise_scale_K,
         "max_err_K": max_err_K,
-        "node_jump_rmse_K": node_jump_rmse_K_mean,
+        "node_jump_rmse_K": node_jump_rmse_K_stats["mean"],
+        "node_jump_rmse_K_p95": node_jump_rmse_K_stats["p95"],
         "node_jump_nrmse": jump_nrmse_stats["mean"] * 100.0,
         "node_jump_nrmse_p90": jump_nrmse_stats["p90"] * 100.0,
         "node_jump_nrmse_p99": jump_nrmse_stats["p99"] * 100.0,
@@ -585,12 +626,15 @@ def eval_all_seeds(
                 "test_nrmse_max": float(metrics.get("nrmse_max", float("nan"))),
                 "test_rmse_K": float(metrics.get("rmse_K", float("nan"))),
                 "test_rmse_K_p90": float(metrics.get("rmse_K_p90", float("nan"))),
+                "test_rmse_K_p95": float(metrics.get("rmse_K_p95", float("nan"))),
                 "test_rmse_K_p99": float(metrics.get("rmse_K_p99", float("nan"))),
                 "test_rmse_K_max": float(metrics.get("rmse_K_max", float("nan"))),
                 "test_gnrmse_pct": float(metrics.get("gnrmse_pct", float("nan"))),
                 "test_gnrmse_pct_p99": float(metrics.get("gnrmse_pct_p99", float("nan"))),
+                "temperature_rise_scale_K": float(metrics.get("temperature_rise_scale_K", float("nan"))),
                 "test_max_err_K": float(metrics.get("max_err_K", float("nan"))),
                 "test_node_jump_rmse_K": float(metrics.get("node_jump_rmse_K", float("nan"))),
+                "test_node_jump_rmse_K_p95": float(metrics.get("node_jump_rmse_K_p95", float("nan"))),
                 "test_node_jump_nrmse": float(metrics.get("node_jump_nrmse", float("nan"))),
                 "test_node_jump_nrmse_p90": float(metrics.get("node_jump_nrmse_p90", float("nan"))),
                 "test_node_jump_nrmse_p99": float(metrics.get("node_jump_nrmse_p99", float("nan"))),
@@ -657,12 +701,14 @@ def print_seed_report(results: list[dict]) -> dict:
     nrmse_max_mu, _ = _seed_stat("test_nrmse_max")
     rmse_K_mu, rmse_K_std = _seed_stat("test_rmse_K")
     rmse_K_p90_mu, _ = _seed_stat("test_rmse_K_p90")
+    rmse_K_p95_mu, _ = _seed_stat("test_rmse_K_p95")
     rmse_K_p99_mu, _ = _seed_stat("test_rmse_K_p99")
     rmse_K_max_mu, _ = _seed_stat("test_rmse_K_max")
     gnrmse_pct_mu, gnrmse_pct_std = _seed_stat("test_gnrmse_pct")
     gnrmse_pct_p99_mu, _ = _seed_stat("test_gnrmse_pct_p99")
     max_err_K_mu, _ = _seed_stat("test_max_err_K")
     jump_rmse_K_mu, jump_rmse_K_std = _seed_stat("test_node_jump_rmse_K")
+    jump_rmse_K_p95_mu, _ = _seed_stat("test_node_jump_rmse_K_p95")
     jump_nrmse_mu, jump_nrmse_std = _seed_stat("test_node_jump_nrmse")
     jump_gnrmse_pct_mu, jump_gnrmse_pct_std = _seed_stat("test_node_jump_gnrmse_pct")
     jump_gnrmse_pct_p99_mu, _ = _seed_stat("test_node_jump_gnrmse_pct_p99")
@@ -677,18 +723,24 @@ def print_seed_report(results: list[dict]) -> dict:
     print(f"test_boundary_rel_l2_norm mean, std: ({bnd_norm_mu}, {bnd_norm_std})")
     print(f"test_boundary_rel_l2(phys) mean, std: ({bnd_mu}, {bnd_std})")
     print(f"test_rmse_K (Kelvin)     mean, std: ({rmse_K_mu}, {rmse_K_std})   <- physical headline")
-    print(f"test_rmse_K tails (K)    p90/p99/max_sample: ({rmse_K_p90_mu}, {rmse_K_p99_mu}, {rmse_K_max_mu})")
+    print(f"test_rmse_K tails (K)    p90/p95/p99/max_sample: ({rmse_K_p90_mu}, {rmse_K_p95_mu}, {rmse_K_p99_mu}, {rmse_K_max_mu})")
     print(f"test_max_err_K           mean: {max_err_K_mu}   (Kelvin pointwise worst-case)")
-    print(f"test_gnrmse (%)          mean, p99: ({gnrmse_pct_mu}, {gnrmse_pct_p99_mu})   (= rmse_K/sigma_global)")
+    print(f"test_gnrmse (%)          pooled, pair-p99: ({gnrmse_pct_mu}, {gnrmse_pct_p99_mu})   (training temperature-rise scale)")
     print(f"test_nrmse (%)           mean, std: ({nrmse_mu}, {nrmse_std})   <- diagnostic, small-signal divergence")
     print(f"test_nrmse dist (%)      p50/IQR/p90/p99/max: ({nrmse_p50_mu}, {nrmse_iqr_mu}, {nrmse_p90_mu}, {nrmse_p99_mu}, {nrmse_max_mu})")
     print(f"test_node_jump_rmse_K    mean, std: ({jump_rmse_K_mu}, {jump_rmse_K_std})   (Kelvin)")
+    print(f"test_node_jump_rmse_K    p95: {jump_rmse_K_p95_mu}   (Kelvin)")
     print(f"test_node_jump_gnrmse(%) mean, p99: ({jump_gnrmse_pct_mu}, {jump_gnrmse_pct_p99_mu})")
     print(f"test_node_jump_nrmse (%) mean, std: ({jump_nrmse_mu}, {jump_nrmse_std})   <- offset-free interface")
 
-    best = min(results, key=lambda r: r["test_rel_l2_norm"])
+    # Seed selection must never look at the test set: picking the seed that
+    # minimizes test error and then quoting that seed's test error reports a
+    # minimum over seeds as if it were a draw, which is optimistically biased.
+    # best_val is the same quantity _select_seed_checkpoint uses per seed.
+    best = min(results, key=lambda r: r["best_val"])
     print(
-        f"Best by lowest normalized test error: seed={best['seed']} "
+        f"Best by lowest validation loss: seed={best['seed']} "
+        f"best_val={best['best_val']} "
         f"test_rel_l2_norm={best['test_rel_l2_norm']} "
         f"test_rel_l2={best['test_rel_l2']} "
         f"test_iface_rel_l2_norm={best['test_iface_rel_l2_norm']} "
@@ -721,6 +773,7 @@ def print_seed_report(results: list[dict]) -> dict:
         "test_rmse_K_mean": rmse_K_mu,
         "test_rmse_K_std": rmse_K_std,
         "test_rmse_K_p90_mean": rmse_K_p90_mu,
+        "test_rmse_K_p95_mean": rmse_K_p95_mu,
         "test_rmse_K_p99_mean": rmse_K_p99_mu,
         "test_rmse_K_max_mean": rmse_K_max_mu,
         "test_gnrmse_pct_mean": gnrmse_pct_mu,
@@ -729,6 +782,7 @@ def print_seed_report(results: list[dict]) -> dict:
         "test_max_err_K_mean": max_err_K_mu,
         "test_node_jump_rmse_K_mean": jump_rmse_K_mu,
         "test_node_jump_rmse_K_std": jump_rmse_K_std,
+        "test_node_jump_rmse_K_p95_mean": jump_rmse_K_p95_mu,
         "test_node_jump_nrmse_mean": jump_nrmse_mu,
         "test_node_jump_nrmse_std": jump_nrmse_std,
         "test_node_jump_gnrmse_pct_mean": jump_gnrmse_pct_mu,
@@ -753,13 +807,14 @@ def save_report(run_root: str, results: list[dict], summary: dict,
 # ---------- PER-SAMPLE TEST RECORDS (paper figures data source) ----------
 
 TEST_RECORD_FIELDS = [
-    "sim_id", "s", "j", "t_s", "t_bar", "R_c", "benchmark",
+    "provenance_id", "sim_id", "s", "j", "t_s", "t_bar", "R_c", "benchmark",
     "temporal_family", "spatial_family",
     "x_h", "y_h", "A", "freq", "regime",
     "R_c_amp", "R_c_y0", "R_c_sigma",
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
     "nrmse_pct", "rmse_K", "gnrmse_pct",
     "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
+    "node_jump_abs_max_pred_K", "node_jump_abs_max_true_K",
     # OOD identity (joined from ood_metadata.jsonl by sim_id; in-distribution
     # defaults when the sidecar is absent).
     "ood_axis", "ood_value", "ood_repeat", "latents_hash", "distribution_class",
@@ -832,7 +887,7 @@ def _select_seed_checkpoint(run_root: Path, seed=None):
         ckpt_path = seed_dir / "fno2d_best.pt"
         if not ckpt_path.exists():
             continue
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         best_val = float(ckpt.get("best_val", float("inf")))
         if best is None or best_val < best[0]:
             best = (best_val, seed_dir, ckpt)
@@ -860,6 +915,169 @@ def _amp_freq_from_params(params: dict) -> tuple[float | None, float | None]:
     return None, None
 
 
+TEST_RECORD_PROVENANCE_SCHEMA = "test-records-provenance/v1"
+TEST_RECORD_SCHEMA_VERSION = 4
+TEMPERATURE_REFERENCE_K = 300.0
+NORMALIZATION_PROVENANCE_SIDECAR = "normalization_provenance.json"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_hash(payload: dict) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _evaluation_dataset_file_hashes(config: dict) -> dict[str, str]:
+    data = config["data"]
+    paths = {
+        "trajectories": Path(data["trajectories.npy"]),
+        "sim_params": Path(data["sim_params_path"]),
+        "x_grid": Path(data["x_grid_path"]),
+        "y_grid": Path(data["y_grid_path"]),
+        "t_grid": Path(data["t_grid_path"]),
+    }
+    data_dir = paths["t_grid"].parent
+    for name in ("meta.npy", "dt.npy", "ramp_seconds.npy"):
+        path = data_dir / name
+        if path.is_file():
+            paths[name] = path
+    return {name: _sha256_file(path) for name, path in sorted(paths.items())}
+
+
+def _evaluation_population_identity(dataset, x_grid, y_grid, config: dict) -> dict:
+    return {
+        "sim_ids": np.asarray(dataset.sim_ids, dtype=np.int64).tolist(),
+        "pairs": [list(map(int, pair)) for pair in dataset._pairs],
+        "t_grid": np.asarray(dataset.t_grid, dtype=np.float64).tolist(),
+        "x_grid_sha256": hashlib.sha256(
+            np.ascontiguousarray(x_grid).view(np.uint8)
+        ).hexdigest(),
+        "y_grid_sha256": hashlib.sha256(
+            np.ascontiguousarray(y_grid).view(np.uint8)
+        ).hexdigest(),
+        "dataset_file_hashes": _evaluation_dataset_file_hashes(config),
+        "benchmark": config.get("benchmark", {}).get("name"),
+        "representation": config.get("benchmark", {}).get("representation"),
+    }
+
+
+def _normalization_provenance_for_records(
+    seed_dir: Path, checkpoint: dict
+) -> tuple[dict, str, str | None]:
+    norm = checkpoint.get("normalization_provenance")
+    if norm:
+        return norm, "checkpoint", None
+
+    path = seed_dir / NORMALIZATION_PROVENANCE_SIDECAR
+    if not path.is_file():
+        return {}, "unavailable", None
+    payload = json.loads(path.read_text())
+    required = {
+        "normalization_definition",
+        "normalization_definition_hash",
+        "training_population_hash",
+        "training_population",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(
+            f"{path} is missing normalization provenance fields: {missing}"
+        )
+    return payload, str(path), _sha256_file(path)
+
+
+def _write_test_record_provenance(
+    *,
+    seed_dir: Path,
+    checkpoint_path: Path,
+    checkpoint: dict,
+    config: dict,
+    dataset,
+    x_grid,
+    y_grid,
+    benchmark: str,
+    rollout_options: RolloutOptions,
+    output_csv_name: str,
+) -> tuple[str, Path]:
+    mu_train = float(checkpoint["mu_global"])
+    sigma_train = float(checkpoint["sigma_global"])
+    rise_scale = math.sqrt(
+        sigma_train ** 2 + (mu_train - TEMPERATURE_REFERENCE_K) ** 2
+    )
+    norm, norm_source, norm_source_sha256 = _normalization_provenance_for_records(
+        seed_dir, checkpoint
+    )
+    prediction_mode = (
+        f"autoregressive_{int(rollout_options.num_substeps)}_substeps"
+        if rollout_is_active(rollout_options) else "direct_pair"
+    )
+    evaluation_population = _evaluation_population_identity(
+        dataset, x_grid, y_grid, config
+    )
+    payload = {
+        "schema": TEST_RECORD_PROVENANCE_SCHEMA,
+        "test_record_schema_version": TEST_RECORD_SCHEMA_VERSION,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": _sha256_file(checkpoint_path),
+        "checkpoint_selection_metric": config.get("training", {}).get(
+            "checkpoint_metric", "val_rel_l2"
+        ),
+        "validation_selected_epoch": int(checkpoint.get("epoch", -1)),
+        "best_validation_value": float(checkpoint.get("best_val", float("nan"))),
+        "training_mean_K": mu_train,
+        "training_population_std_K": sigma_train,
+        "normalization_standard_deviation_convention": "population (ddof=0)",
+        "training_temperature_rise_rms_K": rise_scale,
+        "temperature_reference_K": TEMPERATURE_REFERENCE_K,
+        "normalization_definition": norm.get("normalization_definition"),
+        "normalization_definition_hash": norm.get("normalization_definition_hash"),
+        "training_population_hash": norm.get("training_population_hash"),
+        "normalization_provenance_source": norm_source,
+        "normalization_provenance_source_sha256": norm_source_sha256,
+        "evaluation_population": evaluation_population,
+        "evaluation_population_hash": _canonical_hash(evaluation_population),
+        "prediction_mode": prediction_mode,
+        "rollout_enabled": bool(rollout_options.enabled),
+        "rollout_num_substeps": int(rollout_options.num_substeps),
+        "rollout_partition": rollout_options.partition,
+        "benchmark": benchmark,
+        "representation": config.get("benchmark", {}).get(
+            "representation", "temporal_encoder"
+        ),
+        "seed": str(checkpoint.get("seed", seed_dir.name.removeprefix("seed"))),
+        "code_commit": (
+            (seed_dir / "git_commit.txt").read_text().strip()
+            if (seed_dir / "git_commit.txt").exists() else None
+        ),
+        "code_dirty": bool(
+            (seed_dir / "git_status.txt").exists()
+            and (seed_dir / "git_status.txt").read_text().strip()
+        ),
+        "test_records_file": output_csv_name,
+        "n_simulations": int(len(dataset.sim_ids)),
+        # Effective snapshot count actually used, not the requested one: it
+        # governs the pair count, so a short study CSV can never be mistaken
+        # for a full publication CSV.
+        "n_snapshots_test": int(len(dataset.t_indices)),
+        "n_pairs": int(len(dataset)),
+        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    provenance_id = _canonical_hash(payload)
+    payload["provenance_id"] = provenance_id
+    provenance_path = seed_dir / f"{Path(output_csv_name).stem}.provenance.json"
+    provenance_path.write_text(json.dumps(payload, indent=2, allow_nan=True))
+    return provenance_id, provenance_path
+
+
 def write_test_records(
     run_root,
     seed=None,
@@ -873,6 +1091,8 @@ def write_test_records(
     target_times: list[float] | None = None,
     protocols: list[str] | None = None,
     device: str | None = None,
+    inference_batch_size: int = 1,
+    n_snapshots_test: int | None = None,
 ) -> Path:
     """Write one per-(sim_id, s, j) test-pair record row for paper figures.
 
@@ -897,6 +1117,9 @@ def write_test_records(
         num_substeps=rollout_num_substeps,
         partition=rollout_partition,
     )
+    inference_batch_size = int(inference_batch_size)
+    if inference_batch_size < 1:
+        raise ValueError("inference_batch_size must be positive")
 
     # Point the trained checkpoint at a different dataset (e.g. a freshly
     # generated benchmark set). Only the test split is consumed, and the
@@ -924,6 +1147,7 @@ def write_test_records(
         time_norm_horizon=time_norm_horizon,
         target_times=target_times,
         protocols=protocols,
+        n_snapshots_test=n_snapshots_test,
     )
     dataset = test_loader.dataset
     pair_tags = getattr(dataset, "_pair_tags", None)
@@ -970,7 +1194,20 @@ def write_test_records(
             mask_cache[key] = build_interface_mask(x_grid, y_grid, key, hw).to(device)
         return mask_cache[key]
 
-    sigma_global = float(ckpt.get("sigma_global") or 1.0)
+    if ckpt.get("mu_global") is None or ckpt.get("sigma_global") is None:
+        raise ValueError(
+            "checkpoint must contain mu_global and sigma_global for physical metrics"
+        )
+    sigma_global = float(ckpt["sigma_global"])
+    if sigma_global < 0.0 or not math.isfinite(sigma_global):
+        raise ValueError("checkpoint sigma_global must be finite and non-negative")
+    physical_temperature_scale = sigma_global + T_EPS
+    mu_global = float(ckpt["mu_global"])
+    if not math.isfinite(mu_global):
+        raise ValueError("checkpoint mu_global must be finite")
+    temperature_rise_scale_K = math.sqrt(
+        sigma_global ** 2 + (mu_global - TEMPERATURE_REFERENCE_K) ** 2
+    )
     flank_cache: dict[float, tuple[int, int]] = {}
 
     def _flank_for(interface_x: float) -> tuple[int, int]:
@@ -979,19 +1216,104 @@ def write_test_records(
             flank_cache[key] = interface_flanking_nodes(x_grid, key)
         return flank_cache[key]
 
-    rows = []
-    with torch.no_grad():
-        for idx in range(len(dataset)):
-            sim_id, s, j = dataset._pairs[idx]
-            sim_id, s, j = int(sim_id), int(s), int(j)
-            item = dataset[idx]
+    checkpoint_path = seed_dir / "fno2d_best.pt"
+    provenance_id, provenance_path = _write_test_record_provenance(
+        seed_dir=seed_dir,
+        checkpoint_path=checkpoint_path,
+        checkpoint=ckpt,
+        config=config,
+        dataset=dataset,
+        x_grid=x_grid,
+        y_grid=y_grid,
+        benchmark=benchmark,
+        rollout_options=rollout_options,
+        output_csv_name=out_name,
+    )
 
-            spatial = item["spatial"].unsqueeze(0).to(device)
-            cond = item["cond_static"].unsqueeze(0).to(device)
-            y_true = item["Y"].unsqueeze(0).to(device)
-            forcing_seq = item.get("forcing_seq")
-            if rollout_is_active(rollout_options):
-                y_pred = predict_autoregressive(
+    def _batch_metrics(start, items, predictions):
+        truths = torch.stack([item["Y"] for item in items]).to(device)
+        interfaces = [
+            float(dataset.sim_params[int(dataset._pairs[idx][0])].get("interface_x", 0.5))
+            for idx in range(start, start + len(items))
+        ]
+        masks = torch.stack([_mask_for(interface_x) for interface_x in interfaces])
+        mask_values = masks.unsqueeze(-1).to(predictions.dtype)
+
+        diff_sq = (predictions - truths) ** 2
+        reduce_dims = tuple(range(1, predictions.ndim))
+        sse = torch.sum(diff_sq, dim=reduce_dims)
+        target_sse = torch.sum(truths ** 2, dim=reduce_dims)
+        rms = torch.sqrt(torch.mean(diff_sq, dim=reduce_dims))
+        true_std = torch.std(truths, dim=reduce_dims, unbiased=False)
+
+        interface_sse = torch.sum(diff_sq * mask_values, dim=reduce_dims)
+        interface_target_sse = torch.sum(
+            truths ** 2 * mask_values, dim=reduce_dims
+        )
+        interface_counts = torch.sum(mask_values, dim=reduce_dims).to(torch.int64)
+
+        flanks = [_flank_for(interface_x) for interface_x in interfaces]
+        left = torch.tensor([pair[0] for pair in flanks], device=device)
+        right = torch.tensor([pair[1] for pair in flanks], device=device)
+        batch = torch.arange(len(items), device=device)
+        pred_jump = predictions[batch, right, :, :] - predictions[batch, left, :, :]
+        true_jump = truths[batch, right, :, :] - truths[batch, left, :, :]
+        jump_reduce_dims = tuple(range(1, pred_jump.ndim))
+        jump_error = torch.sqrt(
+            torch.mean((pred_jump - true_jump) ** 2, dim=jump_reduce_dims)
+        )
+        jump_true = torch.sqrt(torch.mean(true_jump ** 2, dim=jump_reduce_dims))
+        pred_jump_max = torch.amax(torch.abs(pred_jump), dim=jump_reduce_dims)
+        true_jump_max = torch.amax(torch.abs(true_jump), dim=jump_reduce_dims)
+
+        sigma_sq = physical_temperature_scale * physical_temperature_scale
+        values = torch.stack(
+            [
+                100.0 * torch.sqrt(sse / target_sse),
+                100.0 * torch.sqrt(interface_sse / interface_target_sse),
+                100.0 * rms / true_std.clamp_min(EPS_STD),
+                rms * physical_temperature_scale,
+                sse * sigma_sq,
+                target_sse * sigma_sq,
+                interface_sse * sigma_sq,
+                interface_target_sse * sigma_sq,
+                jump_error * physical_temperature_scale,
+                100.0 * jump_error / jump_true.clamp_min(EPS_JUMP),
+                100.0 * jump_error,
+                pred_jump_max * physical_temperature_scale,
+                true_jump_max * physical_temperature_scale,
+            ],
+            dim=1,
+        ).cpu().numpy()
+        interface_counts = interface_counts.cpu().numpy()
+        num_error_cells = int(np.prod(truths.shape[1:]))
+        return [
+            {
+                "rel_l2": float(row[0]),
+                "iface_rel_l2": float(row[1]),
+                "nrmse_pct": float(row[2]),
+                "rmse_K": float(row[3]),
+                "sse_K2": float(row[4]),
+                "target_sse_K2": float(row[5]),
+                "interface_sse_K2": float(row[6]),
+                "interface_target_sse_K2": float(row[7]),
+                "node_jump_rmse_K": float(row[8]),
+                "node_jump_nrmse_pct": float(row[9]),
+                "node_jump_gnrmse_pct": float(row[10]),
+                "node_jump_abs_max_pred_K": float(row[11]),
+                "node_jump_abs_max_true_K": float(row[12]),
+                "num_error_cells": num_error_cells,
+                "num_interface_cells": int(interface_counts[offset]),
+            }
+            for offset, row in enumerate(values)
+        ]
+
+    def _prediction_items():
+        if rollout_is_active(rollout_options):
+            for idx in range(len(dataset)):
+                sim_id, s, j = map(int, dataset._pairs[idx])
+                item = dataset[idx]
+                prediction = predict_autoregressive(
                     model=fno,
                     dataset=dataset,
                     sim_id=sim_id,
@@ -1000,44 +1322,44 @@ def write_test_records(
                     num_substeps=rollout_options.num_substeps,
                     device=device,
                 )
-            elif uses_forcing and forcing_seq is not None:
-                y_pred = fno(spatial, cond, forcing_seq.unsqueeze(0).to(device))
-            else:
-                y_pred = fno(spatial, cond)
+                yield idx, item, _batch_metrics(idx, [item], prediction)[0]
+            return
 
-            rel_l2 = ((torch.mean((y_pred - y_true) ** 2) / torch.mean(y_true ** 2)) ** 0.5 * 100).item()
+        total = len(dataset)
+        for start in range(0, total, inference_batch_size):
+            stop = min(start + inference_batch_size, total)
+            items = [dataset[idx] for idx in range(start, stop)]
+            spatial = torch.stack([item["spatial"] for item in items]).to(device)
+            cond = torch.stack([item["cond_static"] for item in items]).to(device)
+            if uses_forcing:
+                forcing = torch.stack([item["forcing_seq"] for item in items]).to(device)
+                predictions = fno(spatial, cond, forcing)
+            else:
+                predictions = fno(spatial, cond)
+            batch_metrics = _batch_metrics(start, items, predictions)
+            for offset, (item, metrics) in enumerate(zip(items, batch_metrics, strict=True)):
+                yield start + offset, item, metrics
+            if start == 0 or stop == total or stop % 5000 < inference_batch_size:
+                print(f"Scored {stop}/{total} test pairs", flush=True)
+
+    rows = []
+    with torch.no_grad():
+        for idx, item, metrics in _prediction_items():
+            sim_id, s, j = dataset._pairs[idx]
+            sim_id, s, j = int(sim_id), int(s), int(j)
 
             params = dataset.sim_params[sim_id]
             interface_x = float(params.get("interface_x", 0.5))
-            iface_mask = _mask_for(interface_x)
-            iface_rel_l2 = compute_interface_rel_l2(y_pred, y_true, iface_mask)
-
-            # Pooled sufficient statistics in physical K^2. y_* are normalized, so
-            # multiplying both the error and target sums by sigma^2 keeps the
-            # pooled rel-L2 ratio identical to the normalized-space rel_l2_pct
-            # (sigma^2 cancels) while rmse_K pools coherently.
-            sigma_sq = sigma_global * sigma_global
-            diff = y_pred - y_true
-            sse_K2 = float(torch.sum(diff ** 2).item()) * sigma_sq
-            num_error_cells = int(y_true.numel())
-            target_sse_K2 = float(torch.sum(y_true ** 2).item()) * sigma_sq
-            pred_iface = y_pred[:, iface_mask, :]
-            true_iface = y_true[:, iface_mask, :]
-            interface_sse_K2 = float(torch.sum((pred_iface - true_iface) ** 2).item()) * sigma_sq
-            num_interface_cells = int(true_iface.numel())
-            interface_target_sse_K2 = float(torch.sum(true_iface ** 2).item()) * sigma_sq
-
-            rms_i = per_sample_sq_rms(y_pred, y_true)
-            nrmse_pct = float(per_sample_nrmse(y_pred, y_true).item()) * 100.0
-            rmse_K = float(rms_i.item()) * sigma_global
-            gnrmse_pct = float(rms_i.item()) * 100.0
-            left_n, right_n = _flank_for(interface_x)
-            jump_err, jump_true = per_sample_node_jump_errors(y_pred, y_true, left_n, right_n)
-            node_jump_rmse_K = float(jump_err.item()) * sigma_global
-            node_jump_gnrmse_pct = float(jump_err.item()) * 100.0
-            node_jump_nrmse_pct = float(
-                (jump_err / jump_true.clamp_min(EPS_JUMP)).item()
-            ) * 100.0
+            rel_l2 = metrics["rel_l2"]
+            iface_rel_l2 = metrics["iface_rel_l2"]
+            nrmse_pct = metrics["nrmse_pct"]
+            rmse_K = metrics["rmse_K"]
+            gnrmse_pct = 100.0 * rmse_K / temperature_rise_scale_K
+            node_jump_rmse_K = metrics["node_jump_rmse_K"]
+            node_jump_gnrmse_pct = metrics["node_jump_gnrmse_pct"]
+            node_jump_nrmse_pct = metrics["node_jump_nrmse_pct"]
+            node_jump_abs_max_pred_K = metrics["node_jump_abs_max_pred_K"]
+            node_jump_abs_max_true_K = metrics["node_jump_abs_max_true_K"]
 
             t_s_val = float(dataset.t_grid[s])
             t_j_val = float(dataset.t_grid[j])
@@ -1092,6 +1414,7 @@ def write_test_records(
                 distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
 
             rows.append({
+                "provenance_id": provenance_id,
                 "sim_id": sim_id,
                 "s": s,
                 "j": j,
@@ -1118,6 +1441,8 @@ def write_test_records(
                 "node_jump_rmse_K": node_jump_rmse_K,
                 "node_jump_nrmse_pct": node_jump_nrmse_pct,
                 "node_jump_gnrmse_pct": node_jump_gnrmse_pct,
+                "node_jump_abs_max_pred_K": node_jump_abs_max_pred_K,
+                "node_jump_abs_max_true_K": node_jump_abs_max_true_K,
                 "ood_axis": ood_axis,
                 "ood_value": ood_value,
                 "ood_repeat": ood_repeat,
@@ -1131,12 +1456,12 @@ def write_test_records(
                 "target_time_actual": tgt_time_act,
                 "dataset_t_final": rec_t_final,
                 "time_norm_horizon": rec_norm_horizon,
-                "sse_K2": sse_K2,
-                "num_error_cells": num_error_cells,
-                "interface_sse_K2": interface_sse_K2,
-                "num_interface_cells": num_interface_cells,
-                "target_sse_K2": target_sse_K2,
-                "interface_target_sse_K2": interface_target_sse_K2,
+                "sse_K2": metrics["sse_K2"],
+                "num_error_cells": metrics["num_error_cells"],
+                "interface_sse_K2": metrics["interface_sse_K2"],
+                "num_interface_cells": metrics["num_interface_cells"],
+                "target_sse_K2": metrics["target_sse_K2"],
+                "interface_target_sse_K2": metrics["interface_target_sse_K2"],
             })
 
     rows.sort(key=lambda r: (r["sim_id"], r["s"], r["j"]))
@@ -1147,4 +1472,5 @@ def write_test_records(
         writer.writeheader()
         writer.writerows(rows)
     print(f"Saved {len(rows)} test records ({benchmark}) -> {out_path}")
+    print(f"Saved test-record provenance -> {provenance_path}")
     return out_path

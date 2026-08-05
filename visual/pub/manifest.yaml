@@ -9,21 +9,30 @@
 # Known, deliberate gaps -- every one of these surfaces as a Degradation rather
 # than being papered over:
 #   * one seed per benchmark, so no across-seed spread (TOO_FEW_SEEDS)
-#   * source_itr is a `bins` checkpoint while figures.yaml requires
-#     temporal_encoder (REPRESENTATION_MISMATCH); to be retrained before
-#     publication
+#   * source_itr temporarily uses the available `bins` checkpoint while
+#     figures.yaml requires temporal_encoder (REPRESENTATION_MISMATCH); the
+#     user authorized this mixed-representation descriptive evaluation, but a
+#     temporal-encoder rerun is still required for the strict publication cohort
 #   * no *_train entries: learning curves are produced from the real MSI
 #     training metrics, not from these checkpoints
 
 sources:
   forcing_records:
     - run: runs/pub_forcing/config0/seed32
+      seed: 32
+      status: completed
   source_records:
     - run: runs/pub_source/config0/seed32
+      seed: 32
+      status: completed
   source_itr_records:
     - run: runs/pub_source_itr/config0/seed42
+      seed: 42
+      status: completed
   interfaces_records:
-    - run: runs/pub_interfaces/config0/seed32
+    - run: runs/pub_interfaces_neumann_ic_v1/config0/seed32
+      seed: 32
+      status: completed
 
   forcing_checkpoint:
     - run: runs/pub_forcing/config0/seed32
@@ -31,8 +40,10 @@ sources:
     - run: runs/pub_source/config0/seed32
   source_itr_checkpoint:
     - run: runs/pub_source_itr/config0/seed42
+      seed: 42
+      status: completed
   interfaces_checkpoint:
-    - run: runs/pub_interfaces/config0/seed32
+    - run: runs/pub_interfaces_neumann_ic_v1/config0/seed32
 
   inverse_forcing:
     - table: results_inverse.csv

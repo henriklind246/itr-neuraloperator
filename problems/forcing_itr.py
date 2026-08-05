@@ -12,6 +12,7 @@ from problems.forcing import (
     SPATIAL_CHANNELS_BINS as FORCING_SPATIAL_CHANNELS_BINS,
     SPATIAL_CHANNELS_TEMPORAL as FORCING_SPATIAL_CHANNELS_TEMPORAL,
     ForcingProblem,
+    _SPATIAL_ONEHOT_DIM as FORCING_ONEHOT_DIM,
 )
 from problems.source_itr import RC_Y_CHANNEL, rc_log_norm
 from src.physics.boundary_forcing import (
@@ -29,6 +30,16 @@ from src.physics.internal_source import (
 
 
 COND_STATIC_DIM = FORCING_COND_STATIC_DIM + 3
+
+# Spatial-descriptor conditioning ablation slices for the *expanded* 13-dim
+# vector (single source of truth for the mask helper and the tests).
+# build_cond_vector_forcing_itr rewrites forcing's [t_bar, R_c, onehot(4),
+# params(4)] into [t_bar, itr(4), onehot(4), params(4)] (the scalar R_c slot at
+# index 1 becomes the four void params). So the retained ITR block is [1:5],
+# the one-hot family label is [5:9], and the full spatial descriptor is [5:13].
+_ITR_PREFIX = 1 + 4  # t_bar + 4 void (ITR) params
+FORCING_ITR_FAMILY_SLICE = slice(_ITR_PREFIX, _ITR_PREFIX + FORCING_ONEHOT_DIM)  # slice(5, 9)
+FORCING_ITR_SPATIAL_DESCRIPTOR_SLICE = slice(_ITR_PREFIX, COND_STATIC_DIM)  # slice(5, 13)
 SPATIAL_CHANNELS_TEMPORAL = FORCING_SPATIAL_CHANNELS_TEMPORAL + 1
 SPATIAL_CHANNELS_BINS = FORCING_SPATIAL_CHANNELS_BINS + 1
 S_Y_CHANNEL = 3
@@ -83,7 +94,7 @@ def build_cond_vector_forcing_itr(
         ],
         dtype=np.float32,
     )
-    return np.concatenate([parent[:2], itr, parent[3:]]).astype(np.float32)
+    return np.concatenate([parent[:1], itr, parent[2:]]).astype(np.float32)
 
 
 class ForcingItrProblem(ForcingProblem):
@@ -91,6 +102,10 @@ class ForcingItrProblem(ForcingProblem):
 
     name = "forcing_itr"
     required_observation_times = REQUIRED_OBSERVATION_TIMES
+
+    # Override forcing's 10-dim slices with the expanded 13-dim layout.
+    family_cond_slice = FORCING_ITR_FAMILY_SLICE
+    spatial_descriptor_cond_slice = FORCING_ITR_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -237,6 +252,9 @@ class ForcingItrProblem(ForcingProblem):
             R_amp=float(params["R_c_amp"]),
             y0=float(params["R_c_y0"]),
             sigma=float(params["R_c_sigma"]),
+        )
+        parent["cond_static"] = self._apply_spatial_conditioning_mask(
+            parent["cond_static"]
         )
         return parent
 

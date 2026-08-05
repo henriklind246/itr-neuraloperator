@@ -29,8 +29,10 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import PercentFormatter
 
 from visual._common import PLOT_STYLE, _save_figure
+from visual.pub import style as pub_style
 
 
 # ============================================================
@@ -71,7 +73,9 @@ class InversePlotSpec:
     lead_hat_col: str
     lead_true_col: str
     lead_abserr_col: str
+    lead_description: str
     lead_unit: str
+    lead_unit_text: str
     # Identifiability (Fig 2).
     sv_cols: tuple[str, ...]
     sens_cols: dict[str, str]
@@ -86,6 +90,9 @@ class InversePlotSpec:
     profile_ci_low_col: str
     profile_ci_high_col: str
     profile_covered_col: str
+    lead_profile_ci_low_col: str
+    lead_profile_ci_high_col: str
+    lead_profile_covered_col: str
     mcmc_lead_mean_col: str
     mcmc_lead_ci_low_col: str
     mcmc_lead_ci_high_col: str
@@ -112,7 +119,9 @@ FORCING_SPEC = InversePlotSpec(
     lead_hat_col="R_c_map",
     lead_true_col="R_c_true",
     lead_abserr_col="R_c_abs_error",
-    lead_unit="",
+    lead_description="contact resistance R_c",
+    lead_unit=r"\mathrm{m^2\,K/W}",
+    lead_unit_text="m² K/W",
     sv_cols=("sv_0",),
     sens_cols={"R_c": "sens_R_c"},
     cond_col=None,
@@ -124,6 +133,9 @@ FORCING_SPEC = InversePlotSpec(
     profile_ci_low_col="profile_R_c_ci_low",
     profile_ci_high_col="profile_R_c_ci_high",
     profile_covered_col="profile_R_c_covered",
+    lead_profile_ci_low_col="profile_R_c_ci_low",
+    lead_profile_ci_high_col="profile_R_c_ci_high",
+    lead_profile_covered_col="profile_R_c_covered",
     mcmc_lead_mean_col="mcmc_R_c_mean",
     mcmc_lead_ci_low_col="mcmc_R_c_ci_low",
     mcmc_lead_ci_high_col="mcmc_R_c_ci_high",
@@ -157,7 +169,9 @@ SOURCE_ITR_SPEC = InversePlotSpec(
     lead_hat_col="excess_int_hat",
     lead_true_col="excess_int_true",
     lead_abserr_col="excess_int_abserr",
-    lead_unit=" (severity)",
+    lead_description="integrated excess resistance S_R = ∫(R_c − R_base) dy",
+    lead_unit=r"\mathrm{m^3\,K/W}",
+    lead_unit_text="m³ K/W",
     sv_cols=("sv_0", "sv_1", "sv_2", "sv_3"),
     sens_cols={
         "R_base": "sens_R_base", "R_amp": "sens_R_amp",
@@ -172,6 +186,9 @@ SOURCE_ITR_SPEC = InversePlotSpec(
     profile_ci_low_col="profile_R_amp_ci_low",
     profile_ci_high_col="profile_R_amp_ci_high",
     profile_covered_col="profile_R_amp_covered",
+    lead_profile_ci_low_col="profile_excess_ci_low",
+    lead_profile_ci_high_col="profile_excess_ci_high",
+    lead_profile_covered_col="profile_excess_covered",
     mcmc_lead_mean_col="mcmc_excess_mean",
     mcmc_lead_ci_low_col="mcmc_excess_ci_low",
     mcmc_lead_ci_high_col="mcmc_excess_ci_high",
@@ -1050,6 +1067,585 @@ def _panel_mcmc_posterior(ax, rep_art, spec: InversePlotSpec, table: dict) -> No
     ax.set_ylabel("posterior density")
     ax.set_title(f"MCMC posterior — {spec.lead_name}")
     ax.grid(True)
+
+
+# ============================================================
+# PAIRED SENSOR SWEEP — manuscript figures
+# ============================================================
+
+_SENSOR_SWEEP_COUNTS = (8, 16, 32)
+_SENSOR_SWEEP_N_CASES = 8
+_SENSOR_RECOVERY_SIZE = (3.42, 2.75)
+_SENSOR_UQ_SIZE = (7.0, 2.75)
+_PROFILE_COLOR = "#0072B2"
+_MCMC_COLOR = "#E69F00"
+
+
+def _sensor_sweep_data(csv_path: str | Path, spec: InversePlotSpec) -> dict:
+    table = _load_inverse_csv(csv_path)
+    required = [
+        "benchmark",
+        "sim_id",
+        "n_sensors",
+        "noise_seed",
+        "init_seed",
+        spec.lead_abserr_col,
+        spec.lead_profile_ci_low_col,
+        spec.lead_profile_ci_high_col,
+        spec.lead_profile_covered_col,
+        spec.mcmc_lead_ci_low_col,
+        spec.mcmc_lead_ci_high_col,
+        spec.mcmc_lead_covered_col,
+    ]
+    _require_columns(table, required, "inverse sensor sweep")
+
+    numeric_columns = {
+        column: _floats(table, column)
+        for column in required
+        if column not in {
+            "benchmark",
+            spec.lead_profile_covered_col,
+            spec.mcmc_lead_covered_col,
+        }
+    }
+    profile_covered = _bools(table, spec.lead_profile_covered_col)
+    mcmc_covered = _bools(table, spec.mcmc_lead_covered_col)
+    if any(str(value) != spec.benchmark for value in table["benchmark"]):
+        raise ValueError(
+            f"inverse sensor sweep benchmark column does not match {spec.benchmark!r}."
+        )
+
+    sensor_values = numeric_columns["n_sensors"]
+    sim_values = numeric_columns["sim_id"]
+    if not all(np.all(np.isfinite(values)) for values in numeric_columns.values()):
+        raise ValueError("inverse sensor sweep contains non-finite numeric values.")
+    if not (np.all(np.isfinite(profile_covered)) and np.all(np.isfinite(mcmc_covered))):
+        raise ValueError("inverse sensor sweep contains missing interval coverage values.")
+
+    row_by_key: dict[tuple[int, int], int] = {}
+    for row_index, (count_value, sim_value) in enumerate(zip(sensor_values, sim_values)):
+        count = int(count_value)
+        sim_id = int(sim_value)
+        if count_value != count or sim_value != sim_id:
+            raise ValueError("sensor counts and simulation IDs must be integers.")
+        key = (count, sim_id)
+        if key in row_by_key:
+            raise ValueError(f"duplicate inverse sensor sweep row for {key}.")
+        row_by_key[key] = row_index
+
+    counts = tuple(sorted({count for count, _ in row_by_key}))
+    if counts != _SENSOR_SWEEP_COUNTS:
+        raise ValueError(
+            f"inverse sensor sweep counts {counts} do not match "
+            f"{_SENSOR_SWEEP_COUNTS}."
+        )
+    ids_by_count = {
+        count: tuple(sorted(sim_id for row_count, sim_id in row_by_key if row_count == count))
+        for count in counts
+    }
+    sim_ids = ids_by_count[counts[0]]
+    if len(sim_ids) != _SENSOR_SWEEP_N_CASES:
+        raise ValueError(
+            f"inverse sensor sweep has {len(sim_ids)} paired cases; "
+            f"expected {_SENSOR_SWEEP_N_CASES}."
+        )
+    if any(ids != sim_ids for ids in ids_by_count.values()):
+        raise ValueError(f"inverse sensor sweep cases are not paired: {ids_by_count}.")
+
+    for sim_id in sim_ids:
+        noise = {
+            int(numeric_columns["noise_seed"][row_by_key[(count, sim_id)]])
+            for count in counts
+        }
+        init = {
+            int(numeric_columns["init_seed"][row_by_key[(count, sim_id)]])
+            for count in counts
+        }
+        if len(noise) != 1 or len(init) != 1:
+            raise ValueError(
+                f"simulation {sim_id} does not retain paired noise/init seeds."
+            )
+
+    def matrix(values: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            [
+                [values[row_by_key[(count, sim_id)]] for count in counts]
+                for sim_id in sim_ids
+            ],
+            dtype=np.float64,
+        )
+
+    errors = matrix(numeric_columns[spec.lead_abserr_col])
+    profile_low = matrix(numeric_columns[spec.lead_profile_ci_low_col])
+    profile_high = matrix(numeric_columns[spec.lead_profile_ci_high_col])
+    mcmc_low = matrix(numeric_columns[spec.mcmc_lead_ci_low_col])
+    mcmc_high = matrix(numeric_columns[spec.mcmc_lead_ci_high_col])
+    profile_width = profile_high - profile_low
+    mcmc_width = mcmc_high - mcmc_low
+    if np.any(errors < 0.0) or np.any(profile_width < 0.0) or np.any(mcmc_width < 0.0):
+        raise ValueError("inverse sensor sweep contains negative errors or interval widths.")
+
+    return {
+        "counts": counts,
+        "sim_ids": sim_ids,
+        "errors": errors,
+        "profile_covered": matrix(profile_covered),
+        "mcmc_covered": matrix(mcmc_covered),
+        "profile_width": profile_width,
+        "mcmc_width": mcmc_width,
+    }
+
+
+def _save_sensor_sweep_figure(
+    fig,
+    out_dir: str | Path,
+    stem: str,
+    dimensions: tuple[float, float],
+) -> dict[str, str]:
+    out_dir = Path(out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "png": out_dir / f"{stem}.png",
+        "pdf": out_dir / f"{stem}.pdf",
+    }
+    fig.set_size_inches(*dimensions, forward=True)
+    fig.savefig(paths["png"], format="png", dpi=300, facecolor="white")
+    fig.savefig(paths["pdf"], format="pdf", facecolor="white")
+    plt.close(fig)
+    for path in paths.values():
+        if not path.is_file() or path.stat().st_size == 0:
+            raise OSError(f"failed to write manuscript figure: {path}")
+    return {kind: str(path) for kind, path in paths.items()}
+
+
+def _quantity_axis_label(spec: InversePlotSpec, *, width: bool = False) -> str:
+    if width:
+        return rf"95% interval width [${spec.lead_unit}$]"
+    return rf"Absolute ${spec.lead_name}$ error [${spec.lead_unit}$]"
+
+
+def _format_percent(value: float) -> str:
+    return f"{100.0 * value:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _deterministic_jitter(sim_ids, span: float = 0.055) -> np.ndarray:
+    ids = np.asarray(sim_ids, dtype=np.int64)
+    order = np.argsort(ids, kind="stable")
+    offsets = np.linspace(-span, span, len(ids), dtype=np.float64)
+    jitter = np.empty(len(ids), dtype=np.float64)
+    jitter[order] = offsets
+    return jitter
+
+
+def plot_sensor_sweep_recovery(
+    csv_path: str | Path,
+    spec: InversePlotSpec,
+    *,
+    out_dir: str | Path,
+) -> dict:
+    data = _sensor_sweep_data(csv_path, spec)
+    counts = data["counts"]
+    errors = data["errors"]
+    means = np.mean(errors, axis=0)
+    q1 = np.percentile(errors, 25.0, axis=0)
+    q3 = np.percentile(errors, 75.0, axis=0)
+    paired_difference = float(means[-1] - means[0])
+    percent_change = (
+        float(100.0 * paired_difference / means[0])
+        if means[0] > 0.0
+        else float("nan")
+    )
+    improved = int(np.sum(errors[:, -1] < errors[:, 0]))
+    positions = np.arange(len(counts), dtype=np.float64)
+
+    with pub_style.pub_style(
+        {"savefig.bbox": None, "savefig.pad_inches": 0.0}
+    ):
+        fig, ax = plt.subplots(
+            figsize=_SENSOR_RECOVERY_SIZE,
+            layout="constrained",
+        )
+        ax.fill_between(
+            positions,
+            q1,
+            q3,
+            color=spec.color,
+            alpha=0.10,
+            linewidth=0,
+            zorder=0,
+        )
+        for case_errors in errors:
+            ax.plot(
+                positions,
+                case_errors,
+                color="0.64",
+                linewidth=0.45,
+                alpha=0.66,
+                marker="o",
+                markersize=1.8,
+                markerfacecolor="white",
+                markeredgecolor="0.52",
+                markeredgewidth=0.45,
+                zorder=1,
+            )
+        ax.plot(
+            positions,
+            means,
+            color=spec.color,
+            linewidth=1.15,
+            marker="o",
+            markersize=3.6,
+            markerfacecolor="white",
+            markeredgecolor=spec.color,
+            markeredgewidth=1.0,
+            zorder=4,
+        )
+        for position, mean in zip(positions, means):
+            ax.annotate(
+                f"{mean:.4f}",
+                (position, mean),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=6.5,
+                color=spec.color,
+                family="DejaVu Sans Mono",
+            )
+        ax.set_xticks(positions, [str(count) for count in counts])
+        ax.set_xlim(-0.18, len(counts) - 0.82)
+        ax.set_ylim(bottom=0.0)
+        ax.set_xlabel("number of spatial sensors")
+        ax.set_ylabel(_quantity_axis_label(spec))
+        ax.grid(True, axis="y")
+        ax.text(
+            0.98,
+            0.96,
+            f"n={len(data['sim_ids'])} paired simulations",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=6.2,
+            color="0.42",
+        )
+        files = _save_sensor_sweep_figure(
+            fig,
+            out_dir,
+            "sensor_recovery_vs_sensors",
+            _SENSOR_RECOVERY_SIZE,
+        )
+
+    if np.isfinite(percent_change):
+        direction = "decreased" if percent_change < 0.0 else "increased"
+        change_text = f"{direction} by {abs(percent_change):.1f}%"
+    else:
+        change_text = "had no defined percentage change"
+    caption = (
+        f"Absolute {spec.lead_description} recovery error ({spec.lead_unit_text}; lower is "
+        f"better) for the same {len(data['sim_ids'])} simulations at each sensor "
+        f"count. Thin lines pair individual simulations, the translucent band "
+        f"shows the IQR, and the emphasized line shows the mean. From "
+        f"{counts[0]} to {counts[-1]} sensors, mean error "
+        f"{change_text}; {improved}/{len(data['sim_ids'])} cases had lower error. "
+        "These summaries are descriptive for this eight-case evaluation."
+    )
+    return {
+        "status": "complete",
+        "files": files,
+        "dimensions_inches": list(_SENSOR_RECOVERY_SIZE),
+        "source_columns": [spec.lead_abserr_col],
+        "caption": caption,
+        "statistics": {
+            "sensor_counts": list(counts),
+            "n_cases": len(data["sim_ids"]),
+            "mean_error": [float(value) for value in means],
+            "q1_error": [float(value) for value in q1],
+            "q3_error": [float(value) for value in q3],
+            "paired_mean_difference_8_to_32": paired_difference,
+            "mean_percent_change_8_to_32": percent_change,
+            "improved_cases_8_to_32": improved,
+        },
+    }
+
+
+def _distribution_summary(values: np.ndarray) -> dict[str, list[float]]:
+    return {
+        "mean": [float(value) for value in np.mean(values, axis=0)],
+        "median": [float(value) for value in np.median(values, axis=0)],
+        "q1": [float(value) for value in np.percentile(values, 25.0, axis=0)],
+        "q3": [float(value) for value in np.percentile(values, 75.0, axis=0)],
+    }
+
+
+def plot_sensor_sweep_uq(
+    csv_path: str | Path,
+    spec: InversePlotSpec,
+    *,
+    out_dir: str | Path,
+) -> dict:
+    data = _sensor_sweep_data(csv_path, spec)
+    counts = data["counts"]
+    positions = np.arange(len(counts), dtype=np.float64)
+    n_cases = len(data["sim_ids"])
+    profile_covered = data["profile_covered"]
+    mcmc_covered = data["mcmc_covered"]
+    coverage = {
+        "profile": np.mean(profile_covered, axis=0),
+        "mcmc": np.mean(mcmc_covered, axis=0),
+    }
+    successes = {
+        "profile": np.sum(profile_covered, axis=0).astype(int),
+        "mcmc": np.sum(mcmc_covered, axis=0).astype(int),
+    }
+    width_summary = {
+        "profile": _distribution_summary(data["profile_width"]),
+        "mcmc": _distribution_summary(data["mcmc_width"]),
+    }
+    method_styles = {
+        "profile": {
+            "label": "Profile likelihood",
+            "color": _PROFILE_COLOR,
+            "marker": "o",
+            "linestyle": "-",
+            "offset": -0.10,
+        },
+        "mcmc": {
+            "label": "MCMC",
+            "color": _MCMC_COLOR,
+            "marker": "D",
+            "linestyle": "--",
+            "offset": 0.10,
+        },
+    }
+
+    with pub_style.pub_style(
+        {"savefig.bbox": None, "savefig.pad_inches": 0.0}
+    ):
+        fig, (coverage_ax, width_ax) = plt.subplots(
+            1,
+            2,
+            figsize=_SENSOR_UQ_SIZE,
+            layout="constrained",
+        )
+        legend_handles = []
+        for method, styles in method_styles.items():
+            rates = coverage[method]
+            intervals = [_wilson_ci(int(k), n_cases) for k in successes[method]]
+            lower = np.asarray([rate - interval[0] for rate, interval in zip(rates, intervals)])
+            upper = np.asarray([interval[1] - rate for rate, interval in zip(rates, intervals)])
+            x_values = positions + styles["offset"]
+            handle = coverage_ax.errorbar(
+                x_values,
+                rates,
+                yerr=np.vstack([lower, upper]),
+                color=styles["color"],
+                marker=styles["marker"],
+                linestyle=styles["linestyle"],
+                linewidth=1.0,
+                markersize=3.6,
+                markerfacecolor="white",
+                markeredgewidth=0.9,
+                capsize=2.0,
+                elinewidth=0.7,
+                zorder=3,
+                label=styles["label"],
+            )
+            legend_handles.append(handle)
+            for count_index, (x_value, rate, success) in enumerate(
+                zip(x_values, rates, successes[method])
+            ):
+                if method == "profile":
+                    offset = (4, 6) if count_index == 0 else (-4, 6)
+                    horizontal_alignment = "left" if count_index == 0 else "right"
+                    vertical_alignment = "bottom"
+                else:
+                    offset = (-4, -10) if count_index == 2 else (4, -10)
+                    horizontal_alignment = "right" if count_index == 2 else "left"
+                    vertical_alignment = "top"
+                coverage_ax.annotate(
+                    f"{_format_percent(float(rate))} ({success}/{n_cases})",
+                    (x_value, rate),
+                    xytext=offset,
+                    textcoords="offset points",
+                    ha=horizontal_alignment,
+                    va=vertical_alignment,
+                    fontsize=7,
+                    color="0.2",
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72,
+                          "pad": 0.15},
+                )
+
+        pub_style.add_reference_line(
+            coverage_ax,
+            0.95,
+            "95% nominal",
+        )
+        coverage_ax.set_xticks(positions, [str(count) for count in counts])
+        coverage_ax.set_xlim(-0.28, len(counts) - 0.72)
+        coverage_ax.set_ylim(0.0, 1.07)
+        coverage_ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
+        coverage_ax.set_xlabel("number of spatial sensors")
+        coverage_ax.set_ylabel("Empirical 95% interval coverage")
+        coverage_ax.set_title("Interval coverage", fontsize=7)
+        coverage_ax.grid(True, axis="y")
+        coverage_ax.text(
+            0.02,
+            0.035,
+            f"one case = {100.0 / n_cases:.1f} percentage points",
+            transform=coverage_ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=6.2,
+            color="0.42",
+        )
+
+        jitter = _deterministic_jitter(data["sim_ids"])
+        for method, values in (
+            ("profile", data["profile_width"]),
+            ("mcmc", data["mcmc_width"]),
+        ):
+            styles = method_styles[method]
+            summary = width_summary[method]
+            for count_index, position in enumerate(positions):
+                center = position + styles["offset"]
+                width_ax.scatter(
+                    center + jitter,
+                    values[:, count_index],
+                    s=8,
+                    marker=styles["marker"],
+                    facecolors="white",
+                    edgecolors=styles["color"],
+                    linewidths=0.5,
+                    alpha=0.58,
+                    zorder=2,
+                )
+                q1 = summary["q1"][count_index]
+                q3 = summary["q3"][count_index]
+                median = summary["median"][count_index]
+                mean = summary["mean"][count_index]
+                width_ax.vlines(
+                    center,
+                    q1,
+                    q3,
+                    color=styles["color"],
+                    linewidth=3.6,
+                    alpha=0.16,
+                    zorder=3,
+                )
+                width_ax.hlines(
+                    median,
+                    center - 0.075,
+                    center + 0.075,
+                    color=styles["color"],
+                    linewidth=1.0,
+                    zorder=4,
+                )
+                width_ax.scatter(
+                    [center],
+                    [mean],
+                    s=20,
+                    marker="D",
+                    color=styles["color"],
+                    edgecolor="white",
+                    linewidth=0.5,
+                    zorder=5,
+                )
+                if method == "profile":
+                    mean_offset = (-5, 6)
+                    horizontal_alignment = "right"
+                    vertical_alignment = "bottom"
+                else:
+                    mean_offset = (-5, -10) if count_index == 2 else (5, -10)
+                    horizontal_alignment = "right" if count_index == 2 else "left"
+                    vertical_alignment = "top"
+                width_ax.annotate(
+                    f"{mean:.3f}",
+                    (center, mean),
+                    xytext=mean_offset,
+                    textcoords="offset points",
+                    ha=horizontal_alignment,
+                    va=vertical_alignment,
+                    fontsize=7,
+                    color="0.2",
+                    family="DejaVu Sans Mono",
+                )
+        width_ax.set_xticks(positions, [str(count) for count in counts])
+        width_ax.set_xlim(-0.50, len(counts) - 0.60)
+        width_ax.set_ylim(bottom=0.0)
+        width_ax.set_xlabel("number of spatial sensors")
+        width_ax.set_ylabel(_quantity_axis_label(spec, width=True))
+        width_ax.set_title("Interval precision", fontsize=7)
+        width_ax.grid(True, axis="y")
+        width_ax.text(
+            0.98,
+            0.96,
+            "IQR bar  |  median tick  |  mean diamond",
+            transform=width_ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=6.2,
+            color="0.42",
+        )
+        pub_style.panel_letters(
+            (coverage_ax, width_ax),
+            loc=(-0.10, 1.02),
+        )
+        fig.legend(
+            legend_handles,
+            [method_styles[method]["label"] for method in ("profile", "mcmc")],
+            loc="outside upper center",
+            ncol=2,
+            frameon=False,
+            handlelength=2.5,
+            columnspacing=1.8,
+        )
+        files = _save_sensor_sweep_figure(
+            fig,
+            out_dir,
+            "sensor_uq_vs_sensors",
+            _SENSOR_UQ_SIZE,
+        )
+
+    coverage_text = "; ".join(
+        f"{count} sensors: profile {successes['profile'][index]}/{n_cases}, "
+        f"MCMC {successes['mcmc'][index]}/{n_cases}"
+        for index, count in enumerate(counts)
+    )
+    caption = (
+        f"Empirical 95% interval coverage (higher is better) and interval width "
+        f"for {spec.lead_description} ({spec.lead_unit_text}; lower width is more precise) "
+        f"over the same {n_cases} paired simulations. Coverage is shown with "
+        f"Wilson 95% intervals and is descriptive: one case changes the observed "
+        f"rate by {100.0 / n_cases:.1f} percentage points. {coverage_text}. "
+        "Width summaries show individual cases, IQR, median, and mean without "
+        "implying statistical significance between sensor counts."
+    )
+    return {
+        "status": "complete",
+        "files": files,
+        "dimensions_inches": list(_SENSOR_UQ_SIZE),
+        "source_columns": [
+            spec.lead_profile_ci_low_col,
+            spec.lead_profile_ci_high_col,
+            spec.lead_profile_covered_col,
+            spec.mcmc_lead_ci_low_col,
+            spec.mcmc_lead_ci_high_col,
+            spec.mcmc_lead_covered_col,
+        ],
+        "caption": caption,
+        "statistics": {
+            "sensor_counts": list(counts),
+            "n_cases": n_cases,
+            "coverage": {
+                method: {
+                    "successes": [int(value) for value in successes[method]],
+                    "rates": [float(value) for value in coverage[method]],
+                }
+                for method in ("profile", "mcmc")
+            },
+            "interval_width": width_summary,
+        },
+    }
 
 
 # ============================================================

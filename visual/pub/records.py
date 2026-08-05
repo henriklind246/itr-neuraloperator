@@ -12,6 +12,8 @@ Schema versions of ``test_records.csv``:
 - v2: adds the pooled sufficient statistics (``sse_K2`` etc.). This is the
   minimum for any quantitative figure in the paper.
 - v3: adds the protocol / OOD identity columns needed by the OOD figures.
+- v4: links every row to run-level provenance and stores the per-target maximum
+  absolute predicted/truth node jump needed for initial-state peak histories.
 """
 
 from __future__ import annotations
@@ -48,15 +50,19 @@ SCHEMA_V3_REQUIRED: tuple[str, ...] = (
     "lead_time_actual", "time_norm_horizon",
 )
 
+SCHEMA_V4_REQUIRED: tuple[str, ...] = (
+    "provenance_id", "node_jump_abs_max_pred_K", "node_jump_abs_max_true_K",
+)
+
 _INT_COLS = ("sim_id", "s", "j")
 _STR_COLS = (
-    "benchmark", "temporal_family", "spatial_family", "regime",
+    "provenance_id", "benchmark", "temporal_family", "spatial_family", "regime",
     "protocol", "distribution_class", "ood_axis", "ood_value", "latents_hash",
 )
 
 
 def detect_schema_version(columns) -> int:
-    """Return 3, 2, or 1 for a ``test_records`` column set.
+    """Return 4, 3, 2, or 1 for a ``test_records`` column set.
 
     Raises when the frame is not even a v1 test-records table, so a mis-pointed
     manifest entry fails at load rather than producing an empty figure.
@@ -69,6 +75,10 @@ def detect_schema_version(columns) -> int:
             f"{missing_v1[:6]}{'...' if len(missing_v1) > 6 else ''}"
         )
     if all(c in cols for c in SCHEMA_V2_REQUIRED):
+        if all(c in cols for c in SCHEMA_V3_REQUIRED) and all(
+            c in cols for c in SCHEMA_V4_REQUIRED
+        ):
+            return 4
         if all(c in cols for c in SCHEMA_V3_REQUIRED):
             return 3
         return 2
@@ -166,6 +176,33 @@ def load_test_records(path: str | Path, *, require_version: int = 2,
 
     return RecordFrame(df=df, schema_version=version, path=path,
                        seed=resolved_seed, degradations=degradations)
+
+
+def provenance_path_for(records_path: str | Path) -> Path:
+    path = Path(records_path)
+    return path.with_name(f"{path.stem}.provenance.json")
+
+
+def load_test_record_provenance(records_path: str | Path) -> dict:
+    """Load and verify the run-level metadata linked by schema-v4 records."""
+    records_path = Path(records_path)
+    provenance_path = provenance_path_for(records_path)
+    if not provenance_path.exists():
+        raise SchemaError(f"test-record provenance not found: {provenance_path}")
+    payload = __import__("json").loads(provenance_path.read_text())
+    if payload.get("schema") != "test-records-provenance/v1":
+        raise SchemaError(
+            f"{provenance_path} has unsupported schema {payload.get('schema')!r}"
+        )
+    header = pd.read_csv(records_path, usecols=["provenance_id"])
+    ids = set(header["provenance_id"].dropna().astype(str).unique())
+    expected = str(payload.get("provenance_id", ""))
+    if ids != {expected}:
+        raise SchemaError(
+            f"{records_path} provenance IDs {sorted(ids)} do not match "
+            f"{provenance_path} ({expected!r})"
+        )
+    return payload
 
 
 def load_many_test_records(paths, *, require_version: int = 2) -> RecordFrame:
@@ -282,12 +319,15 @@ __all__ = [
     "SCHEMA_V1_COLUMNS",
     "SCHEMA_V2_REQUIRED",
     "SCHEMA_V3_REQUIRED",
+    "SCHEMA_V4_REQUIRED",
     "SchemaError",
     "RecordFrame",
     "artifact_paths",
     "detect_schema_version",
     "seed_from_path",
     "load_test_records",
+    "load_test_record_provenance",
+    "provenance_path_for",
     "load_many_test_records",
     "load_train_metrics",
     "load_csv_table",

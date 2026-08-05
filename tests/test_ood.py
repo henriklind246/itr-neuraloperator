@@ -256,23 +256,19 @@ def test_separate_horizons_closed_form(horizon_dataset):
     def cond(**match):
         return ds[_find_pair(ds, **match)]["cond_static"].numpy()
 
-    # fixed_initial, t_s=0: lead = t_t/0.30, t_s_norm = 0.
+    # fixed_initial, t_s=0: lead = t_t/0.30.
     c = cond(protocol="fixed_initial", target_time_actual=0.30)
     assert c[0] == pytest.approx(1.0, abs=2e-3)  # lead in-range at ID target
-    assert c[1] == pytest.approx(0.0, abs=2e-3)
     c = cond(protocol="fixed_initial", target_time_actual=0.45)
     assert c[0] == pytest.approx(1.5, abs=2e-3)  # lead > 1 (OOD)
-    assert c[1] == pytest.approx(0.0, abs=2e-3)
 
-    # anchored_from_horizon, t_s=0.30: lead=(0.45-0.30)/0.30=0.5, t_s_norm=1.0.
+    # anchored_from_horizon, t_s=0.30: lead=(0.45-0.30)/0.30=0.5.
     c = cond(protocol="anchored_from_horizon", target_time_actual=0.45)
     assert c[0] == pytest.approx(0.5, abs=2e-3)
-    assert c[1] == pytest.approx(1.0, abs=2e-3)
 
-    # ood_local_fixed_lead, t_s=0.35, t_t=0.40: lead=0.05/0.30, t_s_norm=0.35/0.30.
+    # ood_local_fixed_lead, t_s=0.35, t_t=0.40: lead=0.05/0.30.
     c = cond(protocol="ood_local_fixed_lead", source_time_actual=0.35)
     assert c[0] == pytest.approx(0.05 / 0.30, abs=2e-3)
-    assert c[1] == pytest.approx(0.35 / 0.30, abs=2e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +350,7 @@ def test_write_test_records_sidecar_join(
         "model": {
             "parameters": {
                 "modes1": 2, "modes2": 2, "width": 8, "in_channels": 4,
-                "out_channels": 1, "n_layers": 2, "cond_static_dim": 11,
+                "out_channels": 1, "n_layers": 2, "cond_static_dim": 10,
                 "cond_hidden": 256, "temporal_token_dim": 2,
                 "temporal_samples": 128, "temporal_hidden": 16,
                 "forcing_embed_dim": 16,

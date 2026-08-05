@@ -8,13 +8,13 @@ from src.operators.fno2d import FNO2d
 
 # Forcing benchmark, temporal_encoder representation (dataset/model default).
 FORCING_IN_CHANNELS = 4
-FORCING_COND_STATIC_DIM = 11
+FORCING_COND_STATIC_DIM = 10
 FORCING_TEMPORAL_TOKEN_DIM = 2
 FORCING_TEMPORAL_SAMPLES = 128
 
 # Source benchmark, bins representation (temporal encoder off, no A_norm leak).
 SOURCE_IN_CHANNELS = 20
-SOURCE_COND_STATIC_DIM = 7
+SOURCE_COND_STATIC_DIM = 6
 
 
 # ---------- solver fixtures ----------
@@ -143,6 +143,33 @@ def synthetic_source_sim_params(synthetic_trajectories):
             "ic_family": "uniform_2d",
             "ic_params": {"T0_offset": 0.0},
         })
+    return np.array(params, dtype=object)
+
+
+@pytest.fixture
+def synthetic_source_itr_sim_params(synthetic_source_sim_params):
+    """Synthetic sim_params for source_itr: source params plus the void scalars.
+
+    The R_amp bound is dependent on R_base (as in sample_sim_params) so the
+    profile peak stays under R_PEAK_MAX without clipping.
+    """
+    from src.physics.internal_source import RC_VOID_RANGES, R_PEAK_MAX
+
+    base_lo, base_hi = RC_VOID_RANGES["R_base"]
+    y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+    sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
+
+    rng = np.random.default_rng(11)
+    params = []
+    for entry in synthetic_source_sim_params:
+        p = dict(entry)
+        R_base = float(rng.uniform(base_lo, base_hi))
+        p["R_c_base"] = R_base
+        p["R_c_amp"] = float(rng.uniform(0.0, 1.0)) * (R_PEAK_MAX - R_base)
+        p["R_c_y0"] = float(rng.uniform(y0_lo, y0_hi))
+        p["R_c_sigma"] = float(rng.uniform(sig_lo, sig_hi))
+        p["R_c"] = R_base
+        params.append(p)
     return np.array(params, dtype=object)
 
 

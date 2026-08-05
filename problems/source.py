@@ -32,7 +32,13 @@ RC_RANGE = (0.05, 1.0)
 INTERFACE_X = 0.5
 T_OFF_FRAC = 0.75
 
-COND_STATIC_DIM = 7  # base 3 + [x_h, y_h, w_h, h_h]; no source amplitude leak
+COND_STATIC_DIM = 6  # [lead, R_c] + [x_h, y_h, w_h, h_h]; no source amplitude leak
+
+# Spatial-descriptor conditioning ablation slice (single source of truth for the
+# mask helper and the tests). cond layout is [t_bar_norm, R_c_norm, x_h_norm,
+# y_h_norm, w_h_norm, h_h_norm]; the patch-geometry descriptor is [2:6]. There is
+# no one-hot family label, so family_cond_slice stays None (no_family is a no-op).
+SOURCE_SPATIAL_DESCRIPTOR_SLICE = slice(2, COND_STATIC_DIM)  # slice(2, 6)
 SOURCE_BINS = 16
 
 # Spatial channels per representation. temporal_encoder mode lifts the lean
@@ -69,7 +75,6 @@ def _q_ref(t_final: float) -> float:
 
 def build_cond_vector(
     t_bar_norm: float,
-    t_s_norm: float,
     R_c: float,
     x_h: float,
     y_h: float,
@@ -81,9 +86,9 @@ def build_cond_vector(
     x_length_scale: float = 1.0,
     y_length_scale: float = 1.0,
 ) -> np.ndarray:
-    """Assemble the 7-dim static conditioning vector.
+    """Assemble the 6-dim static conditioning vector.
 
-    Layout: [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm,
+    Layout: [t_bar_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm,
     h_h_norm]. The source amplitude A is deliberately excluded from
     conditioning; the heating signal is carried by the temporal token stream
     (temporal_encoder mode) or the source-bin channels (bins mode).
@@ -94,7 +99,7 @@ def build_cond_vector(
     w_h_norm = w_h / x_length_scale
     h_h_norm = h_h / y_length_scale
     return np.array(
-        [t_bar_norm, t_s_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm],
+        [t_bar_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm],
         dtype=np.float32,
     )
 
@@ -246,6 +251,8 @@ class SourceProblem(ProblemSpec):
     """
 
     name = "source"
+
+    spatial_descriptor_cond_slice = SOURCE_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -428,7 +435,6 @@ class SourceProblem(ProblemSpec):
         t_s_val = float(ds.t_grid[s])
         t_j_val = float(ds.t_grid[j])
         t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
-        t_s_norm = t_s_val / ds.time_norm_horizon
 
         S_h = self._patch_mask(ds, sid)
         spatial_base = np.stack(
@@ -436,7 +442,7 @@ class SourceProblem(ProblemSpec):
         ).astype(np.float32)
 
         cond_static = build_cond_vector(
-            t_bar_norm=float(t_bar_norm), t_s_norm=float(t_s_norm),
+            t_bar_norm=float(t_bar_norm),
             R_c=R_c,
             x_h=float(params["x_h"]), y_h=float(params["y_h"]),
             w_h=float(params["w_h"]), h_h=float(params["h_h"]),
@@ -453,6 +459,7 @@ class SourceProblem(ProblemSpec):
             x_length_scale=float(ds.x_grid[-1] - ds.x_grid[0]),
             y_length_scale=float(ds.y_grid[-1] - ds.y_grid[0]),
         )
+        cond_static = self._apply_spatial_conditioning_mask(cond_static)
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global, interface_x], dtype=np.float32)

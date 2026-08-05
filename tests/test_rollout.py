@@ -9,8 +9,10 @@ from data.dataset import SnapshotPairDataset
 from problems import forcing as forcing_problem
 from problems import interfaces as interfaces_problem
 from problems import source as source_problem
+from problems import source_itr as source_itr_problem
 from problems.registry import get_problem
 from src.operators.eval import evaluate
+from src.operators.fno2d import FNO2d
 from src.operators.rollout import (
     RolloutOptions,
     build_homogeneous_rollout_times,
@@ -20,8 +22,22 @@ from src.operators.rollout import (
     rollout_options_from_config,
 )
 
+# (benchmark, representation) pairs the rollout dispatch supports.
+# forcing_itr has no rollout branch.
+ROLLOUT_CASES = [
+    ("forcing", "temporal_encoder"),
+    ("forcing", "bins"),
+    ("interfaces", "temporal_encoder"),
+    ("interfaces", "bins"),
+    ("source", "temporal_encoder"),
+    ("source", "bins"),
+    ("source_itr", "temporal_encoder"),
+    ("source_itr", "bins"),
+]
 
-def _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec):
+
+def _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec,
+                  time_norm_horizon=None):
     return SnapshotPairDataset(
         trajectories=trajectories,
         t_grid=t_grid,
@@ -34,6 +50,7 @@ def _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec):
         n_snapshots=6,
         noise_std=0.0,
         problem=spec,
+        time_norm_horizon=time_norm_horizon,
     )
 
 
@@ -59,6 +76,18 @@ def _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid):
         ),
         dtype=object,
     )
+
+
+def _sim_params_for(benchmark, spec, trajectories, x_grid, y_grid, t_grid, fixtures):
+    """Pick the sim_params source for a benchmark.
+
+    forcing/source/source_itr use hand-built fixtures whose schema is pinned to
+    the live sampler; interfaces round-trips through the spec's own sampler
+    because its params (interface_x, sampled ICs) have no shortcut.
+    """
+    if benchmark in fixtures:
+        return fixtures[benchmark]
+    return _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
 
 
 def _direct_model_pred(model, item):
@@ -188,6 +217,221 @@ class TestRolloutItemRecompute:
         np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
 
 
+class TestSingleSubstepItemIdentity:
+    """K=1 rollout must reconstruct the direct item, for every dispatch branch.
+
+    Non-trivial because the rollout path does not copy the conditioning: it
+    recomputes the cond vector, the forcing_seq, and the Q-bin channels from
+    sim_params. Any mis-wired argument in a branch shows up here rather than as
+    a silently-worse rollout number.
+    """
+
+    @pytest.mark.parametrize("benchmark,representation", ROLLOUT_CASES)
+    def test_k1_item_matches_direct_item(
+        self, benchmark, representation, synthetic_trajectories,
+        synthetic_sim_params, synthetic_source_sim_params,
+        synthetic_source_itr_sim_params,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem(benchmark, representation)
+        sim_params = _sim_params_for(
+            benchmark, spec, trajectories, x_grid, y_grid, t_grid,
+            {
+                "forcing": synthetic_sim_params,
+                "source": synthetic_source_sim_params,
+                "source_itr": synthetic_source_itr_sim_params,
+            },
+        )
+        ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
+        sid, s, j = 0, 10, 30
+        t_s, t_j = float(t_grid[s]), float(t_grid[j])
+
+        # The endpoints are assigned, not derived, so they must be bit-exact.
+        intervals = build_homogeneous_rollout_times(t_s, t_j, 1)
+        assert intervals == [(t_s, t_j)]
+
+        direct = spec.build_item(ds, sid, s, j)
+        rollout = build_rollout_item_from_base(
+            direct, ds, spec, sid, direct["spatial"][..., 0], t_s, t_j
+        )
+
+        assert set(rollout) == set(direct)
+        # Copied verbatim by _copy_item, so exact.
+        split = get_problem(benchmark, "temporal_encoder").dims.in_channels
+        np.testing.assert_array_equal(
+            rollout["spatial"][..., :split], direct["spatial"][..., :split]
+        )
+        np.testing.assert_array_equal(rollout["Y"], direct["Y"])
+        np.testing.assert_array_equal(rollout["T_stats"], direct["T_stats"])
+        # Recomputed through linspace / horizon division / range normalization.
+        np.testing.assert_allclose(
+            rollout["cond_static"], direct["cond_static"], rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            rollout["forcing_seq"], direct["forcing_seq"], rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            rollout["spatial"][..., split:], direct["spatial"][..., split:], rtol=1e-6
+        )
+
+
+class TestShortSubintervalIntegrity:
+    """K=8 on the shortest lead: the partition and its features stay well-formed.
+
+    Deliberately mechanical. Homogeneous subdivision at large K produces
+    subinterval *leads* far shorter than any training pair, which is a plausible
+    mechanism for large-K degradation and therefore a result to measure, not an
+    implementation error. Asserting it here would encode a scientific claim as a
+    correctness contract.
+    """
+
+    NUM_SUBSTEPS = 8
+
+    @pytest.mark.parametrize("benchmark,representation", ROLLOUT_CASES)
+    def test_shortest_lead_partition_and_features_are_well_formed(
+        self, benchmark, representation, synthetic_trajectories,
+        synthetic_sim_params, synthetic_source_sim_params,
+        synthetic_source_itr_sim_params,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem(benchmark, representation)
+        sim_params = _sim_params_for(
+            benchmark, spec, trajectories, x_grid, y_grid, t_grid,
+            {
+                "forcing": synthetic_sim_params,
+                "source": synthetic_source_sim_params,
+                "source_itr": synthetic_source_itr_sim_params,
+            },
+        )
+        ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
+        # Shortest lead available on the n_snapshots=6 partition.
+        s, j = int(ds.t_indices[0]), int(ds.t_indices[1])
+        sid = 0
+        t_s, t_j = float(t_grid[s]), float(t_grid[j])
+
+        intervals = build_homogeneous_rollout_times(t_s, t_j, self.NUM_SUBSTEPS)
+        assert len(intervals) == self.NUM_SUBSTEPS
+        edges = [lo for lo, _ in intervals] + [intervals[-1][1]]
+        assert all(math.isfinite(e) for e in edges)
+        assert all(hi > lo for lo, hi in intervals)
+        assert all(b > a for a, b in zip(edges, edges[1:]))
+        assert edges[0] == t_s
+        assert edges[-1] == t_j
+
+        base = spec.build_item(ds, sid, s, j)
+        for t_lo, t_hi in intervals:
+            item = build_rollout_item_from_base(
+                base, ds, spec, sid, base["spatial"][..., 0], t_lo, t_hi
+            )
+            assert np.all(np.isfinite(item["cond_static"]))
+            assert np.all(np.isfinite(item["spatial"]))
+            if spec.representation == "temporal_encoder":
+                seq = item["forcing_seq"]
+                assert seq.shape == (ds.temporal_samples, spec.dims.temporal_token_dim)
+                assert np.all(np.isfinite(seq))
+                # Position tokens must still span the subinterval, however short.
+                np.testing.assert_allclose(seq[0, 0], 0.0, atol=1e-7)
+                np.testing.assert_allclose(seq[-1, 0], 1.0, atol=1e-7)
+
+
+class TestSourceItrRollout:
+    def test_rc_y_channel_survives_and_bins_recompute(
+        self, synthetic_trajectories, synthetic_source_itr_sim_params
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem("source_itr", "bins")
+        ds = _make_dataset(
+            trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sim_params, spec
+        )
+        sid, s, k, j = 0, 0, 10, 20
+        base = spec.build_item(ds, sid, s, j)
+        direct_sub = spec.build_item(ds, sid, s, k)
+        current = base["spatial"][..., 0] + np.float32(0.25)
+
+        rollout = build_rollout_item_from_base(
+            base, ds, spec, sid, current, float(t_grid[s]), float(t_grid[k])
+        )
+
+        assert rollout["cond_static"].shape == (source_itr_problem.COND_STATIC_DIM,)
+        assert source_itr_problem.COND_STATIC_DIM == 9
+        np.testing.assert_allclose(rollout["cond_static"], direct_sub["cond_static"])
+
+        # R_c(y) is time-invariant, so _copy_item carries it through untouched.
+        rc = rollout["spatial"][..., source_itr_problem.RC_Y_CHANNEL]
+        np.testing.assert_array_equal(
+            rc, base["spatial"][..., source_itr_problem.RC_Y_CHANNEL]
+        )
+        # Non-constant along y: a plain `source` item has no void profile here.
+        assert float(rc[0].std()) > 0.0
+
+        bins = rollout["spatial"][..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:]
+        np.testing.assert_allclose(
+            bins,
+            direct_sub["spatial"][..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:],
+        )
+        # Recomputed for [t_s, t_k], not copied from the [t_s, t_j] base item.
+        assert not np.allclose(
+            bins, base["spatial"][..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:]
+        )
+        np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
+
+
+class TestRolloutTimeNormalizationHorizon:
+    """Rollout subinterval lead time must normalize by time_norm_horizon.
+
+    They previously divided by t_final. The two coincide on the standard test
+    partition, so the divergence only appears when the normalization horizon
+    differs from the dataset's final time.
+    """
+
+    HORIZON = 0.6
+
+    def _dataset(self, spec, trajectories, x_grid, y_grid, t_grid, sim_params):
+        ds = _make_dataset(
+            trajectories, x_grid, y_grid, t_grid, sim_params, spec,
+            time_norm_horizon=self.HORIZON,
+        )
+        assert ds.time_norm_horizon != ds.t_final
+        return ds
+
+    @pytest.mark.parametrize(
+        "benchmark", ["forcing", "interfaces", "source", "source_itr"]
+    )
+    def test_subinterval_time_features_match_direct_item_past_horizon(
+        self, benchmark, synthetic_trajectories, synthetic_sim_params,
+        synthetic_source_sim_params, synthetic_source_itr_sim_params,
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem(benchmark, "temporal_encoder")
+        sim_params = _sim_params_for(
+            benchmark, spec, trajectories, x_grid, y_grid, t_grid,
+            {
+                "forcing": synthetic_sim_params,
+                "source": synthetic_source_sim_params,
+                "source_itr": synthetic_source_itr_sim_params,
+            },
+        )
+        ds = self._dataset(spec, trajectories, x_grid, y_grid, t_grid, sim_params)
+
+        # t_s past the trained horizon: t_grid[35] = 0.70 > 0.60.
+        sid, s, k, j = 0, 35, 40, 45
+        t_s, t_k = float(t_grid[s]), float(t_grid[k])
+        assert t_s > self.HORIZON
+
+        base = spec.build_item(ds, sid, s, j)
+        direct_sub = spec.build_item(ds, sid, s, k)
+        rollout = build_rollout_item_from_base(
+            base, ds, spec, sid, base["spatial"][..., 0], t_s, t_k
+        )
+
+        np.testing.assert_allclose(
+            rollout["cond_static"][0], direct_sub["cond_static"][0], rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            rollout["cond_static"][0], (t_k - t_s) / self.HORIZON, rtol=1e-6
+        )
+
+
 class TestPredictAutoregressive:
     def test_single_substep_matches_direct_model_prediction(
         self, synthetic_trajectories, synthetic_sim_params, small_fno2d
@@ -212,6 +456,51 @@ class TestPredictAutoregressive:
             )
 
         torch.testing.assert_close(rollout, direct)
+
+    def test_single_substep_matches_direct_for_source_itr(
+        self, synthetic_trajectories, synthetic_source_itr_sim_params
+    ):
+        """Same equivalence through the new source_itr branch, end to end.
+
+        rtol is loosened relative to the item-level tests because this compares
+        two forward passes, not two arrays.
+        """
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem("source_itr", "temporal_encoder")
+        ds = _make_dataset(
+            trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sim_params, spec
+        )
+        model = FNO2d(
+            modes1=2,
+            modes2=2,
+            width=8,
+            in_channels=spec.dims.in_channels,
+            out_channels=1,
+            n_layers=2,
+            cond_static_dim=spec.dims.cond_static_dim,
+            temporal_token_dim=spec.dims.temporal_token_dim,
+            temporal_hidden=16,
+            forcing_embed_dim=16,
+            use_forcing_time_aug=spec.dims.use_forcing_time_aug,
+            s_y_channel=spec.dims.s_y_channel,
+        )
+        model.eval()
+        sid, s, j = 0, 0, 20
+        item = spec.build_item(ds, sid, s, j)
+
+        with torch.no_grad():
+            direct = _direct_model_pred(model, item)
+            rollout = predict_autoregressive(
+                model,
+                ds,
+                sim_id=sid,
+                s=s,
+                j=j,
+                num_substeps=1,
+                device=torch.device("cpu"),
+            )
+
+        torch.testing.assert_close(rollout, direct, rtol=1e-5, atol=1e-6)
 
 
 class TestRolloutEvalMetricContract:
