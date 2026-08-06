@@ -1,4 +1,7 @@
 import copy
+import hashlib
+import json
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 
@@ -38,6 +41,28 @@ def problem_from_config(config: dict) -> ProblemSpec:
         spec.rc_channel_mode = str(benchmark.get("rc_channel_mode"))
     if "rc_ell" in benchmark:
         spec.rc_ell = float(benchmark.get("rc_ell"))
+    if "spatial_conditioning" in benchmark:
+        mode = str(benchmark.get("spatial_conditioning"))
+        spec.set_spatial_conditioning(mode)
+        if mode == "no_family" and spec.family_cond_slice is None:
+            warnings.warn(
+                f"spatial_conditioning {mode} has no effect for benchmark "
+                f"{name!r} (no family label to ablate); this run duplicates the "
+                f"'full' baseline.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif (
+            mode == "spatial_field_only"
+            and spec.spatial_descriptor_cond_slice is None
+        ):
+            warnings.warn(
+                f"spatial_conditioning {mode} has no effect for benchmark "
+                f"{name!r} (no spatial descriptor to ablate); this run duplicates "
+                f"the 'full' baseline.",
+                UserWarning,
+                stacklevel=2,
+            )
     return spec
 
 
@@ -853,6 +878,103 @@ def compute_global_stats(
     mu_global = float(train_data.mean())
     sigma_global = float(train_data.std())
     return mu_global, sigma_global
+
+
+NORMALIZATION_TEMPERATURE_REFERENCE_K = 300.0
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_hash(payload: dict) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_normalization_provenance(
+    trajectories: np.ndarray,
+    train_ids: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    t_grid: np.ndarray,
+    *,
+    max_time: float | None = None,
+    data_paths: dict | None = None,
+) -> dict:
+    """Checkpoint provenance for how the training-set normalization was defined.
+
+    Baked into every checkpoint so evaluation can prove a checkpoint's
+    normalization matches the dataset it is scored against.
+    ``normalization_definition`` fixes the population-std (``ddof=0``) convention;
+    ``training_population_hash`` is a canonical hash that changes whenever the
+    training split or that definition changes, so a mismatched split or scheme is
+    detected downstream instead of silently rescaling errors.
+    """
+    train_ids_sorted = sorted(int(i) for i in np.asarray(train_ids).tolist())
+    mu_global, sigma_global = compute_global_stats(
+        trajectories, np.asarray(train_ids), t_grid=t_grid, max_time=max_time,
+    )
+    rise_rms = float(
+        np.sqrt(
+            sigma_global ** 2
+            + (mu_global - NORMALIZATION_TEMPERATURE_REFERENCE_K) ** 2
+        )
+    )
+
+    normalization_definition = {
+        "statistic": "global_train_mean_std",
+        "numpy_ddof": 0,
+        "standard_deviation_convention": "population (ddof=0)",
+        "temperature_reference_K": NORMALIZATION_TEMPERATURE_REFERENCE_K,
+        "max_time": None if max_time is None else float(max_time),
+    }
+
+    compact_dataset_file_hashes: dict[str, str] = {}
+    if data_paths:
+        for key, value in sorted(data_paths.items()):
+            if isinstance(value, (str, Path)):
+                candidate = Path(value)
+                if candidate.is_file():
+                    compact_dataset_file_hashes[key] = _sha256_file(candidate)
+
+    training_population = {
+        "train_sim_ids": train_ids_sorted,
+        "num_train_sims": len(train_ids_sorted),
+        "training_mean_K": mu_global,
+        "training_population_std_K": sigma_global,
+        "training_temperature_rise_rms_K": rise_rms,
+        "x_grid": np.asarray(x_grid, dtype=np.float64).tolist(),
+        "y_grid": np.asarray(y_grid, dtype=np.float64).tolist(),
+        "t_grid": np.asarray(t_grid, dtype=np.float64).tolist(),
+        "max_time": None if max_time is None else float(max_time),
+        "compact_dataset_file_hashes": compact_dataset_file_hashes,
+    }
+
+    normalization_definition_hash = _canonical_hash(normalization_definition)
+    training_population_hash = _canonical_hash(
+        {
+            "normalization_definition": normalization_definition,
+            "training_population": training_population,
+        }
+    )
+
+    return {
+        "normalization_definition": normalization_definition,
+        "normalization_definition_hash": normalization_definition_hash,
+        "training_population": training_population,
+        "training_population_hash": training_population_hash,
+        "training_mean_K": mu_global,
+        "training_population_std_K": sigma_global,
+        "training_temperature_rise_rms_K": rise_rms,
+        "temperature_reference_K": NORMALIZATION_TEMPERATURE_REFERENCE_K,
+    }
 
 
 # ------- CREATE DATALOADERS -------
