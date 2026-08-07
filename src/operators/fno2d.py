@@ -15,7 +15,9 @@ import torch.nn.functional as F
 # h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways in addition to the bins:
 #   1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s_y(y) * z_{a,k} is concatenated
 #      to spatial input as K extra channels (learned spatial pathway).
-#   2. Global: [cond_static (15D), h_a (64D)] drives Conditional Instance Normalization.
+#   2. Global: [cond_static, h_a] drives Conditional Instance Normalization.
+# forcing_cond_mode gates which of these two pathways h_a feeds (both | spatial_only |
+# cond_only), the Q1 forcing-routing ablation.
 
 
 # --------- SpectralConv2d ---------
@@ -242,6 +244,7 @@ class FNO2d(nn.Module):
         spectral_dropout: float = 0.0,
         use_temporal_encoder: bool = True,
         use_forcing_time_aug: bool = False,
+        forcing_cond_mode: str = "both",
         s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
         padding_mode: str = "zeros",
@@ -263,6 +266,25 @@ class FNO2d(nn.Module):
         self.forcing_spatial_dim = forcing_spatial_dim
         self.use_temporal_encoder = use_temporal_encoder
         self.use_forcing_time_aug = use_forcing_time_aug
+        # Q1 forcing-routing ablation. The temporal embedding h_a normally feeds
+        # two pathways: the spatial injection s_y * z_a and the CIN conditioning
+        # (h_a concatenated into cond_full). This gate isolates them:
+        #   both        -> h_a drives spatial injection and CIN (default)
+        #   spatial_only -> h_a drives only spatial injection; CIN sees cond_static
+        #   cond_only    -> h_a drives only CIN; no spatial forcing channels
+        if forcing_cond_mode not in ("both", "spatial_only", "cond_only"):
+            raise ValueError(
+                f"forcing_cond_mode must be one of both|spatial_only|cond_only, "
+                f"got {forcing_cond_mode!r}"
+            )
+        if forcing_cond_mode != "both" and not use_temporal_encoder:
+            raise ValueError(
+                "forcing_cond_mode only applies with use_temporal_encoder=True; "
+                f"got {forcing_cond_mode!r} with the encoder disabled."
+            )
+        self.forcing_cond_mode = forcing_cond_mode
+        self._forcing_to_spatial = use_temporal_encoder and forcing_cond_mode in ("both", "spatial_only")
+        self._forcing_to_cond = use_temporal_encoder and forcing_cond_mode in ("both", "cond_only")
         self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
@@ -285,20 +307,21 @@ class FNO2d(nn.Module):
             )
 
         # Spatial-forcing channels (s_y * z_a) are only injected when the temporal
-        # branch is active; with the encoder off the lift sees in_channels alone.
-        lift_extra = forcing_spatial_dim if use_temporal_encoder else 0
+        # branch is active and the ablation routes forcing to the spatial pathway;
+        # otherwise the lift sees in_channels alone.
+        lift_extra = forcing_spatial_dim if self._forcing_to_spatial else 0
         # Lift: (B, Nx, Ny, in_channels + K) → (B, Nx, Ny, width)
         self.linear_p = nn.Linear(in_channels + lift_extra, width)
 
         # Project temporal embedding h_a to K spatial-forcing weights; multiplied by s_y(y)
         # to form K extra spatial channels (restores the direct spatial pathway lost when
         # the hand-crafted Q_y_bins were removed).
-        if use_temporal_encoder:
+        if self._forcing_to_spatial:
             self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
 
         # Time-augmented spatial forcing: fold t_bar_norm into h_a before
         # projecting to spatial-forcing weights, so the learned field can vary with lead.
-        if use_temporal_encoder and use_forcing_time_aug:
+        if self._forcing_to_spatial and use_forcing_time_aug:
             self.forcing_aug_mlp = nn.Sequential(
                 nn.Linear(forcing_embed_dim + 1, forcing_embed_dim),
                 nn.GELU(),
@@ -327,7 +350,7 @@ class FNO2d(nn.Module):
                 hidden=temporal_hidden,
                 embed_dim=forcing_embed_dim,
             )
-            cond_dim = cond_static_dim + forcing_embed_dim
+            cond_dim = cond_static_dim + forcing_embed_dim if self._forcing_to_cond else cond_static_dim
         else:
             cond_dim = cond_static_dim
         self.cond_mlp = ConditioningMLP(
@@ -368,20 +391,28 @@ class FNO2d(nn.Module):
 
             # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}. The s_y channel
             # index is representation-specific (forcing/source: 3; interfaces: 5).
-            if self.use_forcing_time_aug:
-                t_feats = cond_static[:, 0:1]                     # (B, 1) = [t_bar_norm]
-                h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
-                z_a = self.forcing_to_spatial(h_aug)              # (B, K)
+            # Skipped in cond_only mode (forcing_cond_mode ablation).
+            if self._forcing_to_spatial:
+                if self.use_forcing_time_aug:
+                    t_feats = cond_static[:, 0:1]                 # (B, 1) = [t_bar_norm]
+                    h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
+                    z_a = self.forcing_to_spatial(h_aug)          # (B, K)
+                else:
+                    z_a = self.forcing_to_spatial(h_a)            # (B, K)
+                s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]  # (B, Nx, Ny, 1)
+                Nx, Ny = spatial.size(1), spatial.size(2)
+                z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1)  # (B, Nx, Ny, K)
+                forcing_field = s_y * z_grid                      # (B, Nx, Ny, K)
+                spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
             else:
-                z_a = self.forcing_to_spatial(h_a)                # (B, K)
-            s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]  # (B, Nx, Ny, 1)
-            Nx, Ny = spatial.size(1), spatial.size(2)
-            z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1) # (B, Nx, Ny, K)
-            forcing_field = s_y * z_grid                          # (B, Nx, Ny, K)
-            spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
+                spatial_aug = spatial
 
-            # Conditioning MLP (h_a is also routed through CIN)
-            cond_full = torch.cat([cond_static, h_a], dim=-1)     # (B, cond_static_dim + forcing_embed_dim)
+            # Conditioning MLP. h_a is routed through CIN unless the ablation
+            # restricts forcing to the spatial pathway (spatial_only).
+            if self._forcing_to_cond:
+                cond_full = torch.cat([cond_static, h_a], dim=-1)  # (B, cond_static_dim + forcing_embed_dim)
+            else:
+                cond_full = cond_static
         else:
             spatial_aug = spatial
             cond_full = cond_static

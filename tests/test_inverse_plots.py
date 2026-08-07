@@ -130,58 +130,45 @@ def _sensor_sweep_columns(benchmark="forcing"):
     factors = np.array([0.5, 0.7, 0.8, 0.9, 1.0, 1.1, 1.3, 1.7])
     errors = (0.1124837305, 0.07380207628, 0.0431657508)
     profile_widths = (0.3700892713, 0.2493770319, 0.2063509481)
-    mcmc_widths = (0.2246758178, 0.1990697829, 0.1701742952)
-    profile_successes = (6, 7, 6)
-    mcmc_successes = (4, 5, 6)
+    fv_resid_K = (0.1832, 0.1544, 0.1361)
     columns = {
         "benchmark": [],
         "sim_id": [],
         "n_sensors": [],
         "noise_seed": [],
         "init_seed": [],
+        "noise_std_K": [],
+        "fv_resid_rms_K": [],
     }
     if benchmark == "forcing":
         names = {
             "error": "R_c_abs_error",
             "profile_low": "profile_R_c_ci_low",
             "profile_high": "profile_R_c_ci_high",
-            "profile_covered": "profile_R_c_covered",
-            "mcmc_low": "mcmc_R_c_ci_low",
-            "mcmc_high": "mcmc_R_c_ci_high",
-            "mcmc_covered": "mcmc_R_c_covered",
         }
     else:
         names = {
             "error": "excess_int_abserr",
             "profile_low": "profile_excess_ci_low",
             "profile_high": "profile_excess_ci_high",
-            "profile_covered": "profile_excess_covered",
-            "mcmc_low": "mcmc_excess_ci_low",
-            "mcmc_high": "mcmc_excess_ci_high",
-            "mcmc_covered": "mcmc_excess_covered",
         }
     for column in names.values():
         columns[column] = []
     for count_index, count in enumerate(counts):
         for case_index, sim_id in enumerate(sim_ids):
             profile_width = profile_widths[count_index] * factors[case_index]
-            mcmc_width = mcmc_widths[count_index] * factors[case_index]
             columns["benchmark"].append(benchmark)
             columns["sim_id"].append(sim_id)
             columns["n_sensors"].append(count)
             columns["noise_seed"].append(sim_id)
             columns["init_seed"].append(0)
+            columns["noise_std_K"].append(0.25)
+            columns["fv_resid_rms_K"].append(
+                fv_resid_K[count_index] * factors[case_index]
+            )
             columns[names["error"]].append(errors[count_index] * factors[case_index])
             columns[names["profile_low"]].append(0.5 - profile_width / 2.0)
             columns[names["profile_high"]].append(0.5 + profile_width / 2.0)
-            columns[names["profile_covered"]].append(
-                str(case_index < profile_successes[count_index])
-            )
-            columns[names["mcmc_low"]].append(0.5 - mcmc_width / 2.0)
-            columns[names["mcmc_high"]].append(0.5 + mcmc_width / 2.0)
-            columns[names["mcmc_covered"]].append(
-                str(case_index < mcmc_successes[count_index])
-            )
     return columns
 
 
@@ -409,14 +396,24 @@ def test_sensor_sweep_manuscript_plots_render_exact_size(tmp_path, benchmark):
     assert recovery["statistics"]["improved_cases_8_to_32"] == 8
     assert "IQR" in recovery["caption"]
     uq_stats = uncertainty["statistics"]
-    assert uq_stats["coverage"]["profile"]["successes"] == [6, 7, 6]
-    assert uq_stats["coverage"]["mcmc"]["successes"] == [4, 5, 6]
-    assert uq_stats["interval_width"]["profile"]["mean"] == pytest.approx(
+    # Only the two reported UQ-side statistics survive: the FV verification
+    # residual and the profile interval width. No coverage, no MCMC.
+    assert set(uq_stats) == {
+        "sensor_counts", "n_cases", "noise_std_K",
+        "fv_residual_K", "interval_width",
+    }
+    assert uq_stats["noise_std_K"] == pytest.approx(0.25)
+    assert uq_stats["fv_residual_K"]["mean"] == pytest.approx(
+        [0.1832, 0.1544, 0.1361]
+    )
+    assert uq_stats["interval_width"]["mean"] == pytest.approx(
         [0.3700892713, 0.2493770319, 0.2063509481]
     )
-    assert uq_stats["interval_width"]["mcmc"]["mean"] == pytest.approx(
-        [0.2246758178, 0.1990697829, 0.1701742952]
-    )
+    assert uncertainty["source_columns"] == [
+        "fv_resid_rms_K",
+        spec.lead_profile_ci_low_col,
+        spec.lead_profile_ci_high_col,
+    ]
     assert "statistical significance" in uncertainty["caption"]
 
 

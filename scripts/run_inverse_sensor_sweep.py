@@ -243,11 +243,6 @@ def build_inversion_command(
         str(INIT_SEED),
         "--device",
         device,
-        "--fv-refine",
-        "--sensitivity",
-        "--profile",
-        "--laplace",
-        "--mcmc",
         "--uq-level",
         str(UQ_LEVEL),
         "--calibration-artifact",
@@ -332,25 +327,11 @@ def _resume_provenance_matches(previous: dict | None, current: dict) -> bool:
 
 
 def _required_stage_columns(benchmark: str) -> tuple[str, ...]:
+    """Columns the three reported statistics must have populated per sim."""
+    shared = ("fv_resid_rms_K", "fv_resid_over_noise")
     if benchmark == "forcing":
-        return (
-            "fno_resid",
-            "sens_R_c",
-            "profile_R_c_ci_low",
-            "profile_R_c_ci_high",
-            "laplace_eig_0",
-            "mcmc_R_c_ci_low",
-            "mcmc_R_c_ci_high",
-        )
-    return (
-        "fno_resid",
-        "sens_R_base",
-        "profile_excess_ci_low",
-        "profile_excess_ci_high",
-        "laplace_eig_0",
-        "mcmc_excess_ci_low",
-        "mcmc_excess_ci_high",
-    )
+        return shared + ("profile_R_c_ci_low", "profile_R_c_ci_high")
+    return shared + ("profile_excess_ci_low", "profile_excess_ci_high")
 
 
 def validate_and_annotate_rows(
@@ -414,65 +395,39 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+# One block per reported statistic. Spread is median/Q1/Q3/IQR only: at
+# N_CASES = 8 a ddof=1 SD carries ~27% relative uncertainty and min/max are
+# single order statistics, so the earlier mean/SD/min/max block reported
+# precision the sample cannot support.
+_ROBUST_STATISTICS = ("n", "median", "q1", "q3", "iqr")
+
 _PAPER_SUMMARY_COLUMNS = (
     "benchmark",
     "estimand",
     "unit",
     "n_sensors",
     "n_simulations",
-    "absolute_error_mean",
-    "absolute_error_sample_sd",
+    # Statistic 1: lead-estimand recovery error.
+    "absolute_error_n",
     "absolute_error_median",
     "absolute_error_q1",
     "absolute_error_q3",
     "absolute_error_iqr",
-    "absolute_error_min",
-    "absolute_error_max",
     "recovery_rmse",
-    "signed_error_mean_bias",
-    "signed_error_sample_sd",
-    "profile_coverage_successes",
-    "profile_coverage_total",
-    "profile_coverage_rate",
-    "profile_coverage_percent",
-    "profile_coverage_indicator_sample_sd",
-    "profile_coverage_wilson95_low",
-    "profile_coverage_wilson95_high",
-    "profile_coverage_wilson95_low_percent",
-    "profile_coverage_wilson95_high_percent",
-    "profile_width_mean",
-    "profile_width_sample_sd",
+    # Statistic 2: FV-verified sensor residual (Kelvin) vs the noise floor.
+    "fv_resid_K_n",
+    "fv_resid_K_median",
+    "fv_resid_K_q1",
+    "fv_resid_K_q3",
+    "fv_resid_K_iqr",
+    "fv_resid_over_noise_median",
+    # Statistic 3: profile-likelihood interval width on the lead estimand.
+    "profile_width_n",
     "profile_width_median",
     "profile_width_q1",
     "profile_width_q3",
     "profile_width_iqr",
-    "profile_width_min",
-    "profile_width_max",
-    "mcmc_coverage_successes",
-    "mcmc_coverage_total",
-    "mcmc_coverage_rate",
-    "mcmc_coverage_percent",
-    "mcmc_coverage_indicator_sample_sd",
-    "mcmc_coverage_wilson95_low",
-    "mcmc_coverage_wilson95_high",
-    "mcmc_coverage_wilson95_low_percent",
-    "mcmc_coverage_wilson95_high_percent",
-    "mcmc_width_mean",
-    "mcmc_width_sample_sd",
-    "mcmc_width_median",
-    "mcmc_width_q1",
-    "mcmc_width_q3",
-    "mcmc_width_iqr",
-    "mcmc_width_min",
-    "mcmc_width_max",
-    "mcmc_acceptance_rate_mean",
-    "mcmc_acceptance_rate_sample_sd",
-    "mcmc_acceptance_rate_median",
-    "mcmc_acceptance_rate_q1",
-    "mcmc_acceptance_rate_q3",
-    "mcmc_acceptance_rate_iqr",
-    "mcmc_acceptance_rate_min",
-    "mcmc_acceptance_rate_max",
+    "profile_bound_limited_cases",
 )
 
 
@@ -502,7 +457,8 @@ def _summary_bool(row: dict[str, str], column: str) -> bool:
     )
 
 
-def _sample_distribution(values: np.ndarray) -> dict[str, float | int]:
+def _robust_summary(values: np.ndarray) -> dict[str, float | int]:
+    """Median/quartile spread of a per-simulation quantity across one arm."""
     values = np.asarray(values, dtype=np.float64)
     if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
         raise ValueError(
@@ -511,34 +467,10 @@ def _sample_distribution(values: np.ndarray) -> dict[str, float | int]:
     q1, median, q3 = np.percentile(values, [25.0, 50.0, 75.0])
     return {
         "n": int(values.size),
-        "mean": float(np.mean(values)),
-        "sample_sd": float(np.std(values, ddof=1)),
         "median": float(median),
         "q1": float(q1),
         "q3": float(q3),
         "iqr": float(q3 - q1),
-        "min": float(np.min(values)),
-        "max": float(np.max(values)),
-    }
-
-
-def _coverage_summary(values: np.ndarray) -> dict[str, float | int]:
-    indicators = np.asarray(values, dtype=np.float64)
-    distribution = _sample_distribution(indicators)
-    total = int(indicators.size)
-    successes = int(np.sum(indicators))
-    rate = successes / total
-    low, high = _wilson_ci(successes, total)
-    return {
-        "successes": successes,
-        "total": total,
-        "rate": float(rate),
-        "percent": float(100.0 * rate),
-        "indicator_sample_sd": float(distribution["sample_sd"]),
-        "wilson95_low": float(low),
-        "wilson95_high": float(high),
-        "wilson95_low_percent": float(100.0 * low),
-        "wilson95_high_percent": float(100.0 * high),
     }
 
 
@@ -549,13 +481,6 @@ def _flat_paper_row(
     unit: str,
     arm: dict,
 ) -> dict[str, object]:
-    absolute = arm["recovery"]["absolute_error"]
-    signed = arm["recovery"]["signed_error"]
-    profile_coverage = arm["profile_likelihood"]["coverage"]
-    profile_width = arm["profile_likelihood"]["interval_width"]
-    mcmc_coverage = arm["mcmc"]["coverage"]
-    mcmc_width = arm["mcmc"]["interval_width"]
-    acceptance = arm["mcmc"]["acceptance_rate"]
     row: dict[str, object] = {
         "benchmark": benchmark,
         "estimand": estimand,
@@ -563,34 +488,15 @@ def _flat_paper_row(
         "n_sensors": arm["n_sensors"],
         "n_simulations": arm["n_simulations"],
         "recovery_rmse": arm["recovery"]["rmse"],
-        "signed_error_mean_bias": signed["mean"],
-        "signed_error_sample_sd": signed["sample_sd"],
+        "fv_resid_over_noise_median": arm["fv_verification"]["over_noise_median"],
+        "profile_bound_limited_cases": arm["profile_interval"]["bound_limited_cases"],
     }
     for prefix, summary in (
-        ("absolute_error", absolute),
-        ("profile_width", profile_width),
-        ("mcmc_width", mcmc_width),
-        ("mcmc_acceptance_rate", acceptance),
+        ("absolute_error", arm["recovery"]["absolute_error"]),
+        ("fv_resid_K", arm["fv_verification"]["residual_K"]),
+        ("profile_width", arm["profile_interval"]["width"]),
     ):
-        for statistic in (
-            "mean", "sample_sd", "median", "q1", "q3", "iqr", "min", "max"
-        ):
-            row[f"{prefix}_{statistic}"] = summary[statistic]
-    for prefix, summary in (
-        ("profile_coverage", profile_coverage),
-        ("mcmc_coverage", mcmc_coverage),
-    ):
-        for statistic in (
-            "successes",
-            "total",
-            "rate",
-            "percent",
-            "indicator_sample_sd",
-            "wilson95_low",
-            "wilson95_high",
-            "wilson95_low_percent",
-            "wilson95_high_percent",
-        ):
+        for statistic in _ROBUST_STATISTICS:
             row[f"{prefix}_{statistic}"] = summary[statistic]
     return row
 
@@ -611,13 +517,11 @@ def generate_paper_summary(
         spec.lead_hat_col,
         spec.lead_true_col,
         spec.lead_abserr_col,
+        "fv_resid_rms_K",
+        "fv_resid_over_noise",
         spec.lead_profile_ci_low_col,
         spec.lead_profile_ci_high_col,
-        spec.lead_profile_covered_col,
-        spec.mcmc_lead_ci_low_col,
-        spec.mcmc_lead_ci_high_col,
-        spec.mcmc_lead_covered_col,
-        "mcmc_accept_rate",
+        "profile_bound_limited",
     )
     missing = [
         column
@@ -678,44 +582,33 @@ def generate_paper_summary(
                 f"paper summary absolute-error column is inconsistent at {count} sensors."
             )
 
+        fv_resid_K = np.asarray(
+            [_summary_float(row, "fv_resid_rms_K") for row in arm_rows]
+        )
+        fv_over_noise = np.asarray(
+            [_summary_float(row, "fv_resid_over_noise") for row in arm_rows]
+        )
+        if np.any(fv_resid_K < 0.0):
+            raise ValueError(
+                f"paper summary found a negative FV residual at {count} sensors."
+            )
+
         profile_low = np.asarray(
             [_summary_float(row, spec.lead_profile_ci_low_col) for row in arm_rows]
         )
         profile_high = np.asarray(
             [_summary_float(row, spec.lead_profile_ci_high_col) for row in arm_rows]
         )
-        profile_covered = np.asarray(
-            [_summary_bool(row, spec.lead_profile_covered_col) for row in arm_rows]
-        )
-        mcmc_low = np.asarray(
-            [_summary_float(row, spec.mcmc_lead_ci_low_col) for row in arm_rows]
-        )
-        mcmc_high = np.asarray(
-            [_summary_float(row, spec.mcmc_lead_ci_high_col) for row in arm_rows]
-        )
-        mcmc_covered = np.asarray(
-            [_summary_bool(row, spec.mcmc_lead_covered_col) for row in arm_rows]
-        )
-        if np.any(profile_high < profile_low) or np.any(mcmc_high < mcmc_low):
+        if np.any(profile_high < profile_low):
             raise ValueError(
                 f"paper summary found negative interval width at {count} sensors."
             )
-        if not np.array_equal(profile_covered, (profile_low <= truth) & (truth <= profile_high)):
-            raise ValueError(
-                f"paper summary profile coverage is inconsistent at {count} sensors."
-            )
-        if not np.array_equal(mcmc_covered, (mcmc_low <= truth) & (truth <= mcmc_high)):
-            raise ValueError(
-                f"paper summary MCMC coverage is inconsistent at {count} sensors."
-            )
-        acceptance = np.asarray(
-            [_summary_float(row, "mcmc_accept_rate") for row in arm_rows]
+        # Censored intervals are counted, not silently averaged in: an interval
+        # that stopped at the edge of the physical range never closed on a
+        # Wilks crossing, so its width is a lower bound, not a measurement.
+        bound_limited = sum(
+            1 for row in arm_rows if _summary_bool(row, "profile_bound_limited")
         )
-        if np.any((acceptance < 0.0) | (acceptance > 1.0)):
-            raise ValueError(
-                f"paper summary MCMC acceptance rate is outside [0, 1] at "
-                f"{count} sensors."
-            )
 
         absolute_errors_by_count[count] = absolute_error
         by_sensor_count.append(
@@ -724,43 +617,17 @@ def generate_paper_summary(
                 "n_simulations": len(sim_ids),
                 "simulation_ids": list(sim_ids),
                 "recovery": {
-                    "absolute_error": _sample_distribution(absolute_error),
-                    "signed_error": _sample_distribution(signed_error),
+                    "absolute_error": _robust_summary(absolute_error),
                     "rmse": float(np.sqrt(np.mean(np.square(signed_error)))),
                 },
-                "profile_likelihood": {
-                    "coverage": _coverage_summary(profile_covered),
-                    "interval_width": _sample_distribution(
-                        profile_high - profile_low
-                    ),
+                "fv_verification": {
+                    "residual_K": _robust_summary(fv_resid_K),
+                    "over_noise_median": float(np.median(fv_over_noise)),
                 },
-                "mcmc": {
-                    "coverage": _coverage_summary(mcmc_covered),
-                    "interval_width": _sample_distribution(mcmc_high - mcmc_low),
-                    "acceptance_rate": _sample_distribution(acceptance),
+                "profile_interval": {
+                    "width": _robust_summary(profile_high - profile_low),
+                    "bound_limited_cases": int(bound_limited),
                 },
-            }
-        )
-
-    paired_changes = []
-    for from_count, to_count in ((8, 16), (16, 32), (8, 32)):
-        differences = (
-            absolute_errors_by_count[to_count]
-            - absolute_errors_by_count[from_count]
-        )
-        baseline_mean = float(np.mean(absolute_errors_by_count[from_count]))
-        paired_changes.append(
-            {
-                "from_n_sensors": from_count,
-                "to_n_sensors": to_count,
-                "absolute_error_difference": _sample_distribution(differences),
-                "mean_percent_change": (
-                    float(100.0 * np.mean(differences) / baseline_mean)
-                    if baseline_mean > 0.0
-                    else None
-                ),
-                "improved_cases": int(np.sum(differences < 0.0)),
-                "total_cases": len(sim_ids),
             }
         )
 
@@ -771,22 +638,33 @@ def generate_paper_summary(
         "estimand": spec.lead_name,
         "estimand_description": spec.lead_description,
         "unit": spec.lead_unit_text,
-        "coverage_level": UQ_LEVEL,
+        "confidence_level": UQ_LEVEL,
         "sensor_counts": list(counts),
         "n_paired_simulations": len(sim_ids),
         "simulation_ids": list(sim_ids),
         "source_csv": str(combined_path.resolve()),
         "source_columns": source_columns,
+        "reported_statistics": [
+            "recovery_error", "fv_verification", "profile_interval"
+        ],
         "statistics_conventions": {
-            "sample_standard_deviation": "numpy std with ddof=1 across simulations",
+            "spread": (
+                "median with Q1/Q3/IQR; no mean/SD, which n=8 cannot support"
+            ),
             "quantiles": "numpy percentile with the default linear method",
             "rmse": "sqrt(mean((estimate - truth)^2)) across simulations",
-            "coverage": "truth inside inclusive lower/upper 95% interval",
-            "coverage_interval": "two-sided 95% Wilson score interval",
-            "paired_change": "to-sensor error minus from-sensor error for each simulation",
+            "fv_residual": (
+                "physical RMS sigma_global*sqrt(2*fv_resid) at theta_hat under "
+                "the real FVSolver2D, and its ratio to the measurement noise std"
+            ),
+            "profile_interval": (
+                "Wilks interval on the lead estimand at the frozen "
+                "validation-calibrated sigma_eff; bound_limited_cases counts "
+                "intervals censored by the parameter range rather than closed "
+                "by a likelihood crossing"
+            ),
         },
         "by_sensor_count": by_sensor_count,
-        "paired_absolute_error_changes": paired_changes,
     }
 
     json_path = (out_dir / "inverse_sensor_sweep_summary.json").resolve()
@@ -814,42 +692,32 @@ def generate_paper_summary(
 
 
 def _print_paper_summary(summary: dict) -> None:
-    print("\nPaper summary (sample SD uses ddof=1):", flush=True)
+    print("\nPaper summary (median [Q1, Q3] across simulations):", flush=True)
     for arm in summary["by_sensor_count"]:
         absolute = arm["recovery"]["absolute_error"]
-        profile = arm["profile_likelihood"]
-        mcmc = arm["mcmc"]
+        residual = arm["fv_verification"]["residual_K"]
+        width = arm["profile_interval"]["width"]
         print(
-            f"  {arm['n_sensors']} sensors (n={arm['n_simulations']}): "
-            f"absolute error mean={absolute['mean']:.6g}, "
-            f"SD={absolute['sample_sd']:.6g}, median={absolute['median']:.6g}, "
-            f"Q1={absolute['q1']:.6g}, Q3={absolute['q3']:.6g}, "
+            f"  {arm['n_sensors']} sensors (n={arm['n_simulations']}):",
+            flush=True,
+        )
+        print(
+            f"    recovery error: {absolute['median']:.6g} "
+            f"[{absolute['q1']:.6g}, {absolute['q3']:.6g}], "
             f"RMSE={arm['recovery']['rmse']:.6g}",
             flush=True,
         )
-        for label, method in (("profile", profile), ("MCMC", mcmc)):
-            coverage = method["coverage"]
-            width = method["interval_width"]
-            print(
-                f"    {label}: coverage={coverage['percent']:.3g}% "
-                f"({coverage['successes']}/{coverage['total']}), "
-                f"Wilson95=[{coverage['wilson95_low_percent']:.3g}%, "
-                f"{coverage['wilson95_high_percent']:.3g}%], "
-                f"width mean={width['mean']:.6g}, SD={width['sample_sd']:.6g}, "
-                f"median={width['median']:.6g}, Q1={width['q1']:.6g}, "
-                f"Q3={width['q3']:.6g}",
-                flush=True,
-            )
-    for change in summary["paired_absolute_error_changes"]:
-        difference = change["absolute_error_difference"]
-        percent = change["mean_percent_change"]
-        percent_text = "undefined" if percent is None else f"{percent:.3g}%"
         print(
-            f"  paired {change['from_n_sensors']}->{change['to_n_sensors']}: "
-            f"mean difference={difference['mean']:.6g}, "
-            f"SD={difference['sample_sd']:.6g}, "
-            f"mean percent change={percent_text}, "
-            f"improved={change['improved_cases']}/{change['total_cases']}",
+            f"    FV residual:    {residual['median']:.6g} K "
+            f"[{residual['q1']:.6g}, {residual['q3']:.6g}], "
+            f"{arm['fv_verification']['over_noise_median']:.3g}x noise std",
+            flush=True,
+        )
+        print(
+            f"    profile width:  {width['median']:.6g} "
+            f"[{width['q1']:.6g}, {width['q3']:.6g}], "
+            f"{arm['profile_interval']['bound_limited_cases']}"
+            f"/{arm['n_simulations']} bound-limited",
             flush=True,
         )
 
@@ -938,7 +806,9 @@ def run_sweep(
             "noise_seed": NOISE_SEED,
             "fv_refine": True,
             "uq_level": UQ_LEVEL,
-            "uq_stages": ["sensitivity", "profile", "laplace", "mcmc"],
+            "reported_statistics": [
+                "recovery_error", "fv_verification", "profile_interval"
+            ],
         },
         "arms": {},
     }
@@ -1231,6 +1101,73 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+# ===========================================================================
+# RETIRED AGGREGATIONS - not called by run_sweep() / generate_paper_summary().
+#
+# The companion appendix to the retired block in scripts/invert.py. These
+# summarized statistics the entry point no longer computes, so they have no
+# input columns to read even if re-wired; they are kept for reference.
+#
+#   * _sample_distribution - the eight-number block (mean, ddof=1 SD, median,
+#     Q1, Q3, IQR, min, max) that was applied to absolute error, signed error,
+#     both interval widths, and MCMC acceptance: 40 of the old 58 summary
+#     columns. At N_CASES = 8 the SD carries ~27% relative uncertainty and
+#     min/max are single order statistics. Live code uses _robust_summary.
+#   * _coverage_summary - the nine-field coverage block with a Wilson score
+#     interval. Retired with coverage itself: one noise draw per simulation
+#     aggregated across simulations with different truths is not coverage over
+#     noise replications, and at n=8 the Wilson interval (6/8 -> [41%, 93%])
+#     cannot discriminate any true rate. Validating calibration properly means
+#     a separate experiment: one fixed theta, ~200 noise replications, one
+#     number.
+#   * Signed-error mean bias, and the paired 8->16->32 absolute-error change
+#     block (three pairs x eleven fields, including a percent change on an
+#     8-sample mean), were dropped inline rather than kept as functions: an
+#     8-sample mean bias is not distinguishable from zero, and the sensor
+#     trend is already visible in the per-arm medians and the recovery figure.
+# ===========================================================================
+
+
+def _sample_distribution(values: np.ndarray) -> dict[str, float | int]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError(
+            "paper summary distributions require at least two finite values."
+        )
+    q1, median, q3 = np.percentile(values, [25.0, 50.0, 75.0])
+    return {
+        "n": int(values.size),
+        "mean": float(np.mean(values)),
+        "sample_sd": float(np.std(values, ddof=1)),
+        "median": float(median),
+        "q1": float(q1),
+        "q3": float(q3),
+        "iqr": float(q3 - q1),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+    }
+
+
+def _coverage_summary(values: np.ndarray) -> dict[str, float | int]:
+    indicators = np.asarray(values, dtype=np.float64)
+    distribution = _sample_distribution(indicators)
+    total = int(indicators.size)
+    successes = int(np.sum(indicators))
+    rate = successes / total
+    low, high = _wilson_ci(successes, total)
+    return {
+        "successes": successes,
+        "total": total,
+        "rate": float(rate),
+        "percent": float(100.0 * rate),
+        "indicator_sample_sd": float(distribution["sample_sd"]),
+        "wilson95_low": float(low),
+        "wilson95_high": float(high),
+        "wilson95_low_percent": float(100.0 * low),
+        "wilson95_high_percent": float(100.0 * high),
+    }
 
 
 if __name__ == "__main__":

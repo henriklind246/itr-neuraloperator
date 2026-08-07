@@ -32,6 +32,7 @@ model:
     temporal_hidden: 128
     forcing_embed_dim: 64
     forcing_spatial_dim: 16       # K: learned spatial-forcing channels injected as s_y * z_a
+    forcing_cond_mode: both       # Q1 forcing-routing ablation: both | spatial_only | cond_only (temporal_encoder repr only)
     activation: "GELU"            # doc-only; FNO2d hardcodes GELU
     dropout: 0.0
     spectral_dropout: 0.0

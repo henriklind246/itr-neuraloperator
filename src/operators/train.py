@@ -1418,6 +1418,7 @@ def run_one_seed(
         spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
         use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
+        forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),

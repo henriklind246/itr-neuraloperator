@@ -94,6 +94,7 @@ def _build_model(config: dict, model_state, device):
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
+        forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),

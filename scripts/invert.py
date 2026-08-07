@@ -13,41 +13,47 @@ differentiable surrogate to recover inverse parameters
 from observed temperatures, via a MAP / least-squares fit. The forward code is
 untouched; this script only *imports* it.
 
-What Stages 1-5 do (deliberately narrow):
+The pipeline that produces the estimate is unchanged:
   * direct-from-IC observation operator with every non-theta input held fixed,
-  * observations at several times spanning early/mid/late, either full-field
-    (Stage 1) or through a masked interface-proximal *sensor operator* M
-    (Stage 2 — paired interface-adjacent nodes or a finite interface band
-    crossed with physical y coordinates; full-field is the all-pixels case),
+  * observations at several times spanning early/mid/late, either full-field or
+    through a masked interface-proximal *sensor operator* M (paired
+    interface-adjacent nodes or a finite interface band crossed with physical y
+    coordinates; full-field is the all-pixels case),
   * LHS multistart Adam -> L-BFGS over an unconstrained reparameterization that
     keeps every iterate inside the physical box and honors the R_base-dependent
-    R_amp ceiling (so the FNO is never queried out-of-distribution) (Stage 3),
-  * a sensitivity / identifiability report (Stage 3): the SVD of the observation
-    Jacobian ``dG_theta/dtheta`` at the estimate, which exposes ill-conditioned
-    directions — chiefly the coupled R_amp/sigma void-"mass" ridge the plan
-    predicts. Diagnostic only; no UQ intervals here.
-  * an FV refinement / surrogate-error check (Stage 4): the FNO is the fast
-    *exploration and sensitivity engine*, but the conservative Crank-Nicolson
-    finite-volume solver is the *accuracy engine*. We re-evaluate the FNO MAP
-    estimate ``theta_hat`` with the **real** ``FVSolver2D`` (rebuilt via
-    ``ds.problem.configure_solver`` so the active benchmark operator is
-    identical to data generation),
-    report the FV sensor residual and the theta-local FNO-vs-FV discrepancy as a
-    post-hoc diagnostic only, and optionally **polish** ``theta_hat`` against
-    the FV sensor residual with derivative-free Nelder-Mead (the FV solve is not
-    autodiff). Cheap because it starts from the FNO MAP.
-  * measurement noise + uncertainty quantification (Stage 5): iid Gaussian
-    sensor noise is added once to the observations, and every likelihood stage
-    uses the same frozen validation-calibrated variance
-    ``sigma_eff^2 = sigma_meas^2 + sigma_FNO,cal^2``. UQ is led by an interval on
-    the well-conditioned
-    integrated void *severity* (excess-resistance integral), via two primary
-    routes: a **profile likelihood** (frequentist, Wilks interval over the
-    R_amp/sigma ridge or the R_amp~0 boundary) and a **short RW-Metropolis
-    MCMC** (Bayesian, uniform-theta prior pushed through the reparameterization
-    Jacobian). The **Laplace** Gauss-Newton eigen-spectrum is reported only as a
-    degeneracy *diagnostic* (it is least valid along the ridge / at the
-    boundary), never as the reported interval.
+    R_amp ceiling (so the FNO is never queried out-of-distribution),
+  * iid Gaussian sensor noise added once to the observations.
+
+**Three statistics are reported per simulation, and only these three.** Each
+run emits them all; there are no flags to turn individual ones on or off.
+
+  1. *Recovery error of the lead estimand* (``summarize``). ``R_c`` for
+     forcing, the integrated excess resistance ``S_R`` for the spatial-ITR
+     benchmarks: the estimate, the truth, and the absolute error. This is the
+     statistic the inverse claim rests on.
+
+  2. *FV-verified sensor residual at theta_hat* (``fv_refine_report`` +
+     ``fv_verification_summary``). The FNO is the fast exploration engine, but
+     the conservative Crank-Nicolson finite-volume solver is the accuracy
+     engine, so ``theta_hat`` is re-evaluated with the **real** ``FVSolver2D``
+     (rebuilt via ``ds.problem.configure_solver``, i.e. the exact
+     data-generation operator) and the residual is reported in Kelvin against
+     the measurement noise floor. Without it, "the surrogate recovered theta"
+     is indistinguishable from "the surrogate fit its own error".
+
+  3. *Profile-likelihood interval on the lead estimand*
+     (``profile_likelihood`` + ``profile_interval_summary``). A Wilks interval
+     from the Gaussian NLL at the frozen validation-calibrated variance
+     ``sigma_eff^2 = sigma_meas^2 + sigma_FNO,cal^2``. Deterministic, with no
+     sampler to mistune. Requires ``--calibration-artifact``; without one it is
+     skipped with a printed note rather than silently faked.
+
+Everything the earlier report computed beyond these three (the Jacobian-SVD
+identifiability block, the Laplace spectrum, the RW-Metropolis MCMC, the FV
+polish, the equivalent-scalar comparison, and interval coverage) is retained
+verbatim at the bottom of this file under "RETIRED STATISTICS", where the
+header records why each one left the reported set. Nothing on the live path
+calls them.
 
 theta enters the FNO in *two* places, and both must agree with the data
 pipeline exactly:
@@ -62,9 +68,9 @@ real ``problem.build_item(ds, sid, s=0, j=n)`` so the scaffolding cannot drift
 from training. Only channel 4 and cond[1:5] are replaced by torch functions of
 theta, so autograd produces dT/dtheta through the frozen model.
 
-The profile / MCMC intervals are conditional on one frozen global calibration
-scale, not a test-case oracle covariance. The recoverable quantity under sparse
-sensing is the integrated excess resistance S_R, not necessarily the individual
+The profile interval is conditional on one frozen global calibration scale, not
+a test-case oracle covariance. The recoverable quantity under sparse sensing is
+the integrated excess resistance S_R, not necessarily the individual
 R_amp/sigma shape scalars.
 """
 
@@ -327,6 +333,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cpu") -> LoadedModel:
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
+        forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
@@ -597,95 +604,6 @@ def predict_fullfield(
 
 
 # ---------------------------------------------------------------------------
-# Sensitivity / identifiability diagnostics (Stage 3): J = dG_theta/dtheta at a
-# point, and the SVD of J that exposes ill-conditioned directions (notably the
-# coupled R_amp/sigma void-"mass" ridge). This is *diagnostic only* — no UQ,
-# no Laplace/Hessian intervals (those are Stage 5).
-# ---------------------------------------------------------------------------
-
-def observation_jacobian(
-    model: FNO2d,
-    obs: ObservationSet,
-    theta: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
-) -> torch.Tensor:
-    """Jacobian ``J = d(masked G_theta)/d theta`` at ``theta``: ``(m, 4)``.
-
-    ``m`` is the number of observed scalars (sensor pixels times observation
-    times times channels). The model is frozen; only the four physical void
-    scalars are differentiated, through both injection points.
-    """
-    theta0 = theta.detach().to(obs.spatial.device)
-
-    def obs_vec(th: torch.Tensor) -> torch.Tensor:
-        pred = predict_fullfield(model, obs, th, adapter)
-        return apply_sensor_mask(pred, obs.mask).reshape(-1)
-
-    try:
-        J = torch.autograd.functional.jacobian(obs_vec, theta0, vectorize=True)
-    except RuntimeError:
-        # vmap may not support every op (e.g. some FFT paths); fall back to the
-        # slower row-by-row reverse-mode Jacobian, which is always correct.
-        J = torch.autograd.functional.jacobian(obs_vec, theta0, vectorize=False)
-    return J.detach()
-
-
-def svd_identifiability(J: np.ndarray) -> dict:
-    """Identifiability summary from the observation Jacobian ``J`` (m, 4).
-
-    Pure linear algebra (unit-tested independently of the FNO):
-      * ``singular_values`` — descending; small values flag directions the data
-        cannot constrain.
-      * ``right_vectors`` — (4, 4), columns are orthonormal directions in
-        theta-space ``(R_base, R_amp, y0, sigma)``.
-      * ``param_sensitivity`` — per-parameter column norms ``||dG/dtheta_k||``.
-      * ``least_identified_dir`` — right singular vector of the *smallest*
-        singular value (the worst-constrained combination).
-      * ``ramp_sigma_alignment`` — source_itr-only fraction of that direction's
-        norm lying in the ``(R_amp, sigma)`` plane.
-      * ``cond_number`` — s_max / s_min.
-    """
-    Jn = np.asarray(J, dtype=np.float64)
-    param_sensitivity = np.linalg.norm(Jn, axis=0)
-    _, S, Vt = np.linalg.svd(Jn, full_matrices=False)
-    V = Vt.T
-    least = V[:, -1]
-    least = least / (np.linalg.norm(least) + 1e-300)
-    ramp_sigma_alignment = (
-        float(np.linalg.norm(least[[1, 3]]) / (np.linalg.norm(least) + 1e-300))
-        if least.shape[0] > 3
-        else float("nan")
-    )
-    cond_number = float(S[0] / S[-1]) if S[-1] > 0 else float("inf")
-    return {
-        "singular_values": S,
-        "right_vectors": V,
-        "param_sensitivity": param_sensitivity,
-        "least_identified_dir": least,
-        "ramp_sigma_alignment": ramp_sigma_alignment,
-        "cond_number": cond_number,
-    }
-
-
-def sensitivity_report(
-    model: FNO2d,
-    obs: ObservationSet,
-    theta: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
-) -> dict:
-    """``svd_identifiability`` of the observation Jacobian at ``theta``."""
-    J = observation_jacobian(model, obs, theta, adapter)
-    return svd_identifiability(J.cpu().numpy())
-
-
-def sensitivity_summary(
-    report: dict, adapter: InverseAdapter = _SOURCE_ITR_ADAPTER
-) -> dict:
-    """Flatten a :func:`sensitivity_report` into scalar CSV columns."""
-    return adapter.sensitivity_summary(report)
-
-
-# ---------------------------------------------------------------------------
 # Multistart sampling (Stage 3): Latin-hypercube starts over the theta-box.
 # ---------------------------------------------------------------------------
 
@@ -845,15 +763,17 @@ def _default_time_indices(Nt: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: FV refinement + post-hoc theta-local surrogate diagnostic.
+# Reported statistic 2: FV-verified sensor residual at theta_hat.
 #
-# The FNO is the *exploration / sensitivity* engine; the conservative FV solver
-# is the *accuracy* engine. We rebuild the EXACT data-generation operator via
+# The FNO is the *exploration* engine; the conservative FV solver is the
+# *accuracy* engine. We rebuild the EXACT data-generation operator via
 # ``ds.problem.configure_solver`` (k=3/35 layers, q_left=0, the patch source,
-# ``interface_R=[Rc(y)]``) and re-evaluate the FNO MAP estimate with it. We
-# report the FV sensor residual and the theta-local FNO-vs-FV discrepancy
-# local discrepancy, and optionally polish theta_hat against the FV residual
-# with derivative-free Nelder-Mead (FV is not autodiff). It never sets UQ width.
+# ``interface_R=[Rc(y)]``) and re-evaluate the FNO MAP estimate with it, then
+# report the FV sensor residual in Kelvin against the measurement noise floor.
+# It never sets the UQ width.
+#
+# ``fv_refine_report(polish=True)`` reaches the retired Nelder-Mead polish at
+# the bottom of this file; main() never passes it.
 # ---------------------------------------------------------------------------
 
 def build_fv_base_kwargs(ds: SnapshotPairDataset) -> dict:
@@ -967,127 +887,6 @@ class FVRefineResult:
     fv_polish_evals: Optional[int] = None
 
 
-def _solve_scalar_fv_masked(
-    ds: SnapshotPairDataset,
-    base_kwargs: dict,
-    obs: ObservationSet,
-    resistance: float,
-    *,
-    mu_global: float,
-    sigma_global: float,
-    adapter: InverseAdapter,
-) -> torch.Tensor:
-    params = dict(ds.sim_params[int(obs.sid)])
-    solver = adapter.build_scalar_fv_solver(
-        ds, params, float(resistance), base_kwargs
-    )
-    T0 = adapter.fv_initial_condition(ds, params, solver)
-    t_solver, x_grid, y_grid, T_hist = solver.solve(
-        T0=T0, store_trajectory=True
-    )
-    indices, _ = resolve_observation_times(
-        np.asarray(t_solver, dtype=np.float64),
-        np.asarray(obs.observation_times, dtype=np.float64),
-    )
-    field = torch.from_numpy(
-        (
-            (np.asarray(T_hist)[indices] - mu_global)
-            / (sigma_global + T_EPS)
-        ).astype(np.float32)
-    ).unsqueeze(-1)
-    return apply_sensor_mask(
-        field, sensor_mask_for_grid(obs, x_grid, y_grid)
-    )
-
-
-def equivalent_scalar_fv_summary(
-    ds: SnapshotPairDataset,
-    base_kwargs: dict,
-    obs: ObservationSet,
-    theta: torch.Tensor,
-    *,
-    mu_global: float,
-    sigma_global: float,
-    adapter: InverseAdapter,
-) -> dict:
-    """Compare a spatial profile with base- and conductance-matched scalar FV cases."""
-    if not adapter.supports_equivalent_scalar:
-        raise ValueError(
-            f"{type(adapter).__name__} does not support equivalent-scalar FV checks."
-        )
-    profile_obs = fv_predict_masked(
-        ds, base_kwargs, obs.sid, theta, obs.time_indices,
-        mu_global=mu_global, sigma_global=sigma_global,
-        mask=None if obs.mask is None else obs.mask.cpu(),
-        adapter=adapter, obs=obs,
-    )
-    R_base, R_eq = adapter.equivalent_scalar_values(
-        theta,
-        torch.as_tensor(base_kwargs["y_grid"], dtype=theta.dtype),
-    )
-    base_obs = _solve_scalar_fv_masked(
-        ds, base_kwargs, obs, R_base,
-        mu_global=mu_global, sigma_global=sigma_global, adapter=adapter,
-    )
-    req_obs = _solve_scalar_fv_masked(
-        ds, base_kwargs, obs, R_eq,
-        mu_global=mu_global, sigma_global=sigma_global, adapter=adapter,
-    )
-    return {
-        "R_eq": R_eq,
-        "fv_base_match_vs_profile_rms": float(
-            torch.sqrt(torch.mean((base_obs - profile_obs) ** 2))
-        ),
-        "fv_req_match_vs_profile_rms": float(
-            torch.sqrt(torch.mean((req_obs - profile_obs) ** 2))
-        ),
-    }
-
-
-def fv_polish(
-    ds: SnapshotPairDataset,
-    base_kwargs: dict,
-    obs: ObservationSet,
-    theta_hat: torch.Tensor,
-    *,
-    mu_global: float,
-    sigma_global: float,
-    maxiter: int = 60,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
-) -> tuple[torch.Tensor, float, int]:
-    """Derivative-free FV polish of ``theta_hat`` against the FV sensor residual.
-
-    Optimizes in the unconstrained ``u``-space (so every FV query stays inside
-    the physical box and honors the R_base-dependent amplitude ceiling) with
-    Nelder-Mead, starting from the FNO MAP. Returns ``(theta_polished,
-    final_half_mse, n_func_evals)``.
-    """
-    from scipy.optimize import minimize
-
-    mask_cpu = None if obs.mask is None else obs.mask.cpu()
-    target_obs = apply_sensor_mask(obs.targets.detach().cpu(), mask_cpu)
-    u0 = adapter.unconstrained_from_theta(theta_hat.detach().cpu()).numpy().astype(np.float64)
-
-    def objective(u_np: np.ndarray) -> float:
-        u_t = torch.from_numpy(u_np.astype(np.float32))
-        theta = adapter.theta_from_unconstrained(u_t)
-        pred_obs = fv_predict_masked(
-            ds, base_kwargs, obs.sid, theta, obs.time_indices,
-            mu_global=mu_global, sigma_global=sigma_global, mask=mask_cpu,
-            adapter=adapter, obs=obs,
-        )
-        return _masked_half_mse(pred_obs, target_obs)
-
-    res = minimize(
-        objective, u0, method="Nelder-Mead",
-        options={"maxiter": int(maxiter), "xatol": 1e-4, "fatol": 1e-14},
-    )
-    theta_polished = adapter.theta_from_unconstrained(
-        torch.from_numpy(np.asarray(res.x, dtype=np.float32))
-    )
-    return theta_polished, float(res.fun), int(res.nfev)
-
-
 def fv_refine_report(
     model: FNO2d,
     ds: SnapshotPairDataset,
@@ -1143,20 +942,51 @@ def fv_refine_summary(
     return adapter.fv_refine_summary(res, obs, y_grid)
 
 
+def fv_verification_summary(
+    res: FVRefineResult,
+    *,
+    sigma_global: float,
+    noise_std_norm: float,
+) -> dict:
+    """Reported form of statistic 2: the FV sensor residual in Kelvin.
+
+    ``FVRefineResult`` carries half-MSEs in normalized temperature units, which
+    are not quotable. The reported number is the physical RMS
+    ``sigma_global * sqrt(2 * fv_resid)`` and its ratio to the measurement
+    noise std; a ratio at or below 1 is the claim that the recovered theta
+    reproduces the observations to within noise *under the real solver*. The
+    FNO-vs-FV term is converted the same way so the surrogate's own share of
+    the residual is visible next to it.
+
+    ``fv_resid_over_noise`` is NaN when the run is noiseless: the residual has
+    no floor to be measured against.
+    """
+
+    def _rms_K(half_mse: float) -> float:
+        return float(sigma_global) * float(np.sqrt(2.0 * float(half_mse)))
+
+    noise_std_K = float(sigma_global) * float(noise_std_norm)
+    fv_rms_K = _rms_K(res.fv_resid)
+    return {
+        "fv_resid_rms_K": fv_rms_K,
+        "fno_vs_fv_rms_K": _rms_K(res.fno_vs_fv_resid),
+        "fv_resid_over_noise": (
+            fv_rms_K / noise_std_K if noise_std_K > 0.0 else float("nan")
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
-# Stage 5: measurement noise + uncertainty quantification.
+# Reported statistic 3: profile-likelihood interval on the lead estimand.
 #
-# The honesty constraints from the plan are load-bearing here:
-#   * Profile-likelihood (frequentist) and a short RW-Metropolis MCMC (Bayesian,
-#     uniform-theta prior) are the PRIMARY UQ. Both lead with an interval on the
-#     well-conditioned integrated void "severity" (excess-resistance integral),
-#     not on R_amp/sigma separately.
-#   * Laplace (Gauss-Newton from the observation Jacobian) is DEMOTED to a fast
-#     degeneracy *diagnostic*: its eigen-spectrum identifies the coupled
-#     R_amp/sigma ridge and the R_amp~0 boundary, where a Gaussian-around-MAP is
-#     least trustworthy. We never report final intervals from it.
-#   * The surrogate scale is calibrated once on validation sensors and frozen
-#     before test inversion. Test-local FNO/FV discrepancies are diagnostics only.
+# iid Gaussian sensor noise is added once to the observations, and the
+# likelihood uses the frozen validation-calibrated variance
+# ``sigma_eff^2 = sigma_meas^2 + sigma_FNO,cal^2``. The interval leads with the
+# well-conditioned quantity (``S_R`` for the spatial-ITR benchmarks, ``R_c``
+# for forcing) rather than with individually weak shape scalars.
+#
+# The surrogate scale is calibrated once on validation sensors and frozen
+# before test inversion; test-local FNO/FV discrepancies never set it.
 # ---------------------------------------------------------------------------
 
 # Wilks thresholds on (NLL - NLL_min): 0.5 * chi2_inv(level, df=1). A profile
@@ -1237,11 +1067,6 @@ def add_measurement_noise(
     obs.targets = obs.targets + (noise * float(noise_std)).to(obs.targets)
     obs.noise_seed = int(seed)
     obs.noise_std = float(noise_std)
-
-
-def theta_logabsdet_du(u: torch.Tensor) -> torch.Tensor:
-    """Legacy source_itr wrapper for ``SourceItrAdapter.theta_logabsdet_du``."""
-    return _SOURCE_ITR_ADAPTER.theta_logabsdet_du(u)
 
 
 # --- Profile likelihood (primary, frequentist) -----------------------------
@@ -1410,225 +1235,43 @@ def profile_likelihood(
     )
 
 
-def profile_summary(
+def profile_interval_summary(
     res: ProfileResult,
-    obs: ObservationSet,
     adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
 ) -> dict:
-    """Flatten a :func:`profile_likelihood` result into CSV columns."""
-    return adapter.profile_summary(res, obs)
+    """Reported form of statistic 3: the lead-estimand interval, no coverage.
 
+    Emits ``low``/``high``/``width`` for the *lead* quantity only — the
+    severity integral where the benchmark has one, otherwise the profiled
+    scalar itself — under the column names the plot layer's
+    ``lead_profile_ci_*_col`` fields already expect.
 
-# --- Laplace degeneracy diagnostic (diagnostic only) -----------------------
+    ``bound_limited`` flags an interval that ran into the edge of the profiled
+    parameter's physical range instead of closing on a Wilks crossing. Those
+    widths are censored and must not be averaged in as if they were measured;
+    the retired ``profile_summary`` reported width without saying so.
 
-def laplace_spectrum(
-    model: FNO2d,
-    obs: ObservationSet,
-    theta_hat: torch.Tensor,
-    sigma_eff2: float,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
-) -> dict:
-    """Gauss-Newton eigen-spectrum at ``theta_hat`` (degeneracy diagnostic).
-
-    Builds the observation Jacobian ``J = dG/dtheta`` and the Gauss-Newton
-    Hessian of the NLL ``H = J^T J / sigma_eff2``. Its eigenvalues are
-    ``S_k^2 / sigma_eff2`` and eigenvectors the right singular vectors of ``J``,
-    so this reuses :func:`svd_identifiability`. Small eigenvalues + an
-    ``(R_amp, sigma)``-aligned least-identified direction confirm the ridge the
-    profile/MCMC must handle. Reported as a diagnostic; NOT used for intervals
-    (the Gaussian-around-MAP is least valid exactly along this degenerate
-    direction and at the R_amp~0 boundary).
+    Deliberately no ``*_covered`` boolean: see the coverage note in the retired
+    section header.
     """
-    J = observation_jacobian(model, obs, theta_hat, adapter).cpu().numpy()
-    ident = svd_identifiability(J)
-    S = ident["singular_values"]
-    eig = (S ** 2) / float(sigma_eff2)
-    return {
-        "eigenvalues": eig,                       # descending
-        "right_vectors": ident["right_vectors"],
-        "least_identified_dir": ident["least_identified_dir"],
-        "ramp_sigma_alignment": ident["ramp_sigma_alignment"],
-        "cond_number": float(eig[0] / eig[-1]) if eig[-1] > 0 else float("inf"),
-    }
-
-
-def laplace_summary(
-    spec: dict, adapter: InverseAdapter = _SOURCE_ITR_ADAPTER
-) -> dict:
-    """Flatten a :func:`laplace_spectrum` into CSV columns."""
-    return adapter.laplace_summary(spec)
-
-
-# --- Short MCMC (primary, Bayesian with a uniform-theta prior) --------------
-
-@dataclass
-class MCMCResult:
-    theta_samples: np.ndarray   # (S, theta_dim) physical
-    excess_int: np.ndarray      # (S,) integrated severity per sample
-    accept_rate: float
-    level: float
-    # Description of the chain actually generated (so artifacts are self-contained
-    # rather than relying on external arg state). thin is 1: the sampler keeps
-    # every post-burn draw.
-    burn: int = 0
-    n_samples: int = 0
-    seed: int = 0
-    step_size: float = 0.0
-    thin: int = 1
-    initial_theta: Optional[np.ndarray] = None   # (theta_dim,) physical start
-    # Mixing diagnostics (Geyer initial-monotone), computed post-chain.
-    ess_per_param: Optional[np.ndarray] = None   # (theta_dim,)
-    iat_per_param: Optional[np.ndarray] = None   # (theta_dim,)
-    ess_excess: float = float("nan")
-    iat_excess: float = float("nan")
-
-
-def _autocovariance(x: np.ndarray, max_lag: int) -> np.ndarray:
-    """Biased autocovariance of a 1D series for lags 0..max_lag (FFT-based)."""
-    x = np.asarray(x, dtype=np.float64).ravel()
-    n = x.size
-    xc = x - x.mean()
-    fft_len = int(2 ** np.ceil(np.log2(2 * n - 1))) if n > 1 else 1
-    f = np.fft.rfft(xc, n=fft_len)
-    acov = np.fft.irfft(f * np.conjugate(f), n=fft_len)[: max_lag + 1] / n
-    return acov
-
-
-def geyer_ess_iat(x: np.ndarray) -> tuple[float, float]:
-    """Effective sample size and integrated autocorr time of a single chain.
-
-    Uses Geyer's initial monotone sequence estimator: pair adjacent
-    autocorrelations ``Gamma_k = rho(2k) + rho(2k+1)`` (theoretically positive),
-    truncate at the first non-positive pair (initial positive sequence), then
-    enforce a non-increasing envelope (initial monotone sequence). The IAT is
-    ``tau = -1 + 2*sum_k Gamma_k`` and ``ESS = N / tau``. This is robust to the
-    noise tail that breaks a naive full-chain autocorrelation sum.
-    """
-    x = np.asarray(x, dtype=np.float64).ravel()
-    n = x.size
-    if n < 2:
-        return float(n), 1.0
-    acov = _autocovariance(x, n - 1)
-    gamma0 = acov[0]
-    if not np.isfinite(gamma0) or gamma0 <= 0.0:
-        return float(n), 1.0
-    rho = acov / gamma0
-    max_k = (n - 1) // 2
-    gamma_pairs = np.array(
-        [rho[2 * k] + rho[2 * k + 1] for k in range(max_k)], dtype=np.float64
-    )
-    m = 0
-    while m < gamma_pairs.size and gamma_pairs[m] > 0.0:
-        m += 1
-    if m == 0:
-        return float(n), 1.0
-    gamma_pairs = gamma_pairs[:m]
-    for k in range(1, gamma_pairs.size):
-        if gamma_pairs[k] > gamma_pairs[k - 1]:
-            gamma_pairs[k] = gamma_pairs[k - 1]
-    tau = max(1.0, -1.0 + 2.0 * float(gamma_pairs.sum()))
-    ess = min(float(n), n / tau)
-    return ess, tau
-
-
-def run_mcmc(
-    model: FNO2d,
-    obs: ObservationSet,
-    theta_hat: torch.Tensor,
-    sigma_eff2: float,
-    *,
-    n_samples: int = 2000,
-    burn: int = 500,
-    step_size: float = 0.05,
-    level: float = 0.95,
-    seed: int = 0,
-    theta_init: Optional[torch.Tensor] = None,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
-) -> MCMCResult:
-    """Random-walk Metropolis in ``u`` with a uniform-theta prior.
-
-    The target is ``log p(u) = -NLL(theta(u)) + log|det d theta/du|``: the
-    Jacobian term pushes a *uniform prior in physical theta* (matching data
-    generation) through the unconstrained reparameterization, so the box
-    constraints are respected automatically and the boundary at ``R_amp ~ 0`` is
-    handled honestly (no Gaussian-around-MAP assumption). Captures the
-    non-Gaussian, boundary-coupled posterior the Laplace diagnostic flags.
-
-    The chain starts at ``theta_init`` when supplied (physical theta), else at
-    ``theta_hat`` (the MAP). A dispersed ``theta_init`` is required for an honest
-    multi-chain split-R-hat: identical MAP starts with different seeds can mask
-    poor exploration of the ridge.
-    """
-    device = obs.spatial.device
-    rng = np.random.default_rng(int(seed))
-    start_theta = theta_hat if theta_init is None else theta_init
-    u = adapter.unconstrained_from_theta(start_theta.detach().cpu()).to(device)
-
-    def log_target(u_t: torch.Tensor) -> float:
-        with torch.no_grad():
-            theta = adapter.theta_from_unconstrained(u_t)
-            nll = float(neg_log_likelihood(model, obs, theta, sigma_eff2, adapter))
-            ladj = float(adapter.theta_logabsdet_du(u_t))
-        return -nll + ladj
-
-    cur_lp = log_target(u)
-    samples, n_acc = [], 0
-    total = int(burn) + int(n_samples)
-    for it in range(total):
-        prop = u + torch.from_numpy(
-            (rng.standard_normal(adapter.theta_dim) * step_size).astype(np.float32)
-        ).to(device)
-        prop_lp = log_target(prop)
-        if np.log(rng.uniform()) < (prop_lp - cur_lp):
-            u, cur_lp = prop, prop_lp
-            n_acc += 1
-        if it >= burn:
-            samples.append(adapter.theta_from_unconstrained(u).detach().cpu().numpy())
-
-    theta_samples = np.asarray(samples, dtype=np.float64)
-    excess = np.array(
-        [
-            adapter.uq_quantity(torch.from_numpy(s.astype(np.float32)), obs.y_grid)
-            for s in theta_samples
-        ]
-    )
-
-    if theta_samples.size:
-        ess_per_param = np.empty(theta_samples.shape[1], dtype=np.float64)
-        iat_per_param = np.empty(theta_samples.shape[1], dtype=np.float64)
-        for j in range(theta_samples.shape[1]):
-            ess_per_param[j], iat_per_param[j] = geyer_ess_iat(theta_samples[:, j])
-        ess_excess, iat_excess = geyer_ess_iat(excess)
+    if adapter.reports_spatial_severity:
+        low, high = res.excess_ci_low, res.excess_ci_high
+        stem = "profile_excess"
     else:
-        ess_per_param = np.zeros(adapter.theta_dim, dtype=np.float64)
-        iat_per_param = np.full(adapter.theta_dim, np.nan, dtype=np.float64)
-        ess_excess, iat_excess = 0.0, float("nan")
-
-    return MCMCResult(
-        theta_samples=theta_samples,
-        excess_int=excess,
-        accept_rate=n_acc / max(1, total),
-        level=level,
-        burn=int(burn),
-        n_samples=int(n_samples),
-        seed=int(seed),
-        step_size=float(step_size),
-        thin=1,
-        initial_theta=start_theta.detach().cpu().numpy().astype(np.float64),
-        ess_per_param=ess_per_param,
-        iat_per_param=iat_per_param,
-        ess_excess=float(ess_excess),
-        iat_excess=float(iat_excess),
-    )
-
-
-def mcmc_summary(
-    res: MCMCResult,
-    obs: ObservationSet,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
-) -> dict:
-    """Posterior summaries from an MCMC run, led by the severity interval."""
-    return adapter.mcmc_summary(res, obs)
+        low, high = res.ci_low, res.ci_high
+        stem = f"profile_{res.param_name}"
+    bound_lo, bound_hi = adapter.profile_bounds(res.param_index)
+    atol = 1e-9 + 1e-6 * (bound_hi - bound_lo)
+    return {
+        "profile_param": res.param_name,
+        "profile_level": res.level,
+        f"{stem}_ci_low": float(low),
+        f"{stem}_ci_high": float(high),
+        f"{stem}_ci_width": float(high - low),
+        "profile_bound_limited": bool(
+            res.ci_low <= bound_lo + atol or res.ci_high >= bound_hi - atol
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2117,30 +1760,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--self-consistency", action="store_true",
                     help="Invert against the FNO's own output at theta_true "
                          "(isolates operator wiring from surrogate accuracy)")
-    # Stage 3 diagnostics.
     ap.add_argument("--start-sampling", choices=["lhs", "normal"], default="lhs",
                     help="Multistart sampling over the theta-box (default: lhs)")
-    ap.add_argument("--sensitivity", action="store_true",
-                    help="Report dG/dtheta SVD identifiability at theta_hat "
-                         "(spatial-ITR adapters also report R_amp/sigma ridge alignment)")
-    # Stage 4: FV refinement. The FNO MAP is re-checked against the real solver.
-    ap.add_argument("--fv-refine", action="store_true",
-                    help="Re-evaluate theta_hat with the real FVSolver2D and "
-                         "report fno/fv/fno-vs-fv sensor residuals (C_FNO at theta_hat)")
-    ap.add_argument("--fv-polish", action="store_true",
-                    help="Derivative-free (Nelder-Mead) FV polish of theta_hat "
-                         "against the FV sensor residual (implies --fv-refine)")
-    ap.add_argument("--fv-polish-maxiter", type=int, default=60,
-                    help="Max Nelder-Mead iterations for --fv-polish (default 60)")
+    # Statistic 2 knob. The FV verification itself is unconditional.
     ap.add_argument(
         "--fv-grid-size", type=int, default=None,
-        help="Optional square FV grid size for refinement; sensors are re-resolved physically",
+        help="Optional square FV grid size for verification; sensors are re-resolved physically",
     )
-    ap.add_argument(
-        "--fv-equivalent-scalar", action="store_true",
-        help="forcing_itr only: FV comparison with base- and conductance-matched scalar resistance",
-    )
-    # Stage 5: measurement noise + uncertainty quantification.
+    # Measurement noise (feeds statistic 2's noise floor and statistic 3's likelihood).
     ap.add_argument("--noise-std", type=float, default=0.0,
                     help="Std of iid Gaussian sensor noise (normalized temp units); "
                          "0 disables noise")
@@ -2159,30 +1786,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--allow-surrogate-limited", action="store_true",
         help="Allow diagnostic inversion when the frozen local sensor gate failed",
     )
+    # Statistic 3 knobs. The profile itself runs whenever a frozen calibration
+    # artifact is supplied.
     ap.add_argument("--uq-level", type=float, default=0.95,
-                    help="Confidence/credible level for profile + MCMC intervals")
-    ap.add_argument("--profile", action="store_true",
-                    help="Profile-likelihood UQ using --calibration-artifact")
+                    help="Confidence level for the profile-likelihood interval")
     ap.add_argument("--profile-index", type=int, default=None,
                     help="Parameter index to profile (adapter default: R_amp for spatial ITR, R_c for scalar forcing)")
     ap.add_argument("--profile-grid", type=int, default=11,
-                    help="Number of pinned grid points for --profile (default 11)")
+                    help="Number of pinned grid points for the profile (default 11)")
     ap.add_argument("--profile-span", type=float, default=0.6,
                     help="Half-width of the profiled-parameter grid around theta_hat")
-    ap.add_argument("--laplace", action="store_true",
-                    help="Laplace Gauss-Newton eigen-spectrum (degeneracy DIAGNOSTIC only, "
-                         "not reported as an interval)")
-    ap.add_argument("--mcmc", action="store_true",
-                    help="Short RW-Metropolis MCMC UQ (primary, uniform-theta prior). "
-                         "Uses --calibration-artifact.")
-    ap.add_argument("--mcmc-samples", type=int, default=2000)
-    ap.add_argument("--mcmc-burn", type=int, default=500)
-    ap.add_argument("--mcmc-step", type=float, default=0.05,
-                    help="RW-Metropolis proposal std in u-space (default 0.05)")
     ap.add_argument("--artifact-dir", default=None,
                     help="If set, write one self-describing sim_<id>.npz per sim "
-                         "(raw profile curves, MCMC samples, Jacobian + split "
-                         "provenance) for the inverse-results figures")
+                         "(raw profile curves + split provenance) for the "
+                         "inverse-results figures")
     args = ap.parse_args(argv)
 
     loaded = load_checkpoint(args.checkpoint, device=args.device)
@@ -2284,21 +1901,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         device=args.device, start_sampling=args.start_sampling,
     )
 
-    do_uq = args.profile or args.laplace or args.mcmc
-    do_fv = args.fv_refine or args.fv_polish or args.fv_equivalent_scalar
-    fv_base_kwargs = (
-        adapter.fv_base_kwargs(ds, grid_size=args.fv_grid_size)
-        if do_fv else None
-    )
+    # Statistic 2 is unconditional, so the FV operator is always rebuilt.
+    fv_base_kwargs = adapter.fv_base_kwargs(ds, grid_size=args.fv_grid_size)
+
+    # Statistic 3 needs a frozen validation scale for its likelihood. Without
+    # one it is skipped for every sim rather than run against an invented
+    # variance; statistics 1 and 2 are unaffected.
+    do_profile = args.calibration_artifact is not None
+    if not do_profile:
+        print(
+            "No --calibration-artifact: reporting recovery error and FV "
+            "verification only. The profile-likelihood interval needs a frozen "
+            "validation calibration (build one with --calibration-out)."
+        )
     calibration = None
     sigma_fno_cal = None
     calibration_fingerprint = None
-    if do_uq:
-        if args.calibration_artifact is None:
-            ap.error(
-                "likelihood-based stages require --calibration-artifact from "
-                "the held-out validation split"
-            )
+    if do_profile:
         calibration = load_surrogate_calibration(
             args.calibration_artifact,
             benchmark=adapter.benchmark,
@@ -2324,8 +1943,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     rows = []
     for sid in sim_ids:
         # None-init the per-sim stage locals so artifact writing never hits an
-        # unbound local when a stage was skipped for this sim.
-        report = J = fv_res = prof = mc = sigma_eff2 = c_fno = None
+        # unbound local when a stage was skipped for this sim. `report`, `J` and
+        # `mc` stay None for good now: they feed retired statistics, and
+        # _write_sim_artifact omits their blocks when they are absent.
+        report = J = mc = None
+        fv_res = prof = sigma_eff2 = None
         obs = build_observation_set(
             ds, int(sid), time_indices, device=args.device,
             adapter=adapter,
@@ -2379,95 +2001,57 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         summary["n_sensors"] = n_sensors
         summary["self_consistency"] = bool(args.self_consistency)
-        if args.sensitivity:
-            report = sensitivity_report(loaded.model, obs, theta_hat, adapter)
-            summary.update(sensitivity_summary(report, adapter))
-        if do_fv:
-            fv_res = fv_refine_report(
-                loaded.model, ds, fv_base_kwargs, obs, theta_hat,
-                mu_global=loaded.mu_global, sigma_global=loaded.sigma_global,
-                polish=args.fv_polish, polish_maxiter=args.fv_polish_maxiter,
-                adapter=adapter,
+
+        # --- Statistic 2: FV-verified sensor residual at theta_hat. ---
+        fv_res = fv_refine_report(
+            loaded.model, ds, fv_base_kwargs, obs, theta_hat,
+            mu_global=loaded.mu_global, sigma_global=loaded.sigma_global,
+            polish=False,
+            adapter=adapter,
+        )
+        summary.update(
+            fv_refine_summary(
+                fv_res,
+                obs,
+                torch.as_tensor(
+                    fv_base_kwargs["y_grid"], dtype=obs.y_grid.dtype
+                ),
+                adapter,
             )
-            summary.update(
-                fv_refine_summary(
-                    fv_res,
-                    obs,
-                    torch.as_tensor(
-                        fv_base_kwargs["y_grid"], dtype=obs.y_grid.dtype
-                    ),
-                    adapter,
-                )
+        )
+        summary.update(
+            fv_verification_summary(
+                fv_res,
+                sigma_global=loaded.sigma_global,
+                noise_std_norm=args.noise_std,
             )
-        if args.fv_equivalent_scalar:
-            if not adapter.supports_equivalent_scalar:
-                raise ValueError(
-                    "--fv-equivalent-scalar is only available for adapters "
-                    "with a spatial-ITR scalar comparison."
-                )
-            # Must be the recovered profile, not obs.theta_true: the question is
-            # whether the *inferred* R_c(y) is distinguishable from a matched
-            # scalar. Ground truth makes this an oracle check, and one that is
-            # uncomputable on real data where theta_true does not exist.
-            summary.update(
-                equivalent_scalar_fv_summary(
-                    ds, fv_base_kwargs, obs, theta_hat,
-                    mu_global=loaded.mu_global,
-                    sigma_global=loaded.sigma_global,
-                    adapter=adapter,
-                )
-            )
-        if do_uq:
-            c_fno = float(summary.get("fno_vs_fv_resid", 0.0))
+        )
+
+        # --- Statistic 3: profile-likelihood interval on the lead estimand. ---
+        if do_profile:
             sigma_eff2 = effective_sigma2(
                 args.noise_std, sigma_fno_cal=sigma_fno_cal
             )
-            summary["uq_sigma_eff2"] = sigma_eff2
-            summary["uq_sigma_fno_cal"] = float(sigma_fno_cal)
-            summary["oracle_test_fno_variance"] = 2.0 * c_fno
-            summary["map_neg_log_likelihood"] = float(
-                neg_log_likelihood(
-                    loaded.model, obs, theta_hat, sigma_eff2, adapter
-                )
-            )
             if sigma_eff2 <= 0:
                 print(
-                    f"[sim {sid}] UQ skipped: sigma_eff2<=0 "
-                    f"(supply --noise-std and/or --fv-refine for a noise model)"
+                    f"[sim {sid}] profile interval skipped: sigma_eff2<=0 "
+                    f"(supply --noise-std for a measurement-noise model)"
                 )
+                sigma_eff2 = None
             else:
-                if args.profile:
-                    prof = profile_likelihood(
-                        loaded.model, obs, theta_hat, sigma_eff2,
-                        param_index=profile_index, n_grid=args.profile_grid,
-                        span=args.profile_span, level=args.uq_level,
-                        adapter=adapter,
-                    )
-                    summary.update(profile_summary(prof, obs, adapter))
-                if args.laplace:
-                    spec = laplace_spectrum(
-                        loaded.model, obs, theta_hat, sigma_eff2, adapter
-                    )
-                    summary.update(laplace_summary(spec, adapter))
-                if args.mcmc:
-                    mc = run_mcmc(
-                        loaded.model, obs, theta_hat, sigma_eff2,
-                        n_samples=args.mcmc_samples, burn=args.mcmc_burn,
-                        step_size=args.mcmc_step, level=args.uq_level,
-                        seed=args.seed + int(sid), adapter=adapter,
-                    )
-                    summary.update(mcmc_summary(mc, obs, adapter))
+                prof = profile_likelihood(
+                    loaded.model, obs, theta_hat, sigma_eff2,
+                    param_index=profile_index, n_grid=args.profile_grid,
+                    span=args.profile_span, level=args.uq_level,
+                    adapter=adapter,
+                )
+                summary.update(profile_interval_summary(prof, adapter))
         if args.artifact_dir:
-            # The only added compute: a single raw-physical Jacobian recompute
-            # when both --sensitivity and --artifact-dir are set (the plot layer
-            # scales it by param_scales for the normalized-coordinate SVD).
-            if args.sensitivity:
-                J = observation_jacobian(loaded.model, obs, theta_hat, adapter)
             _write_sim_artifact(
                 args.artifact_dir, int(sid), adapter,
                 obs=obs, result=result, report=report, J=J,
                 fv_res=fv_res, prof=prof, mc=mc,
-                sigma_eff2=sigma_eff2, c_fno=c_fno,
+                sigma_eff2=sigma_eff2, c_fno=None,
                 noise_std=args.noise_std, ci_level=args.uq_level,
                 dataset_path=args.data_dir,
                 dataset_fingerprint=dataset_fingerprint,
@@ -2492,43 +2076,31 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"  excess_int {summary['excess_int_hat']:.4f}/"
                 f"{summary.get('excess_int_true', float('nan')):.4f}"
             )
+        ci_part = ""
+        stem = (
+            "profile_excess"
+            if adapter.reports_spatial_severity
+            else f"profile_{adapter.param_names[profile_index]}"
+        )
+        if f"{stem}_ci_low" in summary:
+            ci_part = (
+                f"  CI=[{summary[f'{stem}_ci_low']:.4f},"
+                f"{summary[f'{stem}_ci_high']:.4f}]"
+                + ("*" if summary.get("profile_bound_limited") else "")
+            )
         print(
             f"[sim {sid}] loss={summary['loss']:.3e}  n_sensors={n_sensors}  "
             + "  ".join(param_parts)
             + quantity_part
             + (
-                f"  cond={summary['cond_number']:.2e}  "
-                f"ramp_sigma_align={summary['ramp_sigma_alignment']:.3f}"
-                if args.sensitivity and "ramp_sigma_alignment" in summary else ""
+                f"  fv_resid={summary['fv_resid_rms_K']:.4g} K"
+                + (
+                    f" ({summary['fv_resid_over_noise']:.2f}x noise)"
+                    if np.isfinite(summary["fv_resid_over_noise"])
+                    else ""
+                )
             )
-            + (
-                f"  cond={summary['cond_number']:.2e}"
-                if args.sensitivity and "cond_number" in summary
-                and "ramp_sigma_alignment" not in summary else ""
-            )
-            + (
-                f"  fno_resid={summary['fno_resid']:.3e}  "
-                f"fv_resid={summary['fv_resid']:.3e}  "
-                f"C_FNO={summary['fno_vs_fv_resid']:.3e}"
-                + (f"  fv_polish_resid={summary['fv_polish_resid']:.3e}"
-                   if args.fv_polish else "")
-                if do_fv else ""
-            )
-            + (
-                f"  prof_excess_CI=[{summary['profile_excess_ci_low']:.4f},"
-                f"{summary['profile_excess_ci_high']:.4f}]"
-                if args.profile and "profile_excess_ci_low" in summary else ""
-            )
-            + (
-                f"  mcmc_excess_CI=[{summary['mcmc_excess_ci_low']:.4f},"
-                f"{summary['mcmc_excess_ci_high']:.4f}]"
-                f" acc={summary['mcmc_accept_rate']:.2f}"
-                if args.mcmc and "mcmc_excess_ci_low" in summary else ""
-            )
-            + (
-                f"  laplace_cond={summary['laplace_cond']:.2e}"
-                if args.laplace and "laplace_cond" in summary else ""
-            )
+            + ci_part
         )
 
     if args.out_csv and rows:
@@ -2540,6 +2112,488 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Wrote {len(rows)} rows to {args.out_csv}")
 
     return 0
+
+
+# ===========================================================================
+# RETIRED STATISTICS - not called by main().
+#
+# These were part of the earlier "compute everything" inverse report. They are
+# kept verbatim, importable, and unit-tested (tests/test_invert.py exercises
+# each one directly), but nothing on the live path reaches them: the CLI no
+# longer has flags that trigger them and main() never calls them.
+#
+# Retired here, with the reason each one left the reported set:
+#   * observation_jacobian / svd_identifiability / sensitivity_report /
+#     sensitivity_summary - the Jacobian-SVD identifiability block. Degenerate
+#     for scalar-theta benchmarks (forcing): J is (m, 1), so cond_number == 1,
+#     least_dir == 1, and sv_0 == sens_R_c identically. Four columns carrying
+#     one number.
+#   * laplace_spectrum / laplace_summary - the same Jacobian SVD rescaled by
+#     1/sigma_eff2 (eig = S**2 / sigma_eff2). A third copy of one matrix, and
+#     never used for an interval even when it was live.
+#   * MCMCResult / _autocovariance / geyer_ess_iat / run_mcmc / mcmc_summary -
+#     a second interval on the same scalar the profile likelihood already
+#     covers, and the one that was mistuned: a fixed, unadapted u-space step
+#     (0.05) drove observed acceptance to 0.72-0.99 against ~0.44 optimal for a
+#     1-D random walk, so the chain barely moved and its sample quantiles were
+#     under-dispersed. The mixing diagnostics that would have caught it
+#     (geyer_ess_iat -> ess/iat) were computed but never surfaced to the CSV,
+#     and there was only ever one chain, so no split R-hat. Re-enabling this
+#     needs step-size adaptation, dispersed multi-chain starts, and ESS/R-hat
+#     gates - not just re-wiring the call.
+#   * fv_polish - changes the estimator rather than measuring it: either
+#     theta_hat is the FNO MAP (and the polish is a second, unbenchmarked
+#     method) or it is the polished value (and the method is FNO + Nelder-Mead
+#     over the full FV solver, which undercuts the surrogate-speed claim).
+#     Reached only via fv_refine_report(polish=True), which main() never sets.
+#   * _solve_scalar_fv_masked / equivalent_scalar_fv_summary - the
+#     "is R_c(y) distinguishable from a conductance-matched scalar" question.
+#     A separate study with its own protocol, and forcing_itr-only.
+#   * profile_summary - the adapter-backed profile flattener. Superseded on the
+#     live path by profile_interval_summary(), which reports the lead interval
+#     without the per-case coverage boolean. Coverage was retired because it is
+#     not a frequentist coverage statement: one noise draw per simulation,
+#     aggregated across simulations with different truths, at n=8 - where a
+#     Wilson interval spans roughly [41%, 93%] and cannot discriminate anything.
+#   * theta_logabsdet_du - legacy source_itr wrapper whose only live consumer
+#     was run_mcmc.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity / identifiability diagnostics (Stage 3): J = dG_theta/dtheta at a
+# point, and the SVD of J that exposes ill-conditioned directions (notably the
+# coupled R_amp/sigma void-"mass" ridge). This is *diagnostic only* — no UQ,
+# no Laplace/Hessian intervals (those are Stage 5).
+# ---------------------------------------------------------------------------
+
+def observation_jacobian(
+    model: FNO2d,
+    obs: ObservationSet,
+    theta: torch.Tensor,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> torch.Tensor:
+    """Jacobian ``J = d(masked G_theta)/d theta`` at ``theta``: ``(m, 4)``.
+
+    ``m`` is the number of observed scalars (sensor pixels times observation
+    times times channels). The model is frozen; only the four physical void
+    scalars are differentiated, through both injection points.
+    """
+    theta0 = theta.detach().to(obs.spatial.device)
+
+    def obs_vec(th: torch.Tensor) -> torch.Tensor:
+        pred = predict_fullfield(model, obs, th, adapter)
+        return apply_sensor_mask(pred, obs.mask).reshape(-1)
+
+    try:
+        J = torch.autograd.functional.jacobian(obs_vec, theta0, vectorize=True)
+    except RuntimeError:
+        # vmap may not support every op (e.g. some FFT paths); fall back to the
+        # slower row-by-row reverse-mode Jacobian, which is always correct.
+        J = torch.autograd.functional.jacobian(obs_vec, theta0, vectorize=False)
+    return J.detach()
+
+
+def svd_identifiability(J: np.ndarray) -> dict:
+    """Identifiability summary from the observation Jacobian ``J`` (m, 4).
+
+    Pure linear algebra (unit-tested independently of the FNO):
+      * ``singular_values`` — descending; small values flag directions the data
+        cannot constrain.
+      * ``right_vectors`` — (4, 4), columns are orthonormal directions in
+        theta-space ``(R_base, R_amp, y0, sigma)``.
+      * ``param_sensitivity`` — per-parameter column norms ``||dG/dtheta_k||``.
+      * ``least_identified_dir`` — right singular vector of the *smallest*
+        singular value (the worst-constrained combination).
+      * ``ramp_sigma_alignment`` — source_itr-only fraction of that direction's
+        norm lying in the ``(R_amp, sigma)`` plane.
+      * ``cond_number`` — s_max / s_min.
+    """
+    Jn = np.asarray(J, dtype=np.float64)
+    param_sensitivity = np.linalg.norm(Jn, axis=0)
+    _, S, Vt = np.linalg.svd(Jn, full_matrices=False)
+    V = Vt.T
+    least = V[:, -1]
+    least = least / (np.linalg.norm(least) + 1e-300)
+    ramp_sigma_alignment = (
+        float(np.linalg.norm(least[[1, 3]]) / (np.linalg.norm(least) + 1e-300))
+        if least.shape[0] > 3
+        else float("nan")
+    )
+    cond_number = float(S[0] / S[-1]) if S[-1] > 0 else float("inf")
+    return {
+        "singular_values": S,
+        "right_vectors": V,
+        "param_sensitivity": param_sensitivity,
+        "least_identified_dir": least,
+        "ramp_sigma_alignment": ramp_sigma_alignment,
+        "cond_number": cond_number,
+    }
+
+
+def sensitivity_report(
+    model: FNO2d,
+    obs: ObservationSet,
+    theta: torch.Tensor,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> dict:
+    """``svd_identifiability`` of the observation Jacobian at ``theta``."""
+    J = observation_jacobian(model, obs, theta, adapter)
+    return svd_identifiability(J.cpu().numpy())
+
+
+def sensitivity_summary(
+    report: dict, adapter: InverseAdapter = _SOURCE_ITR_ADAPTER
+) -> dict:
+    """Flatten a :func:`sensitivity_report` into scalar CSV columns."""
+    return adapter.sensitivity_summary(report)
+
+
+def _solve_scalar_fv_masked(
+    ds: SnapshotPairDataset,
+    base_kwargs: dict,
+    obs: ObservationSet,
+    resistance: float,
+    *,
+    mu_global: float,
+    sigma_global: float,
+    adapter: InverseAdapter,
+) -> torch.Tensor:
+    params = dict(ds.sim_params[int(obs.sid)])
+    solver = adapter.build_scalar_fv_solver(
+        ds, params, float(resistance), base_kwargs
+    )
+    T0 = adapter.fv_initial_condition(ds, params, solver)
+    t_solver, x_grid, y_grid, T_hist = solver.solve(
+        T0=T0, store_trajectory=True
+    )
+    indices, _ = resolve_observation_times(
+        np.asarray(t_solver, dtype=np.float64),
+        np.asarray(obs.observation_times, dtype=np.float64),
+    )
+    field = torch.from_numpy(
+        (
+            (np.asarray(T_hist)[indices] - mu_global)
+            / (sigma_global + T_EPS)
+        ).astype(np.float32)
+    ).unsqueeze(-1)
+    return apply_sensor_mask(
+        field, sensor_mask_for_grid(obs, x_grid, y_grid)
+    )
+
+
+def equivalent_scalar_fv_summary(
+    ds: SnapshotPairDataset,
+    base_kwargs: dict,
+    obs: ObservationSet,
+    theta: torch.Tensor,
+    *,
+    mu_global: float,
+    sigma_global: float,
+    adapter: InverseAdapter,
+) -> dict:
+    """Compare a spatial profile with base- and conductance-matched scalar FV cases."""
+    if not adapter.supports_equivalent_scalar:
+        raise ValueError(
+            f"{type(adapter).__name__} does not support equivalent-scalar FV checks."
+        )
+    profile_obs = fv_predict_masked(
+        ds, base_kwargs, obs.sid, theta, obs.time_indices,
+        mu_global=mu_global, sigma_global=sigma_global,
+        mask=None if obs.mask is None else obs.mask.cpu(),
+        adapter=adapter, obs=obs,
+    )
+    R_base, R_eq = adapter.equivalent_scalar_values(
+        theta,
+        torch.as_tensor(base_kwargs["y_grid"], dtype=theta.dtype),
+    )
+    base_obs = _solve_scalar_fv_masked(
+        ds, base_kwargs, obs, R_base,
+        mu_global=mu_global, sigma_global=sigma_global, adapter=adapter,
+    )
+    req_obs = _solve_scalar_fv_masked(
+        ds, base_kwargs, obs, R_eq,
+        mu_global=mu_global, sigma_global=sigma_global, adapter=adapter,
+    )
+    return {
+        "R_eq": R_eq,
+        "fv_base_match_vs_profile_rms": float(
+            torch.sqrt(torch.mean((base_obs - profile_obs) ** 2))
+        ),
+        "fv_req_match_vs_profile_rms": float(
+            torch.sqrt(torch.mean((req_obs - profile_obs) ** 2))
+        ),
+    }
+
+
+def fv_polish(
+    ds: SnapshotPairDataset,
+    base_kwargs: dict,
+    obs: ObservationSet,
+    theta_hat: torch.Tensor,
+    *,
+    mu_global: float,
+    sigma_global: float,
+    maxiter: int = 60,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> tuple[torch.Tensor, float, int]:
+    """Derivative-free FV polish of ``theta_hat`` against the FV sensor residual.
+
+    Optimizes in the unconstrained ``u``-space (so every FV query stays inside
+    the physical box and honors the R_base-dependent amplitude ceiling) with
+    Nelder-Mead, starting from the FNO MAP. Returns ``(theta_polished,
+    final_half_mse, n_func_evals)``.
+    """
+    from scipy.optimize import minimize
+
+    mask_cpu = None if obs.mask is None else obs.mask.cpu()
+    target_obs = apply_sensor_mask(obs.targets.detach().cpu(), mask_cpu)
+    u0 = adapter.unconstrained_from_theta(theta_hat.detach().cpu()).numpy().astype(np.float64)
+
+    def objective(u_np: np.ndarray) -> float:
+        u_t = torch.from_numpy(u_np.astype(np.float32))
+        theta = adapter.theta_from_unconstrained(u_t)
+        pred_obs = fv_predict_masked(
+            ds, base_kwargs, obs.sid, theta, obs.time_indices,
+            mu_global=mu_global, sigma_global=sigma_global, mask=mask_cpu,
+            adapter=adapter, obs=obs,
+        )
+        return _masked_half_mse(pred_obs, target_obs)
+
+    res = minimize(
+        objective, u0, method="Nelder-Mead",
+        options={"maxiter": int(maxiter), "xatol": 1e-4, "fatol": 1e-14},
+    )
+    theta_polished = adapter.theta_from_unconstrained(
+        torch.from_numpy(np.asarray(res.x, dtype=np.float32))
+    )
+    return theta_polished, float(res.fun), int(res.nfev)
+
+
+def theta_logabsdet_du(u: torch.Tensor) -> torch.Tensor:
+    """Legacy source_itr wrapper for ``SourceItrAdapter.theta_logabsdet_du``."""
+    return _SOURCE_ITR_ADAPTER.theta_logabsdet_du(u)
+
+
+def profile_summary(
+    res: ProfileResult,
+    obs: ObservationSet,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> dict:
+    """Flatten a :func:`profile_likelihood` result into CSV columns."""
+    return adapter.profile_summary(res, obs)
+
+
+# --- Laplace degeneracy diagnostic (diagnostic only) -----------------------
+
+def laplace_spectrum(
+    model: FNO2d,
+    obs: ObservationSet,
+    theta_hat: torch.Tensor,
+    sigma_eff2: float,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> dict:
+    """Gauss-Newton eigen-spectrum at ``theta_hat`` (degeneracy diagnostic).
+
+    Builds the observation Jacobian ``J = dG/dtheta`` and the Gauss-Newton
+    Hessian of the NLL ``H = J^T J / sigma_eff2``. Its eigenvalues are
+    ``S_k^2 / sigma_eff2`` and eigenvectors the right singular vectors of ``J``,
+    so this reuses :func:`svd_identifiability`. Small eigenvalues + an
+    ``(R_amp, sigma)``-aligned least-identified direction confirm the ridge the
+    profile/MCMC must handle. Reported as a diagnostic; NOT used for intervals
+    (the Gaussian-around-MAP is least valid exactly along this degenerate
+    direction and at the R_amp~0 boundary).
+    """
+    J = observation_jacobian(model, obs, theta_hat, adapter).cpu().numpy()
+    ident = svd_identifiability(J)
+    S = ident["singular_values"]
+    eig = (S ** 2) / float(sigma_eff2)
+    return {
+        "eigenvalues": eig,                       # descending
+        "right_vectors": ident["right_vectors"],
+        "least_identified_dir": ident["least_identified_dir"],
+        "ramp_sigma_alignment": ident["ramp_sigma_alignment"],
+        "cond_number": float(eig[0] / eig[-1]) if eig[-1] > 0 else float("inf"),
+    }
+
+
+def laplace_summary(
+    spec: dict, adapter: InverseAdapter = _SOURCE_ITR_ADAPTER
+) -> dict:
+    """Flatten a :func:`laplace_spectrum` into CSV columns."""
+    return adapter.laplace_summary(spec)
+
+
+# --- Short MCMC (primary, Bayesian with a uniform-theta prior) --------------
+
+@dataclass
+class MCMCResult:
+    theta_samples: np.ndarray   # (S, theta_dim) physical
+    excess_int: np.ndarray      # (S,) integrated severity per sample
+    accept_rate: float
+    level: float
+    # Description of the chain actually generated (so artifacts are self-contained
+    # rather than relying on external arg state). thin is 1: the sampler keeps
+    # every post-burn draw.
+    burn: int = 0
+    n_samples: int = 0
+    seed: int = 0
+    step_size: float = 0.0
+    thin: int = 1
+    initial_theta: Optional[np.ndarray] = None   # (theta_dim,) physical start
+    # Mixing diagnostics (Geyer initial-monotone), computed post-chain.
+    ess_per_param: Optional[np.ndarray] = None   # (theta_dim,)
+    iat_per_param: Optional[np.ndarray] = None   # (theta_dim,)
+    ess_excess: float = float("nan")
+    iat_excess: float = float("nan")
+
+
+def _autocovariance(x: np.ndarray, max_lag: int) -> np.ndarray:
+    """Biased autocovariance of a 1D series for lags 0..max_lag (FFT-based)."""
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    xc = x - x.mean()
+    fft_len = int(2 ** np.ceil(np.log2(2 * n - 1))) if n > 1 else 1
+    f = np.fft.rfft(xc, n=fft_len)
+    acov = np.fft.irfft(f * np.conjugate(f), n=fft_len)[: max_lag + 1] / n
+    return acov
+
+
+def geyer_ess_iat(x: np.ndarray) -> tuple[float, float]:
+    """Effective sample size and integrated autocorr time of a single chain.
+
+    Uses Geyer's initial monotone sequence estimator: pair adjacent
+    autocorrelations ``Gamma_k = rho(2k) + rho(2k+1)`` (theoretically positive),
+    truncate at the first non-positive pair (initial positive sequence), then
+    enforce a non-increasing envelope (initial monotone sequence). The IAT is
+    ``tau = -1 + 2*sum_k Gamma_k`` and ``ESS = N / tau``. This is robust to the
+    noise tail that breaks a naive full-chain autocorrelation sum.
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    if n < 2:
+        return float(n), 1.0
+    acov = _autocovariance(x, n - 1)
+    gamma0 = acov[0]
+    if not np.isfinite(gamma0) or gamma0 <= 0.0:
+        return float(n), 1.0
+    rho = acov / gamma0
+    max_k = (n - 1) // 2
+    gamma_pairs = np.array(
+        [rho[2 * k] + rho[2 * k + 1] for k in range(max_k)], dtype=np.float64
+    )
+    m = 0
+    while m < gamma_pairs.size and gamma_pairs[m] > 0.0:
+        m += 1
+    if m == 0:
+        return float(n), 1.0
+    gamma_pairs = gamma_pairs[:m]
+    for k in range(1, gamma_pairs.size):
+        if gamma_pairs[k] > gamma_pairs[k - 1]:
+            gamma_pairs[k] = gamma_pairs[k - 1]
+    tau = max(1.0, -1.0 + 2.0 * float(gamma_pairs.sum()))
+    ess = min(float(n), n / tau)
+    return ess, tau
+
+
+def run_mcmc(
+    model: FNO2d,
+    obs: ObservationSet,
+    theta_hat: torch.Tensor,
+    sigma_eff2: float,
+    *,
+    n_samples: int = 2000,
+    burn: int = 500,
+    step_size: float = 0.05,
+    level: float = 0.95,
+    seed: int = 0,
+    theta_init: Optional[torch.Tensor] = None,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> MCMCResult:
+    """Random-walk Metropolis in ``u`` with a uniform-theta prior.
+
+    The target is ``log p(u) = -NLL(theta(u)) + log|det d theta/du|``: the
+    Jacobian term pushes a *uniform prior in physical theta* (matching data
+    generation) through the unconstrained reparameterization, so the box
+    constraints are respected automatically and the boundary at ``R_amp ~ 0`` is
+    handled honestly (no Gaussian-around-MAP assumption). Captures the
+    non-Gaussian, boundary-coupled posterior the Laplace diagnostic flags.
+
+    The chain starts at ``theta_init`` when supplied (physical theta), else at
+    ``theta_hat`` (the MAP). A dispersed ``theta_init`` is required for an honest
+    multi-chain split-R-hat: identical MAP starts with different seeds can mask
+    poor exploration of the ridge.
+    """
+    device = obs.spatial.device
+    rng = np.random.default_rng(int(seed))
+    start_theta = theta_hat if theta_init is None else theta_init
+    u = adapter.unconstrained_from_theta(start_theta.detach().cpu()).to(device)
+
+    def log_target(u_t: torch.Tensor) -> float:
+        with torch.no_grad():
+            theta = adapter.theta_from_unconstrained(u_t)
+            nll = float(neg_log_likelihood(model, obs, theta, sigma_eff2, adapter))
+            ladj = float(adapter.theta_logabsdet_du(u_t))
+        return -nll + ladj
+
+    cur_lp = log_target(u)
+    samples, n_acc = [], 0
+    total = int(burn) + int(n_samples)
+    for it in range(total):
+        prop = u + torch.from_numpy(
+            (rng.standard_normal(adapter.theta_dim) * step_size).astype(np.float32)
+        ).to(device)
+        prop_lp = log_target(prop)
+        if np.log(rng.uniform()) < (prop_lp - cur_lp):
+            u, cur_lp = prop, prop_lp
+            n_acc += 1
+        if it >= burn:
+            samples.append(adapter.theta_from_unconstrained(u).detach().cpu().numpy())
+
+    theta_samples = np.asarray(samples, dtype=np.float64)
+    excess = np.array(
+        [
+            adapter.uq_quantity(torch.from_numpy(s.astype(np.float32)), obs.y_grid)
+            for s in theta_samples
+        ]
+    )
+
+    if theta_samples.size:
+        ess_per_param = np.empty(theta_samples.shape[1], dtype=np.float64)
+        iat_per_param = np.empty(theta_samples.shape[1], dtype=np.float64)
+        for j in range(theta_samples.shape[1]):
+            ess_per_param[j], iat_per_param[j] = geyer_ess_iat(theta_samples[:, j])
+        ess_excess, iat_excess = geyer_ess_iat(excess)
+    else:
+        ess_per_param = np.zeros(adapter.theta_dim, dtype=np.float64)
+        iat_per_param = np.full(adapter.theta_dim, np.nan, dtype=np.float64)
+        ess_excess, iat_excess = 0.0, float("nan")
+
+    return MCMCResult(
+        theta_samples=theta_samples,
+        excess_int=excess,
+        accept_rate=n_acc / max(1, total),
+        level=level,
+        burn=int(burn),
+        n_samples=int(n_samples),
+        seed=int(seed),
+        step_size=float(step_size),
+        thin=1,
+        initial_theta=start_theta.detach().cpu().numpy().astype(np.float64),
+        ess_per_param=ess_per_param,
+        iat_per_param=iat_per_param,
+        ess_excess=float(ess_excess),
+        iat_excess=float(iat_excess),
+    )
+
+
+def mcmc_summary(
+    res: MCMCResult,
+    obs: ObservationSet,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> dict:
+    """Posterior summaries from an MCMC run, led by the severity interval."""
+    return adapter.mcmc_summary(res, obs)
 
 
 if __name__ == "__main__":

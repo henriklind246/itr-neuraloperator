@@ -62,19 +62,15 @@ def _write_mock_forcing_results(command: list[str]) -> None:
                 "sim_id": sid,
                 "n_sensors": count,
                 "noise_seed": sid,
+                "noise_std_K": 0.25,
                 "R_c_true": true_value,
                 "R_c_map": map_value,
                 "R_c_abs_error": abs(signed_error),
-                "fno_resid": 0.01,
-                "sens_R_c": 1.0,
+                "fv_resid_rms_K": 0.18 + 0.001 * sid,
+                "fv_resid_over_noise": (0.18 + 0.001 * sid) / 0.25,
                 "profile_R_c_ci_low": 0.2,
                 "profile_R_c_ci_high": 0.8,
-                "profile_R_c_covered": True,
-                "laplace_eig_0": 2.0,
-                "mcmc_R_c_ci_low": 0.25,
-                "mcmc_R_c_ci_high": 0.75,
-                "mcmc_R_c_covered": True,
-                "mcmc_accept_rate": 0.4 + 0.01 * sid,
+                "profile_bound_limited": False,
             }
         )
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -109,8 +105,8 @@ def _write_mock_calibration(path: Path, *, gate_pass: bool = True) -> None:
 
 def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
     spec = sweep.spec_for(benchmark)
-    profile_successes = {8: 6, 16: 7, 32: 6}
-    mcmc_successes = {8: 4, 16: 5, 32: 6}
+    bound_limited_cases = {8: 3, 16: 1, 32: 0}
+    noise_std_K = 0.25
     rows = []
     for count in sweep.SENSOR_COUNTS:
         scale = 8.0 / count
@@ -119,17 +115,8 @@ def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
             absolute_error = 0.01 * sim_id * scale
             signed_error = absolute_error if sim_id % 2 else -absolute_error
             profile_width = (0.10 + 0.01 * sim_id) * scale
-            mcmc_width = (0.08 + 0.005 * sim_id) * scale
-            profile_covered = sim_id <= profile_successes[count]
-            mcmc_covered = sim_id <= mcmc_successes[count]
-            if profile_covered:
-                profile_low = truth - 0.5 * profile_width
-            else:
-                profile_low = truth + 0.01
-            if mcmc_covered:
-                mcmc_low = truth - 0.5 * mcmc_width
-            else:
-                mcmc_low = truth + 0.01
+            profile_low = truth - 0.5 * profile_width
+            fv_resid_K = (0.15 + 0.01 * sim_id) * scale
             rows.append(
                 {
                     "benchmark": benchmark,
@@ -137,16 +124,15 @@ def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
                     "n_sensors": count,
                     "noise_seed": sim_id,
                     "init_seed": 0,
+                    "noise_std_K": noise_std_K,
                     spec.lead_true_col: truth,
                     spec.lead_hat_col: truth + signed_error,
                     spec.lead_abserr_col: absolute_error,
+                    "fv_resid_rms_K": fv_resid_K,
+                    "fv_resid_over_noise": fv_resid_K / noise_std_K,
                     spec.lead_profile_ci_low_col: profile_low,
                     spec.lead_profile_ci_high_col: profile_low + profile_width,
-                    spec.lead_profile_covered_col: profile_covered,
-                    spec.mcmc_lead_ci_low_col: mcmc_low,
-                    spec.mcmc_lead_ci_high_col: mcmc_low + mcmc_width,
-                    spec.mcmc_lead_covered_col: mcmc_covered,
-                    "mcmc_accept_rate": 0.20 + 0.02 * sim_id,
+                    "profile_bound_limited": sim_id <= bound_limited_cases[count],
                 }
             )
     return rows
@@ -174,49 +160,55 @@ def test_paper_summary_contains_all_table_statistics(
     assert result["status"] == "complete"
     assert result["estimand"] == estimand
     assert result["unit"] == unit
-    assert result["statistics_conventions"]["sample_standard_deviation"].endswith(
-        "ddof=1 across simulations"
-    )
+    assert result["reported_statistics"] == [
+        "recovery_error", "fv_verification", "profile_interval"
+    ]
+    assert "no mean/SD" in result["statistics_conventions"]["spread"]
     assert Path(result["json"]).is_file()
     assert Path(result["csv"]).is_file()
 
     arm8 = result["by_sensor_count"][0]
-    absolute = arm8["recovery"]["absolute_error"]
     expected_errors = np.arange(1, 9, dtype=float) * 0.01
-    assert absolute["mean"] == pytest.approx(0.045)
-    assert absolute["sample_sd"] == pytest.approx(
-        np.std(expected_errors, ddof=1)
-    )
+
+    # Statistic 1: recovery error, robust spread only.
+    absolute = arm8["recovery"]["absolute_error"]
+    assert set(absolute) == {"n", "median", "q1", "q3", "iqr"}
     assert absolute["median"] == pytest.approx(0.045)
+    assert absolute["q1"] == pytest.approx(np.percentile(expected_errors, 25.0))
+    assert absolute["q3"] == pytest.approx(np.percentile(expected_errors, 75.0))
     assert arm8["recovery"]["rmse"] == pytest.approx(
         np.sqrt(np.mean(expected_errors**2))
     )
-    profile = arm8["profile_likelihood"]
-    assert profile["coverage"]["successes"] == 6
-    assert profile["coverage"]["percent"] == 75.0
-    assert profile["coverage"]["wilson95_low_percent"] == pytest.approx(
-        40.928, abs=0.001
-    )
-    assert profile["interval_width"]["sample_sd"] > 0.0
-    mcmc = arm8["mcmc"]
-    assert mcmc["coverage"]["successes"] == 4
-    assert mcmc["coverage"]["percent"] == 50.0
-    assert mcmc["interval_width"]["sample_sd"] > 0.0
-    assert mcmc["acceptance_rate"]["sample_sd"] > 0.0
 
-    change = result["paired_absolute_error_changes"][2]
-    assert (change["from_n_sensors"], change["to_n_sensors"]) == (8, 32)
-    assert change["mean_percent_change"] == pytest.approx(-75.0)
-    assert change["improved_cases"] == 8
+    # Statistic 2: FV verification against the noise floor.
+    expected_fv = (0.15 + 0.01 * np.arange(1, 9, dtype=float))
+    fv = arm8["fv_verification"]
+    assert fv["residual_K"]["median"] == pytest.approx(np.median(expected_fv))
+    assert fv["over_noise_median"] == pytest.approx(np.median(expected_fv) / 0.25)
+
+    # Statistic 3: interval width plus the censoring count.
+    profile = arm8["profile_interval"]
+    expected_width = 0.10 + 0.01 * np.arange(1, 9, dtype=float)
+    assert profile["width"]["median"] == pytest.approx(np.median(expected_width))
+    assert profile["bound_limited_cases"] == 3
+    assert result["by_sensor_count"][2]["profile_interval"][
+        "bound_limited_cases"
+    ] == 0
+
+    # Retired blocks are absent from the summary entirely.
+    assert "mcmc" not in arm8
+    assert "profile_likelihood" not in arm8
+    assert "paired_absolute_error_changes" not in result
 
     with Path(result["csv"]).open(newline="") as handle:
         flat_rows = list(csv.DictReader(handle))
     assert len(flat_rows) == 3
-    assert float(flat_rows[0]["absolute_error_sample_sd"]) == pytest.approx(
-        np.std(expected_errors, ddof=1)
+    assert set(flat_rows[0]) == set(sweep._PAPER_SUMMARY_COLUMNS)
+    assert float(flat_rows[0]["absolute_error_median"]) == pytest.approx(0.045)
+    assert float(flat_rows[0]["fv_resid_K_median"]) == pytest.approx(
+        np.median(expected_fv)
     )
-    assert float(flat_rows[0]["profile_coverage_percent"]) == 75.0
-    assert float(flat_rows[0]["mcmc_width_sample_sd"]) > 0.0
+    assert int(flat_rows[0]["profile_bound_limited_cases"]) == 3
 
 
 def test_paper_summary_rejects_inconsistent_derived_columns(tmp_path):
@@ -298,14 +290,20 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
         assert int(_option(command, "--seed")) == 0
         assert int(_option(command, "--noise-seed")) == 0
     assert int(_option(inversion, "--n-starts")) == 8
+    # The three reported statistics are unconditional in the entry point, so
+    # the protocol carries no per-statistic flags. The retired ones no longer
+    # exist as flags at all.
     for flag in (
         "--fv-refine",
         "--sensitivity",
         "--profile",
         "--laplace",
         "--mcmc",
+        "--fv-polish",
+        "--fv-equivalent-scalar",
     ):
-        assert flag in inversion
+        assert flag not in inversion
+    assert "--calibration-artifact" in inversion
     assert "--allow-surrogate-limited" not in inversion
     assert float(_option(inversion, "--uq-level")) == 0.95
 
@@ -408,9 +406,10 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     assert Path(manifest["paper_summary"]["json"]).is_file()
     assert Path(manifest["paper_summary"]["csv"]).is_file()
     assert len(manifest["paper_summary"]["by_sensor_count"]) == 3
-    assert manifest["paper_summary"]["by_sensor_count"][0]["recovery"][
-        "absolute_error"
-    ]["sample_sd"] > 0.0
+    arm8 = manifest["paper_summary"]["by_sensor_count"][0]
+    assert arm8["recovery"]["absolute_error"]["median"] > 0.0
+    assert arm8["fv_verification"]["residual_K"]["median"] > 0.0
+    assert arm8["profile_interval"]["width"]["median"] > 0.0
     assert all(
         manifest["arms"][str(count)]["status"] == "complete"
         for count in sweep.SENSOR_COUNTS

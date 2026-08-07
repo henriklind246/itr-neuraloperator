@@ -1143,12 +1143,35 @@ def main():
             spec = inverse_plots.spec_for(benchmark)
             csv_path = csv_by_bench.get(benchmark)
             art_dir = art_by_bench.get(benchmark)
+            # One probe column per figure whose statistic scripts/invert.py no
+            # longer reports. The identifiability figure reads the retired
+            # Jacobian-SVD block, and the uncertainty figure needs a profile
+            # interval (present only when a calibration artifact was supplied).
+            # Skip with a reason rather than crashing on a missing column; see
+            # the RETIRED STATISTICS section of scripts/invert.py.
+            probe_by_kind = {
+                "identifiability": spec.sv_cols[0],
+                "uncertainty": spec.lead_profile_ci_low_col,
+            }
+            available = (
+                set(inverse_plots._load_inverse_csv(csv_path))
+                if csv_path is not None
+                else set()
+            )
             for kind, fn in fn_by_kind.items():
                 name = f"{benchmark}_{kind}"
                 if not _should_run(name, groups, individual):
                     continue
                 if csv_path is None:
                     _print_skip(name, f"need --inverse-csv {benchmark}=<path>")
+                    continue
+                probe = probe_by_kind.get(kind)
+                if probe is not None and probe not in available:
+                    _print_skip(
+                        name,
+                        f"{csv_path} has no {probe!r} column; this figure reads "
+                        "a statistic scripts/invert.py no longer reports",
+                    )
                     continue
                 print(f"--- {name} ---")
                 save_path = inverse_dir / f"{name}.png"

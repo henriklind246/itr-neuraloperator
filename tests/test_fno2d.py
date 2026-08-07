@@ -290,6 +290,105 @@ class TestFNO2d:
         out = model(spatial, cond_static, forcing_seq)
         assert out.shape == (2, 11, 11, 1)
 
+    def test_forcing_cond_mode_spatial_only_drops_h_a_from_cin(self):
+        """spatial_only: forcing reaches the model only via s_y * z_a. The CIN
+        MLP consumes cond_static alone (h_a dropped), yet the lift still gains
+        the K spatial-forcing channels and the temporal encoder is built."""
+        in_ch, cond_dim, K = 4, 4, 4
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=in_ch, out_channels=1, n_layers=2,
+            cond_static_dim=cond_dim, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=K,
+            forcing_cond_mode="spatial_only",
+        )
+        assert model.cond_mlp.net[0].in_features == cond_dim
+        assert model.linear_p.in_features == in_ch + K
+        assert hasattr(model, "temporal_encoder")
+        assert hasattr(model, "forcing_to_spatial")
+
+        spatial = torch.randn(2, 11, 11, in_ch)
+        cond_static = torch.randn(2, cond_dim)
+        forcing_seq = torch.randn(2, 16, 2)
+        out = model(spatial, cond_static, forcing_seq)
+        assert out.shape == (2, 11, 11, 1)
+
+    def test_forcing_cond_mode_spatial_only_cin_independent_of_forcing(self):
+        """In spatial_only the CIN γ/β must not depend on forcing_seq: the h_a
+        route into conditioning is severed. Two different forcing_seq inputs give
+        identical cond_mlp output, while the spatial pathway keeps the overall
+        output forcing-sensitive."""
+        torch.manual_seed(0)
+        in_ch, cond_dim = 8, 4
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=in_ch, out_channels=1, n_layers=2,
+            cond_static_dim=cond_dim, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+            forcing_cond_mode="spatial_only",
+        )
+        model.eval()
+        cond_static = torch.randn(2, cond_dim)
+        cin = model.cond_mlp(cond_static)
+        # cond_mlp is driven by cond_static only, so its output is fixed regardless
+        # of any forcing_seq — the defining property of spatial_only conditioning.
+        assert cin.shape == (2, 2, 2, 8)
+
+        spatial = torch.randn(2, 11, 11, in_ch)
+        spatial[..., 3] = 1.0  # non-uniform s_y so the spatial pathway is live
+        fseq_a = torch.randn(2, 16, 2)
+        fseq_b = torch.randn(2, 16, 2)
+        with torch.no_grad():
+            out_a = model(spatial, cond_static, fseq_a)
+            out_b = model(spatial, cond_static, fseq_b)
+        # Forcing still changes the prediction, but only through s_y * z_a.
+        assert not torch.allclose(out_a, out_b)
+
+    def test_forcing_cond_mode_cond_only_omits_spatial_pathway(self):
+        """cond_only: forcing reaches the model only through CIN. The lift sees
+        in_channels alone (no K forcing channels) and no forcing_to_spatial /
+        forcing_aug_mlp are built, while the CIN MLP still consumes h_a."""
+        in_ch, cond_dim = 4, 4
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=in_ch, out_channels=1, n_layers=2,
+            cond_static_dim=cond_dim, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_forcing_time_aug=True,
+            forcing_cond_mode="cond_only",
+        )
+        assert model.cond_mlp.net[0].in_features == cond_dim + 16
+        assert model.linear_p.in_features == in_ch
+        assert not hasattr(model, "forcing_to_spatial")
+        assert not hasattr(model, "forcing_aug_mlp")
+        assert hasattr(model, "temporal_encoder")
+
+        spatial = torch.randn(2, 11, 11, in_ch)
+        cond_static = torch.randn(2, cond_dim)
+        forcing_seq = torch.randn(2, 16, 2)
+        out = model(spatial, cond_static, forcing_seq)
+        assert out.shape == (2, 11, 11, 1)
+
+    def test_forcing_cond_mode_invalid_value_raises(self):
+        with pytest.raises(ValueError, match="forcing_cond_mode must be one of"):
+            FNO2d(
+                modes1=2, modes2=2, width=8,
+                in_channels=4, out_channels=1, n_layers=2,
+                cond_static_dim=4, temporal_token_dim=2,
+                temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+                forcing_cond_mode="bogus",
+            )
+
+    def test_forcing_cond_mode_requires_temporal_encoder(self):
+        with pytest.raises(ValueError, match="use_temporal_encoder=True"):
+            FNO2d(
+                modes1=2, modes2=2, width=8,
+                in_channels=20, out_channels=1, n_layers=2,
+                cond_static_dim=4,
+                use_temporal_encoder=False,
+                forcing_cond_mode="spatial_only",
+            )
+
     def test_no_forcing_time_aug_omits_aug_mlp(self):
         model = FNO2d(
             modes1=2, modes2=2, width=8,
