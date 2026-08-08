@@ -44,6 +44,8 @@ _BENCHMARK_COLORS = {
     "forcing": "#0072B2",     # blue
     "forcing_itr": "#D55E00", # vermillion
     "source_itr": "#CC79A7",  # reddish purple
+    "source_itr_sin": "#9467BD",  # violet (sinusoid ITR variant)
+    "forcing_itr_sin": "#8C564B", # brown (sinusoid ITR forcing variant)
 }
 
 
@@ -209,10 +211,64 @@ FORCING_ITR_SPEC = replace(
     color=_BENCHMARK_COLORS["forcing_itr"],
 )
 
+
+# Sinusoid ITR variant: 2 params theta = (R_base, A); R_c(y) = R_base + A*sin(pi y).
+# The lead deliverable is unchanged (integrated excess severity S_R). There is no
+# (R_amp, sigma) ridge — the two params are well-separated — so cond/align/ridge
+# identifiability structure is dropped. The profile default is over A (depth).
+SOURCE_ITR_SIN_SPEC = InversePlotSpec(
+    benchmark="source_itr_sin",
+    color=_BENCHMARK_COLORS["source_itr_sin"],
+    param_names=("R_base", "A"),
+    param_ranges={
+        "R_base": (0.05, 1.0),
+        "A": (0.0, 2.95),
+    },
+    hat_cols={"R_base": "R_base_hat", "A": "A_hat"},
+    true_cols={"R_base": "R_base_true", "A": "A_true"},
+    abserr_cols={"R_base": "R_base_abserr", "A": "A_abserr"},
+    lead_name="S_R",
+    lead_hat_col="excess_int_hat",
+    lead_true_col="excess_int_true",
+    lead_abserr_col="excess_int_abserr",
+    lead_description="integrated excess resistance S_R = ∫(R_c − R_base) dy",
+    lead_unit=r"\mathrm{m^3\,K/W}",
+    lead_unit_text="m³ K/W",
+    sv_cols=("sv_0", "sv_1"),
+    sens_cols={"R_base": "sens_R_base", "A": "sens_A"},
+    cond_col="cond_number",
+    align_col=None,
+    has_ridge=False,
+    ridge_pair=None,
+    sigma_eff2_col="uq_sigma_eff2",
+    profile_param_name="A",
+    profile_ci_low_col="profile_A_ci_low",
+    profile_ci_high_col="profile_A_ci_high",
+    profile_covered_col="profile_A_covered",
+    lead_profile_ci_low_col="profile_excess_ci_low",
+    lead_profile_ci_high_col="profile_excess_ci_high",
+    lead_profile_covered_col="profile_excess_covered",
+    mcmc_lead_mean_col="mcmc_excess_mean",
+    mcmc_lead_ci_low_col="mcmc_excess_ci_low",
+    mcmc_lead_ci_high_col="mcmc_excess_ci_high",
+    mcmc_lead_covered_col="mcmc_excess_covered",
+    profile_excess_low_col="profile_excess_ci_low",
+    profile_excess_high_col="profile_excess_ci_high",
+)
+
+
+FORCING_ITR_SIN_SPEC = replace(
+    SOURCE_ITR_SIN_SPEC,
+    benchmark="forcing_itr_sin",
+    color=_BENCHMARK_COLORS["forcing_itr_sin"],
+)
+
 _SPECS = {
     "forcing": FORCING_SPEC,
     "forcing_itr": FORCING_ITR_SPEC,
     "source_itr": SOURCE_ITR_SPEC,
+    "source_itr_sin": SOURCE_ITR_SIN_SPEC,
+    "forcing_itr_sin": FORCING_ITR_SIN_SPEC,
 }
 
 

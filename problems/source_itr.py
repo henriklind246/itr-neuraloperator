@@ -254,13 +254,7 @@ class SourceItrProblem(SourceProblem):
             w=params["w_h"], h=params["h_h"],
             A=params["A"], t_off=params["t_off"],
         )
-        Rc_profile = make_rc_void_profile(
-            y_grid,
-            R_base=float(params["R_c_base"]),
-            R_amp=float(params["R_c_amp"]),
-            y0=float(params["R_c_y0"]),
-            sigma=float(params["R_c_sigma"]),
-        )
+        Rc_profile = self._canonical_profile(params, y_grid)
         return FVSolver2D(
             a=base_kwargs["a"], b=base_kwargs["b"],
             c=base_kwargs["c"], d=base_kwargs["d"],
@@ -277,17 +271,57 @@ class SourceItrProblem(SourceProblem):
             source=source,
         )
 
-    # ---- dataset item ----
+    # ---- interface-resistance profile hook ----
 
-    def _rc_channel(self, ds, params: dict) -> np.ndarray:
-        """Build the (Nx, Ny) normalized R_c(y) input channel for one sim."""
-        Rc_y = make_rc_void_profile(
-            ds.y_grid,
+    def _canonical_profile(self, params: dict, y_grid: np.ndarray) -> np.ndarray:
+        """Return the (Ny,) interface R_c(y) profile for this sim.
+
+        Required override point: subclasses with a different R_c(y) family (e.g.
+        the sinusoid benchmark) override only this hook so `configure_solver` and
+        `_rc_channel` stay inherited and cannot drift from each other.
+        """
+        return make_rc_void_profile(
+            y_grid,
             R_base=float(params["R_c_base"]),
             R_amp=float(params["R_c_amp"]),
             y0=float(params["R_c_y0"]),
             sigma=float(params["R_c_sigma"]),
         )
+
+    def _cond_vector(
+        self,
+        params: dict,
+        *,
+        t_bar_norm: float,
+        x_center_range: tuple[float, float],
+        y_center_range: tuple[float, float],
+        x_length_scale: float,
+        y_length_scale: float,
+    ) -> np.ndarray:
+        """Return the cond_static vector for this sim.
+
+        Required override point: subclasses whose interface family conditions on
+        a different parameter set (e.g. the 2-param sinusoid) override only this
+        hook so `build_item` stays inherited and the spatial/cond channels cannot
+        drift apart.
+        """
+        return build_cond_vector_itr(
+            t_bar_norm=float(t_bar_norm),
+            R_base=float(params["R_c_base"]), R_amp=float(params["R_c_amp"]),
+            y0=float(params["R_c_y0"]), sigma=float(params["R_c_sigma"]),
+            x_h=float(params["x_h"]), y_h=float(params["y_h"]),
+            w_h=float(params["w_h"]), h_h=float(params["h_h"]),
+            x_center_range=x_center_range,
+            y_center_range=y_center_range,
+            x_length_scale=x_length_scale,
+            y_length_scale=y_length_scale,
+        )
+
+    # ---- dataset item ----
+
+    def _rc_channel(self, ds, params: dict) -> np.ndarray:
+        """Build the (Nx, Ny) normalized R_c(y) input channel for one sim."""
+        Rc_y = self._canonical_profile(params, ds.y_grid)
         Rc_y_norm = rc_log_norm(Rc_y)  # (Ny,)
         if self.rc_channel_mode == "broadcast":
             channel = np.broadcast_to(Rc_y_norm[None, :], (ds.Nx, ds.Ny))
@@ -333,12 +367,9 @@ class SourceItrProblem(SourceProblem):
         x_center_range, y_center_range = _patch_center_ranges(
             x_lo, x_hi, y_lo, y_hi, float(params["w_h"]), float(params["h_h"]),
         )
-        cond_static = build_cond_vector_itr(
+        cond_static = self._cond_vector(
+            params,
             t_bar_norm=float(t_bar_norm),
-            R_base=float(params["R_c_base"]), R_amp=float(params["R_c_amp"]),
-            y0=float(params["R_c_y0"]), sigma=float(params["R_c_sigma"]),
-            x_h=float(params["x_h"]), y_h=float(params["y_h"]),
-            w_h=float(params["w_h"]), h_h=float(params["h_h"]),
             x_center_range=x_center_range,
             y_center_range=y_center_range,
             x_length_scale=(x_hi - x_lo),

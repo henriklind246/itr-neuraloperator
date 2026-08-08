@@ -108,6 +108,8 @@ BENCHMARK_COLORS: dict[str, str] = {
     "interfaces": "#009E73",
     "source_itr": "#CC79A7",
     "forcing_itr": "#D55E00",
+    "source_itr_sin": "#9467BD",
+    "forcing_itr_sin": "#8C564B",
 }
 
 GREY = "0.35"

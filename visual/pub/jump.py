@@ -40,15 +40,15 @@ JUMP_DEFINITION = {
 }
 
 
-SPATIAL_RC_BENCHMARKS = frozenset({"source_itr"})
+SPATIAL_RC_BENCHMARKS = frozenset({"source_itr", "source_itr_sin"})
 
 
 def rc_symbol(benchmark: str) -> str:
     """LaTeX symbol for ``R_c`` on axis labels, without the enclosing ``$``.
 
-    Only ``source_itr`` samples a per-row resistance profile; on every other
-    benchmark ``R_c`` is a scalar, so writing ``R_c(y)`` claims a dependence the
-    case does not have.
+    Only the ITR benchmarks (``source_itr``, ``source_itr_sin``) sample a per-row
+    resistance profile; on every other benchmark ``R_c`` is a scalar, so writing
+    ``R_c(y)`` claims a dependence the case does not have.
     """
     return "R_c(y)" if benchmark in SPATIAL_RC_BENCHMARKS else "R_c"
 

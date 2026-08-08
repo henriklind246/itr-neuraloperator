@@ -169,6 +169,52 @@ def make_rc_void_profile(
     return R_base + R_amp * np.exp(-(((y - y0) / sigma) ** 2))
 
 
+# ---------------------------------------------------------------------------
+# Spatially-varying interface resistance (sinusoidal hump)
+# ---------------------------------------------------------------------------
+# R_c(y) = R_base + A * sin(pi * y)
+#
+# A smooth single-hump alternative to the Gaussian void, used by the
+# source_itr_sin / forcing_itr_sin benchmarks. On [0, 1], sin(pi y) >= 0 with a
+# single peak at y = 0.5, so with A >= 0 and the *dependent* bound
+# A <= R_PEAK_MAX - R_base the profile stays in
+#   R_c(y) in [R_base, R_base + A] subset [RC_MIN, R_PEAK_MAX],
+# strictly positive by construction (rc_log_norm and the [RC_MIN, R_PEAK_MAX]
+# normalization apply unchanged). Sampling A in [0, R_PEAK_MAX - R_base] makes
+# the (R_base, A) joint distribution triangular, mirroring the void's amp bound.
+#
+# Two distinct normalizations of A are used downstream and MUST NOT be conflated:
+#   - network conditioning uses the fixed global A_norm = A / (R_PEAK_MAX - RC_MIN)
+#     over RC_SIN_RANGES["A"] below (constant denominator, stationary channel);
+#   - sampling / OOD / inverse unconstrained space uses the headroom fraction
+#     u_A = A / (R_PEAK_MAX - R_base), so A = u_A * (R_PEAK_MAX - R_base).
+# RC_SIN_RANGES is the single source of truth for the *global* denominator only.
+RC_SIN_RANGES: dict[str, tuple[float, float]] = {
+    "R_base": (0.05, 1.0),
+    # Global max used for conditioning normalization (R_base at its floor); the
+    # per-sample admissible upper bound is resolved as (R_PEAK_MAX - R_base).
+    "A": (0.0, R_PEAK_MAX - RC_MIN),
+}
+
+
+def make_rc_sin_profile(
+    y_grid: np.ndarray,
+    R_base: float,
+    A: float,
+) -> np.ndarray:
+    """Return the (Ny,) sinusoidal interface-resistance profile R_c(y).
+
+    Evaluated at the interface-row coordinates `y_grid`:
+        R_c(y) = R_base + A * sin(pi * y).
+    With A = 0 this returns a flat R_base profile. Returns float64 so it feeds
+    the solver's series-resistance formula at full precision. The exact peak
+    R_base + A is attained at y = 0.5; the analytic severity over [0, 1] is
+    int_0^1 (R_c - R_base) dy = A * (2 / pi).
+    """
+    y = np.asarray(y_grid, dtype=np.float64)
+    return R_base + A * np.sin(np.pi * y)
+
+
 def interface_control_volume_weights(
     y_grid: np.ndarray,
     bounds: tuple[float, float],

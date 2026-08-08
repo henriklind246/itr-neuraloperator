@@ -24,12 +24,21 @@ from problems.source_itr import (
     rc_log_norm,
 )
 from src.physics.internal_source import (
+    RC_MIN,
+    RC_SIN_RANGES,
     RC_VOID_RANGES,
     R_PEAK_MAX,
+    make_rc_sin_profile,
     make_rc_void_profile,
 )
 from scripts import invert as inv
-from scripts.inverse_adapters import ForcingAdapter, InverseAdapter, SourceItrAdapter
+from scripts.inverse_adapters import (
+    ForcingAdapter,
+    ForcingItrSinAdapter,
+    InverseAdapter,
+    SourceItrAdapter,
+    SourceItrSinAdapter,
+)
 
 
 # A handful of physical thetas spanning the box, including the dependent-ceiling
@@ -1338,3 +1347,164 @@ def test_artifact_dir_writes_expected_npz_keys_forcing(tmp_path):
     assert "mcmc_theta_samples" not in d
     assert "sigma_eff2" not in d
     assert "c_fno" not in d
+
+
+# ---------------------------------------------------------------------------
+# Sinusoid interface-resistance adapters (source_itr_sin / forcing_itr_sin):
+# the 2-param R_c(y) = R_base + A*sin(pi*y) reparameterization. The load-bearing
+# checks mirror the void's: the torch reparameterization must reproduce the two
+# theta injection points bit-for-bit against the forward pipeline, and the
+# lower-triangular Jacobian's log-det must match autograd.
+# ---------------------------------------------------------------------------
+
+# (R_base, A) pairs spanning the box; each satisfies the dependent ceiling
+# A <= R_PEAK_MAX - R_base, including the near-ceiling edge and the no-hump floor.
+THETAS_SIN = [
+    (0.20, 0.50),
+    (0.05, 2.90),   # near the amplitude ceiling at the R_base floor
+    (0.90, 0.10),
+    (0.50, 0.00),   # no-hump floor (A = 0)
+    (0.75, 1.20),
+]
+
+
+@pytest.mark.parametrize("theta", THETAS_SIN)
+def test_sin_adapter_cond_slice_matches_build_cond_vector_sin(theta):
+    from problems.source_itr_sin import build_cond_vector_sin
+
+    R_base, A = theta
+    x_lo, x_hi, y_lo, y_hi = 0.0, 1.0, 0.0, 1.0
+    w_h = h_h = 0.1
+    xcr, ycr = _patch_center_ranges(x_lo, x_hi, y_lo, y_hi, w_h, h_h)
+    cond = build_cond_vector_sin(
+        t_bar_norm=0.3,
+        R_base=R_base, A=A,
+        x_h=0.5, y_h=0.5, w_h=w_h, h_h=h_h,
+        x_center_range=xcr, y_center_range=ycr,
+        x_length_scale=(x_hi - x_lo), y_length_scale=(y_hi - y_lo),
+    )
+    ref_slice = cond[1:3]  # [R_base_norm, A_norm] (global A norm over RC_SIN_RANGES)
+
+    adapter = SourceItrSinAdapter()
+    assert adapter.cond_slice_indices() == (1, 3)
+    got = adapter.cond_slice_from_theta(
+        torch.tensor(theta, dtype=torch.float64)
+    ).numpy()
+    np.testing.assert_allclose(got, ref_slice, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("theta", THETAS_SIN)
+def test_sin_adapter_rc_channel_matches_numpy_profile(theta):
+    # Mandatory NumPy<->Torch equivalence: the torch spatial channel must equal
+    # the forward log-normalized make_rc_sin_profile broadcast across x. This is
+    # the worst inverse bug class (data generated under one profile
+    # parameterization, fit under another).
+    R_base, A = theta
+    Ny, Nx = 100, 100
+    y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float64)
+
+    Rc_y = make_rc_sin_profile(y_grid, R_base=R_base, A=A)
+    ref_channel = np.broadcast_to(rc_log_norm(Rc_y)[None, :], (Nx, Ny))
+
+    adapter = SourceItrSinAdapter()
+    y_t = torch.from_numpy(y_grid)
+    got = adapter.spatial_channel_from_theta(
+        torch.tensor(theta, dtype=torch.float64), y_t, Nx
+    ).numpy()
+
+    assert got.shape == (Nx, Ny)
+    np.testing.assert_allclose(got, ref_channel, rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("theta", THETAS_SIN)
+def test_sin_adapter_unconstrained_roundtrip(theta):
+    adapter = SourceItrSinAdapter()
+    theta_t = torch.tensor(theta, dtype=torch.float64)
+    u = adapter.unconstrained_from_theta(theta_t)
+    back = adapter.theta_from_unconstrained(u)
+    np.testing.assert_allclose(back.numpy(), theta_t.numpy(), rtol=0, atol=1e-5)
+
+
+def test_sin_adapter_theta_from_unconstrained_respects_box_and_ceiling():
+    adapter = SourceItrSinAdapter()
+    rng = np.random.default_rng(0)
+    u = torch.from_numpy(rng.normal(0, 3.0, size=(500, 2)))
+    theta = adapter.theta_from_unconstrained(u)
+    R_base, A = theta[:, 0], theta[:, 1]
+
+    base_lo, base_hi = RC_SIN_RANGES["R_base"]
+    assert torch.all(R_base >= base_lo - 1e-9) and torch.all(R_base <= base_hi + 1e-9)
+    # Dependent ceiling: A >= 0 and the peak R_base + A <= R_PEAK_MAX.
+    assert torch.all(A >= -1e-9)
+    assert torch.all(R_base + A <= R_PEAK_MAX + 1e-6)
+
+
+def test_sin_adapter_triangular_jacobian_logdet_matches_autograd():
+    adapter = SourceItrSinAdapter()
+    u = torch.tensor([0.4, -0.7], dtype=torch.float64)
+    J = torch.autograd.functional.jacobian(
+        lambda v: adapter.theta_from_unconstrained(v), u
+    )
+    # Lower-triangular map: dR_base/du1 == 0 (the (0,1) entry), so only the two
+    # diagonal terms enter log|det J|.
+    assert float(J[0, 1]) == pytest.approx(0.0, abs=1e-12)
+    ref = torch.linalg.slogdet(J)[1]
+    got = adapter.theta_logabsdet_du(u)
+    assert float(got) == pytest.approx(float(ref), rel=1e-8, abs=1e-10)
+
+
+def test_sin_adapter_theta_from_sim_params_and_injection():
+    adapter = SourceItrSinAdapter()
+    params = {"R_c_base": 0.4, "R_c_A": 0.9, "R_c": 0.4}
+    theta = adapter.theta_from_sim_params(params)
+    assert theta.shape == (2,)
+    np.testing.assert_allclose(theta.numpy(), [0.4, 0.9], rtol=0, atol=1e-6)
+
+    updated = adapter.inject_theta_into_sim_params(params, torch.tensor([0.7, 1.1]))
+    assert updated is not params
+    assert updated["R_c_base"] == pytest.approx(0.7)
+    assert updated["R_c_A"] == pytest.approx(1.1)
+    assert updated["R_c"] == pytest.approx(0.7)  # universal column mirrors R_base
+    assert params["R_c_base"] == pytest.approx(0.4)  # source dict untouched
+
+
+def test_sin_adapter_uq_quantity_matches_analytic_severity():
+    adapter = SourceItrSinAdapter()
+    A = 1.3
+    theta = torch.tensor([0.4, A], dtype=torch.float64)
+    y_grid = torch.linspace(0.0, 1.0, 400, dtype=torch.float64)
+    got = adapter.uq_quantity(theta, y_grid)
+    # Analytic integrated excess int_0^1 (R_c - R_base) dy = A * (2/pi).
+    assert got == pytest.approx(A * 2.0 / np.pi, rel=1e-3)
+
+
+def test_sin_adapter_dispatch_from_config():
+    assert isinstance(
+        InverseAdapter.from_config({"benchmark": {"name": "source_itr_sin"}}),
+        SourceItrSinAdapter,
+    )
+    forcing_sin = InverseAdapter.from_config(
+        {"benchmark": {"name": "forcing_itr_sin"}}
+    )
+    assert isinstance(forcing_sin, ForcingItrSinAdapter)
+    assert isinstance(forcing_sin, SourceItrSinAdapter)  # subclass relationship
+
+
+def test_forcing_sin_adapter_equivalent_scalar_on_sin_profile():
+    from src.physics.internal_source import equivalent_scalar_resistance
+
+    adapter = ForcingItrSinAdapter()
+    assert adapter.supports_equivalent_scalar is True
+
+    R_base, A = 0.5, 1.4
+    theta = torch.tensor([R_base, A], dtype=torch.float64)
+    y_grid = torch.linspace(0.0, 1.0, 256, dtype=torch.float64)
+    r_base_out, r_eq = adapter.equivalent_scalar_values(theta, y_grid)
+
+    y = y_grid.numpy()
+    profile = make_rc_sin_profile(y, R_base, A)
+    ref = equivalent_scalar_resistance(y, profile, bounds=(0.0, 1.0))
+    assert r_base_out == pytest.approx(R_base)
+    assert r_eq == pytest.approx(ref, rel=1e-9)
+    # The single-hump profile raises the effective resistance above R_base.
+    assert r_eq > R_base

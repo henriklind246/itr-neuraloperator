@@ -242,11 +242,11 @@ def _resolve_layer_conductivities(ds, sid: int, config: dict | None = None) -> t
             except (KeyError, TypeError, IndexError):
                 pass
         benchmark = str(config.get("benchmark", {}).get("name", ""))
-        if benchmark in ("source", "source_itr"):
+        if benchmark in ("source", "source_itr", "source_itr_sin"):
             return _SOURCE_K_LEFT, _SOURCE_K_RIGHT
     try:
         problem_name = str(getattr(ds.problem, "name", ""))
-        if problem_name in ("source", "source_itr"):
+        if problem_name in ("source", "source_itr", "source_itr_sin"):
             return _SOURCE_K_LEFT, _SOURCE_K_RIGHT
     except AttributeError:
         pass

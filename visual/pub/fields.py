@@ -199,7 +199,7 @@ def bundles(source) -> dict[str, RunBundle]:
 # ------------------------------------------------------------------ evaluation
 
 def layer_conductivities(bundle_: RunBundle) -> tuple[float, float]:
-    if bundle_.benchmark in ("source", "source_itr"):
+    if bundle_.benchmark in ("source", "source_itr", "source_itr_sin"):
         return _K_LEFT_SOURCE, _K_RIGHT_SOURCE
     layers = bundle_.config.get("physics", {}).get("layers")
     if layers and len(layers) >= 2:
@@ -231,6 +231,12 @@ def resistance(bundle_: RunBundle, sim_id: int) -> np.ndarray | float:
             np.asarray(bundle_.y_grid, dtype=np.float64),
             R_base=float(params["R_c_base"]), R_amp=float(params["R_c_amp"]),
             y0=float(params["R_c_y0"]), sigma=float(params["R_c_sigma"]),
+        )
+    if all(k in names for k in ("R_c_base", "R_c_A")):
+        from src.physics.internal_source import make_rc_sin_profile
+        return make_rc_sin_profile(
+            np.asarray(bundle_.y_grid, dtype=np.float64),
+            R_base=float(params["R_c_base"]), A=float(params["R_c_A"]),
         )
     return float(params["R_c"])
 

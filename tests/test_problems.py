@@ -32,6 +32,14 @@ CONTRACTS = {
         in_ch=21, cond=13, has_fseq=False, token=2, t_stats=2,
         encoder=False, s_y=3, aug=False,
     ),
+    ("forcing_itr_sin", "temporal_encoder"): dict(
+        in_ch=5, cond=11, has_fseq=True, token=2, t_stats=2,
+        encoder=True, s_y=3, aug=True,
+    ),
+    ("forcing_itr_sin", "bins"): dict(
+        in_ch=21, cond=11, has_fseq=False, token=2, t_stats=2,
+        encoder=False, s_y=3, aug=False,
+    ),
     ("source", "temporal_encoder"): dict(
         in_ch=4, cond=6, has_fseq=True, token=2, t_stats=3,
         encoder=True, s_y=3, aug=False,
@@ -46,6 +54,14 @@ CONTRACTS = {
     ),
     ("source_itr", "bins"): dict(
         in_ch=21, cond=9, has_fseq=False, token=2, t_stats=3,
+        encoder=False, s_y=3, aug=False,
+    ),
+    ("source_itr_sin", "temporal_encoder"): dict(
+        in_ch=5, cond=7, has_fseq=True, token=2, t_stats=3,
+        encoder=True, s_y=3, aug=False,
+    ),
+    ("source_itr_sin", "bins"): dict(
+        in_ch=21, cond=7, has_fseq=False, token=2, t_stats=3,
         encoder=False, s_y=3, aug=False,
     ),
     ("interfaces", "temporal_encoder"): dict(
@@ -126,6 +142,14 @@ def source_dataset(synthetic_trajectories):
 def source_itr_dataset(synthetic_trajectories):
     trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
     spec = get_problem("source_itr")
+    sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
+    return _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
+
+
+@pytest.fixture
+def source_itr_sin_dataset(synthetic_trajectories):
+    trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+    spec = get_problem("source_itr_sin")
     sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
     return _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
 
@@ -691,6 +715,143 @@ class TestSourceItrValPairRow:
         assert "spatial_family" not in row
 
 
+# ===================== source_itr_sin adapter =====================
+
+class TestSourceItrSinItem:
+    def test_item_keys_shapes(self, source_itr_sin_dataset):
+        ds = source_itr_sin_dataset
+        spec = get_problem("source_itr_sin")
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        # source_itr_sin/temporal_encoder: 5-channel spatial (Rc_y at 4), cond 7.
+        assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, 5)
+        assert item["cond_static"].shape == (7,)
+        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
+        assert item["T_stats"].shape == (3,)
+
+    def test_rc_channel_index_is_4(self, source_itr_sin_dataset):
+        ds = source_itr_sin_dataset
+        spec = get_problem("source_itr_sin")
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        rc_channel = item["spatial"][:, :, 4]
+        np.testing.assert_allclose(
+            rc_channel,
+            np.broadcast_to(rc_channel[0:1, :], rc_channel.shape),
+            rtol=0, atol=0,
+        )
+
+    def test_rc_channel_matches_sin_log_norm_profile(self, source_itr_sin_dataset):
+        from problems.source_itr import rc_log_norm
+        from src.physics.internal_source import make_rc_sin_profile
+
+        ds = source_itr_sin_dataset
+        spec = get_problem("source_itr_sin")
+        sim_id, s, j = ds._pairs[0]
+        p = ds.sim_params[int(sim_id)]
+        item = spec.build_item(ds, sim_id, s, j)
+        expected = rc_log_norm(
+            make_rc_sin_profile(
+                ds.y_grid, R_base=float(p["R_c_base"]), A=float(p["R_c_A"]),
+            )
+        )
+        np.testing.assert_allclose(item["spatial"][0, :, 4], expected, rtol=0, atol=0)
+
+    def test_getitem_matches_build_item(self, source_itr_sin_dataset):
+        ds = source_itr_sin_dataset
+        spec = get_problem("source_itr_sin")
+        ref = ds[0]
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert set(item) == set(ref.keys())
+        for k in item:
+            np.testing.assert_allclose(item[k], ref[k].numpy(), rtol=0, atol=0)
+
+
+class TestSourceItrSinSchema:
+    def test_accepts_valid(self, source_itr_sin_dataset):
+        ds = source_itr_sin_dataset
+        get_problem("source_itr_sin").validate_schema(ds.sim_params, ds.sim_ids)
+
+    def test_rejects_void_keys(self):
+        spec = get_problem("source_itr_sin")
+        bad = np.array([{
+            "R_c": 0.5, "interface_x": 0.5, "x_h": 0.3, "y_h": 0.5,
+            "A": 5000.0, "t_off": 0.225, "w_h": 0.1, "h_h": 0.1,
+            "R_c_base": 0.5, "R_c_A": 0.5,
+            "R_c_amp": 0.5, "R_c_y0": 0.5, "R_c_sigma": 0.1,
+        }], dtype=object)
+        with pytest.raises(ValueError, match="forbidden keys"):
+            spec.validate_schema(bad, np.array([0]))
+
+
+class TestSourceItrSinSampleParity:
+    def test_sin_params_present_and_bounded(self, source_itr_sin_dataset):
+        from src.physics.internal_source import RC_SIN_RANGES, R_PEAK_MAX
+        ds = source_itr_sin_dataset
+        b_lo, b_hi = RC_SIN_RANGES["R_base"]
+        for p in ds.sim_params:
+            assert b_lo <= p["R_c_base"] <= b_hi
+            assert 0.0 <= p["R_c_A"] <= R_PEAK_MAX - p["R_c_base"] + 1e-9
+            assert p["R_c"] == pytest.approx(p["R_c_base"])
+            # Void keys must be absent (popped after the parent sampler).
+            assert "R_c_amp" not in p
+            assert "R_c_y0" not in p
+            assert "R_c_sigma" not in p
+
+    def test_patch_sampling_matches_source(self, synthetic_trajectories):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        src = get_problem("source")
+        sin = get_problem("source_itr_sin")
+        p_src = _adapter_sim_params(src, trajectories, x_grid, y_grid, t_grid)
+        p_sin = _adapter_sim_params(sin, trajectories, x_grid, y_grid, t_grid)
+        for a, b in zip(p_src, p_sin):
+            assert a["x_h"] == pytest.approx(b["x_h"])
+            assert a["y_h"] == pytest.approx(b["y_h"])
+            assert a["A"] == pytest.approx(b["A"])
+            assert a["regime"] == b["regime"]
+
+
+class TestSourceItrSinSolver:
+    def test_wires_per_row_interface_resistance(self, synthetic_trajectories):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = get_problem("source_itr_sin")
+        sim_params = _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid)
+        params = sim_params[0]
+        Nx = Ny = 20
+        xg = np.linspace(0.0, 1.0, Nx)
+        yg = np.linspace(0.0, 1.0, Ny)
+        X, Y = np.meshgrid(xg, yg, indexing="ij")
+        base_kwargs = dict(
+            a=0.0, b=1.0, c=0.0, d=1.0, Nx=Nx, Ny=Ny,
+            lam_target=0.8, layers=None, t_final=0.3,
+            flux_f=0.0, flux_A=0.0, t_on=0.0, t_off=0.2, phase=0.0,
+            dt=0.005, tukey_alpha=0.5, y_grid=yg, X=X, Y=Y,
+        )
+        solver = spec.configure_solver(params, base_kwargs)
+        assert isinstance(solver, FVSolver2D)
+        assert solver.source is not None
+        rc = solver.interface_R[0]
+        assert np.ndim(rc) == 1
+        assert np.shape(rc) == (Ny,)
+
+
+class TestSourceItrSinValPairRow:
+    def test_fields_and_row(self, source_itr_sin_dataset):
+        ds = source_itr_sin_dataset
+        spec = get_problem("source_itr_sin")
+        assert spec.val_pair_fields == ("x_h", "y_h", "A", "regime", "R_c_A")
+        sim_id, s, j = ds._pairs[0]
+        row = spec.val_pair_row(ds, sim_id, s, j)
+        assert set(row) == set(spec.val_pair_fields)
+        p = ds.sim_params[int(sim_id)]
+        assert row["R_c_A"] == pytest.approx(float(p["R_c_A"]))
+        assert "R_c_amp" not in row
+        assert "temporal_family" not in row
+
+
 class TestProblemFromConfig:
     @pytest.mark.parametrize(
         "name,cls",
@@ -1015,6 +1176,11 @@ OOD_AXIS_CONTRACTS = {
         "rc_y0": "simulation_parameter",
         "rc_severity": "compound",
     },
+    "source_itr_sin": {
+        "rc_base": "simulation_parameter",
+        "rc_A": "simulation_parameter",
+        "rc_severity": "compound",
+    },
     "interfaces": {
         "rc": "simulation_parameter",
         "interface_x": "simulation_parameter",
@@ -1062,6 +1228,8 @@ _ABLATION_KEYS = [
     ("source", "bins"),
     ("source_itr", "temporal_encoder"),
     ("source_itr", "bins"),
+    ("source_itr_sin", "temporal_encoder"),
+    ("source_itr_sin", "bins"),
 ]
 
 _ALL_MODES = ("full", "no_family", "spatial_field_only")
@@ -1382,7 +1550,10 @@ class TestSpatialConditioningApprovalGates:
         # to the same spec mode for every benchmark (auditable seed-matched runs).
         import yaml
 
-        for name in ("forcing", "forcing_itr", "source", "source_itr", "interfaces"):
+        for name in (
+            "forcing", "forcing_itr", "forcing_itr_sin",
+            "source", "source_itr", "source_itr_sin", "interfaces",
+        ):
             for mode in _ALL_MODES:
                 cfg = {"benchmark": {"name": name, "spatial_conditioning": mode}}
                 path = tmp_path / f"config_used_{name}_{mode}.yaml"

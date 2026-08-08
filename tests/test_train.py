@@ -352,6 +352,7 @@ class TestValidate:
             "R_c_amp",
             "R_c_y0",
             "R_c_sigma",
+            "R_c_A",
             "S_R",
         }
         assert {int(row["epoch"]) for row in rows} == {7}
@@ -370,6 +371,7 @@ class TestValidate:
                 "R_c_amp",
                 "R_c_y0",
                 "R_c_sigma",
+                "R_c_A",
             ):
                 assert row[empty_col] == ""
 

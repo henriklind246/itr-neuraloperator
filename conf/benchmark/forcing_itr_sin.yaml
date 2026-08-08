@@ -1,0 +1,16 @@
+# @package _global_
+
+benchmark:
+  name: forcing_itr_sin
+  rc_channel_mode: broadcast
+  # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
+  # spatial channel intact; cond_static_dim unchanged; ITR sin params retained):
+  #   full / no_family / spatial_field_only. See conf/benchmark/forcing.yaml.
+  spatial_conditioning: full
+
+training:
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.05
+    interface_weight: 15.0
+    per_sample_interface_x: false

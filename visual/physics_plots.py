@@ -465,7 +465,7 @@ def _itr_canonical_params(benchmark: str, itr_value: float,
         meta = {"itr_kind": "scalar_Rc", "itr_value": float(itr_value), "R_c": float(itr_value)}
         return params, meta
 
-    if benchmark in ("source", "source_itr"):
+    if benchmark in ("source", "source_itr", "source_itr_sin"):
         t_off = 0.75 * float(base_kwargs["t_final"])
         params = {
             "interface_x": 0.5,
@@ -477,11 +477,24 @@ def _itr_canonical_params(benchmark: str, itr_value: float,
             params["R_c"] = float(itr_value)
             meta = {"itr_kind": "scalar_Rc", "itr_value": float(itr_value), "R_c": float(itr_value)}
             return params, meta
+        R_c_base = 0.05
+        R_c_peak = min(float(itr_value), _ITR_R_PEAK_MAX)
+        if benchmark == "source_itr_sin":
+            # source_itr_sin: itr_value is the sinusoid peak R_c,peak = R_base + A
+            # (capped), so the amplitude is the excess over the base. Universal
+            # column rule holds: store R_c == R_c_base.
+            R_c_A = R_c_peak - R_c_base
+            params.update({
+                "R_c_base": R_c_base, "R_c_A": R_c_A, "R_c": R_c_base,
+            })
+            meta = {
+                "itr_kind": "Rc_peak", "itr_value": R_c_peak, "R_c": R_c_base,
+                "R_c_base": R_c_base, "R_c_A": R_c_A, "R_c_peak": R_c_peak,
+            }
+            return params, meta
         # source_itr: itr_value is the void peak R_c,peak (capped); amp is the
         # excess over the base, mirroring the benchmark's universal-column rule
         # of storing R_c == R_c_base.
-        R_c_base = 0.05
-        R_c_peak = min(float(itr_value), _ITR_R_PEAK_MAX)
         R_c_amp = R_c_peak - R_c_base
         params.update({
             "R_c_base": R_c_base, "R_c_amp": R_c_amp,
@@ -602,7 +615,11 @@ def plot_itr_temperature_jump_sweep(
 
     for benchmark in benchmarks:
         spec = get_problem(benchmark)
-        sweep_values = rc_peak_values if benchmark == "source_itr" else scalar_rc_values
+        sweep_values = (
+            rc_peak_values
+            if benchmark in ("source_itr", "source_itr_sin")
+            else scalar_rc_values
+        )
         panel_data[benchmark] = {t_req: {"x": [], "y": []} for t_req in requested_times}
 
         for itr_value in sweep_values:
@@ -676,7 +693,11 @@ def plot_itr_temperature_jump_sweep(
                     color=color, label=f"t = {t_req:.2f}",
                 )
             ax.set_title(benchmark)
-            ax.set_xlabel(r"$R_{c,\mathrm{peak}}$" if benchmark == "source_itr" else r"$R_c$")
+            ax.set_xlabel(
+                r"$R_{c,\mathrm{peak}}$"
+                if benchmark in ("source_itr", "source_itr_sin")
+                else r"$R_c$"
+            )
             ax.set_ylabel(r"mean $|\Delta T_{\mathrm{contact}}|$ [K]")
             ax.grid(True)
 

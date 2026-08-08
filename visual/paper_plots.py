@@ -45,7 +45,7 @@ from visual.dataset_plots import (
     _prepare_prediction_case,
     _resolve_layer_conductivities,
 )
-from src.physics.internal_source import make_rc_void_profile
+from src.physics.internal_source import make_rc_sin_profile, make_rc_void_profile
 
 
 TEMPORAL_ORDER = ("sin", "exp", "pulse_train", "exp_train")
@@ -60,6 +60,7 @@ _BENCHMARK_COLORS = {
     "source": "#E69F00",      # orange
     "interfaces": "#009E73",  # bluish green
     "source_itr": "#CC79A7",  # reddish purple
+    "source_itr_sin": "#9467BD",  # violet (sinusoid ITR variant)
 }
 _SAME_SIM_COLOR = "#0072B2"   # blue
 _UNSEEN_COLOR = "#D55E00"     # vermillion
@@ -111,7 +112,7 @@ _BENCHMARK_OVERVIEW_ROWS: dict[str, dict[str, str]] = {
 _INT_COLS = ("sim_id", "s", "j")
 _FLOAT_COLS = (
     "t_s", "t_bar", "R_c", "x_h", "y_h", "A", "freq",
-    "R_c_amp", "R_c_y0", "R_c_sigma",
+    "R_c_amp", "R_c_y0", "R_c_sigma", "R_c_A",
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
     "nrmse_pct", "rmse_K", "gnrmse_pct",
     "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
@@ -404,21 +405,29 @@ def _debug_scalar(value) -> float:
 
 
 def _source_itr_rc_profile(params: dict, y_grid: np.ndarray):
-    required = ("R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma")
-    if all(k in params for k in required):
+    y = np.asarray(y_grid, dtype=np.float64)
+    void_keys = ("R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma")
+    if all(k in params for k in void_keys):
         return make_rc_void_profile(
-            np.asarray(y_grid, dtype=np.float64),
+            y,
             R_base=float(params["R_c_base"]),
             R_amp=float(params["R_c_amp"]),
             y0=float(params["R_c_y0"]),
             sigma=float(params["R_c_sigma"]),
+        )
+    sin_keys = ("R_c_base", "R_c_A")
+    if all(k in params for k in sin_keys):
+        return make_rc_sin_profile(
+            y,
+            R_base=float(params["R_c_base"]),
+            A=float(params["R_c_A"]),
         )
     return float(params["R_c"])
 
 
 def _interface_R_for_sim(ds, sid: int):
     params = ds.sim_params[int(sid)]
-    if getattr(ds.problem, "name", "") == "source_itr":
+    if getattr(ds.problem, "name", "") in ("source_itr", "source_itr_sin"):
         return _source_itr_rc_profile(params, ds.y_grid)
     return float(params["R_c"])
 
@@ -455,8 +464,15 @@ def _selected_source_rows(records, ds=None, prefer_void: bool = False) -> list[t
         if prefer_void and ds is not None:
             idx = np.where(mask & np.isfinite(records["rel_l2_pct"]))[0]
             if idx.size:
+                # Severity key: void depth R_c_amp, or the sinusoid amplitude
+                # R_c_A when the void keys are absent (source_itr_sin).
                 amps = np.array([
-                    float(ds.sim_params[int(records["sim_id"][i])].get("R_c_amp", 0.0))
+                    float(
+                        ds.sim_params[int(records["sim_id"][i])].get(
+                            "R_c_amp",
+                            ds.sim_params[int(records["sim_id"][i])].get("R_c_A", 0.0),
+                        )
+                    )
                     for i in idx
                 ])
                 row = int(idx[int(np.argmax(amps))])
@@ -484,7 +500,7 @@ def _predict_phys_case(model, ds, sid: int, s: int, target_indices: np.ndarray, 
 def _slice_points_for_case(ds, sid: int) -> tuple[float, float]:
     params = ds.sim_params[int(sid)]
     name = getattr(ds.problem, "name", "")
-    if name in ("source", "source_itr"):
+    if name in ("source", "source_itr", "source_itr_sin"):
         return float(params["y_h"]), float(params["x_h"])
     if name == "forcing":
         spatial_params = params.get("spatial_params", {})

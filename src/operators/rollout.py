@@ -287,23 +287,19 @@ def _build_source_itr_rollout_item(
     spatial = out["spatial"]
     spatial[..., 0] = current
     # The R_c(y) channel (index 4) depends only on params and ds.y_grid, so
-    # _copy_item already carries it forward unchanged.
+    # _copy_item already carries it forward unchanged (any R_c(y) family).
     t_bar_norm = _subinterval_lead_feature(ds, t_lo, t_hi)
     x_center_range, y_center_range = source_problem._patch_center_ranges(
         float(ds.x_grid[0]), float(ds.x_grid[-1]),
         float(ds.y_grid[0]), float(ds.y_grid[-1]),
         float(params["w_h"]), float(params["h_h"]),
     )
-    out["cond_static"] = source_itr_problem.build_cond_vector_itr(
-        t_bar_norm=t_bar_norm,
-        R_base=float(params["R_c_base"]),
-        R_amp=float(params["R_c_amp"]),
-        y0=float(params["R_c_y0"]),
-        sigma=float(params["R_c_sigma"]),
-        x_h=float(params["x_h"]),
-        y_h=float(params["y_h"]),
-        w_h=float(params["w_h"]),
-        h_h=float(params["h_h"]),
+    # Route through the spec's cond hook so the sinusoid subclass (which
+    # conditions on [R_base, A] rather than the 4 void params) reuses this
+    # path without the rollout code branching on the interface family.
+    out["cond_static"] = problem._cond_vector(
+        params,
+        t_bar_norm=float(t_bar_norm),
         x_center_range=x_center_range,
         y_center_range=y_center_range,
         x_length_scale=float(ds.x_grid[-1] - ds.x_grid[0]),
@@ -363,7 +359,7 @@ def build_rollout_item_from_base(
         return _build_interfaces_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     if problem.name == "source":
         return _build_source_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
-    if problem.name == "source_itr":
+    if problem.name in ("source_itr", "source_itr_sin"):
         return _build_source_itr_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     raise ValueError(f"Unsupported benchmark for rollout: {problem.name!r}")
 

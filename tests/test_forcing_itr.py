@@ -11,9 +11,13 @@ from scripts import invert
 from scripts.inverse_adapters import ForcingItrAdapter, InverseAdapter
 from src.operators.fno2d import FNO2d
 from src.physics.internal_source import (
+    RC_MIN,
+    RC_SIN_RANGES,
+    R_PEAK_MAX,
     equivalent_scalar_resistance,
     integrated_excess_resistance,
     interface_control_volume_weights,
+    make_rc_sin_profile,
     make_rc_void_profile,
 )
 
@@ -169,6 +173,89 @@ def test_forcing_itr_zero_amp_encoding_is_finite():
     assert item["cond_static"][2] == pytest.approx(0.0)
 
 
+def _sample_pair_sin(num_sims=6, nx=12, ny=12, t_final=0.3, dt=0.005):
+    x = np.linspace(0.0, 1.0, nx)
+    y = np.linspace(0.0, 1.0, ny)
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    grids = {"X": X, "Y": Y, "x_grid": x, "y_grid": y}
+    time_cfg = {
+        "num_sims": num_sims, "dt": dt, "t_final": t_final,
+        "lhs_seed": 0, "forcing_profile_seed": 1,
+        "t_on": 0.0, "t_off": 0.2, "phase": 0.0, "tukey_alpha": 0.5,
+    }
+    forcing = get_problem("forcing")
+    sin = get_problem("forcing_itr_sin")
+    parent = forcing.sample_sim_params(
+        np.random.default_rng(0), np.random.default_rng(1), grids, time_cfg
+    )
+    spatial = sin.sample_sim_params(
+        np.random.default_rng(0), np.random.default_rng(1), grids, time_cfg
+    )
+    return forcing, sin, parent, spatial, grids, time_cfg
+
+
+def test_forcing_itr_sin_provenance_schema_and_bounds():
+    _, spec, parent, spatial, _, _ = _sample_pair_sin()
+    for index, (base, profile) in enumerate(zip(parent, spatial)):
+        assert profile["parent_benchmark"] == "forcing"
+        assert profile["parent_sim_id"] == index
+        assert profile["R_c_base"] == pytest.approx(base["R_c"])
+        assert "R_c_A" in profile
+        for key in ("R_c_amp", "R_c_y0", "R_c_sigma"):
+            assert key not in profile
+        R_base = float(profile["R_c_base"])
+        A = float(profile["R_c_A"])
+        assert 0.0 <= A <= R_PEAK_MAX - R_base + 1e-9
+    spec.validate_schema(np.asarray(spatial, dtype=object), np.arange(len(spatial)))
+
+
+@pytest.mark.parametrize("representation", ["temporal_encoder", "bins"])
+def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout(representation):
+    forcing, sin, parent, spatial, grids, _ = _sample_pair_sin()
+    parent_ds = _dataset(forcing, parent, grids, representation)
+    sin_ds = _dataset(sin, spatial, grids, representation)
+    parent_item = parent_ds.problem.build_item(parent_ds, 0, 0, 3)
+    sin_item = sin_ds.problem.build_item(sin_ds, 0, 0, 3)
+    # R_c(y) channel inserted at index 4; forcing channels otherwise identical.
+    np.testing.assert_array_equal(
+        sin_item["spatial"][..., :4], parent_item["spatial"][..., :4]
+    )
+    np.testing.assert_array_equal(
+        sin_item["spatial"][..., 5:], parent_item["spatial"][..., 4:]
+    )
+    # cond [t_bar, R_base, A, onehot(4), params(4)]; the block after the two
+    # sinusoid scalars matches the parent's block after its scalar R_c slot.
+    np.testing.assert_array_equal(
+        sin_item["cond_static"][3:], parent_item["cond_static"][2:]
+    )
+    assert sin_item["cond_static"].shape == (11,)
+    expected_ch = 5 if representation == "temporal_encoder" else 21
+    assert sin_item["spatial"].shape[-1] == expected_ch
+
+
+def test_forcing_itr_sin_schema_rejects_void_keys():
+    _, spec, _, spatial, _, _ = _sample_pair_sin(num_sims=2)
+    bad = copy.deepcopy(np.asarray(spatial, dtype=object))
+    bad[0]["R_c_amp"] = 0.5
+    with pytest.raises(ValueError, match="forbidden keys"):
+        spec.validate_schema(bad, np.array([0]))
+
+
+def test_forcing_itr_sin_solver_uses_sin_profile():
+    _, sin, _, spatial, grids, _ = _sample_pair_sin(num_sims=1, t_final=0.02)
+    kwargs = _base_kwargs(grids)
+    solver = sin.configure_solver(spatial[0], kwargs)
+    assert len(solver.interface_R) == 1
+    prof = np.asarray(solver.interface_R[0])
+    assert prof.shape == (len(grids["y_grid"]),)
+    expected = make_rc_sin_profile(
+        grids["y_grid"],
+        R_base=float(spatial[0]["R_c_base"]),
+        A=float(spatial[0]["R_c_A"]),
+    )
+    np.testing.assert_allclose(prof, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_fv_weights_severity_continuous_limit_and_general_domain_req():
     y = np.linspace(0.0, 1.0, 101)
     weights = interface_control_volume_weights(y, (0.0, 1.0))
@@ -196,6 +283,35 @@ def test_fv_weights_severity_continuous_limit_and_general_domain_req():
     assert equivalent_scalar_resistance(
         centers, np.full(3, 2.0), bounds=(-1.0, 2.0)
     ) == pytest.approx(2.0)
+
+
+def test_rc_sin_profile_invariants_peak_and_severity():
+    base_lo, base_hi = RC_SIN_RANGES["R_base"]
+    rng = np.random.default_rng(0)
+    y = np.linspace(0.0, 1.0, 100)  # deliberately excludes y = 0.5
+    for _ in range(16):
+        R_base = float(rng.uniform(base_lo, base_hi))
+        A = float(rng.uniform(0.0, 1.0) * (R_PEAK_MAX - R_base))
+        # Sampling invariants.
+        assert RC_MIN <= R_base <= R_PEAK_MAX
+        assert 0.0 <= A <= R_PEAK_MAX - R_base + 1e-12
+
+        profile = make_rc_sin_profile(y, R_base, A)
+        assert profile.min() >= RC_MIN - 1e-12
+        assert profile.max() <= R_PEAK_MAX + 1e-12
+        # A general grid need not contain y = 0.5, so the array max only bounds
+        # the true peak; assert the exact peak by evaluating at the point.
+        assert profile.max() <= R_base + A + 1e-12
+        peak = make_rc_sin_profile(np.array([0.5]), R_base, A)[0]
+        np.testing.assert_allclose(peak, R_base + A)
+
+        # Numeric FV severity vs analytic int_0^1 (R_c - R_base) dy = A * 2 / pi.
+        y_fine = np.linspace(0.0, 1.0, 401)
+        prof_fine = make_rc_sin_profile(y_fine, R_base, A)
+        computed = integrated_excess_resistance(
+            y_fine, prof_fine, R_base, bounds=(0.0, 1.0)
+        )
+        np.testing.assert_allclose(computed, A * 2.0 / np.pi, rtol=2e-3, atol=1e-6)
 
 
 def test_interface_weights_match_solver_dy():

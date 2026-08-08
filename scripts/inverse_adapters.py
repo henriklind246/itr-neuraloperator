@@ -13,15 +13,18 @@ from problems.source_itr import RC_Y_CHANNEL
 from src.physics.fv_solver_2d import Layer2D
 from src.physics.internal_source import (
     RC_MIN,
+    RC_SIN_RANGES,
     RC_VOID_RANGES,
     R_PEAK_MAX,
     equivalent_scalar_resistance,
     integrated_excess_resistance,
+    make_rc_sin_profile,
     make_rc_void_profile,
 )
 
 
 VOID_PARAM_NAMES = ("R_base", "R_amp", "y0", "sigma")
+SIN_PARAM_NAMES = ("R_base", "A")
 
 _GEN_DOMAIN = dict(a=0.0, b=1.0, c=0.0, d=1.0)
 _GEN_LAM_TARGET = 0.8
@@ -94,8 +97,10 @@ class InverseAdapter(ABC):
         name = bench.get("name", "forcing") if isinstance(bench, dict) else str(bench)
         adapters = {
             "source_itr": SourceItrAdapter,
+            "source_itr_sin": SourceItrSinAdapter,
             "forcing": ForcingAdapter,
             "forcing_itr": ForcingItrAdapter,
+            "forcing_itr_sin": ForcingItrSinAdapter,
         }
         adapter_cls = adapters.get(name)
         if adapter_cls is not None:
@@ -856,6 +861,251 @@ class ForcingItrAdapter(SourceItrAdapter):
         values = _to_numpy_theta(theta, self.theta_dim)
         y = y_grid.detach().cpu().numpy().astype(np.float64)
         profile = make_rc_void_profile(y, *values)
+        req = equivalent_scalar_resistance(
+            y, profile, bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
+        )
+        return float(values[0]), req
+
+    def build_scalar_fv_solver(
+        self, ds, sim_params: dict, resistance: float, base_kwargs: dict
+    ):
+        params = dict(sim_params)
+        params["R_c"] = float(resistance)
+        return ForcingProblem(self._representation(ds)).configure_solver(
+            params, base_kwargs
+        )
+
+    @staticmethod
+    def _representation(ds) -> str:
+        return str(getattr(ds.problem, "representation", "temporal_encoder"))
+
+
+class SourceItrSinAdapter(SourceItrAdapter):
+    """Inverse adapter for the sinusoid interface-resistance source benchmark.
+
+    Two parameters ``theta = (R_base, A)`` reparameterize ``source_itr``'s
+    Gaussian-void quartet. The unconstrained -> theta map mirrors the void's
+    ``R_base``/``R_amp`` pair (the dependent-amplitude construction is identical),
+    so the Jacobian is lower-triangular and ``theta_logabsdet_du`` reuses the
+    void's two diagonal log-det terms verbatim. All patch/IC bookkeeping is
+    inherited; only the theta-shaped hooks change. Conditioning uses the **global**
+    ``A_norm = A / (R_PEAK_MAX - RC_MIN)`` over ``RC_SIN_RANGES["A"]`` to match the
+    forward ``build_cond_vector_sin`` (NOT the headroom fraction).
+    """
+
+    benchmark = "source_itr_sin"
+    theta_dim = 2
+    param_names = SIN_PARAM_NAMES
+
+    @property
+    def default_profile_index(self) -> int:
+        return 1  # profile over A (depth), matching the void's R_amp default.
+
+    def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
+        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        s = torch.sigmoid(u)
+        R_base = base_lo + (base_hi - base_lo) * s[..., 0]
+        A = s[..., 1] * (R_PEAK_MAX - R_base)
+        return torch.stack([R_base, A], dim=-1)
+
+    def unconstrained_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        R_base = theta[..., 0]
+        A = theta[..., 1]
+        p_base = (R_base - base_lo) / (base_hi - base_lo)
+        ceil = (R_PEAK_MAX - R_base).clamp_min(_dtype_eps(theta.dtype))
+        p_A = A / ceil
+        return torch.stack([_logit(p_base), _logit(p_A)], dim=-1)
+
+    def theta_logabsdet_du(self, u: torch.Tensor) -> torch.Tensor:
+        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        sp = torch.nn.functional.softplus
+        u0, u1 = u[..., 0], u[..., 1]
+        R_base = base_lo + (base_hi - base_lo) * torch.sigmoid(u0)
+        # Lower-triangular map: only the two diagonal entries enter the
+        # determinant (the off-diagonal dA/du0 does not).
+        log_diag0 = float(np.log(base_hi - base_lo)) - sp(-u0) - sp(u0)
+        log_diag1 = torch.log(R_PEAK_MAX - R_base) - sp(-u1) - sp(u1)
+        return log_diag0 + log_diag1
+
+    def theta_from_sim_params(
+        self, sim_params: dict, *, dtype: torch.dtype = torch.float32, device=None
+    ) -> torch.Tensor:
+        return torch.tensor(
+            [float(sim_params["R_c_base"]), float(sim_params["R_c_A"])],
+            dtype=dtype,
+            device=device,
+        )
+
+    def cond_slice_indices(self) -> tuple[int, int]:
+        return (1, 3)
+
+    def cond_slice_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        A_lo, A_hi = RC_SIN_RANGES["A"]
+        R_base = theta[..., 0]
+        A = theta[..., 1]
+        R_base_norm = (R_base - base_lo) / (base_hi - base_lo)
+        A_norm = (A - A_lo) / (A_hi - A_lo)  # global norm (matches forward)
+        return torch.stack([R_base_norm, A_norm], dim=-1)
+
+    def spatial_channel_from_theta(
+        self, theta: torch.Tensor, y_grid: torch.Tensor, Nx: int
+    ) -> torch.Tensor:
+        R_base = theta[..., 0:1]
+        A = theta[..., 1:2]
+        y = y_grid.to(dtype=theta.dtype, device=theta.device)
+        Rc_y = R_base + A * torch.sin(np.pi * y)
+
+        log_min = float(np.log(RC_MIN))
+        log_max = float(np.log(R_PEAK_MAX))
+        Rc_y_norm = 2.0 * (torch.log(Rc_y) - log_min) / (log_max - log_min) - 1.0
+        return Rc_y_norm.unsqueeze(-2).expand(*Rc_y_norm.shape[:-1], Nx, y.shape[0])
+
+    def inject_theta_into_sim_params(self, sim_params: dict, theta) -> dict:
+        th = _to_numpy_theta(theta, self.theta_dim)
+        params = dict(sim_params)
+        params["R_c_base"] = float(th[0])
+        params["R_c_A"] = float(th[1])
+        params["R_c"] = float(th[0])
+        return params
+
+    def validate_dataset(self, ds) -> None:
+        if getattr(ds.problem, "name", None) != self.benchmark:
+            raise ValueError(
+                f"SourceItrSinAdapter expected dataset benchmark "
+                f"{self.benchmark!r}, got {getattr(ds.problem, 'name', None)!r}."
+            )
+        if getattr(ds.problem, "rc_channel_mode", None) != "broadcast":
+            raise ValueError(
+                f"{self.benchmark} inversion only supports "
+                f"rc_channel_mode='broadcast'; got "
+                f"{getattr(ds.problem, 'rc_channel_mode', None)!r}."
+            )
+        first_sid = int(ds.sim_ids[0])
+        sample = ds.problem.build_item(ds, first_sid, 0, min(1, ds.Nt - 1))
+        spatial_channels = int(sample["spatial"].shape[-1])
+        if ds.problem.dims.in_channels != spatial_channels:
+            raise ValueError(
+                f"Dataset spatial schema has {spatial_channels} channels, "
+                f"expected {ds.problem.dims.in_channels}."
+            )
+        required = {"R_c_base", "R_c_A"}
+        missing = required - set(dict(ds.sim_params[first_sid]).keys())
+        if missing:
+            raise ValueError(
+                f"{self.benchmark} sim_params missing keys: {sorted(missing)}"
+            )
+
+    def profile_bounds(self, param_index: int) -> tuple[float, float]:
+        if param_index == 0:
+            return tuple(RC_SIN_RANGES["R_base"])
+        if param_index == 1:
+            return (0.0, R_PEAK_MAX - RC_MIN)
+        raise ValueError(f"profile param_index {param_index} out of range")
+
+    def theta_profile(
+        self, u: torch.Tensor, fixed_index: int, fixed_value: float
+    ) -> torch.Tensor:
+        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        s = torch.sigmoid(u)
+        if fixed_index == 1:
+            A = torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
+            base_ceiling = min(base_hi, R_PEAK_MAX - float(fixed_value))
+            R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
+        else:
+            R_base = (
+                torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
+                if fixed_index == 0
+                else base_lo + (base_hi - base_lo) * s[..., 0]
+            )
+            A = s[..., 1] * (R_PEAK_MAX - R_base)
+        return torch.stack([R_base, A], dim=-1)
+
+    def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
+        R_base, A = theta[0].item(), theta[1].item()
+        y = y_grid.detach().cpu().numpy().astype(np.float64)
+        profile = make_rc_sin_profile(y, R_base, A)
+        return integrated_excess_resistance(
+            y, profile, R_base,
+            bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"]),
+        )
+
+    def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
+        out = {
+            "loss": result.loss,
+            "R_base_hat": float(result.theta_hat[0]),
+            "A_hat": float(result.theta_hat[1]),
+            "excess_int_hat": self.uq_quantity(result.theta_hat, y_grid),
+        }
+        if result.theta_true is not None:
+            t = result.theta_true
+            out.update(
+                {
+                    "R_base_true": float(t[0]),
+                    "A_true": float(t[1]),
+                    "excess_int_true": self.uq_quantity(t, y_grid),
+                    "R_base_abserr": abs(float(result.theta_hat[0]) - float(t[0])),
+                    "A_abserr": abs(float(result.theta_hat[1]) - float(t[1])),
+                }
+            )
+            out["excess_int_abserr"] = abs(
+                out["excess_int_hat"] - out["excess_int_true"]
+            )
+        return out
+
+
+class ForcingItrSinAdapter(SourceItrSinAdapter):
+    """Inverse adapter for the sinusoid interface-resistance forcing benchmark.
+
+    Mirrors :class:`ForcingItrAdapter` for the 2-param sinusoid: reuses the
+    forcing FV domain/layers, exposes the equivalent-scalar diagnostic on the
+    sin profile, and builds the scalar comparison solver through
+    :class:`ForcingProblem`.
+    """
+
+    benchmark = "forcing_itr_sin"
+
+    @property
+    def supports_equivalent_scalar(self) -> bool:
+        return True
+
+    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
+        return ForcingAdapter().fv_base_kwargs(ds, grid_size=grid_size)
+
+    def validate_dataset(self, ds) -> None:
+        if getattr(ds.problem, "name", None) != self.benchmark:
+            raise ValueError(
+                f"ForcingItrSinAdapter expected dataset benchmark "
+                f"{self.benchmark!r}, got {getattr(ds.problem, 'name', None)!r}."
+            )
+        if getattr(ds.problem, "rc_channel_mode", None) != "broadcast":
+            raise ValueError(
+                f"{self.benchmark} inversion only supports "
+                f"rc_channel_mode='broadcast'."
+            )
+        first_sid = int(ds.sim_ids[0])
+        sample = ds.problem.build_item(ds, first_sid, 0, min(1, ds.Nt - 1))
+        if int(sample["spatial"].shape[-1]) != ds.problem.dims.in_channels:
+            raise ValueError(
+                f"{self.benchmark} dataset spatial schema does not match its spec."
+            )
+        required = {
+            "R_c_base", "R_c_A",
+            "temporal_family", "temporal_params", "spatial_family", "spatial_params",
+        }
+        missing = required - set(dict(ds.sim_params[first_sid]))
+        if missing:
+            raise ValueError(
+                f"{self.benchmark} sim_params missing keys: {sorted(missing)}"
+            )
+
+    def equivalent_scalar_values(
+        self, theta: torch.Tensor, y_grid: torch.Tensor
+    ) -> tuple[float, float]:
+        values = _to_numpy_theta(theta, self.theta_dim)
+        y = y_grid.detach().cpu().numpy().astype(np.float64)
+        profile = make_rc_sin_profile(y, float(values[0]), float(values[1]))
         req = equivalent_scalar_resistance(
             y, profile, bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
         )

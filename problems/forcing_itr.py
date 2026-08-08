@@ -178,6 +178,22 @@ class ForcingItrProblem(ForcingProblem):
             sigma=float(params["R_c_sigma"]),
         )
 
+    def _cond_vector(self, params: dict, parent_cond: np.ndarray) -> np.ndarray:
+        """Insert the interface-family conditioning into the parent cond vector.
+
+        Required override point: subclasses whose interface family conditions on
+        a different parameter set (e.g. the 2-param sinusoid) override only this
+        hook so `build_item` stays inherited and cannot drift from the spatial
+        R_c(y) channel built via `_canonical_profile`.
+        """
+        return build_cond_vector_forcing_itr(
+            parent_cond,
+            R_base=float(params["R_c_base"]),
+            R_amp=float(params["R_c_amp"]),
+            y0=float(params["R_c_y0"]),
+            sigma=float(params["R_c_sigma"]),
+        )
+
     def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
         physics = self.physics_parameters(
             base_kwargs["a"], base_kwargs["b"],
@@ -246,13 +262,7 @@ class ForcingItrProblem(ForcingProblem):
             ],
             axis=-1,
         ).astype(np.float32)
-        parent["cond_static"] = build_cond_vector_forcing_itr(
-            parent["cond_static"],
-            R_base=float(params["R_c_base"]),
-            R_amp=float(params["R_c_amp"]),
-            y0=float(params["R_c_y0"]),
-            sigma=float(params["R_c_sigma"]),
-        )
+        parent["cond_static"] = self._cond_vector(params, parent["cond_static"])
         parent["cond_static"] = self._apply_spatial_conditioning_mask(
             parent["cond_static"]
         )

@@ -33,6 +33,8 @@ ROLLOUT_CASES = [
     ("source", "bins"),
     ("source_itr", "temporal_encoder"),
     ("source_itr", "bins"),
+    ("source_itr_sin", "temporal_encoder"),
+    ("source_itr_sin", "bins"),
 ]
 
 
