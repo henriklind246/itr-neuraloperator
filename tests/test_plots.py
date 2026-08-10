@@ -154,9 +154,8 @@ class TestPlotRegistry:
             assert _common.PLOT_REGISTRY[name] == "interfaces"
         assert "interfaces" in _common.GROUPS
 
-    def test_bc_verification_and_sweep_hyperparams_registered(self):
+    def test_bc_verification_registered(self):
         assert _common.PLOT_REGISTRY["bc_verification"] == "physics"
-        assert _common.PLOT_REGISTRY["sweep_hyperparams"] == "sweep"
 
     def test_itr_temperature_jump_sweep_registered(self):
         assert _common.PLOT_REGISTRY["itr_temperature_jump_sweep"] == "physics"
@@ -174,7 +173,6 @@ class TestPlotRegistry:
         for name in [
             "benchmark_overview",
             "all_benchmarks_tail_errors",
-            "generalization_same_vs_unseen",
         ]:
             assert _common.PLOT_REGISTRY[name] == "paper"
             assert name in _common._plots_for_group("paper")
@@ -1876,143 +1874,3 @@ class TestBenchmarkOverview:
         result = paper_plots.plot_benchmark_overview(save_path=out_path)
         assert out_path.exists()
         assert result == out_path
-
-
-def _gen_records(t_bar, *, benchmark="forcing", sim_ids=None, seed=0,
-                 metrics=("rmse_K", "node_jump_gnrmse_pct")):
-    """Build a loaded-records-style dict for the generalization helpers."""
-    t_bar = np.asarray(t_bar, dtype=np.float64)
-    n = int(t_bar.size)
-    rng = np.random.default_rng(seed)
-    rec = {
-        "_n": np.int64(n),
-        "t_bar": t_bar,
-        "benchmark": np.array([benchmark] * n, dtype=object),
-    }
-    for m in metrics:
-        rec[m] = rng.uniform(1.0, 5.0, n)
-    if sim_ids is not None:
-        rec["sim_id"] = np.asarray(sim_ids)
-    return rec
-
-
-class TestGeneralizationHelpers:
-    def test_shared_edges_drive_both_metric_panels(self):
-        same = _gen_records(np.linspace(0.0, 0.30, 12), seed=1)
-        unseen = _gen_records(np.linspace(0.05, 0.35, 12), seed=2)
-        info = paper_plots._compute_shared_lead_bin_edges(same, unseen, n_lead_bins=4)
-        edges = info["lead_bin_edges"]
-
-        union = np.concatenate([same["t_bar"], unseen["t_bar"]])
-        expected = np.unique(np.quantile(union, np.linspace(0.0, 1.0, 5)))
-        assert np.allclose(edges, expected)
-        assert info["n_effective_bins"] == edges.size - 1
-
-        # One binning shared across metrics: identical edges -> identical per-bin
-        # counts for two fully-present metrics.
-        s1 = paper_plots._compute_generalization_by_lead_bin(
-            same, unseen, benchmark="forcing", metric="rmse_K", lead_bin_edges=edges)
-        s2 = paper_plots._compute_generalization_by_lead_bin(
-            same, unseen, benchmark="forcing", metric="node_jump_gnrmse_pct",
-            lead_bin_edges=edges)
-        assert np.array_equal(s1["same_sim_counts"], s2["same_sim_counts"])
-        assert np.array_equal(s1["unseen_counts"], s2["unseen_counts"])
-
-    def test_tied_quantiles_collapse_bins(self):
-        tied = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
-        info = paper_plots._compute_shared_lead_bin_edges(
-            _gen_records(tied, seed=3), _gen_records(tied, seed=4), n_lead_bins=4)
-        assert info["n_effective_bins"] < 4
-        assert info["lead_bin_edges"].size == info["n_effective_bins"] + 1
-
-    def test_fewer_than_two_distinct_tbar_raises(self):
-        const = np.full(6, 0.2)
-        with pytest.raises(ValueError, match="two distinct t_bar"):
-            paper_plots._compute_shared_lead_bin_edges(
-                _gen_records(const, seed=5), _gen_records(const, seed=6))
-
-    def test_empty_record_set_raises(self):
-        ok = _gen_records(np.linspace(0.0, 0.3, 8), seed=7)
-        empty = _gen_records(np.array([]), seed=8)
-        with pytest.raises(ValueError, match="finite t_bar"):
-            paper_plots._compute_shared_lead_bin_edges(ok, empty)
-
-    def test_empty_bin_yields_zero_count_and_nan(self):
-        # Same-sim t_bar all in [0, 1); hand-made edges put bins 2,3 empty.
-        same = _gen_records(np.linspace(0.0, 0.9, 10), seed=9)
-        unseen = _gen_records(np.linspace(0.0, 2.9, 10), seed=10)
-        edges = np.array([0.0, 1.0, 2.0, 3.0])
-        stats = paper_plots._compute_generalization_by_lead_bin(
-            same, unseen, benchmark="forcing", metric="rmse_K", lead_bin_edges=edges)
-        assert stats["same_sim_counts"][1] == 0
-        assert np.isnan(stats["same_sim_median"][1])
-
-    def test_benchmark_mismatch_raises(self):
-        same = _gen_records(np.linspace(0.0, 0.3, 6), benchmark="source", seed=11)
-        unseen = _gen_records(np.linspace(0.0, 0.3, 6), benchmark="forcing", seed=12)
-        edges = np.array([0.0, 0.15, 0.3])
-        with pytest.raises(ValueError, match="does not match requested"):
-            paper_plots._compute_generalization_by_lead_bin(
-                same, unseen, benchmark="forcing", metric="rmse_K", lead_bin_edges=edges)
-
-    def test_record_set_spanning_multiple_benchmarks_raises(self):
-        mixed = _gen_records(np.linspace(0.0, 0.3, 6), seed=13)
-        mixed["benchmark"] = np.array(
-            ["forcing", "source", "forcing", "source", "forcing", "source"], dtype=object)
-        with pytest.raises(ValueError, match="span multiple benchmarks"):
-            paper_plots._assert_single_benchmark(mixed, "forcing")
-
-    def test_missing_benchmark_column_is_accepted(self):
-        rec = _gen_records(np.linspace(0.0, 0.3, 6), seed=14)
-        del rec["benchmark"]
-        # No column -> kwarg stands alone, no raise.
-        paper_plots._assert_single_benchmark(rec, "forcing")
-
-
-class TestGeneralizationFigure:
-    def test_returns_path_not_tuple(self, tmp_path):
-        same = _gen_records(np.linspace(0.0, 0.30, 14), sim_ids=range(14), seed=20)
-        unseen = _gen_records(np.linspace(0.05, 0.35, 14),
-                              sim_ids=range(100, 114), seed=21)
-        out_path = tmp_path / "generalization_same_vs_unseen.png"
-        result = paper_plots.plot_generalization_same_vs_unseen(
-            same, unseen, benchmark="forcing", save_path=out_path)
-        assert isinstance(result, Path)
-        assert out_path.exists()
-
-    def test_sim_id_overlap_raises(self, tmp_path):
-        same = _gen_records(np.linspace(0.0, 0.3, 10), sim_ids=range(10), seed=22)
-        unseen = _gen_records(np.linspace(0.05, 0.35, 10), sim_ids=range(5, 15), seed=23)
-        with pytest.raises(ValueError, match="share sim_ids"):
-            paper_plots.plot_generalization_same_vs_unseen(
-                same, unseen, benchmark="forcing",
-                save_path=tmp_path / "gen.png")
-
-    def test_sim_id_absent_skips_guard(self, tmp_path):
-        # No sim_id column on either set -> disjointness guard skipped, renders.
-        same = _gen_records(np.linspace(0.0, 0.30, 12), seed=24)
-        unseen = _gen_records(np.linspace(0.05, 0.35, 12), seed=25)
-        out_path = tmp_path / "gen_no_simid.png"
-        result = paper_plots.plot_generalization_same_vs_unseen(
-            same, unseen, benchmark="forcing", save_path=out_path)
-        assert result == out_path
-        assert out_path.exists()
-
-
-class TestGeneralizationCLI:
-    def test_single_records_flag_prints_skip(self, tmp_path, monkeypatch, capsys):
-        import sys
-
-        from visual import cli
-
-        argv = [
-            "cli.py", "--plots", "generalization_same_vs_unseen",
-            "--out", str(tmp_path),
-            "--records-same-sim", str(tmp_path / "same.csv"),
-        ]
-        monkeypatch.setattr(sys, "argv", argv)
-        cli.main()
-        out = capsys.readouterr().out
-        assert "Skipping generalization_same_vs_unseen" in out
-        assert "--records-unseen" in out
-        assert "--generalization-benchmark" in out

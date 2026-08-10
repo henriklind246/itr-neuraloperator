@@ -34,7 +34,7 @@ Currently, `requirements.txt` is the safest install source. `pyproject.toml` doe
 ## Workflow Overview
 
 1. Generate simulation data with [data/generate_dataset.py](data/generate_dataset.py).
-2. Train a model or run a sweep with [scripts/run_train.py](scripts/run_train.py) or [src/operators/train.py](src/operators/train.py).
+2. Train a model with [scripts/run_train_fixed.py](scripts/run_train_fixed.py) or [src/operators/train.py](src/operators/train.py).
 3. Evaluate saved checkpoints with [src/operators/eval.py](src/operators/eval.py).
 4. Generate plots with [visual/cli.py](visual/cli.py) (per-group plot modules under `visual/`).
 
@@ -43,11 +43,10 @@ Currently, `requirements.txt` is the safest install source. `pyproject.toml` doe
 These are the current entry points that correspond to runnable code:
 
 - `python data/generate_dataset.py`
-- `python scripts/run_train.py -m`
+- `python scripts/run_train_fixed.py experiment.name=<name> config_id=0`
 - `python -m src.operators.train`
 - `python -m src.operators.eval`
 - `python -m visual.cli ...`
-- `python scripts/collect_best_config.py`
 
 These files are present but currently empty and should not be treated as working entry points:
 
@@ -76,18 +75,17 @@ Currently, the files are written to the working directory, so running from the r
 
 ## Training
 
-### 7a. Hydra Sweep Workflow
+### Fixed-Config Training
 
-[scripts/run_train.py](scripts/run_train.py) is the current entry point for Hydra-based sweeps. Hydra handles multirun orchestration and output management, while Optuna is the hyperparameter search engine used by the Hydra sweeper. Optuna proposes trial parameter combinations from the configured search space in [conf/search_space/medium.yaml](conf/search_space/medium.yaml), and each Hydra job corresponds to one Optuna trial. The sweeper configuration lives in [conf/hydra/sweeper/optuna_local.yaml](conf/hydra/sweeper/optuna_local.yaml), and the optimization objective is the configured mean best validation score across seeds from [conf/config.yaml](conf/config.yaml).
-
-Each invocation gets an experiment namespace such as `experiment0`. Each job is written under `runs/<experiment>/conf<job_num>/`, and each seed for that configuration is written under `seed<seed>/`. Resolved configs, JSON summaries, rankings, and `best_config.yaml` are written under `conf/generated/<experiment>/`.
+[scripts/run_train_fixed.py](scripts/run_train_fixed.py) loads the main YAML
+config, accepts dotted `key=value` overrides, and writes each seed below
+`runs/<experiment>/config<config_id>/`.
 
 ```bash
-python scripts/run_train.py -m
-python scripts/run_train.py -m tuning.n_trials=10
+python scripts/run_train_fixed.py experiment.name=forcing_screen config_id=0
 ```
 
-### 7b. Direct Training Module
+### Direct Training Module
 
 [src/operators/train.py](src/operators/train.py) is the lower-level training entry point. It loads [conf/config.yaml](conf/config.yaml), expects the dataset files to already exist, trains all configured seeds, and writes per-seed checkpoints together with `train_metrics.csv`.
 
@@ -107,7 +105,7 @@ Currently, the module `__main__` assumes `runs/experiment0/config0`, which is a 
 
 ## Plot Generation
 
-[visual/cli.py](visual/cli.py) provides the current plot-generation CLI. It supports grouped outputs for `physics`, `mms`, `training`, `data`, and `sweep`. Each group's plot functions live in its own module under `visual/` (`physics_plots.py`, `mms_plots.py`, `training_plots.py`, `dataset_plots.py`, `sweep_plots.py`); shared helpers live in `visual/_common.py`.
+[visual/cli.py](visual/cli.py) provides the current plot-generation CLI. It supports grouped outputs for physics, MMS, training, data, forcing, source, interfaces, evaluation, and inverse workflows. Each group's plot functions live in its own module under `visual/`; shared helpers live in `visual/_common.py`.
 
 Important flags:
 
@@ -138,10 +136,9 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 
 ## Configuration and Outputs
 
-- [conf/config.yaml](conf/config.yaml) is the main training and sweep configuration.
+- [conf/config.yaml](conf/config.yaml) is the main training configuration.
 - [conf/paths/default.yaml](conf/paths/default.yaml) defines the main path settings.
 - `runs/` stores training outputs and checkpoints.
-- `conf/generated/` stores resolved configs, trial summaries, rankings, and `best_config.yaml`.
 - `data/` is the intended home for generated datasets, even though the current direct generation script writes to the working directory.
 
 `PROJECT_ROOT` is used by the config system for path resolution and is set by the training wrapper when applicable.
@@ -155,8 +152,7 @@ Some plots require extra inputs and will be skipped if the relevant arguments ar
 - [src/operators/fno1d.py](src/operators/fno1d.py): Fourier Neural Operator model
 - [src/operators/train.py](src/operators/train.py): direct training module
 - [src/operators/eval.py](src/operators/eval.py): checkpoint evaluation and reporting
-- [scripts/run_train.py](scripts/run_train.py): Hydra + Optuna sweep entry point
-- [scripts/collect_best_config.py](scripts/collect_best_config.py): rebuild generated config rankings
+- [scripts/run_train_fixed.py](scripts/run_train_fixed.py): fixed-config training with dotted overrides
 - [visual/cli.py](visual/cli.py): plot-generation CLI (dispatches to per-group modules in `visual/`)
 - [conf/config.yaml](conf/config.yaml): main configuration
 - [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md): deeper technical overview

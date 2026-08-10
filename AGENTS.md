@@ -83,15 +83,12 @@ Before changing architecture, losses, or data encoding:
 - Inspect the run artifacts that match the exact code/data/config being
   discussed: `config_used.yaml` (check the `benchmark` and `representation`
   values), `train_metrics.csv`, `diagnostics.csv`, `val_pairs.csv`,
-  `final_metrics.json`, and any same-sim held-out result.
+  and `final_metrics.json`.
 - Use `scripts/inspect_val_pairs.py` to stratify validation error. It is
   benchmark-aware: it emits universal stratifications (lead time, `t_s`, `R_c`,
   sim ID) plus the active benchmark's `val_pair_fields`.
-- Use `scripts/eval_same_sim_holdout.py` when deciding whether the gap is mostly
-  simulation-level generalization or a failure to learn the forcing/time
-  representation even within seen simulations.
-- Do not treat old `conf/generated/*` or old run folders as authoritative
-  unless their `config_used.yaml`, git status, dataset shape, and `(benchmark,
+- Do not treat old run folders as authoritative unless their
+  `config_used.yaml`, git status, dataset shape, and `(benchmark,
   representation)` contracts match the current code path.
 
 Experiment turnaround is a core constraint. A 100-epoch run on 5 A100s has been
@@ -312,7 +309,7 @@ one `R_c(y)` channel (spatial index 4) on top of `source`.
   on the defaults.
 - **Spectral mode invariant**: `2 · modes1 ≤ Nx_freq`. Always use distinct
   `modes1` and `modes2`. No bare `modes` key — that was 1D-only and has been
-  removed from search spaces.
+  removed from the 2D configuration.
 - The model has **no benchmark-specific branches** beyond what flows through
   `cond_static`, `forcing_seq`, and the spatial channels. New families or
   benchmarks are added by extending the boundary-forcing / source registries and
@@ -332,11 +329,10 @@ one `R_c(y)` channel (spatial index 4) on top of `source`.
   eval in `src/operators/eval.py`, losses in `src/operators/losses.py`
 - Data: `data/generate_dataset.py`, `data/dataset.py`
 - Config: `conf/config.yaml`, `conf/benchmark/*.yaml`,
-  `conf/representation/*.yaml` (+ `conf/search_space/*.yaml` for Optuna sweeps)
-- Entry scripts: `scripts/run_train_fixed.py`, `scripts/run_train.py`
+  `conf/representation/*.yaml`
+- Entry script: `scripts/run_train_fixed.py`
 - Experiment diagnostics: `scripts/inspect_val_pairs.py` (benchmark-aware),
-  `scripts/eval_same_sim_holdout.py`, `scripts/run_eval.py`,
-  `scripts/write_test_records.py`, `visual/*.py`
+  `scripts/run_eval.py`, `scripts/write_test_records.py`, `visual/*.py`
 - Cluster: `slurm/*.sbatch`
 - Tests: `tests/test_*.py` (`pytest tests/` from repo root; `test_problems.py`
   is the contract table's source of truth)
@@ -355,8 +351,7 @@ the concern. Do not split a single concern across new modules.
    `get_problem(...)` / `problem_from_config(...)`; do not assume a fixed shape.
 3. Locate the existing function/class that owns the concern; edit there. For
    benchmark-specific behavior, edit the relevant `ProblemSpec`.
-4. If a config knob changes, add a default in `conf/config.yaml`. If the knob
-   should be sweepable, add it to a relevant `conf/search_space/*.yaml`.
+4. If a config knob changes, add a default in `conf/config.yaml`.
 5. Update or add a test under `tests/` for any solver, loss, dataset, or
    model change. Contract changes must update `tests/test_problems.py`.
 6. Run `pytest tests/ -q` before claiming the change works.

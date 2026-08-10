@@ -6,36 +6,44 @@ import torch.nn.functional as F
 # -------- Time-conditioned 2d FNO --------
 #
 # Operator-learning task:
-# G(T(x, y, t_s), x, y, s_y, Q_y_bins, cond_static, forcing_seq) -> T(x, y, t_j)
+# G(T(x, y, t_s), cond_static, forcing_seq) -> T(x, y, t_j)
 #
-# where t_bar = t_j - t_s is the lead time and
-# T is the globally normalized temperature (using fixed mu_global, sig_global per training set).
-# spatial input carries 4 base channels + 16 fixed temporal-forcing integral bins
-# (Q_y_bins(x, y, k) = s_y(y) * ∫a(t)dt over the k-th subinterval of [t_s, t_j], /q_ref).
-# h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways in addition to the bins:
-#   1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s_y(y) * z_{a,k} is concatenated
-#      to spatial input as K extra channels (learned spatial pathway).
-#   2. Global: [cond_static, h_a] drives Conditional Instance Normalization.
-# forcing_cond_mode gates which of these two pathways h_a feeds (both | spatial_only |
-# cond_only), the Q1 forcing-routing ablation.
+# where t_bar = t_j - t_s is the lead time and T is the globally normalized
+# temperature (fixed mu_global, sig_global per training set).
+#
+# The concrete tensor shapes are NOT fixed here: every model-facing dim
+# (in_channels, cond_static_dim, temporal_token_dim, s_y_channel, and the
+# use_temporal_encoder / use_forcing_time_aug toggles) is owned by the
+# ProblemDims of the active (benchmark, representation) pair and passed in at
+# construction. See problems/base.py and problems/<benchmark>.py, and the
+# contract table in CLAUDE.md / tests/test_problems.py.
+#
+# Two input representations share this model:
+#   - temporal_encoder (default): the spatial input carries only lean base
+#     channels (e.g. forcing: [T̃, x_norm, y_norm, s_y]); the temporal branch is
+#     ON. h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways:
+#       1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s(y) * z_{a,k} is
+#          concatenated to the spatial input as K learned forcing channels.
+#       2. Global: [cond_static, h_a] drives Conditional Instance Normalization.
+#     forcing_cond_mode gates which pathway h_a feeds (both | spatial_only |
+#     cond_only), the Q1 forcing-routing ablation.
+#   - bins: the spatial input additionally carries 16 fixed integral forcing
+#     bins (Q_y_bins(x, y, k) = s(y) * ∫a(t)dt over the k-th subinterval of
+#     [t_s, t_j], /q_ref); the temporal branch is OFF and forcing_seq is empty,
+#     so CIN is driven by cond_static alone.
 
 
 # --------- SpectralConv2d ---------
 
 class SpectralConv2d(nn.Module):
-    """2D Fourier convolution: FFT → mode-wise channel mixing → IFFT.
+    """2D Fourier convolution: FFT → mode-wise channel mixing → IFFT."""
 
-    When ``spectral_dropout > 0``, random Fourier modes are zeroed during
-    training, preventing the model from relying on specific frequencies.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2:int, spectral_dropout: float = 0.0):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2:int):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.modes1 = modes1
         self.modes2 = modes2
-        self.spectral_dropout = spectral_dropout
 
         self.scale = 1.0 / (in_channels * out_channels)
         # Stored as real (..., 2) rather than cfloat: torch.distributed cannot
@@ -80,7 +88,9 @@ class SpectralConv2d(nn.Module):
         weights1 = torch.view_as_complex(self.weights1)
         weights2 = torch.view_as_complex(self.weights2)
 
-        out_ft = torch.zeros(x.size(0), self.out_channels, Nx_freq, Ny_freq, dtype=torch.cfloat, device=x.device)
+        # Inherit dtype/device from x_ft so float64 inputs keep complex128
+        # precision instead of being silently downcast to complex64.
+        out_ft = x_ft.new_zeros(x.size(0), self.out_channels, Nx_freq, Ny_freq)
         # positive modes
         out_ft[:, :, :mx, :my] = self.compl_mul2d(x_ft[:, :, :mx, :my], weights1[:, :, :mx, :my])
         # negative modes
@@ -88,18 +98,6 @@ class SpectralConv2d(nn.Module):
         # mx and my are still used for weights2 simply because the slice is still shape (B, C_in, mx, my) so its just
         # illustrating the size of the weight2 learnable tensor
         out_ft[:, :, -mx:, :my] = self.compl_mul2d(x_ft[:, :, -mx:, :my], weights2[:, :, :mx, :my])
-
-        # Spectral dropout: randomly zero modes during training.
-        # Matches fno1d.SpectralConv1d: no inverse-scaling by 1/(1-p), so
-        # training-time spectral magnitude is attenuated vs eval. Intentional
-        # (mirrors the 1D baseline); kept consistent across 1D/2D.
-        if self.training and self.spectral_dropout > 0:
-            mask_x = (torch.rand(mx, device=x.device) >= self.spectral_dropout).to(out_ft.dtype)
-            mask_y = (torch.rand(my, device=x.device) >= self.spectral_dropout).to(out_ft.dtype)
-            mask = mask_x[:, None] * mask_y[None, :]
-            out_ft[:, :, :mx, :my] = out_ft[:, :, :mx, :my] * mask
-            out_ft[:, :, -mx:, :my] = out_ft[:, :, -mx:, :my] * mask
-
 
         # IFFT back to physical space
         return torch.fft.irfft2(out_ft, s=(Nx, Ny), dim=(-2, -1))
@@ -216,16 +214,28 @@ class FNO2d(nn.Module):
     Forward signature:
         model(spatial, cond_static, forcing_seq) → y_pred
 
-    spatial      : (B, Nx, Ny, 20)       — T̃(x, y, t_s), x_norm, y_norm, s_y, Q_y_bin_0..Q_y_bin_15
-    cond_static  : (B, cond_static_dim)   — lead time and benchmark parameters
-    forcing_seq  : (B, M, token_dim)     — 5-D tokens sampled from a(t) over [t_s, t_j]
-    y_pred       : (B, Nx, Ny, out_channels) — predicted T̃(x, y, t_j)
+    spatial      : (B, Nx, Ny, in_channels)   — T̃(x, y, t_s) plus the active
+                   representation's spatial channels (see the module header).
+    cond_static  : (B, cond_static_dim)       — lead time and benchmark parameters
+    forcing_seq  : (B, M, temporal_token_dim) — tokens sampled from a(t) over
+                   [t_s, t_j]; empty (B, 0, 0) in bins mode / when the temporal
+                   encoder is disabled
+    y_pred       : (B, Nx, Ny, out_channels)  — predicted T̃(x, y, t_j)
 
-    Internally, h_a = TemporalForcingEncoder(forcing_seq) is projected to z_a ∈ R^K and
-    s_y * z_a is concatenated as K extra spatial channels before the lift, so linear_p
-    receives (in_channels + K) channels (e.g. 20 + 16 = 36 with the default config).
+    All of in_channels, cond_static_dim, and temporal_token_dim are supplied by
+    the resolved ProblemDims for the active (benchmark, representation) pair; the
+    ``__init__`` defaults below are placeholders that construction always
+    overrides.
+
+    When the temporal encoder is active, h_a = TemporalForcingEncoder(forcing_seq)
+    is projected to z_a ∈ R^K and s(y) * z_a is concatenated as K extra spatial
+    channels before the lift, so linear_p receives (in_channels + K) channels.
     """
 
+    # NOTE: the in_channels / cond_static_dim / temporal_token_dim defaults below
+    # are legacy placeholders (they do not match any current representation). The
+    # training and eval paths always pass the resolved ProblemDims values, so the
+    # defaults exist only to keep the bare constructor callable.
     def __init__(
         self,
         modes1: int,
@@ -241,7 +251,6 @@ class FNO2d(nn.Module):
         forcing_embed_dim: int = 64,
         forcing_spatial_dim: int = 16,
         dropout: float = 0.0,
-        spectral_dropout: float = 0.0,
         use_temporal_encoder: bool = True,
         use_forcing_time_aug: bool = False,
         forcing_cond_mode: str = "both",
@@ -330,7 +339,7 @@ class FNO2d(nn.Module):
 
         # ------- FOURIER LAYERS -------------
         self.spectral_layers = nn.ModuleList([
-            SpectralConv2d(width, width, modes1, modes2, spectral_dropout=spectral_dropout) for _ in range(n_layers)
+            SpectralConv2d(width, width, modes1, modes2) for _ in range(n_layers)
         ])
         # local linear transformations (essentially skip connections)
         self.conv_layers = nn.ModuleList([

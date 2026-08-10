@@ -238,7 +238,6 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
                         "temporal_hidden": 16,
                         "forcing_embed_dim": 16,
                         "dropout": 0.0,
-                        "spectral_dropout": 0.0,
                     }
                 }
             },
@@ -285,7 +284,6 @@ def small_source_fno2d_checkpoint(tmp_path, small_source_fno2d):
                         "cond_static_dim": SOURCE_COND_STATIC_DIM,
                         "use_temporal_encoder": False,
                         "dropout": 0.0,
-                        "spectral_dropout": 0.0,
                     }
                 },
             },

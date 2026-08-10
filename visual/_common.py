@@ -51,10 +51,6 @@ PLOT_REGISTRY: dict[str, str] = {
     "forcing_summary_scalars":              "forcing",
     "forcing_param_distributions_design":   "forcing",
     "forcing_param_distributions_empirical": "forcing",
-    # group: sweep
-    "sweep_ranking":             "sweep",
-    "sweep_convergence":         "sweep",
-    "sweep_hyperparams":         "sweep",
     # group: resinv
     "resolution_invariance":     "resinv",
     # group: source
@@ -109,7 +105,6 @@ PLOT_REGISTRY: dict[str, str] = {
     "interfaces_tail_errors":                   "paper",
     "all_benchmarks_tail_errors":               "paper",
     "benchmark_overview":                       "paper",
-    "generalization_same_vs_unseen":            "paper",
     # group: rollout
     "rollout_partition_error":                  "rollout",
     # group: inverse
@@ -127,7 +122,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "source_itr_uncertainty":                   "inverse",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout", "inverse"}
+GROUPS = {"physics", "mms", "training", "data", "forcing", "source", "interfaces", "paper", "resinv", "rollout", "inverse"}
 
 PLOT_STYLE = {
     "font.size": 10,

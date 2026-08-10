@@ -9,7 +9,6 @@ from data.dataset import (
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
-    split_pairs_within_sims,
     long_lead_pairs,
     SnapshotPairDataset,
     create_dataloaders,
@@ -386,24 +385,6 @@ class TestSnapshotPairDataset:
             n_snapshots=10,
         )
         assert len(ds_test) > len(ds_train)
-
-    def test_split_pairs_within_sims_is_disjoint_and_complete(self, dataset_subsampled):
-        train_pairs, val_pairs = split_pairs_within_sims(dataset_subsampled, val_pair_frac=0.2, seed=123)
-
-        original = set(dataset_subsampled._pairs)
-        train_set = set(train_pairs._pairs)
-        val_set = set(val_pairs._pairs)
-        assert train_set.isdisjoint(val_set)
-        assert train_set | val_set == original
-        assert len(val_pairs) > 0
-        assert train_pairs.trajectories is dataset_subsampled.trajectories
-        assert val_pairs.trajectories is dataset_subsampled.trajectories
-
-    def test_split_pairs_resets_q_callable_cache(self, dataset_subsampled):
-        """Train and val copies must not share the _q_callables dict (mutable, worker-local)."""
-        train_pairs, val_pairs = split_pairs_within_sims(dataset_subsampled, val_pair_frac=0.2, seed=123)
-        assert train_pairs._q_callables is not val_pairs._q_callables
-        assert train_pairs._q_callables is not dataset_subsampled._q_callables
 
     def test_long_lead_pairs_full_span_only(self, dataset_subsampled):
         s_first = int(dataset_subsampled.t_indices[0])

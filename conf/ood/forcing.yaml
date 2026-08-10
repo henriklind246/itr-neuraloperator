@@ -1,7 +1,7 @@
 # OOD suite descriptor for the `forcing` benchmark.
 #
-# Consumed by scripts/run_ood_suite.py (plain yaml.safe_load, NOT a Hydra config
-# group). Each axis is generated into its own dataset dir, evaluated all-sims
+# Consumed directly by scripts/run_ood_suite.py with yaml.safe_load. Each axis
+# is generated into its own dataset dir, evaluated all-sims
 # against a trained run, and aggregated by scripts/inspect_ood.py. Values default
 # to the axis's declared sweep (problems/forcing.py: ood_axes); list them here
 # only to override. `refine` opts an axis into the convergence pass: regenerate

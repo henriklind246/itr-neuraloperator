@@ -1,4 +1,5 @@
 import csv
+import copy
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+import yaml
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam, AdamW
 
@@ -48,8 +50,6 @@ from src.operators.losses import (
     tail_stats,
 )
 from src.operators.utils import resolve_device
-
-from omegaconf import OmegaConf
 
 from problems.registry import REGISTRY as _PROBLEM_REGISTRY
 
@@ -95,8 +95,25 @@ VAL_PAIR_FIELDNAMES = _build_val_pair_fieldnames()
 VAL_PAIRS_SUBSAMPLE_SEED = 0
 
 
+def _load_yaml_mapping(path: Path) -> dict:
+    with path.open(encoding="utf-8") as config_file:
+        payload = yaml.safe_load(config_file)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config must be a mapping/dict, got: {type(payload)}")
+    return payload
+
+
+def _merge_config(base: dict, overlay: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def load_config(config_path: str | None = None) -> dict:
-    # train.py -> src/operators -> project root is parents[2]
     project_root = Path(__file__).resolve().parents[2]
     path = Path(config_path) if config_path else (project_root / "conf" / "config.yaml")
     path = path.expanduser().resolve()
@@ -104,58 +121,68 @@ def load_config(config_path: str | None = None) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    import os
     os.environ.setdefault("PROJECT_ROOT", project_root.as_posix())
 
-    cfg = OmegaConf.load(path)
-    paths_cfg = OmegaConf.load(project_root / "conf" / "paths" / "default.yaml")
-    cfg = OmegaConf.merge({"paths": paths_cfg}, cfg)
+    paths_cfg = _load_yaml_mapping(project_root / "conf" / "paths" / "default.yaml")
+    cfg = _merge_config({"paths": paths_cfg}, _load_yaml_mapping(path))
 
-    # Compose the active benchmark group. Hydra entrypoints do this via the
-    # `defaults` list; load_config (fixed-run path) bypasses Hydra, so merge the
-    # group manually. Name comes from $BENCHMARK, else the `defaults` list,
-    # else "forcing". The group file is `# @package _global_`, so its keys are
-    # top-level and provide the (benchmark-specific) representational dims.
-    benchmark_name = os.environ.get("BENCHMARK")
-    if benchmark_name is None:
-        benchmark_name = "forcing"
-        for entry in cfg.get("defaults", []) or []:
-            if not isinstance(entry, str):
-                d = OmegaConf.to_container(entry)
-                if isinstance(d, dict) and "benchmark" in d:
-                    benchmark_name = d["benchmark"]
-                    break
+    benchmark_cfg = cfg.get("benchmark", {})
+    benchmark_name = os.environ.get("BENCHMARK", str(benchmark_cfg.get("name", "forcing")))
     benchmark_path = project_root / "conf" / "benchmark" / f"{benchmark_name}.yaml"
     if not benchmark_path.exists():
         raise FileNotFoundError(f"Benchmark config not found: {benchmark_path}")
-    cfg = OmegaConf.merge(cfg, OmegaConf.load(benchmark_path))
+    cfg = _merge_config(cfg, _load_yaml_mapping(benchmark_path))
 
-    # Compose the representation group the same way. Name comes from
-    # $REPRESENTATION, else the `defaults` list, else "temporal_encoder". The
-    # group file is `# @package _global_` and sets `benchmark.representation`.
-    representation_name = os.environ.get("REPRESENTATION")
-    if representation_name is None:
-        representation_name = "temporal_encoder"
-        for entry in cfg.get("defaults", []) or []:
-            if not isinstance(entry, str):
-                d = OmegaConf.to_container(entry)
-                if isinstance(d, dict) and "representation" in d:
-                    representation_name = d["representation"]
-                    break
+    benchmark_cfg = cfg.get("benchmark", {})
+    representation_name = os.environ.get(
+        "REPRESENTATION", str(benchmark_cfg.get("representation", "temporal_encoder"))
+    )
     representation_path = project_root / "conf" / "representation" / f"{representation_name}.yaml"
     if not representation_path.exists():
         raise FileNotFoundError(f"Representation config not found: {representation_path}")
-    cfg = OmegaConf.merge(cfg, OmegaConf.load(representation_path))
+    cfg = _merge_config(cfg, _load_yaml_mapping(representation_path))
 
-    # Remove Hydra-only sections that can't resolve outside Hydra
-    for key in ("hydra", "defaults"):
-        if key in cfg:
-            del cfg[key]
+    paths = cfg["paths"]
+    configured_project_root = paths.get("project_root")
+    resolved_project_root = Path(
+        str(configured_project_root or os.environ.get("PROJECT_ROOT", project_root))
+    ).expanduser().resolve()
+    configured_data_dir = paths.get("data_dir")
+    configured_runs_root = paths.get("runs_root")
+    data_dir = Path(
+        str(configured_data_dir or os.environ.get("DATA_DIR", resolved_project_root / "data"))
+    ).expanduser().resolve()
+    runs_root = Path(
+        str(configured_runs_root or os.environ.get("RUNS_ROOT", resolved_project_root / "runs"))
+    ).expanduser().resolve()
+    paths.update(
+        project_root=str(resolved_project_root),
+        data_dir=str(data_dir),
+        runs_root=str(runs_root),
+    )
 
-    cfg = OmegaConf.to_container(cfg, resolve=True)
+    data_paths = {
+        "t_grid_path": "t_grid.npy",
+        "x_grid_path": "x_grid.npy",
+        "y_grid_path": "y_grid.npy",
+        "trajectories.npy": "trajectories.npy",
+        "sim_params_path": "sim_params.npy",
+    }
+    for key, file_name in data_paths.items():
+        if not cfg["data"].get(key):
+            cfg["data"][key] = str(data_dir / file_name)
 
-    if not isinstance(cfg, dict):
-        raise ValueError(f"Config must be a mapping/dict, got: {type(cfg)}")
+    experiment_name = os.environ.get("EXPERIMENT_NAME")
+    if experiment_name:
+        cfg.setdefault("experiment", {})["name"] = experiment_name
+
+    run_cfg = cfg.setdefault("training", {}).setdefault("run", {})
+    if not run_cfg.get("run_dir"):
+        run_cfg["run_dir"] = str(
+            runs_root
+            / str(cfg["experiment"]["name"])
+            / f"config{cfg['config_id']}"
+        )
 
     return cfg
 
@@ -252,7 +279,8 @@ def _stamp_resolved_dims(config: dict, dims) -> None:
 
 
 def _dump_resolved_config(run_path: Path, config: dict) -> None:
-    OmegaConf.save(OmegaConf.create(config), run_path / "config_used.yaml")
+    with (run_path / "config_used.yaml").open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file, sort_keys=False)
 
 
 def _summarize_metrics_csv(csv_path: Path) -> dict:
@@ -1415,7 +1443,6 @@ def run_one_seed(
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
-        spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
         use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
         forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),

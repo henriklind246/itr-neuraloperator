@@ -1,4 +1,3 @@
-# @package _global_
 
 benchmark:
   name: forcing_itr_sin

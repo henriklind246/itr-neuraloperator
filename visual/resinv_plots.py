@@ -80,7 +80,7 @@ def _load_seed_reports(run_root: Path,
                 entry[f"{field}_std"] = np.nan
             else:
                 entry[f"{field}_mean"] = float(vals.mean())
-                entry[f"{field}_std"] = float(vals.std())  # population std, matches sweep_plots
+                entry[f"{field}_std"] = float(vals.std())  # population standard deviation
         out[N] = entry
     return out
 

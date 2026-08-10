@@ -340,8 +340,8 @@ def _run_metadata(run_dir: Path) -> RunSource:
         seed = str(final_metrics.get("seed") or "") or None
 
     data_cfg = config.get("data", {}) if isinstance(config, dict) else {}
-    # Hydra composes the benchmark group as a nested block; the flat keys are
-    # accepted too because a hand-written config_used.yaml is a legitimate way
+    # Training configs store the benchmark group as a nested block; flat keys
+    # are accepted too because a hand-written config_used.yaml is a legitimate way
     # to describe a run that was trained elsewhere.
     bench_cfg = config.get("benchmark") if isinstance(config, dict) else None
     if isinstance(bench_cfg, dict):

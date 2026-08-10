@@ -130,12 +130,11 @@ Single source of truth: `tests/test_problems.py: CONTRACTS` and each spec's
   `src/operators/losses.py`, `src/operators/rollout.py`,
   `src/operators/distributed.py`
 - Config: `conf/config.yaml`, `conf/benchmark/*.yaml`,
-  `conf/representation/*.yaml`, `conf/search_space/*.yaml`
-- Entrypoints: `scripts/run_train_fixed.py`, `scripts/run_train.py`
+  `conf/representation/*.yaml`
+- Entrypoint: `scripts/run_train_fixed.py`
 - Diagnostics: `scripts/inspect_val_pairs.py` (benchmark-aware),
-  `scripts/eval_same_sim_holdout.py`, `scripts/run_eval.py`,
-  `scripts/write_test_records.py`, `scripts/fv_convergence_baseline.py`,
-  `visual/*.py`
+  `scripts/run_eval.py`, `scripts/write_test_records.py`,
+  `scripts/fv_convergence_baseline.py`, `visual/*.py`
 - Cluster: `slurm/*.sbatch`
 - Tests: `tests/test_*.py` (notably `test_problems.py` for the contract table)
 
@@ -143,12 +142,10 @@ Single source of truth: `tests/test_problems.py: CONTRACTS` and each spec's
 
 - Start from artifacts, not memory: `config_used.yaml` (check `benchmark` and
   `representation`), `train_metrics.csv`, `diagnostics.csv`, `val_pairs.csv`,
-  `final_metrics.json`, and same-sim held-out results when available.
+  and `final_metrics.json`.
 - Use `scripts/inspect_val_pairs.py <run>/seed42/val_pairs.csv` before drawing
   conclusions. It is benchmark-aware: it emits universal stratifications plus the
   benchmark's `val_pair_fields`.
-- Run same-sim held-out validation when separating simulation-level
-  generalization from a broken forcing/time representation.
 - Prefer short screens for architecture or encoding ideas: 30-50 epochs should
   show whether the forcing path is learning; 60 epochs is a stronger screen;
   100+ epochs are confirmation runs.
@@ -163,16 +160,12 @@ Single source of truth: `tests/test_problems.py: CONTRACTS` and each spec's
 ## Running Things
 
 - Single fixed run (pick benchmark + representation):
-  `python scripts/run_train_fixed.py experiment.name=forcing_screen_40ep benchmark=forcing representation=temporal_encoder training.epochs=41 training.validate_every=5`
-- Optuna/local sweep:
-  `python scripts/run_train.py --multirun`
+  `BENCHMARK=forcing REPRESENTATION=temporal_encoder python scripts/run_train_fixed.py experiment.name=forcing_screen_40ep training.epochs=41 training.validate_every=5`
 - Data generation (per benchmark):
   `python data/generate_dataset.py --num-sims 8000 --benchmark forcing`
   (benchmark also reads the `BENCHMARK` env var; default `forcing`)
 - Val-pair inspection:
   `python scripts/inspect_val_pairs.py <run_dir>/seed42/val_pairs.csv`
-- Same-sim held-out diagnostic:
-  `python scripts/eval_same_sim_holdout.py experiment.name=<name> training.epochs=41`
 - Test eval:
   `python scripts/run_eval.py <run_dir>`
 - Tests:
@@ -186,8 +179,7 @@ Single source of truth: `tests/test_problems.py: CONTRACTS` and each spec's
   prior discussion. New benchmarks are added as a `ProblemSpec` plus a
   `conf/benchmark/*.yaml` and a `REGISTRY` entry — not by branching on the
   benchmark name in the dataset/model/training code.
-- New model/training config knobs need defaults in `conf/config.yaml`; sweepable
-  knobs also need a relevant `conf/search_space/*.yaml` entry.
+- New model/training config knobs need defaults in `conf/config.yaml`.
 - Solver, loss, dataset, or model behavior changes need tests under `tests/`.
   Changes to the per-benchmark contract must update `tests/test_problems.py`.
 - Numerical-scheme changes require MMS verification in `src/physics/mms_2d.py`

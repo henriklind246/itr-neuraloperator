@@ -20,7 +20,6 @@ from visual import (
     physics_plots,
     resinv_plots,
     rollout_plots,
-    sweep_plots,
     training_plots,
 )
 
@@ -55,7 +54,6 @@ def main():
       python -m visual.cli --group mms --out visual/              # MMS convergence only
       python -m visual.cli --group training --csv <path> --out visual/
       python -m visual.cli --group data --data <path> --x-grid <path> --y-grid <path> --t-grid <path> --params <path> --out visual/
-      python -m visual.cli --group sweep --experiment <path> --runs <path> --out visual/
       python -m visual.cli --group paper --records <test_records.csv> --out visual/
       python -m visual.cli --plots prediction_vs_truth lead_time_error --checkpoint <path> --out visual/
 
@@ -68,9 +66,6 @@ def main():
       --csv         Path to train_metrics.csv
       --report      Path to seed_report.json
       --checkpoint  Path to model checkpoint .pt (for model diagnostic plots)
-      --experiment  Path to conf/generated/experiment{N}/ directory (sweep plots)
-      --runs        Path to runs/experiment{N}/ directory (sweep convergence)
-      --sweep-seed  Which seed to show in convergence plot (default: 0)
     """
 
     import argparse
@@ -83,12 +78,6 @@ def main():
     parser.add_argument("--params", type=str, default=None, help="Path to sim_params .npy file")
     parser.add_argument("--csv", type=str, default=None, help="Path to train_metrics.csv")
     parser.add_argument("--report", type=str, default=None, help="Path to seed_report.json")
-    parser.add_argument("--experiment", type=str, default=None,
-                        help="Path to conf/generated/experiment{N}/ directory (sweep plots)")
-    parser.add_argument("--runs", type=str, default=None,
-                        help="Path to runs/experiment{N}/ directory (sweep convergence)")
-    parser.add_argument("--sweep-seed", type=int, default=0,
-                        help="Which seed to show in convergence plot (default: 0)")
     parser.add_argument("--resinv-run-root", type=str, default=None,
                         help="Directory with seed_report_r<N>.json files (resolution_invariance)")
     parser.add_argument("--resinv-root", type=str, default=None,
@@ -113,12 +102,6 @@ def main():
                         help="Path to interfaces test_records.csv (combined paper figures)")
     parser.add_argument("--records-source-itr", type=str, default=None,
                         help="Path to source_itr test_records.csv (combined paper figures)")
-    parser.add_argument("--records-same-sim", type=str, default=None,
-                        help="Path to same-sim held-out test_records.csv (generalization figure)")
-    parser.add_argument("--records-unseen", type=str, default=None,
-                        help="Path to unseen-sim test_records.csv (generalization figure)")
-    parser.add_argument("--generalization-benchmark", type=str, default=None,
-                        help="Benchmark name for the generalization figure (required kwarg)")
     parser.add_argument("--inverse-csv", type=str, nargs="+", default=None,
                         help="Inverse-problem summary CSV(s) as benchmark=path tokens "
                              "(e.g. --inverse-csv forcing=a.csv source_itr=b.csv)")
@@ -129,7 +112,7 @@ def main():
                         help="Restrict inverse figures to these benchmark(s)")
     parser.add_argument("--out", type=str, default=None, help="Output directory for plots")
     parser.add_argument("--group", type=str, nargs="+", default=["all"],
-                        choices=["all", "physics", "mms", "training", "data", "forcing", "sweep", "source", "interfaces", "paper", "resinv", "rollout", "inverse"],
+                        choices=["all", "physics", "mms", "training", "data", "forcing", "source", "interfaces", "paper", "resinv", "rollout", "inverse"],
                         help="Which plot group(s) to generate (default: all)")
     parser.add_argument("--plots", type=str, nargs="+", default=None,
                         help="Individual plot names to generate (overrides --group)")
@@ -1028,63 +1011,6 @@ def main():
                 "needs a (model, ds, records, config, dt) context per benchmark "
                 "(forcing, source, interfaces, source_itr)",
             )
-
-        if _should_run("generalization_same_vs_unseen", groups, individual):
-            same_path = args.records_same_sim
-            unseen_path = args.records_unseen
-            if same_path and unseen_path and args.generalization_benchmark:
-                print("--- generalization_same_vs_unseen ---")
-                paper_dir.mkdir(parents=True, exist_ok=True)
-                paper_plots.plot_generalization_same_vs_unseen(
-                    paper_plots._load_test_records(same_path),
-                    paper_plots._load_test_records(unseen_path),
-                    benchmark=args.generalization_benchmark,
-                    save_path=paper_dir / "generalization_same_vs_unseen.png")
-            else:
-                missing = [
-                    flag for flag, val in (
-                        ("--records-same-sim", same_path),
-                        ("--records-unseen", unseen_path),
-                        ("--generalization-benchmark", args.generalization_benchmark),
-                    ) if not val
-                ]
-                _print_skip("generalization_same_vs_unseen",
-                            "need " + ", ".join(missing))
-
-    # ---- SWEEP GROUP ----
-    sweep_plot_names = _plots_for_group("sweep")
-    need_sweep = any(_should_run(p, groups, individual) for p in sweep_plot_names)
-
-    if need_sweep:
-        print("=== SWEEP GROUP ===")
-
-        if args.experiment:
-            experiment_dir = Path(args.experiment)
-            sweep_dir = out_dir / "sweep"
-
-            if _should_run("sweep_ranking", groups, individual):
-                print("--- sweep_ranking ---")
-                sweep_plots.plot_sweep_ranking(experiment_dir, save_path=sweep_dir / "sweep_ranking.png")
-
-            if _should_run("sweep_convergence", groups, individual):
-                if args.runs:
-                    print("--- sweep_convergence ---")
-                    sweep_plots.plot_sweep_convergence(
-                        experiment_dir,
-                        args.runs,
-                        seed=args.sweep_seed,
-                        save_path=sweep_dir / "sweep_convergence.png",
-                    )
-                else:
-                    _print_skip("sweep_convergence", "need --runs")
-
-            if _should_run("sweep_hyperparams", groups, individual):
-                print("--- sweep_hyperparams ---")
-                sweep_plots.plot_sweep_hyperparams(experiment_dir, save_path=sweep_dir / "sweep_hyperparams.png")
-        else:
-            for name in sweep_plot_names:
-                if _should_run(name, groups, individual):
-                    _print_skip(name, "need --experiment")
 
     # ---- RESINV GROUP ----
     if _should_run("resolution_invariance", groups, individual):

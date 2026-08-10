@@ -551,7 +551,6 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
-        spectral_dropout=model_cfg.get("spectral_dropout", 0.0),
         use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
         forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),

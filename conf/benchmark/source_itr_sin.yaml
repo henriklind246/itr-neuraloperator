@@ -1,4 +1,3 @@
-# @package _global_
 # Source-ITR-Sin benchmark: internal volumetric chip-heating patch (interface
 # fixed at x = 0.5) with a spatially-varying interface thermal resistance R_c(y)
 # following a sinusoidal single-hump profile R_c(y) = R_base + A * sin(pi * y)

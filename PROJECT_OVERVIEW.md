@@ -402,20 +402,6 @@ T_tilde = (T - mu_global) / (sigma_global + 1e-6)
 `mu_global` and `sigma_global` are computed from the training simulations only.
 The project deliberately does not use per-sample normalization.
 
-### Same-Sim Held-Out Pair Diagnostic
-
-`split_pairs_within_sims(dataset, val_pair_frac=0.1, seed=0)` creates train and
-validation datasets that share the same simulation IDs but use disjoint
-snapshot-pair lists. The script `scripts/eval_same_sim_holdout.py` runs this
-diagnostic through the standard training path.
-
-Interpretation:
-
-| Result | Meaning |
-|--------|---------|
-| same-sim val much lower than cross-sim val | overfitting is mostly simulation-level |
-| same-sim val similar to cross-sim val | representation/optimization issue is more likely |
-
 ---
 
 ## 8. FNO2d Model
@@ -448,7 +434,6 @@ Default config:
 | `cond_dim` | 28 |
 | `cond_hidden` | 256 |
 | `dropout` | 0.0 |
-| `spectral_dropout` | 0.0 |
 
 ### Architecture
 
@@ -577,7 +562,7 @@ self-describing for later experiment auditing:
 | `git_commit.txt` | Full + short HEAD SHA at run start |
 | `git_status.txt` | `git status --short` at run start |
 | `slurm_job.txt` | SLURM env (job id, node), hostname, argv, start UTC |
-| `config_used.yaml` | Resolved Hydra/OmegaConf config actually used |
+| `config_used.yaml` | Resolved YAML config actually used |
 | `train_metrics.csv` | Aggregate per-epoch metrics |
 | `val_pairs.csv` | Per-validation-pair diagnostics |
 | `final_metrics.json` | Best/final epoch summary, wall time, status, model/training params, git short SHA |
@@ -648,29 +633,22 @@ checkpoints are intentionally incompatible.
 
 ---
 
-## 12. Hyperparameter Search and Cluster Scripts
+## 12. Training and Cluster Scripts
 
 Entry-point scripts under `scripts/`:
 
 | Script | Purpose |
 |--------|---------|
 | `run_train_fixed.py` | Fixed-config training with dotted CLI overrides |
-| `run_train.py` | Hydra/Optuna sweep |
 | `run_eval.py` | Run `eval.py` over `seed*/fno2d_best.pt` checkpoints |
 | `run_gen_data.py` | Driver for dataset generation |
 | `run_dataset.py` | Dataset construction utilities / smoke checks |
-| `eval_same_sim_holdout.py` | Same-sim held-out-pair diagnostic |
-| `collect_best_config.py` | Aggregate Optuna sweep results into best-config summaries |
-
-Search spaces live under `conf/search_space/`.
 
 MSI scripts:
 
 | Script | Purpose |
 |--------|---------|
 | `slurm/train_fno_msi_fixed.sbatch` | Single fixed config |
-| `slurm/train_fno_msi.sbatch` | Optuna sweep |
-| `slurm/eval_same_sim_holdout_msi.sbatch` | Same-sim held-out-pair diagnostic |
 | `slurm/generate_data_msi.sbatch` | Dataset generation |
 | `slurm/setup_env_msi.sh` | Environment setup helper sourced by sbatch jobs |
 
@@ -681,10 +659,7 @@ and copies results back to `$HOME/fno_runs` after completion.
 
 ## 13. Current Empirical Status
 
-The main remaining issue is cross-simulation generalization. Same-simulation
-held-out-pair experiments showed much smaller gaps than cross-simulation
-validation, which suggests the FNO can interpolate within seen trajectories but
-struggles to generalize to unseen simulation parameter/forcing combinations.
+The main remaining issue is cross-simulation generalization.
 
 Recent per-pair diagnostics repeatedly show that validation error is not
 uniformly distributed:
@@ -726,14 +701,10 @@ Current likely next interventions:
 | `src/operators/train.py` | Training loop, validation, checkpoints, diagnostics |
 | `src/operators/eval.py` | Physical-space test evaluation |
 | `scripts/run_train_fixed.py` | Fixed-config training with CLI overrides |
-| `scripts/run_train.py` | Hydra/Optuna sweep entry |
 | `scripts/run_eval.py` | Test-set evaluation driver |
 | `scripts/run_gen_data.py` | Dataset generation driver |
 | `scripts/run_dataset.py` | Dataset construction utilities |
-| `scripts/eval_same_sim_holdout.py` | Same-sim held-out-pair diagnostic |
-| `scripts/collect_best_config.py` | Aggregates sweep results into best-config summaries |
 | `conf/config.yaml` | Main config |
-| `conf/search_space/*.yaml` | Sweep definitions |
 | `slurm/*.sbatch` | MSI jobs |
 | `tests/test_*.py` | Physics, dataset, model, training, eval tests |
 | `visual/*.py` | Plotting and diagnostics |

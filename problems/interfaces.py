@@ -140,9 +140,9 @@ class InterfacesProblem(ProblemSpec):
     Two representations over the same trajectories/sim_params:
 
     - ``temporal_encoder``: 6 spatial channels [T_tilde, x, y, K_norm, D_norm,
-      s_y], 4 static conditioning dims, a (128, 2) forcing_seq [r_m, a_m/A_ref],
+      s_y], 3 static conditioning dims, a (128, 2) forcing_seq [r_m, a_m/A_ref],
       temporal encoder on with time-augmented spatial injection.
-    - ``bins``: 22 spatial channels [..., s_y, Q_y_bin_0..15], same 4 static
+    - ``bins``: 22 spatial channels [..., s_y, Q_y_bin_0..15], same 3 static
       dims, an empty forcing_seq, temporal encoder off.
 
     s_y lives at spatial channel 5 in both modes; the 3-dim T_stats carries

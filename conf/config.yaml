@@ -1,20 +1,11 @@
-defaults:
-  - paths: default
-  - search_space: medium
-  - benchmark: forcing
-  - representation: temporal_encoder
-  - override hydra/sweeper: optuna_local
-  - _self_
-
 config_id: 0
 
 experiment:
-  name: ${oc.env:EXPERIMENT_NAME,experiment0}
+  name: experiment0
 
-tuning:
-  n_trials: 50
-  direction: minimize
-  objective: best_val_mean
+benchmark:
+  name: forcing
+  representation: temporal_encoder
 
 model:
   type: "2D FNO time-conditioned (temporal branch)"
@@ -35,7 +26,6 @@ model:
     forcing_cond_mode: both       # Q1 forcing-routing ablation: both | spatial_only | cond_only (temporal_encoder repr only)
     activation: "GELU"            # doc-only; FNO2d hardcodes GELU
     dropout: 0.0
-    spectral_dropout: 0.0
     padding_reference_resolution: 100  # scale FNO pad cells with grid resolution; set = training grid (null = fixed pad=8)
     padding_mode: replicate       # boundary extension for the FNO domain pad: zeros|replicate|reflect
     cin_exclude_padding: true     # compute CIN instance stats over the unpadded region only
@@ -62,7 +52,7 @@ training:
     cosine_floor_lr_ratio: 0.05
     final_lr_ratio: 0.005
     # training.learning_rate remains the source of truth for the peak LR.
-    # Ratio fields scale the schedule cleanly during Optuna sweeps.
+    # Ratio fields keep the schedule proportional when the peak LR is overridden.
     # StepLR params (used when type=StepLR):
     step_size: 50
     gamma: 0.5
@@ -71,7 +61,7 @@ training:
   # lr / weight_decay come from training.learning_rate / training.weight_decay.
   # Spectral weights are 5-D real tensors; per-dimension preconditioners handle
   # them (all dims << max_precond_dim). precondition_1d: false -> 1-D biases use
-  # the Adam-style fallback. Needs a separate LR sweep (conf/search_space/soap.yaml).
+  # the Adam-style fallback.
   soap:
     betas: [0.95, 0.95]
     shampoo_beta: 0.95
@@ -122,17 +112,17 @@ training:
   # world_size at runtime; set an int to override.
   num_workers: null
   run:
-    run_dir: ${paths.runs_root}/${experiment.name}/config${config_id}
+    run_dir: null
     # Keep local/debug launches verbose by default. MSI opts into the compact
     # loss/validation-only stream in slurm/train_cvit_pino_msi.sbatch.
     compact_stdout: false
 
 data:
-  t_grid_path: ${paths.data_dir}/t_grid.npy
-  x_grid_path: ${paths.data_dir}/x_grid.npy
-  y_grid_path: ${paths.data_dir}/y_grid.npy
-  trajectories.npy: ${paths.data_dir}/trajectories.npy
-  sim_params_path: ${paths.data_dir}/sim_params.npy
+  t_grid_path: null
+  x_grid_path: null
+  y_grid_path: null
+  trajectories.npy: null
+  sim_params_path: null
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
@@ -160,13 +150,3 @@ evaluation:
     enabled: false
     num_substeps: 1
     partition: homogeneous
-
-hydra:
-  mode: MULTIRUN
-  job:
-    chdir: false
-  run:
-    dir: ${paths.runs_root}/${experiment.name}/single_run
-  sweep:
-    dir: ${paths.runs_root}/${experiment.name}/multirun
-    subdir: ${hydra.job.num}

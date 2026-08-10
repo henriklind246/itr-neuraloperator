@@ -1,4 +1,3 @@
-# @package _global_
 # Source benchmark: internal volumetric chip-heating patch, interface fixed at
 # x = 0.5. All representation-determined tensor dims (in_channels,
 # cond_static_dim, temporal_token_dim, use_temporal_encoder, s_y_channel,

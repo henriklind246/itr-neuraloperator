@@ -87,7 +87,7 @@ def _detect_benchmark(df: pd.DataFrame, csv_path: Path) -> str:
 
 
 def _benchmark_from_config(cfg_path: Path) -> str | None:
-    """Minimal scan for ``benchmark:\\n  name: <x>`` in an OmegaConf YAML dump."""
+    """Minimal scan for ``benchmark:\\n  name: <x>`` in a saved YAML config."""
     in_benchmark = False
     for line in cfg_path.read_text().splitlines():
         if re.match(r"^benchmark:\s*$", line):

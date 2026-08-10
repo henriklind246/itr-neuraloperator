@@ -19,7 +19,6 @@ conda install pytorch pytorch-cuda=12.4 -c pytorch -c nvidia -y
 
 # Remaining Python deps (not torch — already installed via conda)
 pip install numpy==2.2.6 scipy==1.15.3 PyYAML==6.0.2
-pip install hydra-core==1.3.2 hydra-optuna-sweeper==1.2.0 optuna==2.10.0
 
 # Install project in editable mode (makes src/ and data/ importable)
 cd "$HOME/no-tps-itr"

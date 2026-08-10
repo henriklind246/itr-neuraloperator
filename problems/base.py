@@ -293,9 +293,16 @@ class ProblemSpec(ABC):
         every value reuses verbatim. It must NOT bake in the swept field --
         :meth:`apply_ood_value` injects that from the explicit value.
 
-        Storing quantiles (not realized params) lets compound axes map the SAME
-        background through different families' inverse CDFs, giving reproducible
-        CRN coupling across otherwise-unrelated parameterizations.
+        Storing quantiles (not realized params) lets compound axes that share a
+        parameter space (e.g. ``rc_severity``: a shared peak fraction) map the
+        SAME background through each value's parameterization, giving strict CRN
+        coupling. Compound axes that span *incommensurable* family
+        parameterizations (``family_transfer``: sin vs exp temporal, uniform vs
+        patch spatial, which share no common latent) instead couple the swept
+        profile through a single shared profile seed re-run per family. That
+        pairing is reproducible and holds the non-family background byte-equal,
+        but is a shared-fingerprint coupling, not a strict shared-quantile
+        mapping of the profile latents.
         """
         raise NotImplementedError(
             f"{type(self).__name__} declares OOD axes but does not implement "
@@ -311,8 +318,11 @@ class ProblemSpec(ABC):
         :meth:`sample_sim_params` rows, passing :meth:`validate_schema` and
         :meth:`configure_solver`). The ``latents`` bundle is reused for every
         value of a repeat, so for ordinary axes every non-swept field is
-        byte-identical across values and only the swept field changes; for
-        compound axes the shared quantiles map through each value's families.
+        byte-identical across values and only the swept field changes;
+        parameter-sharing compound axes (``rc_severity``) map the shared
+        quantiles through each value's families, while incommensurable-family
+        compound axes (``family_transfer``) hold the non-family background
+        byte-equal and re-run each family's sampler from a shared profile seed.
 
         When snapping/clipping/truncation can change another quantity (interface
         face-alignment, patch clipping at a boundary, void-profile truncation),

@@ -69,14 +69,28 @@ def problem_from_config(config: dict) -> ProblemSpec:
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
 
-# Static conditioning layout (23 dims):
+# LEGACY (single-experiment) static-conditioning helpers.
+#
+# The active dataset path routes every item through
+# `SnapshotPairDataset.__getitem__` -> `self.problem.build_item`, so the live
+# conditioning vector is built by the per-benchmark ProblemSpec (e.g.
+# `problems/forcing.py: build_cond_vector`, a 10-dim forcing-agnostic vector)
+# and its width is owned by `ProblemDims.cond_static_dim`. The module-level
+# `COND_STATIC_DIM = 23`, `TEMPORAL_SAMPLES = 64`, `TEMPORAL_TOKEN_DIM = 5`, and
+# the `build_cond_vector` / `build_forcing_seq` / `build_forcing_summary`
+# helpers below describe the OLD forcing-only representation and are NOT used by
+# training or eval. They are retained only because legacy diagnostic and
+# visualization code (visual/forcing_plots.py, visual/dataset_plots.py) and
+# their tests still import them. Do not treat these as the current contract.
+#
+# Legacy static conditioning layout (23 dims):
 #   [0:3]    base:             t_bar_norm, t_s_norm, R_c_norm
 #   [3:7]    spatial onehot:   uniform, patch, gaussian, triangle
 #   [7:11]   spatial params:   y_c_norm, w_norm, sigma_y_norm, ell_norm
 #   [11:15]  temporal onehot:  sin, exp, pulse_train, exp_train
 #   [15:23]  forcing summary:  S1..S8 (signed/abs/pos/neg impulse, mean, RMS, peak, final)
 #
-# The forcing summary block gives the conditioning MLP global, interval-level
+# The forcing summary block gave the conditioning MLP global, interval-level
 # scalar descriptors of a(t) over [t_s, t_j] — complementary to the spatial
 # Q_y_bins channels and the learned TemporalForcingEncoder embedding.
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
@@ -106,8 +120,11 @@ def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
                       spatial_family: str, spatial_params: dict,
                       temporal_family: str,
                       forcing_summary: np.ndarray) -> np.ndarray:
-    """Assemble the 23-dim static conditioning vector. Used by both the
-    dataset and the inference plotting paths so they cannot drift apart.
+    """Assemble the legacy 23-dim static conditioning vector.
+
+    LEGACY: superseded by the per-benchmark `ProblemSpec.build_cond_vector`
+    (e.g. `problems/forcing.py`). Retained only for legacy plotting code and its
+    tests; the active dataset does not call this.
 
     `R_c` is the raw contact resistance (not pre-normalized) — normalization
     happens here once. `forcing_summary` is the (_FORCING_SUMMARY_DIM,) vector
@@ -288,12 +305,21 @@ class SnapshotPairDataset(Dataset):
     from the full trajectory and enumerates all possible pairs per
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
-    Returns 5-tuple: (spatial, cond_static, forcing_seq, Y, T_stats)
-        spatial      : (Nx, Ny, 20)       — [T̃_source, x_norm, y_norm, s_y, Q_y_bin_0, ..., Q_y_bin_15]
-        cond_static  : (23,)              — see COND_STATIC_DIM layout above
-        forcing_seq  : (M, 5)             — token-encoded a(t) over [t_s, t_j]
-        Y            : (Nx, Ny, 1)        — T̃_target (globally normalized)
-        T_stats      : (2,)               — [μ_global, σ_global] for denormalization
+    `__getitem__` delegates item construction to `self.problem.build_item`, so
+    the concrete keys and per-tensor dims are owned by the active
+    `(benchmark, representation)` ProblemSpec, not by this class. Every item is a
+    dict (not a tuple) with keys:
+        spatial      : (Nx, Ny, in_channels)   — T̃_source plus the
+                       representation's spatial channels (lean base in
+                       temporal_encoder mode; base + 16 Q-bins in bins mode)
+        cond_static  : (cond_static_dim,)      — lead time and benchmark params
+        forcing_seq  : (M, temporal_token_dim) — token-encoded a(t) over
+                       [t_s, t_j]; empty (0, 0) in bins mode
+        Y            : (Nx, Ny, 1)             — T̃_target (globally normalized)
+        T_stats      : (t_stats_dim,)          — [μ_global, σ_global, ...] for
+                       denormalization
+    See problems/<benchmark>.py and the contract table in CLAUDE.md /
+    tests/test_problems.py for the exact dims per pair.
     """
 
     def __init__(
@@ -472,30 +498,6 @@ def _dataset_with_pairs(dataset: SnapshotPairDataset, pairs: list[tuple[int, int
     if hasattr(out, "_q_callables"):
         out._q_callables = {}
     return out
-
-
-def split_pairs_within_sims(
-    dataset: SnapshotPairDataset,
-    val_pair_frac: float = 0.1,
-    seed: int = 0,
-) -> tuple[Dataset, Dataset]:
-    rng = np.random.default_rng(seed)
-    val_indices = set()
-    for sim_id in dataset.sim_ids:
-        sim_pair_indices = [i for i, pair in enumerate(dataset._pairs) if pair[0] == int(sim_id)]
-        n_val = int(round(len(sim_pair_indices) * val_pair_frac))
-        if val_pair_frac > 0.0 and len(sim_pair_indices) > 0:
-            n_val = max(1, n_val)
-        if n_val > 0:
-            chosen = rng.choice(sim_pair_indices, size=n_val, replace=False)
-            val_indices.update(int(i) for i in chosen)
-
-    train_pairs = [pair for i, pair in enumerate(dataset._pairs) if i not in val_indices]
-    val_pairs = [pair for i, pair in enumerate(dataset._pairs) if i in val_indices]
-    train_dataset = _dataset_with_pairs(dataset, train_pairs)
-    val_dataset = _dataset_with_pairs(dataset, val_pairs)
-    val_dataset.noise_std = 0.0
-    return train_dataset, val_dataset
 
 
 def long_lead_pairs(dataset: SnapshotPairDataset) -> list[tuple[int, int, int]]:
@@ -1189,8 +1191,9 @@ if __name__ == '__main__':
 
     # Verify shapes
     batch = next(iter(train_loader))
-    print(f"spatial: {batch['spatial'].shape}")          # (B, Nx, Ny, 20)
-    print(f"cond_static: {batch['cond_static'].shape}")  # (B, 23)
-    print(f"forcing_seq: {batch['forcing_seq'].shape}")  # (B, M, 5)
+    # Shapes are representation-dependent (default forcing/temporal_encoder shown).
+    print(f"spatial: {batch['spatial'].shape}")          # (B, Nx, Ny, in_channels=4)
+    print(f"cond_static: {batch['cond_static'].shape}")  # (B, cond_static_dim=10)
+    print(f"forcing_seq: {batch['forcing_seq'].shape}")  # (B, M=128, token_dim=2)
     print(f"Y: {batch['Y'].shape}")                      # (B, Nx, Ny, 1)
-    print(f"T_stats: {batch['T_stats'].shape}")          # (B, 2)
+    print(f"T_stats: {batch['T_stats'].shape}")          # (B, t_stats_dim=2)

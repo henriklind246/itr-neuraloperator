@@ -240,10 +240,10 @@ class SourceProblem(ProblemSpec):
 
     Two representations over the same trajectories/sim_params:
 
-    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, S_h], 7 static
+    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, S_h], 6 static
       conditioning dims, a (128, 2) forcing_seq sampling the sin^2 heating
       pulse, temporal encoder on.
-    - ``bins``: 20 spatial channels [T_tilde, x, y, S_h, Q_0..15], same 7
+    - ``bins``: 20 spatial channels [T_tilde, x, y, S_h, Q_0..15], same 6
       static dims, an empty forcing_seq, temporal encoder off.
 
     The source amplitude A never enters conditioning. Interface fixed at

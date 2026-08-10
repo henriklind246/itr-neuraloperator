@@ -83,7 +83,7 @@ def _resolve_run_dir(config: dict) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a fixed training config without Hydra/Optuna.")
+    parser = argparse.ArgumentParser(description="Run a fixed training config.")
     parser.add_argument("overrides", nargs="*", help="Config overrides in dotted key=value form.")
     args = parser.parse_args()
 

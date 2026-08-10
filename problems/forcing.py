@@ -404,7 +404,6 @@ class ForcingProblem(ProblemSpec):
         if self.representation == "temporal_encoder":
             # Force the 128-sample token grid regardless of the config default.
             ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
-            ds._r = np.linspace(0.0, 1.0, ds.temporal_samples, dtype=np.float32)
             ds._q_callables = {}
         else:
             ds.q_ref = np.float32(SIN_AMP_RANGE[1] * ds.t_final / FORCING_BINS)

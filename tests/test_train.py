@@ -104,9 +104,33 @@ class TestLoadConfig:
 
     def test_resolves_variables(self):
         cfg = load_config()
-        # paths should be resolved, not contain ${...}
         traj_path = cfg["data"]["trajectories.npy"]
         assert "${" not in traj_path
+
+    def test_resolves_environment_paths(self, tmp_path, monkeypatch):
+        data_dir = tmp_path / "data"
+        runs_root = tmp_path / "runs"
+        monkeypatch.setenv("DATA_DIR", str(data_dir))
+        monkeypatch.setenv("RUNS_ROOT", str(runs_root))
+
+        cfg = load_config()
+
+        assert cfg["paths"]["data_dir"] == str(data_dir)
+        assert cfg["paths"]["runs_root"] == str(runs_root)
+        assert cfg["data"]["trajectories.npy"] == str(data_dir / "trajectories.npy")
+        assert cfg["training"]["run"]["run_dir"] == str(
+            runs_root / "experiment0" / "config0"
+        )
+
+    def test_selects_benchmark_and_representation_from_environment(self, monkeypatch):
+        monkeypatch.setenv("BENCHMARK", "interfaces")
+        monkeypatch.setenv("REPRESENTATION", "bins")
+
+        cfg = load_config()
+
+        assert cfg["benchmark"]["name"] == "interfaces"
+        assert cfg["benchmark"]["representation"] == "bins"
+        assert cfg["training"]["loss"]["per_sample_interface_x"] is True
 
 
 # ===================== helpers for training tests =====================
@@ -801,15 +825,6 @@ class TestRIGNOThreePhaseSchedule:
 
         with pytest.raises(ValueError, match="scheduler.peak_lr must match training.learning_rate"):
             build_scheduler(config, optimizer)
-
-
-class TestSearchSpaceConfig:
-    def test_search_space_drops_stale_cosine_restart_params(self):
-        search_space_path = Path(__file__).resolve().parents[1] / "conf" / "search_space" / "medium.yaml"
-        text = search_space_path.read_text(encoding="utf-8")
-
-        assert "training.scheduler.T_0" not in text
-        assert "training.scheduler.T_mult" not in text
 
 
 # ===================== _is_training_complete =====================
