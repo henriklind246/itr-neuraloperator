@@ -32,7 +32,6 @@ from scripts.invert import (  # noqa: E402
     prepare_inversion_dataset,
 )
 from visual.inverse_plots import (  # noqa: E402
-    _wilson_ci,
     plot_sensor_sweep_recovery,
     plot_sensor_sweep_uq,
     spec_for,
@@ -1141,73 +1140,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
-
-
-# ===========================================================================
-# RETIRED AGGREGATIONS - not called by run_sweep() / generate_paper_summary().
-#
-# The companion appendix to the retired block in scripts/invert.py. These
-# summarized statistics the entry point no longer computes, so they have no
-# input columns to read even if re-wired; they are kept for reference.
-#
-#   * _sample_distribution - the eight-number block (mean, ddof=1 SD, median,
-#     Q1, Q3, IQR, min, max) that was applied to absolute error, signed error,
-#     both interval widths, and MCMC acceptance: 40 of the old 58 summary
-#     columns. At N_CASES = 8 the SD carries ~27% relative uncertainty and
-#     min/max are single order statistics. Live code uses _robust_summary.
-#   * _coverage_summary - the nine-field coverage block with a Wilson score
-#     interval. Retired with coverage itself: one noise draw per simulation
-#     aggregated across simulations with different truths is not coverage over
-#     noise replications, and at n=8 the Wilson interval (6/8 -> [41%, 93%])
-#     cannot discriminate any true rate. Validating calibration properly means
-#     a separate experiment: one fixed theta, ~200 noise replications, one
-#     number.
-#   * Signed-error mean bias, and the paired 8->16->32 absolute-error change
-#     block (three pairs x eleven fields, including a percent change on an
-#     8-sample mean), were dropped inline rather than kept as functions: an
-#     8-sample mean bias is not distinguishable from zero, and the sensor
-#     trend is already visible in the per-arm medians and the recovery figure.
-# ===========================================================================
-
-
-def _sample_distribution(values: np.ndarray) -> dict[str, float | int]:
-    values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
-        raise ValueError(
-            "paper summary distributions require at least two finite values."
-        )
-    q1, median, q3 = np.percentile(values, [25.0, 50.0, 75.0])
-    return {
-        "n": int(values.size),
-        "mean": float(np.mean(values)),
-        "sample_sd": float(np.std(values, ddof=1)),
-        "median": float(median),
-        "q1": float(q1),
-        "q3": float(q3),
-        "iqr": float(q3 - q1),
-        "min": float(np.min(values)),
-        "max": float(np.max(values)),
-    }
-
-
-def _coverage_summary(values: np.ndarray) -> dict[str, float | int]:
-    indicators = np.asarray(values, dtype=np.float64)
-    distribution = _sample_distribution(indicators)
-    total = int(indicators.size)
-    successes = int(np.sum(indicators))
-    rate = successes / total
-    low, high = _wilson_ci(successes, total)
-    return {
-        "successes": successes,
-        "total": total,
-        "rate": float(rate),
-        "percent": float(100.0 * rate),
-        "indicator_sample_sd": float(distribution["sample_sd"]),
-        "wilson95_low": float(low),
-        "wilson95_high": float(high),
-        "wilson95_low_percent": float(100.0 * low),
-        "wilson95_high_percent": float(100.0 * high),
-    }
 
 
 if __name__ == "__main__":

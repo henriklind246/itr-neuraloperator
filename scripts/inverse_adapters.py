@@ -130,10 +130,6 @@ class InverseAdapter(ABC):
     def unconstrained_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
         ...
 
-    @abstractmethod
-    def theta_logabsdet_du(self, u: torch.Tensor) -> torch.Tensor:
-        ...
-
     def lhs_starts_unconstrained(
         self, n_starts: int, rng: np.random.Generator, eps: float = 1e-3
     ) -> np.ndarray:
@@ -293,15 +289,7 @@ class InverseAdapter(ABC):
         ...
 
     @abstractmethod
-    def profile_summary(self, res, obs) -> dict:
-        ...
-
-    @abstractmethod
     def laplace_summary(self, spec: dict) -> dict:
-        ...
-
-    @abstractmethod
-    def mcmc_summary(self, res, obs) -> dict:
         ...
 
 
@@ -349,21 +337,6 @@ class SourceItrAdapter(InverseAdapter):
         return torch.stack(
             [_logit(p_base), _logit(p_amp), _logit(p_y0), _logit(p_sigma)], dim=-1
         )
-
-    def theta_logabsdet_du(self, u: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_VOID_RANGES["R_base"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-
-        sp = torch.nn.functional.softplus
-        u0, u1, u2, u3 = u[..., 0], u[..., 1], u[..., 2], u[..., 3]
-        R_base = base_lo + (base_hi - base_lo) * torch.sigmoid(u0)
-
-        log_diag0 = float(np.log(base_hi - base_lo)) - sp(-u0) - sp(u0)
-        log_diag1 = torch.log(R_PEAK_MAX - R_base) - sp(-u1) - sp(u1)
-        log_diag2 = float(np.log(y0_hi - y0_lo)) - sp(-u2) - sp(u2)
-        log_diag3 = float(np.log(sig_hi - sig_lo)) - sp(-u3) - sp(u3)
-        return log_diag0 + log_diag1 + log_diag2 + log_diag3
 
     def theta_from_sim_params(
         self, sim_params: dict, *, dtype: torch.dtype = torch.float32, device=None
@@ -585,26 +558,6 @@ class SourceItrAdapter(InverseAdapter):
                 )
         return out
 
-    def profile_summary(self, res, obs) -> dict:
-        out = {
-            "profile_param": res.param_name,
-            "profile_level": res.level,
-            f"profile_{res.param_name}_ci_low": res.ci_low,
-            f"profile_{res.param_name}_ci_high": res.ci_high,
-            "profile_excess_ci_low": res.excess_ci_low,
-            "profile_excess_ci_high": res.excess_ci_high,
-            "profile_excess_ci_width": res.excess_ci_high - res.excess_ci_low,
-        }
-        if obs.theta_true is not None:
-            excess_true = self.uq_quantity(obs.theta_true, obs.y_grid)
-            out["profile_excess_covered"] = bool(
-                res.excess_ci_low <= excess_true <= res.excess_ci_high
-            )
-            out[f"profile_{res.param_name}_covered"] = bool(
-                res.ci_low <= float(obs.theta_true[res.param_index]) <= res.ci_high
-            )
-        return out
-
     def laplace_summary(self, spec: dict) -> dict:
         eig = spec["eigenvalues"]
         least = spec["least_identified_dir"]
@@ -616,28 +569,6 @@ class SourceItrAdapter(InverseAdapter):
             out[f"laplace_eig_{i}"] = float(eig[i])
         for i, nm in enumerate(self.param_names):
             out[f"laplace_least_dir_{nm}"] = float(least[i])
-        return out
-
-    def mcmc_summary(self, res, obs) -> dict:
-        alpha = (1.0 - res.level) / 2.0
-        qlo, qhi = 100.0 * alpha, 100.0 * (1.0 - alpha)
-        exc_lo, exc_hi = np.percentile(res.excess_int, [qlo, qhi])
-        out = {
-            "mcmc_accept_rate": res.accept_rate,
-            "mcmc_excess_mean": float(np.mean(res.excess_int)),
-            "mcmc_excess_ci_low": float(exc_lo),
-            "mcmc_excess_ci_high": float(exc_hi),
-            "mcmc_excess_ci_width": float(exc_hi - exc_lo),
-        }
-        for i, nm in enumerate(self.param_names):
-            col = res.theta_samples[:, i]
-            lo, hi = np.percentile(col, [qlo, qhi])
-            out[f"mcmc_{nm}_mean"] = float(np.mean(col))
-            out[f"mcmc_{nm}_ci_low"] = float(lo)
-            out[f"mcmc_{nm}_ci_high"] = float(hi)
-        if obs.theta_true is not None:
-            excess_true = self.uq_quantity(obs.theta_true, obs.y_grid)
-            out["mcmc_excess_covered"] = bool(exc_lo <= excess_true <= exc_hi)
         return out
 
 
@@ -656,12 +587,6 @@ class ForcingAdapter(InverseAdapter):
         lo, hi = RC_RANGE
         p = (theta[..., 0] - lo) / (hi - lo)
         return _logit(p).unsqueeze(-1)
-
-    def theta_logabsdet_du(self, u: torch.Tensor) -> torch.Tensor:
-        lo, hi = RC_RANGE
-        sp = torch.nn.functional.softplus
-        u0 = u[..., 0]
-        return float(np.log(hi - lo)) - sp(-u0) - sp(u0)
 
     def theta_from_sim_params(
         self, sim_params: dict, *, dtype: torch.dtype = torch.float32, device=None
@@ -783,20 +708,6 @@ class ForcingAdapter(InverseAdapter):
                 )
         return out
 
-    def profile_summary(self, res, obs) -> dict:
-        out = {
-            "profile_param": res.param_name,
-            "profile_level": res.level,
-            "profile_R_c_ci_low": res.ci_low,
-            "profile_R_c_ci_high": res.ci_high,
-            "profile_R_c_ci_width": res.ci_high - res.ci_low,
-        }
-        if obs.theta_true is not None:
-            out["profile_R_c_covered"] = bool(
-                res.ci_low <= float(obs.theta_true[0]) <= res.ci_high
-            )
-        return out
-
     def laplace_summary(self, spec: dict) -> dict:
         eig = spec["eigenvalues"]
         least = spec["least_identified_dir"]
@@ -805,22 +716,6 @@ class ForcingAdapter(InverseAdapter):
             "laplace_eig_0": float(eig[0]) if len(eig) else float("nan"),
             "laplace_least_dir_R_c": float(least[0]),
         }
-
-    def mcmc_summary(self, res, obs) -> dict:
-        alpha = (1.0 - res.level) / 2.0
-        qlo, qhi = 100.0 * alpha, 100.0 * (1.0 - alpha)
-        col = res.theta_samples[:, 0]
-        lo, hi = np.percentile(col, [qlo, qhi])
-        out = {
-            "mcmc_accept_rate": res.accept_rate,
-            "mcmc_R_c_mean": float(np.mean(col)),
-            "mcmc_R_c_ci_low": float(lo),
-            "mcmc_R_c_ci_high": float(hi),
-            "mcmc_R_c_ci_width": float(hi - lo),
-        }
-        if obs.theta_true is not None:
-            out["mcmc_R_c_covered"] = bool(lo <= float(obs.theta_true[0]) <= hi)
-        return out
 
 
 class ForcingItrAdapter(SourceItrAdapter):
@@ -886,8 +781,7 @@ class SourceItrSinAdapter(SourceItrAdapter):
     Two parameters ``theta = (R_base, A)`` reparameterize ``source_itr``'s
     Gaussian-void quartet. The unconstrained -> theta map mirrors the void's
     ``R_base``/``R_amp`` pair (the dependent-amplitude construction is identical),
-    so the Jacobian is lower-triangular and ``theta_logabsdet_du`` reuses the
-    void's two diagonal log-det terms verbatim. All patch/IC bookkeeping is
+    so the Jacobian is lower-triangular. All patch/IC bookkeeping is
     inherited; only the theta-shaped hooks change. Conditioning uses the **global**
     ``A_norm = A / (R_PEAK_MAX - RC_MIN)`` over ``RC_SIN_RANGES["A"]`` to match the
     forward ``build_cond_vector_sin`` (NOT the headroom fraction).
@@ -916,17 +810,6 @@ class SourceItrSinAdapter(SourceItrAdapter):
         ceil = (R_PEAK_MAX - R_base).clamp_min(_dtype_eps(theta.dtype))
         p_A = A / ceil
         return torch.stack([_logit(p_base), _logit(p_A)], dim=-1)
-
-    def theta_logabsdet_du(self, u: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_SIN_RANGES["R_base"]
-        sp = torch.nn.functional.softplus
-        u0, u1 = u[..., 0], u[..., 1]
-        R_base = base_lo + (base_hi - base_lo) * torch.sigmoid(u0)
-        # Lower-triangular map: only the two diagonal entries enter the
-        # determinant (the off-diagonal dA/du0 does not).
-        log_diag0 = float(np.log(base_hi - base_lo)) - sp(-u0) - sp(u0)
-        log_diag1 = torch.log(R_PEAK_MAX - R_base) - sp(-u1) - sp(u1)
-        return log_diag0 + log_diag1
 
     def theta_from_sim_params(
         self, sim_params: dict, *, dtype: torch.dtype = torch.float32, device=None

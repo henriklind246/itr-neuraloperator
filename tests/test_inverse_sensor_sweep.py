@@ -87,7 +87,7 @@ def _write_mock_calibration(path: Path, *, gate_pass: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         path,
-        calibration_schema_version=1,
+        calibration_schema_version=2,
         benchmark="forcing",
         split="val",
         checkpoint_fingerprint="mock-checkpoint",

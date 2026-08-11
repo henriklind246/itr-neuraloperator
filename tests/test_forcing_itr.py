@@ -403,7 +403,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
 
 def test_calibration_artifact_rejects_mismatch_and_uses_frozen_scale(tmp_path):
     artifact = {
-        "calibration_schema_version": np.int64(1),
+        "calibration_schema_version": np.int64(2),
         "benchmark": np.str_("forcing_itr"),
         "split": np.str_("val"),
         "sigma_fno_norm": np.float64(0.02),
@@ -476,4 +476,12 @@ def test_validation_calibration_artifact_construction():
     assert np.asarray(calibration["interface_jump_rms_K"]).shape == (2,)
     assert float(calibration["sigma_fno_K"]) == pytest.approx(
         2.0 * float(calibration["sigma_fno_norm"])
+    )
+    # The correlation-aware design effect is frozen into the artifact and is
+    # never below the independent baseline of 1.
+    assert int(calibration["residual_dim"]) == 3 * 16
+    assert float(calibration["residual_design_effect"]) >= 1.0
+    assert float(calibration["residual_n_eff"]) == pytest.approx(
+        float(calibration["residual_dim"])
+        / float(calibration["residual_design_effect"])
     )

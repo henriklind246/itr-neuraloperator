@@ -800,6 +800,67 @@ def test_effective_sigma2_is_cmeas_plus_2cfno():
     assert inv.effective_sigma2(0.0, 0.0) == 0.0
 
 
+def test_effective_sigma2_scales_by_design_effect():
+    base = inv.effective_sigma2(0.2, sigma_fno_cal=0.1)
+    assert base == pytest.approx(0.04 + 0.01)
+    # A design effect > 1 inflates the variance multiplicatively.
+    assert inv.effective_sigma2(
+        0.2, sigma_fno_cal=0.1, design_effect=3.0
+    ) == pytest.approx(base * 3.0)
+    # It defaults to a no-op and never shrinks below the independent baseline.
+    assert inv.effective_sigma2(0.2, sigma_fno_cal=0.1) == pytest.approx(base)
+    assert inv.effective_sigma2(
+        0.2, sigma_fno_cal=0.1, design_effect=0.4
+    ) == pytest.approx(base)
+
+
+def test_residual_design_effect_independent_is_unity():
+    rng = np.random.default_rng(0)
+    indep = rng.normal(size=(400, 12))
+    d = inv._residual_design_effect(indep, 0.0)
+    assert d["dim"] == 12
+    assert d["design_effect"] == pytest.approx(1.0, abs=0.1)
+    assert d["n_eff"] == pytest.approx(12.0 / d["design_effect"])
+
+
+def test_residual_design_effect_correlated_deflates_to_one_over_m():
+    rng = np.random.default_rng(1)
+    # Rank-1 residual field: every component is the same per-sim draw, so the
+    # m=12 sensors carry the information of a single independent observation.
+    shared = rng.normal(size=(400, 1))
+    corr = shared * np.ones((1, 12))
+    d = inv._residual_design_effect(corr, 0.0)
+    assert d["design_effect"] == pytest.approx(12.0, rel=1e-6)
+    assert d["n_eff"] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_residual_design_effect_measurement_noise_pulls_to_one():
+    rng = np.random.default_rng(2)
+    shared = rng.normal(size=(400, 1))
+    corr = shared * np.ones((1, 12))
+    # Correlated FNO error of unit scale is swamped by huge iid measurement
+    # noise, so the independent measurement term drives D back toward 1.
+    swamped = inv._residual_design_effect(corr, sigma_meas2=1.0e6)
+    assert swamped["design_effect"] == pytest.approx(1.0, abs=1e-3)
+    # With only a modest measurement floor the correlation still inflates D.
+    modest = inv._residual_design_effect(corr, sigma_meas2=100.0)
+    assert modest["design_effect"] > 1.05
+
+
+def test_residual_design_effect_clamps_and_handles_degenerate():
+    rng = np.random.default_rng(3)
+    shared = rng.normal(size=(200, 1))
+    # Anti-correlated columns: raw design effect < 1, applied value clamped to 1.
+    anti = np.hstack([shared, -shared])
+    d = inv._residual_design_effect(anti, 0.0)
+    assert d["design_effect_raw"] < 1.0
+    assert d["design_effect"] == pytest.approx(1.0)
+    # Fewer than two simulations cannot estimate a covariance: no-op.
+    degen = inv._residual_design_effect(np.zeros((1, 5)), 0.0)
+    assert degen["design_effect"] == pytest.approx(1.0)
+    assert degen["dim"] == 5
+
+
 def test_add_measurement_noise_reproducible_and_noop():
     base = _fake_observation_set()
     base.targets = base.targets + 1.0  # nonzero field so a no-op is detectable
@@ -820,19 +881,6 @@ def test_add_measurement_noise_reproducible_and_noop():
     z = inv.ObservationSet(**{**base.__dict__, "targets": base.targets.clone()})
     inv.add_measurement_noise(z, 0.0, seed=7)        # non-positive -> no-op
     assert torch.allclose(z.targets, base.targets)
-
-
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_theta_logabsdet_du_matches_autograd(seed):
-    torch.manual_seed(seed)
-    u = (torch.randn(4, dtype=torch.float64) * 1.5).requires_grad_(False)
-    # Reference: |det| of the full reparameterization Jacobian.
-    J = torch.autograd.functional.jacobian(
-        lambda v: inv.theta_from_unconstrained(v), u
-    )
-    ref = torch.linalg.slogdet(J)[1]  # log|det J|
-    got = inv.theta_logabsdet_du(u)
-    assert float(got) == pytest.approx(float(ref), rel=1e-5, abs=1e-6)
 
 
 def test_neg_log_likelihood_zero_at_fit_and_scales_inverse_variance():
@@ -912,14 +960,10 @@ def test_profile_likelihood_summary_columns_present():
         param_index=1, n_grid=5, span=0.3, level=0.95,
         adam_steps=8, lbfgs_steps=3,
     )
-    flat = inv.profile_summary(res, obs)
-    assert flat["profile_param"] == "R_amp"
-    assert flat["profile_excess_ci_low"] <= flat["profile_excess_ci_high"]
-    assert np.isfinite(flat["profile_excess_ci_width"])
-    assert "profile_R_amp_ci_low" in flat and "profile_R_amp_ci_high" in flat
-    # theta_true known -> coverage booleans emitted.
-    assert isinstance(flat["profile_excess_covered"], bool)
-    assert isinstance(flat["profile_R_amp_covered"], bool)
+    assert res.param_name == "R_amp"
+    assert res.excess_ci_low <= res.excess_ci_high
+    assert np.isfinite(res.excess_ci_high - res.excess_ci_low)
+    assert res.ci_low <= res.ci_high
     # Profiled NLL never beats the unconstrained min by construction.
     assert res.nll.min() >= res.nll_min - 1e-6
 
@@ -946,34 +990,6 @@ def test_laplace_spectrum_eigs_are_singular_values_squared_over_variance():
     # Eigenvalues are sorted descending (cond uses [0]/[-1]).
     eig = spec["eigenvalues"]
     assert np.all(np.diff(eig) <= 1e-8)
-
-
-def test_run_mcmc_accept_rate_and_summary_columns():
-    model = _tiny_source_itr_model().eval()
-    obs = _fake_observation_set()
-    obs.targets = obs.targets + 0.5
-    theta_hat = obs.theta_true.to(torch.float32)
-    res = inv.run_mcmc(
-        model, obs, theta_hat, sigma_eff2=0.1,
-        n_samples=40, burn=10, step_size=0.1, level=0.9, seed=3,
-    )
-    assert res.theta_samples.shape == (40, 4)
-    assert 0.0 <= res.accept_rate <= 1.0
-    # Samples respect the physical box (uniform-theta prior via the Jacobian).
-    assert np.all(res.theta_samples[:, 0] >= 0.05 - 1e-4)
-    assert np.all(res.theta_samples[:, 0] <= 1.0 + 1e-4)
-    assert np.all(res.theta_samples[:, 1] >= -1e-4)
-    assert np.all(
-        res.theta_samples[:, 0] + res.theta_samples[:, 1] <= R_PEAK_MAX + 1e-3
-    )
-
-    flat = inv.mcmc_summary(res, obs)
-    assert flat["mcmc_excess_ci_low"] <= flat["mcmc_excess_ci_high"]
-    assert np.isfinite(flat["mcmc_excess_mean"])
-    for nm in ("R_base", "R_amp", "y0", "sigma"):
-        assert f"mcmc_{nm}_mean" in flat
-        assert flat[f"mcmc_{nm}_ci_low"] <= flat[f"mcmc_{nm}_ci_high"]
-    assert isinstance(flat["mcmc_excess_covered"], bool)
 
 
 # ---------------------------------------------------------------------------
@@ -1090,20 +1106,12 @@ def _tiny_forcing_dataset(Nx=10, Ny=10):
     return ds
 
 
-def test_forcing_adapter_reparameterization_roundtrip_logdet_and_shape():
+def test_forcing_adapter_reparameterization_roundtrip_and_shape():
     adapter = ForcingAdapter()
     u = torch.tensor([[-2.0], [0.0], [1.5]], dtype=torch.float64)
     theta = adapter.theta_from_unconstrained(u)
     back = adapter.unconstrained_from_theta(theta)
     np.testing.assert_allclose(back.numpy(), u.numpy(), rtol=0, atol=1e-8)
-
-    u1 = torch.tensor([0.4], dtype=torch.float64)
-    J = torch.autograd.functional.jacobian(
-        lambda v: adapter.theta_from_unconstrained(v), u1
-    )
-    ref = torch.linalg.slogdet(J)[1]
-    got = adapter.theta_logabsdet_du(u1)
-    assert float(got) == pytest.approx(float(ref), rel=1e-6, abs=1e-8)
 
     theta1 = adapter.theta_from_unconstrained(torch.tensor([0.0], dtype=torch.float32))
     assert theta1.shape == (1,)
@@ -1201,22 +1209,12 @@ def test_forcing_adapter_one_dimensional_uq_smoke():
         param_index=0, n_grid=5, span=0.2, level=0.9,
         adam_steps=2, lbfgs_steps=1, adapter=adapter,
     )
-    flat_prof = inv.profile_summary(prof, obs, adapter)
-    assert flat_prof["profile_param"] == "R_c"
-    assert "profile_R_c_ci_low" in flat_prof
+    assert prof.param_name == "R_c"
+    assert prof.ci_low <= prof.ci_high
 
     spec = inv.laplace_spectrum(model, obs, theta_hat, 0.05, adapter)
     flat_lap = inv.laplace_summary(spec, adapter)
     assert "laplace_least_dir_R_c" in flat_lap
-
-    mc = inv.run_mcmc(
-        model, obs, theta_hat, sigma_eff2=0.05,
-        n_samples=20, burn=5, step_size=0.05, level=0.9,
-        seed=5, adapter=adapter,
-    )
-    assert mc.theta_samples.shape == (20, 1)
-    flat_mc = inv.mcmc_summary(mc, obs, adapter)
-    assert "mcmc_R_c_mean" in flat_mc
 
     cfg = inv.InversionConfig(n_starts=1, adam_steps=5, lbfgs_steps=1, seed=0)
     result = inv.invert_sim(model, obs, cfg, adapter)
@@ -1263,57 +1261,6 @@ def test_inverse_adapter_dispatch_and_validation(tiny_fv_dataset):
 
 
 # ---------------------------------------------------------------------------
-# MCMC chain metadata + mixing diagnostics (the extended MCMCResult).
-# ---------------------------------------------------------------------------
-
-def test_run_mcmc_carries_chain_metadata_and_mixing_diagnostics():
-    model = _tiny_source_itr_model().eval()
-    obs = _fake_observation_set()
-    obs.targets = obs.targets + 0.5
-    theta_hat = obs.theta_true.to(torch.float32)
-    res = inv.run_mcmc(
-        model, obs, theta_hat, sigma_eff2=0.1,
-        n_samples=40, burn=10, step_size=0.1, level=0.9, seed=3,
-    )
-    # The chain describes itself: the args that produced it are persisted.
-    assert res.burn == 10
-    assert res.n_samples == 40
-    assert res.seed == 3
-    assert res.step_size == pytest.approx(0.1)
-    assert res.thin == 1
-    assert res.initial_theta is not None
-    assert res.initial_theta.shape == (4,)
-    # Default start is the MAP (theta_hat) when theta_init is omitted.
-    assert np.allclose(res.initial_theta, theta_hat.numpy(), atol=1e-5)
-    # Geyer mixing diagnostics land per-parameter and for the lead deliverable.
-    assert res.ess_per_param is not None and res.ess_per_param.shape == (4,)
-    assert res.iat_per_param is not None and res.iat_per_param.shape == (4,)
-    assert np.all(np.isfinite(res.ess_per_param))
-    assert np.all(res.ess_per_param > 0.0)
-    assert np.all(res.ess_per_param <= 40.0 + 1e-6)
-    assert np.isfinite(res.ess_excess) and res.ess_excess > 0.0
-    assert np.isfinite(res.iat_excess) and res.iat_excess >= 1.0
-
-
-def test_run_mcmc_theta_init_starts_from_supplied_point():
-    model = _tiny_source_itr_model().eval()
-    obs = _fake_observation_set()
-    obs.targets = obs.targets + 0.5
-    theta_hat = obs.theta_true.to(torch.float32)
-    # A dispersed start distinct from the MAP; a tiny step keeps the chain local.
-    start = torch.tensor([0.6, 0.4, 0.3, 0.15])
-    res = inv.run_mcmc(
-        model, obs, theta_hat, sigma_eff2=0.1,
-        n_samples=12, burn=0, step_size=1e-3, level=0.9, seed=1,
-        theta_init=start,
-    )
-    assert res.initial_theta is not None
-    assert np.allclose(res.initial_theta, start.numpy(), atol=1e-5)
-    # With a tiny proposal scale the post-burn samples stay near the start.
-    assert np.allclose(res.theta_samples[0], start.numpy(), atol=5e-2)
-
-
-# ---------------------------------------------------------------------------
 # Per-sim NPZ artifact dump (--artifact-dir): keys/shapes for both benchmarks.
 # ---------------------------------------------------------------------------
 
@@ -1328,17 +1275,12 @@ def test_artifact_dir_writes_expected_npz_keys_source_itr(tmp_path):
 
     report = inv.sensitivity_report(model, obs, theta_hat, adapter)
     J = inv.observation_jacobian(model, obs, theta_hat, adapter)
-    mc = inv.run_mcmc(
-        model, obs, theta_hat, sigma_eff2=0.1,
-        n_samples=30, burn=5, step_size=0.05, level=0.95, seed=0,
-        adapter=adapter,
-    )
     result = SimpleNamespace(theta_hat=theta_hat)
 
     path = inv._write_sim_artifact(
         str(tmp_path), 7, adapter,
         obs=obs, result=result, report=report, J=J,
-        fv_res=None, prof=None, mc=mc, sigma_eff2=0.1, c_fno=0.01,
+        fv_res=None, prof=None, sigma_eff2=0.1, c_fno=0.01,
         noise_std=0.01, ci_level=0.95,
         dataset_path="data/sourceitr_smoke", dataset_fingerprint="abc123",
         split_seed=0, split_name="test",
@@ -1368,15 +1310,6 @@ def test_artifact_dir_writes_expected_npz_keys_source_itr(tmp_path):
     assert d["singular_values"].shape == (4,)
     assert "ramp_sigma_alignment" in d
     assert d["observation_jacobian"].shape[1] == 4
-    # MCMC block: chain + mixing diagnostics.
-    assert d["mcmc_theta_samples"].shape == (30, 4)
-    assert d["mcmc_excess_int"].shape == (30,)
-    assert int(d["mcmc_burn"]) == 5
-    assert int(d["mcmc_n_samples"]) == 30
-    assert "mcmc_ess_per_param" in d and d["mcmc_ess_per_param"].shape == (4,)
-    assert "mcmc_iat_per_param" in d and d["mcmc_iat_per_param"].shape == (4,)
-    assert "mcmc_ess_excess" in d and "mcmc_iat_excess" in d
-    assert "mcmc_initial_theta" in d and d["mcmc_initial_theta"].shape == (4,)
     # Inflation scalars mirror the UQ columns.
     assert float(d["sigma_eff2"]) == pytest.approx(0.1)
     assert float(d["c_fno"]) == pytest.approx(0.01)
@@ -1399,7 +1332,7 @@ def test_artifact_dir_writes_expected_npz_keys_forcing(tmp_path):
     path = inv._write_sim_artifact(
         str(tmp_path), 3, adapter,
         obs=obs, result=result, report=report, J=J,
-        fv_res=None, prof=None, mc=None, sigma_eff2=None, c_fno=None,
+        fv_res=None, prof=None, sigma_eff2=None, c_fno=None,
         noise_std=0.0, ci_level=0.95,
         dataset_path="data/forcing_inv", dataset_fingerprint="def456",
         split_seed=0, split_name="test",
@@ -1415,9 +1348,8 @@ def test_artifact_dir_writes_expected_npz_keys_forcing(tmp_path):
     assert d["param_scales"].shape == (1,)
     assert d["right_vectors"].shape == (1, 1)
     assert d["observation_jacobian"].shape[1] == 1
-    # One parameter: no (R_amp, sigma) ridge alignment and no MCMC block.
+    # One parameter: no (R_amp, sigma) ridge alignment.
     assert "ramp_sigma_alignment" not in d
-    assert "mcmc_theta_samples" not in d
     assert "sigma_eff2" not in d
     assert "c_fno" not in d
 
@@ -1512,18 +1444,14 @@ def test_sin_adapter_theta_from_unconstrained_respects_box_and_ceiling():
     assert torch.all(R_base + A <= R_PEAK_MAX + 1e-6)
 
 
-def test_sin_adapter_triangular_jacobian_logdet_matches_autograd():
+def test_sin_adapter_reparameterization_is_lower_triangular():
     adapter = SourceItrSinAdapter()
     u = torch.tensor([0.4, -0.7], dtype=torch.float64)
     J = torch.autograd.functional.jacobian(
         lambda v: adapter.theta_from_unconstrained(v), u
     )
-    # Lower-triangular map: dR_base/du1 == 0 (the (0,1) entry), so only the two
-    # diagonal terms enter log|det J|.
+    # Lower-triangular map: dR_base/du1 == 0 (the (0,1) entry).
     assert float(J[0, 1]) == pytest.approx(0.0, abs=1e-12)
-    ref = torch.linalg.slogdet(J)[1]
-    got = adapter.theta_logabsdet_du(u)
-    assert float(got) == pytest.approx(float(ref), rel=1e-8, abs=1e-10)
 
 
 def test_sin_adapter_theta_from_sim_params_and_injection():
