@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from src.operators.fno2d import ConditionalInstanceNorm2d, FNO2d, TemporalForcingEncoder
+from src.operators.fno2d import (
+    BoundaryForcingExtender,
+    ConditionalInstanceNorm2d,
+    FNO2d,
+    TemporalForcingEncoder,
+)
 
 SPATIAL_IN_CHANNELS = 20
 COND_STATIC_DIM = 23
@@ -81,6 +86,125 @@ class TestTemporalForcingEncoder:
         z = torch.randn(3, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
         h = enc(z)
         assert h.shape == (3, 16)
+
+
+def _forcing_spatial(batch=2, nx=11, ny=13, in_channels=4):
+    spatial = torch.zeros(batch, nx, ny, in_channels)
+    x = torch.linspace(0.0, 1.0, nx)
+    y = torch.linspace(0.0, 1.0, ny)
+    spatial[..., 1] = x[None, :, None]
+    spatial[..., 2] = y[None, None, :]
+    spatial[..., 3] = 0.25 + y[None, None, :]
+    return spatial
+
+
+class TestBoundaryForcingExtender:
+    def test_token_contract_uses_boundary_waveform_and_exact_lead(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=4, out_dim=2, grid_size=3, num_heads=2, s_y_channel=3
+        )
+        spatial = _forcing_spatial(batch=1, nx=5, ny=4)
+        h_a = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        t_bar_norm = torch.tensor([[0.375]])
+
+        boundary = extender._build_boundary_tokens(h_a, spatial, t_bar_norm)
+        domain, coarse_shape = extender._build_domain_tokens(spatial, t_bar_norm)
+
+        s_y = spatial[:, 0, :, 3:4]
+        assert boundary.shape == (1, 4, 7)
+        assert torch.equal(boundary[..., 0:1], spatial[:, 0, :, 2:3])
+        assert torch.equal(boundary[..., 1:2], s_y)
+        assert torch.equal(boundary[..., 2:6], s_y * h_a[:, None, :])
+        assert torch.equal(boundary[..., 6:7], t_bar_norm[:, None, :].expand(-1, 4, -1))
+        assert coarse_shape == (3, 3)
+        assert domain.shape == (1, 9, 3)
+        assert torch.equal(domain[..., 2:3], t_bar_norm[:, None, :].expand(-1, 9, -1))
+
+    def test_zero_profile_removes_all_waveform_dependence(self):
+        torch.manual_seed(0)
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=6, num_heads=2, s_y_channel=3
+        ).eval()
+        spatial = _forcing_spatial(batch=2, nx=8, ny=9)
+        spatial[..., 3] = 0.0
+        t_bar_norm = torch.tensor([[0.2], [0.7]])
+        h_a = torch.randn(2, 8)
+        h_b = torch.randn(2, 8)
+
+        with torch.no_grad():
+            out_a = extender(h_a, spatial, t_bar_norm)
+            out_b = extender(h_b, spatial, t_bar_norm)
+
+        assert torch.equal(out_a, out_b)
+
+    def test_nonzero_profile_routes_waveform_and_gradients(self):
+        torch.manual_seed(0)
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, cond_hidden=16,
+            temporal_token_dim=2, temporal_hidden=16,
+            forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_temporal_encoder=True, use_forcing_time_aug=True,
+            forcing_cond_mode="spatial_only",
+            forcing_spatial_mode="boundary_extender",
+            forcing_extender_grid_size=6,
+            forcing_extender_heads=4,
+            s_y_channel=3,
+        )
+        spatial = _forcing_spatial(batch=2, nx=9, ny=11)
+        cond_static = torch.randn(2, 10)
+        forcing_a = torch.randn(2, 16, 2)
+        forcing_b = torch.randn(2, 16, 2)
+
+        out_a = model(spatial, cond_static, forcing_a)
+        out_b = model(spatial, cond_static, forcing_b)
+        assert out_a.shape == out_b.shape == (2, 9, 11, 1)
+        assert not torch.allclose(out_a, out_b)
+
+        out_a.square().mean().backward()
+        grad_total = sum(
+            p.grad.abs().sum().item()
+            for p in model.temporal_encoder.parameters()
+            if p.grad is not None
+        )
+        assert grad_total > 0.0
+
+    def test_controlled_weights_permit_x_dependent_extensions(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=4, out_dim=1, grid_size=2, num_heads=1, s_y_channel=3
+        ).eval()
+        with torch.no_grad():
+            for parameter in extender.parameters():
+                parameter.zero_()
+            extender.domain_lift[0].weight[0, 0] = 1.0
+            extender.domain_lift[2].weight[0, 0] = 1.0
+            extender.attention_norm.weight.fill_(1.0)
+            extender.ffn_norm.weight.fill_(1.0)
+            extender.output_projection.weight[0, 0] = 1.0
+
+        spatial = _forcing_spatial(batch=1, nx=5, ny=5)
+        h_a = torch.ones(1, 4)
+        t_bar_norm = torch.tensor([[0.5]])
+        with torch.no_grad():
+            extended = extender(h_a, spatial, t_bar_norm)
+
+        assert not torch.allclose(extended[:, 0], extended[:, -1])
+
+    def test_grid_clamps_and_upsamples_to_input_shape(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=16, num_heads=2, s_y_channel=3
+        )
+        spatial = _forcing_spatial(batch=2, nx=5, ny=7)
+        h_a = torch.randn(2, 8)
+        t_bar_norm = torch.randn(2, 1)
+
+        domain, coarse_shape = extender._build_domain_tokens(spatial, t_bar_norm)
+        out = extender(h_a, spatial, t_bar_norm)
+
+        assert coarse_shape == (5, 7)
+        assert domain.shape == (2, 35, 3)
+        assert out.shape == (2, 5, 7, 4)
 
 
 class TestFNO2d:
@@ -234,6 +358,7 @@ class TestFNO2d:
         )
         assert not hasattr(model, "temporal_encoder")
         assert not hasattr(model, "forcing_to_spatial")
+        assert not hasattr(model, "boundary_extender")
         assert model.linear_p.in_features == in_ch
         assert model.cond_mlp.net[0].in_features == cond_dim
 
@@ -289,6 +414,96 @@ class TestFNO2d:
         forcing_seq = torch.randn(2, 16, 2)
         out = model(spatial, cond_static, forcing_seq)
         assert out.shape == (2, 11, 11, 1)
+
+    def test_boundary_extender_replaces_broadcast_channels_at_same_width(self):
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=16,
+            use_temporal_encoder=True, use_forcing_time_aug=True,
+            forcing_cond_mode="spatial_only",
+            forcing_spatial_mode="boundary_extender",
+            forcing_extender_grid_size=8,
+            forcing_extender_heads=4,
+        )
+
+        assert model.linear_p.in_features == 20
+        assert model.boundary_extender.out_dim == 16
+        assert hasattr(model, "boundary_extender")
+        assert not hasattr(model, "forcing_to_spatial")
+        assert not hasattr(model, "forcing_aug_mlp")
+        assert model.cond_mlp.net[0].in_features == 10
+
+    @pytest.mark.parametrize(
+        "overrides,match",
+        [
+            (
+                {"forcing_spatial_mode": "unknown"},
+                "forcing_spatial_mode must be one of",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "boundary_extender",
+                    "use_temporal_encoder": False,
+                },
+                "requires use_temporal_encoder=True",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "boundary_extender",
+                    "forcing_cond_mode": "cond_only",
+                    "use_forcing_time_aug": True,
+                },
+                "requires a spatial forcing route",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "boundary_extender",
+                    "forcing_cond_mode": "spatial_only",
+                },
+                "requires use_forcing_time_aug=True",
+            ),
+        ],
+    )
+    def test_boundary_extender_rejects_contradictory_config(self, overrides, match):
+        kwargs = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, temporal_token_dim=2,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_temporal_encoder=True, use_forcing_time_aug=False,
+            forcing_cond_mode="both",
+        )
+        kwargs.update(overrides)
+        with pytest.raises(ValueError, match=match):
+            FNO2d(**kwargs)
+
+    def test_default_and_explicit_broadcast_are_numerically_identical(self):
+        common = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, cond_hidden=16,
+            temporal_token_dim=2, temporal_hidden=16,
+            forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_temporal_encoder=True, use_forcing_time_aug=True,
+            forcing_cond_mode="spatial_only",
+        )
+        torch.manual_seed(7)
+        default = FNO2d(**common).eval()
+        explicit = FNO2d(**common, forcing_spatial_mode="broadcast").eval()
+        explicit.load_state_dict(default.state_dict(), strict=True)
+
+        assert not hasattr(default, "boundary_extender")
+        assert not any(key.startswith("boundary_extender.") for key in default.state_dict())
+
+        spatial = _forcing_spatial(batch=2, nx=9, ny=11)
+        cond_static = torch.randn(2, 10)
+        forcing_seq = torch.randn(2, 16, 2)
+        with torch.no_grad():
+            expected = default(spatial, cond_static, forcing_seq)
+            actual = explicit(spatial, cond_static, forcing_seq)
+        assert torch.equal(actual, expected)
 
     def test_forcing_cond_mode_spatial_only_drops_h_a_from_cin(self):
         """spatial_only: forcing reaches the model only via s_y * z_a. The CIN

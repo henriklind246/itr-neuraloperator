@@ -27,6 +27,12 @@ import torch.nn.functional as F
 #       2. Global: [cond_static, h_a] drives Conditional Instance Normalization.
 #     forcing_cond_mode gates which pathway h_a feeds (both | spatial_only |
 #     cond_only), the Q1 forcing-routing ablation.
+#     forcing_spatial_mode selects the spatial pathway implementation:
+#       - broadcast: forcing_field_k(x, y) = s(y) * z_{a,k} (legacy/default)
+#       - boundary_extender: boundary tokens [y, s(y), s(y)h_a, t_bar] are
+#         cross-attended into learned domain pseudo-extensions. h_a is excluded
+#         from the domain queries, so waveform information cannot bypass the
+#         boundary pathway.
 #   - bins: the spatial input additionally carries 16 fixed integral forcing
 #     bins (Q_y_bins(x, y, k) = s(y) * ∫a(t)dt over the k-th subinterval of
 #     [t_s, t_j], /q_ref); the temporal branch is OFF and forcing_seq is empty,
@@ -206,6 +212,115 @@ class TemporalForcingEncoder(nn.Module):
         return self.act(self.proj(h))          # (B, embed_dim)
 
 
+# --------- Boundary-to-domain forcing extender ---------
+
+class BoundaryForcingExtender(nn.Module):
+    """Lift a left-boundary forcing representation into domain-wide fields.
+
+    ``h_a`` enters only through the boundary interaction ``s(y) * h_a``. The
+    coarse domain queries contain normalized coordinates and the exact lead-time
+    scalar supplied by ``cond_static[:, 0]``; they never receive ``h_a``.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        out_dim: int,
+        grid_size: int = 16,
+        num_heads: int = 4,
+        s_y_channel: int = 3,
+    ):
+        super().__init__()
+        if grid_size <= 0:
+            raise ValueError(f"grid_size must be positive, got {grid_size}")
+        if num_heads <= 0 or embed_dim % num_heads != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be positive and divide embed_dim={embed_dim}"
+            )
+
+        self.embed_dim = embed_dim
+        self.out_dim = out_dim
+        self.grid_size = grid_size
+        self.num_heads = num_heads
+        self.s_y_channel = s_y_channel
+
+        self.boundary_lift = nn.Sequential(
+            nn.Linear(embed_dim + 3, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.domain_lift = nn.Sequential(
+            nn.Linear(3, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.output_projection = nn.Linear(embed_dim, out_dim)
+
+    def _build_boundary_tokens(self, h_a, spatial, t_bar_norm):
+        # forcing benchmark invariant: normalized y is spatial channel 2 and
+        # s(y) is broadcast in x, so the x=0 slice is the boundary function.
+        y_boundary = spatial[:, 0, :, 2:3]
+        s_y = spatial[:, 0, :, self.s_y_channel:self.s_y_channel + 1]
+        Ny = spatial.size(2)
+        h_boundary = s_y * h_a[:, None, :]
+        t_boundary = t_bar_norm[:, None, :].expand(-1, Ny, -1)
+        return torch.cat([y_boundary, s_y, h_boundary, t_boundary], dim=-1)
+
+    def _build_domain_tokens(self, spatial, t_bar_norm):
+        Nx, Ny = spatial.size(1), spatial.size(2)
+        coarse_shape = (min(self.grid_size, Nx), min(self.grid_size, Ny))
+        coords = spatial[..., 1:3].permute(0, 3, 1, 2)
+        coords = F.interpolate(
+            coords,
+            size=coarse_shape,
+            mode="bilinear",
+            align_corners=True,
+        )
+        coords = coords.permute(0, 2, 3, 1).reshape(spatial.size(0), -1, 2)
+        t_domain = t_bar_norm[:, None, :].expand(-1, coords.size(1), -1)
+        return torch.cat([coords, t_domain], dim=-1), coarse_shape
+
+    def forward(self, h_a, spatial, t_bar_norm):
+        """Return ``(B, Nx, Ny, out_dim)`` learned pseudo-extensions."""
+        boundary_tokens = self._build_boundary_tokens(h_a, spatial, t_bar_norm)
+        domain_tokens, coarse_shape = self._build_domain_tokens(spatial, t_bar_norm)
+
+        boundary = self.boundary_lift(boundary_tokens)
+        domain = self.domain_lift(domain_tokens)
+        attended, _ = self.cross_attention(
+            query=domain,
+            key=boundary,
+            value=boundary,
+            need_weights=False,
+        )
+        domain = self.attention_norm(domain + attended)
+        domain = self.ffn_norm(domain + self.ffn(domain))
+
+        coarse = self.output_projection(domain)
+        coarse = coarse.reshape(
+            spatial.size(0), coarse_shape[0], coarse_shape[1], self.out_dim
+        ).permute(0, 3, 1, 2)
+        extended = F.interpolate(
+            coarse,
+            size=(spatial.size(1), spatial.size(2)),
+            mode="bilinear",
+            align_corners=True,
+        )
+        return extended.permute(0, 2, 3, 1)
+
+
 # --------- FNO2d ---------
 
 class FNO2d(nn.Module):
@@ -227,9 +342,10 @@ class FNO2d(nn.Module):
     ``__init__`` defaults below are placeholders that construction always
     overrides.
 
-    When the temporal encoder is active, h_a = TemporalForcingEncoder(forcing_seq)
-    is projected to z_a ∈ R^K and s(y) * z_a is concatenated as K extra spatial
-    channels before the lift, so linear_p receives (in_channels + K) channels.
+    When the temporal encoder's spatial route is active, exactly K forcing
+    channels are concatenated before the lift. ``broadcast`` uses s(y) * z_a;
+    ``boundary_extender`` replaces those fields with learned pseudo-extensions.
+    In either case linear_p receives (in_channels + K) channels.
     """
 
     # NOTE: the in_channels / cond_static_dim / temporal_token_dim defaults below
@@ -254,6 +370,9 @@ class FNO2d(nn.Module):
         use_temporal_encoder: bool = True,
         use_forcing_time_aug: bool = False,
         forcing_cond_mode: str = "both",
+        forcing_spatial_mode: str = "broadcast",
+        forcing_extender_grid_size: int = 16,
+        forcing_extender_heads: int = 4,
         s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
         padding_mode: str = "zeros",
@@ -294,6 +413,29 @@ class FNO2d(nn.Module):
         self.forcing_cond_mode = forcing_cond_mode
         self._forcing_to_spatial = use_temporal_encoder and forcing_cond_mode in ("both", "spatial_only")
         self._forcing_to_cond = use_temporal_encoder and forcing_cond_mode in ("both", "cond_only")
+        if forcing_spatial_mode not in ("broadcast", "boundary_extender"):
+            raise ValueError(
+                "forcing_spatial_mode must be one of broadcast|boundary_extender, "
+                f"got {forcing_spatial_mode!r}"
+            )
+        if forcing_spatial_mode == "boundary_extender":
+            if not use_temporal_encoder:
+                raise ValueError(
+                    "boundary_extender requires use_temporal_encoder=True."
+                )
+            if forcing_cond_mode == "cond_only":
+                raise ValueError(
+                    "boundary_extender requires a spatial forcing route; "
+                    "forcing_cond_mode cannot be 'cond_only'."
+                )
+            if not use_forcing_time_aug:
+                raise ValueError(
+                    "boundary_extender requires use_forcing_time_aug=True so it "
+                    "receives cond_static[:, 0] as normalized lead time."
+                )
+        self.forcing_spatial_mode = forcing_spatial_mode
+        self.forcing_extender_grid_size = forcing_extender_grid_size
+        self.forcing_extender_heads = forcing_extender_heads
         self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
@@ -315,22 +457,33 @@ class FNO2d(nn.Module):
                 "t_right_norm", torch.tensor(float(t_right_norm), dtype=torch.float32)
             )
 
-        # Spatial-forcing channels (s_y * z_a) are only injected when the temporal
-        # branch is active and the ablation routes forcing to the spatial pathway;
-        # otherwise the lift sees in_channels alone.
+        # The spatial route always contributes K channels, preserving the lift
+        # contract across broadcast and extender experiments.
         lift_extra = forcing_spatial_dim if self._forcing_to_spatial else 0
         # Lift: (B, Nx, Ny, in_channels + K) → (B, Nx, Ny, width)
         self.linear_p = nn.Linear(in_channels + lift_extra, width)
 
-        # Project temporal embedding h_a to K spatial-forcing weights; multiplied by s_y(y)
-        # to form K extra spatial channels (restores the direct spatial pathway lost when
-        # the hand-crafted Q_y_bins were removed).
+        # The spatial route contributes exactly K forcing channels. The learned
+        # extender replaces the legacy broadcasts rather than supplementing them.
         if self._forcing_to_spatial:
-            self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
+            if forcing_spatial_mode == "broadcast":
+                self.forcing_to_spatial = nn.Linear(forcing_embed_dim, forcing_spatial_dim)
+            else:
+                self.boundary_extender = BoundaryForcingExtender(
+                    embed_dim=forcing_embed_dim,
+                    out_dim=forcing_spatial_dim,
+                    grid_size=forcing_extender_grid_size,
+                    num_heads=forcing_extender_heads,
+                    s_y_channel=s_y_channel,
+                )
 
         # Time-augmented spatial forcing: fold t_bar_norm into h_a before
         # projecting to spatial-forcing weights, so the learned field can vary with lead.
-        if self._forcing_to_spatial and use_forcing_time_aug:
+        if (
+            self._forcing_to_spatial
+            and forcing_spatial_mode == "broadcast"
+            and use_forcing_time_aug
+        ):
             self.forcing_aug_mlp = nn.Sequential(
                 nn.Linear(forcing_embed_dim + 1, forcing_embed_dim),
                 nn.GELU(),
@@ -398,20 +551,25 @@ class FNO2d(nn.Module):
             # Temporal branch
             h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
 
-            # Spatial forcing injection: F_k(x, y) = s(y) * z_{a,k}. The s_y channel
-            # index is representation-specific (forcing/source: 3; interfaces: 5).
-            # Skipped in cond_only mode (forcing_cond_mode ablation).
+            # Spatial forcing injection is skipped in cond_only mode. Extender
+            # mode replaces the K broadcasts rather than adding another route.
             if self._forcing_to_spatial:
-                if self.use_forcing_time_aug:
-                    t_feats = cond_static[:, 0:1]                 # (B, 1) = [t_bar_norm]
-                    h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
-                    z_a = self.forcing_to_spatial(h_aug)          # (B, K)
+                if self.forcing_spatial_mode == "boundary_extender":
+                    t_bar_norm = cond_static[:, 0:1]
+                    forcing_field = self.boundary_extender(
+                        h_a, spatial, t_bar_norm
+                    )
                 else:
-                    z_a = self.forcing_to_spatial(h_a)            # (B, K)
-                s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]  # (B, Nx, Ny, 1)
-                Nx, Ny = spatial.size(1), spatial.size(2)
-                z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1)  # (B, Nx, Ny, K)
-                forcing_field = s_y * z_grid                      # (B, Nx, Ny, K)
+                    if self.use_forcing_time_aug:
+                        t_feats = cond_static[:, 0:1]             # (B, 1) = [t_bar_norm]
+                        h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
+                        z_a = self.forcing_to_spatial(h_aug)      # (B, K)
+                    else:
+                        z_a = self.forcing_to_spatial(h_a)        # (B, K)
+                    s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]
+                    Nx, Ny = spatial.size(1), spatial.size(2)
+                    z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1)
+                    forcing_field = s_y * z_grid                  # (B, Nx, Ny, K)
                 spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
             else:
                 spatial_aug = spatial
