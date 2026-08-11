@@ -523,6 +523,79 @@ def _tiny_source_itr_fv_dataset(Nx=12, Ny=12, num_sims=2, t_final=0.06, dt=0.01)
     return ds, float(mu_global), float(sigma_global)
 
 
+def _write_inverse_dataset_dir(ds, tmp_path):
+    np.save(tmp_path / "trajectories.npy", np.asarray(ds.trajectories))
+    np.save(tmp_path / "x_grid.npy", np.asarray(ds.x_grid))
+    np.save(tmp_path / "y_grid.npy", np.asarray(ds.y_grid))
+    np.save(tmp_path / "t_grid.npy", np.asarray(ds.t_grid))
+    np.save(tmp_path / "sim_params.npy", np.asarray(ds.sim_params, dtype=object))
+    np.save(tmp_path / "dt.npy", np.asarray(float(ds.dt)))
+
+
+def test_build_dataset_from_dir_disjoint_partition(tmp_path):
+    """The held-out dataset splits into two *disjoint* slices: the first
+    ``n_invert`` sims are inverted (``test``) and the next ``n_calibration`` are
+    reserved for surrogate calibration (``val``), never overlapping, with no
+    training reservation. Keeping them disjoint is what stops calibration from
+    measuring surrogate error on the very sims being inverted."""
+    ds, mu_global, sigma_global = _tiny_source_itr_fv_dataset(num_sims=5)
+    _write_inverse_dataset_dir(ds, tmp_path)
+
+    config = {"benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
+    built = inv.build_dataset_from_dir(
+        str(tmp_path), config, mu_global=mu_global, sigma_global=sigma_global,
+        n_invert=2, n_calibration=3,
+    )
+
+    assert np.asarray(built._split_ids["train"]).size == 0
+    np.testing.assert_array_equal(built._split_ids["test"], np.array([0, 1]))
+    np.testing.assert_array_equal(built._split_ids["val"], np.array([2, 3, 4]))
+    # Disjoint: no sim id appears in both slices.
+    assert not (set(built._split_ids["test"].tolist())
+                & set(built._split_ids["val"].tolist()))
+    assert inv._split_name_for(built, 0) == "test"
+    assert inv._split_name_for(built, 3) == "val"
+
+
+def test_build_dataset_from_dir_rejects_oversized_partition(tmp_path):
+    """The partition cannot request more sims than the dataset holds."""
+    ds, mu_global, sigma_global = _tiny_source_itr_fv_dataset(num_sims=4)
+    _write_inverse_dataset_dir(ds, tmp_path)
+    config = {"benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
+    with pytest.raises(ValueError):
+        inv.build_dataset_from_dir(
+            str(tmp_path), config, mu_global=mu_global, sigma_global=sigma_global,
+            n_invert=3, n_calibration=3,
+        )
+
+
+def test_prepare_inversion_dataset_generates_disjoint_slices(tmp_path):
+    """The shared helper generates one dataset disjoint from training (non-zero
+    seed) and returns contiguous, disjoint inversion/calibration slices."""
+    calls = {}
+
+    def fake_generate(*, num_sims, save_dir, benchmark, nx, ny, save_stride, rng_seed):
+        calls.update(
+            num_sims=num_sims, save_dir=save_dir, benchmark=benchmark,
+            nx=nx, ny=ny, save_stride=save_stride, rng_seed=rng_seed,
+        )
+
+    out_dir = tmp_path / "inversion_data"
+    partition = inv.prepare_inversion_dataset(
+        benchmark="forcing", n_invert=3, n_calibration=5,
+        out_dir=str(out_dir), generate_fn=fake_generate,
+    )
+
+    assert calls["num_sims"] == 8  # n_invert + n_calibration
+    assert calls["benchmark"] == "forcing"
+    assert calls["rng_seed"] == inv.INVERSION_DATASET_SEED != 0
+    assert partition["data_dir"] == str(out_dir)
+    assert partition["invert_ids"] == [0, 1, 2]
+    assert partition["calibration_ids"] == [3, 4, 5, 6, 7]
+    # Disjoint and exhaustive over the generated corpus.
+    assert set(partition["invert_ids"]) & set(partition["calibration_ids"]) == set()
+
+
 @pytest.fixture(scope="module")
 def tiny_fv_dataset():
     return _tiny_source_itr_fv_dataset()

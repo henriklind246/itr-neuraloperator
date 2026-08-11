@@ -24,10 +24,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.dataset import split_sim_ids  # noqa: E402
 from scripts.invert import (  # noqa: E402
+    CALIBRATION_FLOOR,
+    INVERSION_DATASET_SEED,
     _checkpoint_fingerprint,
     build_interface_sensor_mask,
+    prepare_inversion_dataset,
 )
 from visual.inverse_plots import (  # noqa: E402
     _wilson_ci,
@@ -42,15 +44,14 @@ SENSOR_X_HALFWIDTH = 0.005
 NOISE_STD = 0.05
 N_STARTS = 8
 UQ_LEVEL = 0.95
-SPLIT_SEED = 0
 INIT_SEED = 0
 NOISE_SEED = 0
+# Fixed reviewer protocol: invert eight held-out cases, calibrate on a disjoint
+# floor of sims. Both slices come from one dataset generated disjoint from the
+# training corpus (see scripts/invert.prepare_inversion_dataset).
 N_CASES = 8
 
-DEFAULT_DATA_DIRS = {
-    "forcing": PROJECT_ROOT / "data" / "forcinginverse",
-    "forcing_itr": PROJECT_ROOT / "data" / "forcing_itr_inverse_70",
-}
+BENCHMARKS = ("forcing", "forcing_itr")
 REQUIRED_DATA_FILES = (
     "trajectories.npy",
     "x_grid.npy",
@@ -129,26 +130,51 @@ def _validate_data_dir(data_dir: Path) -> None:
         )
 
 
-def select_case_ids(data_dir: Path, config: dict) -> tuple[list[int], list[int]]:
-    trajectories = np.load(data_dir / "trajectories.npy", mmap_mode="r")
-    num_sims = int(trajectories.shape[0])
-    data_cfg = config.get("data", {})
-    train_ids, val_ids, test_ids = split_sim_ids(
-        num_sims,
-        train_frac=float(data_cfg.get("train_split", 0.7)),
-        val_frac=float(data_cfg.get("val_split", 0.15)),
-        seed=SPLIT_SEED,
-    )
-    calibration_ids = sorted(int(sid) for sid in val_ids)
-    if not calibration_ids:
-        raise ValueError("inverse dataset has an empty validation calibration split.")
-    candidate_ids = sorted(int(sid) for sid in np.concatenate([train_ids, test_ids]))
-    if len(candidate_ids) < N_CASES:
-        raise ValueError(
-            f"inverse dataset has only {len(candidate_ids)} non-calibration cases; "
-            f"{N_CASES} are required."
+def prepare_sweep_dataset(
+    *,
+    data_dir: Path | None,
+    benchmark: str,
+    config: dict,
+    out_dir: Path,
+) -> tuple[Path, list[int], list[int]]:
+    """Resolve the disjoint inversion/calibration dataset for the sweep.
+
+    With no ``data_dir`` a fresh dataset disjoint from the training corpus is
+    generated once and reused across every sensor arm. With a ``data_dir``
+    override the existing directory is partitioned in place. Either way the
+    first ``N_CASES`` sims are the inversion slice and the next
+    ``CALIBRATION_FLOOR`` are the calibration slice, matching the partition
+    scripts/invert.py rebuilds from the same ``--n-invert``/``--n-calibration``
+    so both share one dataset fingerprint.
+    """
+    total = N_CASES + CALIBRATION_FLOOR
+    if data_dir is None:
+        data_cfg = config.get("data", {})
+        partition = prepare_inversion_dataset(
+            benchmark=benchmark,
+            n_invert=N_CASES,
+            n_calibration=CALIBRATION_FLOOR,
+            out_dir=str(out_dir / "inversion_data"),
+            nx=int(data_cfg.get("nx", 100)),
+            ny=int(data_cfg.get("ny", 100)),
+            save_stride=int(data_cfg.get("save_stride", 2)),
+            dataset_seed=INVERSION_DATASET_SEED,
         )
-    return candidate_ids[:N_CASES], calibration_ids
+        resolved = Path(partition["data_dir"]).resolve()
+        return resolved, list(partition["invert_ids"]), list(partition["calibration_ids"])
+    resolved = data_dir.expanduser().resolve()
+    _validate_data_dir(resolved)
+    trajectories = np.load(resolved / "trajectories.npy", mmap_mode="r")
+    num_sims = int(trajectories.shape[0])
+    if num_sims < total:
+        raise ValueError(
+            f"inverse dataset {resolved} has {num_sims} sims but the fixed sweep "
+            f"protocol needs {N_CASES} inversion + {CALIBRATION_FLOOR} calibration "
+            f"= {total}."
+        )
+    invert_ids = list(range(N_CASES))
+    calibration_ids = list(range(N_CASES, total))
+    return resolved, invert_ids, calibration_ids
 
 
 def validate_sensor_geometry(data_dir: Path) -> None:
@@ -188,6 +214,10 @@ def build_calibration_command(
         str(checkpoint),
         "--data-dir",
         str(data_dir),
+        "--n-invert",
+        str(N_CASES),
+        "--n-calibration",
+        str(CALIBRATION_FLOOR),
         "--sensor-layout",
         "interface_band",
         "--sensor-x-halfwidth",
@@ -225,6 +255,10 @@ def build_inversion_command(
         str(checkpoint),
         "--data-dir",
         str(data_dir),
+        "--n-invert",
+        str(N_CASES),
+        "--n-calibration",
+        str(CALIBRATION_FLOOR),
         "--sim-ids",
         *(str(sid) for sid in sim_ids),
         "--sensor-layout",
@@ -318,7 +352,7 @@ def _resume_provenance_matches(previous: dict | None, current: dict) -> bool:
         "checkpoint_fingerprint",
         "data_dir",
         "out_dir",
-        "split_seed",
+        "dataset_seed",
         "calibration_sim_ids",
         "evaluation_sim_ids",
         "fixed_protocol",
@@ -760,12 +794,11 @@ def run_sweep(
     *,
     benchmark: str,
     checkpoint: Path,
-    data_dir: Path,
+    data_dir: Path | None,
     out_dir: Path,
     device: str,
 ) -> Path:
     checkpoint = checkpoint.expanduser().resolve()
-    data_dir = data_dir.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
     config = _load_checkpoint_config(checkpoint)
     checkpoint_benchmark, representation = _checkpoint_benchmark(config)
@@ -774,11 +807,15 @@ def run_sweep(
             f"selected benchmark {benchmark!r} does not match checkpoint benchmark "
             f"{checkpoint_benchmark!r}."
         )
-    _validate_data_dir(data_dir)
-    sim_ids, calibration_ids = select_case_ids(data_dir, config)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir, sim_ids, calibration_ids = prepare_sweep_dataset(
+        data_dir=data_dir,
+        benchmark=benchmark,
+        config=config,
+        out_dir=out_dir,
+    )
     validate_sensor_geometry(data_dir)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "sweep_manifest.json"
     combined_path = out_dir / "inverse_sensor_sweep.csv"
     previous_manifest = _load_json(manifest_path)
@@ -793,7 +830,7 @@ def run_sweep(
         "checkpoint_fingerprint": checkpoint_fingerprint,
         "data_dir": str(data_dir),
         "out_dir": str(out_dir),
-        "split_seed": SPLIT_SEED,
+        "dataset_seed": INVERSION_DATASET_SEED,
         "calibration_sim_ids": calibration_ids,
         "evaluation_sim_ids": sim_ids,
         "fixed_protocol": {
@@ -1033,14 +1070,17 @@ def run_sweep(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--benchmark", required=True, choices=sorted(DEFAULT_DATA_DIRS)
+        "--benchmark", required=True, choices=sorted(BENCHMARKS)
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=None,
-        help="Override the bundled benchmark-specific inverse dataset.",
+        help=(
+            "Optional existing disjoint inverse dataset. If omitted, one is "
+            "generated (disjoint from training) into <out-dir>/inversion_data."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -1074,7 +1114,7 @@ def main(argv: list[str] | None = None) -> int:
         data_dir = (
             args.data_dir.expanduser().resolve()
             if args.data_dir is not None
-            else DEFAULT_DATA_DIRS[args.benchmark].resolve()
+            else None
         )
         fingerprint = _checkpoint_fingerprint(str(checkpoint))
         out_dir = (

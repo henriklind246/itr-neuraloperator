@@ -25,7 +25,7 @@ def _checkpoint(path: Path, benchmark: str = "forcing") -> Path:
     return path
 
 
-def _data_dir(path: Path, num_sims: int = 10) -> Path:
+def _data_dir(path: Path, num_sims: int = sweep.N_CASES + sweep.CALIBRATION_FLOOR) -> Path:
     path.mkdir()
     np.save(path / "trajectories.npy", np.zeros((num_sims, 1, 2, 2), np.float32))
     np.save(path / "x_grid.npy", np.linspace(0.0, 1.0, 100, dtype=np.float32))
@@ -94,7 +94,7 @@ def _write_mock_calibration(path: Path, *, gate_pass: bool = True) -> None:
         dataset_fingerprint="mock-dataset",
         observation_fingerprint="mock-observation",
         local_gate_pass=gate_pass,
-        simulation_count=1,
+        simulation_count=sweep.CALIBRATION_FLOOR,
         sigma_fno_norm=0.01 if gate_pass else 0.2,
         sigma_fno_K=0.1 if gate_pass else 2.0,
         sensor_rms_median_K=0.05 if gate_pass else 2.0,
@@ -224,9 +224,15 @@ def test_paper_summary_rejects_inconsistent_derived_columns(tmp_path):
         )
 
 
-def test_default_data_dirs_and_cli_overrides(tmp_path):
-    assert sweep.DEFAULT_DATA_DIRS["forcing"].name == "forcinginverse"
-    assert sweep.DEFAULT_DATA_DIRS["forcing_itr"].name == "forcing_itr_inverse_70"
+def test_cli_data_dir_optional_and_overrides(tmp_path):
+    # The sweep generates its own disjoint dataset by default, so --data-dir is
+    # optional and defaults to None (generate).
+    minimal = sweep._build_parser().parse_args(
+        ["--benchmark", "forcing", "--checkpoint", "model.pt"]
+    )
+    assert minimal.data_dir is None
+    assert set(sweep.BENCHMARKS) == {"forcing", "forcing_itr"}
+
     args = sweep._build_parser().parse_args(
         [
             "--benchmark",
@@ -254,17 +260,57 @@ def test_default_device_prefers_available_accelerator(monkeypatch):
     assert sweep.default_device() == "cpu"
 
 
-def test_select_case_ids_excludes_calibration_and_requires_eight(tmp_path):
-    config = {"data": {"train_split": 0.7, "val_split": 0.15}}
+def test_prepare_sweep_dataset_partitions_existing_dir_disjointly(tmp_path):
+    config = {"data": {}}
     data_dir = _data_dir(tmp_path / "data")
-    sim_ids, calibration_ids = sweep.select_case_ids(data_dir, config)
-    assert calibration_ids == [0]
-    assert sim_ids == list(range(1, 9))
+    resolved, sim_ids, calibration_ids = sweep.prepare_sweep_dataset(
+        data_dir=data_dir, benchmark="forcing", config=config,
+        out_dir=tmp_path / "out",
+    )
+    assert resolved == data_dir.resolve()
+    assert sim_ids == list(range(sweep.N_CASES))
+    assert calibration_ids == list(
+        range(sweep.N_CASES, sweep.N_CASES + sweep.CALIBRATION_FLOOR)
+    )
     assert not set(sim_ids).intersection(calibration_ids)
 
-    too_small = _data_dir(tmp_path / "small", num_sims=8)
-    with pytest.raises(ValueError, match="non-calibration cases"):
-        sweep.select_case_ids(too_small, config)
+    too_small = _data_dir(tmp_path / "small", num_sims=sweep.N_CASES + 1)
+    with pytest.raises(ValueError, match="fixed sweep protocol needs"):
+        sweep.prepare_sweep_dataset(
+            data_dir=too_small, benchmark="forcing", config=config,
+            out_dir=tmp_path / "out2",
+        )
+
+
+def test_prepare_sweep_dataset_generates_when_no_dir(tmp_path, monkeypatch):
+    config = {"data": {"nx": 100, "ny": 100, "save_stride": 2}}
+    captured = {}
+
+    def fake_prepare(**kwargs):
+        captured.update(kwargs)
+        gen_dir = Path(kwargs["out_dir"])
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "data_dir": str(gen_dir),
+            "invert_ids": list(range(kwargs["n_invert"])),
+            "calibration_ids": list(
+                range(kwargs["n_invert"], kwargs["n_invert"] + kwargs["n_calibration"])
+            ),
+        }
+
+    monkeypatch.setattr(sweep, "prepare_inversion_dataset", fake_prepare)
+    resolved, sim_ids, calibration_ids = sweep.prepare_sweep_dataset(
+        data_dir=None, benchmark="forcing", config=config, out_dir=tmp_path / "out",
+    )
+    assert captured["benchmark"] == "forcing"
+    assert captured["n_invert"] == sweep.N_CASES
+    assert captured["n_calibration"] == sweep.CALIBRATION_FLOOR
+    assert captured["dataset_seed"] == sweep.INVERSION_DATASET_SEED
+    assert resolved == (tmp_path / "out" / "inversion_data").resolve()
+    assert sim_ids == list(range(sweep.N_CASES))
+    assert calibration_ids == list(
+        range(sweep.N_CASES, sweep.N_CASES + sweep.CALIBRATION_FLOOR)
+    )
 
 
 def test_command_builders_fix_the_reviewer_protocol(tmp_path):
@@ -289,6 +335,10 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
         assert float(_option(command, "--noise-std")) == 0.05
         assert int(_option(command, "--seed")) == 0
         assert int(_option(command, "--noise-seed")) == 0
+        # Both subprocesses rebuild the identical disjoint partition so their
+        # dataset fingerprints match.
+        assert int(_option(command, "--n-invert")) == sweep.N_CASES
+        assert int(_option(command, "--n-calibration")) == sweep.CALIBRATION_FLOOR
     assert int(_option(inversion, "--n-starts")) == 8
     # The three reported statistics are unconditional in the entry point, so
     # the protocol carries no per-statistic flags. The retired ones no longer
@@ -386,20 +436,22 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     assert len(rows) == 24
     assert {int(row["n_sensors"]) for row in rows} == {8, 16, 32}
     assert {int(row["init_seed"]) for row in rows} == {0}
-    assert {int(row["noise_seed"]) for row in rows} == set(range(1, 9))
+    assert {int(row["noise_seed"]) for row in rows} == set(range(sweep.N_CASES))
     for count in sweep.SENSOR_COUNTS:
         assert sorted(
             int(row["sim_id"])
             for row in rows
             if int(row["n_sensors"]) == count
-        ) == list(range(1, 9))
+        ) == list(range(sweep.N_CASES))
 
     with (out_dir / "sweep_manifest.json").open() as handle:
         manifest = json.load(handle)
     assert manifest["status"] == "complete"
     assert manifest["combined_row_count"] == 24
-    assert manifest["calibration_sim_ids"] == [0]
-    assert manifest["evaluation_sim_ids"] == list(range(1, 9))
+    assert manifest["calibration_sim_ids"] == list(
+        range(sweep.N_CASES, sweep.N_CASES + sweep.CALIBRATION_FLOOR)
+    )
+    assert manifest["evaluation_sim_ids"] == list(range(sweep.N_CASES))
     assert manifest["plots"]["status"] == "complete"
     assert manifest["schema_version"] == 2
     assert manifest["paper_summary"]["status"] == "complete"

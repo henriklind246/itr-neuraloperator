@@ -95,7 +95,6 @@ from data.dataset import (  # noqa: E402
     T_EPS,
     load_sim_data,
     problem_from_config,
-    split_sim_ids,
 )
 from scripts.inverse_adapters import (  # noqa: E402
     InverseAdapter,
@@ -107,6 +106,17 @@ from src.operators.fno2d import FNO2d  # noqa: E402
 _SOURCE_ITR_ADAPTER = SourceItrAdapter()
 PAPER_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
 PAPER_SENSOR_Y = tuple(np.linspace(0.1, 0.9, 8))
+
+# Inversion always runs on a freshly generated dataset that is disjoint from the
+# training corpus. Training draws use ``rng_seed=0``; a non-zero seed here makes
+# the inversion draws provably disjoint and records that seed in the dataset
+# ``meta`` (see ``data/generate_dataset.py``).
+INVERSION_DATASET_SEED = 1
+# Calibration estimates the FNO's sensor-level error at true theta. It is cheap
+# (one forward per sim, no optimization/FV), so we hold out a fixed floor of
+# calibration sims regardless of how many sims are inverted: enough sims to keep
+# the pooled sigma_FNO and the per-sim p90 local gate stable.
+CALIBRATION_FLOOR = 32
 
 
 # ---------------------------------------------------------------------------
@@ -354,18 +364,79 @@ def load_checkpoint(ckpt_path: str, device: str = "cpu") -> LoadedModel:
 # Dataset construction over a local source_itr artifact directory.
 # ---------------------------------------------------------------------------
 
+def prepare_inversion_dataset(
+    *,
+    benchmark: str,
+    n_invert: int,
+    n_calibration: int,
+    out_dir: str,
+    nx: int = 100,
+    ny: int = 100,
+    save_stride: int = 2,
+    dataset_seed: int = INVERSION_DATASET_SEED,
+    generate_fn=None,
+) -> dict[str, object]:
+    """Generate one disjoint held-out dataset and return its slice partition.
+
+    The single dataset of ``n_invert + n_calibration`` sims is generated with a
+    non-zero ``dataset_seed`` so its draws are disjoint from the training corpus
+    (``rng_seed=0``). The first ``n_invert`` sims are the inversion slice; the
+    next ``n_calibration`` are the calibration slice. Both entry points (this
+    module's ``main`` and ``scripts/run_inverse_sensor_sweep.py``) route through
+    here so calibration and inversion always share one dataset -- hence one
+    ``_dataset_fingerprint`` -- while remaining disjoint by construction.
+
+    ``generate_fn`` defaults to ``data.generate_dataset.generate_sim_data`` and
+    is injectable so tests can substitute a lightweight writer.
+    """
+    if n_invert <= 0:
+        raise ValueError(f"n_invert must be positive, got {n_invert}.")
+    if n_calibration <= 0:
+        raise ValueError(f"n_calibration must be positive, got {n_calibration}.")
+    if generate_fn is None:
+        from data.generate_dataset import generate_sim_data
+
+        generate_fn = generate_sim_data
+    total = n_invert + n_calibration
+    os.makedirs(out_dir, exist_ok=True)
+    generate_fn(
+        num_sims=total,
+        save_dir=out_dir,
+        benchmark=benchmark,
+        nx=nx,
+        ny=ny,
+        save_stride=save_stride,
+        rng_seed=dataset_seed,
+    )
+    return {
+        "data_dir": str(out_dir),
+        "invert_ids": list(range(n_invert)),
+        "calibration_ids": list(range(n_invert, total)),
+    }
+
+
 def build_dataset_from_dir(
     data_dir: str,
     config: dict,
     *,
     mu_global: float,
     sigma_global: float,
-    seed: int = 0,
+    n_invert: int | None = None,
+    n_calibration: int | None = None,
 ) -> SnapshotPairDataset:
     """Construct a SnapshotPairDataset over ``data_dir`` with the checkpoint's stats.
 
     Uses the checkpoint's baked ``(mu_global, sigma_global)`` so normalization
     matches training exactly (never re-normalized per-sample).
+
+    The directory is a freshly generated held-out dataset (disjoint from the
+    training corpus by seed). It is partitioned into two disjoint slices: the
+    first ``n_invert`` sims are the inversion slice (``test``) and the next
+    ``n_calibration`` sims are the calibration slice (``val``); ``train`` is
+    empty. Keeping calibration and inversion sims disjoint avoids measuring
+    surrogate error on the very sims being inverted. When ``n_calibration`` is
+    ``None``/0 the whole corpus (or the first ``n_invert`` sims) is the inversion
+    slice and no calibration slice is reserved.
     """
     traj_path = os.path.join(data_dir, "trajectories.npy")
     x_path = os.path.join(data_dir, "x_grid.npy")
@@ -376,12 +447,19 @@ def build_dataset_from_dir(
     trajectories, x_grid, y_grid, t_grid = load_sim_data(traj_path, x_path, y_path, t_path)
     sim_params = np.load(sim_params_path, allow_pickle=True)
     num_sims = trajectories.shape[0]
-    train_ids, val_ids, test_ids = split_sim_ids(
-        num_sims,
-        train_frac=config["data"].get("train_split", 0.7),
-        val_frac=config["data"].get("val_split", 0.15),
-        seed=seed,
-    )
+    n_calib = int(n_calibration or 0)
+    n_inv = int(n_invert) if n_invert is not None else num_sims - n_calib
+    if n_inv <= 0:
+        raise ValueError(
+            f"n_invert resolves to {n_inv} for a {num_sims}-sim dataset."
+        )
+    if n_inv + n_calib > num_sims:
+        raise ValueError(
+            f"dataset has {num_sims} sims but the requested partition needs "
+            f"{n_inv} inversion + {n_calib} calibration = {n_inv + n_calib}."
+        )
+    invert_ids = np.arange(n_inv)
+    calibration_ids = np.arange(n_inv, n_inv + n_calib)
 
     dt_path = os.path.join(data_dir, "dt.npy")
     ramp_path = os.path.join(data_dir, "ramp_seconds.npy")
@@ -402,7 +480,11 @@ def build_dataset_from_dir(
         dt=dt,
         ramp_seconds=ramp_seconds,
     )
-    ds._split_ids = {"train": train_ids, "val": val_ids, "test": test_ids}
+    ds._split_ids = {
+        "train": np.array([], dtype=int),
+        "val": calibration_ids,
+        "test": invert_ids,
+    }
     required_times = getattr(problem, "required_observation_times", ())
     if required_times:
         resolve_observation_times(ds.t_grid, required_times)
@@ -1369,7 +1451,8 @@ def _observation_fingerprint(
 
 def _split_name_for(ds: SnapshotPairDataset, sid: int) -> str:
     """Which split ``sid`` falls in (``test`` for held-out inversion targets)."""
-    for name, ids in ds._split_ids.items():
+    for name in ("test", "val", "train"):
+        ids = ds._split_ids.get(name, [])
         if int(sid) in {int(i) for i in ids}:
             return name
     return "unknown"
@@ -1721,10 +1804,23 @@ def _write_sim_artifact(
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", required=True, help="Path to fno2d_best.pt")
-    ap.add_argument("--data-dir", required=True, help="Dir with trajectories/sim_params/grids")
+    ap.add_argument("--data-dir", default=None,
+                    help="Existing disjoint held-out dataset dir. If omitted, a "
+                         "fresh disjoint dataset is generated into --generate-dir")
+    ap.add_argument("--generate-dir", default=None,
+                    help="Where to write the generated disjoint dataset when "
+                         "--data-dir is omitted (default: <artifact-dir>/inversion_data)")
+    ap.add_argument("--n-invert", type=int, default=None,
+                    help="Size of the inversion slice (first N sims). When "
+                         "generating, the dataset holds n-invert + n-calibration sims")
+    ap.add_argument("--n-calibration", type=int, default=CALIBRATION_FLOOR,
+                    help="Size of the disjoint calibration slice (fixed floor, "
+                         f"default {CALIBRATION_FLOOR})")
+    ap.add_argument("--dataset-seed", type=int, default=INVERSION_DATASET_SEED,
+                    help="rng_seed for generated inversion data (non-zero keeps "
+                         "it disjoint from the seed-0 training corpus)")
     ap.add_argument("--sim-ids", type=int, nargs="*", default=None,
-                    help="Sim ids to invert (default: first few test-split sims)")
-    ap.add_argument("--n-sims", type=int, default=3, help="How many test sims if --sim-ids omitted")
+                    help="Sim ids to invert (default: the whole inversion slice)")
     time_group = ap.add_mutually_exclusive_group()
     time_group.add_argument("--time-indices", type=int, nargs="*", default=None,
                             help="Legacy observation snapshot indices")
@@ -1810,9 +1906,38 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.profile_index is not None
         else adapter.default_profile_index
     )
+    if args.data_dir is not None:
+        data_dir = args.data_dir
+    else:
+        if args.n_invert is None:
+            raise ValueError(
+                "--n-invert is required when generating a dataset (no --data-dir)."
+            )
+        data_cfg = loaded.config.get("data", {})
+        generate_dir = args.generate_dir or os.path.join(
+            args.artifact_dir or ".", "inversion_data"
+        )
+        partition = prepare_inversion_dataset(
+            benchmark=adapter.benchmark,
+            n_invert=args.n_invert,
+            n_calibration=args.n_calibration,
+            out_dir=generate_dir,
+            nx=int(data_cfg.get("nx", 100)),
+            ny=int(data_cfg.get("ny", 100)),
+            save_stride=int(data_cfg.get("save_stride", 2)),
+            dataset_seed=args.dataset_seed,
+        )
+        data_dir = partition["data_dir"]
+        print(
+            f"Generated disjoint inversion dataset at {data_dir} "
+            f"({args.n_invert} inversion + {args.n_calibration} calibration "
+            f"sims, seed={args.dataset_seed})."
+        )
+
     ds = build_dataset_from_dir(
-        args.data_dir, loaded.config,
+        data_dir, loaded.config,
         mu_global=loaded.mu_global, sigma_global=loaded.sigma_global,
+        n_invert=args.n_invert, n_calibration=args.n_calibration,
     )
     adapter.validate_dataset(ds)
 
@@ -1894,7 +2019,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.sim_ids is not None:
         sim_ids = list(args.sim_ids)
     else:
-        sim_ids = list(ds._split_ids["test"][: args.n_sims])
+        sim_ids = list(ds._split_ids["test"])
     cfg = InversionConfig(
         n_starts=args.n_starts, adam_steps=args.adam_steps, adam_lr=args.adam_lr,
         lbfgs_steps=args.lbfgs_steps, reg_weight=args.reg_weight, seed=args.seed,
@@ -2053,9 +2178,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 fv_res=fv_res, prof=prof, mc=mc,
                 sigma_eff2=sigma_eff2, c_fno=None,
                 noise_std=args.noise_std, ci_level=args.uq_level,
-                dataset_path=args.data_dir,
+                dataset_path=data_dir,
                 dataset_fingerprint=dataset_fingerprint,
-                split_seed=0,
+                split_seed=args.dataset_seed,
                 split_name=_split_name_for(ds, int(sid)),
                 calibration_fingerprint=calibration_fingerprint,
                 sigma_fno_cal=sigma_fno_cal,
