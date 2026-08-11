@@ -2,6 +2,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts.run_train_fixed import (
     _apply_override,
@@ -40,6 +41,19 @@ class TestRunTrainFixedHelpers:
         config = {"training": {"n_snapshots": 15}}
         with pytest.raises(KeyError, match="Unknown config path"):
             _apply_override(config, "training.missing.value", 1)
+
+    def test_boundary_extender_depth_is_cli_overrideable(self):
+        config_path = Path(__file__).resolve().parents[1] / "conf" / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        _apply_override(config, "model.parameters.forcing_extender_depth", 3)
+
+        params = config["model"]["parameters"]
+        assert params["forcing_extender_depth"] == 3
+        assert params["forcing_embed_dim"] == 64
+        assert params["forcing_extender_heads"] == 4
+        assert params["forcing_spatial_dim"] == 16
+        assert params["forcing_extender_grid_size"] == 16
 
     def test_validate_fixed_run_requires_experiment_name(self):
         config = {

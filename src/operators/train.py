@@ -1449,6 +1449,7 @@ def run_one_seed(
         forcing_spatial_mode=model_cfg.get("forcing_spatial_mode", "broadcast"),
         forcing_extender_grid_size=model_cfg.get("forcing_extender_grid_size", 16),
         forcing_extender_heads=model_cfg.get("forcing_extender_heads", 4),
+        forcing_extender_depth=model_cfg.get("forcing_extender_depth", 1),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),

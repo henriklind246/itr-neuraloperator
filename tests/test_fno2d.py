@@ -99,6 +99,64 @@ def _forcing_spatial(batch=2, nx=11, ny=13, in_channels=4):
 
 
 class TestBoundaryForcingExtender:
+    @pytest.mark.parametrize("depth", [1, 2, 3])
+    def test_cross_attention_depth_refines_domain_at_fixed_shape(self, depth):
+        torch.manual_seed(0)
+        extender = BoundaryForcingExtender(
+            embed_dim=8,
+            out_dim=4,
+            grid_size=6,
+            num_heads=2,
+            depth=depth,
+            s_y_channel=3,
+        )
+        spatial = _forcing_spatial(batch=2, nx=8, ny=9)
+        h_a = torch.randn(2, 8)
+        t_bar_norm = torch.randn(2, 1)
+
+        out = extender(h_a, spatial, t_bar_norm)
+        out.square().mean().backward()
+
+        assert extender.depth == depth
+        assert len(extender.additional_cross_attentions) == depth - 1
+        assert out.shape == (2, 8, 9, 4)
+        for attention in extender.additional_cross_attentions:
+            assert attention.in_proj_weight.grad is not None
+            assert attention.in_proj_weight.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("depth", [0, 4, 1.5, True])
+    def test_rejects_depth_outside_integer_one_to_three(self, depth):
+        with pytest.raises(ValueError, match="depth must be an integer"):
+            BoundaryForcingExtender(
+                embed_dim=8,
+                out_dim=4,
+                grid_size=6,
+                num_heads=2,
+                depth=depth,
+                s_y_channel=3,
+            )
+
+    def test_depth_one_preserves_v1_state_dict_keys(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=8,
+            out_dim=4,
+            grid_size=6,
+            num_heads=2,
+            depth=1,
+            s_y_channel=3,
+        )
+
+        assert not any("additional_" in key for key in extender.state_dict())
+        clone = BoundaryForcingExtender(
+            embed_dim=8,
+            out_dim=4,
+            grid_size=6,
+            num_heads=2,
+            depth=1,
+            s_y_channel=3,
+        )
+        clone.load_state_dict(extender.state_dict(), strict=True)
+
     def test_token_contract_uses_boundary_waveform_and_exact_lead(self):
         extender = BoundaryForcingExtender(
             embed_dim=4, out_dim=2, grid_size=3, num_heads=2, s_y_channel=3
@@ -426,10 +484,13 @@ class TestFNO2d:
             forcing_spatial_mode="boundary_extender",
             forcing_extender_grid_size=8,
             forcing_extender_heads=4,
+            forcing_extender_depth=3,
         )
 
         assert model.linear_p.in_features == 20
         assert model.boundary_extender.out_dim == 16
+        assert model.boundary_extender.depth == 3
+        assert len(model.boundary_extender.additional_cross_attentions) == 2
         assert hasattr(model, "boundary_extender")
         assert not hasattr(model, "forcing_to_spatial")
         assert not hasattr(model, "forcing_aug_mlp")

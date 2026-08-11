@@ -228,6 +228,7 @@ class BoundaryForcingExtender(nn.Module):
         out_dim: int,
         grid_size: int = 16,
         num_heads: int = 4,
+        depth: int = 1,
         s_y_channel: int = 3,
     ):
         super().__init__()
@@ -237,11 +238,16 @@ class BoundaryForcingExtender(nn.Module):
             raise ValueError(
                 f"num_heads={num_heads} must be positive and divide embed_dim={embed_dim}"
             )
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth not in (1, 2, 3):
+            raise ValueError(
+                f"depth must be an integer in {{1, 2, 3}}, got {depth!r}"
+            )
 
         self.embed_dim = embed_dim
         self.out_dim = out_dim
         self.grid_size = grid_size
         self.num_heads = num_heads
+        self.depth = depth
         self.s_y_channel = s_y_channel
 
         self.boundary_lift = nn.Sequential(
@@ -266,6 +272,28 @@ class BoundaryForcingExtender(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.additional_cross_attentions = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                batch_first=True,
+            )
+            for _ in range(depth - 1)
+        ])
+        self.additional_attention_norms = nn.ModuleList([
+            nn.LayerNorm(embed_dim) for _ in range(depth - 1)
+        ])
+        self.additional_ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            for _ in range(depth - 1)
+        ])
+        self.additional_ffn_norms = nn.ModuleList([
+            nn.LayerNorm(embed_dim) for _ in range(depth - 1)
+        ])
         self.output_projection = nn.Linear(embed_dim, out_dim)
 
     def _build_boundary_tokens(self, h_a, spatial, t_bar_norm):
@@ -307,6 +335,20 @@ class BoundaryForcingExtender(nn.Module):
         )
         domain = self.attention_norm(domain + attended)
         domain = self.ffn_norm(domain + self.ffn(domain))
+        for cross_attention, attention_norm, ffn, ffn_norm in zip(
+            self.additional_cross_attentions,
+            self.additional_attention_norms,
+            self.additional_ffns,
+            self.additional_ffn_norms,
+        ):
+            attended, _ = cross_attention(
+                query=domain,
+                key=boundary,
+                value=boundary,
+                need_weights=False,
+            )
+            domain = attention_norm(domain + attended)
+            domain = ffn_norm(domain + ffn(domain))
 
         coarse = self.output_projection(domain)
         coarse = coarse.reshape(
@@ -373,6 +415,7 @@ class FNO2d(nn.Module):
         forcing_spatial_mode: str = "broadcast",
         forcing_extender_grid_size: int = 16,
         forcing_extender_heads: int = 4,
+        forcing_extender_depth: int = 1,
         s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
         padding_mode: str = "zeros",
@@ -436,6 +479,16 @@ class FNO2d(nn.Module):
         self.forcing_spatial_mode = forcing_spatial_mode
         self.forcing_extender_grid_size = forcing_extender_grid_size
         self.forcing_extender_heads = forcing_extender_heads
+        if (
+            isinstance(forcing_extender_depth, bool)
+            or not isinstance(forcing_extender_depth, int)
+            or forcing_extender_depth not in (1, 2, 3)
+        ):
+            raise ValueError(
+                "forcing_extender_depth must be an integer in {1, 2, 3}, "
+                f"got {forcing_extender_depth!r}"
+            )
+        self.forcing_extender_depth = forcing_extender_depth
         self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
@@ -474,6 +527,7 @@ class FNO2d(nn.Module):
                     out_dim=forcing_spatial_dim,
                     grid_size=forcing_extender_grid_size,
                     num_heads=forcing_extender_heads,
+                    depth=forcing_extender_depth,
                     s_y_channel=s_y_channel,
                 )
 
