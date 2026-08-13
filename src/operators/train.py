@@ -932,6 +932,13 @@ def _per_pair_rel_l2_percent(y_pred: torch.Tensor, y_true: torch.Tensor) -> torc
 _CHECKPOINT_METRIC_KEYS = {
     "val_rel_l2": "rel_l2",
     "val_nrmse": "nrmse",
+    # Per-pair mean Kelvin RMSE. `val_rel_l2` is a POOLED ratio-of-sums,
+    # sqrt(sum|err|^2 / sum|y|^2), so it is dominated by the highest-energy
+    # pairs and can fall while most pairs get worse. On the N=16 sinusoid
+    # fine-tune the two disagreed in sign: pooled read 9.78 -> 9.55 while the
+    # per-pair mean over the same val set read 5.82 -> 8.24. Select on this
+    # when the reported headline is a per-pair average.
+    "val_rmse_K": "rmse_K",
     "val_jump_nrmse": "node_jump_nrmse",
     # Long-lead OOD selection: minimize post-cutoff (tau > tc) Kelvin RMSE. Only
     # available when training.lead_cutoff_time is set; selection reads the guard
@@ -1689,24 +1696,24 @@ def run_one_seed(
                 f"{ref_metrics['rmse_K_lead_gt_tc']:.4f}K",
                 flush=True,
             )
+        # Write every val_* column, not just the headline pair. A fine-tune may
+        # legitimately select on `val_rmse_K` or `val_nrmse` instead of
+        # `val_rel_l2`, and a reference row that omits the chosen metric leaves
+        # the run unable to answer "did this beat model A" in its own units.
         # The lead-split keys exist only when a cutoff is set.
-        def _ref(key):
-            value = ref_metrics.get(key, None)
-            return float("nan") if value is None else float(value)
-
-        csv_writer.writerow({
+        ref_row = {
             "epoch": -1,
             "lr_first": float("nan"),
             "lr_last": float("nan"),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "is_best": 0,
-            "val_rel_l2": float(ref_metrics["rel_l2"]),
-            "val_rmse_K": float(ref_metrics["rmse_K"]),
-            "val_rmse_K_lead_le_tc": _ref("rmse_K_lead_le_tc"),
-            "val_rmse_K_lead_gt_tc": _ref("rmse_K_lead_gt_tc"),
-            "val_rel_l2_lead_le_tc": _ref("rel_l2_lead_le_tc"),
-            "val_rel_l2_lead_gt_tc": _ref("rel_l2_lead_gt_tc"),
-        })
+        }
+        for column in fieldnames:
+            if not column.startswith("val_"):
+                continue
+            value = ref_metrics.get(column[len("val_"):], None)
+            ref_row[column] = float("nan") if value is None else float(value)
+        csv_writer.writerow(ref_row)
         csv_file.flush()
 
     should_stop = False

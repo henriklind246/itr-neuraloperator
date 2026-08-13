@@ -64,9 +64,24 @@ script, unchanged:
      `--lead-cutoff-time` is not the ID probe; step 3's `id_baseline` arm is.
 
      Kill criterion: val > 1.10x the epoch -1 reference, or two consecutive
-     validations worsening. A single small rise (the 6.18 -> 6.45 in the pilot,
-     +4.4%) is not by itself destructive; that pilot's real signal was that it
-     kept worsening as the LR fell.
+     validations worsening. A single small rise is not by itself destructive.
+
+     Read the kill criterion on `val_rmse_K`, NOT on `val_rel_l2`. `val_rel_l2`
+     is pooled, sqrt(sum|err|^2 / sum|y|^2), so high-energy pairs dominate it and
+     it can fall while most pairs degrade. That is not hypothetical: it is what
+     the first N=16 calibration on E11-ca2 did, and it inverted the conclusion.
+
+       LR     pooled val_rel_l2      per-pair val_rmse_K     500-sim scorer
+       1e-7   9.7803 -> 9.7860 (ep0)  0.3235 -> 0.3245 (ep0)  --
+       3e-7   9.7803 -> 9.8010 (ep0)  0.3235 -> 0.3268 (ep0)  --
+       1e-6   9.7803 -> 9.5511 (ep15) 0.3235 -> 0.3384 (ep0)  sinusoid +20%,
+                     "best", and wrong                        ID +421%
+
+     Under the pooled metric 1e-6 looks like the one arm that adapts, dipping to
+     0.977x at epoch 15. Under the per-pair metric every arm degrades
+     monotonically and the best epoch is always 0. The independent scorer agrees
+     with the per-pair metric. So `checkpoint_metric` is set to `val_rmse_K`
+     here; if you change it, change what you read too.
 
   2b. Transfer control (--scratch): same split, same normalization, same epoch
      budget, random init. Fine-tuning beating zero-shot only shows the model
@@ -288,8 +303,16 @@ def build_finetune_config(source_conf, *, checkpoint_path, data_dir, run_root, a
     # The lead curriculum is a from-scratch device; over a fine-tune this short
     # it would hide the long leads for most of the run.
     training["curriculum_warmup"] = 0
-    # One hypothesis per run: plain val selection, no long-lead selection metric.
-    training["checkpoint_metric"] = "val_rel_l2"
+    # NOT val_rel_l2, which is a pooled ratio-of-sums and is therefore an
+    # energy-weighted metric: it tracks the highest-signal pairs and can improve
+    # while most pairs degrade. The N=16 sinusoid calibration is the worked
+    # example -- at 1e-6 the pooled metric read 9.7803 -> 9.5511 and selected
+    # epoch 15 as "best", while the per-pair mean over that same val set read
+    # 5.8197 -> 8.2430 and the independent 500-sim scorer put the selected
+    # checkpoint 20% WORSE on sinusoid and 421% worse in-distribution. val_rmse_K
+    # is a per-pair mean and matches the convention every OOD number is reported
+    # in, so selection and the headline can no longer disagree in sign.
+    training["checkpoint_metric"] = "val_rmse_K"
     # Optional lead diagnostics only. The epoch -1 reference row (model A before
     # any optimizer step, the honest "before" in the training metric convention)
     # is logged by train.py on every warm start and does not depend on this.

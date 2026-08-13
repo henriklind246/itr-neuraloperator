@@ -229,16 +229,18 @@ class TestFinetuneConfig:
         assert training["curriculum_warmup"] == 0
         assert training["lead_cutoff_time"] is None
         assert training["checkpoint_forgetting_ratio"] is None
-        assert training["checkpoint_metric"] == "val_rel_l2"
+        # Per-pair, matching the OOD scorer. The pooled val_rel_l2 selected an
+        # epoch that was 20% worse on the independent sinusoid set.
+        assert training["checkpoint_metric"] == "val_rmse_K"
 
     def test_lead_cutoff_opts_into_the_step0_reference_pass(self):
         config = build_finetune_config(
             _source_conf(), checkpoint_path="/ckpt/fno2d_best.pt", data_dir="/arm",
             run_root="/out", args=_args("--lead-cutoff-time", "0.15"))
         assert config["training"]["lead_cutoff_time"] == pytest.approx(0.15)
-        # Selection must stay on plain val rel_l2, or the cutoff would silently
-        # change which epoch is kept.
-        assert config["training"]["checkpoint_metric"] == "val_rel_l2"
+        # Selection must stay on the plain per-pair metric, or the cutoff would
+        # silently change which epoch is kept.
+        assert config["training"]["checkpoint_metric"] == "val_rmse_K"
         assert config["training"]["checkpoint_forgetting_ratio"] is None
 
     def test_weight_decay_is_inherited_unless_overridden(self):

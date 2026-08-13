@@ -198,14 +198,21 @@ class TestStepZeroReference:
         ref = [r for r in rows if int(r["epoch"]) == -1]
         assert len(ref) == 1, "exactly one step-0 reference row (epoch -1) expected"
         r = ref[0]
-        for col in ("val_rel_l2", "val_rmse_K"):
+        lead_cols = {
+            "val_rmse_K_lead_le_tc", "val_rmse_K_lead_gt_tc",
+            "val_rel_l2_lead_le_tc", "val_rel_l2_lead_gt_tc",
+        }
+        # Every val_* column, not just the headline pair: any of them may be the
+        # run's checkpoint_metric, and a reference row missing the selected metric
+        # cannot answer "did the fine-tune beat model A" in the units being read.
+        val_cols = [c for c in r if c.startswith("val_") and c not in lead_cols]
+        assert len(val_cols) > 2, "expected the full val_* block in the header"
+        for col in val_cols:
+            assert r[col] not in ("", None), col
             assert np.isfinite(float(r[col])), col
         # No cutoff means no lead split to report; the columns stay in the header
         # so the CSV schema does not depend on the run's diagnostics settings.
-        for col in (
-            "val_rmse_K_lead_le_tc", "val_rmse_K_lead_gt_tc",
-            "val_rel_l2_lead_le_tc", "val_rel_l2_lead_gt_tc",
-        ):
+        for col in sorted(lead_cols):
             assert np.isnan(float(r[col])), col
 
     def test_no_reference_row_from_a_cold_start(self, tmp_path, ll_config):
