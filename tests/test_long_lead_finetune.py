@@ -184,6 +184,39 @@ class TestStepZeroReference:
             assert r[col] not in ("", None), col
             assert np.isfinite(float(r[col])), col
 
+    def test_reference_row_logged_without_a_lead_cutoff(self, tmp_path, ll_config):
+        """Every warm start gets the E_0 row; the cutoff only adds the lead split."""
+        base_best = _baseline_best(ll_config, tmp_path / "baseline")
+
+        warm = copy.deepcopy(ll_config)
+        warm["training"]["init_from_checkpoint"] = str(base_best)
+        warm_dir = tmp_path / "warm_step0_nocutoff"
+        run_one_seed(warm, seed=0, run_dir=warm_dir)
+
+        with (warm_dir / "train_metrics.csv").open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        ref = [r for r in rows if int(r["epoch"]) == -1]
+        assert len(ref) == 1, "exactly one step-0 reference row (epoch -1) expected"
+        r = ref[0]
+        for col in ("val_rel_l2", "val_rmse_K"):
+            assert np.isfinite(float(r[col])), col
+        # No cutoff means no lead split to report; the columns stay in the header
+        # so the CSV schema does not depend on the run's diagnostics settings.
+        for col in (
+            "val_rmse_K_lead_le_tc", "val_rmse_K_lead_gt_tc",
+            "val_rel_l2_lead_le_tc", "val_rel_l2_lead_gt_tc",
+        ):
+            assert np.isnan(float(r[col])), col
+
+    def test_no_reference_row_from_a_cold_start(self, tmp_path, ll_config):
+        """A random init has no "before" worth measuring, so --scratch has no E_0."""
+        cold_dir = tmp_path / "cold"
+        run_one_seed(copy.deepcopy(ll_config), seed=0, run_dir=cold_dir)
+
+        with (cold_dir / "train_metrics.csv").open("r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert not [r for r in rows if int(r["epoch"]) == -1]
+
 
 class TestPostCutoffSelection:
     def test_selects_min_post_cutoff_epoch(self, tmp_path, ll_config):

@@ -31,6 +31,14 @@ GAUSS_SIGMA_RANGE = (0.03, 0.20)
 GAUSS_CENTER_RANGE = (0.05, 0.95)
 TRIANGLE_ELL_RANGE = (0.05, 0.35)
 
+# OOD-only sinusoid family. Deliberately absent from SPATIAL_FAMILIES so
+# sample_spatial_family can never draw it into a training set.
+# Frequency in cycles per unit y; the upper bound matches the largest cos(pi*n*y)
+# mode of init_conditions.ic_random_sinusoid_2d (SINU_KMAX=8 -> f = n/2 = 4.0).
+SINUSOID_FREQ_RANGE = (0.5, 4.0)
+# Modulation depth m = c1 / (c0 + c1) with c0 + c1 = 1; m = 0.5 makes s(y) touch 0.
+SINUSOID_MOD_DEPTH_RANGE = (0.0, 0.5)
+
 # Temporal sampling bounds. Train/exp ranges are expressed as fractions of
 # (dt, t_final) and resolved per-call by the samplers.
 SIN_AMP_RANGE = (50.0, 300.0)
@@ -81,11 +89,19 @@ def spatial_gaussian(y: np.ndarray, y_c: float, sigma_y: float) -> np.ndarray:
 def spatial_triangle(y: np.ndarray, y_c: float, ell: float) -> np.ndarray:
     return np.maximum(1.0 - np.abs(y - y_c) / ell, 0.0)
 
+def spatial_sinusoid(y: np.ndarray, c0: float, c1: float, f: float,
+                     phase: float) -> np.ndarray:
+    return c0 + c1 * np.sin(2.0 * np.pi * f * np.asarray(y, dtype=float) + phase)
+
+# "sinusoid" is registered here (and in SPATIAL_SAMPLERS) but not in
+# SPATIAL_FAMILIES: it must stay reachable by explicit request for OOD studies
+# while remaining unreachable from sample_spatial_family.
 SPATIAL_BUILDERS = {
     "uniform":  lambda y: spatial_uniform(y),
     "patch":    lambda y, y_c, w: spatial_patch(y, y_c, w),
     "gaussian": lambda y, y_c, sigma_y: spatial_gaussian(y, y_c, sigma_y),
     "triangle": lambda y, y_c, ell: spatial_triangle(y, y_c, ell),
+    "sinusoid": lambda y, c0, c1, f, phase: spatial_sinusoid(y, c0, c1, f, phase),
 }
 
 # -------- TEMPORAL FORCING FUNCTIONS ----------
@@ -526,11 +542,21 @@ def sample_triangle_params(rng: np.random.Generator, c: float = 0.0, d: float = 
     y_c = float(rng.uniform(float(c) + ell, float(d) - ell))
     return {"y_c": y_c, "ell": ell}
 
+def sample_sinusoid_params(rng: np.random.Generator, c: float = 0.0, d: float = 1.0) -> dict:
+    span = _span(c, d)
+    lo, hi = SINUSOID_FREQ_RANGE
+    u = rng.uniform(0.0, 1.0)
+    f = float(lo * (hi / lo) ** u) / span
+    m = float(rng.uniform(*SINUSOID_MOD_DEPTH_RANGE))
+    phase = float(rng.uniform(0.0, 2.0 * np.pi))
+    return {"c0": 1.0 - m, "c1": m, "f": f, "phase": phase}
+
 SPATIAL_SAMPLERS = {
     "uniform":  sample_uniform_params,
     "patch":    sample_patch_params,
     "gaussian": sample_gauss_params,
     "triangle": sample_triangle_params,
+    "sinusoid": sample_sinusoid_params,
 }
 
 def sample_sin_params(rng: np.random.Generator, dt: float, t_final: float,

@@ -1646,12 +1646,19 @@ def run_one_seed(
     grad_clip = config["training"].get("grad_clip", None)
     warmup_epochs = config["training"].get("curriculum_warmup", 0)
 
-    # Step-0 reference (Capability 7). For a warm-started fine-tune with a lead
-    # cutoff, run ONE validation pass on the freshly-loaded model A weights BEFORE
-    # any optimizer step, so `pre_cutoff_ref` = rmse_K^A_{tau<=tc} is model A
-    # exactly (not epoch-0-post-step). Logged as epoch -1 so it is auditable. Only
-    # on a fresh warm-start (skip on auto-resume, which already has trained state).
-    if is_main and (not resuming) and init_from_checkpoint and lead_cutoff_time is not None:
+    # Step-0 reference (Capability 7). For a warm start, run ONE validation pass
+    # on the freshly-loaded model A weights BEFORE any optimizer step, so the
+    # run's own metrics contain the honest "before" row rather than an
+    # epoch-0-post-step approximation of it. Logged as epoch -1 so it is
+    # auditable. Only on a fresh warm-start (skip on auto-resume, which already
+    # has trained state).
+    #
+    # Unconditional, not gated on `lead_cutoff_time`: a fine-tune's headline
+    # result is E_0 -> E_best, and that is worth one validation pass on every
+    # warm start. When a cutoff IS set the same pass additionally captures
+    # `pre_cutoff_ref` = rmse_K^A_{tau<=tc}, which is model A exactly and is what
+    # the long-lead selection guard compares against.
+    if is_main and (not resuming) and init_from_checkpoint:
         ref_metrics = validate(
             model=fno_unwrapped,
             val_loader=validation_set,
@@ -1668,13 +1675,25 @@ def run_one_seed(
             sigma_global=sigma_global,
             lead_cutoff_time=lead_cutoff_time,
         )
-        pre_cutoff_ref = float(ref_metrics["rmse_K_lead_le_tc"])
         print(
-            f"[step-0 ref] pre_cutoff_ref (rmse_K tau<={lead_cutoff_time}) = "
-            f"{pre_cutoff_ref:.4f}K; post-cutoff rmse_K = "
-            f"{ref_metrics['rmse_K_lead_gt_tc']:.4f}K",
+            f"[step-0 ref] model A before any optimizer step: "
+            f"val rel_l2={float(ref_metrics['rel_l2']):.4f}%, "
+            f"rmse_K={float(ref_metrics['rmse_K']):.4f}K",
             flush=True,
         )
+        if lead_cutoff_time is not None:
+            pre_cutoff_ref = float(ref_metrics["rmse_K_lead_le_tc"])
+            print(
+                f"[step-0 ref] pre_cutoff_ref (rmse_K tau<={lead_cutoff_time}) = "
+                f"{pre_cutoff_ref:.4f}K; post-cutoff rmse_K = "
+                f"{ref_metrics['rmse_K_lead_gt_tc']:.4f}K",
+                flush=True,
+            )
+        # The lead-split keys exist only when a cutoff is set.
+        def _ref(key):
+            value = ref_metrics.get(key, None)
+            return float("nan") if value is None else float(value)
+
         csv_writer.writerow({
             "epoch": -1,
             "lr_first": float("nan"),
@@ -1683,10 +1702,10 @@ def run_one_seed(
             "is_best": 0,
             "val_rel_l2": float(ref_metrics["rel_l2"]),
             "val_rmse_K": float(ref_metrics["rmse_K"]),
-            "val_rmse_K_lead_le_tc": float(ref_metrics["rmse_K_lead_le_tc"]),
-            "val_rmse_K_lead_gt_tc": float(ref_metrics["rmse_K_lead_gt_tc"]),
-            "val_rel_l2_lead_le_tc": float(ref_metrics["rel_l2_lead_le_tc"]),
-            "val_rel_l2_lead_gt_tc": float(ref_metrics["rel_l2_lead_gt_tc"]),
+            "val_rmse_K_lead_le_tc": _ref("rmse_K_lead_le_tc"),
+            "val_rmse_K_lead_gt_tc": _ref("rmse_K_lead_gt_tc"),
+            "val_rel_l2_lead_le_tc": _ref("rel_l2_lead_le_tc"),
+            "val_rel_l2_lead_gt_tc": _ref("rel_l2_lead_gt_tc"),
         })
         csv_file.flush()
 

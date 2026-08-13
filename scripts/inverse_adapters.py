@@ -18,6 +18,7 @@ from src.physics.internal_source import (
     R_PEAK_MAX,
     equivalent_scalar_resistance,
     integrated_excess_resistance,
+    interface_control_volume_weights,
     make_rc_sin_profile,
     make_rc_void_profile,
 )
@@ -276,6 +277,31 @@ class InverseAdapter(ABC):
     def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
         ...
 
+    def theta_profile_severity(
+        self, u: torch.Tensor, fixed_severity: float, y_grid: torch.Tensor
+    ) -> torch.Tensor:
+        """Pin the integrated severity ``S_R`` and leave the rest free.
+
+        Returns a differentiable ``theta`` for which ``uq_quantity(theta) ==
+        fixed_severity`` (up to the amplitude ceiling), so a Gaussian-NLL refit
+        over ``u`` profiles the severity estimand itself rather than a coordinate
+        that only co-varies with it. Only severity-reporting adapters implement
+        this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not profile integrated severity."
+        )
+
+    def max_feasible_severity(self, y_grid: torch.Tensor) -> float:
+        """Upper bound on ``S_R`` reachable inside the physical parameter box.
+
+        Used to clamp the severity-profile grid so pinned values stay in the
+        FNO's training distribution.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not profile integrated severity."
+        )
+
     @abstractmethod
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
         ...
@@ -492,6 +518,58 @@ class SourceItrAdapter(InverseAdapter):
             y, profile, R_base,
             bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"]),
         )
+
+    def _severity_weights(self, y_grid: torch.Tensor) -> torch.Tensor:
+        y = y_grid.detach().cpu().numpy().astype(np.float64)
+        w = interface_control_volume_weights(
+            y, (_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
+        )
+        return torch.as_tensor(w, dtype=y_grid.dtype, device=y_grid.device)
+
+    def theta_profile_severity(
+        self, u: torch.Tensor, fixed_severity: float, y_grid: torch.Tensor
+    ) -> torch.Tensor:
+        base_lo, base_hi = RC_VOID_RANGES["R_base"]
+        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
+
+        s = torch.sigmoid(u)
+        y0 = y0_lo + (y0_hi - y0_lo) * s[..., 2]
+        sigma = sig_lo + (sig_hi - sig_lo) * s[..., 3]
+
+        y = y_grid.to(dtype=u.dtype, device=u.device)
+        w = self._severity_weights(y_grid).to(dtype=u.dtype)
+        # S_R = R_amp * sum_k w_k exp(-((y_k - y0)/sigma)^2); solve for R_amp.
+        coeff = torch.sum(w * torch.exp(-(((y - y0) / sigma) ** 2)))
+        coeff = coeff.clamp_min(_dtype_eps(u.dtype))
+        S = torch.as_tensor(fixed_severity, dtype=u.dtype, device=u.device)
+        amp_ceiling = torch.as_tensor(
+            R_PEAK_MAX - base_lo, dtype=u.dtype, device=u.device
+        )
+        R_amp = torch.minimum((S / coeff).clamp_min(0.0), amp_ceiling)
+        # Shrink the free R_base box so R_base + R_amp never exceeds R_PEAK_MAX.
+        base_ceiling = torch.clamp(R_PEAK_MAX - R_amp, min=base_lo, max=base_hi)
+        R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
+        return torch.stack([R_base, R_amp, y0, sigma], dim=-1)
+
+    def max_feasible_severity(self, y_grid: torch.Tensor) -> float:
+        # S_R = R_amp * coeff(y0, sigma) with coeff = sum_k w_k exp(-((y_k-y0)/sigma)^2).
+        # The severity a *single* void can realize is capped by the widest
+        # profile, not sum(w): coeff grows with sigma, so it peaks at sig_hi over
+        # the best-centered y0. Scan the (y0, sigma) box for that max coefficient
+        # so the returned bound is actually attainable by some shape.
+        base_lo, _ = RC_VOID_RANGES["R_base"]
+        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
+        _, sig_hi = RC_VOID_RANGES["sigma"]
+        y = y_grid.detach().cpu().numpy().astype(np.float64)
+        w = interface_control_volume_weights(
+            y, (_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
+        )
+        y0s = np.linspace(y0_lo, y0_hi, 65)
+        coeff = (
+            w[None, :] * np.exp(-(((y[None, :] - y0s[:, None]) / sig_hi) ** 2))
+        ).sum(axis=1)
+        return float((R_PEAK_MAX - base_lo) * float(coeff.max()))
 
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
         out = {
@@ -913,6 +991,32 @@ class SourceItrSinAdapter(SourceItrAdapter):
             y, profile, R_base,
             bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"]),
         )
+
+    def _severity_sin_coeff(self, y_grid: torch.Tensor, dtype) -> torch.Tensor:
+        y = y_grid.to(dtype=dtype)
+        w = self._severity_weights(y_grid).to(dtype=dtype)
+        # S_R = A * sum_k w_k sin(pi y_k); coefficient is param-independent.
+        return torch.sum(w * torch.sin(np.pi * y)).clamp_min(_dtype_eps(dtype))
+
+    def theta_profile_severity(
+        self, u: torch.Tensor, fixed_severity: float, y_grid: torch.Tensor
+    ) -> torch.Tensor:
+        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        s = torch.sigmoid(u)
+        coeff = self._severity_sin_coeff(y_grid, u.dtype)
+        S = torch.as_tensor(fixed_severity, dtype=u.dtype, device=u.device)
+        amp_ceiling = torch.as_tensor(
+            R_PEAK_MAX - base_lo, dtype=u.dtype, device=u.device
+        )
+        A = torch.minimum((S / coeff).clamp_min(0.0), amp_ceiling)
+        base_ceiling = torch.clamp(R_PEAK_MAX - A, min=base_lo, max=base_hi)
+        R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
+        return torch.stack([R_base, A], dim=-1)
+
+    def max_feasible_severity(self, y_grid: torch.Tensor) -> float:
+        base_lo, _ = RC_SIN_RANGES["R_base"]
+        coeff = self._severity_sin_coeff(y_grid, torch.float64)
+        return float((R_PEAK_MAX - base_lo) * float(coeff))
 
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
         out = {

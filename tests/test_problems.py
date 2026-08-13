@@ -3,7 +3,11 @@ import pytest
 
 from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
-from problems.forcing import FORCING_TEMPORAL_SAMPLES, ForcingProblem
+from problems.forcing import (
+    FORCING_TEMPORAL_SAMPLES,
+    ForcingProblem,
+    build_cond_vector,
+)
 from problems.forcing_itr import ForcingItrProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
@@ -236,6 +240,71 @@ class TestForcingItem:
         np.testing.assert_allclose(
             first["cond_static"], shifted["cond_static"], rtol=0.0, atol=1e-7
         )
+
+
+class TestForcingUnknownSpatialFamily:
+    """An unseen spatial family may only be conditioned on when the descriptor
+    slice is masked out anyway (spatial_conditioning='spatial_field_only')."""
+
+    _SINU = {"c0": 0.7, "c1": 0.3, "f": 2.0, "phase": 0.5}
+
+    def test_raises_by_default(self):
+        with pytest.raises(ValueError, match="unknown spatial_family"):
+            build_cond_vector(0.1, 0.5, "sinusoid", self._SINU)
+
+    def test_typo_still_raises(self):
+        with pytest.raises(ValueError, match="unknown spatial_family"):
+            build_cond_vector(0.1, 0.5, "gausian", {"y_c": 0.5, "sigma_y": 0.1})
+
+    def test_opt_in_zeroes_the_descriptor(self):
+        cond = build_cond_vector(
+            0.1, 0.5, "sinusoid", self._SINU, allow_unknown_spatial_family=True,
+        )
+        assert cond.shape == (10,)
+        np.testing.assert_allclose(cond[2:10], 0.0)
+
+    def test_masked_output_matches_a_registered_family(self):
+        spec = get_problem("forcing")
+        spec.set_spatial_conditioning("spatial_field_only")
+        unknown = spec._apply_spatial_conditioning_mask(build_cond_vector(
+            0.1, 0.5, "sinusoid", self._SINU, allow_unknown_spatial_family=True,
+        ))
+        known = spec._apply_spatial_conditioning_mask(
+            build_cond_vector(0.1, 0.5, "gaussian", {"y_c": 0.5, "sigma_y": 0.1})
+        )
+        np.testing.assert_allclose(unknown, known, rtol=0.0, atol=0.0)
+
+    def _sinusoid_dataset(self, synthetic_trajectories, synthetic_sim_params, spec):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        params = np.array([dict(p) for p in synthetic_sim_params], dtype=object)
+        for p in params:
+            p["spatial_family"] = "sinusoid"
+            p["spatial_params"] = dict(self._SINU)
+        return _make_dataset(trajectories, x_grid, y_grid, t_grid, params, spec)
+
+    def test_build_item_raises_under_full_conditioning(
+        self, synthetic_trajectories, synthetic_sim_params
+    ):
+        spec = get_problem("forcing")
+        spec.set_spatial_conditioning("full")
+        ds = self._sinusoid_dataset(synthetic_trajectories, synthetic_sim_params, spec)
+        sim_id, s, j = ds._pairs[0]
+        with pytest.raises(ValueError, match="unknown spatial_family"):
+            spec.build_item(ds, sim_id, s, j)
+
+    def test_build_item_succeeds_under_spatial_field_only(
+        self, synthetic_trajectories, synthetic_sim_params
+    ):
+        spec = get_problem("forcing")
+        spec.set_spatial_conditioning("spatial_field_only")
+        ds = self._sinusoid_dataset(synthetic_trajectories, synthetic_sim_params, spec)
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        assert item["cond_static"].shape == (10,)
+        np.testing.assert_allclose(item["cond_static"][2:10], 0.0)
+        # The sinusoid still reaches the model through the s_y spatial channel.
+        s_y = item["spatial"][..., 3]
+        assert float(s_y.max()) > float(s_y.min())
 
 
 # ===================== schema validation =====================

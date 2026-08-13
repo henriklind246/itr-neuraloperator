@@ -89,7 +89,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -1253,23 +1253,30 @@ def _profile_refit(
     adam_lr: float = 0.05,
     lbfgs_steps: int = 30,
     adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    theta_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> tuple[float, torch.Tensor]:
-    """Re-optimize the free three void scalars at a pinned ``fixed_value``.
+    """Re-optimize the free scalars at a pinned constraint.
 
     Minimizes the Gaussian NLL over ``u`` (the pinned coord's ``u`` is inert),
-    Adam then an L-BFGS polish, returning ``(nll_min, theta)``.
+    Adam then an L-BFGS polish, returning ``(nll_min, theta)``. By default the
+    pin is ``theta[fixed_index] = fixed_value`` via ``adapter.theta_profile``;
+    pass ``theta_fn`` to pin a derived quantity instead (e.g. the integrated
+    severity), in which case ``fixed_index``/``fixed_value`` are ignored.
     """
-    if adapter.theta_dim == 1:
-        theta_device = adapter.theta_profile(
-            u_seed.to(obs.spatial.device), fixed_index, fixed_value
-        )
+    def make_theta(u_: torch.Tensor) -> torch.Tensor:
+        if theta_fn is not None:
+            return theta_fn(u_)
+        return adapter.theta_profile(u_, fixed_index, fixed_value)
+
+    if theta_fn is None and adapter.theta_dim == 1:
+        theta_device = make_theta(u_seed.to(obs.spatial.device))
         final = float(neg_log_likelihood(model, obs, theta_device, sigma_eff2, adapter))
         return final, theta_device.detach().cpu()
 
     u = u_seed.clone().detach().to(obs.spatial.device).requires_grad_(True)
 
     def nll():
-        theta = adapter.theta_profile(u, fixed_index, fixed_value)
+        theta = make_theta(u)
         return neg_log_likelihood(model, obs, theta, sigma_eff2, adapter)
 
     adam = torch.optim.Adam([u], lr=adam_lr)
@@ -1290,7 +1297,7 @@ def _profile_refit(
     lbfgs.step(closure)
 
     with torch.no_grad():
-        theta_device = adapter.theta_profile(u, fixed_index, fixed_value)
+        theta_device = make_theta(u)
         final = float(
             neg_log_likelihood(model, obs, theta_device, sigma_eff2, adapter)
         )
@@ -1398,6 +1405,71 @@ def profile_likelihood(
     )
 
 
+def severity_profile_likelihood(
+    model: FNO2d,
+    obs: ObservationSet,
+    theta_hat: torch.Tensor,
+    sigma_eff2: float,
+    *,
+    n_grid: int = 11,
+    span: float = 0.6,
+    level: float = 0.95,
+    adam_steps: int = 150,
+    lbfgs_steps: int = 30,
+    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+) -> ProfileResult:
+    """Direct profile-likelihood interval for the integrated severity ``S_R``.
+
+    Unlike ``profile_likelihood`` (which profiles a single scalar such as
+    ``R_amp`` and then reads off the severity *along that path*), this pins the
+    severity itself onto a grid and re-fits *all* remaining freedom by
+    minimizing the Gaussian NLL, so the reported interval is a genuine
+    profile-likelihood CI for ``S_R``: ``l_p(s) = min_{theta: S_R(theta)=s}
+    NLL(theta)``, thresholded by Wilks. The pin is enforced exactly and
+    differentiably by ``adapter.theta_profile_severity`` (solving the amplitude
+    that realizes ``s`` for the shape drawn from the free coordinates).
+
+    ``span`` is a *fractional* half-width around ``S_R(theta_hat)`` here (grid
+    spans ``s_hat * [1 - span, 1 + span]``), not a physical-unit offset, because
+    severity has no fixed scale across benchmarks. The grid is clamped to
+    ``(0, max_feasible_severity]``.
+    """
+    y_grid = obs.y_grid
+    s_hat = float(adapter.uq_quantity(theta_hat, y_grid))
+    s_max = float(adapter.max_feasible_severity(y_grid))
+    atol = 1e-9 + 1e-6 * max(s_max, 1.0)
+    lo = max(atol, s_hat * (1.0 - span))
+    hi = min(s_max, s_hat * (1.0 + span))
+    if hi <= lo:
+        hi = min(s_max, lo + atol)
+    grid = np.linspace(lo, hi, int(n_grid))
+    u_seed = adapter.unconstrained_from_theta(theta_hat.detach().cpu())
+
+    nll = np.empty(len(grid), dtype=np.float64)
+    excess = np.empty(len(grid), dtype=np.float64)
+    for i, s_val in enumerate(grid):
+        def theta_fn(uu: torch.Tensor, _s: float = float(s_val)) -> torch.Tensor:
+            return adapter.theta_profile_severity(uu, _s, y_grid)
+
+        val, theta = _profile_refit(
+            model, obs, sigma_eff2, -1, float(s_val), u_seed,
+            adam_steps=adam_steps, lbfgs_steps=lbfgs_steps, adapter=adapter,
+            theta_fn=theta_fn,
+        )
+        nll[i] = val
+        excess[i] = float(adapter.uq_quantity(theta, y_grid))
+
+    nll_min = float(nll.min())
+    thresh = _CHI2_HALF_THRESH.get(level, 1.920729)
+    ci_low, ci_high = _threshold_crossings(grid, nll - nll_min, thresh)
+    return ProfileResult(
+        param_index=adapter.default_profile_index, param_name="S_R", level=level,
+        grid=grid, nll=nll, excess_int=excess, nll_min=nll_min,
+        ci_low=ci_low, ci_high=ci_high,
+        excess_ci_low=float(ci_low), excess_ci_high=float(ci_high),
+    )
+
+
 def profile_interval_summary(
     res: ProfileResult,
     adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
@@ -1417,13 +1489,19 @@ def profile_interval_summary(
     Deliberately no ``*_covered`` boolean: see the coverage note in the retired
     section header.
     """
+    severity_profile = res.param_name == "S_R"
     if adapter.reports_spatial_severity:
         low, high = res.excess_ci_low, res.excess_ci_high
         stem = "profile_excess"
     else:
         low, high = res.ci_low, res.ci_high
         stem = f"profile_{res.param_name}"
-    bound_lo, bound_hi = adapter.profile_bounds(res.param_index)
+    if severity_profile:
+        # The severity grid is its own domain: a censored width is one that
+        # closed on the grid edge rather than a Wilks crossing.
+        bound_lo, bound_hi = float(res.grid[0]), float(res.grid[-1])
+    else:
+        bound_lo, bound_hi = adapter.profile_bounds(res.param_index)
     atol = 1e-9 + 1e-6 * (bound_hi - bound_lo)
     return {
         "profile_param": res.param_name,
@@ -1432,7 +1510,7 @@ def profile_interval_summary(
         f"{stem}_ci_high": float(high),
         f"{stem}_ci_width": float(high - low),
         "profile_bound_limited": bool(
-            res.ci_low <= bound_lo + atol or res.ci_high >= bound_hi - atol
+            low <= bound_lo + atol or high >= bound_hi - atol
         ),
     }
 
@@ -1869,6 +1947,8 @@ def _write_sim_artifact(
         payload["profile_nll_min"] = np.float64(prof.nll_min)
         payload["profile_param_index"] = np.int64(prof.param_index)
         payload["profile_param_name"] = np.str_(prof.param_name)
+        payload["profile_excess_ci_low"] = np.float64(prof.excess_ci_low)
+        payload["profile_excess_ci_high"] = np.float64(prof.excess_ci_high)
 
     if sigma_eff2 is not None:
         payload["sigma_eff2"] = np.float64(sigma_eff2)
@@ -1970,7 +2050,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--profile-grid", type=int, default=11,
                     help="Number of pinned grid points for the profile (default 11)")
     ap.add_argument("--profile-span", type=float, default=0.6,
-                    help="Half-width of the profiled-parameter grid around theta_hat")
+                    help="Grid half-width around theta_hat: a physical offset for "
+                         "the scalar-parameter profile, a fractional half-width "
+                         "for the direct severity profile (spatial-ITR benchmarks)")
     ap.add_argument("--artifact-dir", default=None,
                     help="If set, write one self-describing sim_<id>.npz per sim "
                          "(raw profile curves + split provenance) for the "
@@ -2247,6 +2329,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"(supply --noise-std for a measurement-noise model)"
                 )
                 sigma_eff2 = None
+            elif adapter.reports_spatial_severity:
+                prof = severity_profile_likelihood(
+                    loaded.model, obs, theta_hat, sigma_eff2,
+                    n_grid=args.profile_grid, span=args.profile_span,
+                    level=args.uq_level, adapter=adapter,
+                )
+                summary.update(profile_interval_summary(prof, adapter))
             else:
                 prof = profile_likelihood(
                     loaded.model, obs, theta_hat, sigma_eff2,

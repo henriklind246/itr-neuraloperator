@@ -1,166 +1,139 @@
-# itr-neuraloperator
+# Neural operators for interfacial thermal resistance
 
-Repository for modeling interfacial thermal resistance (ITR) and multilayer heat conduction with neural operators. Simulation data is generated with a finite-difference solver, the learning model is a time-conditioned Fourier Neural Operator (FNO) trained on all-to-all snapshot pairs, and the repository includes training, evaluation, and plotting utilities. The long-term goal is to provide clean entry points for the full pipeline, but the current interface is still uneven and is documented here as it exists today.
+A benchmark suite and time-conditioned 2D Fourier Neural Operator for transient
+heat conduction across an imperfect material interface.
 
-## Project Status
+The geometry is two stacked slabs on `[0, 1] x [0, 1]` separated by a thin
+contact resistance `R_c`. Reference trajectories come from a conservative
+Crank-Nicolson finite-volume solver, verified against manufactured solutions.
+The surrogate maps a source snapshot to any later target snapshot,
 
-### Current state
-
-The repository already contains the main components for data generation, model training, model evaluation, and visualization. At present, those components are not all exposed through consistent top-level scripts, and some files under `scripts/` are placeholders rather than working entry points.
-
-### Target state
-
-The goal is to provide meaningful, stable entry points for each major stage of the workflow: generate data, train models, evaluate checkpoints, and generate plots. Until that surface is cleaned up, this README documents the real working entry points instead of the placeholder wrappers.
-
-## Setup
-
-Run commands from the repository root.
-
-1. Create and activate a virtual environment:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
+```
+G_theta : ( T(x, y, t_s), lead time, forcing, R_c ) -> T(x, y, t_j)
 ```
 
-2. Install dependencies:
+and is trained on all-to-all snapshot pairs `(t_s, t_j)` rather than fixed
+single-step rollouts, so one model covers every lead time in `(0, t_final]`.
+
+Seven benchmarks are crossed with two input representations. The dataset,
+model, and training loop never branch on the benchmark name: everything routes
+through a `ProblemSpec` adapter in `problems/`.
+
+## Installation
 
 ```bash
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Currently, `requirements.txt` is the safest install source. `pyproject.toml` does not yet reflect the full runtime dependency set used by the codebase.
+Requires Python >= 3.11. Run all commands from the repository root.
 
-## Workflow Overview
-
-1. Generate simulation data with [data/generate_dataset.py](data/generate_dataset.py).
-2. Train a model with [scripts/run_train_fixed.py](scripts/run_train_fixed.py) or [src/operators/train.py](src/operators/train.py).
-3. Evaluate saved checkpoints with [src/operators/eval.py](src/operators/eval.py).
-4. Generate plots with [visual/cli.py](visual/cli.py) (per-group plot modules under `visual/`).
-
-## Current Entry Points
-
-These are the current entry points that correspond to runnable code:
-
-- `python data/generate_dataset.py`
-- `python scripts/run_train_fixed.py experiment.name=<name> config_id=0`
-- `python -m src.operators.train`
-- `python -m src.operators.eval`
-- `python -m visual.cli ...`
-
-These files are present but currently empty and should not be treated as working entry points:
-
-- [scripts/run_gen_data.py](scripts/run_gen_data.py)
-- [scripts/run_dataset.py](scripts/run_dataset.py)
-- [scripts/run_eval.py](scripts/run_eval.py)
-
-## Data Generation
-
-[data/generate_dataset.py](data/generate_dataset.py) is the current entry point for synthetic data generation. It builds two-layer finite-difference solver configurations with sampled material properties and forcing parameters, runs the simulations, and saves the resulting trajectories for later training.
-
-The current default is `1024` simulations. The script writes:
-
-- `x_grid.npy`
-- `t_grid.npy`
-- `trajectories.npy`
-- `sim_params.npy`
-
-These files are later consumed by [data/dataset.py](data/dataset.py).
+## Quick start
 
 ```bash
-python data/generate_dataset.py
+# 1. Generate trajectories (100x100 grid)
+python data/generate_dataset.py --benchmark forcing --num-sims 8000
+
+# 2. Train
+BENCHMARK=forcing REPRESENTATION=temporal_encoder \
+python scripts/run_train_fixed.py experiment.name=forcing_baseline training.epochs=101
+
+# 3. Evaluate on the test split
+python scripts/run_eval.py runs/forcing_baseline/config0
+
+# 4. Inspect per-pair validation error
+python scripts/inspect_val_pairs.py runs/forcing_baseline/config0/seed42/val_pairs.csv
 ```
 
-Currently, the files are written to the working directory, so running from the repository root is the safe default. There is not yet a dedicated wrapper script or a configurable output path for this direct entry point.
+## Benchmarks
 
-## Training
+| Benchmark         | Varies                                                                      | `R_c`    |
+|-------------------|-----------------------------------------------------------------------------|----------|
+| `forcing`         | Separable left flux `q_L(y,t) = a(t) s(y)`; 4 temporal x 4 spatial families | scalar   |
+| `forcing_itr`     | `forcing` with a Gaussian void profile `R_c(y)`                             | `R_c(y)` |
+| `forcing_itr_sin` | `forcing` with `R_c(y) = R_base + A sin(pi y)`                              | `R_c(y)` |
+| `source`          | Internal volumetric heating patch `(x_h, y_h, A, w_h, h_h)`                 | scalar   |
+| `source_itr`      | `source` with a Gaussian void profile `R_c(y)`                              | `R_c(y)` |
+| `source_itr_sin`  | `source` with `R_c(y) = R_base + A sin(pi y)`                               | `R_c(y)` |
+| `interfaces`      | Interface location `x_i in [0.2, 0.8]` and initial condition                | scalar   |
 
-### Fixed-Config Training
+Representations (set via `REPRESENTATION` or `benchmark.representation`):
 
-[scripts/run_train_fixed.py](scripts/run_train_fixed.py) loads the main YAML
-config, accepts dotted `key=value` overrides, and writes each seed below
-`runs/<experiment>/config<config_id>/`.
+- **`temporal_encoder`** (default) — lean spatial channels plus a `(128, 2)`
+  forcing token sequence consumed by a temporal branch.
+- **`bins`** — 16 additional spatial channels holding integral forcing bins over
+  `[t_s, t_j]`; no temporal branch.
+
+Channel counts and conditioning dims are owned by each spec's `ProblemDims` and
+pinned by `tests/test_problems.py`.
+
+## Configuration
+
+`conf/config.yaml` is the base config, composed with `conf/benchmark/*.yaml` and
+`conf/representation/*.yaml`. Any key is overridable with dotted `key=value`
+arguments:
 
 ```bash
-python scripts/run_train_fixed.py experiment.name=forcing_screen config_id=0
+python scripts/run_train_fixed.py \
+  experiment.name=ablation model.parameters.width=96 training.seeds=[42,43,44]
 ```
 
-### Direct Training Module
+Each run writes `runs/<experiment>/config<id>/seed<seed>/` containing
+`fno2d_best.pt`, `config_used.yaml`, `train_metrics.csv`, `val_pairs.csv`, and
+`final_metrics.json`.
 
-[src/operators/train.py](src/operators/train.py) is the lower-level training entry point. It loads [conf/config.yaml](conf/config.yaml), expects the dataset files to already exist, trains all configured seeds, and writes per-seed checkpoints together with `train_metrics.csv`.
+## Repository layout
+
+```
+problems/      ProblemSpec adapters + registry (one file per benchmark)
+src/physics/   FV solver, MMS verification, boundary forcing, internal source
+src/operators/ FNO2d model, training, evaluation, losses, rollout
+data/          Dataset generation and all-to-all snapshot-pair dataset
+conf/          Base config plus benchmark/ and representation/ groups
+scripts/       Training, evaluation, inverse, and OOD entry points
+visual/pub/    Publication figures with provenance tracking
+tests/         Solver, model, and contract tests
+```
+
+## Inverse problems
+
+`scripts/invert.py` recovers boundary forcing and interface resistance from
+sparse noisy sensors, using a trained checkpoint as the forward map. The
+benchmark is read from the checkpoint config.
 
 ```bash
-python -m src.operators.train
+python scripts/invert.py \
+  --checkpoint runs/forcing_baseline/config0/seed42/fno2d_best.pt \
+  --sensor-n-y 16 --noise-std 0.1
 ```
 
-## Evaluation
-
-[src/operators/eval.py](src/operators/eval.py) is the current evaluation entry point. It loads `fno1d_best.pt` checkpoints from a run directory, computes per-seed test metrics, and writes `seed_report.json`.
+## Reproducing paper figures
 
 ```bash
-python -m src.operators.eval
+python -m visual.pub --verify                  # check artifact availability
+python -m visual.pub --all --out visual/pub_out
 ```
 
-Currently, the module `__main__` assumes `runs/experiment0/config0`, which is a limitation of the current interface rather than a polished evaluation CLI. [scripts/run_eval.py](scripts/run_eval.py) is currently empty.
+Figures declare their required run artifacts in `visual/pub/figures.yaml` and
+refuse to render when those are missing. Point `visual/pub/manifest.yaml` at
+your own run directories.
 
-## Plot Generation
-
-[visual/cli.py](visual/cli.py) provides the current plot-generation CLI. It supports grouped outputs for physics, MMS, training, data, forcing, source, interfaces, evaluation, and inverse workflows. Each group's plot functions live in its own module under `visual/`; shared helpers live in `visual/_common.py`.
-
-Important flags:
-
-- `--data`
-- `--x-grid`
-- `--t-grid`
-- `--params`
-- `--csv`
-- `--report`
-- `--checkpoint`
-- `--out`
-- `--group`
-- `--plots`
-
-Examples:
+## Tests
 
 ```bash
-python -m visual.cli --out visual/
-python -m visual.cli --group physics --out visual/
-python -m visual.cli --group training --csv runs/experiment0/conf0/seed0/train_metrics.csv --report runs/experiment0/conf0/seed_report.json --out visual/
-python -m visual.cli --group data --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
-python -m visual.cli --plots prediction_vs_truth lead_time_error --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
-python -m visual.cli --plots dataset_summary --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --out visual/
-python -m visual.cli --plots interface_jump_summary --data trajectories.npy --x-grid x_grid.npy --t-grid t_grid.npy --params sim_params.npy --checkpoint runs/experiment0/config0/seed42/fno1d_best.pt --out visual/
+pytest tests/ -q          # add -m "not slow" to skip MMS convergence studies
 ```
 
-Some plots require extra inputs and will be skipped if the relevant arguments are not provided. Training plots need `--csv` or `--report`. Grid-based data plots need `--data`, `--x-grid`, and `--t-grid`. Parameter-space and split-aware dataset plots also need `--params`. Checkpoint-based diagnostics such as `prediction_vs_truth`, `interface_error`, `lead_time_error`, `parameter_error_slices`, and `interface_jump_summary` also need `--checkpoint`. The new `dataset_summary` plot is the recommended one-figure dataset overview, while `interface_jump_summary` is the recommended aggregate check for interface-physics fidelity.
+## Citation
 
-## Configuration and Outputs
+```bibtex
+@article{TODO,
+  title  = {TODO},
+  author = {TODO},
+  year   = {TODO}
+}
+```
 
-- [conf/config.yaml](conf/config.yaml) is the main training configuration.
-- [conf/paths/default.yaml](conf/paths/default.yaml) defines the main path settings.
-- `runs/` stores training outputs and checkpoints.
-- `data/` is the intended home for generated datasets, even though the current direct generation script writes to the working directory.
+## License
 
-`PROJECT_ROOT` is used by the config system for path resolution and is set by the training wrapper when applicable.
-
-## Project Layout
-
-- [data/generate_dataset.py](data/generate_dataset.py): synthetic trajectory generation
-- [data/dataset.py](data/dataset.py): all-to-all snapshot-pair dataset construction and dataloaders
-- [src/physics/fv_solver_1d.py](src/physics/fv_solver_1d.py): multilayer finite-volume solver
-- [src/physics/mms_1d.py](src/physics/mms_1d.py): manufactured-solution verification
-- [src/operators/fno1d.py](src/operators/fno1d.py): Fourier Neural Operator model
-- [src/operators/train.py](src/operators/train.py): direct training module
-- [src/operators/eval.py](src/operators/eval.py): checkpoint evaluation and reporting
-- [scripts/run_train_fixed.py](scripts/run_train_fixed.py): fixed-config training with dotted overrides
-- [visual/cli.py](visual/cli.py): plot-generation CLI (dispatches to per-group modules in `visual/`)
-- [conf/config.yaml](conf/config.yaml): main configuration
-- [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md): deeper technical overview
-
-## Known Gaps
-
-- Empty wrapper scripts remain in `scripts/`.
-- The top-level CLI surface is inconsistent.
-- Evaluation still defaults to a hard-coded run path in the module `__main__`.
-- Dataset generation currently writes to the working directory instead of a configurable output path.
-- Dependency metadata is split between [requirements.txt](requirements.txt) and [pyproject.toml](pyproject.toml).
+TODO

@@ -192,6 +192,7 @@ def _independent_temporal_integral(family, params, t_lo, t_hi):
         ("patch", {"y_c": 0.5, "w": 0.4}),
         ("gaussian", {"y_c": 0.35, "sigma_y": 0.12}),
         ("triangle", {"y_c": 0.65, "ell": 0.25}),
+        ("sinusoid", {"c0": 0.7, "c1": 0.3, "f": 2.5, "phase": 0.9}),
     ],
 )
 @pytest.mark.parametrize(

@@ -968,6 +968,82 @@ def test_profile_likelihood_summary_columns_present():
     assert res.nll.min() >= res.nll_min - 1e-6
 
 
+@pytest.mark.parametrize("adapter_cls", [SourceItrAdapter, SourceItrSinAdapter])
+def test_theta_profile_severity_realizes_pinned_severity(adapter_cls):
+    adapter = adapter_cls()
+    y_grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
+    assert adapter.max_feasible_severity(y_grid) > 0.0
+    torch.manual_seed(0)
+    u = torch.randn(adapter.theta_dim, dtype=torch.float64)
+    # For a *fixed* shape u the realizable severity is capped by that shape's
+    # amplitude ceiling; read it back by pinning far above the cap (the solve
+    # clamps to the shape's max). Feasible pins are then realized exactly.
+    s_cap = float(adapter.uq_quantity(
+        adapter.theta_profile_severity(u, 1e9, y_grid), y_grid
+    ))
+    assert s_cap > 0.0
+    for frac in (0.1, 0.5, 0.9):
+        s_pin = frac * s_cap
+        theta = adapter.theta_profile_severity(u, s_pin, y_grid)
+        got = float(adapter.uq_quantity(theta, y_grid))
+        assert got == pytest.approx(s_pin, rel=1e-4, abs=1e-6)
+        # Peak resistance stays physical: R_base + amp <= R_PEAK_MAX.
+        assert float(theta[0]) + float(theta[1]) <= R_PEAK_MAX + 1e-4
+
+
+def test_theta_profile_severity_caps_at_amp_ceiling():
+    # Pinning above the feasible ceiling clamps the amplitude (severity is then
+    # the max attainable rather than the requested value) and keeps R_base+amp
+    # inside the physical box.
+    adapter = SourceItrAdapter()
+    y_grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
+    s_max = adapter.max_feasible_severity(y_grid)
+    u = torch.tensor([20.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    theta = adapter.theta_profile_severity(u, 10.0 * s_max, y_grid)
+    R_base, R_amp = float(theta[0]), float(theta[1])
+    assert R_amp <= (R_PEAK_MAX - RC_VOID_RANGES["R_base"][0]) + 1e-6
+    assert R_base + R_amp <= R_PEAK_MAX + 1e-6
+
+
+def test_theta_profile_severity_is_differentiable():
+    adapter = SourceItrAdapter()
+    y_grid = torch.linspace(0.0, 1.0, 32, dtype=torch.float64)
+    s_max = adapter.max_feasible_severity(y_grid)
+    u = torch.zeros(4, dtype=torch.float64, requires_grad=True)
+    theta = adapter.theta_profile_severity(u, 0.4 * s_max, y_grid)
+    theta.sum().backward()
+    assert u.grad is not None and torch.isfinite(u.grad).all()
+
+
+def test_severity_profile_likelihood_is_valid_profile_interval():
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5  # nonzero residuals against the untrained net
+    theta_hat = obs.theta_true.to(torch.float32)
+    res = inv.severity_profile_likelihood(
+        model, obs, theta_hat, sigma_eff2=0.05,
+        n_grid=5, span=0.5, level=0.95, adam_steps=8, lbfgs_steps=3,
+        adapter=inv._SOURCE_ITR_ADAPTER,
+    )
+    assert res.param_name == "S_R"
+    # Direct severity profile: the reported CI *is* the severity CI.
+    assert res.excess_ci_low == pytest.approx(res.ci_low)
+    assert res.excess_ci_high == pytest.approx(res.ci_high)
+    assert res.ci_low <= res.ci_high
+    # Grid stays inside the feasible severity range.
+    s_max = inv._SOURCE_ITR_ADAPTER.max_feasible_severity(obs.y_grid)
+    assert res.grid.min() > 0.0 and res.grid.max() <= s_max + 1e-6
+    # Profiled NLL never beats the unconstrained min by construction.
+    assert res.nll.min() >= res.nll_min - 1e-6
+    summ = inv.profile_interval_summary(res, inv._SOURCE_ITR_ADAPTER)
+    assert summ["profile_param"] == "S_R"
+    assert summ["profile_excess_ci_low"] <= summ["profile_excess_ci_high"]
+    assert summ["profile_excess_ci_width"] == pytest.approx(
+        summ["profile_excess_ci_high"] - summ["profile_excess_ci_low"]
+    )
+    assert isinstance(summ["profile_bound_limited"], bool)
+
+
 def test_laplace_spectrum_eigs_are_singular_values_squared_over_variance():
     model = _tiny_source_itr_model().eval()
     obs = _fake_observation_set()

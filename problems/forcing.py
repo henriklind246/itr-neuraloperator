@@ -91,19 +91,34 @@ def _normalize_y_length(length: float, y_bounds: tuple[float, float]) -> float:
 
 def build_cond_vector(t_bar_norm: float, R_c: float,
                       spatial_family: str, spatial_params: dict,
-                      y_bounds: tuple[float, float] = (0.0, 1.0)) -> np.ndarray:
+                      y_bounds: tuple[float, float] = (0.0, 1.0),
+                      *,
+                      allow_unknown_spatial_family: bool = False) -> np.ndarray:
     """Assemble the 10-dim forcing-agnostic static conditioning vector.
 
     Layout: [t_bar_norm, R_c_norm, spatial_onehot(4),
     spatial_params(4)]. Carries no temporal-family identity or forcing
     summary; in temporal_encoder mode the only temporal forcing information
     lives in forcing_seq, in bins mode it lives in the Q-bin spatial channels.
+
+    An unknown spatial_family raises by default so a typo cannot silently
+    become an all-zero descriptor. allow_unknown_spatial_family=True is only
+    honest when the [2:10] slice is masked out anyway, i.e. under
+    spatial_conditioning='spatial_field_only'.
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     base = np.array([t_bar_norm, R_c_norm], dtype=np.float32)
 
     spatial_oh = np.zeros(_SPATIAL_ONEHOT_DIM, dtype=np.float32)
-    spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
+    if spatial_family in SPATIAL_FAMILY_ORDER:
+        spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
+    elif not allow_unknown_spatial_family:
+        raise ValueError(
+            f"unknown spatial_family {spatial_family!r}; expected one of "
+            f"{list(SPATIAL_FAMILY_ORDER)}. Pass allow_unknown_spatial_family=True "
+            "only when the spatial descriptor slice is masked out anyway "
+            "(spatial_conditioning='spatial_field_only')."
+        )
     y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
     if spatial_family == "patch":
         y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
@@ -459,6 +474,9 @@ class ForcingProblem(ProblemSpec):
             spatial_family=spatial_family,
             spatial_params=spatial_params,
             y_bounds=(float(ds.y_grid[0]), float(ds.y_grid[-1])),
+            allow_unknown_spatial_family=(
+                self.spatial_conditioning == "spatial_field_only"
+            ),
         )
 
         Y = T_target_norm[:, :, None].astype(np.float32)

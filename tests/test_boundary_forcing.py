@@ -30,6 +30,10 @@ from src.physics.boundary_forcing import (
     spatial_patch,
     spatial_gaussian,
     spatial_triangle,
+    spatial_sinusoid,
+    SINUSOID_FREQ_RANGE,
+    SINUSOID_MOD_DEPTH_RANGE,
+    sample_sinusoid_params,
     sample_spatial_family,
     sample_temporal_family,
     sample_patch_params,
@@ -176,6 +180,44 @@ class TestSamplers:
         rng = np.random.default_rng(0)
         seen = {sample_spatial_family(rng) for _ in range(1000)}
         assert seen == set(SPATIAL_FAMILIES.keys())
+        # The OOD-only family must never enter a generated dataset.
+        assert "sinusoid" not in seen
+
+
+class TestSpatialSinusoid:
+    """The OOD-only sinusoid family: reachable explicitly, never sampled."""
+
+    def test_matches_closed_form(self):
+        y = np.linspace(0.0, 1.0, 41)
+        got = spatial_sinusoid(y, c0=0.7, c1=0.3, f=2.5, phase=0.4)
+        want = 0.7 + 0.3 * np.sin(2.0 * np.pi * 2.5 * y + 0.4)
+        assert np.allclose(got, want)
+
+    def test_zero_modulation_is_uniform(self):
+        y = np.linspace(0.0, 1.0, 41)
+        got = spatial_sinusoid(y, **{"c0": 1.0, "c1": 0.0, "f": 1.0, "phase": 0.0})
+        assert np.allclose(got, spatial_uniform(y))
+
+    def test_sampler_respects_ranges_and_profile_bounds(self):
+        rng = np.random.default_rng(3)
+        y = np.linspace(0.0, 1.0, 201)
+        for _ in range(500):
+            p = sample_sinusoid_params(rng)
+            assert SINUSOID_FREQ_RANGE[0] - 1e-12 <= p["f"] <= SINUSOID_FREQ_RANGE[1] + 1e-12
+            m = p["c1"]
+            assert SINUSOID_MOD_DEPTH_RANGE[0] <= m <= SINUSOID_MOD_DEPTH_RANGE[1]
+            assert np.isclose(p["c0"] + p["c1"], 1.0)
+            assert 0.0 <= p["phase"] < 2.0 * np.pi
+            s = SPATIAL_BUILDERS["sinusoid"](y, **p)
+            assert s.min() >= -1e-12
+            assert s.max() <= 1.0 + 1e-12
+
+    def test_registered_in_builders_and_samplers_only(self):
+        assert "sinusoid" in SPATIAL_BUILDERS
+        assert "sinusoid" in SPATIAL_SAMPLERS
+        # Absent from SPATIAL_FAMILIES is what keeps sample_spatial_family
+        # (and therefore every generated training set) free of it.
+        assert "sinusoid" not in SPATIAL_FAMILIES
 
     def test_temporal_family_sampler_covers_all(self):
         rng = np.random.default_rng(0)

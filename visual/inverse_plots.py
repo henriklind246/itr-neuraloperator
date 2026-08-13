@@ -1109,15 +1109,25 @@ def _panel_mcmc_posterior(ax, rep_art, spec: InversePlotSpec, table: dict) -> No
     ax.axvline(lo, color="0.2", linestyle="--", linewidth=1.1)
     ax.axvline(hi, color="0.2", linestyle="--", linewidth=1.1,
                label=f"95% CI [{lo:.3g}, {hi:.3g}]")
-    # source_itr: annotate the profile-path severity range (a path projection).
+    # source_itr: annotate the severity profile-likelihood CI. Newer artifacts
+    # store the true profiled crossings (profile_excess_ci_low/high); fall back
+    # to the legacy profile-path min/max projection for older dumps.
     if spec.profile_excess_low_col and rep_art is not None:
-        plo = rep_art.get("profile_excess_int")
-        if plo is not None:
-            pe = np.asarray(plo, dtype=np.float64)
-            pe = pe[np.isfinite(pe)]
-            if pe.size:
-                ax.axvspan(float(pe.min()), float(pe.max()), color="0.6",
-                           alpha=0.15, label="profile-path severity range")
+        ci_lo = rep_art.get("profile_excess_ci_low")
+        ci_hi = rep_art.get("profile_excess_ci_high")
+        if ci_lo is not None and ci_hi is not None:
+            band_lo, band_hi = float(np.asarray(ci_lo)), float(np.asarray(ci_hi))
+            if np.isfinite(band_lo) and np.isfinite(band_hi):
+                ax.axvspan(band_lo, band_hi, color="0.6", alpha=0.15,
+                           label="severity profile-likelihood CI")
+        else:
+            plo = rep_art.get("profile_excess_int")
+            if plo is not None:
+                pe = np.asarray(plo, dtype=np.float64)
+                pe = pe[np.isfinite(pe)]
+                if pe.size:
+                    ax.axvspan(float(pe.min()), float(pe.max()), color="0.6",
+                               alpha=0.15, label="profile-path severity range")
     ax.legend(loc="upper right", fontsize=7)
     ax.set_xlabel(spec.lead_name)
     ax.set_ylabel("posterior density")
