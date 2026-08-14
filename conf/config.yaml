@@ -111,6 +111,9 @@ training:
   # epoch/best_val start fresh (peak LR = training.learning_rate). The
   # checkpoint's (mu_global, sigma_global) must equal the recomputed stats.
   init_from_checkpoint: null
+  # Keep selective adaptation deliberately narrow: full updates every weight;
+  # boundary_extender freezes the backbone and updates only that existing module.
+  trainable_scope: "full"
   seeds: [42]
   # DataLoader workers per rank. `null` derives from SLURM_CPUS_PER_TASK /
   # world_size at runtime; set an int to override.

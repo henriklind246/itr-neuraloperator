@@ -1,16 +1,23 @@
 """Tests for scripts/run_ood_finetune.py (warm-start fine-tune on an OOD arm)."""
 
 import copy
+from pathlib import Path
 
 import pytest
 
 from scripts.run_ood_finetune import (
     DIM_FIELDS,
+    LOCKED_BASE_TRAIN_IDS,
+    LOCKED_EXPANSION_IDS,
+    LOCKED_FINAL_TEST_IDS,
+    LOCKED_LABEL_COMPOSITIONS,
+    LOCKED_VAL_IDS,
     assert_dims_match,
     build_finetune_config,
     check_schedule_fits,
     inherited_provenance,
     parse_args,
+    resolve_locked_study_cohorts,
     resolve_sim_split,
 )
 
@@ -87,6 +94,27 @@ def _composition(labels, ids):
     for sim_id in ids:
         counts[labels[int(sim_id)]] = counts.get(labels[int(sim_id)], 0) + 1
     return counts
+
+
+def _locked_labels():
+    labels = [None] * 128
+    cohorts = {
+        "base_train": LOCKED_BASE_TRAIN_IDS,
+        "validation": LOCKED_VAL_IDS,
+        "expansion": LOCKED_EXPANSION_IDS,
+        "final_test": LOCKED_FINAL_TEST_IDS,
+    }
+    for name, cohort in cohorts.items():
+        remaining = dict(LOCKED_LABEL_COMPOSITIONS[name])
+        assigned_families = []
+        while any(remaining.values()):
+            for family in remaining:
+                if remaining[family]:
+                    assigned_families.append(family)
+                    remaining[family] -= 1
+        for sim_id, family in zip(cohort, assigned_families):
+            labels[sim_id] = family
+    return labels
 
 
 class TestSimSplit:
@@ -176,6 +204,55 @@ class TestSimSplit:
             resolve_sim_split(_labels(64), train_sims, val_sims)
 
 
+class TestLockedStudyCohorts:
+    def test_d16_uses_the_previously_run_train_and_val_ids(self):
+        train, val, expansion, final_test = resolve_locked_study_cohorts(
+            _locked_labels(), 16,
+        )
+        assert train.tolist() == list(LOCKED_BASE_TRAIN_IDS)
+        assert val.tolist() == list(LOCKED_VAL_IDS)
+        assert expansion.tolist() == list(LOCKED_EXPANSION_IDS)
+        assert final_test.tolist() == list(LOCKED_FINAL_TEST_IDS)
+
+    def test_d64_is_d16_plus_only_the_reserved_expansion_cohort(self):
+        train, val, expansion, final_test = resolve_locked_study_cohorts(
+            _locked_labels(), 64,
+        )
+        assert train[:16].tolist() == list(LOCKED_BASE_TRAIN_IDS)
+        assert train[16:].tolist() == list(LOCKED_EXPANSION_IDS)
+        assert not set(train.tolist()) & set(val.tolist())
+        assert not set(train.tolist()) & set(final_test.tolist())
+        assert len(expansion) == 48 and len(final_test) == 48
+
+    def test_d32_is_nested_and_uses_the_balanced_expansion_prefix(self):
+        labels = _locked_labels()
+        d16, _, _, _ = resolve_locked_study_cohorts(labels, 16)
+        d32, val, expansion, final_test = resolve_locked_study_cohorts(labels, 32)
+        assert d32[:16].tolist() == d16.tolist()
+        assert d32[16:].tolist() == list(LOCKED_EXPANSION_IDS[:16])
+        assert _composition(labels, d32) == {
+            "exp": 8, "exp_train": 8, "pulse_train": 8, "sin": 8,
+        }
+        assert not set(d32.tolist()) & set(val.tolist())
+        assert not set(d32.tolist()) & set(final_test.tolist())
+        assert expansion.tolist() == list(LOCKED_EXPANSION_IDS)
+
+    def test_four_cohorts_partition_the_128_simulation_arm(self):
+        train, val, expansion, final_test = resolve_locked_study_cohorts(
+            _locked_labels(), 16,
+        )
+        assigned = list(train) + list(val) + list(expansion) + list(final_test)
+        assert sorted(assigned) == list(range(128))
+
+    def test_wrong_dataset_size_or_labels_are_rejected(self):
+        with pytest.raises(ValueError, match="exactly 128"):
+            resolve_locked_study_cohorts(_locked_labels()[:-1], 16)
+        labels = _locked_labels()
+        labels[LOCKED_BASE_TRAIN_IDS[0]] = "wrong"
+        with pytest.raises(ValueError, match="do not match the locked dataset"):
+            resolve_locked_study_cohorts(labels, 16)
+
+
 class TestDimsGuard:
     def test_matching_dims_pass(self):
         assert_dims_match(_dims(), _model_params())
@@ -220,6 +297,23 @@ class TestFinetuneConfig:
         assert training["seeds"] == [7]
         assert training["device"] == "mps"
         assert training["run"]["run_dir"] == "/out"
+        assert training["trainable_scope"] == "full"
+
+    def test_boundary_extender_scope_uses_its_own_lr(self):
+        config = build_finetune_config(
+            _source_conf(), checkpoint_path="/ckpt/fno2d_best.pt", data_dir="/arm",
+            run_root="/out",
+            args=_args("--trainable-scope", "boundary_extender",
+                       "--lr", "3e-7", "--extender-lr", "3e-6"))
+        assert config["training"]["trainable_scope"] == "boundary_extender"
+        assert config["training"]["learning_rate"] == pytest.approx(3e-6)
+        assert config["training"]["init_from_checkpoint"] == "/ckpt/fno2d_best.pt"
+
+    def test_boundary_extender_scope_falls_back_to_lr_argument(self):
+        config = build_finetune_config(
+            _source_conf(), checkpoint_path="/c", data_dir="/arm", run_root="/out",
+            args=_args("--trainable-scope", "boundary_extender", "--lr", "1e-6"))
+        assert config["training"]["learning_rate"] == pytest.approx(1e-6)
 
     def test_curriculum_and_long_lead_machinery_are_disabled(self):
         config = build_finetune_config(
@@ -266,9 +360,12 @@ class TestFinetuneConfig:
         config = build_finetune_config(
             _source_conf(), checkpoint_path="/c", data_dir="/arm/data_sinusoid",
             run_root="/out", args=_args())
-        assert config["data"]["trajectories.npy"] == "/arm/data_sinusoid/trajectories.npy"
-        assert config["data"]["sim_params_path"] == "/arm/data_sinusoid/sim_params.npy"
-        assert config["data"]["t_grid_path"] == "/arm/data_sinusoid/t_grid.npy"
+        assert Path(config["data"]["trajectories.npy"]) == Path(
+            "/arm/data_sinusoid/trajectories.npy")
+        assert Path(config["data"]["sim_params_path"]) == Path(
+            "/arm/data_sinusoid/sim_params.npy")
+        assert Path(config["data"]["t_grid_path"]) == Path(
+            "/arm/data_sinusoid/t_grid.npy")
 
     def test_experiment_name_derives_from_the_source_run(self):
         config = build_finetune_config(
@@ -308,15 +405,18 @@ class TestScratchBaseline:
             _args("--scratch")
 
     def test_scratch_uses_the_same_split_as_the_finetune(self):
-        labels = _labels()
+        labels = _locked_labels()
         warm = _args("--train-sims", "16")
         cold = _args("--scratch", "--lr", "1.75e-4", "--train-sims", "16")
-        a = resolve_sim_split(labels, warm.train_sims, warm.val_sims,
-                              seed=warm.split_seed)
-        b = resolve_sim_split(labels, cold.train_sims, cold.val_sims,
-                              seed=cold.split_seed)
+        a = resolve_locked_study_cohorts(labels, warm.train_sims)
+        b = resolve_locked_study_cohorts(labels, cold.train_sims)
         assert a[0].tolist() == b[0].tolist()
         assert a[1].tolist() == b[1].tolist()
+
+    def test_scratch_cannot_be_combined_with_selective_adaptation(self):
+        with pytest.raises(SystemExit):
+            _args("--scratch", "--lr", "1.75e-4",
+                  "--trainable-scope", "boundary_extender")
 
 
 class TestScheduleGuard:
@@ -416,11 +516,19 @@ class TestArgDefaults:
         # few-shot curve is the low-N end.
         assert args.train_sims == 16 and args.val_sims == 16
         assert args.split_seed == 0
+        assert args.trainable_scope == "full"
+        assert args.extender_lr is None
         assert args.device in ("mps", "auto", "cuda")
 
-    def test_split_sizes_reach_resolve_sim_split(self):
-        args = _args("--train-sims", "12", "--val-sims", "4")
-        train, val, _ = resolve_sim_split(
-            _labels(16), args.train_sims, args.val_sims, seed=args.split_seed)
-        assert len(train) == 12 and len(val) == 4
-        assert not set(train.tolist()) & set(val.tolist())
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            ("--train-sims", "48"),
+            ("--val-sims", "8"),
+            ("--split-seed", "1"),
+            ("--extender-lr", "3e-6"),
+        ],
+    )
+    def test_nonstudy_cohorts_and_ambiguous_extender_lr_are_rejected(self, extra):
+        with pytest.raises(SystemExit):
+            _args(*extra)

@@ -28,6 +28,7 @@ from src.operators.train import (
     _resolve_rigno_phase_lengths,
     build_optimizer,
     build_scheduler,
+    configure_trainable_scope,
     run_one_seed,
     run_config_seeds,
 )
@@ -189,6 +190,74 @@ def _make_tiny_fno():
         temporal_hidden=16,
         forcing_embed_dim=16,
     )
+
+
+def _make_tiny_extender_fno():
+    return FNO2d(
+        modes1=2, modes2=2, width=8,
+        in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=8,
+        use_temporal_encoder=True, use_forcing_time_aug=True,
+        forcing_cond_mode="spatial_only",
+        forcing_spatial_mode="boundary_extender",
+        forcing_extender_grid_size=8,
+        forcing_extender_heads=4,
+        forcing_extender_depth=2,
+    )
+
+
+class TestTrainableScope:
+    def test_full_scope_leaves_every_parameter_trainable(self):
+        model = _make_tiny_extender_fno()
+        trainable, total = configure_trainable_scope(model, "full")
+        assert trainable == total
+        assert all(parameter.requires_grad for parameter in model.parameters())
+
+    def test_boundary_extender_scope_changes_only_extender_weights(self):
+        model = _make_tiny_extender_fno()
+        trainable, total = configure_trainable_scope(model, "boundary_extender")
+        assert 0 < trainable < total
+        assert {
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        } == {
+            name for name, _ in model.named_parameters()
+            if name.startswith("boundary_extender.")
+        }
+
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=1e-3,
+        )
+        prediction = model(
+            torch.randn(2, 11, 11, SPATIAL_IN_CHANNELS),
+            torch.randn(2, COND_STATIC_DIM),
+            torch.randn(2, 16, TEMPORAL_TOKEN_DIM),
+        )
+        loss = (prediction - torch.randn_like(prediction)).square().mean()
+        loss.backward()
+        optimizer.step()
+
+        changed = {
+            name for name, parameter in model.named_parameters()
+            if not torch.equal(before[name], parameter)
+        }
+        assert changed
+        assert all(name.startswith("boundary_extender.") for name in changed)
+
+    def test_boundary_extender_scope_requires_that_module(self):
+        with pytest.raises(ValueError, match="forcing_spatial_mode"):
+            configure_trainable_scope(_make_tiny_fno(), "boundary_extender")
+
+    def test_unknown_scope_is_rejected(self):
+        with pytest.raises(ValueError, match="trainable_scope"):
+            configure_trainable_scope(_make_tiny_extender_fno(), "head")
 
 
 @pytest.fixture

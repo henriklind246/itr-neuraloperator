@@ -4,23 +4,19 @@
 spatial family zero-shot. This script asks the next question: how much of that
 gap closes when the model is allowed to see a handful of sinusoid trajectories?
 
-Every weight is trainable, so what a win here establishes is that PRETRAINING ON
-THE ORIGINAL SPATIAL FAMILIES PROVIDES TRANSFERABLE STRUCTURE FOR ADAPTING TO AN
-UNSEEN FAMILY FROM FEW TARGET TRAJECTORIES -- which is what the --scratch control
-isolates. It does NOT establish that the pretrained representation already
-contained the unseen family, because the representation itself moves during a
-full fine-tune. That is a different question, and it needs a different method:
-extender-only, head-only, or frozen-backbone-plus-adapter adaptation. Later
-experiment, not this one.
+The default full fine-tune updates every weight; the matched --scratch control
+isolates whether pretraining transferred useful structure. The one selective
+alternative, --trainable-scope boundary_extender, freezes the backbone and asks
+whether adapting the existing boundary-to-domain forcing map is sufficient.
 
 Only training lives here. Data generation and scoring are the existing study
 script, unchanged:
 
   1. Generate a fine-tune arm DISJOINT from the arms the checkpoint was scored
      on, by reusing the study's own generator at a different --rng-seed. Size
-     the pool for the LARGEST N in the planned sweep plus the fixed validation
-     set: an 8/16/32/64 sweep at --val-sims 16 needs >= 80 sims, so generate
-     128 once and never regenerate:
+     the pool once at 128 simulations. Their roles are locked permanently:
+     16 base training, 16 validation, 48 optional training expansion, and 48
+     final untouched test simulations:
 
        python scripts/run_ood_spatial_family.py <ckpt> \
            --out-dir ood_studies/sin_ft_data --rng-seed 23 --num-sims 128 \
@@ -34,12 +30,11 @@ script, unchanged:
            --data ood_studies/sin_ft_data/data_sinusoid \
            --out ood_studies/sin_ft_run --train-sims 16 --val-sims 16
 
-     The split is stratified on `temporal_family` and nested across N for a
-     fixed --split-seed/--val-sims, so an 8/16/32/64 sweep varies only how much
-     target data the model saw. Validation is carved first and is identical at
-     every N.
+     D16, D32, and D64 are the only data conditions. D32 is exactly D16 plus
+     the first 16 simulations of the locked expansion order; D64 adds the full
+     48-simulation expansion cohort. Validation and final-test IDs never change.
 
-  2a. Calibrate the LR at N=16 BEFORE the sweep, with --constant-lr, all trials
+  2a. Calibrate the LR at N=16 before the confirmation run, with --constant-lr, all trials
      starting from the same untouched checkpoint. Two pilots bracket it:
      1e-8 was a clean no-op (val 5.2992 -> 5.2940) and 3e-6 was destructive
      (6.18 -> 6.45 -> 9.18 -> 9.41), so the usable range is between them:
@@ -115,8 +110,8 @@ differ enough (mu 305.5 / sigma 9.06 vs the trained 303.1 / 7.18) that
 recomputing would silently redefine the target space. `train.py`'s warm-start
 guard enforces exactly this, so the loaders are built here with the
 checkpoint's (mu, sigma) pinned and handed to `run_one_seed` as overrides —
-which is also what lets this script choose an arbitrary handful of sims as the
-train split, something the config path cannot express.
+which is also what lets this script use the exact locked study cohorts rather
+than the generic config split.
 
 Requires a checkpoint trained with spatial_conditioning='spatial_field_only',
 for the same reason the zero-shot study does: an unseen family has no honest
@@ -167,6 +162,32 @@ MAX_EAGER_LOAD_BYTES = 2 << 30
 # measures which families happened to land in the subset rather than how much
 # target data the model needed.
 STRATIFY_KEY = "temporal_family"
+
+LOCKED_COHORT_PLAN = "sinusoid_128_v1"
+LOCKED_BASE_TRAIN_IDS = (
+    10, 38, 111, 40, 5, 50, 97, 22, 110, 65, 52, 61, 115, 34, 59, 100,
+)
+LOCKED_VAL_IDS = (
+    7, 8, 15, 17, 29, 33, 42, 44, 46, 55, 56, 75, 93, 95, 104, 119,
+)
+LOCKED_EXPANSION_IDS = (
+    92, 31, 80, 27, 90, 62, 88, 32, 26, 87, 125, 60,
+    45, 57, 6, 81, 126, 109, 11, 89, 68, 83, 71, 107,
+    108, 123, 117, 19, 63, 106, 1, 77, 114, 53, 96, 127,
+    9, 16, 43, 67, 64, 35, 37, 74, 47, 72, 86, 122,
+)
+LOCKED_FINAL_TEST_IDS = (
+    39, 2, 118, 82, 14, 58, 99, 21, 18, 102, 101, 103,
+    28, 41, 85, 20, 0, 113, 12, 121, 30, 51, 23, 112,
+    54, 13, 3, 73, 70, 91, 94, 105, 66, 78, 48, 25,
+    4, 24, 76, 120, 84, 36, 98, 69, 49, 79, 116, 124,
+)
+LOCKED_LABEL_COMPOSITIONS = {
+    "base_train": {"exp": 4, "exp_train": 4, "pulse_train": 4, "sin": 4},
+    "validation": {"exp": 4, "exp_train": 4, "pulse_train": 4, "sin": 4},
+    "expansion": {"exp": 12, "exp_train": 12, "pulse_train": 12, "sin": 12},
+    "final_test": {"exp": 12, "exp_train": 18, "pulse_train": 7, "sin": 11},
+}
 
 
 def stratified_order(labels, ids, rng):
@@ -248,6 +269,49 @@ def label_composition(labels, sim_ids):
     return dict(sorted(counts.items()))
 
 
+def resolve_locked_study_cohorts(labels, train_sims):
+    """Return the immutable D16/D32/D64 transfer-study cohorts.
+
+    D16 uses only ``LOCKED_BASE_TRAIN_IDS``. D32 adds the first 16 IDs in the
+    stratified expansion order, and D64 adds all 48. The validation and
+    final-test cohorts never change.
+    """
+    if len(labels) != 128:
+        raise ValueError(
+            f"{LOCKED_COHORT_PLAN} requires exactly 128 simulations, got {len(labels)}."
+        )
+    if train_sims not in {16, 32, 64}:
+        raise ValueError(
+            f"{LOCKED_COHORT_PLAN} supports train-sims 16, 32, or 64, got {train_sims}."
+        )
+
+    base = np.asarray(LOCKED_BASE_TRAIN_IDS, dtype=np.int64)
+    val = np.asarray(LOCKED_VAL_IDS, dtype=np.int64)
+    expansion = np.asarray(LOCKED_EXPANSION_IDS, dtype=np.int64)
+    final_test = np.asarray(LOCKED_FINAL_TEST_IDS, dtype=np.int64)
+    assigned = np.concatenate([base, val, expansion, final_test])
+    if sorted(assigned.tolist()) != list(range(128)):
+        raise RuntimeError(f"{LOCKED_COHORT_PLAN} does not partition simulation IDs 0..127.")
+
+    for name, ids in (
+        ("base_train", base),
+        ("validation", val),
+        ("expansion", expansion),
+        ("final_test", final_test),
+    ):
+        expected = LOCKED_LABEL_COMPOSITIONS[name]
+        observed = label_composition(labels, ids)
+        if observed != expected:
+            raise ValueError(
+                f"{LOCKED_COHORT_PLAN} {name} labels do not match the locked "
+                f"dataset: expected {expected}, got {observed}."
+            )
+
+    used_expansion = expansion[:train_sims - len(base)]
+    train = base if used_expansion.size == 0 else np.concatenate([base, used_expansion])
+    return train, val, expansion, final_test
+
+
 def assert_dims_match(dims, model_params):
     """Fail when today's ProblemSpec no longer matches the checkpoint's dims."""
     mismatched = {
@@ -277,7 +341,12 @@ def build_finetune_config(source_conf, *, checkpoint_path, data_dir, run_root, a
     config = copy.deepcopy(source_conf)
 
     source_name = str((config.get("experiment") or {}).get("name", "unknown"))
-    suffix = "__scratch_sinusoid" if args.scratch else "__ft_sinusoid"
+    if args.scratch:
+        suffix = "__scratch_sinusoid"
+    elif args.trainable_scope == "boundary_extender":
+        suffix = "__ft_extender_sinusoid"
+    else:
+        suffix = "__ft_sinusoid"
     config["experiment"] = dict(config.get("experiment") or {})
     config["experiment"]["name"] = args.experiment_name or f"{source_name}{suffix}"
 
@@ -288,8 +357,13 @@ def build_finetune_config(source_conf, *, checkpoint_path, data_dir, run_root, a
     # win over zero-shot could just be N target sims being enough on their own.
     training["init_from_checkpoint"] = (
         None if args.scratch else str(checkpoint_path))
+    training["trainable_scope"] = str(args.trainable_scope)
     training["epochs"] = int(args.epochs)
-    training["learning_rate"] = float(args.lr)
+    training["learning_rate"] = float(
+        args.extender_lr
+        if args.trainable_scope == "boundary_extender" and args.extender_lr is not None
+        else args.lr
+    )
     training["batch_size"] = int(args.batch_size)
     if args.weight_decay is not None:
         training["weight_decay"] = float(args.weight_decay)
@@ -443,16 +517,14 @@ def parse_args(argv=None):
     p.add_argument("--source-seed", type=int, default=None,
                    help="Seed subdir when the checkpoint is a run_root")
     p.add_argument("--seed", type=int, default=42, help="Fine-tune seed")
-    p.add_argument("--train-sims", type=int, default=16,
-                   help="Shot count N, in SIMULATIONS (not pairs). Subsets are "
-                        "nested across N for a fixed --split-seed/--val-sims, "
-                        "so 8 is a subset of 16 is a subset of 32.")
+    p.add_argument("--train-sims", type=int, choices=(16, 32, 64), default=16,
+                   help="Locked target-data condition: D16 uses the base cohort; "
+                        "D32 adds the first 16 expansion simulations; D64 adds "
+                        "all 48 expansion simulations.")
     p.add_argument("--val-sims", type=int, default=16)
     p.add_argument("--split-seed", type=int, default=0,
-                   help="Seeds the stratified split only, independent of the "
-                        "training seed. Holding it fixed across an N sweep is "
-                        "what makes the subsets nested and the val set shared; "
-                        "varying it draws a different few-shot cohort.")
+                   help="Recorded for compatibility; the study split is locked "
+                        "to seed 0 and immutable simulation IDs.")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=3e-7,
                    help="Peak LR. PROVISIONAL, bracketed by two pilots on this "
@@ -485,6 +557,16 @@ def parse_args(argv=None):
                         "calibration: a decaying schedule confounds 'this "
                         "update scale is safe' with 'the decay arrived before "
                         "the damage did'.")
+    p.add_argument(
+        "--trainable-scope", choices=("full", "boundary_extender"), default="full",
+        help="Update every parameter, or freeze the model except for the existing "
+             "boundary extender module.",
+    )
+    p.add_argument(
+        "--extender-lr", type=float, default=None,
+        help="Peak LR used only with --trainable-scope boundary_extender. If "
+             "omitted, --lr is used.",
+    )
     p.add_argument("--scratch", action="store_true",
                    help="Transfer control: train a random init on the SAME "
                         "target sims, split, normalization and epoch budget. "
@@ -493,6 +575,15 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.device is None:
         args.device = default_device()
+    if args.val_sims != 16 or args.split_seed != 0:
+        p.error(
+            "this study uses the locked sinusoid_128_v1 cohorts: "
+            "--val-sims must be 16 and --split-seed must be 0."
+        )
+    if args.extender_lr is not None and args.trainable_scope != "boundary_extender":
+        p.error("--extender-lr requires --trainable-scope boundary_extender.")
+    if args.scratch and args.trainable_scope != "full":
+        p.error("--scratch is the all-weights control and requires --trainable-scope full.")
     if args.scratch and "--lr" not in (argv if argv is not None else sys.argv[1:]):
         # The warm-start default is ~500x below the from-scratch peak, because
         # it is calibrated not to disturb pretrained weights. Handing it to a
@@ -553,14 +644,14 @@ def main(argv=None):
         str(sim_params[i].get(STRATIFY_KEY, "?"))
         for i in range(int(trajectories.shape[0]))
     ]
-    train_ids, val_ids, test_ids = resolve_sim_split(
-        strat_labels, int(args.train_sims), int(args.val_sims),
-        seed=int(args.split_seed))
+    train_ids, val_ids, expansion_ids, final_test_ids = resolve_locked_study_cohorts(
+        strat_labels, int(args.train_sims),
+    )
     spec.validate_schema(sim_params, np.concatenate([train_ids, val_ids]))
 
     train_loader, val_loader, _ = create_dataloaders(
         trajectories=trajectories, x_grid=x_grid, y_grid=y_grid, t_grid=t_grid,
-        train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
+        train_ids=train_ids, val_ids=val_ids, test_ids=final_test_ids,
         batch_size=int(args.batch_size),
         sim_params=sim_params,
         mu_global=mu_global,
@@ -581,10 +672,17 @@ def main(argv=None):
     })
 
     run_root.mkdir(parents=True, exist_ok=True)
+    if args.scratch:
+        method = "scratch_baseline"
+    elif args.trainable_scope == "boundary_extender":
+        method = "warm_start_boundary_extender_finetune"
+    else:
+        method = "warm_start_full_finetune"
+    effective_lr = float(config["training"]["learning_rate"])
     manifest = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
-        "method": "scratch_baseline" if args.scratch else "warm_start_finetune",
+        "method": method,
         "source_checkpoint": {
             "weights_loaded": not args.scratch,
             "path": str(checkpoint_path),
@@ -610,18 +708,31 @@ def main(argv=None):
             "n_val_sims": int(len(val_ids)),
             "train_sim_ids": train_ids.tolist(),
             "val_sim_ids": val_ids.tolist(),
+            "base_train_sim_ids": list(LOCKED_BASE_TRAIN_IDS),
+            "expansion_sim_ids": expansion_ids.tolist(),
+            "used_expansion_sim_ids": train_ids[len(LOCKED_BASE_TRAIN_IDS):].tolist(),
+            "unused_expansion_sim_ids": expansion_ids[
+                len(train_ids) - len(LOCKED_BASE_TRAIN_IDS):
+            ].tolist(),
+            "final_test_sim_ids": final_test_ids.tolist(),
             "spatial_families_in_train": families,
             "n_snapshots": int(args.n_snapshots),
             "train_pairs": len(train_loader.dataset),
             "val_pairs": len(val_loader.dataset),
         },
         "split": {
+            "cohort_plan": LOCKED_COHORT_PLAN,
             "stratify_key": STRATIFY_KEY,
             "split_seed": int(args.split_seed),
-            "scheme": "val carved first (fixed across train_sims); "
-                      "train subsets nested as train_sims grows",
+            "scheme": "immutable 16 base-train / 16 validation / 48 expansion / "
+                      "48 final-test simulation IDs; D32 = base-train + first 16 "
+                      "expansion IDs; D64 = base-train + all expansion IDs",
             "train_label_composition": label_composition(strat_labels, train_ids),
             "val_label_composition": label_composition(strat_labels, val_ids),
+            "expansion_label_composition": label_composition(
+                strat_labels, expansion_ids),
+            "final_test_label_composition": label_composition(
+                strat_labels, final_test_ids),
         },
         "normalization": {
             "mu_global": mu_global,
@@ -630,7 +741,12 @@ def main(argv=None):
         },
         "optimization": {
             "epochs": int(args.epochs),
-            "learning_rate": float(args.lr),
+            "learning_rate": effective_lr,
+            "full_model_lr_argument": float(args.lr),
+            "extender_lr_argument": (
+                None if args.extender_lr is None else float(args.extender_lr)
+            ),
+            "trainable_scope": str(args.trainable_scope),
             "batch_size": int(args.batch_size),
             "weight_decay": config["training"]["weight_decay"],
             "scheduler": config["training"].get("scheduler", {}).get("type"),
@@ -644,9 +760,12 @@ def main(argv=None):
     (run_root / "finetune_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     print("=" * 78)
-    print("OOD SCRATCH BASELINE (random init, all weights trainable)"
-          if args.scratch else
-          "OOD FINE-TUNE (warm start, all weights trainable)")
+    if args.scratch:
+        print("OOD SCRATCH BASELINE (random init, all weights trainable)")
+    elif args.trainable_scope == "boundary_extender":
+        print("OOD FINE-TUNE (warm start, boundary extender only)")
+    else:
+        print("OOD FINE-TUNE (warm start, all weights trainable)")
     print("=" * 78)
     print(f"  source      : {checkpoint_path}"
           f"{'  [architecture + (mu,sigma) only]' if args.scratch else ''}")
@@ -658,12 +777,16 @@ def main(argv=None):
           f"{len(train_loader.dataset)} pairs  (families: {', '.join(families)})")
     print(f"  val         : {len(val_ids)} sims -> {len(val_loader.dataset)} pairs")
     print(f"  norm        : mu={mu_global:.6f} sigma={sigma_global:.6f} (inherited)")
-    print(f"  split       : stratified on {STRATIFY_KEY} "
-          f"(split-seed {args.split_seed}); nested across --train-sims")
+    print(f"  split       : {LOCKED_COHORT_PLAN}; immutable IDs, stratified on "
+          f"{STRATIFY_KEY}")
     print(f"                train {manifest['split']['train_label_composition']}")
     print(f"                val   {manifest['split']['val_label_composition']}")
-    print(f"  optim       : {args.epochs} epochs, peak lr {args.lr:g}, "
-          f"batch {args.batch_size}, device {args.device}")
+    used_expansion = len(train_ids) - len(LOCKED_BASE_TRAIN_IDS)
+    print(f"  expansion   : {used_expansion}/{len(expansion_ids)} sims used; "
+          f"{len(expansion_ids) - used_expansion} remain unused")
+    print(f"  final test  : {len(final_test_ids)} sims untouched")
+    print(f"  optim       : {args.epochs} epochs, {args.trainable_scope}, "
+          f"peak lr {effective_lr:g}, batch {args.batch_size}, device {args.device}")
     if schedule is not None and schedule["type"] == "constant":
         print(f"  lr curve    : constant {schedule['constant_lr']:g} for all "
               f"{args.epochs} epochs (calibration mode; no decay to hide "

@@ -215,17 +215,27 @@ def _scheduler_type(config: dict) -> str:
     return str(config.get("training", {}).get("scheduler", {}).get("type", "StepLR"))
 
 
+def _trainable_scope(config: dict) -> str:
+    return str(config.get("training", {}).get("trainable_scope", "full"))
+
+
 def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) -> None:
     ckpt_optimizer = _optimizer_name(checkpoint_conf)
     curr_optimizer = _optimizer_name(current_conf)
     ckpt_scheduler = _scheduler_type(checkpoint_conf)
     curr_scheduler = _scheduler_type(current_conf)
+    ckpt_scope = _trainable_scope(checkpoint_conf)
+    curr_scope = _trainable_scope(current_conf)
 
-    if ckpt_optimizer != curr_optimizer or ckpt_scheduler != curr_scheduler:
+    if (ckpt_optimizer != curr_optimizer
+            or ckpt_scheduler != curr_scheduler
+            or ckpt_scope != curr_scope):
         raise ValueError(
             "Incompatible resume state: checkpoint uses "
             f"optimizer={ckpt_optimizer}, scheduler={ckpt_scheduler}, "
-            f"but current config uses optimizer={curr_optimizer}, scheduler={curr_scheduler}. "
+            f"trainable_scope={ckpt_scope}, but current config uses "
+            f"optimizer={curr_optimizer}, scheduler={curr_scheduler}, "
+            f"trainable_scope={curr_scope}. "
             "Start from a fresh run directory or remove fno2d_latest.pt."
         )
 
@@ -415,6 +425,7 @@ def _write_final_metrics(
             "batch_size": training_cfg.get("batch_size"),
             "learning_rate": training_cfg.get("learning_rate"),
             "n_snapshots": training_cfg.get("n_snapshots"),
+            "trainable_scope": training_cfg.get("trainable_scope", "full"),
         },
     }
     (run_path / "final_metrics.json").write_text(json.dumps(payload, indent=2) + "\n")
@@ -467,6 +478,37 @@ def build_optimizer(config: dict, params) -> torch.optim.Optimizer:
         lr=training_cfg["learning_rate"],
         weight_decay=training_cfg["weight_decay"],
     )
+
+
+def configure_trainable_scope(model: torch.nn.Module, scope: str) -> tuple[int, int]:
+    """Apply the one supported selective-adaptation boundary.
+
+    Returns ``(trainable_parameters, total_parameters)`` for run provenance.
+    """
+    if scope not in {"full", "boundary_extender"}:
+        raise ValueError(
+            f"training.trainable_scope must be 'full' or 'boundary_extender', got {scope!r}."
+        )
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(scope == "full")
+
+    if scope == "boundary_extender":
+        extender = getattr(model, "boundary_extender", None)
+        if extender is None:
+            raise ValueError(
+                "training.trainable_scope='boundary_extender' requires "
+                "model.parameters.forcing_spatial_mode='boundary_extender'."
+            )
+        for parameter in extender.parameters():
+            parameter.requires_grad_(True)
+
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(
+        parameter.numel() for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    return trainable, total
 
 
 def _rigno_three_phase_lr_for_epoch(
@@ -786,7 +828,7 @@ def train_one_epoch(
         fixed_left, fixed_right = interface_flanking_nodes(x_grid, interface_x)
 
     global_step = int(global_step_start)
-    _sync_timing = torch.cuda.is_available()
+    _sync_timing = torch.device(device).type == "cuda"
     if _sync_timing:
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -912,7 +954,7 @@ def train_one_epoch(
         "grad_norm": grad_norm,
         "opt_peak_mem_mb": (
             torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
-            if torch.cuda.is_available() else None
+            if _sync_timing else None
         ),
         "successful_updates": int(successful_updates),
         "lr_first": lr_first,
@@ -1524,6 +1566,17 @@ def run_one_seed(
                 f"{init_from_checkpoint} (optimizer/scheduler/epoch fresh)."
             )
 
+    trainable_scope = _trainable_scope(config)
+    trainable_parameters, total_parameters = configure_trainable_scope(
+        fno, trainable_scope,
+    )
+    if is_main:
+        print(
+            f"Trainable scope: {trainable_scope} "
+            f"({trainable_parameters:,}/{total_parameters:,} parameters, "
+            f"{100.0 * trainable_parameters / total_parameters:.2f}%)."
+        )
+
     fno.to(device)
 
     # Wrap with DDP after .to(device) and after loading checkpoint weights.
@@ -1544,7 +1597,9 @@ def run_one_seed(
     else:
         fno_unwrapped = fno
 
-    optimizer = build_optimizer(config, fno.parameters())
+    optimizer = build_optimizer(
+        config, (parameter for parameter in fno.parameters() if parameter.requires_grad),
+    )
     scheduler = build_scheduler(config, optimizer)
 
     if resuming:
