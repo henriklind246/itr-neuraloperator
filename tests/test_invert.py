@@ -1044,6 +1044,87 @@ def test_severity_profile_likelihood_is_valid_profile_interval():
     assert isinstance(summ["profile_bound_limited"], bool)
 
 
+def test_profile_refit_keeps_best_of_several_starts():
+    # The nuisance objective is the same nonconvex surface the MAP fit needs
+    # multistart for, so a refit must return the *best* start, not the last.
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5
+    seeds = [
+        torch.zeros(4, dtype=torch.float32),
+        torch.full((4,), -3.0, dtype=torch.float32),
+        torch.full((4,), 3.0, dtype=torch.float32),
+    ]
+    singles = [
+        inv._profile_refit(
+            model, obs, 0.05, 1, 0.4, [s], adam_steps=8, lbfgs_steps=3
+        )[0]
+        for s in seeds
+    ]
+    multi_nll, multi_theta, multi_u = inv._profile_refit(
+        model, obs, 0.05, 1, 0.4, seeds, adam_steps=8, lbfgs_steps=3
+    )
+    assert multi_nll <= min(singles) + 1e-9
+    assert multi_theta.shape == (4,) and multi_u.shape == (4,)
+    assert float(multi_theta[1]) == pytest.approx(0.4, abs=1e-6)
+
+
+def test_profile_sweep_reports_nonnegative_gap_and_is_deterministic():
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5
+    theta_hat = obs.theta_true.to(torch.float32)
+    kwargs = dict(
+        sigma_eff2=0.05, n_grid=4, span=0.4, level=0.95,
+        adam_steps=6, lbfgs_steps=2, n_starts=3, seed=1,
+        adapter=inv._SOURCE_ITR_ADAPTER,
+    )
+    a = inv.severity_profile_likelihood(model, obs, theta_hat, **kwargs)
+    b = inv.severity_profile_likelihood(model, obs, theta_hat, **kwargs)
+    # sweep_gap is how much the reverse sweep clawed back: never negative.
+    assert a.sweep_gap >= 0.0 and np.isfinite(a.sweep_gap)
+    assert a.n_starts == 3
+    np.testing.assert_allclose(a.nll, b.nll)
+    np.testing.assert_allclose(a.grid, b.grid)
+    assert a.ci_low == pytest.approx(b.ci_low)
+    summ = inv.profile_interval_summary(a, inv._SOURCE_ITR_ADAPTER)
+    assert summ["profile_n_starts"] == 3
+    assert summ["profile_sweep_gap"] >= 0.0
+
+
+def test_profile_multistart_never_worse_than_single_start():
+    # Adding starts can only enlarge the candidate set at each pin, so the
+    # profiled NLL curve must not rise anywhere. A rising profile is exactly the
+    # failure mode that shrinks a Wilks interval below its nominal level.
+    model = _tiny_source_itr_model().eval()
+    obs = _fake_observation_set()
+    obs.targets = obs.targets + 0.5
+    theta_hat = obs.theta_true.to(torch.float32)
+    common = dict(
+        sigma_eff2=0.05, param_index=1, n_grid=4, span=0.3, level=0.95,
+        adam_steps=6, lbfgs_steps=2, seed=0,
+    )
+    one = inv.profile_likelihood(model, obs, theta_hat, n_starts=1, **common)
+    many = inv.profile_likelihood(model, obs, theta_hat, n_starts=4, **common)
+    np.testing.assert_allclose(one.grid, many.grid)
+    assert np.all(many.nll <= one.nll + 1e-6)
+
+
+def test_profile_refit_scalar_adapter_ignores_extra_starts():
+    # With a 1-D theta the pin leaves nothing free, so every seed gives the same
+    # theta: multistart must not be paid for there.
+    adapter = ForcingAdapter()
+    model = _tiny_forcing_model()
+    obs = _fake_forcing_observation_set(Nx=6, Ny=6, N=1)
+    seeds = [torch.zeros(1), torch.full((1,), 2.0), torch.full((1,), -2.0)]
+    nll, theta, _ = inv._profile_refit(
+        model, obs, 0.05, 0, 0.6, seeds, adam_steps=4, lbfgs_steps=1,
+        adapter=adapter,
+    )
+    assert float(theta[0]) == pytest.approx(0.6, abs=1e-6)
+    assert np.isfinite(nll)
+
+
 def test_laplace_spectrum_eigs_are_singular_values_squared_over_variance():
     model = _tiny_source_itr_model().eval()
     obs = _fake_observation_set()
