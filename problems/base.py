@@ -32,6 +32,10 @@ class ProblemDims:
     interface_x). `s_y_channel` is the spatial channel the model multiplies the
     learned forcing weights against; `use_forcing_time_aug` augments the temporal
     embedding with lead time before projecting those weights.
+    `forcing_extender_rc_cond_index` declares the normalized scalar-contact-
+    resistance slot that an eligible boundary extender may add to its domain
+    queries; ``None`` means the active benchmark/representation does not expose
+    that capability.
     """
 
     in_channels: int
@@ -42,6 +46,7 @@ class ProblemDims:
     use_temporal_encoder: bool
     s_y_channel: int = 3
     use_forcing_time_aug: bool = False
+    forcing_extender_rc_cond_index: int | None = None
 
 
 OODKind = Literal["simulation_parameter", "evaluation_parameter", "compound"]

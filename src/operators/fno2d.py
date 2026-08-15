@@ -32,7 +32,8 @@ import torch.nn.functional as F
 #       - boundary_extender: boundary tokens [y, s(y), s(y)h_a, t_bar] are
 #         cross-attended into learned domain pseudo-extensions. h_a is excluded
 #         from the domain queries, so waveform information cannot bypass the
-#         boundary pathway.
+#         boundary pathway. An opt-in scalar-R_c ablation appends normalized
+#         contact resistance to the domain queries only.
 #   - bins: the spatial input additionally carries 16 fixed integral forcing
 #     bins (Q_y_bins(x, y, k) = s(y) * ∫a(t)dt over the k-th subinterval of
 #     [t_s, t_j], /q_ref); the temporal branch is OFF and forcing_seq is empty,
@@ -219,7 +220,8 @@ class BoundaryForcingExtender(nn.Module):
 
     ``h_a`` enters only through the boundary interaction ``s(y) * h_a``. The
     coarse domain queries contain normalized coordinates and the exact lead-time
-    scalar supplied by ``cond_static[:, 0]``; they never receive ``h_a``.
+    scalar supplied by ``cond_static[:, 0]``; the opt-in ablation also appends
+    normalized scalar contact resistance. They never receive ``h_a``.
     """
 
     def __init__(
@@ -230,6 +232,7 @@ class BoundaryForcingExtender(nn.Module):
         num_heads: int = 4,
         depth: int = 1,
         s_y_channel: int = 3,
+        condition_on_rc: bool = False,
     ):
         super().__init__()
         if grid_size <= 0:
@@ -249,6 +252,7 @@ class BoundaryForcingExtender(nn.Module):
         self.num_heads = num_heads
         self.depth = depth
         self.s_y_channel = s_y_channel
+        self.condition_on_rc = condition_on_rc
 
         self.boundary_lift = nn.Sequential(
             nn.Linear(embed_dim + 3, embed_dim),
@@ -256,7 +260,7 @@ class BoundaryForcingExtender(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.domain_lift = nn.Sequential(
-            nn.Linear(3, embed_dim),
+            nn.Linear(3 + int(condition_on_rc), embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
@@ -306,7 +310,7 @@ class BoundaryForcingExtender(nn.Module):
         t_boundary = t_bar_norm[:, None, :].expand(-1, Ny, -1)
         return torch.cat([y_boundary, s_y, h_boundary, t_boundary], dim=-1)
 
-    def _build_domain_tokens(self, spatial, t_bar_norm):
+    def _build_domain_tokens(self, spatial, t_bar_norm, rc_norm=None):
         Nx, Ny = spatial.size(1), spatial.size(2)
         coarse_shape = (min(self.grid_size, Nx), min(self.grid_size, Ny))
         coords = spatial[..., 1:3].permute(0, 3, 1, 2)
@@ -318,12 +322,27 @@ class BoundaryForcingExtender(nn.Module):
         )
         coords = coords.permute(0, 2, 3, 1).reshape(spatial.size(0), -1, 2)
         t_domain = t_bar_norm[:, None, :].expand(-1, coords.size(1), -1)
-        return torch.cat([coords, t_domain], dim=-1), coarse_shape
+        features = [coords, t_domain]
+        if self.condition_on_rc:
+            if rc_norm is None:
+                raise ValueError(
+                    "condition_on_rc=True requires a normalized scalar R_c tensor."
+                )
+            if rc_norm.ndim != 2 or rc_norm.shape != (spatial.size(0), 1):
+                raise ValueError(
+                    "rc_norm must have shape (B, 1), got "
+                    f"{tuple(rc_norm.shape)} for batch size {spatial.size(0)}."
+                )
+            rc_domain = rc_norm[:, None, :].expand(-1, coords.size(1), -1)
+            features.append(rc_domain)
+        return torch.cat(features, dim=-1), coarse_shape
 
-    def forward(self, h_a, spatial, t_bar_norm):
+    def forward(self, h_a, spatial, t_bar_norm, rc_norm=None):
         """Return ``(B, Nx, Ny, out_dim)`` learned pseudo-extensions."""
         boundary_tokens = self._build_boundary_tokens(h_a, spatial, t_bar_norm)
-        domain_tokens, coarse_shape = self._build_domain_tokens(spatial, t_bar_norm)
+        domain_tokens, coarse_shape = self._build_domain_tokens(
+            spatial, t_bar_norm, rc_norm
+        )
 
         boundary = self.boundary_lift(boundary_tokens)
         domain = self.domain_lift(domain_tokens)
@@ -416,6 +435,8 @@ class FNO2d(nn.Module):
         forcing_extender_grid_size: int = 16,
         forcing_extender_heads: int = 4,
         forcing_extender_depth: int = 1,
+        forcing_extender_condition_on_rc: bool = False,
+        forcing_extender_rc_cond_index: int | None = None,
         s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
         padding_mode: str = "zeros",
@@ -461,6 +482,23 @@ class FNO2d(nn.Module):
                 "forcing_spatial_mode must be one of broadcast|boundary_extender, "
                 f"got {forcing_spatial_mode!r}"
             )
+        if forcing_extender_condition_on_rc:
+            if forcing_spatial_mode != "boundary_extender":
+                raise ValueError(
+                    "forcing_extender_condition_on_rc=True requires "
+                    "forcing_spatial_mode='boundary_extender'."
+                )
+            if (
+                isinstance(forcing_extender_rc_cond_index, bool)
+                or not isinstance(forcing_extender_rc_cond_index, int)
+                or not 0 <= forcing_extender_rc_cond_index < cond_static_dim
+            ):
+                raise ValueError(
+                    "forcing_extender_condition_on_rc=True requires an eligible "
+                    "forcing_extender_rc_cond_index in cond_static; got "
+                    f"{forcing_extender_rc_cond_index!r} for cond_static_dim="
+                    f"{cond_static_dim}."
+                )
         if forcing_spatial_mode == "boundary_extender":
             if not use_temporal_encoder:
                 raise ValueError(
@@ -489,6 +527,8 @@ class FNO2d(nn.Module):
                 f"got {forcing_extender_depth!r}"
             )
         self.forcing_extender_depth = forcing_extender_depth
+        self.forcing_extender_condition_on_rc = forcing_extender_condition_on_rc
+        self.forcing_extender_rc_cond_index = forcing_extender_rc_cond_index
         self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
@@ -529,6 +569,7 @@ class FNO2d(nn.Module):
                     num_heads=forcing_extender_heads,
                     depth=forcing_extender_depth,
                     s_y_channel=s_y_channel,
+                    condition_on_rc=forcing_extender_condition_on_rc,
                 )
 
         # Time-augmented spatial forcing: fold t_bar_norm into h_a before
@@ -610,8 +651,12 @@ class FNO2d(nn.Module):
             if self._forcing_to_spatial:
                 if self.forcing_spatial_mode == "boundary_extender":
                     t_bar_norm = cond_static[:, 0:1]
+                    rc_norm = None
+                    if self.forcing_extender_condition_on_rc:
+                        rc_index = self.forcing_extender_rc_cond_index
+                        rc_norm = cond_static[:, rc_index:rc_index + 1]
                     forcing_field = self.boundary_extender(
-                        h_a, spatial, t_bar_norm
+                        h_a, spatial, t_bar_norm, rc_norm
                     )
                 else:
                     if self.use_forcing_time_aug:

@@ -250,6 +250,61 @@ def small_fno2d_checkpoint(tmp_path, small_fno2d):
 
 
 @pytest.fixture
+def small_rc_extender_checkpoint(tmp_path):
+    model = FNO2d(
+        modes1=2,
+        modes2=2,
+        width=8,
+        in_channels=FORCING_IN_CHANNELS,
+        out_channels=1,
+        n_layers=2,
+        cond_static_dim=FORCING_COND_STATIC_DIM,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+        use_forcing_time_aug=True,
+        forcing_spatial_mode="boundary_extender",
+        forcing_extender_condition_on_rc=True,
+        forcing_extender_rc_cond_index=1,
+        s_y_channel=3,
+    )
+    ckpt_path = tmp_path / "small_rc_extender.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "conf": {
+                "benchmark": {
+                    "name": "forcing",
+                    "representation": "temporal_encoder",
+                },
+                "model": {
+                    "parameters": {
+                        "modes1": 2,
+                        "modes2": 2,
+                        "width": 8,
+                        "in_channels": FORCING_IN_CHANNELS,
+                        "out_channels": 1,
+                        "n_layers": 2,
+                        "cond_static_dim": FORCING_COND_STATIC_DIM,
+                        "temporal_token_dim": FORCING_TEMPORAL_TOKEN_DIM,
+                        "temporal_hidden": 16,
+                        "forcing_embed_dim": 16,
+                        "use_forcing_time_aug": True,
+                        "forcing_spatial_mode": "boundary_extender",
+                        "forcing_extender_condition_on_rc": True,
+                        "forcing_extender_rc_cond_index": 1,
+                    }
+                },
+            },
+            "mu_global": 0.0,
+            "sigma_global": 1.0,
+        },
+        ckpt_path,
+    )
+    return ckpt_path
+
+
+@pytest.fixture
 def small_source_fno2d():
     """Tiny source-benchmark FNO2d (bins representation: encoder off, 7 static dims)."""
     return FNO2d(

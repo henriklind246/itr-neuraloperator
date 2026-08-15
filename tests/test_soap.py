@@ -179,6 +179,17 @@ def test_resume_compat_raises_on_adamw_to_soap():
         _validate_resume_compatibility(ckpt_conf, curr_conf)
 
 
+def test_resume_compat_rejects_rc_conditioning_architecture_change():
+    ckpt_conf = {
+        "model": {"parameters": {"forcing_extender_condition_on_rc": False}}
+    }
+    curr_conf = {
+        "model": {"parameters": {"forcing_extender_condition_on_rc": True}}
+    }
+    with pytest.raises(ValueError, match="forcing_extender_condition_on_rc"):
+        _validate_resume_compatibility(ckpt_conf, curr_conf)
+
+
 # ---------- multi-rank gloo ----------
 
 _GLOO_OK = dist.is_available() and dist.is_gloo_available()

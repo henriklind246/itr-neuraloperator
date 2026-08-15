@@ -55,6 +55,21 @@ class TestRunTrainFixedHelpers:
         assert params["forcing_spatial_dim"] == 16
         assert params["forcing_extender_grid_size"] == 16
 
+    def test_boundary_extender_rc_conditioning_is_cli_overrideable(self):
+        config_path = Path(__file__).resolve().parents[1] / "conf" / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert config["model"]["parameters"][
+            "forcing_extender_condition_on_rc"
+        ] is False
+        _apply_override(
+            config, "model.parameters.forcing_extender_condition_on_rc", True
+        )
+
+        assert config["model"]["parameters"][
+            "forcing_extender_condition_on_rc"
+        ] is True
+
     def test_validate_fixed_run_requires_experiment_name(self):
         config = {
             "experiment": {"name": ""},

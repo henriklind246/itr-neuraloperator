@@ -78,6 +78,24 @@ script, unchanged:
      with the per-pair metric. So `checkpoint_metric` is set to `val_rmse_K`
      here; if you change it, change what you read too.
 
+     Outcome of that calibration, scored on the independent 500-sim arms
+     (rel_l2_pct vs the zero-shot checkpoint A; ood_studies/score_lrcal_*):
+
+       LR     sel.ep   sinusoid          id_baseline       uniform_anchor
+       --     --       6.9789            1.1404            1.0342
+       1e-7   0        6.9803  ( +0.0%)  1.1551  ( +1.3%)  1.0558  ( +2.1%)
+       3e-7   0        6.9915  ( +0.2%)  1.2125  ( +6.3%)  1.1377  (+10.0%)
+       1e-6   15       8.3924  (+20.3%)  5.9476  (+421%)   5.6184  (+443%)
+
+     There is no adapting regime in that bracket at N=16. LR buys forgetting and
+     never buys target accuracy: the OOD arm is flat-to-worse at every LR while
+     the ID cost rises monotonically. Full-model FT on 100%-sinusoid batches is
+     the mechanism -- 3040 pairs is ~95 unbalanced steps per epoch. Do not read
+     the surviving `sinusoid_over_id` improvement as transfer; it shrinks only
+     because the denominator collapses. Lowering the LR further approaches a
+     no-op (1e-8 already was one), so the next lever is the objective or the
+     trainable-parameter set, not the step size.
+
   2b. Transfer control (--scratch): same split, same normalization, same epoch
      budget, random init. Fine-tuning beating zero-shot only shows the model
      improved; beating this shows the PRETRAINING transferred.
@@ -151,6 +169,7 @@ DATA_FILE_NAMES = {
 DIM_FIELDS = (
     "in_channels", "cond_static_dim", "temporal_token_dim", "s_y_channel",
     "use_temporal_encoder", "use_forcing_time_aug",
+    "forcing_extender_rc_cond_index",
 )
 
 # A fine-tune arm is tens of sims (~1.2 MB per sim), so it fits in RAM whole;
@@ -527,12 +546,14 @@ def parse_args(argv=None):
                         "to seed 0 and immutable simulation IDs.")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=3e-7,
-                   help="Peak LR. PROVISIONAL, bracketed by two pilots on this "
-                        "checkpoint rather than scaled from the from-scratch "
-                        "peak: 1e-8 was a no-op and 3e-6 was destructive, so "
-                        "the default sits 10x below destructive and 30x above "
-                        "no-op. Recalibrate (--constant-lr, N=16) before "
-                        "trusting it on a different checkpoint or batch size.")
+                   help="Peak LR. This is the LEAST-DAMAGE setting, not a "
+                        "known-good one: the completed N=16 calibration on "
+                        "E11-ca2 (see the module docstring) found no LR in "
+                        "[1e-7, 1e-6] that improves the sinusoid arm, and 3e-7 "
+                        "already costs 6-10% in-distribution for +0.2% on "
+                        "target. 1e-7 is nearly a no-op (+1.3% ID) and 1e-6 is "
+                        "destructive (+421% ID). Recalibrate (--constant-lr, "
+                        "N=16) for a different checkpoint, N, or batch size.")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--weight-decay", type=float, default=None,
                    help="Default: inherit the source checkpoint's value")
@@ -696,6 +717,9 @@ def main(argv=None):
                 "forcing_spatial_mode"),
             "forcing_cond_mode": checkpoint["conf"]["model"]["parameters"].get(
                 "forcing_cond_mode"),
+            "forcing_extender_condition_on_rc": checkpoint["conf"]["model"][
+                "parameters"
+            ].get("forcing_extender_condition_on_rc", False),
         },
         "finetune_data": {
             "data_dir": str(data_dir),

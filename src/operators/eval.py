@@ -590,6 +590,10 @@ def eval_all_seeds(
             forcing_extender_grid_size=model_cfg.get("forcing_extender_grid_size", 16),
             forcing_extender_heads=model_cfg.get("forcing_extender_heads", 4),
             forcing_extender_depth=model_cfg.get("forcing_extender_depth", 1),
+            forcing_extender_condition_on_rc=model_cfg.get(
+                "forcing_extender_condition_on_rc", False
+            ),
+            forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
             s_y_channel=dims.s_y_channel,
             padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
             padding_mode=model_cfg.get("padding_mode", "zeros"),
@@ -1183,6 +1187,10 @@ def write_test_records(
         forcing_extender_grid_size=model_cfg.get("forcing_extender_grid_size", 16),
         forcing_extender_heads=model_cfg.get("forcing_extender_heads", 4),
         forcing_extender_depth=model_cfg.get("forcing_extender_depth", 1),
+        forcing_extender_condition_on_rc=model_cfg.get(
+            "forcing_extender_condition_on_rc", False
+        ),
+        forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),

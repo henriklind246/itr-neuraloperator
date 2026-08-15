@@ -774,6 +774,19 @@ class TestModelDiagnosticPlots:
         assert getattr(model, "_mu_global") == 0.0
         assert getattr(model, "_sigma_global") == 1.0
 
+    def test_load_checkpoint_model_rebuilds_rc_conditioned_extender(
+        self, small_rc_extender_checkpoint
+    ):
+        model, conf = dataset_plots._load_checkpoint_model(
+            small_rc_extender_checkpoint
+        )
+
+        assert conf["model"]["parameters"][
+            "forcing_extender_condition_on_rc"
+        ] is True
+        assert model.forcing_extender_condition_on_rc is True
+        assert model.boundary_extender.domain_lift[0].in_features == 4
+
     def test_load_checkpoint_model_rejects_1d_checkpoint(self, tmp_path):
         ckpt_path = tmp_path / "legacy_fno1d.pt"
         torch.save(

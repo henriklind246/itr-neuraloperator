@@ -219,6 +219,14 @@ def _trainable_scope(config: dict) -> str:
     return str(config.get("training", {}).get("trainable_scope", "full"))
 
 
+def _forcing_extender_conditions_on_rc(config: dict) -> bool:
+    return bool(
+        config.get("model", {}).get("parameters", {}).get(
+            "forcing_extender_condition_on_rc", False
+        )
+    )
+
+
 def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) -> None:
     ckpt_optimizer = _optimizer_name(checkpoint_conf)
     curr_optimizer = _optimizer_name(current_conf)
@@ -226,16 +234,21 @@ def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) ->
     curr_scheduler = _scheduler_type(current_conf)
     ckpt_scope = _trainable_scope(checkpoint_conf)
     curr_scope = _trainable_scope(current_conf)
+    ckpt_extender_rc = _forcing_extender_conditions_on_rc(checkpoint_conf)
+    curr_extender_rc = _forcing_extender_conditions_on_rc(current_conf)
 
     if (ckpt_optimizer != curr_optimizer
             or ckpt_scheduler != curr_scheduler
-            or ckpt_scope != curr_scope):
+            or ckpt_scope != curr_scope
+            or ckpt_extender_rc != curr_extender_rc):
         raise ValueError(
             "Incompatible resume state: checkpoint uses "
             f"optimizer={ckpt_optimizer}, scheduler={ckpt_scheduler}, "
-            f"trainable_scope={ckpt_scope}, but current config uses "
+            f"trainable_scope={ckpt_scope}, "
+            f"forcing_extender_condition_on_rc={ckpt_extender_rc}, but current config uses "
             f"optimizer={curr_optimizer}, scheduler={curr_scheduler}, "
-            f"trainable_scope={curr_scope}. "
+            f"trainable_scope={curr_scope}, "
+            f"forcing_extender_condition_on_rc={curr_extender_rc}. "
             "Start from a fresh run directory or remove fno2d_latest.pt."
         )
 
@@ -286,6 +299,9 @@ def _stamp_resolved_dims(config: dict, dims) -> None:
     params["use_temporal_encoder"] = dims.use_temporal_encoder
     params["s_y_channel"] = dims.s_y_channel
     params["use_forcing_time_aug"] = dims.use_forcing_time_aug
+    params["forcing_extender_rc_cond_index"] = (
+        dims.forcing_extender_rc_cond_index
+    )
 
 
 def _dump_resolved_config(run_path: Path, config: dict) -> None:
@@ -1499,6 +1515,10 @@ def run_one_seed(
         forcing_extender_grid_size=model_cfg.get("forcing_extender_grid_size", 16),
         forcing_extender_heads=model_cfg.get("forcing_extender_heads", 4),
         forcing_extender_depth=model_cfg.get("forcing_extender_depth", 1),
+        forcing_extender_condition_on_rc=model_cfg.get(
+            "forcing_extender_condition_on_rc", False
+        ),
+        forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
@@ -1538,6 +1558,15 @@ def run_one_seed(
         init_ckpt = torch.load(
             init_from_checkpoint, map_location="cpu", weights_only=False,
         )
+        if _forcing_extender_conditions_on_rc(
+            init_ckpt["conf"]
+        ) != _forcing_extender_conditions_on_rc(config):
+            raise ValueError(
+                "init_from_checkpoint cannot cross "
+                "forcing_extender_condition_on_rc architectures because the "
+                "domain_lift input width differs; start this ablation from a "
+                "fresh initialization."
+            )
         # A baseline checkpoint (no hard BC) can warm-start a hard-BC fine-tune:
         # the only tolerated missing key is the t_right_norm buffer, which keeps
         # its build-time value. Any other missing/unexpected key is an error.

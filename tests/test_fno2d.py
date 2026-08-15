@@ -157,6 +157,28 @@ class TestBoundaryForcingExtender:
         )
         clone.load_state_dict(extender.state_dict(), strict=True)
 
+    def test_default_and_explicit_false_preserve_legacy_extender(self):
+        torch.manual_seed(7)
+        default = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=6, num_heads=2, s_y_channel=3
+        ).eval()
+        explicit = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=6, num_heads=2, s_y_channel=3,
+            condition_on_rc=False,
+        ).eval()
+        explicit.load_state_dict(default.state_dict(), strict=True)
+
+        spatial = _forcing_spatial(batch=2, nx=8, ny=9)
+        h_a = torch.randn(2, 8)
+        t_bar_norm = torch.randn(2, 1)
+        with torch.no_grad():
+            expected = default(h_a, spatial, t_bar_norm)
+            actual = explicit(h_a, spatial, t_bar_norm)
+
+        assert default.domain_lift[0].in_features == 3
+        assert explicit.domain_lift[0].in_features == 3
+        assert torch.equal(actual, expected)
+
     def test_token_contract_uses_boundary_waveform_and_exact_lead(self):
         extender = BoundaryForcingExtender(
             embed_dim=4, out_dim=2, grid_size=3, num_heads=2, s_y_channel=3
@@ -177,6 +199,72 @@ class TestBoundaryForcingExtender:
         assert coarse_shape == (3, 3)
         assert domain.shape == (1, 9, 3)
         assert torch.equal(domain[..., 2:3], t_bar_norm[:, None, :].expand(-1, 9, -1))
+
+    def test_rc_conditioned_domain_token_is_unclamped_and_query_only(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=4, out_dim=2, grid_size=3, num_heads=2, s_y_channel=3,
+            condition_on_rc=True,
+        )
+        legacy = BoundaryForcingExtender(
+            embed_dim=4, out_dim=2, grid_size=3, num_heads=2, s_y_channel=3
+        )
+        spatial = _forcing_spatial(batch=2, nx=5, ny=4)
+        h_a = torch.randn(2, 4)
+        t_bar_norm = torch.tensor([[0.25], [0.75]])
+        rc_norm = torch.tensor([[1.2], [-0.3]])
+
+        boundary = extender._build_boundary_tokens(h_a, spatial, t_bar_norm)
+        domain, coarse_shape = extender._build_domain_tokens(
+            spatial, t_bar_norm, rc_norm
+        )
+
+        assert extender.domain_lift[0].in_features == 4
+        assert coarse_shape == (3, 3)
+        assert domain.shape == (2, 9, 4)
+        assert torch.equal(
+            domain[..., 3:4], rc_norm[:, None, :].expand(-1, 9, -1)
+        )
+        assert domain[0, 0, 3] > 1.0
+        assert domain[1, 0, 3] < 0.0
+        assert boundary.shape[-1] == 7
+        assert torch.equal(
+            boundary,
+            legacy._build_boundary_tokens(h_a, spatial, t_bar_norm),
+        )
+
+    def test_rc_conditioned_extension_has_gradient_path(self):
+        torch.manual_seed(0)
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=5, num_heads=2, s_y_channel=3,
+            condition_on_rc=True,
+        )
+        spatial = _forcing_spatial(batch=2, nx=7, ny=9)
+        h_a = torch.randn(2, 8)
+        t_bar_norm = torch.tensor([[0.2], [0.7]])
+        rc_norm = torch.tensor([[0.15], [1.2]], requires_grad=True)
+
+        out = extender(h_a, spatial, t_bar_norm, rc_norm)
+        out.square().mean().backward()
+
+        assert rc_norm.grad is not None
+        assert torch.isfinite(rc_norm.grad).all()
+        assert rc_norm.grad.abs().sum() > 0
+        domain_grad = extender.domain_lift[0].weight.grad
+        assert domain_grad is not None
+        assert torch.isfinite(domain_grad[:, 3]).all()
+        assert domain_grad[:, 3].abs().sum() > 0
+
+    def test_rc_conditioned_extender_requires_rc_tensor(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=5, num_heads=2, s_y_channel=3,
+            condition_on_rc=True,
+        )
+        with pytest.raises(ValueError, match="requires a normalized scalar R_c"):
+            extender(
+                torch.randn(2, 8),
+                _forcing_spatial(batch=2, nx=7, ny=9),
+                torch.randn(2, 1),
+            )
 
     def test_zero_profile_removes_all_waveform_dependence(self):
         torch.manual_seed(0)
@@ -496,6 +584,38 @@ class TestFNO2d:
         assert not hasattr(model, "forcing_aug_mlp")
         assert model.cond_mlp.net[0].in_features == 10
 
+    def test_fno_passes_declared_rc_slot_to_extender(self):
+        torch.manual_seed(0)
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, cond_hidden=16,
+            temporal_token_dim=2, temporal_hidden=16,
+            forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_temporal_encoder=True, use_forcing_time_aug=True,
+            forcing_cond_mode="spatial_only",
+            forcing_spatial_mode="boundary_extender",
+            forcing_extender_grid_size=6,
+            forcing_extender_heads=4,
+            forcing_extender_condition_on_rc=True,
+            forcing_extender_rc_cond_index=1,
+        )
+        spatial = _forcing_spatial(batch=2, nx=9, ny=11)
+        cond_static = torch.randn(2, 10)
+        forcing_seq = torch.randn(2, 16, 2)
+        captured_rc = []
+
+        def capture_rc(_module, inputs):
+            captured_rc.append(inputs[3].detach().clone())
+
+        handle = model.boundary_extender.register_forward_pre_hook(capture_rc)
+        model(spatial, cond_static, forcing_seq)
+        handle.remove()
+
+        assert model.boundary_extender.domain_lift[0].in_features == 4
+        assert len(captured_rc) == 1
+        assert torch.equal(captured_rc[0], cond_static[:, 1:2])
+
     @pytest.mark.parametrize(
         "overrides,match",
         [
@@ -524,6 +644,18 @@ class TestFNO2d:
                     "forcing_cond_mode": "spatial_only",
                 },
                 "requires use_forcing_time_aug=True",
+            ),
+            (
+                {"forcing_extender_condition_on_rc": True},
+                "requires forcing_spatial_mode='boundary_extender'",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "boundary_extender",
+                    "forcing_extender_condition_on_rc": True,
+                    "use_forcing_time_aug": True,
+                },
+                "requires an eligible forcing_extender_rc_cond_index",
             ),
         ],
     )

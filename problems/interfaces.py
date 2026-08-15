@@ -166,6 +166,7 @@ class InterfacesProblem(ProblemSpec):
                 use_temporal_encoder=True,
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=True,
+                forcing_extender_rc_cond_index=1,
             )
         elif representation == "bins":
             self.dims = ProblemDims(

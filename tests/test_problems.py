@@ -201,6 +201,16 @@ class TestRegistry:
         assert dims.s_y_channel == c["s_y"]
         assert dims.use_forcing_time_aug is c["aug"]
 
+    def test_scalar_rc_extender_capability_is_narrow(self):
+        eligible = {
+            ("forcing", "temporal_encoder"),
+            ("interfaces", "temporal_encoder"),
+        }
+        for key in CONTRACTS:
+            dims = get_problem(*key).dims
+            expected = 1 if key in eligible else None
+            assert dims.forcing_extender_rc_cond_index == expected
+
 
 # ===================== forcing item shape contract =====================
 
