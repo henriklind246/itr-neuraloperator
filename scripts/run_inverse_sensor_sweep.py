@@ -1,4 +1,4 @@
-"""Run the fixed reviewer inverse sweep for forcing or forcing_itr.
+"""Run the fixed reviewer inverse sweep for supported inverse benchmarks.
 
 The scientific protocol is intentionally fixed. Reviewers select the inverse
 benchmark and attach its trained checkpoint; the runner calibrates and evaluates
@@ -50,7 +50,7 @@ NOISE_SEED = 0
 # training corpus (see scripts/invert.prepare_inversion_dataset).
 N_CASES = 8
 
-BENCHMARKS = ("forcing", "forcing_itr")
+BENCHMARKS = ("forcing", "forcing_itr", "source_itr_sin")
 REQUIRED_DATA_FILES = (
     "trajectories.npy",
     "x_grid.npy",

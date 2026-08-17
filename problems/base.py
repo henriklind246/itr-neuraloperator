@@ -35,7 +35,9 @@ class ProblemDims:
     `forcing_extender_rc_cond_index` declares the normalized scalar-contact-
     resistance slot that an eligible boundary extender may add to its domain
     queries; ``None`` means the active benchmark/representation does not expose
-    that capability.
+    that capability. `supports_diffusion_geometry_extender` is deliberately
+    narrower: it marks the fixed-interface scalar-R_c contract supported by the
+    first diffusion-inspired geometry-bias experiment.
     """
 
     in_channels: int
@@ -47,6 +49,7 @@ class ProblemDims:
     s_y_channel: int = 3
     use_forcing_time_aug: bool = False
     forcing_extender_rc_cond_index: int | None = None
+    supports_diffusion_geometry_extender: bool = False
 
 
 OODKind = Literal["simulation_parameter", "evaluation_parameter", "compound"]

@@ -157,6 +157,77 @@ class TestBoundaryForcingExtender:
         )
         clone.load_state_dict(extender.state_dict(), strict=True)
 
+    def test_diffusion_geometry_context_and_signed_per_head_bias(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=4,
+            out_dim=2,
+            grid_size=2,
+            num_heads=2,
+            depth=1,
+            s_y_channel=3,
+        )
+        extender.enable_diffusion_geometry_bias(
+            hidden_dim=4, interface_x_norm=0.5
+        )
+        with torch.no_grad():
+            extender.diffusion_geometry_bias_mlps[0][-1].bias.copy_(
+                torch.tensor([2.0, -1.0])
+            )
+
+        x_norm = torch.tensor([[[0.49]], [[0.51]]])
+        t_bar_norm = torch.tensor([[[1.2]], [[-0.2]]])
+        rc_norm = torch.tensor([[[-0.3]], [[1.4]]])
+        context = extender._diffusion_geometry_context(
+            x_norm, t_bar_norm, rc_norm
+        )
+        assert torch.equal(context[..., 0:1], x_norm)
+        assert torch.equal(context[..., 1:2], t_bar_norm)
+        assert torch.equal(context[..., 2], torch.tensor([[0.0], [1.0]]))
+        assert torch.equal(context[..., 3:4], rc_norm)
+
+        spatial = _forcing_spatial(batch=1, nx=3, ny=3)
+        h_a = torch.ones(1, 4)
+        lead = torch.tensor([[0.5]])
+        rc = torch.tensor([[0.25]])
+        boundary = extender._build_boundary_tokens(h_a, spatial, lead)
+        domain, _ = extender._build_domain_tokens(spatial, lead)
+        bias = extender._build_diffusion_geometry_bias(
+            0, domain, boundary, lead, rc
+        )
+
+        assert bias.shape == (2, 4, 3)
+        assert bias[0, 0, 0].item() == pytest.approx(0.0)
+        assert bias[0, 0, -1].item() == pytest.approx(-2.0)
+        assert bias[1, 0, 0].item() == pytest.approx(0.0)
+        assert bias[1, 0, -1].item() == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("depth", [1, 2, 3])
+    def test_diffusion_geometry_bias_has_gradient_in_every_block(self, depth):
+        torch.manual_seed(0)
+        extender = BoundaryForcingExtender(
+            embed_dim=8,
+            out_dim=4,
+            grid_size=5,
+            num_heads=2,
+            depth=depth,
+            s_y_channel=3,
+        )
+        extender.enable_diffusion_geometry_bias(hidden_dim=4)
+        spatial = _forcing_spatial(batch=2, nx=7, ny=9)
+        out = extender(
+            torch.randn(2, 8),
+            spatial,
+            torch.tensor([[0.2], [0.7]]),
+            torch.tensor([[0.15], [1.2]]),
+        )
+        out.square().mean().backward()
+
+        for mlp in extender.diffusion_geometry_bias_mlps:
+            grad = mlp[-1].weight.grad
+            assert grad is not None
+            assert torch.isfinite(grad).all()
+            assert grad.abs().sum() > 0
+
     def test_default_and_explicit_false_preserve_legacy_extender(self):
         torch.manual_seed(7)
         default = BoundaryForcingExtender(
@@ -584,6 +655,86 @@ class TestFNO2d:
         assert not hasattr(model, "forcing_aug_mlp")
         assert model.cond_mlp.net[0].in_features == 10
 
+    def test_physics_extender_is_zero_initialized_without_changing_shared_weights(self):
+        common = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, cond_hidden=16,
+            temporal_token_dim=2, temporal_hidden=16,
+            forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_temporal_encoder=True, use_forcing_time_aug=True,
+            forcing_cond_mode="spatial_only",
+            forcing_extender_grid_size=6,
+            forcing_extender_heads=4,
+            forcing_extender_depth=2,
+            forcing_extender_rc_cond_index=1,
+        )
+        torch.manual_seed(11)
+        ordinary = FNO2d(
+            **common, forcing_spatial_mode="boundary_extender"
+        ).eval()
+        torch.manual_seed(11)
+        physics = FNO2d(
+            **common, forcing_spatial_mode="physics_extender"
+        ).eval()
+
+        assert not hasattr(
+            ordinary.boundary_extender, "diffusion_geometry_bias_mlps"
+        )
+        shared_physics_state = {
+            key: value
+            for key, value in physics.state_dict().items()
+            if "diffusion_geometry_bias_mlps" not in key
+        }
+        assert ordinary.state_dict().keys() == shared_physics_state.keys()
+        assert all(
+            torch.equal(value, shared_physics_state[key])
+            for key, value in ordinary.state_dict().items()
+        )
+        assert all(
+            torch.count_nonzero(mlp[-1].weight) == 0
+            and torch.count_nonzero(mlp[-1].bias) == 0
+            for mlp in physics.boundary_extender.diffusion_geometry_bias_mlps
+        )
+
+        spatial = _forcing_spatial(batch=2, nx=9, ny=11)
+        cond_static = torch.randn(2, 10)
+        forcing_seq = torch.randn(2, 16, 2)
+        with torch.no_grad():
+            ordinary_output = ordinary(spatial, cond_static, forcing_seq)
+            physics_output = physics(spatial, cond_static, forcing_seq)
+        assert torch.equal(ordinary_output, physics_output)
+
+    def test_physics_extender_routes_rc_even_without_direct_rc_conditioning(self):
+        model = FNO2d(
+            modes1=2, modes2=2, width=8,
+            in_channels=4, out_channels=1, n_layers=2,
+            cond_static_dim=10, cond_hidden=16,
+            temporal_token_dim=2, temporal_hidden=16,
+            forcing_embed_dim=16, forcing_spatial_dim=4,
+            use_temporal_encoder=True, use_forcing_time_aug=True,
+            forcing_cond_mode="spatial_only",
+            forcing_spatial_mode="physics_extender",
+            forcing_extender_grid_size=6,
+            forcing_extender_heads=4,
+            forcing_extender_rc_cond_index=1,
+        )
+        spatial = _forcing_spatial(batch=2, nx=9, ny=11)
+        cond_static = torch.randn(2, 10)
+        forcing_seq = torch.randn(2, 16, 2)
+        captured_rc = []
+
+        def capture_rc(_module, inputs):
+            captured_rc.append(inputs[3].detach().clone())
+
+        handle = model.boundary_extender.register_forward_pre_hook(capture_rc)
+        output = model(spatial, cond_static, forcing_seq)
+        handle.remove()
+
+        assert output.shape == (2, 9, 11, 1)
+        assert model.boundary_extender.domain_lift[0].in_features == 3
+        assert torch.equal(captured_rc[0], cond_static[:, 1:2])
+
     def test_fno_passes_declared_rc_slot_to_extender(self):
         torch.manual_seed(0)
         model = FNO2d(
@@ -656,6 +807,31 @@ class TestFNO2d:
                     "use_forcing_time_aug": True,
                 },
                 "requires an eligible forcing_extender_rc_cond_index",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "physics_extender",
+                    "use_forcing_time_aug": True,
+                },
+                "requires an eligible forcing_extender_rc_cond_index",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "physics_extender",
+                    "use_forcing_time_aug": True,
+                    "forcing_extender_rc_cond_index": 1,
+                    "forcing_extender_physics_hidden": 0,
+                },
+                "forcing_extender_physics_hidden",
+            ),
+            (
+                {
+                    "forcing_spatial_mode": "physics_extender",
+                    "use_forcing_time_aug": True,
+                    "forcing_extender_rc_cond_index": 1,
+                    "forcing_extender_interface_x_norm": 1.1,
+                },
+                "forcing_extender_interface_x_norm",
             ),
         ],
     )

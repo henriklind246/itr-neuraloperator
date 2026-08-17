@@ -143,6 +143,7 @@ def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
     [
         ("forcing", "R_c", "m² K/W"),
         ("forcing_itr", "S_R", "m³ K/W"),
+        ("source_itr_sin", "S_R", "m³ K/W"),
     ],
 )
 def test_paper_summary_contains_all_table_statistics(
@@ -231,7 +232,11 @@ def test_cli_data_dir_optional_and_overrides(tmp_path):
         ["--benchmark", "forcing", "--checkpoint", "model.pt"]
     )
     assert minimal.data_dir is None
-    assert set(sweep.BENCHMARKS) == {"forcing", "forcing_itr"}
+    assert set(sweep.BENCHMARKS) == {
+        "forcing",
+        "forcing_itr",
+        "source_itr_sin",
+    }
 
     args = sweep._build_parser().parse_args(
         [

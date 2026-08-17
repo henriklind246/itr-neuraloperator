@@ -24,11 +24,13 @@ model:
     forcing_embed_dim: 64
     forcing_spatial_dim: 16       # K: forcing channels; broadcast fields or learned pseudo-extensions
     forcing_cond_mode: both       # Q1 forcing-routing ablation: both | spatial_only | cond_only (temporal_encoder repr only)
-    forcing_spatial_mode: broadcast  # broadcast | boundary_extender (forcing temporal_encoder only)
+    forcing_spatial_mode: broadcast  # broadcast | boundary_extender | physics_extender (forcing temporal_encoder only)
     forcing_extender_grid_size: 16   # coarse domain-query grid; clamped to the input resolution
     forcing_extender_heads: 4        # attention heads; must divide forcing_embed_dim
     forcing_extender_depth: 1        # successive cross-attention blocks; allowed values: 1, 2, 3
     forcing_extender_condition_on_rc: false  # append normalized scalar R_c to eligible extender domain queries
+    forcing_extender_physics_hidden: 16  # hidden width for each physics-extender per-head coefficient MLP
+    forcing_extender_interface_x_norm: 0.5  # fixed normalized interface used to derive I_cross
     activation: "GELU"            # doc-only; FNO2d hardcodes GELU
     dropout: 0.0
     padding_reference_resolution: 100  # scale FNO pad cells with grid resolution; set = training grid (null = fixed pad=8)

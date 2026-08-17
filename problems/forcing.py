@@ -265,6 +265,7 @@ class ForcingProblem(ProblemSpec):
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=True,
                 forcing_extender_rc_cond_index=1,
+                supports_diffusion_geometry_extender=True,
             )
         elif representation == "bins":
             self.dims = ProblemDims(

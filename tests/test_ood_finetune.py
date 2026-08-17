@@ -42,6 +42,8 @@ def _model_params(**overrides):
                 forcing_extender_rc_cond_index=1,
                 modes1=16, modes2=16, width=64, forcing_spatial_mode="boundary_extender",
                 forcing_extender_depth=2, forcing_cond_mode="spatial_only",
+                forcing_extender_physics_hidden=16,
+                forcing_extender_interface_x_norm=0.5,
                 temporal_samples=64)
     base.update(overrides)
     return base
@@ -374,6 +376,25 @@ class TestFinetuneConfig:
             _source_conf(), checkpoint_path="/c", data_dir="/arm", run_root="/out",
             args=_args())
         assert config["experiment"]["name"] == "E11_source__ft_sinusoid"
+
+    def test_physics_extender_options_survive_finetune_config_derivation(self):
+        source = _source_conf()
+        source["model"]["parameters"].update(
+            {
+                "forcing_spatial_mode": "physics_extender",
+                "forcing_extender_physics_hidden": 24,
+                "forcing_extender_interface_x_norm": 0.45,
+            }
+        )
+        config = build_finetune_config(
+            source, checkpoint_path="/c", data_dir="/arm", run_root="/out",
+            args=_args()
+        )
+
+        params = config["model"]["parameters"]
+        assert params["forcing_spatial_mode"] == "physics_extender"
+        assert params["forcing_extender_physics_hidden"] == 24
+        assert params["forcing_extender_interface_x_norm"] == pytest.approx(0.45)
 
 
 class TestScratchBaseline:

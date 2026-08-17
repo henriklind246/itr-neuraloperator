@@ -334,6 +334,50 @@ class LoadedModel:
     sigma_global: float
 
 
+def _adapt_legacy_zero_source_time_state(
+    state: dict[str, torch.Tensor], config: dict, dims
+) -> dict[str, torch.Tensor]:
+    model_cfg = config["model"]["parameters"]
+    checkpoint_cond_dim = int(
+        model_cfg.get("cond_static_dim", dims.cond_static_dim)
+    )
+    if checkpoint_cond_dim == dims.cond_static_dim:
+        return state
+
+    benchmark_cfg = config.get("benchmark", {})
+    benchmark = (
+        str(benchmark_cfg.get("name", "forcing"))
+        if isinstance(benchmark_cfg, dict)
+        else str(benchmark_cfg)
+    )
+    forcing_benchmarks = {"forcing", "forcing_itr", "forcing_itr_sin"}
+    if (
+        benchmark not in forcing_benchmarks
+        or checkpoint_cond_dim != dims.cond_static_dim + 1
+        or not dims.use_forcing_time_aug
+    ):
+        return state
+
+    cond_key = "cond_mlp.net.0.weight"
+    aug_key = "forcing_aug_mlp.0.weight"
+    cond_weight = state[cond_key]
+    aug_weight = state[aug_key]
+    forcing_embed_dim = int(model_cfg.get("forcing_embed_dim", 64))
+    if cond_weight.shape[1] != checkpoint_cond_dim + forcing_embed_dim:
+        return state
+    if aug_weight.shape[1] != forcing_embed_dim + 2:
+        return state
+
+    # Inverse observations always use s=0, so the retired t_s_norm feature is
+    # identically zero. Removing its two input columns is therefore exact.
+    adapted = dict(state)
+    adapted[cond_key] = torch.cat(
+        [cond_weight[:, :1], cond_weight[:, 2:]], dim=1
+    )
+    adapted[aug_key] = aug_weight[:, :-1]
+    return adapted
+
+
 def load_checkpoint(ckpt_path: str, device: str = "cpu") -> LoadedModel:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt["conf"]
@@ -363,13 +407,22 @@ def load_checkpoint(ckpt_path: str, device: str = "cpu") -> LoadedModel:
             "forcing_extender_condition_on_rc", False
         ),
         forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
+        forcing_extender_physics_hidden=model_cfg.get(
+            "forcing_extender_physics_hidden", 16
+        ),
+        forcing_extender_interface_x_norm=model_cfg.get(
+            "forcing_extender_interface_x_norm", 0.5
+        ),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
         hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
     )
-    model.load_state_dict(ckpt["model_state"])
+    state = _adapt_legacy_zero_source_time_state(
+        ckpt["model_state"], config, dims
+    )
+    model.load_state_dict(state)
     model.to(device)
     model.eval()
     for p in model.parameters():

@@ -720,6 +720,12 @@ def main(argv=None):
             "forcing_extender_condition_on_rc": checkpoint["conf"]["model"][
                 "parameters"
             ].get("forcing_extender_condition_on_rc", False),
+            "forcing_extender_physics_hidden": checkpoint["conf"]["model"][
+                "parameters"
+            ].get("forcing_extender_physics_hidden", 16),
+            "forcing_extender_interface_x_norm": checkpoint["conf"]["model"][
+                "parameters"
+            ].get("forcing_extender_interface_x_norm", 0.5),
         },
         "finetune_data": {
             "data_dir": str(data_dir),

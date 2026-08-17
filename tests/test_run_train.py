@@ -70,6 +70,25 @@ class TestRunTrainFixedHelpers:
             "forcing_extender_condition_on_rc"
         ] is True
 
+    def test_physics_extender_options_are_cli_overrideable(self):
+        config_path = Path(__file__).resolve().parents[1] / "conf" / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        _apply_override(
+            config, "model.parameters.forcing_spatial_mode", "physics_extender"
+        )
+        _apply_override(
+            config, "model.parameters.forcing_extender_physics_hidden", 24
+        )
+        _apply_override(
+            config, "model.parameters.forcing_extender_interface_x_norm", 0.45
+        )
+
+        params = config["model"]["parameters"]
+        assert params["forcing_spatial_mode"] == "physics_extender"
+        assert params["forcing_extender_physics_hidden"] == 24
+        assert params["forcing_extender_interface_x_norm"] == pytest.approx(0.45)
+
     def test_validate_fixed_run_requires_experiment_name(self):
         config = {
             "experiment": {"name": ""},

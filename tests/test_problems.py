@@ -211,6 +211,27 @@ class TestRegistry:
             expected = 1 if key in eligible else None
             assert dims.forcing_extender_rc_cond_index == expected
 
+    def test_diffusion_geometry_extender_capability_is_forcing_temporal_only(self):
+        for key in CONTRACTS:
+            dims = get_problem(*key).dims
+            assert dims.supports_diffusion_geometry_extender is (
+                key == ("forcing", "temporal_encoder")
+            )
+
+    @pytest.mark.parametrize(
+        ("benchmark", "representation"),
+        [("forcing", "bins"), ("interfaces", "temporal_encoder")],
+    )
+    def test_problem_config_rejects_physics_extender_outside_v1_scope(
+        self, benchmark, representation
+    ):
+        config = {
+            "benchmark": {"name": benchmark, "representation": representation},
+            "model": {"parameters": {"forcing_spatial_mode": "physics_extender"}},
+        }
+        with pytest.raises(ValueError, match="fixed-interface"):
+            problem_from_config(config)
+
 
 # ===================== forcing item shape contract =====================
 

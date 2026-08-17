@@ -17,6 +17,7 @@ from src.operators.train import (
     _advance_scheduler,
     _per_pair_rel_l2_percent,
     _selection_metric_value,
+    _validate_resume_compatibility,
     load_config,
     set_seed,
     train_one_epoch,
@@ -134,6 +135,42 @@ class TestLoadConfig:
         assert cfg["training"]["loss"]["per_sample_interface_x"] is True
 
 
+class TestResumeArchitectureCompatibility:
+    @staticmethod
+    def _config(mode="boundary_extender", hidden=16, interface_x=0.5):
+        return {
+            "model": {
+                "parameters": {
+                    "forcing_spatial_mode": mode,
+                    "forcing_extender_physics_hidden": hidden,
+                    "forcing_extender_interface_x_norm": interface_x,
+                }
+            },
+            "training": {
+                "optimizer": "AdamW",
+                "scheduler": {"type": "StepLR"},
+                "trainable_scope": "full",
+            },
+        }
+
+    def test_resume_rejects_cross_mode_extender_state(self):
+        with pytest.raises(ValueError, match="forcing_spatial_mode"):
+            _validate_resume_compatibility(
+                self._config("boundary_extender"),
+                self._config("physics_extender"),
+            )
+
+    @pytest.mark.parametrize(("hidden", "interface_x"), [(24, 0.5), (16, 0.45)])
+    def test_resume_rejects_changed_physics_extender_signature(
+        self, hidden, interface_x
+    ):
+        with pytest.raises(ValueError, match="physics_extender_signature"):
+            _validate_resume_compatibility(
+                self._config("physics_extender"),
+                self._config("physics_extender", hidden, interface_x),
+            )
+
+
 # ===================== helpers for training tests =====================
 
 _ITEM_KEYS = ("spatial", "cond_static", "forcing_seq", "Y", "T_stats")
@@ -208,6 +245,23 @@ def _make_tiny_extender_fno():
     )
 
 
+def _make_tiny_physics_extender_fno():
+    return FNO2d(
+        modes1=2, modes2=2, width=8,
+        in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+        cond_static_dim=COND_STATIC_DIM,
+        temporal_token_dim=TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=8,
+        use_temporal_encoder=True, use_forcing_time_aug=True,
+        forcing_cond_mode="spatial_only",
+        forcing_spatial_mode="physics_extender",
+        forcing_extender_grid_size=8,
+        forcing_extender_heads=4,
+        forcing_extender_depth=2,
+        forcing_extender_rc_cond_index=1,
+    )
+
+
 class TestTrainableScope:
     def test_full_scope_leaves_every_parameter_trainable(self):
         model = _make_tiny_extender_fno()
@@ -250,6 +304,19 @@ class TestTrainableScope:
         }
         assert changed
         assert all(name.startswith("boundary_extender.") for name in changed)
+
+    def test_boundary_extender_scope_includes_physics_bias(self):
+        model = _make_tiny_physics_extender_fno()
+        trainable, total = configure_trainable_scope(model, "boundary_extender")
+        trainable_names = {
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+
+        assert 0 < trainable < total
+        assert trainable_names
+        assert all(name.startswith("boundary_extender.") for name in trainable_names)
+        assert any("diffusion_geometry_bias_mlps" in name for name in trainable_names)
 
     def test_boundary_extender_scope_requires_that_module(self):
         with pytest.raises(ValueError, match="forcing_spatial_mode"):
@@ -1009,6 +1076,41 @@ class TestRunOneSeedResume:
         assert not (run_dir / "fno2d_latest.pt").exists()  # sentinel removed
         assert (run_dir / "train_metrics.csv").exists()
 
+    def test_physics_extender_run_writes_best_checkpoint_bias_grid(
+        self, tmp_path, seed_config
+    ):
+        cfg = copy.deepcopy(seed_config)
+        cfg["model"]["parameters"].update(
+            {
+                "forcing_spatial_mode": "physics_extender",
+                "forcing_extender_grid_size": 4,
+                "forcing_extender_heads": 4,
+                "forcing_extender_depth": 2,
+                "forcing_extender_physics_hidden": 8,
+                "forcing_extender_interface_x_norm": 0.5,
+            }
+        )
+        run_dir = tmp_path / "seed0_physics"
+        run_one_seed(cfg, seed=0, run_dir=run_dir)
+
+        checkpoint = torch.load(
+            run_dir / "fno2d_best.pt", map_location="cpu", weights_only=False
+        )
+        with (run_dir / "diffusion_geometry_bias.csv").open(
+            "r", newline="", encoding="utf-8"
+        ) as csv_file:
+            rows = list(csv.DictReader(csv_file))
+
+        assert len(rows) == 6 * 5 * 3 * 2 * 4
+        assert set(rows[0]) == {
+            "checkpoint_epoch", "block", "head", "x_norm", "t_bar_norm",
+            "I_cross", "R_c_norm", "c",
+        }
+        assert {int(row["checkpoint_epoch"]) for row in rows} == {
+            int(checkpoint["epoch"])
+        }
+        assert {int(row["I_cross"]) for row in rows} == {0, 1}
+
     def test_train_metrics_csv_has_new_metric_columns(self, tmp_path, seed_config):
         """End-to-end run emits the new nRMSE / Kelvin / node-jump columns, finite."""
         run_dir = tmp_path / "seed0"
@@ -1101,6 +1203,7 @@ class TestRunOneSeedResume:
         run_one_seed(cfg, seed=0, run_dir=run_dir)
 
         assert not (run_dir / "diagnostics.csv").exists()
+        assert not (run_dir / "diffusion_geometry_bias.csv").exists()
         assert (run_dir / "val_pairs.csv").exists()
 
     def test_cosine_warm_restarts_scheduler(self, tmp_path, seed_config):

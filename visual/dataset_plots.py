@@ -562,6 +562,12 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
             "forcing_extender_condition_on_rc", False
         ),
         forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
+        forcing_extender_physics_hidden=model_cfg.get(
+            "forcing_extender_physics_hidden", 16
+        ),
+        forcing_extender_interface_x_norm=model_cfg.get(
+            "forcing_extender_interface_x_norm", 0.5
+        ),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),

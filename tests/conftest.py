@@ -305,6 +305,60 @@ def small_rc_extender_checkpoint(tmp_path):
 
 
 @pytest.fixture
+def small_physics_extender_checkpoint(tmp_path):
+    model = FNO2d(
+        modes1=2,
+        modes2=2,
+        width=8,
+        in_channels=FORCING_IN_CHANNELS,
+        out_channels=1,
+        n_layers=2,
+        cond_static_dim=FORCING_COND_STATIC_DIM,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+        use_forcing_time_aug=True,
+        forcing_spatial_mode="physics_extender",
+        forcing_extender_depth=2,
+        forcing_extender_rc_cond_index=1,
+        forcing_extender_physics_hidden=7,
+        forcing_extender_interface_x_norm=0.4,
+        s_y_channel=3,
+    )
+    ckpt_path = tmp_path / "small_physics_extender.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "conf": {
+                "benchmark": {
+                    "name": "forcing",
+                    "representation": "temporal_encoder",
+                },
+                "model": {
+                    "parameters": {
+                        "modes1": 2,
+                        "modes2": 2,
+                        "width": 8,
+                        "out_channels": 1,
+                        "n_layers": 2,
+                        "temporal_hidden": 16,
+                        "forcing_embed_dim": 16,
+                        "forcing_spatial_mode": "physics_extender",
+                        "forcing_extender_depth": 2,
+                        "forcing_extender_physics_hidden": 7,
+                        "forcing_extender_interface_x_norm": 0.4,
+                    }
+                },
+            },
+            "mu_global": 0.0,
+            "sigma_global": 1.0,
+        },
+        ckpt_path,
+    )
+    return ckpt_path
+
+
+@pytest.fixture
 def small_source_fno2d():
     """Tiny source-benchmark FNO2d (bins representation: encoder off, 7 static dims)."""
     return FNO2d(

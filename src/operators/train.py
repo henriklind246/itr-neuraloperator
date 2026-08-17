@@ -94,6 +94,20 @@ VAL_PAIR_FIELDNAMES = _build_val_pair_fieldnames()
 # per-pair error can be tracked across epochs.
 VAL_PAIRS_SUBSAMPLE_SEED = 0
 
+DIFFUSION_GEOMETRY_X_NORM = (0.0, 0.25, 0.49, 0.51, 0.75, 1.0)
+DIFFUSION_GEOMETRY_T_BAR_NORM = (1.0 / 30.0, 0.25, 0.5, 0.75, 1.0)
+DIFFUSION_GEOMETRY_RC_NORM = (0.0, 0.5, 1.0)
+DIFFUSION_GEOMETRY_FIELDNAMES = (
+    "checkpoint_epoch",
+    "block",
+    "head",
+    "x_norm",
+    "t_bar_norm",
+    "I_cross",
+    "R_c_norm",
+    "c",
+)
+
 
 def _load_yaml_mapping(path: Path) -> dict:
     with path.open(encoding="utf-8") as config_file:
@@ -227,6 +241,24 @@ def _forcing_extender_conditions_on_rc(config: dict) -> bool:
     )
 
 
+def _forcing_spatial_mode(config: dict) -> str:
+    return str(
+        config.get("model", {}).get("parameters", {}).get(
+            "forcing_spatial_mode", "broadcast"
+        )
+    )
+
+
+def _physics_extender_signature(config: dict) -> tuple[int, float] | None:
+    if _forcing_spatial_mode(config) != "physics_extender":
+        return None
+    params = config.get("model", {}).get("parameters", {})
+    return (
+        int(params.get("forcing_extender_physics_hidden", 16)),
+        float(params.get("forcing_extender_interface_x_norm", 0.5)),
+    )
+
+
 def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) -> None:
     ckpt_optimizer = _optimizer_name(checkpoint_conf)
     curr_optimizer = _optimizer_name(current_conf)
@@ -236,19 +268,29 @@ def _validate_resume_compatibility(checkpoint_conf: dict, current_conf: dict) ->
     curr_scope = _trainable_scope(current_conf)
     ckpt_extender_rc = _forcing_extender_conditions_on_rc(checkpoint_conf)
     curr_extender_rc = _forcing_extender_conditions_on_rc(current_conf)
+    ckpt_spatial_mode = _forcing_spatial_mode(checkpoint_conf)
+    curr_spatial_mode = _forcing_spatial_mode(current_conf)
+    ckpt_physics = _physics_extender_signature(checkpoint_conf)
+    curr_physics = _physics_extender_signature(current_conf)
 
     if (ckpt_optimizer != curr_optimizer
             or ckpt_scheduler != curr_scheduler
             or ckpt_scope != curr_scope
-            or ckpt_extender_rc != curr_extender_rc):
+            or ckpt_extender_rc != curr_extender_rc
+            or ckpt_spatial_mode != curr_spatial_mode
+            or ckpt_physics != curr_physics):
         raise ValueError(
             "Incompatible resume state: checkpoint uses "
             f"optimizer={ckpt_optimizer}, scheduler={ckpt_scheduler}, "
             f"trainable_scope={ckpt_scope}, "
-            f"forcing_extender_condition_on_rc={ckpt_extender_rc}, but current config uses "
+            f"forcing_spatial_mode={ckpt_spatial_mode}, "
+            f"forcing_extender_condition_on_rc={ckpt_extender_rc}, "
+            f"physics_extender_signature={ckpt_physics}, but current config uses "
             f"optimizer={curr_optimizer}, scheduler={curr_scheduler}, "
             f"trainable_scope={curr_scope}, "
-            f"forcing_extender_condition_on_rc={curr_extender_rc}. "
+            f"forcing_spatial_mode={curr_spatial_mode}, "
+            f"forcing_extender_condition_on_rc={curr_extender_rc}, "
+            f"physics_extender_signature={curr_physics}. "
             "Start from a fresh run directory or remove fno2d_latest.pt."
         )
 
@@ -307,6 +349,71 @@ def _stamp_resolved_dims(config: dict, dims) -> None:
 def _dump_resolved_config(run_path: Path, config: dict) -> None:
     with (run_path / "config_used.yaml").open("w", encoding="utf-8") as config_file:
         yaml.safe_dump(config, config_file, sort_keys=False)
+
+
+def write_diffusion_geometry_bias(
+    model: torch.nn.Module,
+    output_path: str | Path,
+    *,
+    checkpoint_epoch: int,
+) -> bool:
+    extender = getattr(model, "boundary_extender", None)
+    mlps = getattr(extender, "diffusion_geometry_bias_mlps", None)
+    if mlps is None:
+        return False
+
+    contexts = [
+        (x_norm, t_bar_norm, rc_norm)
+        for x_norm in DIFFUSION_GEOMETRY_X_NORM
+        for t_bar_norm in DIFFUSION_GEOMETRY_T_BAR_NORM
+        for rc_norm in DIFFUSION_GEOMETRY_RC_NORM
+    ]
+    parameter = next(mlps.parameters())
+    x_norm = torch.tensor(
+        [item[0] for item in contexts],
+        device=parameter.device,
+        dtype=parameter.dtype,
+    )[:, None]
+    t_bar_norm = torch.tensor(
+        [item[1] for item in contexts],
+        device=parameter.device,
+        dtype=parameter.dtype,
+    )[:, None]
+    rc_norm = torch.tensor(
+        [item[2] for item in contexts],
+        device=parameter.device,
+        dtype=parameter.dtype,
+    )[:, None]
+    with torch.no_grad():
+        coefficients = extender.diffusion_geometry_coefficients(
+            x_norm, t_bar_norm, rc_norm
+        ).detach().cpu()
+
+    path = Path(output_path)
+    with path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=DIFFUSION_GEOMETRY_FIELDNAMES)
+        writer.writeheader()
+        for block in range(coefficients.size(0)):
+            for head in range(coefficients.size(-1)):
+                for context_index, (x_value, t_value, rc_value) in enumerate(contexts):
+                    writer.writerow(
+                        {
+                            "checkpoint_epoch": int(checkpoint_epoch),
+                            "block": block,
+                            "head": head,
+                            "x_norm": x_value,
+                            "t_bar_norm": t_value,
+                            "I_cross": int(
+                                x_value
+                                > extender.diffusion_geometry_interface_x_norm
+                            ),
+                            "R_c_norm": rc_value,
+                            "c": float(
+                                coefficients[block, context_index, head]
+                            ),
+                        }
+                    )
+    return True
 
 
 def _summarize_metrics_csv(csv_path: Path) -> dict:
@@ -514,7 +621,8 @@ def configure_trainable_scope(model: torch.nn.Module, scope: str) -> tuple[int, 
         if extender is None:
             raise ValueError(
                 "training.trainable_scope='boundary_extender' requires "
-                "model.parameters.forcing_spatial_mode='boundary_extender'."
+                "model.parameters.forcing_spatial_mode='boundary_extender' or "
+                "'physics_extender'."
             )
         for parameter in extender.parameters():
             parameter.requires_grad_(True)
@@ -1519,6 +1627,12 @@ def run_one_seed(
             "forcing_extender_condition_on_rc", False
         ),
         forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
+        forcing_extender_physics_hidden=model_cfg.get(
+            "forcing_extender_physics_hidden", 16
+        ),
+        forcing_extender_interface_x_norm=model_cfg.get(
+            "forcing_extender_interface_x_norm", 0.5
+        ),
         s_y_channel=dims.s_y_channel,
         padding_reference_resolution=model_cfg.get("padding_reference_resolution"),
         padding_mode=model_cfg.get("padding_mode", "zeros"),
@@ -1558,6 +1672,19 @@ def run_one_seed(
         init_ckpt = torch.load(
             init_from_checkpoint, map_location="cpu", weights_only=False,
         )
+        if _forcing_spatial_mode(init_ckpt["conf"]) != _forcing_spatial_mode(config):
+            raise ValueError(
+                "init_from_checkpoint cannot cross forcing_spatial_mode "
+                "architectures; start this ablation from a fresh initialization."
+            )
+        if _physics_extender_signature(
+            init_ckpt["conf"]
+        ) != _physics_extender_signature(config):
+            raise ValueError(
+                "init_from_checkpoint requires matching physics-extender hidden "
+                "width and interface location; start this ablation from a fresh "
+                "initialization."
+            )
         if _forcing_extender_conditions_on_rc(
             init_ckpt["conf"]
         ) != _forcing_extender_conditions_on_rc(config):
@@ -1933,6 +2060,11 @@ def run_one_seed(
                             "global_optimizer_step": int(global_optimizer_step),
                         },
                         best_path,
+                    )
+                    write_diffusion_geometry_bias(
+                        fno_unwrapped,
+                        run_path / "diffusion_geometry_bias.csv",
+                        checkpoint_epoch=epoch,
                     )
                     print(f"Saved new best ({checkpoint_metric}): {best_val_loss} -> {best_path}", flush=True)
                 else:

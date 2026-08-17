@@ -787,6 +787,19 @@ class TestModelDiagnosticPlots:
         assert model.forcing_extender_condition_on_rc is True
         assert model.boundary_extender.domain_lift[0].in_features == 4
 
+    def test_load_checkpoint_model_rebuilds_physics_extender(
+        self, small_physics_extender_checkpoint
+    ):
+        model, conf = dataset_plots._load_checkpoint_model(
+            small_physics_extender_checkpoint
+        )
+
+        params = conf["model"]["parameters"]
+        assert params["forcing_spatial_mode"] == "physics_extender"
+        assert len(model.boundary_extender.diffusion_geometry_bias_mlps) == 2
+        assert model.boundary_extender.diffusion_geometry_bias_mlps[0][0].out_features == 7
+        assert model.boundary_extender.diffusion_geometry_interface_x_norm == pytest.approx(0.4)
+
     def test_load_checkpoint_model_rejects_1d_checkpoint(self, tmp_path):
         ckpt_path = tmp_path / "legacy_fno1d.pt"
         torch.save(

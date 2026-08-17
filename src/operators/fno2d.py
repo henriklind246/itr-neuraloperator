@@ -34,6 +34,9 @@ import torch.nn.functional as F
 #         from the domain queries, so waveform information cannot bypass the
 #         boundary pathway. An opt-in scalar-R_c ablation appends normalized
 #         contact resistance to the domain queries only.
+#       - physics_extender: the same extender with a learned, diffusion-inspired
+#         per-head relative-y attention bias. The signed coefficient depends on
+#         normalized query depth, lead time, interface crossing, and scalar R_c.
 #   - bins: the spatial input additionally carries 16 fixed integral forcing
 #     bins (Q_y_bins(x, y, k) = s(y) * ∫a(t)dt over the k-th subinterval of
 #     [t_s, t_j], /q_ref); the temporal branch is OFF and forcing_seq is empty,
@@ -300,6 +303,110 @@ class BoundaryForcingExtender(nn.Module):
         ])
         self.output_projection = nn.Linear(embed_dim, out_dim)
 
+    def enable_diffusion_geometry_bias(
+        self,
+        hidden_dim: int = 16,
+        interface_x_norm: float = 0.5,
+    ) -> None:
+        if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, int) or hidden_dim <= 0:
+            raise ValueError(
+                "forcing_extender_physics_hidden must be a positive integer, "
+                f"got {hidden_dim!r}"
+            )
+        if (
+            isinstance(interface_x_norm, bool)
+            or not isinstance(interface_x_norm, (int, float))
+            or not 0.0 <= float(interface_x_norm) <= 1.0
+        ):
+            raise ValueError(
+                "forcing_extender_interface_x_norm must be a finite number in "
+                f"[0, 1], got {interface_x_norm!r}"
+            )
+        if getattr(self, "diffusion_geometry_bias_mlps", None) is not None:
+            raise RuntimeError("diffusion geometry bias is already enabled")
+
+        self.diffusion_geometry_interface_x_norm = float(interface_x_norm)
+        self.diffusion_geometry_bias_mlps = nn.ModuleList()
+        for _ in range(self.depth):
+            mlp = nn.Sequential(
+                nn.Linear(4, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.num_heads),
+            )
+            nn.init.zeros_(mlp[-1].weight)
+            nn.init.zeros_(mlp[-1].bias)
+            self.diffusion_geometry_bias_mlps.append(mlp)
+
+    def _validate_rc_norm(self, rc_norm, batch_size: int) -> None:
+        if rc_norm is None:
+            raise ValueError(
+                "diffusion geometry bias or condition_on_rc=True requires a "
+                "normalized scalar R_c tensor."
+            )
+        if rc_norm.ndim != 2 or rc_norm.shape != (batch_size, 1):
+            raise ValueError(
+                "rc_norm must have shape (B, 1), got "
+                f"{tuple(rc_norm.shape)} for batch size {batch_size}."
+            )
+
+    def _diffusion_geometry_context(self, x_norm, t_bar_norm, rc_norm):
+        if x_norm.shape != t_bar_norm.shape or x_norm.shape != rc_norm.shape:
+            raise ValueError(
+                "x_norm, t_bar_norm, and rc_norm must have identical shapes, got "
+                f"{tuple(x_norm.shape)}, {tuple(t_bar_norm.shape)}, and "
+                f"{tuple(rc_norm.shape)}."
+            )
+        if x_norm.ndim < 2 or x_norm.shape[-1] != 1:
+            raise ValueError(
+                "diffusion geometry inputs must end in a singleton feature "
+                f"dimension, got {tuple(x_norm.shape)}."
+            )
+        interface_x = self.diffusion_geometry_interface_x_norm
+        crosses_interface = (x_norm > interface_x).to(dtype=x_norm.dtype)
+        return torch.cat(
+            [x_norm, t_bar_norm, crosses_interface, rc_norm], dim=-1
+        )
+
+    def diffusion_geometry_coefficients(self, x_norm, t_bar_norm, rc_norm):
+        """Evaluate signed per-block, per-head geometry coefficients."""
+        mlps = getattr(self, "diffusion_geometry_bias_mlps", None)
+        if mlps is None:
+            raise RuntimeError("diffusion geometry bias is not enabled")
+        context = self._diffusion_geometry_context(
+            x_norm, t_bar_norm, rc_norm
+        )
+        return torch.stack([mlp(context) for mlp in mlps], dim=0)
+
+    def _build_diffusion_geometry_bias(
+        self,
+        block_index: int,
+        domain_tokens,
+        boundary_tokens,
+        t_bar_norm,
+        rc_norm,
+    ):
+        mlps = getattr(self, "diffusion_geometry_bias_mlps", None)
+        if mlps is None:
+            return None
+
+        batch_size, num_queries = domain_tokens.shape[:2]
+        self._validate_rc_norm(rc_norm, batch_size)
+        x_norm = domain_tokens[..., 0:1]
+        t_domain = t_bar_norm[:, None, :].expand(-1, num_queries, -1)
+        rc_domain = rc_norm[:, None, :].expand(-1, num_queries, -1)
+        context = self._diffusion_geometry_context(x_norm, t_domain, rc_domain)
+        coefficients = mlps[block_index](context)
+
+        domain_y = domain_tokens[..., 1]
+        boundary_y = boundary_tokens[..., 0]
+        delta_y_sq = (domain_y[:, :, None] - boundary_y[:, None, :]).square()
+        bias = -coefficients.permute(0, 2, 1)[..., None] * delta_y_sq[:, None, :, :]
+        return bias.reshape(
+            batch_size * self.num_heads,
+            num_queries,
+            boundary_tokens.size(1),
+        )
+
     def _build_boundary_tokens(self, h_a, spatial, t_bar_norm):
         # forcing benchmark invariant: normalized y is spatial channel 2 and
         # s(y) is broadcast in x, so the x=0 slice is the boundary function.
@@ -324,15 +431,7 @@ class BoundaryForcingExtender(nn.Module):
         t_domain = t_bar_norm[:, None, :].expand(-1, coords.size(1), -1)
         features = [coords, t_domain]
         if self.condition_on_rc:
-            if rc_norm is None:
-                raise ValueError(
-                    "condition_on_rc=True requires a normalized scalar R_c tensor."
-                )
-            if rc_norm.ndim != 2 or rc_norm.shape != (spatial.size(0), 1):
-                raise ValueError(
-                    "rc_norm must have shape (B, 1), got "
-                    f"{tuple(rc_norm.shape)} for batch size {spatial.size(0)}."
-                )
+            self._validate_rc_norm(rc_norm, spatial.size(0))
             rc_domain = rc_norm[:, None, :].expand(-1, coords.size(1), -1)
             features.append(rc_domain)
         return torch.cat(features, dim=-1), coarse_shape
@@ -346,24 +445,32 @@ class BoundaryForcingExtender(nn.Module):
 
         boundary = self.boundary_lift(boundary_tokens)
         domain = self.domain_lift(domain_tokens)
+        attention_bias = self._build_diffusion_geometry_bias(
+            0, domain_tokens, boundary_tokens, t_bar_norm, rc_norm
+        )
         attended, _ = self.cross_attention(
             query=domain,
             key=boundary,
             value=boundary,
+            attn_mask=attention_bias,
             need_weights=False,
         )
         domain = self.attention_norm(domain + attended)
         domain = self.ffn_norm(domain + self.ffn(domain))
-        for cross_attention, attention_norm, ffn, ffn_norm in zip(
+        for block_index, (cross_attention, attention_norm, ffn, ffn_norm) in enumerate(zip(
             self.additional_cross_attentions,
             self.additional_attention_norms,
             self.additional_ffns,
             self.additional_ffn_norms,
-        ):
+        ), start=1):
+            attention_bias = self._build_diffusion_geometry_bias(
+                block_index, domain_tokens, boundary_tokens, t_bar_norm, rc_norm
+            )
             attended, _ = cross_attention(
                 query=domain,
                 key=boundary,
                 value=boundary,
+                attn_mask=attention_bias,
                 need_weights=False,
             )
             domain = attention_norm(domain + attended)
@@ -405,8 +512,10 @@ class FNO2d(nn.Module):
 
     When the temporal encoder's spatial route is active, exactly K forcing
     channels are concatenated before the lift. ``broadcast`` uses s(y) * z_a;
-    ``boundary_extender`` replaces those fields with learned pseudo-extensions.
-    In either case linear_p receives (in_channels + K) channels.
+    ``boundary_extender`` replaces those fields with learned pseudo-extensions;
+    ``physics_extender`` adds a diffusion-inspired geometry bias to the same
+    cross-attention blocks. In every case linear_p receives
+    (in_channels + K) channels.
     """
 
     # NOTE: the in_channels / cond_static_dim / temporal_token_dim defaults below
@@ -437,6 +546,8 @@ class FNO2d(nn.Module):
         forcing_extender_depth: int = 1,
         forcing_extender_condition_on_rc: bool = False,
         forcing_extender_rc_cond_index: int | None = None,
+        forcing_extender_physics_hidden: int = 16,
+        forcing_extender_interface_x_norm: float = 0.5,
         s_y_channel: int = 3,
         padding_reference_resolution: int | None = None,
         padding_mode: str = "zeros",
@@ -477,41 +588,49 @@ class FNO2d(nn.Module):
         self.forcing_cond_mode = forcing_cond_mode
         self._forcing_to_spatial = use_temporal_encoder and forcing_cond_mode in ("both", "spatial_only")
         self._forcing_to_cond = use_temporal_encoder and forcing_cond_mode in ("both", "cond_only")
-        if forcing_spatial_mode not in ("broadcast", "boundary_extender"):
+        extender_modes = ("boundary_extender", "physics_extender")
+        if forcing_spatial_mode not in ("broadcast", *extender_modes):
             raise ValueError(
-                "forcing_spatial_mode must be one of broadcast|boundary_extender, "
+                "forcing_spatial_mode must be one of "
+                "broadcast|boundary_extender|physics_extender, "
                 f"got {forcing_spatial_mode!r}"
             )
         if forcing_extender_condition_on_rc:
-            if forcing_spatial_mode != "boundary_extender":
+            if forcing_spatial_mode not in extender_modes:
                 raise ValueError(
                     "forcing_extender_condition_on_rc=True requires "
-                    "forcing_spatial_mode='boundary_extender'."
+                    "forcing_spatial_mode='boundary_extender' or "
+                    "'physics_extender'."
                 )
+        requires_rc_index = (
+            forcing_extender_condition_on_rc
+            or forcing_spatial_mode == "physics_extender"
+        )
+        if requires_rc_index:
             if (
                 isinstance(forcing_extender_rc_cond_index, bool)
                 or not isinstance(forcing_extender_rc_cond_index, int)
                 or not 0 <= forcing_extender_rc_cond_index < cond_static_dim
             ):
                 raise ValueError(
-                    "forcing_extender_condition_on_rc=True requires an eligible "
+                    "the configured forcing extender requires an eligible "
                     "forcing_extender_rc_cond_index in cond_static; got "
                     f"{forcing_extender_rc_cond_index!r} for cond_static_dim="
                     f"{cond_static_dim}."
                 )
-        if forcing_spatial_mode == "boundary_extender":
+        if forcing_spatial_mode in extender_modes:
             if not use_temporal_encoder:
                 raise ValueError(
-                    "boundary_extender requires use_temporal_encoder=True."
+                    f"{forcing_spatial_mode} requires use_temporal_encoder=True."
                 )
             if forcing_cond_mode == "cond_only":
                 raise ValueError(
-                    "boundary_extender requires a spatial forcing route; "
+                    f"{forcing_spatial_mode} requires a spatial forcing route; "
                     "forcing_cond_mode cannot be 'cond_only'."
                 )
             if not use_forcing_time_aug:
                 raise ValueError(
-                    "boundary_extender requires use_forcing_time_aug=True so it "
+                    f"{forcing_spatial_mode} requires use_forcing_time_aug=True so it "
                     "receives cond_static[:, 0] as normalized lead time."
                 )
         self.forcing_spatial_mode = forcing_spatial_mode
@@ -529,6 +648,8 @@ class FNO2d(nn.Module):
         self.forcing_extender_depth = forcing_extender_depth
         self.forcing_extender_condition_on_rc = forcing_extender_condition_on_rc
         self.forcing_extender_rc_cond_index = forcing_extender_rc_cond_index
+        self.forcing_extender_physics_hidden = forcing_extender_physics_hidden
+        self.forcing_extender_interface_x_norm = forcing_extender_interface_x_norm
         self.s_y_channel = s_y_channel
         self.padding = 8  # pad spatial dim for non-periodic signals
         self.padding_reference_resolution = padding_reference_resolution
@@ -624,6 +745,15 @@ class FNO2d(nn.Module):
         self.activation = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
+        # Register the optional MLPs after every shared parameter has been
+        # initialized. Otherwise their random hidden layers would advance the
+        # RNG and invalidate same-seed ordinary-vs-physics initialization.
+        if forcing_spatial_mode == "physics_extender":
+            self.boundary_extender.enable_diffusion_geometry_bias(
+                hidden_dim=forcing_extender_physics_hidden,
+                interface_x_norm=forcing_extender_interface_x_norm,
+            )
+
     def _padding_for_shape(self, Nx: int, Ny: int) -> tuple[int, int]:
         if self.padding_reference_resolution is None:
             return self.padding, self.padding
@@ -649,10 +779,13 @@ class FNO2d(nn.Module):
             # Spatial forcing injection is skipped in cond_only mode. Extender
             # mode replaces the K broadcasts rather than adding another route.
             if self._forcing_to_spatial:
-                if self.forcing_spatial_mode == "boundary_extender":
+                if self.forcing_spatial_mode in ("boundary_extender", "physics_extender"):
                     t_bar_norm = cond_static[:, 0:1]
                     rc_norm = None
-                    if self.forcing_extender_condition_on_rc:
+                    if (
+                        self.forcing_extender_condition_on_rc
+                        or self.forcing_spatial_mode == "physics_extender"
+                    ):
                         rc_index = self.forcing_extender_rc_cond_index
                         rc_norm = cond_static[:, rc_index:rc_index + 1]
                     forcing_field = self.boundary_extender(

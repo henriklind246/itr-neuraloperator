@@ -63,6 +63,19 @@ def problem_from_config(config: dict) -> ProblemSpec:
                 UserWarning,
                 stacklevel=2,
             )
+    forcing_spatial_mode = str(
+        config.get("model", {}).get("parameters", {}).get(
+            "forcing_spatial_mode", "broadcast"
+        )
+    )
+    if (
+        forcing_spatial_mode == "physics_extender"
+        and not spec.dims.supports_diffusion_geometry_extender
+    ):
+        raise ValueError(
+            "forcing_spatial_mode='physics_extender' requires a fixed-interface "
+            "temporal-encoder ProblemSpec with scalar normalized R_c."
+        )
     return spec
 
 

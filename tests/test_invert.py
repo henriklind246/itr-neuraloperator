@@ -41,6 +41,55 @@ from scripts.inverse_adapters import (
 )
 
 
+def test_legacy_forcing_checkpoint_adaptation_is_exact_at_zero_source_time():
+    from problems.registry import get_problem
+
+    dims = get_problem("forcing_itr", "temporal_encoder").dims
+    embed_dim = 4
+    config = {
+        "benchmark": {"name": "forcing_itr"},
+        "model": {
+            "parameters": {
+                "cond_static_dim": dims.cond_static_dim + 1,
+                "forcing_embed_dim": embed_dim,
+            }
+        },
+    }
+    generator = torch.Generator().manual_seed(0)
+    cond_weight = torch.randn(
+        3, dims.cond_static_dim + 1 + embed_dim, generator=generator
+    )
+    aug_weight = torch.randn(3, embed_dim + 2, generator=generator)
+    state = {
+        "cond_mlp.net.0.weight": cond_weight,
+        "forcing_aug_mlp.0.weight": aug_weight,
+    }
+
+    adapted = inv._adapt_legacy_zero_source_time_state(state, config, dims)
+    current_cond = torch.randn(2, dims.cond_static_dim, generator=generator)
+    forcing_embed = torch.randn(2, embed_dim, generator=generator)
+    legacy_cond = torch.cat(
+        [current_cond[:, :1], torch.zeros(2, 1), current_cond[:, 1:]], dim=1
+    )
+    legacy_full = torch.cat([legacy_cond, forcing_embed], dim=1)
+    current_full = torch.cat([current_cond, forcing_embed], dim=1)
+    torch.testing.assert_close(
+        legacy_full @ cond_weight.T,
+        current_full @ adapted["cond_mlp.net.0.weight"].T,
+    )
+
+    legacy_aug = torch.cat(
+        [forcing_embed, current_cond[:, :1], torch.zeros(2, 1)], dim=1
+    )
+    current_aug = torch.cat([forcing_embed, current_cond[:, :1]], dim=1)
+    torch.testing.assert_close(
+        legacy_aug @ aug_weight.T,
+        current_aug @ adapted["forcing_aug_mlp.0.weight"].T,
+    )
+    assert state["cond_mlp.net.0.weight"] is cond_weight
+    assert state["forcing_aug_mlp.0.weight"] is aug_weight
+
+
 # A handful of physical thetas spanning the box, including the dependent-ceiling
 # edge (R_amp near R_PEAK_MAX - R_base) and the no-void floor (R_amp ~ 0).
 THETAS = [
