@@ -11,9 +11,21 @@ for the active `(benchmark, representation)` pair and the run's
 
 ## Repository rules
 
-- **Never commit or push.** Do not run `git commit`, `git push`, `git rebase`,
-  `git reset --hard`, or any history-rewriting command. Stage and modify files
-  freely; let the user review and commit.
+- **Do not commit or push unless the user explicitly authorizes it, and then
+  confirm once more before running the command.** Default behavior is unchanged:
+  stage and modify files freely, then stop and let the user review. When the user
+  does authorize a commit or push:
+  1. Show the exact files to be staged and the proposed commit message (and, for
+     a push, the branch and remote).
+  2. Ask the user to confirm that specific action, and wait for a clear yes.
+  3. Only then run `git commit` / `git push`.
+  Authorization is per-action and per-session — one approved commit does not
+  authorize the next commit, and approving a commit does not authorize a push.
+  Never force-push, and never push to `main` without an explicit, separate
+  confirmation naming the branch.
+- **Never rewrite history.** `git rebase`, `git reset --hard`, `git commit
+  --amend`, `git push --force`, and any other history-rewriting command remain
+  off-limits regardless of authorization; ask the user to run them.
 - **Never edit `.git/`, git config, hooks, or CI configuration.**
 - **Prefer existing classes, modules, and file structures.** Do not introduce
   new abstractions, factories, or wrapper layers when an existing one fits. New
@@ -358,4 +370,6 @@ the concern. Do not split a single concern across new modules.
 7. For experiment conclusions, cite the exact artifact path, the
    `(benchmark, representation)` pair, and the metric convention
    (`train/val_rel_l2` normalized-space percent vs eval physical percent).
-8. Stop. Do not commit. Do not push.
+8. Stop without committing or pushing. If the user has explicitly authorized a
+   commit or push, first show the files, message, and target branch/remote, ask
+   for one more confirmation, and only run the command after a clear yes.
