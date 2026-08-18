@@ -118,9 +118,10 @@ class TestBoundaryForcingExtender:
         out.square().mean().backward()
 
         assert extender.depth == depth
-        assert len(extender.additional_cross_attentions) == depth - 1
+        assert len(extender.cross_attentions) == depth
+        assert len(extender.ffns) == depth
         assert out.shape == (2, 8, 9, 4)
-        for attention in extender.additional_cross_attentions:
+        for attention in extender.cross_attentions:
             assert attention.in_proj_weight.grad is not None
             assert attention.in_proj_weight.grad.abs().sum() > 0
 
@@ -136,26 +137,111 @@ class TestBoundaryForcingExtender:
                 s_y_channel=3,
             )
 
-    def test_depth_one_preserves_v1_state_dict_keys(self):
+    @pytest.mark.parametrize("depth", [1, 2, 3])
+    def test_blocks_are_uniform_and_carry_no_normalization(self, depth):
         extender = BoundaryForcingExtender(
             embed_dim=8,
             out_dim=4,
             grid_size=6,
             num_heads=2,
-            depth=1,
+            depth=depth,
             s_y_channel=3,
         )
+        keys = set(extender.state_dict())
 
-        assert not any("additional_" in key for key in extender.state_dict())
+        # The paper's block is a bare additive residual; any LayerNorm here
+        # reintroduces the post-LN path that broke depth=3 training.
+        assert not any(
+            isinstance(m, torch.nn.LayerNorm) for m in extender.modules()
+        )
+        assert not any("additional_" in key for key in keys)
+        for block in range(depth):
+            assert f"cross_attentions.{block}.in_proj_weight" in keys
+            assert f"ffns.{block}.0.weight" in keys
+            assert f"ffns.{block}.2.weight" in keys
+
         clone = BoundaryForcingExtender(
             embed_dim=8,
             out_dim=4,
             grid_size=6,
             num_heads=2,
-            depth=1,
+            depth=depth,
             s_y_channel=3,
         )
         clone.load_state_dict(extender.state_dict(), strict=True)
+
+    def test_readout_is_a_two_layer_feed_forward(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=6, num_heads=2, s_y_channel=3
+        )
+
+        # Paper: psi_i = FF^(K+1)(a^(K)), not a bare linear readout.
+        assert extender.output_projection[0].in_features == 8
+        assert extender.output_projection[0].out_features == 8
+        assert isinstance(extender.output_projection[1], torch.nn.GELU)
+        assert extender.output_projection[2].out_features == 4
+
+    def test_block_is_exact_additive_residual(self):
+        torch.manual_seed(0)
+        # grid_size == nx == ny so the coarse grid needs no resampling.
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=6, num_heads=2, depth=2,
+            s_y_channel=3,
+        ).eval()
+        # Zeroing every FF output layer must make each block an exact identity,
+        # which only holds if the residual is unnormalized.
+        with torch.no_grad():
+            for ffn in extender.ffns:
+                ffn[2].weight.zero_()
+                ffn[2].bias.zero_()
+
+        spatial = _forcing_spatial(batch=2, nx=6, ny=6)
+        t_bar_norm = torch.tensor([[0.2], [0.7]])
+        domain_tokens, _ = extender._build_domain_tokens(spatial, t_bar_norm)
+        with torch.no_grad():
+            expected = extender.output_projection(
+                extender.domain_lift(domain_tokens)
+            )
+            out = extender(torch.randn(2, 8), spatial, t_bar_norm)
+
+        assert out.shape == (2, 6, 6, 4)
+        assert torch.allclose(out.reshape(2, 36, 4), expected, atol=1e-6)
+
+    @pytest.mark.parametrize("depth", [1, 2, 3])
+    def test_init_passes_boundary_signal_without_attenuation(self, depth):
+        # Norm-free residuals expose the initialization: torch's default Linear
+        # gain (~0.3) attenuated a 1% h_a perturbation to ~1e-4 relative output
+        # change, so the forcing path started ~60x weaker than the signal fed in.
+        torch.manual_seed(0)
+        extender = BoundaryForcingExtender(
+            embed_dim=32, out_dim=8, grid_size=8, num_heads=4, depth=depth,
+            s_y_channel=3,
+        ).eval()
+
+        spatial = _forcing_spatial(batch=4, nx=16, ny=16)
+        t_bar_norm = torch.rand(4, 1)
+        h_a = torch.randn(4, 32)
+        delta = torch.randn(4, 32)
+        delta = 0.01 * delta * h_a.norm() / delta.norm()
+
+        with torch.no_grad():
+            base = extender(h_a, spatial, t_bar_norm)
+            perturbed = extender(h_a + delta, spatial, t_bar_norm)
+        sensitivity = ((perturbed - base).norm() / base.norm()).item()
+
+        assert sensitivity > 2e-3, (
+            f"depth={depth} extender attenuates h_a to {sensitivity:.2e} "
+            "relative sensitivity; check _init_norm_free_residual"
+        )
+
+    def test_residual_branch_biases_start_at_zero(self):
+        extender = BoundaryForcingExtender(
+            embed_dim=8, out_dim=4, grid_size=6, num_heads=2, depth=3,
+            s_y_channel=3,
+        )
+        for ffn in extender.ffns:
+            assert torch.count_nonzero(ffn[0].bias) == 0
+            assert torch.count_nonzero(ffn[2].bias) == 0
 
     def test_diffusion_geometry_context_and_signed_per_head_bias(self):
         extender = BoundaryForcingExtender(
@@ -396,9 +482,8 @@ class TestBoundaryForcingExtender:
                 parameter.zero_()
             extender.domain_lift[0].weight[0, 0] = 1.0
             extender.domain_lift[2].weight[0, 0] = 1.0
-            extender.attention_norm.weight.fill_(1.0)
-            extender.ffn_norm.weight.fill_(1.0)
-            extender.output_projection.weight[0, 0] = 1.0
+            extender.output_projection[0].weight[0, 0] = 1.0
+            extender.output_projection[2].weight[0, 0] = 1.0
 
         spatial = _forcing_spatial(batch=1, nx=5, ny=5)
         h_a = torch.ones(1, 4)
@@ -649,7 +734,7 @@ class TestFNO2d:
         assert model.linear_p.in_features == 20
         assert model.boundary_extender.out_dim == 16
         assert model.boundary_extender.depth == 3
-        assert len(model.boundary_extender.additional_cross_attentions) == 2
+        assert len(model.boundary_extender.cross_attentions) == 3
         assert hasattr(model, "boundary_extender")
         assert not hasattr(model, "forcing_to_spatial")
         assert not hasattr(model, "forcing_aug_mlp")

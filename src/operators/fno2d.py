@@ -225,6 +225,12 @@ class BoundaryForcingExtender(nn.Module):
     coarse domain queries contain normalized coordinates and the exact lead-time
     scalar supplied by ``cond_static[:, 0]``; the opt-in ablation also appends
     normalized scalar contact resistance. They never receive ``h_a``.
+
+    Blocks follow ``a^(k) = a^(k-1) + FF^(k)(CA^(k)(a^(k-1), q^(0)))``: one
+    additive residual per block and deliberately no normalization, so the
+    identity path from ``domain_lift`` to ``output_projection`` is unbroken.
+    An earlier post-LayerNorm variant put two normalized residuals in that path
+    and became untrainable at ``depth=3`` under the standard 2.8e-3 peak LR.
     """
 
     def __init__(
@@ -267,41 +273,51 @@ class BoundaryForcingExtender(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-        self.attention_norm = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-        self.ffn_norm = nn.LayerNorm(embed_dim)
-        self.additional_cross_attentions = nn.ModuleList([
+        self.cross_attentions = nn.ModuleList([
             nn.MultiheadAttention(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
                 batch_first=True,
             )
-            for _ in range(depth - 1)
+            for _ in range(depth)
         ])
-        self.additional_attention_norms = nn.ModuleList([
-            nn.LayerNorm(embed_dim) for _ in range(depth - 1)
-        ])
-        self.additional_ffns = nn.ModuleList([
+        self.ffns = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.GELU(),
                 nn.Linear(embed_dim, embed_dim),
             )
-            for _ in range(depth - 1)
+            for _ in range(depth)
         ])
-        self.additional_ffn_norms = nn.ModuleList([
-            nn.LayerNorm(embed_dim) for _ in range(depth - 1)
-        ])
-        self.output_projection = nn.Linear(embed_dim, out_dim)
+        self.output_projection = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, out_dim),
+        )
+        self._init_norm_free_residual()
+
+    def _init_norm_free_residual(self) -> None:
+        # Torch's default Linear init (Kaiming-uniform with a=sqrt(5)) has a gain
+        # near 0.3. A normalized stack hides that; this one cannot, and it
+        # attenuated the boundary signal ~60x between the attention output and
+        # the readout. Xavier with the GELU gain on pre-activation layers keeps
+        # each block roughly variance-preserving, and zeroed biases stop a branch
+        # from emitting a constant that dilutes its h_a-dependent part.
+        gelu_gain = nn.init.calculate_gain("relu")
+        for block in (
+            self.boundary_lift,
+            self.domain_lift,
+            self.output_projection,
+            *self.ffns,
+        ):
+            nn.init.xavier_uniform_(block[0].weight, gain=gelu_gain)
+            nn.init.xavier_uniform_(block[2].weight)
+            nn.init.zeros_(block[0].bias)
+            nn.init.zeros_(block[2].bias)
+        for attention in self.cross_attentions:
+            # MultiheadAttention xavier-inits in_proj but leaves out_proj on the
+            # default Linear init.
+            nn.init.xavier_uniform_(attention.out_proj.weight)
 
     def enable_diffusion_geometry_bias(
         self,
@@ -445,24 +461,9 @@ class BoundaryForcingExtender(nn.Module):
 
         boundary = self.boundary_lift(boundary_tokens)
         domain = self.domain_lift(domain_tokens)
-        attention_bias = self._build_diffusion_geometry_bias(
-            0, domain_tokens, boundary_tokens, t_bar_norm, rc_norm
-        )
-        attended, _ = self.cross_attention(
-            query=domain,
-            key=boundary,
-            value=boundary,
-            attn_mask=attention_bias,
-            need_weights=False,
-        )
-        domain = self.attention_norm(domain + attended)
-        domain = self.ffn_norm(domain + self.ffn(domain))
-        for block_index, (cross_attention, attention_norm, ffn, ffn_norm) in enumerate(zip(
-            self.additional_cross_attentions,
-            self.additional_attention_norms,
-            self.additional_ffns,
-            self.additional_ffn_norms,
-        ), start=1):
+        for block_index, (cross_attention, ffn) in enumerate(
+            zip(self.cross_attentions, self.ffns)
+        ):
             attention_bias = self._build_diffusion_geometry_bias(
                 block_index, domain_tokens, boundary_tokens, t_bar_norm, rc_norm
             )
@@ -473,8 +474,7 @@ class BoundaryForcingExtender(nn.Module):
                 attn_mask=attention_bias,
                 need_weights=False,
             )
-            domain = attention_norm(domain + attended)
-            domain = ffn_norm(domain + ffn(domain))
+            domain = domain + ffn(attended)
 
         coarse = self.output_projection(domain)
         coarse = coarse.reshape(
