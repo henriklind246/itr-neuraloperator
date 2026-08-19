@@ -262,21 +262,43 @@ def problem_schematic(*, source=None, spec=None, requirement=None):
 
 
 def _real_forcing_tokens(seed: int = 3) -> tuple[np.ndarray, str]:
-    """A genuine ``(M, 2)`` token stream ``[r_m, a_m / A_ref]``.
+    """A genuine ``(M, 3)`` point-plus-interval-average token stream.
 
     Built with the same two functions the dataset uses, so the panel shows the
     live contract rather than a redrawing of it. Returns the tokens and the
     temporal family they came from.
     """
-    from data.dataset import _sample_a
-    from problems.forcing import A_AMP_REF, _forcing_seq_2tok_from_samples
-    from src.physics.boundary_forcing import FORCING_TEMPORAL_SAMPLES
+    from problems.forcing import (
+        A_AMP_REF,
+        _forcing_seq_3tok_from_samples,
+        _sample_a,
+    )
+    from src.physics.boundary_forcing import (
+        FORCING_TEMPORAL_SAMPLES,
+        TEMPORAL_SAMPLERS,
+        integrate_temporal_ramped_signed,
+        ramped_temporal,
+    )
 
     family = "pulse_train"
-    q = _sample_temporal(family, seed)
+    params = TEMPORAL_SAMPLERS[family](
+        np.random.default_rng(seed),
+        dt=_DT,
+        t_final=_T_FINAL,
+        t_on=_T_ON,
+        t_off=_T_OFF,
+    )
+    ramp_seconds = 2.0 * _DT
+    q = ramped_temporal(family, params, ramp_seconds)
     t_samples, a_m = _sample_a(q, _T_ON, _T_OFF, FORCING_TEMPORAL_SAMPLES)
-    return _forcing_seq_2tok_from_samples(t_samples, a_m,
-                                          A_amp_ref=A_AMP_REF), family
+    return _forcing_seq_3tok_from_samples(
+        t_samples,
+        a_m,
+        interval_integral_fn=lambda a, b: integrate_temporal_ramped_signed(
+            family, params, a, b, ramp_seconds
+        ),
+        A_amp_ref=A_AMP_REF,
+    ), family
 
 
 def _draw_architecture_flow(ax, dims, n_layers: int, modes: tuple[int, int],

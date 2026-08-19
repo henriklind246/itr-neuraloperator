@@ -23,6 +23,7 @@ from src.physics.boundary_forcing import (
     FORCING_BINS,
     default_ramp_seconds,
     integrate_temporal_bins_ramped_signed,
+    integrate_temporal_intervals_ramped_signed,
     ramped_temporal,
     sample_spatial_family,
     sample_temporal_family,
@@ -52,9 +53,11 @@ COND_STATIC_DIM = (
 FORCING_FAMILY_SLICE = slice(_BASE_DIM, _BASE_DIM + _SPATIAL_ONEHOT_DIM)  # slice(2, 6)
 FORCING_SPATIAL_DESCRIPTOR_SLICE = slice(_BASE_DIM, COND_STATIC_DIM)  # slice(2, 10)
 
-# temporal_encoder mode: 128 samples x 2 tokens [r_m, a_m / A_ref].
+# temporal_encoder mode: 128 samples x 3 tokens
+# [r_m, a_m / A_ref, interval_average_m / A_ref].
 FORCING_TEMPORAL_SAMPLES = 128
-FORCING_TEMPORAL_TOKEN_DIM = 2
+FORCING_TEMPORAL_TOKEN_DIM = 3
+BINS_TEMPORAL_TOKEN_DIM = 2
 A_AMP_REF = 300.0
 INTERFACE_X = 0.5
 K_LEFT = 2.0
@@ -154,22 +157,50 @@ def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray
     return t_samples, a_m
 
 
-def _forcing_seq_2tok_from_samples(
+def _forcing_seq_3tok_from_samples(
     t_samples: np.ndarray,
     a_m: np.ndarray,
     *,
+    interval_integral_fn,
     A_amp_ref: float,
 ) -> np.ndarray:
-    """temporal_encoder forcing sequence: (M, 2) tokens [r_m, a_m / A_ref].
+    """Build forcing-agnostic point-plus-cell-average temporal tokens.
 
-    r_m is the normalized sample position in [0, 1] over [t_s, t_j]; the second
-    token is the amplitude sample scaled by the reference. Shared by every
-    benchmark's temporal_encoder representation (forcing, source, interfaces).
+    ``interval_integral_fn`` evaluates the generic quantity ``int a(t) dt``;
+    waveform-specific integration remains outside this representation builder.
+    The final endpoint token repeats the preceding interval average so the
+    original endpoint-inclusive sample grid and point-value feature stay intact.
     """
     r = np.linspace(0.0, 1.0, t_samples.shape[0], dtype=np.float32)
     tok0 = r
     tok1 = (a_m / np.float32(A_amp_ref)).astype(np.float32)
-    return np.stack([tok0, tok1], axis=-1).astype(np.float32)
+    widths = np.diff(np.asarray(t_samples, dtype=np.float64))
+    t_lo = np.asarray(t_samples[:-1], dtype=np.float64)
+    t_hi = np.asarray(t_samples[1:], dtype=np.float64)
+    try:
+        integrals = np.asarray(interval_integral_fn(t_lo, t_hi), dtype=np.float64)
+    except Exception:
+        integrals = np.fromiter(
+            (
+                interval_integral_fn(float(a), float(b))
+                for a, b in zip(t_lo, t_hi)
+            ),
+            dtype=np.float64,
+            count=t_lo.size,
+        )
+    if integrals.shape != widths.shape:
+        integrals = np.fromiter(
+            (
+                interval_integral_fn(float(a), float(b))
+                for a, b in zip(t_lo, t_hi)
+            ),
+            dtype=np.float64,
+            count=t_lo.size,
+        )
+    tok2 = np.empty(t_samples.shape[0], dtype=np.float32)
+    tok2[:-1] = (integrals / widths / float(A_amp_ref)).astype(np.float32)
+    tok2[-1] = tok2[-2]
+    return np.stack([tok0, tok1, tok2], axis=-1).astype(np.float32)
 
 
 def _generate_lhs_R_c(num_sims: int, seed: int = 0) -> np.ndarray:
@@ -239,7 +270,8 @@ class ForcingProblem(ProblemSpec):
     Two representations over the same trajectories/sim_params:
 
     - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, s_y], 10
-      forcing-agnostic static dims, a (128, 2) forcing_seq [r_m, a_m / A_ref],
+      forcing-agnostic static dims, a (128, 3) forcing_seq with point values and
+      local interval averages normalized by A_ref,
       temporal encoder on with time-augmented spatial injection.
     - ``bins``: 20 spatial channels [T_tilde, x, y, s_y, Q_y_bin_0..15], same
       10 static dims, an empty forcing_seq, temporal encoder off.
@@ -272,7 +304,7 @@ class ForcingProblem(ProblemSpec):
                 in_channels=SPATIAL_CHANNELS_BINS,
                 cond_static_dim=COND_STATIC_DIM,
                 has_forcing_seq=False,
-                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=2,
                 use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
@@ -493,8 +525,17 @@ class ForcingProblem(ProblemSpec):
                 )
             q = ds._q_callables[sid]
             t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_2tok_from_samples(
-                t_samples, a_m, A_amp_ref=A_AMP_REF,
+            forcing_seq = _forcing_seq_3tok_from_samples(
+                t_samples,
+                a_m,
+                interval_integral_fn=lambda t_lo, t_hi: integrate_temporal_intervals_ramped_signed(
+                    params["temporal_family"],
+                    params["temporal_params"],
+                    t_lo,
+                    t_hi,
+                    ds.ramp_seconds,
+                ),
+                A_amp_ref=A_AMP_REF,
             )
             spatial = spatial_base
         else:

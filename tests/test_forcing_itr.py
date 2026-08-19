@@ -369,7 +369,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
     torch.manual_seed(4)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=13, temporal_token_dim=2,
+        n_layers=2, cond_static_dim=13, temporal_token_dim=3,
         temporal_hidden=16, forcing_embed_dim=16,
         use_temporal_encoder=True, use_forcing_time_aug=True, s_y_channel=3,
     ).eval()
@@ -379,7 +379,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
     spatial[..., 3] = 1.0
     cond = torch.zeros(3, 13)
     cond[:, 0] = torch.tensor([0.07, 0.15, 0.30])
-    forcing_seq = torch.zeros(3, 128, 2)
+    forcing_seq = torch.zeros(3, 128, 3)
     forcing_seq[..., 0] = torch.linspace(0.0, 1.0, 128)
     obs = invert.ObservationSet(
         sid=0, time_indices=[1, 2, 3], spatial=spatial, cond=cond,
@@ -448,7 +448,7 @@ def test_validation_calibration_artifact_construction():
     torch.manual_seed(5)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=13, temporal_token_dim=2,
+        n_layers=2, cond_static_dim=13, temporal_token_dim=3,
         temporal_hidden=16, forcing_embed_dim=16,
         use_temporal_encoder=True, use_forcing_time_aug=True, s_y_channel=3,
     ).eval()

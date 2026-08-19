@@ -19,7 +19,7 @@ from src.operators.train import _selection_metric_value, run_one_seed
 
 _SPATIAL_IN_CHANNELS = 4
 _COND_STATIC_DIM = 10
-_TEMPORAL_TOKEN_DIM = 2
+_TEMPORAL_TOKEN_DIM = 3
 _TEMPORAL_SAMPLES = 128
 
 

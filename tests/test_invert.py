@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 
+from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
 from problems.source import _patch_center_ranges
 from problems.source_itr import (
     RC_Y_CHANNEL,
@@ -187,7 +188,7 @@ def _tiny_source_itr_model():
     from problems.source_itr import COND_STATIC_DIM, SPATIAL_CHANNELS_TEMPORAL
     from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
 
-    torch.manual_seed(0)
+    torch.manual_seed(1)
     return FNO2d(
         modes1=2, modes2=2, width=8,
         in_channels=SPATIAL_CHANNELS_TEMPORAL, out_channels=1, n_layers=2,
@@ -206,7 +207,7 @@ def _fake_observation_set(Nx=16, Ny=16, N=3, M=128):
     spatial[..., 2] = torch.linspace(0, 1, Ny)[None, None, :]
     cond = torch.zeros(N, 9)
     cond[:, 0] = torch.linspace(0.3, 1.0, N)  # t_bar_norm early/mid/late
-    forcing_seq = torch.zeros(N, M, 2)
+    forcing_seq = torch.zeros(N, M, FORCING_TEMPORAL_TOKEN_DIM)
     forcing_seq[..., 0] = torch.linspace(0, 1, M)
     targets = torch.zeros(N, Nx, Ny, 1)
     y_grid = torch.linspace(0, 1, Ny)
@@ -1255,7 +1256,7 @@ def _fake_forcing_observation_set(Nx=8, Ny=8, N=2, M=128):
     spatial[..., 3] = 1.0
     cond = torch.zeros(N, 10)
     cond[:, 0] = torch.linspace(0.25, 0.75, N)
-    forcing_seq = torch.zeros(N, M, 2)
+    forcing_seq = torch.zeros(N, M, FORCING_TEMPORAL_TOKEN_DIM)
     forcing_seq[..., 0] = torch.linspace(0, 1, M)
     targets = torch.zeros(N, Nx, Ny, 1)
     y_grid = torch.linspace(0, 1, Ny)

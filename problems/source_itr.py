@@ -7,9 +7,10 @@ import numpy as np
 
 from problems.base import OODAxis, ProblemDims, empty_forcing_seq
 from problems.forcing import (
+    BINS_TEMPORAL_TOKEN_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
-    _forcing_seq_2tok_from_samples,
+    _forcing_seq_3tok_from_samples,
     _sample_a,
 )
 from problems.source import (
@@ -24,6 +25,7 @@ from src.physics.internal_source import (
     RC_VOID_RANGES,
     R_PEAK_MAX,
     interface_control_volume_weights,
+    integrate_sin2_pulse,
     make_rc_void_profile,
     make_sin2_pulse,
 )
@@ -180,7 +182,7 @@ class SourceItrProblem(SourceProblem):
                 in_channels=SPATIAL_CHANNELS_BINS,
                 cond_static_dim=COND_STATIC_DIM,
                 has_forcing_seq=False,
-                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=3,
                 use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
@@ -389,8 +391,13 @@ class SourceItrProblem(SourceProblem):
                 ds._q_callables[sid] = make_sin2_pulse(A, t_off)
             q = ds._q_callables[sid]
             t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_2tok_from_samples(
-                t_samples, a_m, A_amp_ref=ds.a_amp_ref,
+            forcing_seq = _forcing_seq_3tok_from_samples(
+                t_samples,
+                a_m,
+                interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
+                    A, t_off, t_lo, t_hi
+                ),
+                A_amp_ref=ds.a_amp_ref,
             )
             spatial = spatial_base
         else:

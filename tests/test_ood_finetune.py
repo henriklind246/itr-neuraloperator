@@ -29,7 +29,7 @@ class _Dims:
 
 
 def _dims(**overrides):
-    base = dict(in_channels=4, cond_static_dim=10, temporal_token_dim=2,
+    base = dict(in_channels=4, cond_static_dim=10, temporal_token_dim=3,
                 s_y_channel=3, use_temporal_encoder=True, use_forcing_time_aug=True,
                 forcing_extender_rc_cond_index=1)
     base.update(overrides)
@@ -37,7 +37,7 @@ def _dims(**overrides):
 
 
 def _model_params(**overrides):
-    base = dict(in_channels=4, cond_static_dim=10, temporal_token_dim=2,
+    base = dict(in_channels=4, cond_static_dim=10, temporal_token_dim=3,
                 s_y_channel=3, use_temporal_encoder=True, use_forcing_time_aug=True,
                 forcing_extender_rc_cond_index=1,
                 modes1=16, modes2=16, width=64, forcing_spatial_mode="boundary_extender",

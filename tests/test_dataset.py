@@ -21,18 +21,21 @@ from problems.forcing import (
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
     SPATIAL_CHANNELS_TEMPORAL,
+    _forcing_seq_3tok_from_samples,
     _sample_a,
 )
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
     TEMPORAL_BUILDERS,
+    integrate_temporal_ramped_signed,
+    ramped_temporal,
 )
 
 # Global stats for synthetic test data (standard_normal → mu≈0, sigma≈1)
 _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
 # Active dataset default = forcing benchmark, temporal_encoder representation:
-# 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 2) tokens.
+# 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 3) tokens.
 # TEMPORAL_SAMPLES / TEMPORAL_TOKEN_DIM (64, 5) imported above stay scoped to the
 # legacy standalone build_forcing_seq / build_forcing_summary helper tests.
 SPATIAL_IN_CHANNELS = SPATIAL_CHANNELS_TEMPORAL
@@ -305,6 +308,117 @@ class TestSnapshotPairDataset:
         _, a_m = _sample_a(q, t_s, t_j, FORCING_TEMPORAL_SAMPLES)
         expected_tok1 = (a_m / A_AMP_REF).astype(np.float32)
         np.testing.assert_allclose(forcing_seq[:, 1].numpy(), expected_tok1, atol=1e-5)
+
+    def test_forcing_seq_tok2_matches_interval_average(self, dataset_subsampled):
+        _, _, forcing_seq, _, _ = _unpack(dataset_subsampled[0])
+        sim_id, s, j = dataset_subsampled._pairs[0]
+        params = dataset_subsampled.sim_params[sim_id]
+        t_s = float(dataset_subsampled.t_grid[s])
+        t_j = float(dataset_subsampled.t_grid[j])
+        q = ramped_temporal(
+            params["temporal_family"],
+            params["temporal_params"],
+            dataset_subsampled.ramp_seconds,
+        )
+        t_samples, _ = _sample_a(q, t_s, t_j, FORCING_TEMPORAL_SAMPLES)
+        expected = np.array(
+            [
+                integrate_temporal_ramped_signed(
+                    params["temporal_family"],
+                    params["temporal_params"],
+                    float(a),
+                    float(b),
+                    dataset_subsampled.ramp_seconds,
+                )
+                / (float(b) - float(a))
+                / A_AMP_REF
+                for a, b in zip(t_samples[:-1], t_samples[1:])
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(forcing_seq[:-1, 2].numpy(), expected, atol=1e-5)
+        assert forcing_seq[-1, 2].item() == pytest.approx(
+            forcing_seq[-2, 2].item(), abs=1e-7
+        )
+
+
+    @staticmethod
+    def _pulse(onset: float, duration: float, amplitude: float):
+        def value(t):
+            values = np.asarray(t)
+            result = amplitude * (
+                (values >= onset) & (values < onset + duration)
+            )
+            return float(result) if result.ndim == 0 else result.astype(float)
+
+        def integral(a: float, b: float) -> float:
+            return amplitude * max(0.0, min(b, onset + duration) - max(a, onset))
+
+        return value, integral
+
+    def test_known_point_collision_is_separated_by_interval_average(self):
+        sequences = []
+        point_channels = []
+        for onset in (0.272639125, 0.2740155):
+            params = {
+                "Np": 1,
+                "A_list": [300.0],
+                "t_list": [onset],
+                "dt_list": [0.025],
+            }
+            q = ramped_temporal("pulse_train", params, 0.01)
+            t_samples, a_m = _sample_a(q, 0.0, 0.3, 128)
+            sequence = _forcing_seq_3tok_from_samples(
+                t_samples,
+                a_m,
+                interval_integral_fn=lambda a, b, p=params: integrate_temporal_ramped_signed(
+                    "pulse_train", p, a, b, 0.01
+                ),
+                A_amp_ref=A_AMP_REF,
+            )
+            sequences.append(sequence)
+            point_channels.append(sequence[:, :2])
+
+        np.testing.assert_array_equal(point_channels[0], point_channels[1])
+        assert not np.array_equal(sequences[0], sequences[1])
+
+    def test_subcell_edge_sweep_tracks_occupancy_without_changing_points(self):
+        t_samples = np.linspace(0.0, 1.0, 5, dtype=np.float32)
+        amplitude = 150.0
+        sequences = []
+        for occupancy in np.linspace(0.2, 0.8, 7):
+            q, integral = self._pulse(0.25, occupancy * 0.25, amplitude)
+            a_m = np.asarray(q(t_samples), dtype=np.float32)
+            sequences.append(
+                _forcing_seq_3tok_from_samples(
+                    t_samples,
+                    a_m,
+                    interval_integral_fn=integral,
+                    A_amp_ref=A_AMP_REF,
+                )
+            )
+
+        for sequence in sequences[1:]:
+            np.testing.assert_array_equal(sequence[:, :2], sequences[0][:, :2])
+        cell_averages = np.array([sequence[1, 2] for sequence in sequences])
+        assert np.all(np.diff(cell_averages) > 0.0)
+        assert cell_averages[0] == pytest.approx(0.2 * amplitude / A_AMP_REF)
+        assert cell_averages[-1] == pytest.approx(0.8 * amplitude / A_AMP_REF)
+
+    def test_constant_average_and_final_token_convention(self):
+        t_samples = np.linspace(0.0, 0.5, 128, dtype=np.float32)
+        amplitude = 75.0
+        a_m = np.full_like(t_samples, amplitude)
+        sequence = _forcing_seq_3tok_from_samples(
+            t_samples,
+            a_m,
+            interval_integral_fn=lambda a, b: amplitude * (b - a),
+            A_amp_ref=A_AMP_REF,
+        )
+        np.testing.assert_allclose(sequence[:, 1], amplitude / A_AMP_REF)
+        np.testing.assert_allclose(sequence[:, 2], amplitude / A_AMP_REF)
+        assert sequence.dtype == np.float32
+        assert sequence[-1, 2] == sequence[-2, 2]
 
     def test_t_bar_positive(self, dataset_subsampled):
         for i in range(min(10, len(dataset_subsampled))):

@@ -7,10 +7,11 @@ import numpy as np
 
 from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
 from problems.forcing import (
+    BINS_TEMPORAL_TOKEN_DIM,
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
-    _forcing_seq_2tok_from_samples,
+    _forcing_seq_3tok_from_samples,
     _sample_a,
 )
 import src.physics.internal_source as _internal_source
@@ -241,8 +242,8 @@ class SourceProblem(ProblemSpec):
     Two representations over the same trajectories/sim_params:
 
     - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, S_h], 6 static
-      conditioning dims, a (128, 2) forcing_seq sampling the sin^2 heating
-      pulse, temporal encoder on.
+      conditioning dims, a (128, 3) forcing_seq carrying point samples and
+      local interval averages of the sin^2 heating pulse, temporal encoder on.
     - ``bins``: 20 spatial channels [T_tilde, x, y, S_h, Q_0..15], same 6
       static dims, an empty forcing_seq, temporal encoder off.
 
@@ -272,7 +273,7 @@ class SourceProblem(ProblemSpec):
                 in_channels=SPATIAL_CHANNELS_BINS,
                 cond_static_dim=COND_STATIC_DIM,
                 has_forcing_seq=False,
-                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=3,
                 use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
@@ -471,8 +472,13 @@ class SourceProblem(ProblemSpec):
                 ds._q_callables[sid] = make_sin2_pulse(A, t_off)
             q = ds._q_callables[sid]
             t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_2tok_from_samples(
-                t_samples, a_m, A_amp_ref=ds.a_amp_ref,
+            forcing_seq = _forcing_seq_3tok_from_samples(
+                t_samples,
+                a_m,
+                interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
+                    A, t_off, t_lo, t_hi
+                ),
+                A_amp_ref=ds.a_amp_ref,
             )
             spatial = spatial_base
         else:

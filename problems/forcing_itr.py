@@ -7,6 +7,7 @@ import numpy as np
 
 from problems.base import OODAxis, ProblemDims
 from problems.forcing import (
+    BINS_TEMPORAL_TOKEN_DIM,
     COND_STATIC_DIM as FORCING_COND_STATIC_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
     SPATIAL_CHANNELS_BINS as FORCING_SPATIAL_CHANNELS_BINS,
@@ -126,7 +127,7 @@ class ForcingItrProblem(ForcingProblem):
                 in_channels=SPATIAL_CHANNELS_BINS,
                 cond_static_dim=COND_STATIC_DIM,
                 has_forcing_seq=False,
-                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=2,
                 use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,

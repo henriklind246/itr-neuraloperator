@@ -57,6 +57,7 @@ from src.physics.boundary_forcing import (
     ramp_envelope,
     ramped_temporal,
     integrate_temporal_signed,
+    integrate_temporal_intervals_ramped_signed,
     integrate_temporal_ramped_signed,
     integrate_temporal_bins_ramped_signed,
 )
@@ -725,6 +726,31 @@ class TestRampedIntegral:
         p = dict(A=200.0, t0=0.0, tau=0.1)
         assert integrate_temporal_ramped_signed("exp", p, 0.1, 0.1, T_RAMP) == 0.0
         assert integrate_temporal_ramped_signed("exp", p, 0.2, 0.1, T_RAMP) == 0.0
+
+    def test_vectorized_local_intervals_match_scalar_reference(self):
+        rng = np.random.default_rng(19)
+        edges = np.linspace(0.0, T_FINAL, 129, dtype=np.float32).astype(float)
+        for family in TEMPORAL_FAMILIES:
+            params = TEMPORAL_SAMPLERS[family](
+                rng,
+                dt=DT,
+                t_final=T_FINAL,
+                t_on=0.0,
+                t_off=0.2,
+            )
+            got = integrate_temporal_intervals_ramped_signed(
+                family, params, edges[:-1], edges[1:], T_RAMP
+            )
+            expected = np.array(
+                [
+                    integrate_temporal_ramped_signed(
+                        family, params, a, b, T_RAMP
+                    )
+                    for a, b in zip(edges[:-1], edges[1:])
+                ]
+            )
+            assert got.shape == (128,)
+            np.testing.assert_allclose(got, expected, rtol=1e-6, atol=2e-9)
 
     def test_bins_sum_to_full_integral(self):
         # Additivity is float-tight only when the post-ramp integrator is exactly

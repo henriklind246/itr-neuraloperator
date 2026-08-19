@@ -6,10 +6,11 @@ import numpy as np
 
 from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
 from problems.forcing import (
+    BINS_TEMPORAL_TOKEN_DIM,
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
-    _forcing_seq_2tok_from_samples,
+    _forcing_seq_3tok_from_samples,
     _sample_a,
 )
 from src.physics.boundary_forcing import (
@@ -21,6 +22,7 @@ from src.physics.boundary_forcing import (
     build_qL,
     default_ramp_seconds,
     integrate_temporal_bins_ramped_signed,
+    integrate_temporal_intervals_ramped_signed,
     ramped_temporal,
 )
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
@@ -140,8 +142,9 @@ class InterfacesProblem(ProblemSpec):
     Two representations over the same trajectories/sim_params:
 
     - ``temporal_encoder``: 6 spatial channels [T_tilde, x, y, K_norm, D_norm,
-      s_y], 3 static conditioning dims, a (128, 2) forcing_seq [r_m, a_m/A_ref],
-      temporal encoder on with time-augmented spatial injection.
+      s_y], 3 static conditioning dims, a (128, 3) forcing_seq carrying point
+      samples and local interval averages, temporal encoder on with
+      time-augmented spatial injection.
     - ``bins``: 22 spatial channels [..., s_y, Q_y_bin_0..15], same 3 static
       dims, an empty forcing_seq, temporal encoder off.
 
@@ -173,7 +176,7 @@ class InterfacesProblem(ProblemSpec):
                 in_channels=SPATIAL_CHANNELS_BINS,
                 cond_static_dim=COND_STATIC_DIM,
                 has_forcing_seq=False,
-                temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=3,
                 use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
@@ -391,8 +394,17 @@ class InterfacesProblem(ProblemSpec):
                 )
             q = ds._q_callables[sid]
             t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_2tok_from_samples(
-                t_samples, a_m, A_amp_ref=A_AMP_REF,
+            forcing_seq = _forcing_seq_3tok_from_samples(
+                t_samples,
+                a_m,
+                interval_integral_fn=lambda t_lo, t_hi: integrate_temporal_intervals_ramped_signed(
+                    params["temporal_family"],
+                    params["temporal_params"],
+                    t_lo,
+                    t_hi,
+                    ds.ramp_seconds,
+                ),
+                A_amp_ref=A_AMP_REF,
             )
             spatial = spatial_base
         else:

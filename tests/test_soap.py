@@ -28,7 +28,7 @@ from src.operators.train import build_optimizer, _validate_resume_compatibility
 
 FORCING_IN_CHANNELS = 4
 FORCING_COND_STATIC_DIM = 10
-FORCING_TEMPORAL_TOKEN_DIM = 2
+FORCING_TEMPORAL_TOKEN_DIM = 3
 
 
 def _tiny_fno2d() -> FNO2d:

@@ -55,6 +55,7 @@ NP_MAX = 4
 PULSE_SLOTS = 4
 FORCING_BINS = 16
 SIN_INTEGRAL_SAMPLES = 2049
+_INTERVAL_GAUSS_NODES, _INTERVAL_GAUSS_WEIGHTS = np.polynomial.legendre.leggauss(16)
 
 # Fixed flux scale shared by forcing representations. It is the predetermined
 # maximum sampled forcing amplitude, not the 300 K temperature baseline.
@@ -483,6 +484,192 @@ def integrate_temporal_ramped_signed(
     if t_hi > lo_a:
         total += integrate_temporal_signed(temporal_family, temporal_params, lo_a, t_hi)
     return float(total)
+
+
+def integrate_temporal_intervals_ramped_signed(
+    temporal_family: str,
+    temporal_params: dict,
+    t_lo: np.ndarray,
+    t_hi: np.ndarray,
+    t_ramp: float,
+) -> np.ndarray:
+    """Evaluate the generic signed forcing integral over many local cells."""
+    lo, hi = np.broadcast_arrays(
+        np.asarray(t_lo, dtype=np.float64), np.asarray(t_hi, dtype=np.float64)
+    )
+    if temporal_family != "sin":
+        result = np.zeros(lo.shape, dtype=np.float64)
+        ramp_hi = np.minimum(hi, float(t_ramp))
+        ramp_mask = (float(t_ramp) > 0.0) & (ramp_hi > lo)
+        if np.any(ramp_mask):
+            flat_indices = np.flatnonzero(ramp_mask.reshape(-1))
+            ramp_lo = lo.reshape(-1)[flat_indices]
+            ramp_hi_flat = ramp_hi.reshape(-1)[flat_indices]
+            breakpoints = [0.0, float(t_ramp)]
+            if temporal_family == "exp":
+                breakpoints.append(float(temporal_params["t0"]))
+            elif temporal_family == "pulse_train":
+                for onset, duration in zip(
+                    temporal_params["t_list"], temporal_params["dt_list"]
+                ):
+                    breakpoints.extend(
+                        [float(onset), float(onset) + float(duration)]
+                    )
+            elif temporal_family == "exp_train":
+                breakpoints.extend(float(onset) for onset in temporal_params["t_list"])
+            cuts = np.array(sorted(set(breakpoints)), dtype=np.float64)
+            segment_lo = []
+            segment_hi = []
+            owners = []
+            for index, (a, b) in enumerate(zip(ramp_lo, ramp_hi_flat)):
+                internal = cuts[(cuts > a) & (cuts < b)]
+                edges = np.concatenate(([a], internal, [b]))
+                segment_lo.extend(edges[:-1])
+                segment_hi.extend(edges[1:])
+                owners.extend([index] * (len(edges) - 1))
+            segment_lo = np.asarray(segment_lo, dtype=np.float64)
+            segment_hi = np.asarray(segment_hi, dtype=np.float64)
+            half_width = 0.5 * (segment_hi - segment_lo)
+            midpoint = 0.5 * (segment_hi + segment_lo)
+            times = (
+                midpoint[:, None]
+                + half_width[:, None] * _INTERVAL_GAUSS_NODES
+            )
+            if temporal_family == "exp":
+                onset = float(temporal_params["t0"])
+                elapsed = times - onset
+                values = float(temporal_params["A"]) * np.exp(
+                    -np.maximum(elapsed, 0.0) / float(temporal_params["tau"])
+                ) * (elapsed >= 0.0)
+            elif temporal_family == "pulse_train":
+                values = np.zeros_like(times)
+                for amplitude, onset, duration in zip(
+                    temporal_params["A_list"],
+                    temporal_params["t_list"],
+                    temporal_params["dt_list"],
+                ):
+                    values += float(amplitude) * (
+                        (times >= float(onset))
+                        & (times < float(onset) + float(duration))
+                    )
+            elif temporal_family == "exp_train":
+                values = np.zeros_like(times)
+                for amplitude, onset, tau in zip(
+                    temporal_params["A_list"],
+                    temporal_params["t_list"],
+                    temporal_params["tau_list"],
+                ):
+                    elapsed = times - float(onset)
+                    values += float(amplitude) * np.exp(
+                        -np.maximum(elapsed, 0.0) / float(tau)
+                    ) * (elapsed >= 0.0)
+            else:
+                raise ValueError(f"Unknown temporal family: {temporal_family}")
+            values *= ramp_envelope(times, t_ramp)
+            segment_integrals = half_width * np.sum(
+                values * _INTERVAL_GAUSS_WEIGHTS, axis=-1
+            )
+            result.reshape(-1)[flat_indices] = np.bincount(
+                np.asarray(owners),
+                weights=segment_integrals,
+                minlength=len(flat_indices),
+            )
+
+        analytic_lo = (
+            np.maximum(lo, float(t_ramp)) if float(t_ramp) > 0.0 else lo
+        )
+        analytic_mask = hi > analytic_lo
+        a = analytic_lo[analytic_mask]
+        b = hi[analytic_mask]
+        if temporal_family == "exp":
+            onset = float(temporal_params["t0"])
+            tau = float(temporal_params["tau"])
+            active = b > onset
+            values = np.zeros_like(a)
+            clipped_a = np.maximum(a[active], onset)
+            values[active] = float(temporal_params["A"]) * tau * (
+                np.exp(-(clipped_a - onset) / tau)
+                - np.exp(-(b[active] - onset) / tau)
+            )
+        elif temporal_family == "pulse_train":
+            values = np.zeros_like(a)
+            for amplitude, onset, duration in zip(
+                temporal_params["A_list"],
+                temporal_params["t_list"],
+                temporal_params["dt_list"],
+            ):
+                values += float(amplitude) * np.maximum(
+                    0.0,
+                    np.minimum(b, float(onset) + float(duration))
+                    - np.maximum(a, float(onset)),
+                )
+        elif temporal_family == "exp_train":
+            values = np.zeros_like(a)
+            for amplitude, onset, tau in zip(
+                temporal_params["A_list"],
+                temporal_params["t_list"],
+                temporal_params["tau_list"],
+            ):
+                onset = float(onset)
+                tau = float(tau)
+                active = b > onset
+                clipped_a = np.maximum(a[active], onset)
+                values[active] += float(amplitude) * tau * (
+                    np.exp(-(clipped_a - onset) / tau)
+                    - np.exp(-(b[active] - onset) / tau)
+                )
+        else:
+            raise ValueError(f"Unknown temporal family: {temporal_family}")
+        result[analytic_mask] += values
+        return result
+
+    flat_lo = lo.reshape(-1)
+    flat_hi = hi.reshape(-1)
+    t_min = float(flat_lo.min())
+    t_max = float(flat_hi.max())
+    t_on = float(temporal_params["t_on"])
+    t_off = float(temporal_params["t_off"])
+    alpha = float(temporal_params.get("tukey_alpha", 0.5))
+    frequency = float(temporal_params["f"])
+    phase = float(temporal_params.get("phase", 0.0))
+    breakpoints = [0.0, float(t_ramp), t_on, t_off]
+    if alpha > 0.0:
+        window = t_off - t_on
+        breakpoints.extend(
+            [t_on + 0.5 * alpha * window, t_off - 0.5 * alpha * window]
+        )
+    k_lo = int(np.floor(2.0 * frequency * t_min + phase / np.pi)) - 1
+    k_hi = int(np.ceil(2.0 * frequency * t_max + phase / np.pi)) + 1
+    breakpoints.extend(
+        (k - phase / np.pi) / (2.0 * frequency)
+        for k in range(k_lo, k_hi + 1)
+    )
+    cuts = np.array(
+        sorted({point for point in breakpoints if t_min < point < t_max}),
+        dtype=np.float64,
+    )
+    segment_lo = []
+    segment_hi = []
+    owners = []
+    for index, (a, b) in enumerate(zip(flat_lo, flat_hi)):
+        internal = cuts[(cuts > a) & (cuts < b)]
+        edges = np.concatenate(([a], internal, [b]))
+        segment_lo.extend(edges[:-1])
+        segment_hi.extend(edges[1:])
+        owners.extend([index] * (len(edges) - 1))
+    segment_lo = np.asarray(segment_lo, dtype=np.float64)
+    segment_hi = np.asarray(segment_hi, dtype=np.float64)
+    half_width = 0.5 * (segment_hi - segment_lo)
+    midpoint = 0.5 * (segment_hi + segment_lo)
+    times = midpoint[:, None] + half_width[:, None] * _INTERVAL_GAUSS_NODES
+    values = _windowed_sin_values(times, **temporal_params)
+    values *= ramp_envelope(times, t_ramp)
+    segment_integrals = half_width * np.sum(
+        values * _INTERVAL_GAUSS_WEIGHTS, axis=-1
+    )
+    return np.bincount(
+        np.asarray(owners), weights=segment_integrals, minlength=flat_lo.size
+    ).reshape(lo.shape)
 
 
 def integrate_temporal_bins_ramped_signed(

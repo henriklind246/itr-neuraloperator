@@ -14,9 +14,10 @@ from problems.base import ProblemSpec, empty_forcing_seq
 from src.physics.boundary_forcing import (
     FORCING_BINS,
     integrate_temporal_bins_ramped_signed,
+    integrate_temporal_intervals_ramped_signed,
     ramped_temporal,
 )
-from src.physics.internal_source import make_sin2_pulse
+from src.physics.internal_source import integrate_sin2_pulse, make_sin2_pulse
 
 
 @dataclass(frozen=True)
@@ -144,9 +145,16 @@ def _build_forcing_rollout_item(
     if problem.representation == "temporal_encoder":
         q = _q_callable_for_boundary(ds, sid, params)
         t_samples, a_m = forcing_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = forcing_problem._forcing_seq_2tok_from_samples(
+        out["forcing_seq"] = forcing_problem._forcing_seq_3tok_from_samples(
             t_samples,
             a_m,
+            interval_integral_fn=lambda a, b: integrate_temporal_intervals_ramped_signed(
+                params["temporal_family"],
+                params["temporal_params"],
+                a,
+                b,
+                ds.ramp_seconds,
+            ),
             A_amp_ref=forcing_problem.A_AMP_REF,
         )
     else:
@@ -193,9 +201,16 @@ def _build_interfaces_rollout_item(
     if problem.representation == "temporal_encoder":
         q = _q_callable_for_boundary(ds, sid, params)
         t_samples, a_m = interfaces_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = interfaces_problem._forcing_seq_2tok_from_samples(
+        out["forcing_seq"] = interfaces_problem._forcing_seq_3tok_from_samples(
             t_samples,
             a_m,
+            interval_integral_fn=lambda a, b: integrate_temporal_intervals_ramped_signed(
+                params["temporal_family"],
+                params["temporal_params"],
+                a,
+                b,
+                ds.ramp_seconds,
+            ),
             A_amp_ref=interfaces_problem.A_AMP_REF,
         )
     else:
@@ -258,9 +273,12 @@ def _build_source_rollout_item(
             ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
         q = ds._q_callables[sid]
         t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = source_problem._forcing_seq_2tok_from_samples(
+        out["forcing_seq"] = source_problem._forcing_seq_3tok_from_samples(
             t_samples,
             a_m,
+            interval_integral_fn=lambda a, b: integrate_sin2_pulse(
+                float(params["A"]), float(params["t_off"]), a, b
+            ),
             A_amp_ref=ds.a_amp_ref,
         )
     else:
@@ -313,9 +331,12 @@ def _build_source_itr_rollout_item(
             ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
         q = ds._q_callables[sid]
         t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = source_problem._forcing_seq_2tok_from_samples(
+        out["forcing_seq"] = source_problem._forcing_seq_3tok_from_samples(
             t_samples,
             a_m,
+            interval_integral_fn=lambda a, b: integrate_sin2_pulse(
+                float(params["A"]), float(params["t_off"]), a, b
+            ),
             A_amp_ref=ds.a_amp_ref,
         )
     else:

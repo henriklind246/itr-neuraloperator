@@ -36,10 +36,10 @@ from src.operators.train import (
 import src.operators.train as train_mod
 
 # Active default = forcing benchmark, temporal_encoder representation:
-# 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 2) tokens.
+# 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 3) tokens.
 SPATIAL_IN_CHANNELS = 4
 COND_STATIC_DIM = 10
-TEMPORAL_TOKEN_DIM = 2
+TEMPORAL_TOKEN_DIM = 3
 TEMPORAL_SAMPLES = 128
 
 

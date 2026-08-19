@@ -5,6 +5,7 @@ from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
 from problems.forcing import (
     FORCING_TEMPORAL_SAMPLES,
+    FORCING_TEMPORAL_TOKEN_DIM,
     ForcingProblem,
     build_cond_vector,
 )
@@ -21,7 +22,7 @@ _SYNTH_SIGMA = 1.0
 # the dims/shape/absence tests below; mirrors the plan's contract table.
 CONTRACTS = {
     ("forcing", "temporal_encoder"): dict(
-        in_ch=4, cond=10, has_fseq=True, token=2, t_stats=2,
+        in_ch=4, cond=10, has_fseq=True, token=3, t_stats=2,
         encoder=True, s_y=3, aug=True,
     ),
     ("forcing", "bins"): dict(
@@ -29,7 +30,7 @@ CONTRACTS = {
         encoder=False, s_y=3, aug=False,
     ),
     ("forcing_itr", "temporal_encoder"): dict(
-        in_ch=5, cond=13, has_fseq=True, token=2, t_stats=2,
+        in_ch=5, cond=13, has_fseq=True, token=3, t_stats=2,
         encoder=True, s_y=3, aug=True,
     ),
     ("forcing_itr", "bins"): dict(
@@ -37,7 +38,7 @@ CONTRACTS = {
         encoder=False, s_y=3, aug=False,
     ),
     ("forcing_itr_sin", "temporal_encoder"): dict(
-        in_ch=5, cond=11, has_fseq=True, token=2, t_stats=2,
+        in_ch=5, cond=11, has_fseq=True, token=3, t_stats=2,
         encoder=True, s_y=3, aug=True,
     ),
     ("forcing_itr_sin", "bins"): dict(
@@ -45,7 +46,7 @@ CONTRACTS = {
         encoder=False, s_y=3, aug=False,
     ),
     ("source", "temporal_encoder"): dict(
-        in_ch=4, cond=6, has_fseq=True, token=2, t_stats=3,
+        in_ch=4, cond=6, has_fseq=True, token=3, t_stats=3,
         encoder=True, s_y=3, aug=False,
     ),
     ("source", "bins"): dict(
@@ -53,7 +54,7 @@ CONTRACTS = {
         encoder=False, s_y=3, aug=False,
     ),
     ("source_itr", "temporal_encoder"): dict(
-        in_ch=5, cond=9, has_fseq=True, token=2, t_stats=3,
+        in_ch=5, cond=9, has_fseq=True, token=3, t_stats=3,
         encoder=True, s_y=3, aug=False,
     ),
     ("source_itr", "bins"): dict(
@@ -61,7 +62,7 @@ CONTRACTS = {
         encoder=False, s_y=3, aug=False,
     ),
     ("source_itr_sin", "temporal_encoder"): dict(
-        in_ch=5, cond=7, has_fseq=True, token=2, t_stats=3,
+        in_ch=5, cond=7, has_fseq=True, token=3, t_stats=3,
         encoder=True, s_y=3, aug=False,
     ),
     ("source_itr_sin", "bins"): dict(
@@ -69,7 +70,7 @@ CONTRACTS = {
         encoder=False, s_y=3, aug=False,
     ),
     ("interfaces", "temporal_encoder"): dict(
-        in_ch=6, cond=3, has_fseq=True, token=2, t_stats=3,
+        in_ch=6, cond=3, has_fseq=True, token=3, t_stats=3,
         encoder=True, s_y=5, aug=True,
     ),
     ("interfaces", "bins"): dict(
@@ -237,7 +238,7 @@ class TestRegistry:
 
 class TestForcingItem:
     """forcing/temporal_encoder item shapes: lean 4-channel spatial, cond 10,
-    a 128x2 forcing_seq, T_stats 2."""
+    a 128x3 forcing_seq, T_stats 2."""
 
     def test_item_keys_shapes(self, forcing_dataset):
         ds = forcing_dataset
@@ -247,7 +248,9 @@ class TestForcingItem:
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 4)
         assert item["cond_static"].shape == (10,)
-        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["forcing_seq"].shape == (
+            FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
+        )
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (2,)
 
@@ -433,7 +436,9 @@ class TestInterfacesItem:
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 6)
         assert item["cond_static"].shape == (3,)
-        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["forcing_seq"].shape == (
+            FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
+        )
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (3,)
 
@@ -545,11 +550,13 @@ class TestSourceItem:
         spec = get_problem("source")
         sim_id, s, j = ds._pairs[0]
         item = spec.build_item(ds, sim_id, s, j)
-        # source/temporal_encoder: lean 4-channel spatial, cond 7, pulse 128x2.
+        # source/temporal_encoder: lean 4-channel spatial, cond 6, pulse 128x3.
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 4)
         assert item["cond_static"].shape == (6,)
-        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["forcing_seq"].shape == (
+            FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
+        )
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (3,)
 
@@ -655,7 +662,9 @@ class TestSourceItrItem:
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 5)
         assert item["cond_static"].shape == (9,)
-        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["forcing_seq"].shape == (
+            FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
+        )
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (3,)
 
@@ -827,7 +836,9 @@ class TestSourceItrSinItem:
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 5)
         assert item["cond_static"].shape == (7,)
-        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, 2)
+        assert item["forcing_seq"].shape == (
+            FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
+        )
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (3,)
 
