@@ -5,9 +5,8 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims, ProblemSpec
 from problems.forcing import (
-    BINS_TEMPORAL_TOKEN_DIM,
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
@@ -37,17 +36,13 @@ COND_STATIC_DIM = 6  # [lead, R_c] + [x_h, y_h, w_h, h_h]; no source amplitude l
 
 # Spatial-descriptor conditioning ablation slice (single source of truth for the
 # mask helper and the tests). cond layout is [t_bar_norm, R_c_norm, x_h_norm,
-# y_h_norm, w_h_norm, h_h_norm]; the patch-geometry descriptor is [2:6]. There is
-# no one-hot family label, so family_cond_slice stays None (no_family is a no-op).
+# y_h_norm, w_h_norm, h_h_norm]; the patch-geometry descriptor is [2:6].
 SOURCE_SPATIAL_DESCRIPTOR_SLICE = slice(2, COND_STATIC_DIM)  # slice(2, 6)
-SOURCE_BINS = 16
 
-# Spatial channels per representation. temporal_encoder mode lifts the lean
-# [T_tilde, x, y, S_h] base; bins mode appends the SOURCE_BINS integral Q-bins.
+# The lift sees the lean [T_tilde, x, y, S_h] base.
 SPATIAL_CHANNELS_TEMPORAL = 4
-SPATIAL_CHANNELS_BINS = SPATIAL_CHANNELS_TEMPORAL + SOURCE_BINS  # 20
 
-# S_h is the 4th spatial channel (index 3) in both representations.
+# S_h is the 4th spatial channel (index 3).
 S_Y_CHANNEL = 3
 
 # Stratified-sampling shares for x_h relative to the interface (left/near/right).
@@ -64,12 +59,6 @@ def _patch_a_range() -> tuple[float, float]:
             "datasets."
         )
     return _internal_source.PATCH_A_RANGE
-
-
-def _q_ref(t_final: float) -> float:
-    """Source-bin normalizer Q_REF = A_MAX * t_final / SOURCE_BINS."""
-    A_max = float(_patch_a_range()[1])
-    return float(A_max * float(t_final) / float(SOURCE_BINS))
 
 
 # ----- conditioning -----
@@ -91,8 +80,7 @@ def build_cond_vector(
 
     Layout: [t_bar_norm, R_c_norm, x_h_norm, y_h_norm, w_h_norm,
     h_h_norm]. The source amplitude A is deliberately excluded from
-    conditioning; the heating signal is carried by the temporal token stream
-    (temporal_encoder mode) or the source-bin channels (bins mode).
+    conditioning; the heating signal is carried by the temporal token stream.
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
     x_h_norm = (x_h - x_center_range[0]) / (x_center_range[1] - x_center_range[0])
@@ -239,13 +227,9 @@ def _validate_patch_bounds(
 class SourceProblem(ProblemSpec):
     """Internal volumetric chip-heating patch benchmark.
 
-    Two representations over the same trajectories/sim_params:
-
-    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, S_h], 6 static
-      conditioning dims, a (128, 3) forcing_seq carrying point samples and
-      local interval averages of the sin^2 heating pulse, temporal encoder on.
-    - ``bins``: 20 spatial channels [T_tilde, x, y, S_h, Q_0..15], same 6
-      static dims, an empty forcing_seq, temporal encoder off.
+    4 spatial channels [T_tilde, x, y, S_h], 6 static conditioning dims, and a
+    (128, 3) forcing_seq carrying point samples and local interval averages of
+    the sin^2 heating pulse.
 
     The source amplitude A never enters conditioning. Interface fixed at
     x = 0.5.
@@ -261,21 +245,8 @@ class SourceProblem(ProblemSpec):
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
                 cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=True,
                 temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=3,
-                use_temporal_encoder=True,
-                s_y_channel=S_Y_CHANNEL,
-                use_forcing_time_aug=False,
-            )
-        elif representation == "bins":
-            self.dims = ProblemDims(
-                in_channels=SPATIAL_CHANNELS_BINS,
-                cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=False,
-                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
-                t_stats_dim=3,
-                use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=False,
             )
@@ -384,14 +355,10 @@ class SourceProblem(ProblemSpec):
     def setup_dataset(self, ds) -> None:
         ds._X, ds._Y = np.meshgrid(ds.x_grid, ds.y_grid, indexing="ij")
         ds._patch_mask_cache = {}
-        if self.representation == "temporal_encoder":
-            # Force the 128-sample token grid regardless of the config default.
-            ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
-            ds.a_amp_ref = float(_patch_a_range()[1])
-            ds._q_callables = {}
-        else:
-            ds.source_bins = SOURCE_BINS
-            ds.q_ref = _q_ref(ds.t_final)
+        # Force the 128-sample token grid regardless of the config default.
+        ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
+        ds.a_amp_ref = float(_patch_a_range()[1])
+        ds._q_callables = {}
 
     def _patch_mask(self, ds, sid: int) -> np.ndarray:
         if sid not in ds._patch_mask_cache:
@@ -402,21 +369,6 @@ class SourceProblem(ProblemSpec):
                 float(p["w_h"]), float(p["h_h"]),
             )
         return ds._patch_mask_cache[sid]
-
-    def _source_bin_channels(self, ds, sid: int, t_s: float, t_j: float) -> np.ndarray:
-        p = ds.sim_params[sid]
-        A = float(p["A"])
-        t_off = float(p["t_off"])
-        S_h = self._patch_mask(ds, sid)
-
-        bins = np.zeros((ds.Nx, ds.Ny, ds.source_bins), dtype=np.float32)
-        if t_j <= t_s:
-            return bins
-        edges = np.linspace(t_s, t_j, ds.source_bins + 1, dtype=np.float64)
-        for k in range(ds.source_bins):
-            integral = integrate_sin2_pulse(A, t_off, float(edges[k]), float(edges[k + 1]))
-            bins[..., k] = S_h * np.float32(integral / ds.q_ref)
-        return bins
 
     def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
         sid = int(sid)
@@ -465,29 +417,23 @@ class SourceProblem(ProblemSpec):
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global, interface_x], dtype=np.float32)
 
-        if self.representation == "temporal_encoder":
-            A = float(params["A"])
-            t_off = float(params["t_off"])
-            if sid not in ds._q_callables:
-                ds._q_callables[sid] = make_sin2_pulse(A, t_off)
-            q = ds._q_callables[sid]
-            t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_3tok_from_samples(
-                t_samples,
-                a_m,
-                interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
-                    A, t_off, t_lo, t_hi
-                ),
-                A_amp_ref=ds.a_amp_ref,
-            )
-            spatial = spatial_base
-        else:
-            Q_bins = self._source_bin_channels(ds, sid, t_s_val, t_j_val)
-            spatial = np.concatenate([spatial_base, Q_bins], axis=-1).astype(np.float32)
-            forcing_seq = empty_forcing_seq()
+        A = float(params["A"])
+        t_off = float(params["t_off"])
+        if sid not in ds._q_callables:
+            ds._q_callables[sid] = make_sin2_pulse(A, t_off)
+        q = ds._q_callables[sid]
+        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+        forcing_seq = _forcing_seq_3tok_from_samples(
+            t_samples,
+            a_m,
+            interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
+                A, t_off, t_lo, t_hi
+            ),
+            A_amp_ref=ds.a_amp_ref,
+        )
 
         return {
-            "spatial": spatial,
+            "spatial": spatial_base,
             "cond_static": cond_static,
             "forcing_seq": forcing_seq,
             "Y": Y,

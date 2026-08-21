@@ -111,7 +111,6 @@ class TestPlotRegistry:
             "forcing_temporal_families",
             "forcing_spatial_profiles",
             "forcing_separable_assembly",
-            "forcing_bin_encoding",
             "forcing_seq_tokens",
             "forcing_summary_scalars",
             "forcing_param_distributions_design",
@@ -126,7 +125,6 @@ class TestPlotRegistry:
             "patch_param_scatter",
             "source_temporal_profile",
             "source_field_snapshots",
-            "source_input_channels",
             "patch_overlay_trajectory",
             "energy_budget",
             "regime_error_breakdown",
@@ -481,11 +479,6 @@ class TestForcingPlots:
     def test_separable_assembly_smoke(self, tmp_path):
         out_path = tmp_path / "forcing_separable_assembly.png"
         forcing_plots.plot_forcing_separable_assembly(save_path=out_path)
-        assert out_path.exists()
-
-    def test_bin_encoding_smoke(self, tmp_path):
-        out_path = tmp_path / "forcing_bin_encoding.png"
-        forcing_plots.plot_forcing_bin_encoding(save_path=out_path)
         assert out_path.exists()
 
     def test_seq_tokens_smoke(self, tmp_path):
@@ -917,18 +910,27 @@ def _interfaces_params_from_forcing(synthetic_sim_params):
 
 
 def _small_source_itr_model():
-    from problems.source_itr import COND_STATIC_DIM, SPATIAL_CHANNELS_BINS
+    from problems.source_itr import (
+        COND_STATIC_DIM,
+        FORCING_TEMPORAL_TOKEN_DIM,
+        S_Y_CHANNEL,
+        SPATIAL_CHANNELS_TEMPORAL,
+    )
     from src.operators.fno2d import FNO2d
 
     return FNO2d(
         modes1=2,
         modes2=2,
         width=8,
-        in_channels=SPATIAL_CHANNELS_BINS,
+        in_channels=SPATIAL_CHANNELS_TEMPORAL,
         out_channels=1,
         n_layers=2,
         cond_static_dim=COND_STATIC_DIM,
-        use_temporal_encoder=False,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+        use_forcing_time_aug=False,
+        s_y_channel=S_Y_CHANNEL,
     )
 
 
@@ -1004,7 +1006,7 @@ class TestSourcePlots:
         self, tmp_path, synthetic_trajectories, synthetic_source_sim_params, plot_config
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "temporal_encoder"}}
         out_path = tmp_path / "source_dataset_summary.png"
         dataset_plots.plot_source_dataset_summary(
             trajectories,
@@ -1017,12 +1019,10 @@ class TestSourcePlots:
         )
         assert out_path.exists()
 
-    def test_source_checkpoint_loads_with_temporal_encoder_off(
-        self, small_source_fno2d_checkpoint
-    ):
+    def test_source_checkpoint_loads(self, small_source_fno2d_checkpoint):
         model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
         assert conf["model"]["parameters"]["cond_static_dim"] == 6
-        assert getattr(model, "use_temporal_encoder") is False
+        assert model.cond_static_dim == 6
 
     def test_patch_error_slices_smoke(
         self,
@@ -1034,7 +1034,7 @@ class TestSourcePlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model, conf = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "temporal_encoder"}}
         datasets = dataset_plots._build_split_datasets(
             trajectories, x_grid, y_grid, t_grid, synthetic_source_sim_params, source_config
         )
@@ -1058,28 +1058,16 @@ class TestSourcePlots:
         synthetic_source_sim_params,
         plot_config,
     ):
-        from problems.source_itr import COND_STATIC_DIM, SPATIAL_CHANNELS_BINS
-        from src.operators.fno2d import FNO2d
-
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
         source_itr_config = {
             **plot_config,
-            "benchmark": {"name": "source_itr", "representation": "bins"},
+            "benchmark": {"name": "source_itr", "representation": "temporal_encoder"},
         }
         datasets = dataset_plots._build_split_datasets(
             trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
         )
-        model = FNO2d(
-            modes1=2,
-            modes2=2,
-            width=8,
-            in_channels=SPATIAL_CHANNELS_BINS,
-            out_channels=1,
-            n_layers=2,
-            cond_static_dim=COND_STATIC_DIM,
-            use_temporal_encoder=False,
-        )
+        model = _small_source_itr_model()
         out_path = tmp_path / "source_itr_error_vs_void_params.png"
 
         dataset_plots.plot_source_itr_error_vs_void_params(
@@ -1540,7 +1528,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "temporal_encoder"}}
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid,
             synthetic_source_sim_params, source_config
@@ -1561,7 +1549,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model = _small_source_itr_model()
-        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "bins"}}
+        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
         sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
@@ -1603,7 +1591,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "temporal_encoder"}}
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid,
             synthetic_source_sim_params, source_config
@@ -1624,7 +1612,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model = _small_source_itr_model()
-        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "bins"}}
+        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
         sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config
@@ -1687,7 +1675,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model, _ = dataset_plots._load_checkpoint_model(small_source_fno2d_checkpoint)
-        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "bins"}}
+        source_config = {**plot_config, "benchmark": {"name": "source", "representation": "temporal_encoder"}}
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid,
             synthetic_source_sim_params, source_config
@@ -1708,7 +1696,7 @@ class TestPaperPredictionPlots:
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         model = _small_source_itr_model()
-        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "bins"}}
+        source_itr_config = {**plot_config, "benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
         sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
         ds = paper_plots._records_dataset(
             model, trajectories, x_grid, y_grid, t_grid, sim_params, source_itr_config

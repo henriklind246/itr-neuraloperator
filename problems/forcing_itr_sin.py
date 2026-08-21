@@ -6,14 +6,11 @@ import numpy as np
 
 from problems.base import OODAxis, ProblemDims
 from problems.forcing import (
-    BINS_TEMPORAL_TOKEN_DIM,
     COND_STATIC_DIM as FORCING_COND_STATIC_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
-    _SPATIAL_ONEHOT_DIM as FORCING_ONEHOT_DIM,
 )
 from problems.forcing_itr import (
     DEFAULT_ITR_PROFILE_SEED,
-    SPATIAL_CHANNELS_BINS,
     SPATIAL_CHANNELS_TEMPORAL,
     S_Y_CHANNEL,
     ForcingItrProblem,
@@ -27,19 +24,9 @@ from src.physics.internal_source import (
 )
 
 
-# cond_static: forcing's [t_bar, R_c, onehot(4), params(4)] (10-dim) has its
-# scalar R_c slot at index 1 replaced by the two sinusoid scalars [R_base, A],
-# giving [t_bar, R_base, A, onehot(4), params(4)] (11-dim). One more than the
-# forcing baseline, four fewer than the Gaussian-void `forcing_itr` (which
-# expands to four void params).
-COND_STATIC_DIM = FORCING_COND_STATIC_DIM + 1  # 11
-
-# Spatial-descriptor ablation slices for the expanded 11-dim vector. The retained
-# ITR block is [1:3] (the two sinusoid scalars), the one-hot family label is
-# [3:7], and the full spatial descriptor (family + spatial params) is [3:11].
-_ITR_PREFIX = 1 + 2  # t_bar + 2 sinusoid params
-FORCING_ITR_SIN_FAMILY_SLICE = slice(_ITR_PREFIX, _ITR_PREFIX + FORCING_ONEHOT_DIM)  # slice(3, 7)
-FORCING_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE = slice(_ITR_PREFIX, COND_STATIC_DIM)  # slice(3, 11)
+# cond_static: forcing's [t_bar, R_c] has its scalar R_c slot at index 1 replaced
+# by the two sinusoid scalars [R_base, A], giving [t_bar, R_base, A] (3-dim).
+COND_STATIC_DIM = FORCING_COND_STATIC_DIM + 1  # 3
 
 DEFAULT_SIN_PROFILE_SEED = DEFAULT_ITR_PROFILE_SEED + 993
 
@@ -91,9 +78,6 @@ class ForcingItrSinProblem(ForcingItrProblem):
 
     name = "forcing_itr_sin"
 
-    family_cond_slice = FORCING_ITR_SIN_FAMILY_SLICE
-    spatial_descriptor_cond_slice = FORCING_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE
-
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
         self.rc_channel_mode = "broadcast"
@@ -101,23 +85,10 @@ class ForcingItrSinProblem(ForcingItrProblem):
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
                 cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=True,
                 temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=2,
-                use_temporal_encoder=True,
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=True,
-            )
-        elif representation == "bins":
-            self.dims = ProblemDims(
-                in_channels=SPATIAL_CHANNELS_BINS,
-                cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=False,
-                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
-                t_stats_dim=2,
-                use_temporal_encoder=False,
-                s_y_channel=S_Y_CHANNEL,
-                use_forcing_time_aug=False,
             )
         else:
             raise ValueError(

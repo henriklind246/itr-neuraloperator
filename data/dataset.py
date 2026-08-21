@@ -17,9 +17,7 @@ from src.physics.boundary_forcing import (
     TRIANGLE_ELL_RANGE,
     TEMPORAL_BUILDERS,
     TEMPORAL_FAMILY_ORDER,
-    integrate_temporal_bins_signed,
     default_ramp_seconds,
-    FORCING_BINS,
     SIN_AMP_RANGE,
 )
 from problems.base import ProblemSpec
@@ -44,15 +42,7 @@ def problem_from_config(config: dict) -> ProblemSpec:
     if "spatial_conditioning" in benchmark:
         mode = str(benchmark.get("spatial_conditioning"))
         spec.set_spatial_conditioning(mode)
-        if mode == "no_family" and spec.family_cond_slice is None:
-            warnings.warn(
-                f"spatial_conditioning {mode} has no effect for benchmark "
-                f"{name!r} (no family label to ablate); this run duplicates the "
-                f"'full' baseline.",
-                UserWarning,
-                stacklevel=2,
-            )
-        elif (
+        if (
             mode == "spatial_field_only"
             and spec.spatial_descriptor_cond_slice is None
         ):
@@ -87,7 +77,7 @@ T_EPS = 1e-6  # epsilon for temperature normalization
 # The active dataset path routes every item through
 # `SnapshotPairDataset.__getitem__` -> `self.problem.build_item`, so the live
 # conditioning vector is built by the per-benchmark ProblemSpec (e.g.
-# `problems/forcing.py: build_cond_vector`, a 10-dim forcing-agnostic vector)
+# `problems/forcing.py: build_cond_vector`, a 2-dim forcing-agnostic vector)
 # and its width is owned by `ProblemDims.cond_static_dim`. The module-level
 # `COND_STATIC_DIM = 23`, `TEMPORAL_SAMPLES = 64`, `TEMPORAL_TOKEN_DIM = 5`, and
 # the `build_cond_vector` / `build_forcing_seq` / `build_forcing_summary`
@@ -104,8 +94,8 @@ T_EPS = 1e-6  # epsilon for temperature normalization
 #   [15:23]  forcing summary:  S1..S8 (signed/abs/pos/neg impulse, mean, RMS, peak, final)
 #
 # The forcing summary block gave the conditioning MLP global, interval-level
-# scalar descriptors of a(t) over [t_s, t_j] — complementary to the spatial
-# Q_y_bins channels and the learned TemporalForcingEncoder embedding.
+# scalar descriptors of a(t) over [t_s, t_j] — complementary to the learned
+# TemporalForcingEncoder embedding.
 SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
 
 _BASE_DIM             = 3
@@ -319,20 +309,19 @@ class SnapshotPairDataset(Dataset):
     simulation.  Pairs are sorted by lead time to support curriculum slicing.
 
     `__getitem__` delegates item construction to `self.problem.build_item`, so
-    the concrete keys and per-tensor dims are owned by the active
-    `(benchmark, representation)` ProblemSpec, not by this class. Every item is a
-    dict (not a tuple) with keys:
-        spatial      : (Nx, Ny, in_channels)   — T̃_source plus the
-                       representation's spatial channels (lean base in
-                       temporal_encoder mode; base + 16 Q-bins in bins mode)
+    the concrete keys and per-tensor dims are owned by the active benchmark's
+    ProblemSpec, not by this class. Every item is a dict (not a tuple) with
+    keys:
+        spatial      : (Nx, Ny, in_channels)   — T̃_source plus the benchmark's
+                       spatial channels
         cond_static  : (cond_static_dim,)      — lead time and benchmark params
         forcing_seq  : (M, temporal_token_dim) — token-encoded a(t) over
-                       [t_s, t_j]; empty (0, 0) in bins mode
+                       [t_s, t_j]
         Y            : (Nx, Ny, 1)             — T̃_target (globally normalized)
         T_stats      : (t_stats_dim,)          — [μ_global, σ_global, ...] for
                        denormalization
     See problems/<benchmark>.py and the contract table in CLAUDE.md /
-    tests/test_problems.py for the exact dims per pair.
+    tests/test_problems.py for the exact dims per benchmark.
     """
 
     def __init__(
@@ -489,10 +478,8 @@ class SnapshotPairDataset(Dataset):
 def collate_fn(batch: list[dict]) -> dict:
     """Stack a list of per-item dicts into a batched dict.
 
-    Each benchmark's items share the same keys (optional `forcing_seq` is
-    present for every item of a benchmark that declares `has_forcing_seq`, and
-    absent for every item otherwise), so stacking the first item's keys is
-    sufficient.
+    Each benchmark's items share the same keys, so stacking the first item's
+    keys is sufficient.
     """
     keys = batch[0].keys()
     return {k: torch.stack([item[k] for item in batch]) for k in keys}
@@ -1204,9 +1191,9 @@ if __name__ == '__main__':
 
     # Verify shapes
     batch = next(iter(train_loader))
-    # Shapes are representation-dependent (default forcing/temporal_encoder shown).
+    # Shapes are benchmark-dependent (default forcing shown).
     print(f"spatial: {batch['spatial'].shape}")          # (B, Nx, Ny, in_channels=4)
-    print(f"cond_static: {batch['cond_static'].shape}")  # (B, cond_static_dim=10)
-    print(f"forcing_seq: {batch['forcing_seq'].shape}")  # (B, M=128, token_dim=2)
+    print(f"cond_static: {batch['cond_static'].shape}")  # (B, cond_static_dim=2)
+    print(f"forcing_seq: {batch['forcing_seq'].shape}")  # (B, M=128, token_dim=3)
     print(f"Y: {batch['Y'].shape}")                      # (B, Nx, Ny, 1)
     print(f"T_stats: {batch['T_stats'].shape}")          # (B, t_stats_dim=2)

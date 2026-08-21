@@ -59,7 +59,6 @@ from src.physics.boundary_forcing import (
     integrate_temporal_signed,
     integrate_temporal_intervals_ramped_signed,
     integrate_temporal_ramped_signed,
-    integrate_temporal_bins_ramped_signed,
 )
 from src.physics.fv_solver_1d import windowed_sin_flux
 
@@ -752,22 +751,25 @@ class TestRampedIntegral:
             assert got.shape == (128,)
             np.testing.assert_allclose(got, expected, rtol=1e-6, atol=2e-9)
 
-    def test_bins_sum_to_full_integral(self):
+    def test_interval_integrals_sum_to_full_integral(self):
         # Additivity is float-tight only when the post-ramp integrator is exactly
         # additive: exp/pulse_train/exp_train use closed-form analytic integrals.
         # sin's signed integral is fixed-sample quadrature whose accuracy depends
-        # on interval width, so per-bin quadrature does not sum to the
+        # on interval width, so per-interval quadrature does not sum to the
         # whole-window quadrature; sin additivity is covered structurally by the
         # additivity-at-ramp-boundary test instead.
         rng = np.random.default_rng(4)
         t_s, t_j = 0.0, 0.18
+        edges = np.linspace(t_s, t_j, 17)
         analytic_families = ["exp", "pulse_train", "exp_train"]
         for fam in analytic_families:
             p = TEMPORAL_SAMPLERS[fam](rng, dt=DT, t_final=T_FINAL,
                                        t_on=0.0, t_off=0.2)
-            bins = integrate_temporal_bins_ramped_signed(fam, p, t_s, t_j, T_RAMP)
+            parts = integrate_temporal_intervals_ramped_signed(
+                fam, p, edges[:-1], edges[1:], T_RAMP
+            )
             full = integrate_temporal_ramped_signed(fam, p, t_s, t_j, T_RAMP)
-            assert bins.sum() == pytest.approx(full, rel=1e-9, abs=1e-10), fam
+            assert parts.sum() == pytest.approx(full, rel=1e-9, abs=1e-10), fam
 
     def test_build_qL_integral_is_separable(self):
         # build_qL_integral returns integrate_temporal_ramped_signed(...) * s_vec.

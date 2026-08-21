@@ -5,9 +5,8 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import OODAxis, ProblemDims, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims
 from problems.forcing import (
-    BINS_TEMPORAL_TOKEN_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
     T_EPS,
     _forcing_seq_3tok_from_samples,
@@ -42,16 +41,13 @@ COND_STATIC_DIM = 9
 # mask helper and the tests). cond layout is [t_bar_norm, R_base_norm,
 # R_amp_norm, y0_norm, sigma_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm]; the
 # patch-geometry descriptor is [5:9], while the four void scalars [1:5] are
-# retained. No one-hot family label, so family_cond_slice stays None. This
-# overrides SourceProblem's [2:6] slice (source_itr's layout differs).
+# retained. This overrides SourceProblem's [2:6] slice (source_itr's layout
+# differs).
 SOURCE_ITR_SPATIAL_DESCRIPTOR_SLICE = slice(5, COND_STATIC_DIM)  # slice(5, 9)
 
-# Base spatial channels [T_tilde, x, y, S_h, Rc_y_norm]; bins mode appends the
-# 16 source integral bins after the base. S_h stays at index 3; the new
+# Spatial channels [T_tilde, x, y, S_h, Rc_y_norm]. S_h stays at index 3; the
 # normalized R_c(y) channel is index 4.
-SOURCE_BINS = 16
 SPATIAL_CHANNELS_TEMPORAL = 5
-SPATIAL_CHANNELS_BINS = SPATIAL_CHANNELS_TEMPORAL + SOURCE_BINS  # 21
 S_Y_CHANNEL = 3
 RC_Y_CHANNEL = 4
 
@@ -170,21 +166,8 @@ class SourceItrProblem(SourceProblem):
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
                 cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=True,
                 temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=3,
-                use_temporal_encoder=True,
-                s_y_channel=S_Y_CHANNEL,
-                use_forcing_time_aug=False,
-            )
-        elif representation == "bins":
-            self.dims = ProblemDims(
-                in_channels=SPATIAL_CHANNELS_BINS,
-                cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=False,
-                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
-                t_stats_dim=3,
-                use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=False,
             )
@@ -384,29 +367,23 @@ class SourceItrProblem(SourceProblem):
             [ds.mu_global, ds.sigma_global, interface_x], dtype=np.float32
         )
 
-        if self.representation == "temporal_encoder":
-            A = float(params["A"])
-            t_off = float(params["t_off"])
-            if sid not in ds._q_callables:
-                ds._q_callables[sid] = make_sin2_pulse(A, t_off)
-            q = ds._q_callables[sid]
-            t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_3tok_from_samples(
-                t_samples,
-                a_m,
-                interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
-                    A, t_off, t_lo, t_hi
-                ),
-                A_amp_ref=ds.a_amp_ref,
-            )
-            spatial = spatial_base
-        else:
-            Q_bins = self._source_bin_channels(ds, sid, t_s_val, t_j_val)
-            spatial = np.concatenate([spatial_base, Q_bins], axis=-1).astype(np.float32)
-            forcing_seq = empty_forcing_seq()
+        A = float(params["A"])
+        t_off = float(params["t_off"])
+        if sid not in ds._q_callables:
+            ds._q_callables[sid] = make_sin2_pulse(A, t_off)
+        q = ds._q_callables[sid]
+        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+        forcing_seq = _forcing_seq_3tok_from_samples(
+            t_samples,
+            a_m,
+            interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
+                A, t_off, t_lo, t_hi
+            ),
+            A_amp_ref=ds.a_amp_ref,
+        )
 
         return {
-            "spatial": spatial,
+            "spatial": spatial_base,
             "cond_static": cond_static,
             "forcing_seq": forcing_seq,
             "Y": Y,

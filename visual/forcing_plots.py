@@ -13,17 +13,16 @@ The plots split into two roles:
   that the FV solver applies. This is NOT the exact tensor representation
   seen by the model.
 
-- **Model-side encoding plots** (``forcing_bin_encoding``,
-  ``forcing_seq_tokens``, ``forcing_summary_scalars``) show the
-  representations consumed by the model: the 16-bin signed time-integral
-  channels, the ``(64, 5)`` ``forcing_seq`` tokens, and the 8-scalar
-  static-conditioning summary.
+- **Model-side encoding plots** (``forcing_seq_tokens``,
+  ``forcing_summary_scalars``) show the representation consumed by the model:
+  the ``(64, 5)`` ``forcing_seq`` tokens and the 8-scalar static-conditioning
+  summary.
 
 - **Sampling-coverage plots** (``forcing_param_distributions_design``,
   ``forcing_param_distributions_empirical``) compare the intended sampling
   design with what a particular ``sim_params.npy`` actually contains.
 
-All numbers (token count, bin count, summary size, conditioning size) are
+All numbers (token count, summary size, conditioning size) are
 imported from ``data/dataset.py`` and ``src/physics/boundary_forcing.py``
 so the figures track the active branch's contract.
 """
@@ -44,7 +43,6 @@ from data.dataset import (
     build_forcing_summary,
 )
 from src.physics.boundary_forcing import (
-    FORCING_BINS,
     GAUSS_CENTER_RANGE,
     GAUSS_SIGMA_RANGE,
     NP_CHOICES,
@@ -61,7 +59,6 @@ from src.physics.boundary_forcing import (
     SPATIAL_SAMPLERS,
     TRIANGLE_ELL_RANGE,
     build_qL,
-    integrate_temporal_bins_signed,
 )
 from visual._common import PLOT_STYLE, _save_figure
 
@@ -247,7 +244,7 @@ def plot_forcing_separable_assembly(
 
     This is the PHYSICAL left-boundary flux applied by the FV solver. The
     tensor representation seen by the model is shown in the model-side
-    plots (forcing_bin_encoding / forcing_seq_tokens / forcing_summary_scalars).
+    plots (forcing_seq_tokens / forcing_summary_scalars).
     """
     rng = np.random.default_rng(seed)
     y_grid = np.linspace(0.0, 1.0, n_y)
@@ -306,99 +303,9 @@ def plot_forcing_separable_assembly(
         fig.suptitle(
             "Physical left-boundary flux $q_L(y, t) = a(t)\\,s(y)$  —  "
             "applied by FV solver (not the model-side tensor; see "
-            "forcing_bin_encoding / forcing_seq_tokens / forcing_summary_scalars)"
+            "forcing_seq_tokens / forcing_summary_scalars)"
         )
         _save_figure(fig, save_path, "forcing", "forcing_separable_assembly",
-                     layout="constrained")
-
-
-# --------- 4. BIN ENCODING (Q_y_bin) ----------
-
-def plot_forcing_bin_encoding(
-    n_time: int = 400,
-    seed: int = 0,
-    save_path: str | Path | None = None,
-    dt: float = DEFAULT_DT,
-    t_final: float = DEFAULT_T_FINAL,
-    t_on: float = DEFAULT_T_ON,
-    t_off: float = DEFAULT_T_OFF,
-    t_s: float = DEFAULT_T_ON,
-    t_j: float | None = None,
-):
-    """Per-family stacked plot: a(t) curve on top, signed K-bin integrals below.
-
-    The bottom row corresponds to the temporal contribution of the
-    `Q_y_bin_0..15` channels in the spatial input tensor (before weighting
-    by `s(y) / q_ref`).
-
-    Sanity expectation: the `sin` family is half-wave rectified and should not
-    show negative bins. Train families can be signed if configured with
-    negative amplitudes.
-    """
-    if t_j is None:
-        t_j = t_off
-    rng = np.random.default_rng(seed)
-    t_dense = np.linspace(t_s, t_j, n_time)
-    edges = np.linspace(t_s, t_j, FORCING_BINS + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    bin_width = edges[1] - edges[0]
-
-    panels = []
-    for fam in TEMPORAL_FAMILY_ORDER:
-        params = _sample_temporal_params(fam, rng, dt=dt, t_final=t_final,
-                                         t_on=t_on, t_off=t_off)
-        a = _evaluate_temporal(fam, params, t_dense)
-        bins = integrate_temporal_bins_signed(fam, params, t_s, t_j, K=FORCING_BINS)
-        panels.append((fam, a, bins))
-
-    a_max = max(float(np.max(np.abs(a))) for _, a, _ in panels)
-    a_max = max(a_max, 1.0) * 1.1
-    bin_max = max(float(np.max(np.abs(b))) for _, _, b in panels)
-    bin_max = max(bin_max, 1e-12) * 1.15
-
-    with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(
-            2, len(TEMPORAL_FAMILY_ORDER),
-            figsize=(4.2 * len(TEMPORAL_FAMILY_ORDER), 6.0),
-            constrained_layout=True, squeeze=False,
-            sharex="col",
-        )
-        for c, (fam, a, bins) in enumerate(panels):
-            color = FAMILY_COLORS[fam]
-            ax_top = axes[0, c]
-            ax_top.plot(t_dense, a, color=color, linewidth=1.6)
-            ax_top.axhline(0.0, color="0.5", linewidth=0.8)
-            ax_top.set_ylim(-a_max, a_max)
-            ax_top.set_title(f"{fam}")
-            ax_top.grid(True)
-            if c == 0:
-                ax_top.set_ylabel("a(t)")
-
-            ax_bot = axes[1, c]
-            ax_bot.bar(
-                centers, bins, width=bin_width * 0.95,
-                color=color, edgecolor="0.2", linewidth=0.4,
-            )
-            ax_bot.axhline(0.0, color="0.5", linewidth=0.8)
-            ax_bot.set_ylim(-bin_max, bin_max)
-            ax_bot.set_xlabel("t")
-            if c == 0:
-                ax_bot.set_ylabel(f"signed bins ({FORCING_BINS})")
-            for edge in edges:
-                ax_bot.axvline(edge, color="0.85", linewidth=0.5, zorder=0)
-            ax_bot.grid(True, axis="y")
-            min_b, max_b = float(np.min(bins)), float(np.max(bins))
-            ax_bot.text(
-                0.02, 0.96, f"min={min_b:+.2f}  max={max_b:+.2f}",
-                transform=ax_bot.transAxes, va="top", ha="left",
-                fontsize=8, color="0.2",
-            )
-
-        fig.suptitle(
-            f"Forcing bin encoding (what the model sees in Q_y_bin channels)  "
-            f"—  K = {FORCING_BINS} signed integrals over [{t_s:.2f}, {t_j:.2f}]"
-        )
-        _save_figure(fig, save_path, "forcing", "forcing_bin_encoding",
                      layout="constrained")
 
 

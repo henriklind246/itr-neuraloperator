@@ -105,11 +105,11 @@ class TestSpatialLoad:
 
 
 class TestPrecondition:
-    def test_rejects_non_spatial_field_only(self):
-        ckpt = {"conf": {"benchmark": {"name": "forcing",
-                                       "spatial_conditioning": "full"}}}
-        with pytest.raises(SystemExit, match="spatial_field_only"):
-            check_preconditions(ckpt)
+    def test_accepts_full_spatial_conditioning(self):
+        # The forcing cond_static no longer carries a spatial descriptor, so
+        # "full" is already descriptor-free and needs no ablation gate.
+        check_preconditions({"conf": {"benchmark": {
+            "name": "forcing", "spatial_conditioning": "full"}}})
 
     def test_rejects_other_benchmark(self):
         ckpt = {"conf": {"benchmark": {"name": "source",

@@ -30,21 +30,14 @@ from data.dataset import (
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
     TEMPORAL_BUILDERS,
-    FORCING_BINS,
     SIN_AMP_RANGE,
     SIN_FREQ_RANGE,
     build_qL,
-    integrate_temporal_bins,
 )
-from problems.source import (
-    INTERFACE_X,
-    SOURCE_BINS,
-    SPATIAL_CHANNELS_BINS as SOURCE_SPATIAL_IN_CHANNELS,
-)
+from problems.source import INTERFACE_X
 from problems.source_itr import rc_log_norm
 from problems.interfaces import INTERFACE_X_RANGE
 from src.physics.internal_source import (
-    PATCH_A_RANGE,
     PATCH_H,
     PATCH_W,
     RC_VOID_RANGES,
@@ -82,20 +75,15 @@ def _safe_param_float(params: dict, key: str) -> float:
 def _model_predict_item(model, item):
     """Run a single dataset item through the model, honoring its forcing branch.
 
-    Adds a batch dim, forwards ``forcing_seq`` only when the model uses its
-    temporal encoder and the item carries one (source items have no forcing).
+    Adds a batch dim before forwarding.
     """
     import torch
 
     spatial = item["spatial"].unsqueeze(0)
     cond = item["cond_static"].unsqueeze(0)
-    fseq = item.get("forcing_seq")
-    if fseq is not None:
-        fseq = fseq.unsqueeze(0)
+    fseq = item["forcing_seq"].unsqueeze(0)
     with torch.no_grad():
-        if getattr(model, "use_temporal_encoder", True) and fseq is not None:
-            return model(spatial, cond, fseq)
-        return model(spatial, cond)
+        return model(spatial, cond, fseq)
 
 
 def _forcing_label(params: dict) -> str:
@@ -551,7 +539,6 @@ def _load_checkpoint_model(checkpoint_path: str | Path) -> tuple[FNO2d, dict]:
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
-        use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
         forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         forcing_spatial_mode=model_cfg.get("forcing_spatial_mode", "broadcast"),
@@ -707,24 +694,15 @@ def _prepare_prediction_case(
     ]
     spatial = torch.from_numpy(np.stack([item["spatial"] for item in items], axis=0))
     cond_static = torch.from_numpy(np.stack([item["cond_static"] for item in items], axis=0))
-    forcing_seq = None
-    if all("forcing_seq" in item for item in items):
-        forcing_seq = torch.from_numpy(np.stack([item["forcing_seq"] for item in items], axis=0))
+    forcing_seq = torch.from_numpy(np.stack([item["forcing_seq"] for item in items], axis=0))
 
     device = next(model.parameters()).device
-    use_temporal = bool(getattr(model, "use_temporal_encoder", True))
     with torch.no_grad():
-        if use_temporal and forcing_seq is not None:
-            Y_pred_norm = model(
-                spatial.to(device),
-                cond_static.to(device),
-                forcing_seq.to(device),
-            ).cpu().numpy()[..., 0]
-        else:
-            Y_pred_norm = model(
-                spatial.to(device),
-                cond_static.to(device),
-            ).cpu().numpy()[..., 0]
+        Y_pred_norm = model(
+            spatial.to(device),
+            cond_static.to(device),
+            forcing_seq.to(device),
+        ).cpu().numpy()[..., 0]
 
     Y_pred_rows = []
     Y_true_rows = []
@@ -785,45 +763,33 @@ def _compute_pair_error_records(
     forcing_batch = []
     y_batch = []
     stats_batch = []
-    has_forcing = True
     for idx in sample_indices:
         item = dataset[idx]
         x_batch.append(item["spatial"])
         cond_batch.append(item["cond_static"])
-        fseq = item.get("forcing_seq")
-        if fseq is None:
-            has_forcing = False
-        else:
-            forcing_batch.append(fseq)
+        forcing_batch.append(item["forcing_seq"])
         y_batch.append(item["Y"])
         stats_batch.append(item["T_stats"])
 
     x_tensor = torch.stack(x_batch, dim=0)
     cond_tensor = torch.stack(cond_batch, dim=0)
-    forcing_tensor = torch.stack(forcing_batch, dim=0) if has_forcing else None
+    forcing_tensor = torch.stack(forcing_batch, dim=0)
     y_tensor = torch.stack(y_batch, dim=0)
     stats_tensor = torch.stack(stats_batch, dim=0)
 
     interface_meta = _resolve_interface_metadata(config=_resolve_plot_config(config))
     device = next(model.parameters()).device
-    use_temporal = bool(getattr(model, "use_temporal_encoder", True))
     model.eval()
 
     preds = []
     for start in range(0, sample_size, batch_size):
         stop = min(start + batch_size, sample_size)
         with torch.no_grad():
-            if use_temporal and forcing_tensor is not None:
-                pred = model(
-                    x_tensor[start:stop].to(device),
-                    cond_tensor[start:stop].to(device),
-                    forcing_tensor[start:stop].to(device),
-                ).cpu()
-            else:
-                pred = model(
-                    x_tensor[start:stop].to(device),
-                    cond_tensor[start:stop].to(device),
-                ).cpu()
+            pred = model(
+                x_tensor[start:stop].to(device),
+                cond_tensor[start:stop].to(device),
+                forcing_tensor[start:stop].to(device),
+            ).cpu()
         preds.append(pred)
     y_pred = torch.cat(preds, dim=0)
 
@@ -2215,38 +2181,6 @@ def _format_patch_label(p: dict) -> str:
     )
 
 
-def _build_source_bin_channels(
-    X_grid: np.ndarray,
-    Y_grid: np.ndarray,
-    x_h: float,
-    y_h: float,
-    w_h: float,
-    h_h: float,
-    A: float,
-    t_off: float,
-    t_s: float,
-    t_j: float,
-    t_final: float,
-    source_bins: int = SOURCE_BINS,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (S_h, Q_bins) matching the dataset's source-bin encoding.
-
-    S_h     : (Nx, Ny) indicator
-    Q_bins  : (Nx, Ny, source_bins) future-source bins divided by Q_REF.
-    """
-    A_max = float(PATCH_A_RANGE[1])
-    q_ref = float(A_max * float(t_final) / float(source_bins))
-    S_h = make_patch_indicator(X_grid, Y_grid, x_h, y_h, w_h, h_h)
-    Nx, Ny = X_grid.shape
-    Q = np.zeros((Nx, Ny, source_bins), dtype=np.float32)
-    if t_j > t_s:
-        edges = np.linspace(t_s, t_j, source_bins + 1, dtype=np.float64)
-        for k in range(source_bins):
-            integral = integrate_sin2_pulse(A, t_off, float(edges[k]), float(edges[k + 1]))
-            Q[..., k] = S_h * np.float32(integral / q_ref)
-    return S_h.astype(np.float32), Q
-
-
 _REGIME_COLORS = {"left": "C0", "near": "C2", "right": "C3"}
 
 
@@ -3086,17 +3020,18 @@ def plot_source_temporal_profile(
         ax.grid(True)
 
         ax = axes[1]
-        edges = np.linspace(0.0, t_final, SOURCE_BINS + 1)
+        n_bins = 16
+        edges = np.linspace(0.0, t_final, n_bins + 1)
         integrals = np.array([
             integrate_sin2_pulse(rep_A, rep_t_off, float(edges[k]), float(edges[k + 1]))
-            for k in range(SOURCE_BINS)
+            for k in range(n_bins)
         ])
         ax.step(edges[:-1], integrals, where="post", color="C0", linewidth=1.8)
         ax.axvline(rep_t_off, color="0.35", linestyle=":", label=r"$t_{off}$")
         ax.axvline(t_final, color="0.55", linestyle="--", label=r"$t_{final}$")
         ax.set_xlabel("t bin start")
         ax.set_ylabel(r"$\int_{\tau_k}^{\tau_{k+1}} a(t)\,dt$")
-        ax.set_title(f"Bin Integrals — sim {rep_idx}, A={rep_A:.0f}")
+        ax.set_title(f"Deposited Energy per Interval — sim {rep_idx}, A={rep_A:.0f}")
         ax.legend(loc="upper right")
         ax.grid(True)
 
@@ -3239,39 +3174,29 @@ def plot_patch_region_error_map(
 
     x_batch, c_batch, y_batch, stats_batch = [], [], [], []
     forcing_batch = []
-    has_forcing = True
     for idx in sample_indices:
         item = dataset[idx]
         x_batch.append(item["spatial"])
         c_batch.append(item["cond_static"])
-        fseq = item.get("forcing_seq")
-        if fseq is None:
-            has_forcing = False
-        else:
-            forcing_batch.append(fseq)
+        forcing_batch.append(item["forcing_seq"])
         y_batch.append(item["Y"])
         stats_batch.append(item["T_stats"])
     x_tensor = torch.stack(x_batch, dim=0)
     c_tensor = torch.stack(c_batch, dim=0)
-    forcing_tensor = torch.stack(forcing_batch, dim=0) if has_forcing else None
+    forcing_tensor = torch.stack(forcing_batch, dim=0)
     y_tensor = torch.stack(y_batch, dim=0)
     stats_tensor = torch.stack(stats_batch, dim=0)
 
     device = next(model.parameters()).device
-    use_temporal = bool(getattr(model, "use_temporal_encoder", True))
     model.eval()
     preds = []
     batch_size = 32
     for start in range(0, sample_size, batch_size):
         stop = min(start + batch_size, sample_size)
         with torch.no_grad():
-            if use_temporal and forcing_tensor is not None:
-                p = model(x_tensor[start:stop].to(device),
-                         c_tensor[start:stop].to(device),
-                         forcing_tensor[start:stop].to(device)).cpu()
-            else:
-                p = model(x_tensor[start:stop].to(device),
-                         c_tensor[start:stop].to(device)).cpu()
+            p = model(x_tensor[start:stop].to(device),
+                     c_tensor[start:stop].to(device),
+                     forcing_tensor[start:stop].to(device)).cpu()
         preds.append(p)
     y_pred = torch.cat(preds, dim=0)
     mu_s = stats_tensor[:, 0][:, None, None, None]
@@ -3381,67 +3306,6 @@ def plot_source_field_snapshots(
         fig.colorbar(pcm, ax=axes.ravel().tolist(), label="Q(x, y, t)", shrink=0.92)
         fig.suptitle(f"Source Field Snapshots — sim {sim_id} ({_format_patch_label(params)})")
         _save_figure(fig, save_path, "source", "source_field_snapshots", layout="constrained")
-
-
-def plot_source_input_channels(
-    sim_params: np.ndarray,
-    x_grid: np.ndarray,
-    y_grid: np.ndarray,
-    t_grid: np.ndarray,
-    sim_id: int | None = None,
-    save_path: str | Path | None = None,
-):
-    """Render the SOURCE_BINS Q channels from a built dataset sample."""
-    if sim_id is None:
-        sim_id = _select_representative_source_sim_id(sim_params)
-    params = sim_params[int(sim_id)]
-    x_h = float(params["x_h"])
-    y_h = float(params["y_h"])
-    w_h = float(params["w_h"])
-    h_h = float(params["h_h"])
-    A = float(params["A"])
-    t_off = float(params["t_off"])
-    t_final = float(t_grid[-1])
-
-    X, Y = np.meshgrid(x_grid, y_grid, indexing="ij")
-    _, Q_bins = _build_source_bin_channels(
-        X, Y, x_h, y_h, w_h, h_h, A, t_off,
-        t_s=0.0, t_j=t_final, t_final=t_final,
-    )
-    n_panels = Q_bins.shape[-1]
-    nrows, ncols = _shared_thumbnail_grid(n_panels)
-
-    vmax = float(np.max(Q_bins))
-    interface_meta = _resolve_interface_metadata(sim_params=sim_params, sim_id=int(sim_id))
-
-    with plt.rc_context(PLOT_STYLE):
-        fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows),
-                                constrained_layout=True)
-        axes_arr = np.atleast_2d(axes).ravel()
-        pcm = None
-        for k in range(n_panels):
-            ax = axes_arr[k]
-            pcm = _plot_field_2d(
-                ax, x_grid, y_grid, Q_bins[..., k],
-                cmap="magma", vmin=0.0, vmax=vmax,
-                interface_positions=interface_meta["positions"],
-            )
-            rect = Rectangle(
-                (x_h - 0.5 * w_h, y_h - 0.5 * h_h), w_h, h_h,
-                fill=False, edgecolor="cyan", linewidth=1.0,
-            )
-            ax.add_patch(rect)
-            ax.set_title(f"Q_{k}")
-        for k in range(n_panels, len(axes_arr)):
-            axes_arr[k].axis("off")
-
-        fig.colorbar(pcm, ax=list(axes_arr[:n_panels]),
-                    label="Q_k (normalized)", shrink=0.92)
-        fig.suptitle(
-            f"Source Channels Q_0..Q_{n_panels - 1} "
-            f"(SOURCE_BINS={SOURCE_BINS}, SPATIAL_IN_CHANNELS={SOURCE_SPATIAL_IN_CHANNELS} detected)"
-        )
-        _save_figure(fig, save_path, "source", "source_input_channels", layout="constrained")
 
 
 def plot_patch_overlay_trajectory(

@@ -1,7 +1,0 @@
-# Bins representation: integral Q-bin spatial channels, no temporal encoder. The
-# forcing_seq is emitted as an explicit empty (0, 0) tensor so the dataset item
-# shape stays fixed; FNO2d ignores it when use_temporal_encoder is off. Resolved
-# ProblemSpec owns all representation-determined dims.
-
-benchmark:
-  representation: bins

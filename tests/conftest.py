@@ -8,12 +8,12 @@ from src.operators.fno2d import FNO2d
 
 # Forcing benchmark, temporal_encoder representation (dataset/model default).
 FORCING_IN_CHANNELS = 4
-FORCING_COND_STATIC_DIM = 10
+FORCING_COND_STATIC_DIM = 2
 FORCING_TEMPORAL_TOKEN_DIM = 3
 FORCING_TEMPORAL_SAMPLES = 128
 
-# Source benchmark, bins representation (temporal encoder off, no A_norm leak).
-SOURCE_IN_CHANNELS = 20
+# Source benchmark (no A_norm leak into cond_static).
+SOURCE_IN_CHANNELS = 4
 SOURCE_COND_STATIC_DIM = 6
 
 
@@ -360,7 +360,7 @@ def small_physics_extender_checkpoint(tmp_path):
 
 @pytest.fixture
 def small_source_fno2d():
-    """Tiny source-benchmark FNO2d (bins representation: encoder off, 7 static dims)."""
+    """Tiny source-benchmark FNO2d."""
     return FNO2d(
         modes1=2,
         modes2=2,
@@ -369,7 +369,11 @@ def small_source_fno2d():
         out_channels=1,
         n_layers=2,
         cond_static_dim=SOURCE_COND_STATIC_DIM,
-        use_temporal_encoder=False,
+        temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
+        temporal_hidden=16,
+        forcing_embed_dim=16,
+        use_forcing_time_aug=False,
+        s_y_channel=3,
     )
 
 
@@ -381,7 +385,7 @@ def small_source_fno2d_checkpoint(tmp_path, small_source_fno2d):
         {
             "model_state": small_source_fno2d.state_dict(),
             "conf": {
-                "benchmark": {"name": "source", "representation": "bins"},
+                "benchmark": {"name": "source", "representation": "temporal_encoder"},
                 "model": {
                     "parameters": {
                         "modes1": 2,
@@ -391,7 +395,11 @@ def small_source_fno2d_checkpoint(tmp_path, small_source_fno2d):
                         "out_channels": 1,
                         "n_layers": 2,
                         "cond_static_dim": SOURCE_COND_STATIC_DIM,
-                        "use_temporal_encoder": False,
+                        "temporal_token_dim": FORCING_TEMPORAL_TOKEN_DIM,
+                        "temporal_samples": FORCING_TEMPORAL_SAMPLES,
+                        "temporal_hidden": 16,
+                        "forcing_embed_dim": 16,
+                        "use_forcing_time_aug": False,
                         "dropout": 0.0,
                     }
                 },

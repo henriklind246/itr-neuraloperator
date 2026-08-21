@@ -1,15 +1,10 @@
 # Interfaces benchmark: fixed sin/uniform forcing, interface_x sampled in
-# [0.2, 0.8]. All representation-determined tensor dims (in_channels,
-# cond_static_dim, temporal_token_dim, use_temporal_encoder, s_y_channel,
-# use_forcing_time_aug) are resolved by the ProblemSpec from the
-# (benchmark, representation) pair, not declared here.
+# [0.2, 0.8]. All tensor dims (in_channels, cond_static_dim,
+# temporal_token_dim, s_y_channel, use_forcing_time_aug) are resolved by the
+# benchmark's ProblemSpec, not declared here.
 
 benchmark:
   name: interfaces
-  # Spatial-descriptor conditioning ablation. interfaces carries no spatial
-  # descriptor in cond_static, so every mode is a no-op (regression control);
-  # the knob is declared only for provenance parity across benchmarks.
-  spatial_conditioning: full
 
 training:
   loss:

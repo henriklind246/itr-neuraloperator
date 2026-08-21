@@ -232,7 +232,6 @@ class InverseAdapter(ABC):
         checks = {
             "in_channels": expected.in_channels,
             "cond_static_dim": expected.cond_static_dim,
-            "use_temporal_encoder": expected.use_temporal_encoder,
             "s_y_channel": expected.s_y_channel,
         }
         for attr, exp in checks.items():

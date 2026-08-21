@@ -131,9 +131,8 @@ checkpoint's (mu, sigma) pinned and handed to `run_one_seed` as overrides —
 which is also what lets this script use the exact locked study cohorts rather
 than the generic config split.
 
-Requires a checkpoint trained with spatial_conditioning='spatial_field_only',
-for the same reason the zero-shot study does: an unseen family has no honest
-8-slot spatial descriptor to put in cond_static.
+The forcing cond_static carries no spatial descriptor, so an unseen family
+reaches the model only through its spatial input channel.
 """
 
 import argparse
@@ -168,8 +167,7 @@ DATA_FILE_NAMES = {
 # than as a shape error inside load_state_dict.
 DIM_FIELDS = (
     "in_channels", "cond_static_dim", "temporal_token_dim", "s_y_channel",
-    "use_temporal_encoder", "use_forcing_time_aug",
-    "forcing_extender_rc_cond_index",
+    "use_forcing_time_aug", "forcing_extender_rc_cond_index",
 )
 
 # A fine-tune arm is tens of sims (~1.2 MB per sim), so it fits in RAM whole;
@@ -354,7 +352,7 @@ def build_finetune_config(source_conf, *, checkpoint_path, data_dir, run_root, a
 
     Starting from the checkpoint's `conf` rather than `conf/config.yaml` keeps
     every architectural knob (forcing_spatial_mode, extender depth,
-    spatial_conditioning, ...) exactly as trained, so the only deliberate
+    forcing_cond_mode, ...) exactly as trained, so the only deliberate
     differences are the optimization schedule and where the data comes from.
     """
     config = copy.deepcopy(source_conf)

@@ -1,9 +1,8 @@
 # Source-ITR benchmark: internal volumetric chip-heating patch (interface fixed
 # at x = 0.5) with a spatially-varying interface thermal resistance R_c(y)
-# following a Gaussian void profile. All representation-determined tensor dims
-# (in_channels, cond_static_dim, temporal_token_dim, use_temporal_encoder,
-# s_y_channel, use_forcing_time_aug) are resolved by the ProblemSpec from the
-# (benchmark, representation) pair, not declared here.
+# following a Gaussian void profile. All tensor dims (in_channels,
+# cond_static_dim, temporal_token_dim, s_y_channel, use_forcing_time_aug) are
+# resolved by the benchmark's ProblemSpec, not declared here.
 
 benchmark:
   name: source_itr
@@ -14,8 +13,7 @@ benchmark:
   # x-localization length; only used when rc_channel_mode is localized.
   rc_ell: 0.05
   # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
-  # spatial channel intact; cond_static_dim unchanged; ITR void params retained).
-  # No one-hot family label, so no_family is a no-op (== full):
+  # spatial channels intact; cond_static_dim unchanged; ITR void params retained):
   #   full                - baseline; nothing masked.
   #   spatial_field_only  - zero the patch-geometry descriptor [x_h, y_h, w_h, h_h].
   spatial_conditioning: full

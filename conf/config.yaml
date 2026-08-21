@@ -10,9 +10,9 @@ benchmark:
 model:
   type: "2D FNO time-conditioned (temporal branch)"
   parameters:
-    # Representational dims (in_channels, cond_static_dim, temporal_token_dim,
-    # use_temporal_encoder, s_y_channel, use_forcing_time_aug) are resolved by
-    # the ProblemSpec from the (benchmark, representation) pair, not set here.
+    # Tensor dims (in_channels, cond_static_dim, temporal_token_dim,
+    # s_y_channel, use_forcing_time_aug) are resolved by the benchmark's
+    # ProblemSpec, not set here.
     modes1: 16
     modes2: 16
     width: 64
@@ -137,7 +137,7 @@ data:
   val_split: 0.15
   test_split: 0.15
   # x_shape / cond_static_shape / forcing_seq_shape / t_stats_shape are owned by
-  # the active `benchmark` config group (per-benchmark representation).
+  # the active `benchmark` config group.
   y_shape: "B, Nx, Ny, 1"
   num_sims: 8000
   # TRAIN-split lead/target truncation (long-lead OOD adaptation). Both null =

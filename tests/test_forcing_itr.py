@@ -100,8 +100,8 @@ def test_forcing_itr_pairing_provenance_and_forcing_params():
     spec.validate_schema(np.asarray(spatial, dtype=object), np.arange(len(spatial)))
 
 
-@pytest.mark.parametrize("representation", ["temporal_encoder", "bins"])
-def test_forcing_itr_inherits_exact_forcing_tensors(representation):
+def test_forcing_itr_inherits_exact_forcing_tensors():
+    representation = "temporal_encoder"
     forcing, forcing_itr, parent, spatial, grids, _ = _sample_pair()
     parent_ds = _dataset(forcing, parent, grids, representation)
     spatial_ds = _dataset(forcing_itr, spatial, grids, representation)
@@ -123,12 +123,9 @@ def test_forcing_itr_inherits_exact_forcing_tensors(representation):
     np.testing.assert_array_equal(
         spatial_item["cond_static"][5:], parent_item["cond_static"][2:]
     )
-    expected_fseq = (
-        (128, parent_ds.problem.dims.temporal_token_dim)
-        if representation == "temporal_encoder"
-        else (0, 0)
+    assert spatial_item["forcing_seq"].shape == (
+        128, parent_ds.problem.dims.temporal_token_dim
     )
-    assert spatial_item["forcing_seq"].shape == expected_fseq
 
 
 def test_forcing_itr_alias_is_inert_and_canonical_fields_are_required():
@@ -209,8 +206,8 @@ def test_forcing_itr_sin_provenance_schema_and_bounds():
     spec.validate_schema(np.asarray(spatial, dtype=object), np.arange(len(spatial)))
 
 
-@pytest.mark.parametrize("representation", ["temporal_encoder", "bins"])
-def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout(representation):
+def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout():
+    representation = "temporal_encoder"
     forcing, sin, parent, spatial, grids, _ = _sample_pair_sin()
     parent_ds = _dataset(forcing, parent, grids, representation)
     sin_ds = _dataset(sin, spatial, grids, representation)
@@ -223,14 +220,13 @@ def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout(representation
     np.testing.assert_array_equal(
         sin_item["spatial"][..., 5:], parent_item["spatial"][..., 4:]
     )
-    # cond [t_bar, R_base, A, onehot(4), params(4)]; the block after the two
-    # sinusoid scalars matches the parent's block after its scalar R_c slot.
+    # cond [t_bar, R_base, A]; the block after the two sinusoid scalars matches
+    # the parent's block after its scalar R_c slot.
     np.testing.assert_array_equal(
         sin_item["cond_static"][3:], parent_item["cond_static"][2:]
     )
-    assert sin_item["cond_static"].shape == (11,)
-    expected_ch = 5 if representation == "temporal_encoder" else 21
-    assert sin_item["spatial"].shape[-1] == expected_ch
+    assert sin_item["cond_static"].shape == (3,)
+    assert sin_item["spatial"].shape[-1] == 5
 
 
 def test_forcing_itr_sin_schema_rejects_void_keys():
@@ -369,15 +365,15 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
     torch.manual_seed(4)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=13, temporal_token_dim=3,
+        n_layers=2, cond_static_dim=5, temporal_token_dim=3,
         temporal_hidden=16, forcing_embed_dim=16,
-        use_temporal_encoder=True, use_forcing_time_aug=True, s_y_channel=3,
+        use_forcing_time_aug=True, s_y_channel=3,
     ).eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     spatial = torch.zeros(3, 12, 12, 5)
     spatial[..., 3] = 1.0
-    cond = torch.zeros(3, 13)
+    cond = torch.zeros(3, 5)
     cond[:, 0] = torch.tensor([0.07, 0.15, 0.30])
     forcing_seq = torch.zeros(3, 128, 3)
     forcing_seq[..., 0] = torch.linspace(0.0, 1.0, 128)
@@ -448,9 +444,9 @@ def test_validation_calibration_artifact_construction():
     torch.manual_seed(5)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=13, temporal_token_dim=3,
+        n_layers=2, cond_static_dim=5, temporal_token_dim=3,
         temporal_hidden=16, forcing_embed_dim=16,
-        use_temporal_encoder=True, use_forcing_time_aug=True, s_y_channel=3,
+        use_forcing_time_aug=True, s_y_channel=3,
     ).eval()
     calibration = invert.build_surrogate_calibration(
         model, ds, adapter,

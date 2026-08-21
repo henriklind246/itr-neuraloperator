@@ -758,17 +758,13 @@ class TestSolverDatasetIntegration:
         assert torch.all(torch.isfinite(Y))
 
 
-# ===================== Static conditioning vector layout (11 dims) =====================
-
-# Slot offsets must match problems/forcing.py build_cond_vector.
-_OFF_SPATIAL_OH       = 2
-_OFF_SPATIAL_P        = 6
+# ===================== Static conditioning vector layout =====================
 
 
 class TestCondStaticLayout:
-    """Verifies the 10-dim forcing static conditioning vector layout: base
-    (t_bar, R_c) + spatial one-hot (4) + spatial params (4). The forcing
-    representation carries no temporal one-hot or forcing-summary dims."""
+    """The forcing cond_static is `[t_bar_norm, R_c_norm]`. The spatial profile
+    reaches the model only through the s_y spatial channel, so cond_static must
+    be identical across spatial families while that channel varies."""
 
     def _make_dataset(self, spatial_family, spatial_params,
                       temporal_family, temporal_params,
@@ -816,51 +812,22 @@ class TestCondStaticLayout:
         )
         assert torch.allclose(spatial[:, :, 3], expected)
 
-    def test_uniform_onehot_and_zero_spatial_params(self, synthetic_trajectories):
-        ds = self._make_dataset("uniform", {}, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
-        _, cond_static, _, _, _ = _unpack(ds[0])
-        assert cond_static.shape == (COND_STATIC_DIM,)
-        assert cond_static[_OFF_SPATIAL_OH + 0].item() == 1.0
-        assert torch.all(cond_static[_OFF_SPATIAL_OH + 1:_OFF_SPATIAL_OH + 4] == 0.0)
-        assert torch.all(cond_static[_OFF_SPATIAL_P:_OFF_SPATIAL_P + 4] == 0.0)
-
-    def test_patch_onehot_and_only_yc_w_populated(self, synthetic_trajectories):
-        ds = self._make_dataset("patch", {"y_c": 0.4, "w": 0.3}, "sin", self._DEFAULT_TEMPORAL,
-                                synthetic_trajectories)
-        _, cond_static, _, _, _ = _unpack(ds[0])
-        assert cond_static[_OFF_SPATIAL_OH + 1].item() == 1.0
-        assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.4)
-        assert cond_static[_OFF_SPATIAL_P + 1].item() > 0.0
-        assert cond_static[_OFF_SPATIAL_P + 2].item() == 0.0
-        assert cond_static[_OFF_SPATIAL_P + 3].item() == 0.0
-
-    def test_gaussian_onehot_and_only_yc_sigma_populated(self, synthetic_trajectories):
-        ds = self._make_dataset("gaussian", {"y_c": 0.6, "sigma_y": 0.1}, "sin", self._DEFAULT_TEMPORAL,
-                                synthetic_trajectories)
-        _, cond_static, _, _, _ = _unpack(ds[0])
-        assert cond_static[_OFF_SPATIAL_OH + 2].item() == 1.0
-        assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.6)
-        assert cond_static[_OFF_SPATIAL_P + 1].item() == 0.0
-        assert cond_static[_OFF_SPATIAL_P + 2].item() > 0.0
-        assert cond_static[_OFF_SPATIAL_P + 3].item() == 0.0
-
-    def test_triangle_onehot_and_only_yc_ell_populated(self, synthetic_trajectories):
-        ds = self._make_dataset("triangle", {"y_c": 0.5, "ell": 0.2}, "sin", self._DEFAULT_TEMPORAL,
-                                synthetic_trajectories)
-        _, cond_static, _, _, _ = _unpack(ds[0])
-        assert cond_static[_OFF_SPATIAL_OH + 3].item() == 1.0
-        assert cond_static[_OFF_SPATIAL_P + 0].item() == pytest.approx(0.5)
-        assert cond_static[_OFF_SPATIAL_P + 1].item() == 0.0
-        assert cond_static[_OFF_SPATIAL_P + 2].item() == 0.0
-        assert cond_static[_OFF_SPATIAL_P + 3].item() > 0.0
-
-    def test_spatial_onehot_sums_to_one(self, synthetic_trajectories):
-        for sf, sp in [("uniform", {}), ("patch", {"y_c": 0.5, "w": 0.2}),
-                       ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
-                       ("triangle", {"y_c": 0.5, "ell": 0.1})]:
+    def test_cond_static_is_invariant_to_spatial_family(self, synthetic_trajectories):
+        families = [("uniform", {}), ("patch", {"y_c": 0.5, "w": 0.2}),
+                    ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
+                    ("triangle", {"y_c": 0.5, "ell": 0.1})]
+        conds, s_ys = [], []
+        for sf, sp in families:
             ds = self._make_dataset(sf, sp, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
-            _, cond_static, _, _, _ = _unpack(ds[0])
-            assert cond_static[_OFF_SPATIAL_OH:_OFF_SPATIAL_OH + 4].sum().item() == pytest.approx(1.0, abs=1e-6)
+            spatial, cond_static, _, _, _ = _unpack(ds[0])
+            assert cond_static.shape == (COND_STATIC_DIM,)
+            conds.append(cond_static)
+            s_ys.append(spatial[:, :, 3])
+        for other in conds[1:]:
+            torch.testing.assert_close(conds[0], other)
+        # The profile still reaches the model, just via the spatial channel.
+        for other in s_ys[1:]:
+            assert not torch.allclose(s_ys[0], other)
 
 
 # ===================== build_forcing_summary helper =====================

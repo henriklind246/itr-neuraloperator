@@ -36,9 +36,9 @@ from src.operators.train import (
 import src.operators.train as train_mod
 
 # Active default = forcing benchmark, temporal_encoder representation:
-# 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 3) tokens.
+# 4 spatial channels [T_tilde, x, y, s_y], 2 static cond dims, (128, 3) tokens.
 SPATIAL_IN_CHANNELS = 4
-COND_STATIC_DIM = 10
+COND_STATIC_DIM = 2
 TEMPORAL_TOKEN_DIM = 3
 TEMPORAL_SAMPLES = 128
 
@@ -126,12 +126,12 @@ class TestLoadConfig:
 
     def test_selects_benchmark_and_representation_from_environment(self, monkeypatch):
         monkeypatch.setenv("BENCHMARK", "interfaces")
-        monkeypatch.setenv("REPRESENTATION", "bins")
+        monkeypatch.setenv("REPRESENTATION", "temporal_encoder")
 
         cfg = load_config()
 
         assert cfg["benchmark"]["name"] == "interfaces"
-        assert cfg["benchmark"]["representation"] == "bins"
+        assert cfg["benchmark"]["representation"] == "temporal_encoder"
         assert cfg["training"]["loss"]["per_sample_interface_x"] is True
 
 
@@ -199,25 +199,6 @@ def _make_dict_loader(Nx=11, Ny=11, n_samples=4, batch_size=2):
     )
 
 
-def _make_encoder_off_loader(Nx=11, Ny=11, n_samples=4, batch_size=2,
-                             in_channels=20, cond_dim=8):
-    """Dict batches WITHOUT a forcing_seq key (source/encoder-off benchmark)."""
-    x_spatial = torch.randn(n_samples, Nx, Ny, in_channels)
-    cond_static = torch.rand(n_samples, cond_dim)
-    Y = torch.randn(n_samples, Nx, Ny, 1)
-    T_stats = torch.randn(n_samples, 3)
-    keys = ("spatial", "cond_static", "Y", "T_stats")
-
-    def collate(batch):
-        return {k: torch.stack([item[i] for item in batch]) for i, k in enumerate(keys)}
-
-    return DataLoader(
-        TensorDataset(x_spatial, cond_static, Y, T_stats),
-        batch_size=batch_size,
-        collate_fn=collate,
-    )
-
-
 def _make_tiny_fno():
     return FNO2d(
         modes1=2, modes2=2, width=8,
@@ -236,7 +217,7 @@ def _make_tiny_extender_fno():
         cond_static_dim=COND_STATIC_DIM,
         temporal_token_dim=TEMPORAL_TOKEN_DIM,
         temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=8,
-        use_temporal_encoder=True, use_forcing_time_aug=True,
+        use_forcing_time_aug=True,
         forcing_cond_mode="spatial_only",
         forcing_spatial_mode="boundary_extender",
         forcing_extender_grid_size=8,
@@ -252,7 +233,7 @@ def _make_tiny_physics_extender_fno():
         cond_static_dim=COND_STATIC_DIM,
         temporal_token_dim=TEMPORAL_TOKEN_DIM,
         temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=8,
-        use_temporal_encoder=True, use_forcing_time_aug=True,
+        use_forcing_time_aug=True,
         forcing_cond_mode="spatial_only",
         forcing_spatial_mode="physics_extender",
         forcing_extender_grid_size=8,
@@ -694,58 +675,6 @@ class TestValidate:
                 val_pairs_max_rows=0,
                 epoch=3,
             )
-
-
-# ===================== encoder-off (source) dict batches =====================
-
-class TestEncoderOffDictBatch:
-    """Source-style benchmark: temporal encoder off, dict batches with no forcing_seq key."""
-
-    def _setup(self):
-        Nx = Ny = 11
-        in_channels, cond_dim = 20, 8
-        model = FNO2d(
-            modes1=2, modes2=2, width=8,
-            in_channels=in_channels, out_channels=1, n_layers=2,
-            cond_static_dim=cond_dim,
-            use_temporal_encoder=False,
-        )
-        loader = _make_encoder_off_loader(
-            Nx=Nx, Ny=Ny, in_channels=in_channels, cond_dim=cond_dim,
-        )
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        x_grid = np.linspace(0.0, 1.0, Nx).astype(np.float32)
-        y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
-        loss_fn = SpatiallyWeightedMSE(x_grid, y_grid, interface_weight=1.0)
-        iface_mask = build_interface_mask(x_grid, y_grid)
-        return model, loader, optimizer, loss_fn, torch.device("cpu"), iface_mask
-
-    def test_train_one_epoch_without_forcing_seq(self):
-        model, loader, optimizer, loss_fn, device, iface_mask = self._setup()
-        result = train_one_epoch(
-            model, loader, optimizer, loss_fn, device, iface_mask=iface_mask,
-        )
-        assert np.isfinite(result["loss"]) and result["loss"] >= 0
-        assert np.isfinite(result["rel_l2"]) and result["rel_l2"] >= 0
-        assert np.isfinite(result["iface_rel_l2"])
-        assert np.isfinite(result["nrmse"]) and result["nrmse"] >= 0
-
-    def test_train_updates_parameters(self):
-        model, loader, optimizer, loss_fn, device, iface_mask = self._setup()
-        params_before = {n: p.clone() for n, p in model.named_parameters()}
-        train_one_epoch(model, loader, optimizer, loss_fn, device, iface_mask=iface_mask)
-        changed = any(
-            not torch.equal(params_before[n], p)
-            for n, p in model.named_parameters()
-        )
-        assert changed
-
-    def test_validate_without_forcing_seq(self):
-        model, loader, _, _, device, iface_mask = self._setup()
-        result = validate(model, loader, device, iface_mask=iface_mask)
-        assert isinstance(result["rel_l2"], float) and result["rel_l2"] >= 0
-        assert isinstance(result["iface_rel_l2"], float) and result["iface_rel_l2"] >= 0
-        assert isinstance(result["nrmse"], float) and result["nrmse"] >= 0
 
 
 # ===================== per-sample interface metric =====================

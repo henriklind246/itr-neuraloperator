@@ -487,12 +487,6 @@ def main():
                 save_path=forcing_dir / "forcing_separable_assembly.png",
             )
 
-        if _should_run("forcing_bin_encoding", groups, individual):
-            print("--- forcing_bin_encoding ---")
-            forcing_plots.plot_forcing_bin_encoding(
-                save_path=forcing_dir / "forcing_bin_encoding.png",
-            )
-
         if _should_run("forcing_seq_tokens", groups, individual):
             print("--- forcing_seq_tokens ---")
             forcing_plots.plot_forcing_seq_tokens(
@@ -544,7 +538,6 @@ def main():
             "source_dataset_summary",
             "source_temporal_profile",
             "source_field_snapshots",
-            "source_input_channels",
             "patch_overlay_trajectory",
             "energy_budget",
             "patch_param_scatter",
@@ -637,12 +630,6 @@ def main():
                 dataset_plots.plot_source_field_snapshots(
                     trajectories, x_grid, y_grid, t_grid, sim_params,
                     save_path=source_dir / "source_field_snapshots.png")
-
-            if _should_run("source_input_channels", groups, individual):
-                print("--- source_input_channels ---")
-                dataset_plots.plot_source_input_channels(
-                    sim_params, x_grid, y_grid, t_grid,
-                    save_path=source_dir / "source_input_channels.png")
 
             if _should_run("patch_overlay_trajectory", groups, individual):
                 print("--- patch_overlay_trajectory ---")

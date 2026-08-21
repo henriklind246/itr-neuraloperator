@@ -13,34 +13,29 @@ import torch.nn.functional as F
 #
 # The concrete tensor shapes are NOT fixed here: every model-facing dim
 # (in_channels, cond_static_dim, temporal_token_dim, s_y_channel, and the
-# use_temporal_encoder / use_forcing_time_aug toggles) is owned by the
-# ProblemDims of the active (benchmark, representation) pair and passed in at
-# construction. See problems/base.py and problems/<benchmark>.py, and the
-# contract table in CLAUDE.md / tests/test_problems.py.
+# use_forcing_time_aug toggle) is owned by the ProblemDims of the active
+# benchmark and passed in at construction. See problems/base.py and
+# problems/<benchmark>.py, and the contract table in CLAUDE.md /
+# tests/test_problems.py.
 #
-# Two input representations share this model:
-#   - temporal_encoder (default): the spatial input carries only lean base
-#     channels (e.g. forcing: [T̃, x_norm, y_norm, s_y]); the temporal branch is
-#     ON. h_a = TemporalForcingEncoder(forcing_seq) feeds two pathways:
-#       1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s(y) * z_{a,k} is
-#          concatenated to the spatial input as K learned forcing channels.
-#       2. Global: [cond_static, h_a] drives Conditional Instance Normalization.
-#     forcing_cond_mode gates which pathway h_a feeds (both | spatial_only |
-#     cond_only), the Q1 forcing-routing ablation.
-#     forcing_spatial_mode selects the spatial pathway implementation:
-#       - broadcast: forcing_field_k(x, y) = s(y) * z_{a,k} (legacy/default)
-#       - boundary_extender: boundary tokens [y, s(y), s(y)h_a, t_bar] are
-#         cross-attended into learned domain pseudo-extensions. h_a is excluded
-#         from the domain queries, so waveform information cannot bypass the
-#         boundary pathway. An opt-in scalar-R_c ablation appends normalized
-#         contact resistance to the domain queries only.
-#       - physics_extender: the same extender with a learned, diffusion-inspired
-#         per-head relative-y attention bias. The signed coefficient depends on
-#         normalized query depth, lead time, interface crossing, and scalar R_c.
-#   - bins: the spatial input additionally carries 16 fixed integral forcing
-#     bins (Q_y_bins(x, y, k) = s(y) * ∫a(t)dt over the k-th subinterval of
-#     [t_s, t_j], /q_ref); the temporal branch is OFF and forcing_seq is empty,
-#     so CIN is driven by cond_static alone.
+# The spatial input carries only lean base channels (e.g. forcing:
+# [T̃, x_norm, y_norm, s_y]); h_a = TemporalForcingEncoder(forcing_seq) feeds two
+# pathways:
+#   1. Spatial: z_a = W h_a, then forcing_field_k(x, y) = s(y) * z_{a,k} is
+#      concatenated to the spatial input as K learned forcing channels.
+#   2. Global: [cond_static, h_a] drives Conditional Instance Normalization.
+# forcing_cond_mode gates which pathway h_a feeds (both | spatial_only |
+# cond_only), the Q1 forcing-routing ablation.
+# forcing_spatial_mode selects the spatial pathway implementation:
+#   - broadcast: forcing_field_k(x, y) = s(y) * z_{a,k} (legacy/default)
+#   - boundary_extender: boundary tokens [y, s(y), s(y)h_a, t_bar] are
+#     cross-attended into learned domain pseudo-extensions. h_a is excluded
+#     from the domain queries, so waveform information cannot bypass the
+#     boundary pathway. An opt-in scalar-R_c ablation appends normalized
+#     contact resistance to the domain queries only.
+#   - physics_extender: the same extender with a learned, diffusion-inspired
+#     per-head relative-y attention bias. The signed coefficient depends on
+#     normalized query depth, lead time, interface crossing, and scalar R_c.
 
 
 # --------- SpectralConv2d ---------
@@ -497,18 +492,16 @@ class FNO2d(nn.Module):
     Forward signature:
         model(spatial, cond_static, forcing_seq) → y_pred
 
-    spatial      : (B, Nx, Ny, in_channels)   — T̃(x, y, t_s) plus the active
-                   representation's spatial channels (see the module header).
+    spatial      : (B, Nx, Ny, in_channels)   — T̃(x, y, t_s) plus the benchmark's
+                   spatial channels (see the module header).
     cond_static  : (B, cond_static_dim)       — lead time and benchmark parameters
     forcing_seq  : (B, M, temporal_token_dim) — tokens sampled from a(t) over
-                   [t_s, t_j]; empty (B, 0, 0) in bins mode / when the temporal
-                   encoder is disabled
+                   [t_s, t_j]
     y_pred       : (B, Nx, Ny, out_channels)  — predicted T̃(x, y, t_j)
 
     All of in_channels, cond_static_dim, and temporal_token_dim are supplied by
-    the resolved ProblemDims for the active (benchmark, representation) pair; the
-    ``__init__`` defaults below are placeholders that construction always
-    overrides.
+    the resolved ProblemDims for the active benchmark; the ``__init__`` defaults
+    below are placeholders that construction always overrides.
 
     When the temporal encoder's spatial route is active, exactly K forcing
     channels are concatenated before the lift. ``broadcast`` uses s(y) * z_a;
@@ -519,7 +512,7 @@ class FNO2d(nn.Module):
     """
 
     # NOTE: the in_channels / cond_static_dim / temporal_token_dim defaults below
-    # are legacy placeholders (they do not match any current representation). The
+    # are legacy placeholders (they do not match any current benchmark). The
     # training and eval paths always pass the resolved ProblemDims values, so the
     # defaults exist only to keep the bare constructor callable.
     def __init__(
@@ -537,7 +530,6 @@ class FNO2d(nn.Module):
         forcing_embed_dim: int = 64,
         forcing_spatial_dim: int = 16,
         dropout: float = 0.0,
-        use_temporal_encoder: bool = True,
         use_forcing_time_aug: bool = False,
         forcing_cond_mode: str = "both",
         forcing_spatial_mode: str = "broadcast",
@@ -567,7 +559,6 @@ class FNO2d(nn.Module):
         self.temporal_hidden = temporal_hidden
         self.forcing_embed_dim = forcing_embed_dim
         self.forcing_spatial_dim = forcing_spatial_dim
-        self.use_temporal_encoder = use_temporal_encoder
         self.use_forcing_time_aug = use_forcing_time_aug
         # Q1 forcing-routing ablation. The temporal embedding h_a normally feeds
         # two pathways: the spatial injection s_y * z_a and the CIN conditioning
@@ -580,14 +571,9 @@ class FNO2d(nn.Module):
                 f"forcing_cond_mode must be one of both|spatial_only|cond_only, "
                 f"got {forcing_cond_mode!r}"
             )
-        if forcing_cond_mode != "both" and not use_temporal_encoder:
-            raise ValueError(
-                "forcing_cond_mode only applies with use_temporal_encoder=True; "
-                f"got {forcing_cond_mode!r} with the encoder disabled."
-            )
         self.forcing_cond_mode = forcing_cond_mode
-        self._forcing_to_spatial = use_temporal_encoder and forcing_cond_mode in ("both", "spatial_only")
-        self._forcing_to_cond = use_temporal_encoder and forcing_cond_mode in ("both", "cond_only")
+        self._forcing_to_spatial = forcing_cond_mode in ("both", "spatial_only")
+        self._forcing_to_cond = forcing_cond_mode in ("both", "cond_only")
         extender_modes = ("boundary_extender", "physics_extender")
         if forcing_spatial_mode not in ("broadcast", *extender_modes):
             raise ValueError(
@@ -619,10 +605,6 @@ class FNO2d(nn.Module):
                     f"{cond_static_dim}."
                 )
         if forcing_spatial_mode in extender_modes:
-            if not use_temporal_encoder:
-                raise ValueError(
-                    f"{forcing_spatial_mode} requires use_temporal_encoder=True."
-                )
             if forcing_cond_mode == "cond_only":
                 raise ValueError(
                     f"{forcing_spatial_mode} requires a spatial forcing route; "
@@ -719,18 +701,14 @@ class FNO2d(nn.Module):
             ConditionalInstanceNorm2d(width) for _ in range(n_layers)
         ])
 
-        # Temporal forcing encoder + Conditioning MLP. With the encoder off, the
-        # CIN is driven by cond_static alone (e.g. the source benchmark, which has
-        # no forcing_seq).
-        if use_temporal_encoder:
-            self.temporal_encoder = TemporalForcingEncoder(
-                token_dim=temporal_token_dim,
-                hidden=temporal_hidden,
-                embed_dim=forcing_embed_dim,
-            )
-            cond_dim = cond_static_dim + forcing_embed_dim if self._forcing_to_cond else cond_static_dim
-        else:
-            cond_dim = cond_static_dim
+        # Temporal forcing encoder + Conditioning MLP. In spatial_only mode the
+        # CIN is driven by cond_static alone.
+        self.temporal_encoder = TemporalForcingEncoder(
+            token_dim=temporal_token_dim,
+            hidden=temporal_hidden,
+            embed_dim=forcing_embed_dim,
+        )
+        cond_dim = cond_static_dim + forcing_embed_dim if self._forcing_to_cond else cond_static_dim
         self.cond_mlp = ConditioningMLP(
             cond_dim=cond_dim,
             hidden_dim=cond_hidden,
@@ -766,54 +744,49 @@ class FNO2d(nn.Module):
         """
         spatial      : (B, Nx, Ny, in_channels)
         cond_static  : (B, cond_static_dim)
-        forcing_seq  : (B, M, temporal_token_dim) or None when the temporal
-                       encoder is disabled
+        forcing_seq  : (B, M, temporal_token_dim)
         returns      : (B, Nx, Ny, out_channels)
         """
         assert spatial.size(-1) == self.in_channels
 
-        if self.use_temporal_encoder:
-            # Temporal branch
-            h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
+        # Temporal branch
+        h_a = self.temporal_encoder(forcing_seq)              # (B, forcing_embed_dim)
 
-            # Spatial forcing injection is skipped in cond_only mode. Extender
-            # mode replaces the K broadcasts rather than adding another route.
-            if self._forcing_to_spatial:
-                if self.forcing_spatial_mode in ("boundary_extender", "physics_extender"):
-                    t_bar_norm = cond_static[:, 0:1]
-                    rc_norm = None
-                    if (
-                        self.forcing_extender_condition_on_rc
-                        or self.forcing_spatial_mode == "physics_extender"
-                    ):
-                        rc_index = self.forcing_extender_rc_cond_index
-                        rc_norm = cond_static[:, rc_index:rc_index + 1]
-                    forcing_field = self.boundary_extender(
-                        h_a, spatial, t_bar_norm, rc_norm
-                    )
+        # Spatial forcing injection is skipped in cond_only mode. Extender
+        # mode replaces the K broadcasts rather than adding another route.
+        if self._forcing_to_spatial:
+            if self.forcing_spatial_mode in ("boundary_extender", "physics_extender"):
+                t_bar_norm = cond_static[:, 0:1]
+                rc_norm = None
+                if (
+                    self.forcing_extender_condition_on_rc
+                    or self.forcing_spatial_mode == "physics_extender"
+                ):
+                    rc_index = self.forcing_extender_rc_cond_index
+                    rc_norm = cond_static[:, rc_index:rc_index + 1]
+                forcing_field = self.boundary_extender(
+                    h_a, spatial, t_bar_norm, rc_norm
+                )
+            else:
+                if self.use_forcing_time_aug:
+                    t_feats = cond_static[:, 0:1]             # (B, 1) = [t_bar_norm]
+                    h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
+                    z_a = self.forcing_to_spatial(h_aug)      # (B, K)
                 else:
-                    if self.use_forcing_time_aug:
-                        t_feats = cond_static[:, 0:1]             # (B, 1) = [t_bar_norm]
-                        h_aug = self.forcing_aug_mlp(torch.cat([h_a, t_feats], dim=-1))
-                        z_a = self.forcing_to_spatial(h_aug)      # (B, K)
-                    else:
-                        z_a = self.forcing_to_spatial(h_a)        # (B, K)
-                    s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]
-                    Nx, Ny = spatial.size(1), spatial.size(2)
-                    z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1)
-                    forcing_field = s_y * z_grid                  # (B, Nx, Ny, K)
-                spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
-            else:
-                spatial_aug = spatial
-
-            # Conditioning MLP. h_a is routed through CIN unless the ablation
-            # restricts forcing to the spatial pathway (spatial_only).
-            if self._forcing_to_cond:
-                cond_full = torch.cat([cond_static, h_a], dim=-1)  # (B, cond_static_dim + forcing_embed_dim)
-            else:
-                cond_full = cond_static
+                    z_a = self.forcing_to_spatial(h_a)        # (B, K)
+                s_y = spatial[..., self.s_y_channel:self.s_y_channel + 1]
+                Nx, Ny = spatial.size(1), spatial.size(2)
+                z_grid = z_a[:, None, None, :].expand(-1, Nx, Ny, -1)
+                forcing_field = s_y * z_grid                  # (B, Nx, Ny, K)
+            spatial_aug = torch.cat([spatial, forcing_field], dim=-1)  # (B, Nx, Ny, in_channels + K)
         else:
             spatial_aug = spatial
+
+        # Conditioning MLP. h_a is routed through CIN unless the ablation
+        # restricts forcing to the spatial pathway (spatial_only).
+        if self._forcing_to_cond:
+            cond_full = torch.cat([cond_static, h_a], dim=-1)  # (B, cond_static_dim + forcing_embed_dim)
+        else:
             cond_full = cond_static
 
         cin_params = self.cond_mlp(cond_full)                 # (B, n_layers, 2, width)

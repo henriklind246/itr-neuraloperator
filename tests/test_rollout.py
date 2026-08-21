@@ -26,15 +26,10 @@ from src.operators.rollout import (
 # forcing_itr has no rollout branch.
 ROLLOUT_CASES = [
     ("forcing", "temporal_encoder"),
-    ("forcing", "bins"),
     ("interfaces", "temporal_encoder"),
-    ("interfaces", "bins"),
     ("source", "temporal_encoder"),
-    ("source", "bins"),
     ("source_itr", "temporal_encoder"),
-    ("source_itr", "bins"),
     ("source_itr_sin", "temporal_encoder"),
-    ("source_itr_sin", "bins"),
 ]
 
 
@@ -150,29 +145,6 @@ class TestRolloutItemRecompute:
         np.testing.assert_allclose(rollout["forcing_seq"], direct_sub["forcing_seq"])
         np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
 
-    def test_forcing_bins_recomputes_signed_bins_with_existing_convention(
-        self, synthetic_trajectories, synthetic_sim_params
-    ):
-        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        spec = get_problem("forcing", "bins")
-        ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, synthetic_sim_params, spec)
-        sid, s, k, j = 0, 0, 10, 20
-        base = spec.build_item(ds, sid, s, j)
-        direct_sub = spec.build_item(ds, sid, s, k)
-        current = base["spatial"][..., 0] - np.float32(1.0)
-
-        rollout = build_rollout_item_from_base(
-            base, ds, spec, sid, current, float(t_grid[s]), float(t_grid[k])
-        )
-
-        np.testing.assert_allclose(rollout["spatial"][..., 0], current)
-        np.testing.assert_allclose(
-            rollout["spatial"][..., forcing_problem.SPATIAL_CHANNELS_TEMPORAL:],
-            direct_sub["spatial"][..., forcing_problem.SPATIAL_CHANNELS_TEMPORAL:],
-        )
-        np.testing.assert_allclose(rollout["forcing_seq"], np.zeros((0, 0), dtype=np.float32))
-        np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
-
     def test_interfaces_preserves_material_distance_sy_and_interface_stats(
         self, synthetic_trajectories
     ):
@@ -195,11 +167,11 @@ class TestRolloutItemRecompute:
         np.testing.assert_allclose(rollout["forcing_seq"], direct_sub["forcing_seq"])
         np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
 
-    def test_source_bins_recomputes_source_bins_without_amplitude_cond_leak(
+    def test_source_recomputes_cond_without_amplitude_leak(
         self, synthetic_trajectories, synthetic_source_sim_params
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        spec = get_problem("source", "bins")
+        spec = get_problem("source", "temporal_encoder")
         ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, synthetic_source_sim_params, spec)
         sid, s, k, j = 0, 0, 10, 20
         base = spec.build_item(ds, sid, s, j)
@@ -212,10 +184,7 @@ class TestRolloutItemRecompute:
 
         assert rollout["cond_static"].shape == (source_problem.COND_STATIC_DIM,)
         np.testing.assert_allclose(rollout["cond_static"], direct_sub["cond_static"])
-        np.testing.assert_allclose(
-            rollout["spatial"][..., source_problem.SPATIAL_CHANNELS_TEMPORAL:],
-            direct_sub["spatial"][..., source_problem.SPATIAL_CHANNELS_TEMPORAL:],
-        )
+        np.testing.assert_allclose(rollout["forcing_seq"], direct_sub["forcing_seq"])
         np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
 
 
@@ -337,11 +306,11 @@ class TestShortSubintervalIntegrity:
 
 
 class TestSourceItrRollout:
-    def test_rc_y_channel_survives_and_bins_recompute(
+    def test_rc_y_channel_survives_and_forcing_seq_recomputes(
         self, synthetic_trajectories, synthetic_source_itr_sim_params
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        spec = get_problem("source_itr", "bins")
+        spec = get_problem("source_itr", "temporal_encoder")
         ds = _make_dataset(
             trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sim_params, spec
         )
@@ -366,15 +335,10 @@ class TestSourceItrRollout:
         # Non-constant along y: a plain `source` item has no void profile here.
         assert float(rc[0].std()) > 0.0
 
-        bins = rollout["spatial"][..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:]
-        np.testing.assert_allclose(
-            bins,
-            direct_sub["spatial"][..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:],
-        )
+        seq = rollout["forcing_seq"]
+        np.testing.assert_allclose(seq, direct_sub["forcing_seq"])
         # Recomputed for [t_s, t_k], not copied from the [t_s, t_j] base item.
-        assert not np.allclose(
-            bins, base["spatial"][..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:]
-        )
+        assert not np.allclose(seq, base["forcing_seq"])
         np.testing.assert_allclose(rollout["T_stats"], base["T_stats"])
 
 

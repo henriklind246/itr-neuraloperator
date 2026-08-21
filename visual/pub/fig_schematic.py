@@ -377,8 +377,6 @@ def architecture(*, source=None, spec=None, requirement=None,
 
     problem = get_problem(benchmark, "temporal_encoder")
     dims = problem.dims
-    if not dims.use_temporal_encoder:
-        raise ValueError(f"{benchmark}/temporal_encoder has no temporal encoder")
 
     tokens, family = _real_forcing_tokens()
     n_layers, modes, width_ch = _model_defaults()

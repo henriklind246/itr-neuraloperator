@@ -331,14 +331,13 @@ def _capture_job_context(run_path: Path) -> None:
 def _stamp_resolved_dims(config: dict, dims) -> None:
     """Record the spec-owned model dims into config["model"]["parameters"].
 
-    These dims are resolved from the (benchmark, representation) pair, not the
-    YAML, so without this the dumped config_used.yaml leaves them null.
+    These dims are resolved from the benchmark's ProblemSpec, not the YAML, so
+    without this the dumped config_used.yaml leaves them null.
     """
     params = config.setdefault("model", {}).setdefault("parameters", {})
     params["in_channels"] = dims.in_channels
     params["cond_static_dim"] = dims.cond_static_dim
     params["temporal_token_dim"] = dims.temporal_token_dim
-    params["use_temporal_encoder"] = dims.use_temporal_encoder
     params["s_y_channel"] = dims.s_y_channel
     params["use_forcing_time_aug"] = dims.use_forcing_time_aug
     params["forcing_extender_rc_cond_index"] = (
@@ -1616,7 +1615,6 @@ def run_one_seed(
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
         dropout=model_cfg.get("dropout", 0.0),
-        use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
         forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         forcing_spatial_mode=model_cfg.get("forcing_spatial_mode", "broadcast"),

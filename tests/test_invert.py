@@ -195,7 +195,7 @@ def _tiny_source_itr_model():
         cond_static_dim=COND_STATIC_DIM,
         temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
         temporal_hidden=16, forcing_embed_dim=16,
-        use_temporal_encoder=True, use_forcing_time_aug=False,
+        use_forcing_time_aug=False,
         s_y_channel=3,
     )
 
@@ -1224,7 +1224,7 @@ def _tiny_forcing_model():
         cond_static_dim=COND_STATIC_DIM,
         temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
         temporal_hidden=8, forcing_embed_dim=4, forcing_spatial_dim=1,
-        use_temporal_encoder=True, use_forcing_time_aug=True,
+        use_forcing_time_aug=True,
         s_y_channel=3,
     )
     model.padding = 0
@@ -1343,12 +1343,7 @@ def test_forcing_adapter_cond_injection_matches_build_cond_vector(R_c):
     from problems.forcing import build_cond_vector
 
     adapter = ForcingAdapter()
-    cond = build_cond_vector(
-        t_bar_norm=0.3,
-        R_c=R_c,
-        spatial_family="uniform",
-        spatial_params={},
-    )
+    cond = build_cond_vector(t_bar_norm=0.3, R_c=R_c)
     got = adapter.cond_slice_from_theta(
         torch.tensor([R_c], dtype=torch.float64)
     ).numpy()

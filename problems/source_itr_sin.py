@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from problems.base import OODAxis, ProblemDims
-from problems.forcing import BINS_TEMPORAL_TOKEN_DIM, FORCING_TEMPORAL_TOKEN_DIM
+from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
 from problems.source import (
     SourceProblem,
     _classify_regime,
@@ -16,7 +16,6 @@ from problems.source import (
 from problems.source_itr import (
     RC_Y_CHANNEL,  # noqa: F401  (documented channel index; kept for parity)
     S_Y_CHANNEL,
-    SPATIAL_CHANNELS_BINS,
     SPATIAL_CHANNELS_TEMPORAL,
     SourceItrProblem,
 )
@@ -37,7 +36,7 @@ COND_STATIC_DIM = 7
 # Spatial-descriptor conditioning ablation slice. cond layout is
 # [t_bar_norm, R_base_norm, A_norm, x_h_norm, y_h_norm, w_h_norm, h_h_norm]; the
 # patch-geometry descriptor is [3:7], while the two sinusoid scalars [1:3] are
-# retained. No one-hot family label, so family_cond_slice stays None.
+# retained.
 SOURCE_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE = slice(3, COND_STATIC_DIM)  # slice(3, 7)
 
 
@@ -122,21 +121,8 @@ class SourceItrSinProblem(SourceItrProblem):
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
                 cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=True,
                 temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=3,
-                use_temporal_encoder=True,
-                s_y_channel=S_Y_CHANNEL,
-                use_forcing_time_aug=False,
-            )
-        elif representation == "bins":
-            self.dims = ProblemDims(
-                in_channels=SPATIAL_CHANNELS_BINS,
-                cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=False,
-                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
-                t_stats_dim=3,
-                use_temporal_encoder=False,
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=False,
             )

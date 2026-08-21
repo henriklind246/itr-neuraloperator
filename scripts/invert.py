@@ -396,7 +396,6 @@ def load_checkpoint(ckpt_path: str, device: str = "cpu") -> LoadedModel:
         temporal_hidden=model_cfg.get("temporal_hidden", 128),
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
-        use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
         forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         forcing_spatial_mode=model_cfg.get("forcing_spatial_mode", "broadcast"),

@@ -2,11 +2,8 @@ import numpy as np
 import pytest
 
 from src.physics.boundary_forcing import (
-    FORCING_BINS,
     integrate_temporal,
-    integrate_temporal_bins,
     integrate_temporal_signed,
-    integrate_temporal_bins_signed,
     build_qL,
     build_qL_integral,
 )
@@ -60,34 +57,6 @@ def test_integrate_exp_train_matches_sum_of_analytics_and_outside():
     assert integrate_temporal("exp_train", params, a, b) == pytest.approx(expected, abs=1e-6)
 
 
-@pytest.mark.parametrize(
-    ("family", "params", "tol"),
-    [
-        ("sin", {"A": 2.0, "f": 0.25, "t_on": 0.0, "t_off": 1.0, "phase": 0.0, "tukey_alpha": 0.0}, 1e-3),
-        ("exp", {"A": 3.0, "t0": 0.2, "tau": 0.5}, 1e-6),
-        ("pulse_train", {"Np": 2, "A_list": [10.0, 20.0], "t_list": [0.1, 0.5], "dt_list": [0.2, 0.1]}, 1e-6),
-        ("exp_train", {"Np": 2, "A_list": [2.0, 5.0], "t_list": [0.1, 0.7], "tau_list": [0.2, 0.3]}, 1e-6),
-    ],
-)
-def test_bin_sum_matches_total_integral(family, params, tol):
-    bins = integrate_temporal_bins(family, params, 0.0, 1.0, K=FORCING_BINS)
-    total = integrate_temporal(family, params, 0.0, 1.0)
-    assert bins.shape == (FORCING_BINS,)
-    assert float(bins.sum()) == pytest.approx(total, abs=tol)
-
-
-def test_pulse_train_bins_discriminate_early_and_late_pulses():
-    early = {"Np": 1, "A_list": [8.0], "t_list": [0.0], "dt_list": [0.25]}
-    late = {"Np": 1, "A_list": [8.0], "t_list": [0.75], "dt_list": [0.25]}
-
-    early_bins = integrate_temporal_bins("pulse_train", early, 0.0, 1.0, K=FORCING_BINS)
-    late_bins = integrate_temporal_bins("pulse_train", late, 0.0, 1.0, K=FORCING_BINS)
-
-    assert early_bins[0] == pytest.approx(late_bins[-1], abs=1e-6)
-    assert early_bins[-1] == pytest.approx(late_bins[0], abs=1e-6)
-    assert not np.allclose(early_bins, late_bins)
-
-
 def test_integrate_signed_sin_is_half_wave_rectified():
     # The "sin" family is a half-wave-rectified sine. The signed helper is
     # signed for train families, but does not reintroduce negative sine lobes.
@@ -103,15 +72,6 @@ def test_integrate_signed_pulse_train_negative_amplitude():
     # signed for that family, so both agree here.
     params = {"Np": 1, "A_list": [-4.0], "t_list": [0.1], "dt_list": [0.3]}
     assert integrate_temporal_signed("pulse_train", params, 0.0, 1.0) == pytest.approx(-4.0 * 0.3, abs=1e-12)
-
-
-def test_signed_bins_sum_matches_total_signed_integral():
-    params = {"A": 1.0, "f": 1.0, "t_on": 0.0, "t_off": 1.0, "phase": 0.0, "tukey_alpha": 0.0}
-    bins = integrate_temporal_bins_signed("sin", params, 0.0, 1.0, K=FORCING_BINS)
-    total = integrate_temporal_signed("sin", params, 0.0, 1.0)
-    assert bins.shape == (FORCING_BINS,)
-    assert float(bins.sum()) == pytest.approx(total, abs=1e-3)
-    assert np.all(bins >= -1e-12)
 
 
 def test_build_qL_integral_separable_pulse_train():

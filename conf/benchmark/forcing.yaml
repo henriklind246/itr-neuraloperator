@@ -1,17 +1,10 @@
 # Forcing benchmark: separable boundary flux q_L(y, t) = a(t) * s(y), interface
-# fixed at x = 0.5. All representation-determined tensor dims (in_channels,
-# cond_static_dim, temporal_token_dim, use_temporal_encoder, s_y_channel,
-# use_forcing_time_aug) are resolved by the ProblemSpec from the
-# (benchmark, representation) pair, not declared here.
+# fixed at x = 0.5. All tensor dims (in_channels, cond_static_dim,
+# temporal_token_dim, s_y_channel, use_forcing_time_aug) are resolved by the
+# benchmark's ProblemSpec, not declared here.
 
 benchmark:
   name: forcing
-  # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
-  # spatial channel intact; cond_static_dim is unchanged in every mode):
-  #   full                - baseline; nothing masked.
-  #   no_family           - zero the one-hot spatial-family label only.
-  #   spatial_field_only  - zero the whole spatial descriptor (family + params).
-  spatial_conditioning: full
 
 training:
   loss:

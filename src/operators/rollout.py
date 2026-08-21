@@ -9,11 +9,8 @@ import torch
 from problems import forcing as forcing_problem
 from problems import interfaces as interfaces_problem
 from problems import source as source_problem
-from problems import source_itr as source_itr_problem
-from problems.base import ProblemSpec, empty_forcing_seq
+from problems.base import ProblemSpec
 from src.physics.boundary_forcing import (
-    FORCING_BINS,
-    integrate_temporal_bins_ramped_signed,
     integrate_temporal_intervals_ramped_signed,
     ramped_temporal,
 )
@@ -137,42 +134,22 @@ def _build_forcing_rollout_item(
     out["cond_static"] = forcing_problem.build_cond_vector(
         t_bar_norm=t_bar_norm,
         R_c=float(params["R_c"]),
-        spatial_family=params["spatial_family"],
-        spatial_params=params["spatial_params"],
-        y_bounds=(float(ds.y_grid[0]), float(ds.y_grid[-1])),
     )
 
-    if problem.representation == "temporal_encoder":
-        q = _q_callable_for_boundary(ds, sid, params)
-        t_samples, a_m = forcing_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = forcing_problem._forcing_seq_3tok_from_samples(
-            t_samples,
-            a_m,
-            interval_integral_fn=lambda a, b: integrate_temporal_intervals_ramped_signed(
-                params["temporal_family"],
-                params["temporal_params"],
-                a,
-                b,
-                ds.ramp_seconds,
-            ),
-            A_amp_ref=forcing_problem.A_AMP_REF,
-        )
-    else:
-        s_y = ds.s_y_profiles[sid]
-        bins = integrate_temporal_bins_ramped_signed(
+    q = _q_callable_for_boundary(ds, sid, params)
+    t_samples, a_m = forcing_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
+    out["forcing_seq"] = forcing_problem._forcing_seq_3tok_from_samples(
+        t_samples,
+        a_m,
+        interval_integral_fn=lambda a, b: integrate_temporal_intervals_ramped_signed(
             params["temporal_family"],
             params["temporal_params"],
-            float(t_lo),
-            float(t_hi),
+            a,
+            b,
             ds.ramp_seconds,
-            K=FORCING_BINS,
-        ).astype(np.float32)
-        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
-        spatial[..., forcing_problem.SPATIAL_CHANNELS_TEMPORAL:] = np.broadcast_to(
-            Q_y_bins,
-            (ds.Nx, ds.Ny, FORCING_BINS),
-        )
-        out["forcing_seq"] = empty_forcing_seq()
+        ),
+        A_amp_ref=forcing_problem.A_AMP_REF,
+    )
     return out
 
 
@@ -198,37 +175,20 @@ def _build_interfaces_rollout_item(
         ),
     )
 
-    if problem.representation == "temporal_encoder":
-        q = _q_callable_for_boundary(ds, sid, params)
-        t_samples, a_m = interfaces_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = interfaces_problem._forcing_seq_3tok_from_samples(
-            t_samples,
-            a_m,
-            interval_integral_fn=lambda a, b: integrate_temporal_intervals_ramped_signed(
-                params["temporal_family"],
-                params["temporal_params"],
-                a,
-                b,
-                ds.ramp_seconds,
-            ),
-            A_amp_ref=interfaces_problem.A_AMP_REF,
-        )
-    else:
-        s_y = ds.s_y_profiles[sid]
-        bins = integrate_temporal_bins_ramped_signed(
+    q = _q_callable_for_boundary(ds, sid, params)
+    t_samples, a_m = interfaces_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
+    out["forcing_seq"] = interfaces_problem._forcing_seq_3tok_from_samples(
+        t_samples,
+        a_m,
+        interval_integral_fn=lambda a, b: integrate_temporal_intervals_ramped_signed(
             params["temporal_family"],
             params["temporal_params"],
-            float(t_lo),
-            float(t_hi),
+            a,
+            b,
             ds.ramp_seconds,
-            K=FORCING_BINS,
-        ).astype(np.float32)
-        Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
-        spatial[..., interfaces_problem.SPATIAL_CHANNELS_TEMPORAL:] = np.broadcast_to(
-            Q_y_bins,
-            (ds.Nx, ds.Ny, FORCING_BINS),
-        )
-        out["forcing_seq"] = empty_forcing_seq()
+        ),
+        A_amp_ref=interfaces_problem.A_AMP_REF,
+    )
     return out
 
 
@@ -266,29 +226,20 @@ def _build_source_rollout_item(
         y_length_scale=float(ds.y_grid[-1] - ds.y_grid[0]),
     )
 
-    if problem.representation == "temporal_encoder":
-        if not hasattr(ds, "_q_callables"):
-            ds._q_callables = {}
-        if sid not in ds._q_callables:
-            ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
-        q = ds._q_callables[sid]
-        t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = source_problem._forcing_seq_3tok_from_samples(
-            t_samples,
-            a_m,
-            interval_integral_fn=lambda a, b: integrate_sin2_pulse(
-                float(params["A"]), float(params["t_off"]), a, b
-            ),
-            A_amp_ref=ds.a_amp_ref,
-        )
-    else:
-        spatial[..., source_problem.SPATIAL_CHANNELS_TEMPORAL:] = problem._source_bin_channels(
-            ds,
-            sid,
-            float(t_lo),
-            float(t_hi),
-        )
-        out["forcing_seq"] = empty_forcing_seq()
+    if not hasattr(ds, "_q_callables"):
+        ds._q_callables = {}
+    if sid not in ds._q_callables:
+        ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
+    q = ds._q_callables[sid]
+    t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
+    out["forcing_seq"] = source_problem._forcing_seq_3tok_from_samples(
+        t_samples,
+        a_m,
+        interval_integral_fn=lambda a, b: integrate_sin2_pulse(
+            float(params["A"]), float(params["t_off"]), a, b
+        ),
+        A_amp_ref=ds.a_amp_ref,
+    )
     return out
 
 
@@ -324,29 +275,20 @@ def _build_source_itr_rollout_item(
         y_length_scale=float(ds.y_grid[-1] - ds.y_grid[0]),
     )
 
-    if problem.representation == "temporal_encoder":
-        if not hasattr(ds, "_q_callables"):
-            ds._q_callables = {}
-        if sid not in ds._q_callables:
-            ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
-        q = ds._q_callables[sid]
-        t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
-        out["forcing_seq"] = source_problem._forcing_seq_3tok_from_samples(
-            t_samples,
-            a_m,
-            interval_integral_fn=lambda a, b: integrate_sin2_pulse(
-                float(params["A"]), float(params["t_off"]), a, b
-            ),
-            A_amp_ref=ds.a_amp_ref,
-        )
-    else:
-        spatial[..., source_itr_problem.SPATIAL_CHANNELS_TEMPORAL:] = problem._source_bin_channels(
-            ds,
-            sid,
-            float(t_lo),
-            float(t_hi),
-        )
-        out["forcing_seq"] = empty_forcing_seq()
+    if not hasattr(ds, "_q_callables"):
+        ds._q_callables = {}
+    if sid not in ds._q_callables:
+        ds._q_callables[sid] = make_sin2_pulse(float(params["A"]), float(params["t_off"]))
+    q = ds._q_callables[sid]
+    t_samples, a_m = source_problem._sample_a(q, t_lo, t_hi, ds.temporal_samples)
+    out["forcing_seq"] = source_problem._forcing_seq_3tok_from_samples(
+        t_samples,
+        a_m,
+        interval_integral_fn=lambda a, b: integrate_sin2_pulse(
+            float(params["A"]), float(params["t_off"]), a, b
+        ),
+        A_amp_ref=ds.a_amp_ref,
+    )
     return out
 
 
@@ -388,11 +330,8 @@ def build_rollout_item_from_base(
 def _forward_numpy_item(model, item: dict[str, np.ndarray], device: torch.device) -> torch.Tensor:
     spatial = torch.from_numpy(item["spatial"]).unsqueeze(0).to(device)
     cond = torch.from_numpy(item["cond_static"]).unsqueeze(0).to(device)
-    forcing_seq = item.get("forcing_seq")
-    if bool(getattr(model, "use_temporal_encoder", True)) and forcing_seq is not None:
-        forcing = torch.from_numpy(forcing_seq).unsqueeze(0).to(device)
-        return model(spatial, cond, forcing)
-    return model(spatial, cond)
+    forcing = torch.from_numpy(item["forcing_seq"]).unsqueeze(0).to(device)
+    return model(spatial, cond, forcing)
 
 
 def predict_autoregressive(

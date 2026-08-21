@@ -20,8 +20,9 @@ REGISTRY: dict[str, type[ProblemSpec]] = {
     "source_itr_sin": SourceItrSinProblem,
 }
 
-# The two public representation values. Every benchmark supports both.
-REPRESENTATIONS: tuple[str, ...] = ("temporal_encoder", "bins")
+# The only public representation value. Kept as an explicit axis so run
+# provenance (`config_used.yaml`, published manifests) stays readable.
+REPRESENTATIONS: tuple[str, ...] = ("temporal_encoder",)
 
 
 def get_problem(name: str, representation: str = "temporal_encoder") -> ProblemSpec:

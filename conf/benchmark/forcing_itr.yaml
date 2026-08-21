@@ -2,10 +2,6 @@
 benchmark:
   name: forcing_itr
   rc_channel_mode: broadcast
-  # Spatial-descriptor conditioning ablation (masks cond_static, leaves the
-  # spatial channel intact; cond_static_dim unchanged; ITR void params retained):
-  #   full / no_family / spatial_field_only. See conf/benchmark/forcing.yaml.
-  spatial_conditioning: full
 
 training:
   loss:

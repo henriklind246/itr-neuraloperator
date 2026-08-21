@@ -53,7 +53,6 @@ DT_PULSE_FRAC_HI = 0.2
 NP_CHOICES = (1, 2, 3, 4)
 NP_MAX = 4
 PULSE_SLOTS = 4
-FORCING_BINS = 16
 SIN_INTEGRAL_SAMPLES = 2049
 _INTERVAL_GAUSS_NODES, _INTERVAL_GAUSS_WEIGHTS = np.polynomial.legendre.leggauss(16)
 
@@ -121,8 +120,8 @@ def _windowed_sin_values(t, A: float, f: float, t_on: float, t_off: float,
 
     Bit-for-bit equivalent to mapping the scalar `windowed_sin_flux` closure
     over `t`, but avoids a Python-level call per sample. The quadrature in the
-    `sin` branch evaluates this at 2049 points per bin x 16 bins per item, so
-    the scalar map dominated DataLoader item construction for `sin` forcing.
+    `sin` branch evaluates this at 2049 points per subinterval, so the scalar
+    map dominated DataLoader item construction for `sin` forcing.
     Pinned against the scalar reference in tests/test_boundary_forcing.py.
     """
     if not rectified:
@@ -239,23 +238,6 @@ def integrate_temporal(
     raise ValueError(f"Unknown temporal family: {temporal_family}")
 
 
-def integrate_temporal_bins(
-    temporal_family: str,
-    temporal_params: dict,
-    t_s: float,
-    t_j: float,
-    K: int = FORCING_BINS,
-) -> np.ndarray:
-    edges = np.linspace(float(t_s), float(t_j), int(K) + 1)
-    return np.array(
-        [
-            integrate_temporal(temporal_family, temporal_params, edges[k], edges[k + 1])
-            for k in range(int(K))
-        ],
-        dtype=float,
-    )
-
-
 if hasattr(np, "trapezoid"):
     _trapz = np.trapezoid
 else:
@@ -317,22 +299,6 @@ def integrate_temporal_signed(
 
     raise ValueError(f"Unknown temporal family: {temporal_family}")
 
-
-def integrate_temporal_bins_signed(
-    temporal_family: str,
-    temporal_params: dict,
-    t_s: float,
-    t_j: float,
-    K: int = FORCING_BINS,
-) -> np.ndarray:
-    edges = np.linspace(float(t_s), float(t_j), int(K) + 1)
-    return np.array(
-        [
-            integrate_temporal_signed(temporal_family, temporal_params, edges[k], edges[k + 1])
-            for k in range(int(K))
-        ],
-        dtype=float,
-    )
 
 # --------- STARTUP RAMP (q_L(0) = 0) ----------
 
@@ -671,25 +637,6 @@ def integrate_temporal_intervals_ramped_signed(
         np.asarray(owners), weights=segment_integrals, minlength=flat_lo.size
     ).reshape(lo.shape)
 
-
-def integrate_temporal_bins_ramped_signed(
-    temporal_family: str,
-    temporal_params: dict,
-    t_s: float,
-    t_j: float,
-    t_ramp: float,
-    K: int = FORCING_BINS,
-) -> np.ndarray:
-    edges = np.linspace(float(t_s), float(t_j), int(K) + 1)
-    return np.array(
-        [
-            integrate_temporal_ramped_signed(
-                temporal_family, temporal_params, edges[k], edges[k + 1], t_ramp
-            )
-            for k in range(int(K))
-        ],
-        dtype=float,
-    )
 
 # --------- SAMPLER FUNCTIONS ----------
 

@@ -6,6 +6,7 @@ from problems.registry import get_problem
 from problems.forcing import (
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
+    RC_RANGE,
     ForcingProblem,
     build_cond_vector,
 )
@@ -19,63 +20,28 @@ _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
 
 # Target (benchmark x representation) tensor contract. Single source of truth for
-# the dims/shape/absence tests below; mirrors the plan's contract table.
+# the dims/shape tests below. `temporal_encoder` is the only representation.
 CONTRACTS = {
     ("forcing", "temporal_encoder"): dict(
-        in_ch=4, cond=10, has_fseq=True, token=3, t_stats=2,
-        encoder=True, s_y=3, aug=True,
-    ),
-    ("forcing", "bins"): dict(
-        in_ch=20, cond=10, has_fseq=False, token=2, t_stats=2,
-        encoder=False, s_y=3, aug=False,
+        in_ch=4, cond=2, token=3, t_stats=2, s_y=3, aug=True,
     ),
     ("forcing_itr", "temporal_encoder"): dict(
-        in_ch=5, cond=13, has_fseq=True, token=3, t_stats=2,
-        encoder=True, s_y=3, aug=True,
-    ),
-    ("forcing_itr", "bins"): dict(
-        in_ch=21, cond=13, has_fseq=False, token=2, t_stats=2,
-        encoder=False, s_y=3, aug=False,
+        in_ch=5, cond=5, token=3, t_stats=2, s_y=3, aug=True,
     ),
     ("forcing_itr_sin", "temporal_encoder"): dict(
-        in_ch=5, cond=11, has_fseq=True, token=3, t_stats=2,
-        encoder=True, s_y=3, aug=True,
-    ),
-    ("forcing_itr_sin", "bins"): dict(
-        in_ch=21, cond=11, has_fseq=False, token=2, t_stats=2,
-        encoder=False, s_y=3, aug=False,
+        in_ch=5, cond=3, token=3, t_stats=2, s_y=3, aug=True,
     ),
     ("source", "temporal_encoder"): dict(
-        in_ch=4, cond=6, has_fseq=True, token=3, t_stats=3,
-        encoder=True, s_y=3, aug=False,
-    ),
-    ("source", "bins"): dict(
-        in_ch=20, cond=6, has_fseq=False, token=2, t_stats=3,
-        encoder=False, s_y=3, aug=False,
+        in_ch=4, cond=6, token=3, t_stats=3, s_y=3, aug=False,
     ),
     ("source_itr", "temporal_encoder"): dict(
-        in_ch=5, cond=9, has_fseq=True, token=3, t_stats=3,
-        encoder=True, s_y=3, aug=False,
-    ),
-    ("source_itr", "bins"): dict(
-        in_ch=21, cond=9, has_fseq=False, token=2, t_stats=3,
-        encoder=False, s_y=3, aug=False,
+        in_ch=5, cond=9, token=3, t_stats=3, s_y=3, aug=False,
     ),
     ("source_itr_sin", "temporal_encoder"): dict(
-        in_ch=5, cond=7, has_fseq=True, token=3, t_stats=3,
-        encoder=True, s_y=3, aug=False,
-    ),
-    ("source_itr_sin", "bins"): dict(
-        in_ch=21, cond=7, has_fseq=False, token=2, t_stats=3,
-        encoder=False, s_y=3, aug=False,
+        in_ch=5, cond=7, token=3, t_stats=3, s_y=3, aug=False,
     ),
     ("interfaces", "temporal_encoder"): dict(
-        in_ch=6, cond=3, has_fseq=True, token=3, t_stats=3,
-        encoder=True, s_y=5, aug=True,
-    ),
-    ("interfaces", "bins"): dict(
-        in_ch=22, cond=3, has_fseq=False, token=2, t_stats=3,
-        encoder=False, s_y=5, aug=False,
+        in_ch=6, cond=3, token=3, t_stats=3, s_y=5, aug=True,
     ),
 }
 
@@ -195,10 +161,8 @@ class TestRegistry:
         dims = get_problem(name, representation).dims
         assert dims.in_channels == c["in_ch"]
         assert dims.cond_static_dim == c["cond"]
-        assert dims.has_forcing_seq is c["has_fseq"]
         assert dims.temporal_token_dim == c["token"]
         assert dims.t_stats_dim == c["t_stats"]
-        assert dims.use_temporal_encoder is c["encoder"]
         assert dims.s_y_channel == c["s_y"]
         assert dims.use_forcing_time_aug is c["aug"]
 
@@ -221,7 +185,7 @@ class TestRegistry:
 
     @pytest.mark.parametrize(
         ("benchmark", "representation"),
-        [("forcing", "bins"), ("interfaces", "temporal_encoder")],
+        [("source", "temporal_encoder"), ("interfaces", "temporal_encoder")],
     )
     def test_problem_config_rejects_physics_extender_outside_v1_scope(
         self, benchmark, representation
@@ -237,7 +201,7 @@ class TestRegistry:
 # ===================== forcing item shape contract =====================
 
 class TestForcingItem:
-    """forcing/temporal_encoder item shapes: lean 4-channel spatial, cond 10,
+    """forcing/temporal_encoder item shapes: lean 4-channel spatial, cond 2,
     a 128x3 forcing_seq, T_stats 2."""
 
     def test_item_keys_shapes(self, forcing_dataset):
@@ -247,7 +211,7 @@ class TestForcingItem:
         item = spec.build_item(ds, sim_id, s, j)
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 4)
-        assert item["cond_static"].shape == (10,)
+        assert item["cond_static"].shape == (2,)
         assert item["forcing_seq"].shape == (
             FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
         )
@@ -277,36 +241,19 @@ class TestForcingItem:
 
 
 class TestForcingUnknownSpatialFamily:
-    """An unseen spatial family may only be conditioned on when the descriptor
-    slice is masked out anyway (spatial_conditioning='spatial_field_only')."""
+    """forcing cond_static carries no spatial descriptor, so an unregistered
+    spatial family is conditioned on honestly: it reaches the model only through
+    the s_y spatial channel and needs no escape hatch."""
 
     _SINU = {"c0": 0.7, "c1": 0.3, "f": 2.0, "phase": 0.5}
 
-    def test_raises_by_default(self):
-        with pytest.raises(ValueError, match="unknown spatial_family"):
-            build_cond_vector(0.1, 0.5, "sinusoid", self._SINU)
-
-    def test_typo_still_raises(self):
-        with pytest.raises(ValueError, match="unknown spatial_family"):
-            build_cond_vector(0.1, 0.5, "gausian", {"y_c": 0.5, "sigma_y": 0.1})
-
-    def test_opt_in_zeroes_the_descriptor(self):
-        cond = build_cond_vector(
-            0.1, 0.5, "sinusoid", self._SINU, allow_unknown_spatial_family=True,
+    def test_cond_vector_is_family_independent(self):
+        np.testing.assert_allclose(
+            build_cond_vector(t_bar_norm=0.1, R_c=0.5),
+            np.array([0.1, (0.5 - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])],
+                     dtype=np.float32),
+            rtol=0.0, atol=1e-7,
         )
-        assert cond.shape == (10,)
-        np.testing.assert_allclose(cond[2:10], 0.0)
-
-    def test_masked_output_matches_a_registered_family(self):
-        spec = get_problem("forcing")
-        spec.set_spatial_conditioning("spatial_field_only")
-        unknown = spec._apply_spatial_conditioning_mask(build_cond_vector(
-            0.1, 0.5, "sinusoid", self._SINU, allow_unknown_spatial_family=True,
-        ))
-        known = spec._apply_spatial_conditioning_mask(
-            build_cond_vector(0.1, 0.5, "gaussian", {"y_c": 0.5, "sigma_y": 0.1})
-        )
-        np.testing.assert_allclose(unknown, known, rtol=0.0, atol=0.0)
 
     def _sinusoid_dataset(self, synthetic_trajectories, synthetic_sim_params, spec):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
@@ -316,27 +263,15 @@ class TestForcingUnknownSpatialFamily:
             p["spatial_params"] = dict(self._SINU)
         return _make_dataset(trajectories, x_grid, y_grid, t_grid, params, spec)
 
-    def test_build_item_raises_under_full_conditioning(
+    def test_build_item_succeeds_for_unregistered_family(
         self, synthetic_trajectories, synthetic_sim_params
     ):
         spec = get_problem("forcing")
-        spec.set_spatial_conditioning("full")
-        ds = self._sinusoid_dataset(synthetic_trajectories, synthetic_sim_params, spec)
-        sim_id, s, j = ds._pairs[0]
-        with pytest.raises(ValueError, match="unknown spatial_family"):
-            spec.build_item(ds, sim_id, s, j)
-
-    def test_build_item_succeeds_under_spatial_field_only(
-        self, synthetic_trajectories, synthetic_sim_params
-    ):
-        spec = get_problem("forcing")
-        spec.set_spatial_conditioning("spatial_field_only")
         ds = self._sinusoid_dataset(synthetic_trajectories, synthetic_sim_params, spec)
         sim_id, s, j = ds._pairs[0]
         item = spec.build_item(ds, sim_id, s, j)
-        assert item["cond_static"].shape == (10,)
-        np.testing.assert_allclose(item["cond_static"][2:10], 0.0)
-        # The sinusoid still reaches the model through the s_y spatial channel.
+        assert item["cond_static"].shape == (2,)
+        # The sinusoid reaches the model through the s_y spatial channel.
         s_y = item["spatial"][..., 3]
         assert float(s_y.max()) > float(s_y.min())
 
@@ -982,13 +917,11 @@ class TestProblemFromConfig:
         assert isinstance(problem_from_config({}), ForcingProblem)
         assert isinstance(problem_from_config({"benchmark": {}}), ForcingProblem)
 
-    def test_reads_representation_axis(self):
-        spec = problem_from_config(
-            {"benchmark": {"name": "forcing", "representation": "bins"}}
-        )
-        assert spec.representation == "bins"
-        assert spec.dims.in_channels == 20
-        assert spec.dims.use_temporal_encoder is False
+    def test_rejects_retired_representation(self):
+        with pytest.raises(ValueError, match="representation"):
+            problem_from_config(
+                {"benchmark": {"name": "forcing", "representation": "bins"}}
+            )
 
     def test_defaults_to_temporal_encoder_when_representation_missing(self):
         spec = problem_from_config({"benchmark": {"name": "source"}})
@@ -1085,12 +1018,7 @@ class TestGeometryAwareProblemSampling:
 # ===================== representation x benchmark contracts =====================
 
 def _dataset_for(name, representation, synthetic_trajectories, forcing_sim_params):
-    """Build a dataset for any (benchmark, representation) at the synthetic grid.
-
-    The representation does not change sim_params (both modes derive from the
-    same trajectories + sim_params), so the per-benchmark sim_params are built
-    once and reused across representations.
-    """
+    """Build a dataset for any (benchmark, representation) at the synthetic grid."""
     trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
     spec = get_problem(name, representation)
     if name == "forcing":
@@ -1115,12 +1043,7 @@ class TestRepresentationContracts:
         assert item["cond_static"].shape == (c["cond"],)
         assert item["Y"].shape == (ds.Nx, ds.Ny, 1)
         assert item["T_stats"].shape == (c["t_stats"],)
-
-        if c["has_fseq"]:
-            assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, c["token"])
-        else:
-            # bins mode emits an explicit empty forcing_seq (fixed item shape).
-            assert item["forcing_seq"].shape[-2] == 0
+        assert item["forcing_seq"].shape == (FORCING_TEMPORAL_SAMPLES, c["token"])
 
     @pytest.mark.parametrize("key", list(CONTRACTS))
     def test_getitem_matches_build_item(self, key, synthetic_trajectories, synthetic_sim_params):
@@ -1137,74 +1060,20 @@ class TestRepresentationContracts:
 
 
 class TestRepresentationAbsence:
-    @pytest.mark.parametrize(
-        "name", ["forcing", "source", "interfaces"]
-    )
-    def test_temporal_has_no_integral_bins(self, name, synthetic_trajectories, synthetic_sim_params):
-        """temporal_encoder spatial channels carry no Q-integral bins; bins mode
-        adds exactly the extra bin channels on top of the lean stack."""
-        spec_t, ds_t = _dataset_for(
-            name, "temporal_encoder", synthetic_trajectories, synthetic_sim_params
-        )
-        spec_b, ds_b = _dataset_for(
-            name, "bins", synthetic_trajectories, synthetic_sim_params
-        )
-        lean = CONTRACTS[(name, "temporal_encoder")]["in_ch"]
-        bins = CONTRACTS[(name, "bins")]["in_ch"]
-        # 16 integral bins are present only in bins mode.
-        assert bins - lean == 16
-
-    def test_bins_forcing_seq_is_empty(self, synthetic_trajectories, synthetic_sim_params):
+    def test_source_cond_has_no_A_norm(self, synthetic_trajectories, synthetic_sim_params):
+        # source cond is base 2 + (x_h, y_h, w_h, h_h) = 6; A_norm is dropped.
         spec, ds = _dataset_for(
-            "forcing", "bins", synthetic_trajectories, synthetic_sim_params
+            "source", "temporal_encoder", synthetic_trajectories, synthetic_sim_params
         )
         sim_id, s, j = ds._pairs[0]
         item = spec.build_item(ds, sim_id, s, j)
-        assert item["forcing_seq"].size == 0
-
-    def test_source_cond_has_no_A_norm(self, synthetic_trajectories, synthetic_sim_params):
-        # source cond is base 3 + (x_h, y_h, w_h, h_h) = 7; A_norm is dropped.
-        for representation in ("temporal_encoder", "bins"):
-            spec, ds = _dataset_for(
-                "source", representation, synthetic_trajectories, synthetic_sim_params
-            )
-            sim_id, s, j = ds._pairs[0]
-            item = spec.build_item(ds, sim_id, s, j)
-            assert item["cond_static"].shape == (6,)
+        assert item["cond_static"].shape == (6,)
 
     def test_interfaces_temporal_reads_s_y_channel_5(self):
         # The learned spatial forcing must read s_y at channel 5, not K_norm at 3.
         assert get_problem("interfaces", "temporal_encoder").dims.s_y_channel == 5
         assert get_problem("forcing", "temporal_encoder").dims.s_y_channel == 3
         assert get_problem("source", "temporal_encoder").dims.s_y_channel == 3
-
-
-class TestRepresentationReconstruction:
-    """Both representations are derivable from the same trajectories + sim_params;
-    building one then the other from the same (sid, s, j) must succeed with the
-    contracted shapes (catches benchmarks whose stored metadata is insufficient
-    for the new representation)."""
-
-    @pytest.mark.parametrize("name", ["forcing", "source", "interfaces"])
-    def test_both_representations_from_same_pair(self, name, synthetic_trajectories, synthetic_sim_params):
-        spec_t, ds_t = _dataset_for(
-            name, "temporal_encoder", synthetic_trajectories, synthetic_sim_params
-        )
-        spec_b, ds_b = _dataset_for(
-            name, "bins", synthetic_trajectories, synthetic_sim_params
-        )
-        sim_id, s, j = ds_t._pairs[0]
-        item_t = spec_t.build_item(ds_t, sim_id, s, j)
-        item_b = spec_b.build_item(ds_b, sim_id, s, j)
-
-        ct = CONTRACTS[(name, "temporal_encoder")]
-        cb = CONTRACTS[(name, "bins")]
-        assert item_t["spatial"].shape[-1] == ct["in_ch"]
-        assert item_b["spatial"].shape[-1] == cb["in_ch"]
-        # Y target is representation-invariant.
-        np.testing.assert_allclose(
-            item_t["Y"], item_b["Y"], rtol=0, atol=0
-        )
 
 
 # ===================== val-pair logging hooks =====================
@@ -1328,22 +1197,15 @@ class TestOODAxisContract:
 
 # ===================== spatial-descriptor conditioning ablation =====================
 
-# Benchmarks that carry a maskable spatial descriptor, per representation. Both
-# representations build the same cond_static, so the mask applies identically.
+# Benchmarks that carry a maskable spatial descriptor. The forcing family has
+# none: its s(y) reaches the model only through the s_y spatial channel.
 _ABLATION_KEYS = [
-    ("forcing", "temporal_encoder"),
-    ("forcing", "bins"),
-    ("forcing_itr", "temporal_encoder"),
-    ("forcing_itr", "bins"),
     ("source", "temporal_encoder"),
-    ("source", "bins"),
     ("source_itr", "temporal_encoder"),
-    ("source_itr", "bins"),
     ("source_itr_sin", "temporal_encoder"),
-    ("source_itr_sin", "bins"),
 ]
 
-_ALL_MODES = ("full", "no_family", "spatial_field_only")
+_ALL_MODES = ("full", "spatial_field_only")
 
 
 def _items_across_modes(spec, ds, sid, s, j, modes=_ALL_MODES):
@@ -1377,9 +1239,9 @@ def _assert_slice_masked(full_cond, ablated_cond, sl):
 class TestSpatialConditioningMask:
     """Value-level ablation contract: masking zeros exactly the declared
     descriptor slice, leaves the spatial field and all other cond entries
-    byte-identical, and never changes cond_static_dim. Slices are read from
-    ``spec.family_cond_slice`` / ``spec.spatial_descriptor_cond_slice`` so a
-    wrong slice cannot pass by matching a duplicated literal at the test site."""
+    byte-identical, and never changes cond_static_dim. The slice is read from
+    ``spec.spatial_descriptor_cond_slice`` so a wrong slice cannot pass by
+    matching a duplicated literal at the test site."""
 
     def test_default_mode_is_full(self):
         for name, representation in _ABLATION_KEYS:
@@ -1417,22 +1279,6 @@ class TestSpatialConditioningMask:
         assert dim == (spec.dims.cond_static_dim,)
         for mode in _ALL_MODES:
             assert items[mode]["cond_static"].shape == dim
-
-    @pytest.mark.parametrize("key", _ABLATION_KEYS)
-    def test_no_family_zeros_only_family_slice(
-        self, key, synthetic_trajectories, synthetic_sim_params
-    ):
-        name, representation = key
-        spec, ds = _dataset_for(
-            name, representation, synthetic_trajectories, synthetic_sim_params
-        )
-        sid, s, j = ds._pairs[0]
-        items = _items_across_modes(spec, ds, sid, s, j)
-        _assert_slice_masked(
-            items["full"]["cond_static"],
-            items["no_family"]["cond_static"],
-            spec.family_cond_slice,
-        )
 
     @pytest.mark.parametrize("key", _ABLATION_KEYS)
     def test_spatial_field_only_zeros_full_descriptor(
@@ -1478,31 +1324,30 @@ class TestSpatialConditioningMask:
     def test_itr_prefix_blocks_are_preserved(
         self, synthetic_trajectories, synthetic_sim_params
     ):
-        # forcing_itr and source_itr keep t_bar[0] + 4 ITR/void params[1:5]
-        # ahead of the masked descriptor. Explicit entry-order guard against an
-        # off-by-one that would clobber R_base/R_amp/y0/sigma.
-        for name in ("forcing_itr", "source_itr"):
-            spec, ds = _dataset_for(
-                name, "temporal_encoder", synthetic_trajectories, synthetic_sim_params
+        # source_itr keeps t_bar[0] + 4 void params[1:5] ahead of the masked
+        # descriptor. Explicit entry-order guard against an off-by-one that
+        # would clobber R_base/R_amp/y0/sigma.
+        spec, ds = _dataset_for(
+            "source_itr", "temporal_encoder", synthetic_trajectories,
+            synthetic_sim_params,
+        )
+        sid, s, j = ds._pairs[0]
+        items = _items_across_modes(spec, ds, sid, s, j)
+        prefix = slice(0, 5)  # [t_bar, void x4]; sits before the descriptor
+        for mode in _ALL_MODES:
+            np.testing.assert_array_equal(
+                items[mode]["cond_static"][prefix],
+                items["full"]["cond_static"][prefix],
+                err_msg=f"source_itr: void prefix changed under {mode}",
             )
-            sid, s, j = ds._pairs[0]
-            items = _items_across_modes(spec, ds, sid, s, j)
-            prefix = slice(0, 5)  # [t_bar, itr/void x4]; sits before the descriptor
-            for mode in _ALL_MODES:
-                np.testing.assert_array_equal(
-                    items[mode]["cond_static"][prefix],
-                    items["full"]["cond_static"][prefix],
-                    err_msg=f"{name}: ITR/void prefix changed under {mode}",
-                )
-            # The prefix must lie strictly before the masked descriptor slice.
-            assert spec.spatial_descriptor_cond_slice.start >= 5
+        # The prefix must lie strictly before the masked descriptor slice.
+        assert spec.spatial_descriptor_cond_slice.start >= 5
 
     def test_interfaces_is_noop_control_across_modes(self, interfaces_dataset):
-        # interfaces declares neither slice -> every mode reproduces `full`
-        # exactly (the empty-mask regression control).
+        # interfaces declares no descriptor slice -> every mode reproduces
+        # `full` exactly (the empty-mask regression control).
         ds = interfaces_dataset
         spec = get_problem("interfaces")
-        assert spec.family_cond_slice is None
         assert spec.spatial_descriptor_cond_slice is None
         sid, s, j = ds._pairs[0]
         items = _items_across_modes(spec, ds, sid, s, j)
@@ -1520,27 +1365,25 @@ class TestSpatialConditioningMask:
     def test_noop_modes_warn_at_resolution(self):
         # A mode that masks nothing for the benchmark must surface a warning so a
         # duplicate run is never mistaken for an independent sweep condition.
-        with pytest.warns(UserWarning, match="no_family has no effect"):
-            problem_from_config(
-                {"benchmark": {"name": "source", "spatial_conditioning": "no_family"}}
-            )
-        with pytest.warns(UserWarning, match="spatial_field_only has no effect"):
-            problem_from_config(
-                {"benchmark": {"name": "interfaces",
-                               "spatial_conditioning": "spatial_field_only"}}
-            )
+        for name in ("interfaces", "forcing"):
+            with pytest.warns(UserWarning, match="spatial_field_only has no effect"):
+                problem_from_config(
+                    {"benchmark": {"name": name,
+                                   "spatial_conditioning": "spatial_field_only"}}
+                )
 
     def test_effective_modes_do_not_warn(self, recwarn):
         # A mode that actually masks must not emit the no-op warning.
         problem_from_config(
-            {"benchmark": {"name": "forcing", "spatial_conditioning": "no_family"}}
+            {"benchmark": {"name": "source",
+                           "spatial_conditioning": "spatial_field_only"}}
         )
         assert not any("has no effect" in str(w.message) for w in recwarn.list)
 
     def test_mask_helper_returns_copy_not_alias(self):
         # Ablated modes must never alias the caller's array (guards against
         # mutating a reused dict or shared-memory tensor in place).
-        spec = get_problem("forcing")
+        spec = get_problem("source")
         spec.set_spatial_conditioning("spatial_field_only")
         cond = np.ones(spec.dims.cond_static_dim, dtype=np.float32)
         out = spec._apply_spatial_conditioning_mask(cond)
@@ -1556,12 +1399,12 @@ class TestSpatialConditioningMask:
         # mode must not leak into another (guards against singleton/class-attr
         # aliasing that would silently ablate an intended-baseline run).
         a, ds_a = _dataset_for(
-            "forcing", "temporal_encoder", synthetic_trajectories, synthetic_sim_params
+            "source", "temporal_encoder", synthetic_trajectories, synthetic_sim_params
         )
         sid, s, j = ds_a._pairs[0]
         a_full = a.build_item(ds_a, sid, s, j)["cond_static"].copy()
 
-        b = get_problem("forcing", "temporal_encoder")
+        b = get_problem("source", "temporal_encoder")
         b.set_spatial_conditioning("spatial_field_only")
         assert b.spatial_conditioning == "spatial_field_only"
         assert a.spatial_conditioning == "full"
@@ -1590,7 +1433,6 @@ class TestSpatialConditioningApprovalGates:
             cond_hidden=16,
             temporal_token_dim=dims.temporal_token_dim,
             temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=dims.use_temporal_encoder,
             use_forcing_time_aug=dims.use_forcing_time_aug,
             s_y_channel=dims.s_y_channel,
         )
@@ -1602,10 +1444,10 @@ class TestSpatialConditioningApprovalGates:
         import torch
 
         full = problem_from_config(
-            {"benchmark": {"name": "forcing", "spatial_conditioning": "full"}}
+            {"benchmark": {"name": "source", "spatial_conditioning": "full"}}
         )
         abl = problem_from_config(
-            {"benchmark": {"name": "forcing",
+            {"benchmark": {"name": "source",
                            "spatial_conditioning": "spatial_field_only"}}
         )
         assert full.dims == abl.dims  # ablation is dim-invariant by construction

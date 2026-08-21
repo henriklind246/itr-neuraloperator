@@ -10,42 +10,28 @@ if TYPE_CHECKING:
     from src.physics.fv_solver_2d import FVSolver2D
 
 
-def empty_forcing_seq() -> np.ndarray:
-    """The placeholder ``forcing_seq`` for bins-mode items.
-
-    Bins-mode benchmarks carry no temporal token stream, but the dataset item
-    must keep a fixed set of keys so default collation does not break. They emit
-    this explicit empty ``(0, 0)`` tensor (collated to ``(B, 0, 0)``); ``FNO2d``
-    ignores ``forcing_seq`` whenever ``use_temporal_encoder`` is off.
-    """
-    return np.zeros((0, 0), dtype=np.float32)
-
-
 @dataclass(frozen=True)
 class ProblemDims:
     """Per-benchmark tensor contract.
 
     `in_channels` and `cond_static_dim` size the model's lift and conditioning
-    MLP. `has_forcing_seq` / `use_temporal_encoder` toggle the temporal branch
-    (bins mode has neither). `t_stats_dim` is the width of the denormalization
-    stats vector (2 = [mu, sigma]; 3 adds a per-benchmark scalar such as
-    interface_x). `s_y_channel` is the spatial channel the model multiplies the
-    learned forcing weights against; `use_forcing_time_aug` augments the temporal
+    MLP. `t_stats_dim` is the width of the denormalization stats vector
+    (2 = [mu, sigma]; 3 adds a per-benchmark scalar such as interface_x).
+    `s_y_channel` is the spatial channel the model multiplies the learned
+    forcing weights against; `use_forcing_time_aug` augments the temporal
     embedding with lead time before projecting those weights.
     `forcing_extender_rc_cond_index` declares the normalized scalar-contact-
     resistance slot that an eligible boundary extender may add to its domain
-    queries; ``None`` means the active benchmark/representation does not expose
-    that capability. `supports_diffusion_geometry_extender` is deliberately
+    queries; ``None`` means the active benchmark does not expose that
+    capability. `supports_diffusion_geometry_extender` is deliberately
     narrower: it marks the fixed-interface scalar-R_c contract supported by the
     first diffusion-inspired geometry-bias experiment.
     """
 
     in_channels: int
     cond_static_dim: int
-    has_forcing_seq: bool
     temporal_token_dim: int
     t_stats_dim: int
-    use_temporal_encoder: bool
     s_y_channel: int = 3
     use_forcing_time_aug: bool = False
     forcing_extender_rc_cond_index: int | None = None
@@ -57,22 +43,18 @@ OODKind = Literal["simulation_parameter", "evaluation_parameter", "compound"]
 
 #: Train/eval ablation of the global spatial descriptor in ``cond_static``.
 #:
-#: The spatial forcing profile ``s(y)`` (or, for source benchmarks, the internal
-#: source patch geometry) is visible to the model through two redundant paths:
-#: the spatial input channel it multiplies against, and the global
-#: ``cond_static`` descriptor (a one-hot family label plus continuous params for
-#: forcing/forcing_itr; patch-geometry params for source/source_itr). These
-#: modes zero out the descriptor entries in ``cond_static`` while leaving the
-#: spatial channel intact, so the model must recover the profile from the field
-#: alone. ``cond_static_dim`` is never changed, so the ConditioningMLP
-#: architecture and parameter count are identical across modes.
+#: For the source benchmarks the internal source patch geometry is visible to
+#: the model through two redundant paths: the spatial input channels, and the
+#: global ``cond_static`` patch-geometry params. ``spatial_field_only`` zeros the
+#: descriptor entries in ``cond_static`` while leaving the spatial channels
+#: intact, so the model must recover the geometry from the field alone.
+#: ``cond_static_dim`` is never changed, so the ConditioningMLP architecture and
+#: parameter count are identical across modes.
 #:
 #: - ``full`` -- baseline; nothing zeroed.
-#: - ``no_family`` -- zero only the one-hot family block (retain continuous
-#:   params). A no-op for benchmarks with no family label (source/source_itr).
-#: - ``spatial_field_only`` -- zero the whole spatial descriptor (family label +
-#:   params, or patch params).
-SpatialConditioningMode = Literal["full", "no_family", "spatial_field_only"]
+#: - ``spatial_field_only`` -- zero the whole spatial descriptor. A no-op for
+#:   benchmarks with no descriptor (forcing family, interfaces).
+SpatialConditioningMode = Literal["full", "spatial_field_only"]
 
 
 @dataclass(frozen=True)
@@ -143,14 +125,10 @@ class ProblemSpec(ABC):
     #: Active ablation mode (see :data:`SpatialConditioningMode`). Set via
     #: :meth:`set_spatial_conditioning`; ``full`` leaves ``cond_static`` untouched.
     spatial_conditioning: str = "full"
-    #: ``cond_static`` slice holding the one-hot family label, zeroed under
-    #: ``no_family`` and ``spatial_field_only``. ``None`` for benchmarks with no
-    #: family label (an empty mask). Declared next to each spec's cond layout as
-    #: the single source of truth read by both the mask helper and the tests.
-    family_cond_slice: "slice | None" = None
-    #: ``cond_static`` slice holding the full spatial descriptor (family label +
-    #: continuous params, or patch-geometry params), zeroed under
-    #: ``spatial_field_only``. ``None`` for benchmarks with no descriptor.
+    #: ``cond_static`` slice holding the spatial descriptor (patch-geometry
+    #: params), zeroed under ``spatial_field_only``. ``None`` for benchmarks with
+    #: no descriptor. Declared next to each spec's cond layout as the single
+    #: source of truth read by both the mask helper and the tests.
     spatial_descriptor_cond_slice: "slice | None" = None
 
     def set_spatial_conditioning(self, mode: str) -> None:
@@ -173,22 +151,19 @@ class ProblemSpec(ABC):
         ``full`` returns ``cond`` unchanged. Ablated modes return a *copied*
         array (never aliasing a reused dict or shared-memory tensor) with the
         selected slice zeroed; a ``None`` slice is a no-op copy, so benchmarks
-        without the relevant descriptor (e.g. ``no_family`` on source, or any
-        mode on interfaces) are guaranteed no-ops.
+        without a spatial descriptor (forcing family, interfaces) are guaranteed
+        no-ops.
         """
         mode = self.spatial_conditioning
         if mode == "full":
             return cond
-        out = np.asarray(cond).copy()
-        if mode == "no_family":
-            sl = self.family_cond_slice
-        elif mode == "spatial_field_only":
-            sl = self.spatial_descriptor_cond_slice
-        else:
+        if mode != "spatial_field_only":
             raise ValueError(
                 f"Unknown spatial_conditioning={mode!r}; "
                 f"expected one of {get_args(SpatialConditioningMode)}."
             )
+        out = np.asarray(cond).copy()
+        sl = self.spatial_descriptor_cond_slice
         if sl is not None:
             out[sl] = 0.0
         return out
@@ -235,10 +210,10 @@ class ProblemSpec(ABC):
     def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
         """Construct one (source -> target) training item as a numpy dict.
 
-        Keys: "spatial", "cond_static", "Y", "T_stats", and "forcing_seq" when
-        `dims.has_forcing_seq`. The dataset wraps the arrays in tensors. `ds` is
-        the owning `SnapshotPairDataset` (duck-typed); the adapter reads its
-        grids, trajectories, normalization stats, and caches.
+        Keys: "spatial", "cond_static", "forcing_seq", "Y", "T_stats". The
+        dataset wraps the arrays in tensors. `ds` is the owning
+        `SnapshotPairDataset` (duck-typed); the adapter reads its grids,
+        trajectories, normalization stats, and caches.
         """
 
     @abstractmethod

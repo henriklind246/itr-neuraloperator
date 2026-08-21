@@ -583,7 +583,6 @@ def eval_all_seeds(
             temporal_hidden=model_cfg.get("temporal_hidden", 128),
             forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
             forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
-            use_temporal_encoder=dims.use_temporal_encoder,
             use_forcing_time_aug=dims.use_forcing_time_aug,
             forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
             forcing_spatial_mode=model_cfg.get("forcing_spatial_mode", "broadcast"),
@@ -1186,7 +1185,6 @@ def write_test_records(
         temporal_hidden=model_cfg.get("temporal_hidden", 128),
         forcing_embed_dim=model_cfg.get("forcing_embed_dim", 64),
         forcing_spatial_dim=model_cfg.get("forcing_spatial_dim", 16),
-        use_temporal_encoder=dims.use_temporal_encoder,
         use_forcing_time_aug=dims.use_forcing_time_aug,
         forcing_cond_mode=model_cfg.get("forcing_cond_mode", "both"),
         forcing_spatial_mode=model_cfg.get("forcing_spatial_mode", "broadcast"),
@@ -1212,7 +1210,6 @@ def write_test_records(
     fno.load_state_dict(ckpt["model_state"])
     fno.to(device)
     fno.eval()
-    uses_forcing = bool(getattr(fno, "use_temporal_encoder", True))
 
     hw = float(config.get("training", {}).get("loss", {}).get("interface_half_width", 0.05))
 
@@ -1361,11 +1358,8 @@ def write_test_records(
             items = [dataset[idx] for idx in range(start, stop)]
             spatial = torch.stack([item["spatial"] for item in items]).to(device)
             cond = torch.stack([item["cond_static"] for item in items]).to(device)
-            if uses_forcing:
-                forcing = torch.stack([item["forcing_seq"] for item in items]).to(device)
-                predictions = fno(spatial, cond, forcing)
-            else:
-                predictions = fno(spatial, cond)
+            forcing = torch.stack([item["forcing_seq"] for item in items]).to(device)
+            predictions = fno(spatial, cond, forcing)
             batch_metrics = _batch_metrics(start, items, predictions)
             for offset, (item, metrics) in enumerate(zip(items, batch_metrics, strict=True)):
                 yield start + offset, item, metrics

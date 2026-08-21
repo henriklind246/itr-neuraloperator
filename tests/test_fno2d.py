@@ -448,7 +448,7 @@ class TestBoundaryForcingExtender:
             cond_static_dim=10, cond_hidden=16,
             temporal_token_dim=2, temporal_hidden=16,
             forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=True, use_forcing_time_aug=True,
+            use_forcing_time_aug=True,
             forcing_cond_mode="spatial_only",
             forcing_spatial_mode="boundary_extender",
             forcing_extender_grid_size=6,
@@ -646,29 +646,6 @@ class TestFNO2d:
         assert hasattr(model, "temporal_encoder")
         assert hasattr(model, "forcing_to_spatial")
 
-    def test_forward_encoder_off_no_forcing_seq(self):
-        """Encoder-off path (source benchmark): forward works with
-        forcing_seq=None, lift sees in_channels alone, CIN consumes
-        cond_static alone."""
-        in_ch = 20
-        cond_dim = 8
-        model = FNO2d(
-            modes1=2, modes2=2, width=8,
-            in_channels=in_ch, out_channels=1, n_layers=2,
-            cond_static_dim=cond_dim,
-            use_temporal_encoder=False,
-        )
-        assert not hasattr(model, "temporal_encoder")
-        assert not hasattr(model, "forcing_to_spatial")
-        assert not hasattr(model, "boundary_extender")
-        assert model.linear_p.in_features == in_ch
-        assert model.cond_mlp.net[0].in_features == cond_dim
-
-        spatial = torch.randn(2, 11, 11, in_ch)
-        cond_static = torch.randn(2, cond_dim)
-        out = model(spatial, cond_static)
-        assert out.shape == (2, 11, 11, 1)
-
     def test_s_y_channel_selects_forcing_source_channel(self):
         """The learned spatial forcing field reads s_y from `s_y_channel`. Two
         models with identical weights but different s_y_channel must produce
@@ -723,7 +700,7 @@ class TestFNO2d:
             in_channels=4, out_channels=1, n_layers=2,
             cond_static_dim=10, temporal_token_dim=2,
             temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=16,
-            use_temporal_encoder=True, use_forcing_time_aug=True,
+            use_forcing_time_aug=True,
             forcing_cond_mode="spatial_only",
             forcing_spatial_mode="boundary_extender",
             forcing_extender_grid_size=8,
@@ -747,7 +724,7 @@ class TestFNO2d:
             cond_static_dim=10, cond_hidden=16,
             temporal_token_dim=2, temporal_hidden=16,
             forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=True, use_forcing_time_aug=True,
+            use_forcing_time_aug=True,
             forcing_cond_mode="spatial_only",
             forcing_extender_grid_size=6,
             forcing_extender_heads=4,
@@ -797,7 +774,7 @@ class TestFNO2d:
             cond_static_dim=10, cond_hidden=16,
             temporal_token_dim=2, temporal_hidden=16,
             forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=True, use_forcing_time_aug=True,
+            use_forcing_time_aug=True,
             forcing_cond_mode="spatial_only",
             forcing_spatial_mode="physics_extender",
             forcing_extender_grid_size=6,
@@ -828,7 +805,7 @@ class TestFNO2d:
             cond_static_dim=10, cond_hidden=16,
             temporal_token_dim=2, temporal_hidden=16,
             forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=True, use_forcing_time_aug=True,
+            use_forcing_time_aug=True,
             forcing_cond_mode="spatial_only",
             forcing_spatial_mode="boundary_extender",
             forcing_extender_grid_size=6,
@@ -858,13 +835,6 @@ class TestFNO2d:
             (
                 {"forcing_spatial_mode": "unknown"},
                 "forcing_spatial_mode must be one of",
-            ),
-            (
-                {
-                    "forcing_spatial_mode": "boundary_extender",
-                    "use_temporal_encoder": False,
-                },
-                "requires use_temporal_encoder=True",
             ),
             (
                 {
@@ -926,7 +896,7 @@ class TestFNO2d:
             in_channels=4, out_channels=1, n_layers=2,
             cond_static_dim=10, temporal_token_dim=2,
             temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=True, use_forcing_time_aug=False,
+            use_forcing_time_aug=False,
             forcing_cond_mode="both",
         )
         kwargs.update(overrides)
@@ -940,7 +910,7 @@ class TestFNO2d:
             cond_static_dim=10, cond_hidden=16,
             temporal_token_dim=2, temporal_hidden=16,
             forcing_embed_dim=16, forcing_spatial_dim=4,
-            use_temporal_encoder=True, use_forcing_time_aug=True,
+            use_forcing_time_aug=True,
             forcing_cond_mode="spatial_only",
         )
         torch.manual_seed(7)
@@ -1046,16 +1016,6 @@ class TestFNO2d:
                 cond_static_dim=4, temporal_token_dim=2,
                 temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
                 forcing_cond_mode="bogus",
-            )
-
-    def test_forcing_cond_mode_requires_temporal_encoder(self):
-        with pytest.raises(ValueError, match="use_temporal_encoder=True"):
-            FNO2d(
-                modes1=2, modes2=2, width=8,
-                in_channels=20, out_channels=1, n_layers=2,
-                cond_static_dim=4,
-                use_temporal_encoder=False,
-                forcing_cond_mode="spatial_only",
             )
 
     def test_no_forcing_time_aug_omits_aug_mlp(self):

@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from problems.base import OODAxis, ProblemDims, ProblemSpec, empty_forcing_seq
+from problems.base import OODAxis, ProblemDims, ProblemSpec
 from src.physics.boundary_forcing import (
     DT_PULSE_FRAC_HI,
     DT_PULSE_FRAC_LO,
@@ -20,9 +20,7 @@ from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
     SPATIAL_SAMPLERS,
     SIN_AMP_RANGE,
-    FORCING_BINS,
     default_ramp_seconds,
-    integrate_temporal_bins_ramped_signed,
     integrate_temporal_intervals_ramped_signed,
     ramped_temporal,
     sample_spatial_family,
@@ -37,27 +35,13 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6
 
-SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
+# cond layout is [t_bar_norm, R_c_norm]. The spatial profile s(y) reaches the
+# model as a physical input channel, not as a descriptor in cond_static.
+COND_STATIC_DIM = 2
 
-_BASE_DIM = 2
-_SPATIAL_ONEHOT_DIM = len(SPATIAL_FAMILY_ORDER)
-_SPATIAL_PARAM_DIM = 4
-COND_STATIC_DIM = (
-    _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
-)  # 10 (forcing-agnostic: no temporal one-hot, no forcing summary)
-
-# Spatial-descriptor conditioning ablation slices (single source of truth for the
-# mask helper and the tests). cond layout is [t_bar_norm, R_c_norm,
-# spatial_onehot(4), spatial_params(4)], so the one-hot family label is [2:6] and
-# the full spatial descriptor (family label + continuous params) is [2:10].
-FORCING_FAMILY_SLICE = slice(_BASE_DIM, _BASE_DIM + _SPATIAL_ONEHOT_DIM)  # slice(2, 6)
-FORCING_SPATIAL_DESCRIPTOR_SLICE = slice(_BASE_DIM, COND_STATIC_DIM)  # slice(2, 10)
-
-# temporal_encoder mode: 128 samples x 3 tokens
-# [r_m, a_m / A_ref, interval_average_m / A_ref].
+# 128 samples x 3 tokens [r_m, a_m / A_ref, interval_average_m / A_ref].
 FORCING_TEMPORAL_SAMPLES = 128
 FORCING_TEMPORAL_TOKEN_DIM = 3
-BINS_TEMPORAL_TOKEN_DIM = 2
 A_AMP_REF = 300.0
 INTERFACE_X = 0.5
 K_LEFT = 2.0
@@ -68,76 +52,22 @@ CP_LEFT = 1.0
 CP_RIGHT = 1.0
 T_RIGHT = 300.0
 
-# Spatial channels per representation. temporal_encoder mode lifts the lean
-# [T_tilde, x, y, s_y] base; bins mode appends the FORCING_BINS integral Q-bins.
+# The lift sees the lean [T_tilde, x, y, s_y] base.
 SPATIAL_CHANNELS_TEMPORAL = 4
-SPATIAL_CHANNELS_BINS = SPATIAL_CHANNELS_TEMPORAL + FORCING_BINS  # 20
 
-# s_y is the 4th spatial channel (index 3) in both representations.
+# s_y is the 4th spatial channel (index 3).
 S_Y_CHANNEL = 3
-
-_LOG_SIGMA_LO = float(np.log(GAUSS_SIGMA_RANGE[0]))
-_LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
-
 
 # ----- conditioning / forcing-sequence builders -----
 
-def _normalize_y_position(y: float, y_bounds: tuple[float, float]) -> float:
-    y_lo, y_hi = map(float, y_bounds)
-    return (float(y) - y_lo) / (y_hi - y_lo)
+def build_cond_vector(t_bar_norm: float, R_c: float) -> np.ndarray:
+    """Assemble the 2-dim forcing-agnostic static conditioning vector.
 
-
-def _normalize_y_length(length: float, y_bounds: tuple[float, float]) -> float:
-    y_lo, y_hi = map(float, y_bounds)
-    return float(length) / (y_hi - y_lo)
-
-
-def build_cond_vector(t_bar_norm: float, R_c: float,
-                      spatial_family: str, spatial_params: dict,
-                      y_bounds: tuple[float, float] = (0.0, 1.0),
-                      *,
-                      allow_unknown_spatial_family: bool = False) -> np.ndarray:
-    """Assemble the 10-dim forcing-agnostic static conditioning vector.
-
-    Layout: [t_bar_norm, R_c_norm, spatial_onehot(4),
-    spatial_params(4)]. Carries no temporal-family identity or forcing
-    summary; in temporal_encoder mode the only temporal forcing information
-    lives in forcing_seq, in bins mode it lives in the Q-bin spatial channels.
-
-    An unknown spatial_family raises by default so a typo cannot silently
-    become an all-zero descriptor. allow_unknown_spatial_family=True is only
-    honest when the [2:10] slice is masked out anyway, i.e. under
-    spatial_conditioning='spatial_field_only'.
+    Layout: [t_bar_norm, R_c_norm]. Carries no temporal-family identity and no
+    forcing summary; the only temporal forcing information lives in forcing_seq.
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    base = np.array([t_bar_norm, R_c_norm], dtype=np.float32)
-
-    spatial_oh = np.zeros(_SPATIAL_ONEHOT_DIM, dtype=np.float32)
-    if spatial_family in SPATIAL_FAMILY_ORDER:
-        spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
-    elif not allow_unknown_spatial_family:
-        raise ValueError(
-            f"unknown spatial_family {spatial_family!r}; expected one of "
-            f"{list(SPATIAL_FAMILY_ORDER)}. Pass allow_unknown_spatial_family=True "
-            "only when the spatial descriptor slice is masked out anyway "
-            "(spatial_conditioning='spatial_field_only')."
-        )
-    y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
-    if spatial_family == "patch":
-        y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
-        w_frac = _normalize_y_length(spatial_params["w"], y_bounds)
-        w_norm = (w_frac - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
-    elif spatial_family == "gaussian":
-        y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
-        sigma_frac = _normalize_y_length(spatial_params["sigma_y"], y_bounds)
-        sigma_y_norm = (np.log(sigma_frac) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
-    elif spatial_family == "triangle":
-        y_c_norm = _normalize_y_position(spatial_params["y_c"], y_bounds)
-        ell_frac = _normalize_y_length(spatial_params["ell"], y_bounds)
-        ell_norm = (ell_frac - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
-    spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
-
-    return np.concatenate([base, spatial_oh, spatial_p]).astype(np.float32)
+    return np.array([t_bar_norm, R_c_norm], dtype=np.float32)
 
 
 def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
@@ -267,22 +197,15 @@ def _slice_pulse_pool(pool: dict, Np: int) -> dict:
 class ForcingProblem(ProblemSpec):
     """Separable boundary flux q_L(y, t) = a(t) * s(y) benchmark.
 
-    Two representations over the same trajectories/sim_params:
-
-    - ``temporal_encoder``: 4 spatial channels [T_tilde, x, y, s_y], 10
-      forcing-agnostic static dims, a (128, 3) forcing_seq with point values and
-      local interval averages normalized by A_ref,
-      temporal encoder on with time-augmented spatial injection.
-    - ``bins``: 20 spatial channels [T_tilde, x, y, s_y, Q_y_bin_0..15], same
-      10 static dims, an empty forcing_seq, temporal encoder off.
+    4 spatial channels [T_tilde, x, y, s_y], 2 forcing-agnostic static dims,
+    and a (128, 3) forcing_seq with point values and local interval averages
+    normalized by A_ref, consumed by the temporal encoder with time-augmented
+    spatial injection.
 
     Interface fixed at x = 0.5.
     """
 
     name = "forcing"
-
-    family_cond_slice = FORCING_FAMILY_SLICE
-    spatial_descriptor_cond_slice = FORCING_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -290,25 +213,12 @@ class ForcingProblem(ProblemSpec):
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
                 cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=True,
                 temporal_token_dim=FORCING_TEMPORAL_TOKEN_DIM,
                 t_stats_dim=2,
-                use_temporal_encoder=True,
                 s_y_channel=S_Y_CHANNEL,
                 use_forcing_time_aug=True,
                 forcing_extender_rc_cond_index=1,
                 supports_diffusion_geometry_extender=True,
-            )
-        elif representation == "bins":
-            self.dims = ProblemDims(
-                in_channels=SPATIAL_CHANNELS_BINS,
-                cond_static_dim=COND_STATIC_DIM,
-                has_forcing_seq=False,
-                temporal_token_dim=BINS_TEMPORAL_TOKEN_DIM,
-                t_stats_dim=2,
-                use_temporal_encoder=False,
-                s_y_channel=S_Y_CHANNEL,
-                use_forcing_time_aug=False,
             )
         else:
             raise ValueError(
@@ -450,12 +360,9 @@ class ForcingProblem(ProblemSpec):
     # ---- dataset item ----
 
     def setup_dataset(self, ds) -> None:
-        if self.representation == "temporal_encoder":
-            # Force the 128-sample token grid regardless of the config default.
-            ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
-            ds._q_callables = {}
-        else:
-            ds.q_ref = np.float32(SIN_AMP_RANGE[1] * ds.t_final / FORCING_BINS)
+        # Force the 128-sample token grid regardless of the config default.
+        ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
+        ds._q_callables = {}
 
         profiles = {}
         for sim_id in ds.sim_ids:
@@ -476,8 +383,6 @@ class ForcingProblem(ProblemSpec):
     ) -> dict[str, np.ndarray]:
         sid = int(sid)
         params = ds.sim_params[sid]
-        spatial_family = params["spatial_family"]
-        spatial_params = params["spatial_params"]
 
         T_source = ds.trajectories[sid, s, :, :]
         T_target = ds.trajectories[sid, j, :, :]
@@ -502,58 +407,34 @@ class ForcingProblem(ProblemSpec):
             [T_source_norm, ds.X_norm, ds.Y_norm, S_y], axis=-1,
         ).astype(np.float32)
 
-        cond_static = build_cond_vector(
-            t_bar_norm=t_bar_norm,
-            R_c=R_c,
-            spatial_family=spatial_family,
-            spatial_params=spatial_params,
-            y_bounds=(float(ds.y_grid[0]), float(ds.y_grid[-1])),
-            allow_unknown_spatial_family=(
-                self.spatial_conditioning == "spatial_field_only"
-            ),
-        )
+        cond_static = build_cond_vector(t_bar_norm=t_bar_norm, R_c=R_c)
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global], dtype=np.float32)
 
-        if self.representation == "temporal_encoder":
-            if sid not in ds._q_callables:
-                ds._q_callables[sid] = ramped_temporal(
-                    params["temporal_family"],
-                    params["temporal_params"],
-                    ds.ramp_seconds,
-                )
-            q = ds._q_callables[sid]
-            t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
-            forcing_seq = _forcing_seq_3tok_from_samples(
-                t_samples,
-                a_m,
-                interval_integral_fn=lambda t_lo, t_hi: integrate_temporal_intervals_ramped_signed(
-                    params["temporal_family"],
-                    params["temporal_params"],
-                    t_lo,
-                    t_hi,
-                    ds.ramp_seconds,
-                ),
-                A_amp_ref=A_AMP_REF,
-            )
-            spatial = spatial_base
-        else:
-            bins = integrate_temporal_bins_ramped_signed(
+        if sid not in ds._q_callables:
+            ds._q_callables[sid] = ramped_temporal(
                 params["temporal_family"],
                 params["temporal_params"],
-                t_s_val,
-                t_j_val,
                 ds.ramp_seconds,
-                K=FORCING_BINS,
-            ).astype(np.float32)
-            Q_y_bins = (s_y[None, :, None] * bins[None, None, :] / ds.q_ref).astype(np.float32)
-            Q_y_bins_2d = np.broadcast_to(Q_y_bins, (ds.Nx, ds.Ny, FORCING_BINS))
-            spatial = np.concatenate([spatial_base, Q_y_bins_2d], axis=-1).astype(np.float32)
-            forcing_seq = empty_forcing_seq()
+            )
+        q = ds._q_callables[sid]
+        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+        forcing_seq = _forcing_seq_3tok_from_samples(
+            t_samples,
+            a_m,
+            interval_integral_fn=lambda t_lo, t_hi: integrate_temporal_intervals_ramped_signed(
+                params["temporal_family"],
+                params["temporal_params"],
+                t_lo,
+                t_hi,
+                ds.ramp_seconds,
+            ),
+            A_amp_ref=A_AMP_REF,
+        )
 
         return {
-            "spatial": spatial,
+            "spatial": spatial_base,
             "cond_static": cond_static,
             "forcing_seq": forcing_seq,
             "Y": Y,

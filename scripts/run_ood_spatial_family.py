@@ -20,9 +20,8 @@ Three CRN-paired arms share identical latents per sim_id and differ only in s(y)
                  identical to the trained uniform family. A correctness anchor
                  on the new code path: read it before anything else.
 
-Requires a checkpoint trained with spatial_conditioning='spatial_field_only',
-which zeroes the cond_static spatial descriptor. Under any other mode the model
-would be handed a descriptor that lies about the sinusoid.
+The forcing cond_static carries no spatial descriptor, so s(y) reaches the model
+only through its spatial input channel and an unseen family is fed honestly.
 
 All uncertainty is over simulations, never over pairs: pairs from one simulation
 share latents and a trajectory, so a pair-level SEM is pseudo-replication.
@@ -126,16 +125,6 @@ def check_preconditions(ckpt):
         raise SystemExit(
             f"this study is defined for the forcing benchmark; checkpoint "
             f"reports benchmark.name={name!r}."
-        )
-    mode = bench.get("spatial_conditioning")
-    if mode != "spatial_field_only":
-        raise SystemExit(
-            f"checkpoint has benchmark.spatial_conditioning={mode!r}, expected "
-            "'spatial_field_only'. Under any other mode the model reads the 8-slot "
-            "spatial descriptor in cond_static, and an unseen family has no honest "
-            "descriptor to supply: the sinusoid would be fed a zeroed (or wrong) "
-            "one-hot, so the result would measure a broken input, not zero-shot "
-            "generalization."
         )
 
 
@@ -812,8 +801,6 @@ def main(argv=None):
     how = materialize_checkpoint(ckpt_path, staged, args.allow_symlink)
     print(f"Checkpoint {ckpt_path} -> {staged} ({how})", flush=True)
     print(f"  experiment: {ckpt['conf'].get('experiment', {}).get('name')}", flush=True)
-    print(f"  spatial_conditioning: "
-          f"{ckpt['conf']['benchmark'].get('spatial_conditioning')}", flush=True)
 
     arm_dirs, arm_params, manifest = generate_arms(args, out_dir, ckpt_info={
         "source_path": str(ckpt_path),
