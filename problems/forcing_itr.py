@@ -90,6 +90,7 @@ class ForcingItrProblem(ForcingProblem):
     """Forcing benchmark with a Gaussian spatial interface-resistance profile."""
 
     name = "forcing_itr"
+    supports_scalar_spatial_input = False
     required_observation_times = REQUIRED_OBSERVATION_TIMES
 
     def __init__(self, representation: str = "temporal_encoder"):

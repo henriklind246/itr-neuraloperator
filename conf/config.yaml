@@ -6,6 +6,11 @@ experiment:
 benchmark:
   name: forcing
   representation: temporal_encoder
+  spatial_input:
+    # Optional normalized scalar fields appended after [T_tilde, x, y, s_y].
+    # These duplicate the forcing benchmark's cond_static values for ablations.
+    itr: false
+    lead_time: false
 
 model:
   type: "2D FNO time-conditioned (temporal branch)"

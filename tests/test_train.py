@@ -100,6 +100,13 @@ class TestLoadConfig:
         assert "training" in cfg
         assert "data" in cfg
 
+    def test_forcing_spatial_input_defaults_are_disabled(self):
+        cfg = load_config()
+        assert cfg["benchmark"]["spatial_input"] == {
+            "itr": False,
+            "lead_time": False,
+        }
+
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
             load_config("/nonexistent/path/config.yaml")

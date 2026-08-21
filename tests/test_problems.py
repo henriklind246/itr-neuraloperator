@@ -239,6 +239,50 @@ class TestForcingItem:
             first["cond_static"], shifted["cond_static"], rtol=0.0, atol=1e-7
         )
 
+    @pytest.mark.parametrize(
+        ("include_itr", "include_lead_time", "expected_channels"),
+        [(True, False, 5), (False, True, 5), (True, True, 6)],
+    )
+    def test_optional_scalar_spatial_channels(
+        self,
+        forcing_dataset,
+        include_itr,
+        include_lead_time,
+        expected_channels,
+    ):
+        ds = forcing_dataset
+        spec = problem_from_config({
+            "benchmark": {
+                "name": "forcing",
+                "spatial_input": {
+                    "itr": include_itr,
+                    "lead_time": include_lead_time,
+                },
+            }
+        })
+        ds.problem = spec
+        sid, s, j = ds._pairs[-1]
+        item = spec.build_item(ds, sid, s, j)
+
+        assert spec.dims.in_channels == expected_channels
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, expected_channels)
+        next_channel = 4
+        if include_itr:
+            np.testing.assert_allclose(
+                item["spatial"][..., next_channel],
+                item["cond_static"][1],
+                rtol=0.0,
+                atol=0.0,
+            )
+            next_channel += 1
+        if include_lead_time:
+            np.testing.assert_allclose(
+                item["spatial"][..., next_channel],
+                item["cond_static"][0],
+                rtol=0.0,
+                atol=0.0,
+            )
+
 
 class TestForcingUnknownSpatialFamily:
     """forcing cond_static carries no spatial descriptor, so an unregistered
@@ -942,6 +986,36 @@ class TestProblemFromConfig:
         })
         assert spec.rc_channel_mode == "localized"
         assert spec.rc_ell == pytest.approx(0.08)
+
+    def test_forcing_reads_optional_spatial_input_knobs(self):
+        spec = problem_from_config({
+            "benchmark": {
+                "name": "forcing",
+                "spatial_input": {"itr": True, "lead_time": True},
+            }
+        })
+        assert spec.spatial_input_itr is True
+        assert spec.spatial_input_lead_time is True
+        assert spec.dims.in_channels == 6
+
+    @pytest.mark.parametrize("value", [1, "true", None])
+    def test_forcing_rejects_non_boolean_spatial_input_knobs(self, value):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            problem_from_config({
+                "benchmark": {
+                    "name": "forcing",
+                    "spatial_input": {"itr": value},
+                }
+            })
+
+    def test_other_benchmarks_reject_enabled_scalar_spatial_input(self):
+        with pytest.raises(ValueError, match="only by the forcing benchmark"):
+            problem_from_config({
+                "benchmark": {
+                    "name": "source",
+                    "spatial_input": {"lead_time": True},
+                }
+            })
 
 
 class TestGeometryAwareProblemSampling:

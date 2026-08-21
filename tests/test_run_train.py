@@ -70,6 +70,18 @@ class TestRunTrainFixedHelpers:
             "forcing_extender_condition_on_rc"
         ] is True
 
+    def test_forcing_scalar_spatial_inputs_are_cli_overrideable(self):
+        config_path = Path(__file__).resolve().parents[1] / "conf" / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        _apply_override(config, "benchmark.spatial_input.itr", True)
+        _apply_override(config, "benchmark.spatial_input.lead_time", True)
+
+        assert config["benchmark"]["spatial_input"] == {
+            "itr": True,
+            "lead_time": True,
+        }
+
     def test_physics_extender_options_are_cli_overrideable(self):
         config_path = Path(__file__).resolve().parents[1] / "conf" / "config.yaml"
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))

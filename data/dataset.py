@@ -35,6 +35,23 @@ def problem_from_config(config: dict) -> ProblemSpec:
     name = str(benchmark.get("name", "forcing"))
     representation = str(benchmark.get("representation", "temporal_encoder"))
     spec = get_problem(name, representation)
+    spatial_input = benchmark.get("spatial_input") or {}
+    if not isinstance(spatial_input, dict):
+        raise ValueError("benchmark.spatial_input must be a mapping.")
+    spatial_input_itr = spatial_input.get("itr", False)
+    spatial_input_lead_time = spatial_input.get("lead_time", False)
+    configure_spatial_input = getattr(spec, "configure_spatial_input", None)
+    if configure_spatial_input is None:
+        if spatial_input_itr or spatial_input_lead_time:
+            raise ValueError(
+                "benchmark.spatial_input scalar channels are supported only by "
+                "the forcing benchmark."
+            )
+    else:
+        configure_spatial_input(
+            itr=spatial_input_itr,
+            lead_time=spatial_input_lead_time,
+        )
     if "rc_channel_mode" in benchmark:
         spec.rc_channel_mode = str(benchmark.get("rc_channel_mode"))
     if "rc_ell" in benchmark:

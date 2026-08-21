@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -206,9 +207,12 @@ class ForcingProblem(ProblemSpec):
     """
 
     name = "forcing"
+    supports_scalar_spatial_input = True
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
+        self.spatial_input_itr = False
+        self.spatial_input_lead_time = False
         if representation == "temporal_encoder":
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
@@ -224,6 +228,38 @@ class ForcingProblem(ProblemSpec):
             raise ValueError(
                 f"Unknown representation {representation!r} for benchmark {self.name!r}."
             )
+
+    def configure_spatial_input(self, *, itr: bool, lead_time: bool) -> None:
+        """Enable normalized scalar fields appended to the spatial input."""
+        options = {"itr": itr, "lead_time": lead_time}
+        for key, value in options.items():
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"benchmark.spatial_input.{key} must be a boolean, got "
+                    f"{value!r}."
+                )
+        if not self.supports_scalar_spatial_input and any(options.values()):
+            raise ValueError(
+                "benchmark.spatial_input scalar channels are supported only by "
+                "the forcing benchmark."
+            )
+        if not self.supports_scalar_spatial_input:
+            return
+
+        previous_extra = int(getattr(self, "spatial_input_itr", False)) + int(
+            getattr(self, "spatial_input_lead_time", False)
+        )
+        base_in_channels = self.dims.in_channels - previous_extra
+        self.spatial_input_itr = itr
+        self.spatial_input_lead_time = lead_time
+        self.dims = replace(
+            self.dims,
+            in_channels=(
+                base_in_channels
+                + int(self.spatial_input_itr)
+                + int(self.spatial_input_lead_time)
+            ),
+        )
 
     # ---- data generation ----
 
@@ -401,13 +437,20 @@ class ForcingProblem(ProblemSpec):
         # therefore yields t_bar_norm > 1.0.
         t_bar_norm = t_bar / ds.time_norm_horizon
 
+        cond_static = build_cond_vector(t_bar_norm=t_bar_norm, R_c=R_c)
+
         s_y = ds.s_y_profiles[sid]
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
-        spatial_base = np.stack(
-            [T_source_norm, ds.X_norm, ds.Y_norm, S_y], axis=-1,
-        ).astype(np.float32)
-
-        cond_static = build_cond_vector(t_bar_norm=t_bar_norm, R_c=R_c)
+        spatial_channels = [T_source_norm, ds.X_norm, ds.Y_norm, S_y]
+        if getattr(self, "spatial_input_itr", False):
+            spatial_channels.append(
+                np.full((ds.Nx, ds.Ny), cond_static[1], dtype=np.float32)
+            )
+        if getattr(self, "spatial_input_lead_time", False):
+            spatial_channels.append(
+                np.full((ds.Nx, ds.Ny), cond_static[0], dtype=np.float32)
+            )
+        spatial_base = np.stack(spatial_channels, axis=-1).astype(np.float32)
 
         Y = T_target_norm[:, :, None].astype(np.float32)
         T_stats = np.array([ds.mu_global, ds.sigma_global], dtype=np.float32)
