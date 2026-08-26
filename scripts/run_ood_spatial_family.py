@@ -20,8 +20,11 @@ Three CRN-paired arms share identical latents per sim_id and differ only in s(y)
                  identical to the trained uniform family. A correctness anchor
                  on the new code path: read it before anything else.
 
-The forcing cond_static carries no spatial descriptor, so s(y) reaches the model
-only through its spatial input channel and an unseen family is fed honestly.
+The forcing cond_static carries eight equal-y-interval averages of s(y), so the
+same unseen profile reaches the model honestly through both the spatial field
+and, for checkpoints trained with ``spatial_conditioning=full``, the
+family-independent conditioning pathway. Checkpoints trained with
+``spatial_conditioning=spatial_field_only`` receive zeros in those eight slots.
 
 All uncertainty is over simulations, never over pairs: pairs from one simulation
 share latents and a trajectory, so a pair-level SEM is pseudo-replication.
@@ -125,6 +128,12 @@ def check_preconditions(ckpt):
         raise SystemExit(
             f"this study is defined for the forcing benchmark; checkpoint "
             f"reports benchmark.name={name!r}."
+        )
+    if bench.get("spatial_profile_bins") != 8:
+        raise SystemExit(
+            "this study requires a checkpoint trained with the eight-bin "
+            "spatial-profile conditioning contract "
+            "(benchmark.spatial_profile_bins=8)."
         )
 
 
@@ -667,6 +676,25 @@ def report(out_dir, arm_dirs, arm_params, manifest, args):
         w.writeheader()
         w.writerows(strata)
 
+    from visual.forcing_plots import (
+        generate_zero_shot_sinusoid_field_and_jump,
+        plot_forcing_sinusoid_temporal_panels,
+    )
+
+    forcing_plot_path = out_dir / "sinusoid_temporal_forcing.png"
+    plot_forcing_sinusoid_temporal_panels(
+        seed=args.rng_seed,
+        save_path=forcing_plot_path,
+        dt=float(manifest["grid"]["dt"]),
+        t_final=float(manifest["grid"]["t_final"]),
+    )
+    case_plot_base = out_dir / "zero_shot_field_and_jump"
+    case_plot = generate_zero_shot_sinusoid_field_and_jump(
+        checkpoint_path=out_dir / "ckpt" / args.seed_name / "fno2d_best.pt",
+        data_dir=arm_dirs["sinusoid"],
+        save_path=case_plot_base,
+    )
+
     # ---- console ----
     print()
     print("=" * 78)
@@ -745,6 +773,9 @@ def report(out_dir, arm_dirs, arm_params, manifest, args):
     print(f"Wrote {overall_path}")
     print(f"Wrote {strata_path}")
     print(f"Wrote {per_sim_path}")
+    print(f"Wrote {forcing_plot_path}")
+    for path in case_plot["paths"]:
+        print(f"Wrote {path}")
 
 
 # ---------- main ----------
@@ -809,6 +840,9 @@ def main(argv=None):
         "best_val": ckpt.get("best_val"),
         "config_id": ckpt["conf"].get("config_id"),
         "spatial_conditioning": ckpt["conf"]["benchmark"].get("spatial_conditioning"),
+        "spatial_profile_bins": ckpt["conf"]["benchmark"].get(
+            "spatial_profile_bins"
+        ),
         "representation": ckpt["conf"]["benchmark"].get("representation")
                           or ckpt["conf"].get("representation"),
         "mu_global": ckpt.get("mu_global"),

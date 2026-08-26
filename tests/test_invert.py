@@ -1343,7 +1343,11 @@ def test_forcing_adapter_cond_injection_matches_build_cond_vector(R_c):
     from problems.forcing import build_cond_vector
 
     adapter = ForcingAdapter()
-    cond = build_cond_vector(t_bar_norm=0.3, R_c=R_c)
+    cond = build_cond_vector(
+        t_bar_norm=0.3,
+        R_c=R_c,
+        spatial_profile_bins=np.ones(8, dtype=np.float32),
+    )
     got = adapter.cond_slice_from_theta(
         torch.tensor([R_c], dtype=torch.float64)
     ).numpy()

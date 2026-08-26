@@ -220,12 +220,12 @@ def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout():
     np.testing.assert_array_equal(
         sin_item["spatial"][..., 5:], parent_item["spatial"][..., 4:]
     )
-    # cond [t_bar, R_base, A]; the block after the two sinusoid scalars matches
-    # the parent's block after its scalar R_c slot.
+    # cond [t_bar, R_base, A, profile_bins(8)]; the block after the two
+    # sinusoid scalars matches the parent's block after its scalar R_c slot.
     np.testing.assert_array_equal(
         sin_item["cond_static"][3:], parent_item["cond_static"][2:]
     )
-    assert sin_item["cond_static"].shape == (3,)
+    assert sin_item["cond_static"].shape == (11,)
     assert sin_item["spatial"].shape[-1] == 5
 
 
@@ -365,7 +365,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
     torch.manual_seed(4)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=5, temporal_token_dim=3,
+        n_layers=2, cond_static_dim=13, temporal_token_dim=3,
         temporal_hidden=16, forcing_embed_dim=16,
         use_forcing_time_aug=True, s_y_channel=3,
     ).eval()
@@ -373,7 +373,7 @@ def test_forcing_itr_inverse_dispatch_and_determinism():
         parameter.requires_grad_(False)
     spatial = torch.zeros(3, 12, 12, 5)
     spatial[..., 3] = 1.0
-    cond = torch.zeros(3, 5)
+    cond = torch.zeros(3, 13)
     cond[:, 0] = torch.tensor([0.07, 0.15, 0.30])
     forcing_seq = torch.zeros(3, 128, 3)
     forcing_seq[..., 0] = torch.linspace(0.0, 1.0, 128)
@@ -444,7 +444,7 @@ def test_validation_calibration_artifact_construction():
     torch.manual_seed(5)
     model = FNO2d(
         modes1=2, modes2=2, width=8, in_channels=5, out_channels=1,
-        n_layers=2, cond_static_dim=5, temporal_token_dim=3,
+        n_layers=2, cond_static_dim=13, temporal_token_dim=3,
         temporal_hidden=16, forcing_embed_dim=16,
         use_forcing_time_aug=True, s_y_channel=3,
     ).eval()

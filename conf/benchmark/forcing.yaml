@@ -5,6 +5,8 @@
 
 benchmark:
   name: forcing
+  spatial_conditioning: full
+  spatial_profile_bins: 8
 
 training:
   loss:

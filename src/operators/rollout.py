@@ -131,9 +131,17 @@ def _build_forcing_rollout_item(
     spatial = out["spatial"]
     spatial[..., 0] = current
     t_bar_norm = _subinterval_lead_feature(ds, t_lo, t_hi)
+    profile_bins = forcing_problem.build_spatial_profile_bin_averages(
+        ds.y_grid,
+        spatial[0, :, problem.dims.s_y_channel],
+    )
     out["cond_static"] = forcing_problem.build_cond_vector(
         t_bar_norm=t_bar_norm,
         R_c=float(params["R_c"]),
+        spatial_profile_bins=profile_bins,
+    )
+    out["cond_static"] = problem._apply_spatial_conditioning_mask(
+        out["cond_static"]
     )
 
     q = _q_callable_for_boundary(ds, sid, params)

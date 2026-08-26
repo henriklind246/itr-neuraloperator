@@ -36,9 +36,14 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6
 
-# cond layout is [t_bar_norm, R_c_norm]. The spatial profile s(y) reaches the
-# model as a physical input channel, not as a descriptor in cond_static.
-COND_STATIC_DIM = 2
+# cond layout is [t_bar_norm, R_c_norm, spatial_profile_bin_0..7]. The bins are
+# equal-width interval averages of the same discretized s(y) supplied through
+# the spatial input, so every spatial family (including zero-shot families) has
+# one family-independent conditioning representation.
+SPATIAL_PROFILE_BINS = 8
+_BASE_COND_DIM = 2
+COND_STATIC_DIM = _BASE_COND_DIM + SPATIAL_PROFILE_BINS
+FORCING_SPATIAL_DESCRIPTOR_SLICE = slice(_BASE_COND_DIM, COND_STATIC_DIM)
 
 # 128 samples x 3 tokens [r_m, a_m / A_ref, interval_average_m / A_ref].
 FORCING_TEMPORAL_SAMPLES = 128
@@ -61,14 +66,53 @@ S_Y_CHANNEL = 3
 
 # ----- conditioning / forcing-sequence builders -----
 
-def build_cond_vector(t_bar_norm: float, R_c: float) -> np.ndarray:
-    """Assemble the 2-dim forcing-agnostic static conditioning vector.
+def build_spatial_profile_bin_averages(
+    y_grid: np.ndarray,
+    s_y: np.ndarray,
+) -> np.ndarray:
+    """Average the piecewise-linear sampled profile over eight equal y bins."""
+    y = np.asarray(y_grid, dtype=np.float64)
+    profile = np.asarray(s_y, dtype=np.float64)
+    if y.ndim != 1 or profile.shape != y.shape or y.size < 2:
+        raise ValueError(
+            "y_grid and s_y must be matching one-dimensional arrays with at "
+            f"least two entries, got {y.shape} and {profile.shape}."
+        )
+    if np.any(np.diff(y) <= 0.0):
+        raise ValueError("y_grid must be strictly increasing.")
 
-    Layout: [t_bar_norm, R_c_norm]. Carries no temporal-family identity and no
-    forcing summary; the only temporal forcing information lives in forcing_seq.
+    edges = np.linspace(y[0], y[-1], SPATIAL_PROFILE_BINS + 1, dtype=np.float64)
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    averages = np.empty(SPATIAL_PROFILE_BINS, dtype=np.float32)
+    for k, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        interior = (y > lo) & (y < hi)
+        y_bin = np.concatenate(([lo], y[interior], [hi]))
+        s_bin = np.interp(y_bin, y, profile)
+        averages[k] = np.float32(trapz(s_bin, y_bin) / (hi - lo))
+    return averages
+
+
+def build_cond_vector(
+    t_bar_norm: float,
+    R_c: float,
+    spatial_profile_bins: np.ndarray,
+) -> np.ndarray:
+    """Assemble the 10-dim family-independent static conditioning vector.
+
+    Layout: [t_bar_norm, R_c_norm, spatial_profile_bin_0..7]. Carries no
+    temporal-family identity and no temporal forcing summary; the only temporal
+    forcing information lives in forcing_seq.
     """
     R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    return np.array([t_bar_norm, R_c_norm], dtype=np.float32)
+    profile_bins = np.asarray(spatial_profile_bins, dtype=np.float32)
+    if profile_bins.shape != (SPATIAL_PROFILE_BINS,):
+        raise ValueError(
+            f"spatial_profile_bins must have shape ({SPATIAL_PROFILE_BINS},), "
+            f"got {profile_bins.shape}."
+        )
+    return np.concatenate(
+        [np.array([t_bar_norm, R_c_norm], dtype=np.float32), profile_bins]
+    ).astype(np.float32)
 
 
 def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
@@ -198,7 +242,7 @@ def _slice_pulse_pool(pool: dict, Np: int) -> dict:
 class ForcingProblem(ProblemSpec):
     """Separable boundary flux q_L(y, t) = a(t) * s(y) benchmark.
 
-    4 spatial channels [T_tilde, x, y, s_y], 2 forcing-agnostic static dims,
+    4 spatial channels [T_tilde, x, y, s_y], 10 family-independent static dims,
     and a (128, 3) forcing_seq with point values and local interval averages
     normalized by A_ref, consumed by the temporal encoder with time-augmented
     spatial injection.
@@ -208,6 +252,8 @@ class ForcingProblem(ProblemSpec):
 
     name = "forcing"
     supports_scalar_spatial_input = True
+    spatial_profile_bins = SPATIAL_PROFILE_BINS
+    spatial_descriptor_cond_slice = FORCING_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -437,9 +483,14 @@ class ForcingProblem(ProblemSpec):
         # therefore yields t_bar_norm > 1.0.
         t_bar_norm = t_bar / ds.time_norm_horizon
 
-        cond_static = build_cond_vector(t_bar_norm=t_bar_norm, R_c=R_c)
-
         s_y = ds.s_y_profiles[sid]
+        profile_bins = build_spatial_profile_bin_averages(ds.y_grid, s_y)
+        cond_static = build_cond_vector(
+            t_bar_norm=t_bar_norm,
+            R_c=R_c,
+            spatial_profile_bins=profile_bins,
+        )
+
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
         spatial_channels = [T_source_norm, ds.X_norm, ds.Y_norm, S_y]
         if getattr(self, "spatial_input_itr", False):

@@ -53,7 +53,8 @@ def _source_conf():
     return {
         "experiment": {"name": "E11_source"},
         "benchmark": {"name": "forcing", "representation": "temporal_encoder",
-                      "spatial_conditioning": "spatial_field_only"},
+                      "spatial_conditioning": "spatial_field_only",
+                      "spatial_profile_bins": 8},
         "model": {"parameters": _model_params()},
         "training": {
             "epochs": 36, "learning_rate": 2.8e-3, "batch_size": 512,

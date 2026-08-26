@@ -8,6 +8,7 @@ from problems.base import OODAxis, ProblemDims
 from problems.forcing import (
     COND_STATIC_DIM as FORCING_COND_STATIC_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
+    SPATIAL_PROFILE_BINS,
 )
 from problems.forcing_itr import (
     DEFAULT_ITR_PROFILE_SEED,
@@ -24,9 +25,13 @@ from src.physics.internal_source import (
 )
 
 
-# cond_static: forcing's [t_bar, R_c] has its scalar R_c slot at index 1 replaced
-# by the two sinusoid scalars [R_base, A], giving [t_bar, R_base, A] (3-dim).
-COND_STATIC_DIM = FORCING_COND_STATIC_DIM + 1  # 3
+# cond_static: forcing's [t_bar, R_c, profile_bins(8)] has its scalar R_c slot
+# replaced by [R_base, A], giving [t_bar, R_base, A, profile_bins(8)].
+COND_STATIC_DIM = FORCING_COND_STATIC_DIM + 1
+FORCING_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE = slice(
+    COND_STATIC_DIM - SPATIAL_PROFILE_BINS,
+    COND_STATIC_DIM,
+)
 
 DEFAULT_SIN_PROFILE_SEED = DEFAULT_ITR_PROFILE_SEED + 993
 
@@ -39,7 +44,7 @@ def build_cond_vector_forcing_itr_sin(
 ) -> np.ndarray:
     """Replace forcing's scalar-resistance slot with the two sinusoid parameters.
 
-    Layout: [t_bar, R_base_norm, A_norm, onehot(4), params(4)] (11-dim). R_base is
+    Layout: [t_bar, R_base_norm, A_norm, profile_bins(8)] (11-dim). R_base is
     min-max normalized over RC_SIN_RANGES["R_base"]; A uses the **global**
     conditioning normalization A_norm = A / (R_PEAK_MAX - RC_MIN) over the constant
     RC_SIN_RANGES["A"] (NOT the headroom fraction A / (R_PEAK_MAX - R_base) used for
@@ -77,6 +82,7 @@ class ForcingItrSinProblem(ForcingItrProblem):
     """
 
     name = "forcing_itr_sin"
+    spatial_descriptor_cond_slice = FORCING_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation

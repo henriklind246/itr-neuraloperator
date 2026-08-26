@@ -9,6 +9,7 @@ from problems.base import OODAxis, ProblemDims
 from problems.forcing import (
     COND_STATIC_DIM as FORCING_COND_STATIC_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
+    SPATIAL_PROFILE_BINS,
     SPATIAL_CHANNELS_TEMPORAL as FORCING_SPATIAL_CHANNELS_TEMPORAL,
     ForcingProblem,
 )
@@ -27,9 +28,14 @@ from src.physics.internal_source import (
 )
 
 
-# build_cond_vector_forcing_itr rewrites forcing's [t_bar, R_c] into
-# [t_bar, itr(4)]: the scalar R_c slot at index 1 becomes the four void params.
+# build_cond_vector_forcing_itr rewrites forcing's [t_bar, R_c, profile_bins(8)]
+# into [t_bar, itr(4), profile_bins(8)]: the scalar R_c slot at index 1 becomes
+# the four void parameters.
 COND_STATIC_DIM = FORCING_COND_STATIC_DIM + 3
+FORCING_ITR_SPATIAL_DESCRIPTOR_SLICE = slice(
+    COND_STATIC_DIM - SPATIAL_PROFILE_BINS,
+    COND_STATIC_DIM,
+)
 SPATIAL_CHANNELS_TEMPORAL = FORCING_SPATIAL_CHANNELS_TEMPORAL + 1
 S_Y_CHANNEL = 3
 REQUIRED_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
@@ -91,6 +97,7 @@ class ForcingItrProblem(ForcingProblem):
 
     name = "forcing_itr"
     supports_scalar_spatial_input = False
+    spatial_descriptor_cond_slice = FORCING_ITR_SPATIAL_DESCRIPTOR_SLICE
     required_observation_times = REQUIRED_OBSERVATION_TIMES
 
     def __init__(self, representation: str = "temporal_encoder"):

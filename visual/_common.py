@@ -46,6 +46,8 @@ PLOT_REGISTRY: dict[str, str] = {
     "forcing_temporal_families":            "forcing",
     "forcing_spatial_profiles":             "forcing",
     "forcing_separable_assembly":           "forcing",
+    "forcing_sinusoid_temporal_panels":      "forcing",
+    "forcing_zero_shot_field_jump":          "forcing",
     "forcing_seq_tokens":                   "forcing",
     "forcing_summary_scalars":              "forcing",
     "forcing_param_distributions_design":   "forcing",

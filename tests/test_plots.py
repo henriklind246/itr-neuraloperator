@@ -111,6 +111,8 @@ class TestPlotRegistry:
             "forcing_temporal_families",
             "forcing_spatial_profiles",
             "forcing_separable_assembly",
+            "forcing_sinusoid_temporal_panels",
+            "forcing_zero_shot_field_jump",
             "forcing_seq_tokens",
             "forcing_summary_scalars",
             "forcing_param_distributions_design",
@@ -480,6 +482,80 @@ class TestForcingPlots:
         out_path = tmp_path / "forcing_separable_assembly.png"
         forcing_plots.plot_forcing_separable_assembly(save_path=out_path)
         assert out_path.exists()
+
+    def test_sinusoid_temporal_panels_use_one_profile(self, tmp_path, monkeypatch):
+        calls = []
+        real_build_qL = forcing_plots.build_qL
+
+        def capture(temporal_family, temporal_params, spatial_family,
+                    spatial_params, y_grid, t_ramp=0.0):
+            calls.append((temporal_family, spatial_family, dict(spatial_params)))
+            return real_build_qL(
+                temporal_family, temporal_params, spatial_family,
+                spatial_params, y_grid, t_ramp=t_ramp,
+            )
+
+        monkeypatch.setattr(forcing_plots, "build_qL", capture)
+        out_path = tmp_path / "forcing_sinusoid_temporal_panels.png"
+        forcing_plots.plot_forcing_sinusoid_temporal_panels(
+            n_time=40, n_y=30, save_path=out_path,
+        )
+
+        assert out_path.exists()
+        assert [call[0] for call in calls] == list(
+            forcing_plots.TEMPORAL_FAMILY_ORDER
+        )
+        assert {call[1] for call in calls} == {"sinusoid"}
+        assert all(call[2] == calls[0][2] for call in calls[1:])
+
+    def test_zero_shot_field_and_jump_smoke(self, tmp_path):
+        x = np.linspace(0.0, 1.0, 10)
+        y = np.linspace(0.0, 1.0, 10)
+        X, Y = np.meshgrid(x, y, indexing="ij")
+        truths = [
+            300.0 + 8.0 * np.exp(-2.5 * X)
+            * (0.8 + 0.2 * np.sin(2 * np.pi * Y)),
+            300.0 + 6.0 * np.exp(-3.0 * X)
+            * (0.75 + 0.25 * np.cos(2 * np.pi * Y)),
+        ]
+        predictions = [
+            truths[0] + 0.15 * np.cos(np.pi * X) * np.sin(2 * np.pi * Y),
+            truths[1] - 0.10 * np.sin(np.pi * X) * np.cos(2 * np.pi * Y),
+        ]
+        out_path = tmp_path / "forcing_zero_shot_field_jump.png"
+        cases = []
+        for col, (truth, prediction) in enumerate(zip(truths, predictions)):
+            cases.append({
+                "truth": truth,
+                "prediction": prediction,
+                "interface_x": 0.5,
+                "sim_params": {
+                    "temporal_family": "pulse_train" if col == 0 else "sin",
+                    "spatial_family": "sinusoid",
+                    "spatial_params": {
+                        "c0": 0.7, "c1": 0.3, "f": 1.5, "phase": 0.2,
+                    },
+                    "R_c": 0.4,
+                },
+                "t_source": 0.0,
+                "t_target": 0.08 + 0.02 * col,
+                "sim_id": 3 + col,
+                "source_index": 0,
+                "target_index": 8 + 2 * col,
+            })
+
+        result = forcing_plots.plot_zero_shot_sinusoid_field_and_jump(
+            cases, x, y, mu_global=300.0, save_path=out_path,
+        )
+
+        assert out_path.exists()
+        assert result["paths"] == [out_path]
+        assert [row["temporal_family"] for row in result["selections"]] == [
+            "pulse_train", "sin",
+        ]
+        assert result["metrics"][0]["rmse_K"] == pytest.approx(
+            float(np.sqrt(np.mean((predictions[0] - truths[0]) ** 2)))
+        )
 
     def test_seq_tokens_smoke(self, tmp_path):
         out_path = tmp_path / "forcing_seq_tokens.png"

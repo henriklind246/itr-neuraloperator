@@ -18,11 +18,13 @@ from data.dataset import (
 )
 from problems.forcing import (
     COND_STATIC_DIM,
+    FORCING_SPATIAL_DESCRIPTOR_SLICE,
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
     SPATIAL_CHANNELS_TEMPORAL,
     _forcing_seq_3tok_from_samples,
     _sample_a,
+    build_spatial_profile_bin_averages,
 )
 from src.physics.boundary_forcing import (
     SPATIAL_BUILDERS,
@@ -762,9 +764,7 @@ class TestSolverDatasetIntegration:
 
 
 class TestCondStaticLayout:
-    """The forcing cond_static is `[t_bar_norm, R_c_norm]`. The spatial profile
-    reaches the model only through the s_y spatial channel, so cond_static must
-    be identical across spatial families while that channel varies."""
+    """The forcing condition appends eight profile-bin averages to its scalars."""
 
     def _make_dataset(self, spatial_family, spatial_params,
                       temporal_family, temporal_params,
@@ -812,7 +812,7 @@ class TestCondStaticLayout:
         )
         assert torch.allclose(spatial[:, :, 3], expected)
 
-    def test_cond_static_is_invariant_to_spatial_family(self, synthetic_trajectories):
+    def test_cond_static_bins_match_each_spatial_family(self, synthetic_trajectories):
         families = [("uniform", {}), ("patch", {"y_c": 0.5, "w": 0.2}),
                     ("gaussian", {"y_c": 0.5, "sigma_y": 0.05}),
                     ("triangle", {"y_c": 0.5, "ell": 0.1})]
@@ -821,11 +821,23 @@ class TestCondStaticLayout:
             ds = self._make_dataset(sf, sp, "sin", self._DEFAULT_TEMPORAL, synthetic_trajectories)
             spatial, cond_static, _, _, _ = _unpack(ds[0])
             assert cond_static.shape == (COND_STATIC_DIM,)
+            expected_bins = build_spatial_profile_bin_averages(
+                ds.y_grid, spatial[0, :, 3].numpy()
+            )
+            np.testing.assert_allclose(
+                cond_static[FORCING_SPATIAL_DESCRIPTOR_SLICE].numpy(),
+                expected_bins,
+                rtol=0.0,
+                atol=0.0,
+            )
             conds.append(cond_static)
             s_ys.append(spatial[:, :, 3])
         for other in conds[1:]:
-            torch.testing.assert_close(conds[0], other)
-        # The profile still reaches the model, just via the spatial channel.
+            torch.testing.assert_close(conds[0][:2], other[:2])
+            assert not torch.allclose(
+                conds[0][FORCING_SPATIAL_DESCRIPTOR_SLICE],
+                other[FORCING_SPATIAL_DESCRIPTOR_SLICE],
+            )
         for other in s_ys[1:]:
             assert not torch.allclose(s_ys[0], other)
 

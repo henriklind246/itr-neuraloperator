@@ -70,6 +70,14 @@ def problem_from_config(config: dict) -> ProblemSpec:
                 UserWarning,
                 stacklevel=2,
             )
+    if "spatial_profile_bins" in benchmark:
+        requested_bins = int(benchmark.get("spatial_profile_bins"))
+        expected_bins = getattr(spec, "spatial_profile_bins", None)
+        if requested_bins != expected_bins:
+            raise ValueError(
+                f"benchmark {name!r} requires spatial_profile_bins="
+                f"{expected_bins}, got {requested_bins}."
+            )
     forcing_spatial_mode = str(
         config.get("model", {}).get("parameters", {}).get(
             "forcing_spatial_mode", "broadcast"
@@ -94,7 +102,7 @@ T_EPS = 1e-6  # epsilon for temperature normalization
 # The active dataset path routes every item through
 # `SnapshotPairDataset.__getitem__` -> `self.problem.build_item`, so the live
 # conditioning vector is built by the per-benchmark ProblemSpec (e.g.
-# `problems/forcing.py: build_cond_vector`, a 2-dim forcing-agnostic vector)
+# `problems/forcing.py: build_cond_vector`, a 10-dim family-independent vector)
 # and its width is owned by `ProblemDims.cond_static_dim`. The module-level
 # `COND_STATIC_DIM = 23`, `TEMPORAL_SAMPLES = 64`, `TEMPORAL_TOKEN_DIM = 5`, and
 # the `build_cond_vector` / `build_forcing_seq` / `build_forcing_summary`

@@ -131,8 +131,10 @@ checkpoint's (mu, sigma) pinned and handed to `run_one_seed` as overrides —
 which is also what lets this script use the exact locked study cohorts rather
 than the generic config split.
 
-The forcing cond_static carries no spatial descriptor, so an unseen family
-reaches the model only through its spatial input channel.
+The forcing cond_static carries eight family-independent spatial-profile bin
+averages. An unseen family therefore reaches a ``full`` checkpoint through both
+the spatial and conditioning pathways, while ``spatial_field_only`` masks only
+those eight conditioning entries.
 """
 
 import argparse
@@ -711,6 +713,8 @@ def main(argv=None):
             "best_val": checkpoint.get("best_val"),
             "spatial_conditioning": checkpoint["conf"]["benchmark"].get(
                 "spatial_conditioning"),
+            "spatial_profile_bins": checkpoint["conf"]["benchmark"].get(
+                "spatial_profile_bins"),
             "forcing_spatial_mode": checkpoint["conf"]["model"]["parameters"].get(
                 "forcing_spatial_mode"),
             "forcing_cond_mode": checkpoint["conf"]["model"]["parameters"].get(

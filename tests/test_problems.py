@@ -4,11 +4,15 @@ import pytest
 from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
 from problems.forcing import (
+    COND_STATIC_DIM as FORCING_COND_STATIC_DIM,
+    FORCING_SPATIAL_DESCRIPTOR_SLICE,
     FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM,
     RC_RANGE,
+    SPATIAL_PROFILE_BINS,
     ForcingProblem,
     build_cond_vector,
+    build_spatial_profile_bin_averages,
 )
 from problems.forcing_itr import ForcingItrProblem
 from problems.interfaces import InterfacesProblem
@@ -23,13 +27,13 @@ _SYNTH_SIGMA = 1.0
 # the dims/shape tests below. `temporal_encoder` is the only representation.
 CONTRACTS = {
     ("forcing", "temporal_encoder"): dict(
-        in_ch=4, cond=2, token=3, t_stats=2, s_y=3, aug=True,
+        in_ch=4, cond=10, token=3, t_stats=2, s_y=3, aug=True,
     ),
     ("forcing_itr", "temporal_encoder"): dict(
-        in_ch=5, cond=5, token=3, t_stats=2, s_y=3, aug=True,
+        in_ch=5, cond=13, token=3, t_stats=2, s_y=3, aug=True,
     ),
     ("forcing_itr_sin", "temporal_encoder"): dict(
-        in_ch=5, cond=3, token=3, t_stats=2, s_y=3, aug=True,
+        in_ch=5, cond=11, token=3, t_stats=2, s_y=3, aug=True,
     ),
     ("source", "temporal_encoder"): dict(
         in_ch=4, cond=6, token=3, t_stats=3, s_y=3, aug=False,
@@ -201,7 +205,7 @@ class TestRegistry:
 # ===================== forcing item shape contract =====================
 
 class TestForcingItem:
-    """forcing/temporal_encoder item shapes: lean 4-channel spatial, cond 2,
+    """forcing/temporal_encoder item shapes: lean 4-channel spatial, cond 10,
     a 128x3 forcing_seq, T_stats 2."""
 
     def test_item_keys_shapes(self, forcing_dataset):
@@ -211,7 +215,7 @@ class TestForcingItem:
         item = spec.build_item(ds, sim_id, s, j)
         assert set(item) == {"spatial", "cond_static", "forcing_seq", "Y", "T_stats"}
         assert item["spatial"].shape == (ds.Nx, ds.Ny, 4)
-        assert item["cond_static"].shape == (2,)
+        assert item["cond_static"].shape == (FORCING_COND_STATIC_DIM,)
         assert item["forcing_seq"].shape == (
             FORCING_TEMPORAL_SAMPLES, FORCING_TEMPORAL_TOKEN_DIM
         )
@@ -285,19 +289,45 @@ class TestForcingItem:
 
 
 class TestForcingUnknownSpatialFamily:
-    """forcing cond_static carries no spatial descriptor, so an unregistered
-    spatial family is conditioned on honestly: it reaches the model only through
-    the s_y spatial channel and needs no escape hatch."""
+    """An unregistered family is represented by measurements of its profile."""
 
     _SINU = {"c0": 0.7, "c1": 0.3, "f": 2.0, "phase": 0.5}
 
     def test_cond_vector_is_family_independent(self):
+        bins = np.linspace(0.2, 0.9, SPATIAL_PROFILE_BINS, dtype=np.float32)
         np.testing.assert_allclose(
-            build_cond_vector(t_bar_norm=0.1, R_c=0.5),
-            np.array([0.1, (0.5 - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])],
-                     dtype=np.float32),
+            build_cond_vector(
+                t_bar_norm=0.1,
+                R_c=0.5,
+                spatial_profile_bins=bins,
+            ),
+            np.concatenate([
+                np.array(
+                    [0.1, (0.5 - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])],
+                    dtype=np.float32,
+                ),
+                bins,
+            ]),
             rtol=0.0, atol=1e-7,
         )
+
+    def test_eight_bin_averages_are_grid_independent_for_linear_profile(self):
+        y = np.linspace(-2.0, 3.0, 17)
+        profile = 2.0 * y + 4.0
+        got = build_spatial_profile_bin_averages(y, profile)
+        edges = np.linspace(y[0], y[-1], SPATIAL_PROFILE_BINS + 1)
+        expected = 2.0 * 0.5 * (edges[:-1] + edges[1:]) + 4.0
+        np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-6)
+
+    def test_bin_builder_rejects_invalid_arrays(self):
+        with pytest.raises(ValueError, match="matching one-dimensional"):
+            build_spatial_profile_bin_averages(
+                np.linspace(0.0, 1.0, 4), np.ones(3)
+            )
+        with pytest.raises(ValueError, match="strictly increasing"):
+            build_spatial_profile_bin_averages(
+                np.array([0.0, 0.5, 0.5, 1.0]), np.ones(4)
+            )
 
     def _sinusoid_dataset(self, synthetic_trajectories, synthetic_sim_params, spec):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
@@ -314,10 +344,16 @@ class TestForcingUnknownSpatialFamily:
         ds = self._sinusoid_dataset(synthetic_trajectories, synthetic_sim_params, spec)
         sim_id, s, j = ds._pairs[0]
         item = spec.build_item(ds, sim_id, s, j)
-        assert item["cond_static"].shape == (2,)
-        # The sinusoid reaches the model through the s_y spatial channel.
+        assert item["cond_static"].shape == (FORCING_COND_STATIC_DIM,)
         s_y = item["spatial"][..., 3]
         assert float(s_y.max()) > float(s_y.min())
+        expected = build_spatial_profile_bin_averages(ds.y_grid, s_y[0])
+        np.testing.assert_allclose(
+            item["cond_static"][FORCING_SPATIAL_DESCRIPTOR_SLICE],
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 # ===================== schema validation =====================
@@ -971,6 +1007,19 @@ class TestProblemFromConfig:
         spec = problem_from_config({"benchmark": {"name": "source"}})
         assert spec.representation == "temporal_encoder"
 
+    @pytest.mark.parametrize("name", ("forcing", "forcing_itr", "forcing_itr_sin"))
+    def test_forcing_family_accepts_eight_profile_bins(self, name):
+        spec = problem_from_config({
+            "benchmark": {"name": name, "spatial_profile_bins": 8}
+        })
+        assert spec.spatial_profile_bins == 8
+
+    def test_forcing_rejects_other_profile_bin_width(self):
+        with pytest.raises(ValueError, match="requires spatial_profile_bins=8"):
+            problem_from_config({
+                "benchmark": {"name": "forcing", "spatial_profile_bins": 7}
+            })
+
     def test_source_itr_defaults_broadcast_channel_mode(self):
         spec = problem_from_config({"benchmark": {"name": "source_itr"}})
         assert isinstance(spec, SourceItrProblem)
@@ -1271,9 +1320,10 @@ class TestOODAxisContract:
 
 # ===================== spatial-descriptor conditioning ablation =====================
 
-# Benchmarks that carry a maskable spatial descriptor. The forcing family has
-# none: its s(y) reaches the model only through the s_y spatial channel.
 _ABLATION_KEYS = [
+    ("forcing", "temporal_encoder"),
+    ("forcing_itr", "temporal_encoder"),
+    ("forcing_itr_sin", "temporal_encoder"),
     ("source", "temporal_encoder"),
     ("source_itr", "temporal_encoder"),
     ("source_itr_sin", "temporal_encoder"),
@@ -1439,7 +1489,7 @@ class TestSpatialConditioningMask:
     def test_noop_modes_warn_at_resolution(self):
         # A mode that masks nothing for the benchmark must surface a warning so a
         # duplicate run is never mistaken for an independent sweep condition.
-        for name in ("interfaces", "forcing"):
+        for name in ("interfaces",):
             with pytest.warns(UserWarning, match="spatial_field_only has no effect"):
                 problem_from_config(
                     {"benchmark": {"name": name,
@@ -1448,10 +1498,11 @@ class TestSpatialConditioningMask:
 
     def test_effective_modes_do_not_warn(self, recwarn):
         # A mode that actually masks must not emit the no-op warning.
-        problem_from_config(
-            {"benchmark": {"name": "source",
-                           "spatial_conditioning": "spatial_field_only"}}
-        )
+        for name in ("forcing", "forcing_itr", "forcing_itr_sin", "source"):
+            problem_from_config(
+                {"benchmark": {"name": name,
+                               "spatial_conditioning": "spatial_field_only"}}
+            )
         assert not any("has no effect" in str(w.message) for w in recwarn.list)
 
     def test_mask_helper_returns_copy_not_alias(self):

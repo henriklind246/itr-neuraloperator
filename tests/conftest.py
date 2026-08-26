@@ -8,7 +8,7 @@ from src.operators.fno2d import FNO2d
 
 # Forcing benchmark, temporal_encoder representation (dataset/model default).
 FORCING_IN_CHANNELS = 4
-FORCING_COND_STATIC_DIM = 2
+FORCING_COND_STATIC_DIM = 10
 FORCING_TEMPORAL_TOKEN_DIM = 3
 FORCING_TEMPORAL_SAMPLES = 128
 

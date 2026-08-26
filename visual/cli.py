@@ -487,6 +487,25 @@ def main():
                 save_path=forcing_dir / "forcing_separable_assembly.png",
             )
 
+        if _should_run("forcing_sinusoid_temporal_panels", groups, individual):
+            print("--- forcing_sinusoid_temporal_panels ---")
+            forcing_plots.plot_forcing_sinusoid_temporal_panels(
+                save_path=forcing_dir / "forcing_sinusoid_temporal_panels.png",
+            )
+
+        if _should_run("forcing_zero_shot_field_jump", groups, individual):
+            if args.checkpoint and args.data:
+                print("--- forcing_zero_shot_field_jump ---")
+                forcing_plots.generate_zero_shot_sinusoid_field_and_jump(
+                    checkpoint_path=args.checkpoint,
+                    data_dir=Path(args.data).parent,
+                    save_path=forcing_dir / "forcing_zero_shot_field_jump",
+                )
+            else:
+                _print_skip(
+                    "forcing_zero_shot_field_jump", "need --checkpoint and --data"
+                )
+
         if _should_run("forcing_seq_tokens", groups, individual):
             print("--- forcing_seq_tokens ---")
             forcing_plots.plot_forcing_seq_tokens(

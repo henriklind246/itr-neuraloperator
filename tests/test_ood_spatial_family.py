@@ -106,10 +106,9 @@ class TestSpatialLoad:
 
 class TestPrecondition:
     def test_accepts_full_spatial_conditioning(self):
-        # The forcing cond_static no longer carries a spatial descriptor, so
-        # "full" is already descriptor-free and needs no ablation gate.
         check_preconditions({"conf": {"benchmark": {
-            "name": "forcing", "spatial_conditioning": "full"}}})
+            "name": "forcing", "spatial_conditioning": "full",
+            "spatial_profile_bins": 8}}})
 
     def test_rejects_other_benchmark(self):
         ckpt = {"conf": {"benchmark": {"name": "source",
@@ -119,7 +118,13 @@ class TestPrecondition:
 
     def test_accepts_valid(self):
         check_preconditions({"conf": {"benchmark": {
-            "name": "forcing", "spatial_conditioning": "spatial_field_only"}}})
+            "name": "forcing", "spatial_conditioning": "spatial_field_only",
+            "spatial_profile_bins": 8}}})
+
+    def test_rejects_checkpoint_without_eight_bin_contract(self):
+        with pytest.raises(SystemExit, match="spatial_profile_bins=8"):
+            check_preconditions({"conf": {"benchmark": {
+                "name": "forcing", "spatial_conditioning": "full"}}})
 
 
 class TestPooling:
