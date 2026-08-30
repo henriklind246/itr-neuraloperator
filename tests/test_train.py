@@ -105,6 +105,7 @@ class TestLoadConfig:
         assert cfg["benchmark"]["spatial_input"] == {
             "itr": False,
             "lead_time": False,
+            "material_side": False,
         }
 
     def test_missing_file_raises(self):

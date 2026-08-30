@@ -40,17 +40,23 @@ def problem_from_config(config: dict) -> ProblemSpec:
         raise ValueError("benchmark.spatial_input must be a mapping.")
     spatial_input_itr = spatial_input.get("itr", False)
     spatial_input_lead_time = spatial_input.get("lead_time", False)
+    spatial_input_material_side = spatial_input.get("material_side", False)
     configure_spatial_input = getattr(spec, "configure_spatial_input", None)
     if configure_spatial_input is None:
-        if spatial_input_itr or spatial_input_lead_time:
+        if (
+            spatial_input_itr
+            or spatial_input_lead_time
+            or spatial_input_material_side
+        ):
             raise ValueError(
-                "benchmark.spatial_input scalar channels are supported only by "
+                "benchmark.spatial_input optional channels are supported only by "
                 "the forcing benchmark."
             )
     else:
         configure_spatial_input(
             itr=spatial_input_itr,
             lead_time=spatial_input_lead_time,
+            material_side=spatial_input_material_side,
         )
     if "rc_channel_mode" in benchmark:
         spec.rc_channel_mode = str(benchmark.get("rc_channel_mode"))

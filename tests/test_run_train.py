@@ -70,16 +70,18 @@ class TestRunTrainFixedHelpers:
             "forcing_extender_condition_on_rc"
         ] is True
 
-    def test_forcing_scalar_spatial_inputs_are_cli_overrideable(self):
+    def test_forcing_spatial_inputs_are_cli_overrideable(self):
         config_path = Path(__file__).resolve().parents[1] / "conf" / "config.yaml"
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
         _apply_override(config, "benchmark.spatial_input.itr", True)
         _apply_override(config, "benchmark.spatial_input.lead_time", True)
+        _apply_override(config, "benchmark.spatial_input.material_side", True)
 
         assert config["benchmark"]["spatial_input"] == {
             "itr": True,
             "lead_time": True,
+            "material_side": True,
         }
 
     def test_physics_extender_options_are_cli_overrideable(self):
@@ -199,6 +201,7 @@ class TestRunTrainFixedHelpers:
             subprocess.run(["bash", "-n", str(script)], check=True)
             text = script.read_text(encoding="utf-8")
             assert 'export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data}"' in text
+            assert '"$@"' in text
 
     def test_generate_data_slurm_accepts_output_overrides(self):
         script = Path(__file__).resolve().parents[1] / "slurm" / "generate_data_msi.sbatch"

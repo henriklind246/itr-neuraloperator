@@ -7,10 +7,12 @@ benchmark:
   name: forcing
   representation: temporal_encoder
   spatial_input:
-    # Optional normalized scalar fields appended after [T_tilde, x, y, s_y].
-    # These duplicate the forcing benchmark's cond_static values for ablations.
+    # Optional forcing-only fields appended after [T_tilde, x, y, s_y].
+    # itr and lead_time duplicate normalized cond_static values for ablations.
+    # material_side is regenerated from the physical x grid at each resolution.
     itr: false
     lead_time: false
+    material_side: false
 
 model:
   type: "2D FNO time-conditioned (temporal branch)"

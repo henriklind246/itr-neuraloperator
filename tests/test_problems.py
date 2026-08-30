@@ -287,6 +287,38 @@ class TestForcingItem:
                 atol=0.0,
             )
 
+    @pytest.mark.parametrize("resolution", (100, 256))
+    def test_material_side_channel_is_built_from_each_physical_grid(
+        self,
+        resolution,
+        synthetic_sim_params,
+    ):
+        trajectories = np.zeros(
+            (1, 2, resolution, resolution), dtype=np.float32
+        )
+        x_grid = np.linspace(0.0, 1.0, resolution, dtype=np.float32)
+        y_grid = np.linspace(0.0, 1.0, resolution, dtype=np.float32)
+        t_grid = np.array([0.0, 0.01], dtype=np.float32)
+        sim_params = np.array([dict(synthetic_sim_params[0])], dtype=object)
+        spec = problem_from_config({
+            "benchmark": {
+                "name": "forcing",
+                "spatial_input": {"material_side": True},
+            }
+        })
+        ds = _make_dataset(
+            trajectories, x_grid, y_grid, t_grid, sim_params, spec
+        )
+
+        item = ds.problem.build_item(ds, *ds._pairs[0])
+        expected = np.broadcast_to(
+            (x_grid >= 0.5)[:, None], (resolution, resolution)
+        ).astype(np.float32)
+
+        assert spec.dims.in_channels == 5
+        assert item["spatial"].shape == (resolution, resolution, 5)
+        np.testing.assert_array_equal(item["spatial"][..., 4], expected)
+
 
 class TestForcingUnknownSpatialFamily:
     """An unregistered family is represented by measurements of its profile."""
@@ -1040,29 +1072,36 @@ class TestProblemFromConfig:
         spec = problem_from_config({
             "benchmark": {
                 "name": "forcing",
-                "spatial_input": {"itr": True, "lead_time": True},
+                "spatial_input": {
+                    "itr": True,
+                    "lead_time": True,
+                    "material_side": True,
+                },
             }
         })
         assert spec.spatial_input_itr is True
         assert spec.spatial_input_lead_time is True
-        assert spec.dims.in_channels == 6
+        assert spec.spatial_input_material_side is True
+        assert spec.dims.in_channels == 7
 
+    @pytest.mark.parametrize("key", ("itr", "lead_time", "material_side"))
     @pytest.mark.parametrize("value", [1, "true", None])
-    def test_forcing_rejects_non_boolean_spatial_input_knobs(self, value):
+    def test_forcing_rejects_non_boolean_spatial_input_knobs(self, key, value):
         with pytest.raises(ValueError, match="must be a boolean"):
             problem_from_config({
                 "benchmark": {
                     "name": "forcing",
-                    "spatial_input": {"itr": value},
+                    "spatial_input": {key: value},
                 }
             })
 
-    def test_other_benchmarks_reject_enabled_scalar_spatial_input(self):
+    @pytest.mark.parametrize("key", ("itr", "lead_time", "material_side"))
+    def test_other_benchmarks_reject_enabled_spatial_input(self, key):
         with pytest.raises(ValueError, match="only by the forcing benchmark"):
             problem_from_config({
                 "benchmark": {
                     "name": "source",
-                    "spatial_input": {"lead_time": True},
+                    "spatial_input": {key: True},
                 }
             })
 

@@ -259,6 +259,7 @@ class ForcingProblem(ProblemSpec):
         self.representation = representation
         self.spatial_input_itr = False
         self.spatial_input_lead_time = False
+        self.spatial_input_material_side = False
         if representation == "temporal_encoder":
             self.dims = ProblemDims(
                 in_channels=SPATIAL_CHANNELS_TEMPORAL,
@@ -275,9 +276,19 @@ class ForcingProblem(ProblemSpec):
                 f"Unknown representation {representation!r} for benchmark {self.name!r}."
             )
 
-    def configure_spatial_input(self, *, itr: bool, lead_time: bool) -> None:
-        """Enable normalized scalar fields appended to the spatial input."""
-        options = {"itr": itr, "lead_time": lead_time}
+    def configure_spatial_input(
+        self,
+        *,
+        itr: bool,
+        lead_time: bool,
+        material_side: bool,
+    ) -> None:
+        """Enable optional fields appended to the forcing spatial input."""
+        options = {
+            "itr": itr,
+            "lead_time": lead_time,
+            "material_side": material_side,
+        }
         for key, value in options.items():
             if not isinstance(value, bool):
                 raise ValueError(
@@ -286,7 +297,7 @@ class ForcingProblem(ProblemSpec):
                 )
         if not self.supports_scalar_spatial_input and any(options.values()):
             raise ValueError(
-                "benchmark.spatial_input scalar channels are supported only by "
+                "benchmark.spatial_input optional channels are supported only by "
                 "the forcing benchmark."
             )
         if not self.supports_scalar_spatial_input:
@@ -294,16 +305,18 @@ class ForcingProblem(ProblemSpec):
 
         previous_extra = int(getattr(self, "spatial_input_itr", False)) + int(
             getattr(self, "spatial_input_lead_time", False)
-        )
+        ) + int(getattr(self, "spatial_input_material_side", False))
         base_in_channels = self.dims.in_channels - previous_extra
         self.spatial_input_itr = itr
         self.spatial_input_lead_time = lead_time
+        self.spatial_input_material_side = material_side
         self.dims = replace(
             self.dims,
             in_channels=(
                 base_in_channels
                 + int(self.spatial_input_itr)
                 + int(self.spatial_input_lead_time)
+                + int(self.spatial_input_material_side)
             ),
         )
 
@@ -445,6 +458,10 @@ class ForcingProblem(ProblemSpec):
         # Force the 128-sample token grid regardless of the config default.
         ds.temporal_samples = FORCING_TEMPORAL_SAMPLES
         ds._q_callables = {}
+        ds.material_side = np.broadcast_to(
+            (ds.x_grid >= INTERFACE_X)[:, None],
+            (ds.Nx, ds.Ny),
+        ).astype(np.float32)
 
         profiles = {}
         for sim_id in ds.sim_ids:
@@ -501,6 +518,8 @@ class ForcingProblem(ProblemSpec):
             spatial_channels.append(
                 np.full((ds.Nx, ds.Ny), cond_static[0], dtype=np.float32)
             )
+        if getattr(self, "spatial_input_material_side", False):
+            spatial_channels.append(ds.material_side)
         spatial_base = np.stack(spatial_channels, axis=-1).astype(np.float32)
 
         Y = T_target_norm[:, :, None].astype(np.float32)
