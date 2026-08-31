@@ -343,9 +343,14 @@ class SourceItrProblem(SourceProblem):
 
         S_h = self._patch_mask(ds, sid)
         Rc_channel = self._rc_channel(ds, params)
-        spatial_base = np.stack(
-            [T_source_norm, ds.X_norm, ds.Y_norm, S_h, Rc_channel], axis=-1,
-        ).astype(np.float32)
+        spatial_channels = [
+            T_source_norm, ds.X_norm, ds.Y_norm, S_h, Rc_channel,
+        ]
+        if getattr(self, "spatial_input_material_side", False):
+            spatial_channels.append(
+                self._material_side_channel(ds, interface_x)
+            )
+        spatial_base = np.stack(spatial_channels, axis=-1).astype(np.float32)
 
         x_lo, x_hi = float(ds.x_grid[0]), float(ds.x_grid[-1])
         y_lo, y_hi = float(ds.y_grid[0]), float(ds.y_grid[-1])

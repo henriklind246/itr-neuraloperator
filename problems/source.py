@@ -390,9 +390,12 @@ class SourceProblem(ProblemSpec):
         t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
 
         S_h = self._patch_mask(ds, sid)
-        spatial_base = np.stack(
-            [T_source_norm, ds.X_norm, ds.Y_norm, S_h], axis=-1,
-        ).astype(np.float32)
+        spatial_channels = [T_source_norm, ds.X_norm, ds.Y_norm, S_h]
+        if getattr(self, "spatial_input_material_side", False):
+            spatial_channels.append(
+                self._material_side_channel(ds, interface_x)
+            )
+        spatial_base = np.stack(spatial_channels, axis=-1).astype(np.float32)
 
         cond_static = build_cond_vector(
             t_bar_norm=float(t_bar_norm),

@@ -343,9 +343,14 @@ class InterfacesProblem(ProblemSpec):
         S_y = np.broadcast_to(s_y[None, :], (ds.Nx, ds.Ny))
         K_norm = self._material_channel(ds, interface_x)
         D_norm = self._signed_distance_channel(ds, interface_x)
-        spatial_base = np.stack(
-            [T_source_norm, ds.X_norm, ds.Y_norm, K_norm, D_norm, S_y], axis=-1,
-        ).astype(np.float32)
+        spatial_channels = [
+            T_source_norm, ds.X_norm, ds.Y_norm, K_norm, D_norm, S_y,
+        ]
+        if getattr(self, "spatial_input_material_side", False):
+            spatial_channels.append(
+                self._material_side_channel(ds, interface_x)
+            )
+        spatial_base = np.stack(spatial_channels, axis=-1).astype(np.float32)
 
         cond_static = build_cond_vector(
             t_bar_norm=float(t_bar_norm),

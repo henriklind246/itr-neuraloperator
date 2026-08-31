@@ -1095,9 +1095,9 @@ class TestProblemFromConfig:
                 }
             })
 
-    @pytest.mark.parametrize("key", ("itr", "lead_time", "material_side"))
-    def test_other_benchmarks_reject_enabled_spatial_input(self, key):
-        with pytest.raises(ValueError, match="only by the forcing benchmark"):
+    @pytest.mark.parametrize("key", ("itr", "lead_time"))
+    def test_other_benchmarks_reject_forcing_only_spatial_input(self, key):
+        with pytest.raises(ValueError, match="scalar-R_c forcing benchmark"):
             problem_from_config({
                 "benchmark": {
                     "name": "source",
@@ -1219,6 +1219,78 @@ class TestRepresentationContracts:
         assert set(item) == set(ref.keys())
         for k in item:
             np.testing.assert_allclose(item[k], ref[k].numpy(), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("key", list(CONTRACTS))
+    def test_material_side_is_resolution_native_for_every_benchmark(
+        self, key, synthetic_trajectories, synthetic_sim_params
+    ):
+        name, representation = key
+        c = CONTRACTS[key]
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = problem_from_config({
+            "benchmark": {
+                "name": name,
+                "representation": representation,
+                "spatial_input": {"material_side": True},
+            }
+        })
+        if name == "forcing":
+            sim_params = synthetic_sim_params
+        else:
+            sim_params = _adapter_sim_params(
+                spec, trajectories, x_grid, y_grid, t_grid
+            )
+        ds = _make_dataset(
+            trajectories, x_grid, y_grid, t_grid, sim_params, spec
+        )
+        sim_id, s, j = ds._pairs[0]
+        item = spec.build_item(ds, sim_id, s, j)
+        interface_x = float(
+            ds.sim_params[int(sim_id)].get("interface_x", 0.5)
+        )
+        expected = np.broadcast_to(
+            (ds.x_grid >= interface_x)[:, None], (ds.Nx, ds.Ny)
+        ).astype(np.float32)
+
+        assert spec.spatial_input_material_side is True
+        assert spec.dims.in_channels == c["in_ch"] + 1
+        assert item["spatial"].shape == (ds.Nx, ds.Ny, c["in_ch"] + 1)
+        np.testing.assert_array_equal(item["spatial"][..., -1], expected)
+
+    def test_interfaces_material_side_tracks_each_simulation_interface(
+        self, synthetic_trajectories
+    ):
+        trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        spec = problem_from_config({
+            "benchmark": {
+                "name": "interfaces",
+                "spatial_input": {"material_side": True},
+            }
+        })
+        sim_params = _adapter_sim_params(
+            spec, trajectories, x_grid, y_grid, t_grid
+        )
+        ds = _make_dataset(
+            trajectories, x_grid, y_grid, t_grid, sim_params, spec
+        )
+        interface_x = np.array(
+            [float(params["interface_x"]) for params in ds.sim_params]
+        )
+        left_sid = int(np.argmin(interface_x))
+        right_sid = int(np.argmax(interface_x))
+
+        left = spec.build_item(ds, left_sid, 0, 1)["spatial"][..., -1]
+        right = spec.build_item(ds, right_sid, 0, 1)["spatial"][..., -1]
+        expected_left = np.broadcast_to(
+            (ds.x_grid >= interface_x[left_sid])[:, None], (ds.Nx, ds.Ny)
+        ).astype(np.float32)
+        expected_right = np.broadcast_to(
+            (ds.x_grid >= interface_x[right_sid])[:, None], (ds.Nx, ds.Ny)
+        ).astype(np.float32)
+
+        np.testing.assert_array_equal(left, expected_left)
+        np.testing.assert_array_equal(right, expected_right)
+        assert not np.array_equal(left, right)
 
 
 class TestRepresentationAbsence:

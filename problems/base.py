@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import numpy as np
@@ -120,6 +120,61 @@ class ProblemSpec(ABC):
 
     name: str
     dims: ProblemDims
+
+    #: Only the scalar-R_c forcing benchmark supports duplicating normalized
+    #: ITR and lead-time values as spatial fields. The discontinuous material-
+    #: side field is geometry metadata and is available to every benchmark.
+    supports_scalar_spatial_input: bool = False
+    spatial_input_itr: bool = False
+    spatial_input_lead_time: bool = False
+    spatial_input_material_side: bool = False
+
+    def configure_spatial_input(
+        self,
+        *,
+        itr: bool,
+        lead_time: bool,
+        material_side: bool,
+    ) -> None:
+        """Configure optional spatial fields while preserving disabled defaults."""
+        options = {
+            "itr": itr,
+            "lead_time": lead_time,
+            "material_side": material_side,
+        }
+        for key, value in options.items():
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"benchmark.spatial_input.{key} must be a boolean, got "
+                    f"{value!r}."
+                )
+        if (itr or lead_time) and not self.supports_scalar_spatial_input:
+            raise ValueError(
+                "benchmark.spatial_input.itr and lead_time are supported only "
+                "by the scalar-R_c forcing benchmark."
+            )
+
+        previous_extra = int(getattr(self, "spatial_input_itr", False)) + int(
+            getattr(self, "spatial_input_lead_time", False)
+        ) + int(getattr(self, "spatial_input_material_side", False))
+        base_in_channels = self.dims.in_channels - previous_extra
+        self.spatial_input_itr = itr
+        self.spatial_input_lead_time = lead_time
+        self.spatial_input_material_side = material_side
+        self.dims = replace(
+            self.dims,
+            in_channels=(
+                base_in_channels
+                + int(self.spatial_input_itr)
+                + int(self.spatial_input_lead_time)
+                + int(self.spatial_input_material_side)
+            ),
+        )
+
+    def _material_side_channel(self, ds, interface_x: float) -> np.ndarray:
+        """Return the resolution-native indicator ``1[x >= interface_x]``."""
+        side_x = (ds.x_grid >= float(interface_x)).astype(np.float32)
+        return np.broadcast_to(side_x[:, None], (ds.Nx, ds.Ny))
 
     # ---- spatial-descriptor conditioning ablation ----
     #: Active ablation mode (see :data:`SpatialConditioningMode`). Set via
