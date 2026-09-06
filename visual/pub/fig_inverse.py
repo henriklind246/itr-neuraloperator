@@ -1,16 +1,9 @@
 """Inverse-problem figures: F16, F17, F18, F22.
 
-These read an artifact family independent of the forward benchmarks -- inverse
-result CSVs rather than ``test_records.csv`` -- so they are not blocked by the
-forward eval. They are, however, thin: every surviving inverse CSV in this
-workspace has ten cases at a single sensor count and a single noise
-realization. Ten is below the twenty-case floor the statistics layer needs for
-an interval, so every summary here carries ``TOO_FEW_SIMS`` and is drawn as a
-point estimate. The figures are published as case listings, not as
-distributions.
-
-F18 is blocked on an experiment that has never been run at all: its abscissa,
-sensor count, does not vary in any artifact here.
+These read inverse result CSVs rather than ``test_records.csv``. F16, F17 and
+F22 describe one sensor protocol. F18 consumes the canonical paired sweep from
+``scripts/run_inverse_sensor_sweep.py`` and compares the same eight cases at the
+three discrete sensor counts 8, 16 and 32.
 """
 
 from __future__ import annotations
@@ -205,34 +198,111 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
 def sensor_count(*, source=None, spec=None, requirement=None):
     """F18 -- inversion accuracy against sensor count.
 
-    Entirely new, and the one piece of evidence the audit calls essential that
-    no artifact in this repo speaks to: every inverse run here used the default
-    ``sensor_n_y = 8``.
-
-    Design, once the sweep exists:
-
-    * Sensor counts 4, 8, 16, 32, 64 on a log-2 axis, with **identical
-      simulations, noise realizations and initialization seeds paired across
-      counts**. Pairing is what makes the curve a statement about sensor count
-      rather than about which cases each arm happened to draw;
-      ``stats.paired_seed_delta`` does the matching and the bootstrap resamples
-      the case, not the arm.
-    * Median with IQR of scalar ``R_c`` recovery error for ``forcing`` and of
-      integrated ITR severity plus profile error for ``forcing_itr``.
-    * Optionally a success-rate panel with a Wilson interval and a wall-clock
-      panel, since the practical question is where the accuracy gain stops
-      paying for the instrumentation.
-
-    ``scripts/invert.py`` already exposes the knob (``resolve_sensor_y``,
-    ``build_interface_sensor_mask``); what is missing is a sweep driver that
-    holds the case set fixed across counts and writes one CSV with an
-    ``n_sensors`` column that actually varies.
+    Each row is one inverse benchmark; the columns show absolute lead-estimand
+    recovery error, the FV residual at the recovered parameter, and the 95%
+    profile-likelihood interval width. Thin grey segments connect the same
+    ``(sim_id, noise_seed, init_seed)`` case across counts. The coloured marker
+    and whisker are the median and IQR across the eight cases, not an
+    inferential confidence interval. Crosses identify intervals stopped by a
+    physical bound, whose displayed widths are lower bounds.
     """
-    blocked(requirement,
-            "needs a paired multi-sensor-count inverse sweep; results_inverse."
-            "csv has n_sensors = 8 for all 10 of its rows, so the abscissa of "
-            "this figure does not exist yet.",
-            key="F18_sensor_count")
+    if not records.artifact_paths(source, "inverse_csv"):
+        blocked(
+            requirement,
+            "needs the paired forcing and forcing_itr sweep at 8, 16, and 32 "
+            "sensors; no canonical inverse_sensor_sweep.csv resolved from the "
+            "manifest.",
+            key="F18_sensor_count",
+        )
+    table = records.load_inverse_sensor_sweep(source)
+    summaries = stats.inverse_sensor_sweep_summaries(table)
+    benchmark_order = ("forcing", "forcing_itr")
+    width = spec.width if spec is not None else "two_col"
+    fig, axes = plt.subplots(
+        len(benchmark_order), 3,
+        figsize=style.figsize(width, rows=len(benchmark_order), row_height="grid_row",
+                             extra_in=0.35),
+    )
+    axes = np.atleast_2d(axes)
+
+    for row, benchmark in enumerate(benchmark_order):
+        summary = summaries[benchmark]
+        color = style.benchmark_color(benchmark)
+        estimand_label = r"$R_c$" if benchmark == "forcing" else r"$S_R$"
+        unit_label = "m$^2$ K/W" if benchmark == "forcing" else "m$^3$ K/W"
+        panels.paired_sensor_sweep_panel(
+            axes[row, 0], summary.recovery_error, color=color,
+            ylabel=f"Absolute error\n[{unit_label}]",
+            title=f"{benchmark}: {estimand_label} recovery", legend=(row == 0),
+        )
+        panels.paired_sensor_sweep_panel(
+            axes[row, 1], summary.fv_residual, color=color,
+            ylabel="FV sensor residual [K]", title="physical data fit",
+            reference=summary.noise_floor, legend=(row == 0),
+        )
+        panels.paired_sensor_sweep_panel(
+            axes[row, 2], summary.profile_width, color=color,
+            ylabel=f"95% profile width\n[{unit_label}]",
+            title="profile precision", legend=(row == 0),
+        )
+
+    fig.suptitle(
+        "n=8 paired cases per benchmark; same cases, noise, and initialization",
+        fontsize=8, y=0.985,
+    )
+    style.panel_letters(axes.ravel())
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
+
+    paths = records.artifact_paths(source, "inverse_csv")
+    metric_definition = {
+        "question": (
+            "How do the three discrete interface-sensor counts change recovery "
+            "accuracy, FV-verified fit, and profile-likelihood precision?"
+        ),
+        "tables": [str(path) for path in paths],
+        "sensor_counts": [8, 16, 32],
+        "replication_unit": "inversion case",
+        "pairing_fields": ["benchmark", "sim_id", "noise_seed", "init_seed"],
+        "pairing": (
+            "the identical eight cases, noise realizations, and initialization "
+            "seeds are used at every sensor count within each benchmark"
+        ),
+        "n_cases": {
+            benchmark: summaries[benchmark].recovery_error.n_cases
+            for benchmark in benchmark_order
+        },
+        "recovery_estimands": {
+            "forcing": "absolute error in scalar R_c",
+            "forcing_itr": "absolute error in integrated excess resistance S_R",
+        },
+        "fv_residual": (
+            "physical RMS sensor residual in Kelvin from the real finite-volume "
+            "solver evaluated at the recovered parameter"
+        ),
+        "profile_interval": (
+            "width of the 95% Wilks profile-likelihood interval on the lead "
+            "estimand; bound-limited widths are marked and are lower bounds"
+        ),
+        "bound_limited_cases_by_sensor_count": {
+            benchmark: {
+                str(count): int(value)
+                for count, value in zip(
+                    summaries[benchmark].profile_width.sensor_counts,
+                    summaries[benchmark].bound_limited_cases,
+                )
+            }
+            for benchmark in benchmark_order
+        },
+        "summary": (
+            "paired case trajectories plus median and IQR across cases at each "
+            "discrete count; connecting segments are not fitted curves"
+        ),
+        "inferential_interval": (
+            "none: n=8 is below the 20-case floor for a confidence interval"
+        ),
+        "degradations": ["TOO_FEW_SIMS_NO_CI"],
+    }
+    return fig, None, metric_definition
 
 
 def surrogate_fidelity(*, source=None, spec=None, requirement=None):

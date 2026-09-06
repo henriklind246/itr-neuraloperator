@@ -54,6 +54,46 @@ def make_records(*, n_sims: int, n_pairs: int, seed: str = "42",
     return pd.DataFrame(rows)
 
 
+def make_inverse_sensor_sweep() -> pd.DataFrame:
+    rows = []
+    for benchmark in ("forcing", "forcing_itr"):
+        for sim_id in range(8):
+            truth = 0.4 + 0.02 * sim_id
+            for count in (8, 16, 32):
+                error = 0.01 * (sim_id + 1) * (8.0 / count)
+                width = 0.12 * (8.0 / count) + 0.002 * sim_id
+                fv = 0.04 * (8.0 / count) + 0.001 * sim_id
+                row = {
+                    "benchmark": benchmark,
+                    "sim_id": sim_id,
+                    "n_sensors": count,
+                    "noise_seed": 100 + sim_id,
+                    "init_seed": 0,
+                    "noise_std_K": 0.05,
+                    "fv_resid_rms_K": fv,
+                    "fv_resid_over_noise": fv / 0.05,
+                    "profile_bound_limited": sim_id == 0 and count == 8,
+                }
+                if benchmark == "forcing":
+                    row.update({
+                        "R_c_true": truth,
+                        "R_c_map": truth + error,
+                        "R_c_abs_error": error,
+                        "profile_R_c_ci_low": truth - width / 2.0,
+                        "profile_R_c_ci_high": truth + width / 2.0,
+                    })
+                else:
+                    row.update({
+                        "excess_int_true": truth,
+                        "excess_int_hat": truth - error,
+                        "excess_int_abserr": error,
+                        "profile_excess_ci_low": truth - width / 2.0,
+                        "profile_excess_ci_high": truth + width / 2.0,
+                    })
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
 @pytest.fixture(scope="module")
 def records() -> pd.DataFrame:
     return make_records(n_sims=45, n_pairs=12)
@@ -119,6 +159,110 @@ class TestPooling:
         raw = records[records["sim_id"] == row["sim_id"]]
         expected = np.sqrt(raw["sse_K2"].sum() / raw["num_error_cells"].sum())
         assert row["rmse_K"] == pytest.approx(expected)
+
+
+class TestContactJumpCurve:
+    def test_reduces_profiles_before_simulations(self):
+        lead = np.array([0.1, 0.2])
+        truth = np.array([
+            [[3.0, 4.0], [0.0, 2.0]],
+            [[6.0, 8.0], [0.0, 4.0]],
+        ])
+        pred = truth * np.array([1.0, 1.5])[:, None, None]
+
+        curve = stats.contact_jump_curve(lead, truth, pred)
+
+        np.testing.assert_allclose(curve.lead_times, lead)
+        np.testing.assert_allclose(
+            curve.truth_median,
+            np.median(np.sqrt(np.mean(truth ** 2, axis=2)), axis=0),
+        )
+        np.testing.assert_allclose(curve.relative_median_pct, [25.0, 25.0])
+        assert curve.n_sims == 2
+
+    def test_shape_mismatch_is_rejected(self):
+        with pytest.raises(ValueError, match="same"):
+            stats.contact_jump_curve(
+                [0.1], np.zeros((2, 1, 3)), np.zeros((3, 1, 3)),
+            )
+
+
+class TestInverseSensorSweep:
+    def test_pairs_cases_before_median_and_iqr(self):
+        summaries = stats.inverse_sensor_sweep_summaries(
+            make_inverse_sensor_sweep()
+        )
+
+        forcing = summaries["forcing"]
+        np.testing.assert_array_equal(
+            forcing.recovery_error.sensor_counts, [8, 16, 32]
+        )
+        assert forcing.recovery_error.case_values.shape == (8, 3)
+        assert forcing.recovery_error.n_cases == 8
+        np.testing.assert_allclose(
+            forcing.recovery_error.median, [0.045, 0.0225, 0.01125]
+        )
+        np.testing.assert_array_equal(forcing.bound_limited_cases, [1, 0, 0])
+        assert summaries["forcing_itr"].estimand == "S_R"
+
+    def test_rejects_truth_changes_or_inconsistent_derived_metrics(self):
+        changed_truth = make_inverse_sensor_sweep()
+        row = (
+            (changed_truth["benchmark"] == "forcing")
+            & (changed_truth["sim_id"] == 0)
+            & (changed_truth["n_sensors"] == 16)
+        )
+        changed_truth.loc[row, "R_c_true"] += 0.1
+        with pytest.raises(ValueError, match="changes the true estimand"):
+            stats.inverse_sensor_sweep_summaries(changed_truth)
+
+        bad_ratio = make_inverse_sensor_sweep()
+        bad_ratio.loc[0, "fv_resid_over_noise"] = 99.0
+        with pytest.raises(ValueError, match="FV/noise ratio"):
+            stats.inverse_sensor_sweep_summaries(bad_ratio)
+
+
+class TestRolloutDeltaCurves:
+    @staticmethod
+    def arms():
+        arms = {}
+        for substeps in (1, 2, 4, 8):
+            rows = []
+            for sim_id in range(3):
+                for source_index in (0, 1):
+                    for lead_index in (1, 2):
+                        direct_scale = 1.0 + sim_id + lead_index
+                        increment = 0.0 if substeps == 1 else substeps / 10.0 * lead_index
+                        rows.append({
+                            "seed": "32",
+                            "benchmark": "forcing",
+                            "sim_id": sim_id,
+                            "s": source_index,
+                            "j": source_index + lead_index,
+                            # Deliberate float jitter: grouping must use j-s.
+                            "t_bar": 0.1 * lead_index + source_index * 1e-9,
+                            "lead_time_actual": np.nan,
+                            "sse_K2": (direct_scale + increment) ** 2,
+                            "target_sse_K2": 100.0,
+                        })
+            arms[substeps] = pd.DataFrame(rows)
+        return arms
+
+    def test_pairs_before_reducing_over_simulations(self):
+        curves = stats.rollout_delta_curves(self.arms())
+
+        np.testing.assert_allclose(curves[2].lead_times, [0.1, 0.2])
+        np.testing.assert_allclose(curves[2].median_pp, [2.0, 4.0])
+        np.testing.assert_allclose(curves[4].median_pp, [4.0, 8.0])
+        np.testing.assert_allclose(curves[8].median_pp, [8.0, 16.0])
+        assert curves[2].n_sims == 3
+        assert curves[2].n_snapshot_pairs == 12
+
+    def test_target_mismatch_is_rejected(self):
+        arms = self.arms()
+        arms[4].loc[0, "target_sse_K2"] = 101.0
+        with pytest.raises(ValueError, match="different targets"):
+            stats.rollout_delta_curves(arms)
 
 
 # ---------------------------------------------------------------------------

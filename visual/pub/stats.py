@@ -205,7 +205,7 @@ def shared_bin_edges(frames, stratum: str) -> np.ndarray:
     """Bin edges computed on the union of every frame that will be compared.
 
     Groups compared in one panel must share edges. Computing them per group,
-    as ``visual/paper_plots.py:_quantile_bin_strata`` does, makes the bins
+    as the legacy per-group binning did, makes the bins
     themselves a function of the group and the comparison meaningless.
     """
     spec = stratum_spec(stratum)
@@ -483,6 +483,415 @@ class Summary:
     @property
     def iqr(self) -> float:
         return self.q75 - self.q25
+
+
+@dataclass(frozen=True)
+class ContactJumpCurve:
+    """Simulation-level summaries of a physical contact-jump lead curve."""
+
+    lead_times: np.ndarray
+    truth_median: np.ndarray
+    pred_median: np.ndarray
+    rmse_median: np.ndarray
+    rmse_q25: np.ndarray
+    rmse_q75: np.ndarray
+    relative_median_pct: np.ndarray
+    relative_q25_pct: np.ndarray
+    relative_q75_pct: np.ndarray
+    n_sims: int
+
+
+@dataclass(frozen=True)
+class RolloutDeltaCurve:
+    """Paired autoregressive-minus-direct error at exact lead times."""
+
+    substeps: int
+    lead_times: np.ndarray
+    median_pp: np.ndarray
+    q25_pp: np.ndarray
+    q75_pp: np.ndarray
+    direct_median_pct: np.ndarray
+    n_sims: int
+    n_snapshot_pairs: int
+
+
+@dataclass(frozen=True)
+class SensorSweepCurve:
+    """Paired case values plus summaries at discrete sensor counts."""
+
+    metric: str
+    unit: str
+    sensor_counts: np.ndarray
+    case_keys: tuple[tuple[int, int, int], ...]
+    case_values: np.ndarray
+    median: np.ndarray
+    q25: np.ndarray
+    q75: np.ndarray
+    censored: np.ndarray | None = None
+
+    @property
+    def n_cases(self) -> int:
+        return len(self.case_keys)
+
+
+@dataclass(frozen=True)
+class InverseSensorSweepSummary:
+    """The three paired F18 quantities for one inverse benchmark."""
+
+    benchmark: str
+    estimand: str
+    estimand_unit: str
+    recovery_error: SensorSweepCurve
+    fv_residual: SensorSweepCurve
+    noise_floor: SensorSweepCurve
+    profile_width: SensorSweepCurve
+    fv_over_noise_median: np.ndarray
+    bound_limited_cases: np.ndarray
+
+
+_INVERSE_SENSOR_METRICS = {
+    "forcing": {
+        "estimand": "R_c",
+        "unit": "m² K/W",
+        "truth": "R_c_true",
+        "estimate": "R_c_map",
+        "absolute_error": "R_c_abs_error",
+        "profile_low": "profile_R_c_ci_low",
+        "profile_high": "profile_R_c_ci_high",
+    },
+    "forcing_itr": {
+        "estimand": "S_R",
+        "unit": "m³ K/W",
+        "truth": "excess_int_true",
+        "estimate": "excess_int_hat",
+        "absolute_error": "excess_int_abserr",
+        "profile_low": "profile_excess_ci_low",
+        "profile_high": "profile_excess_ci_high",
+    },
+}
+
+
+def _sensor_sweep_curve(
+    values,
+    *,
+    metric: str,
+    unit: str,
+    sensor_counts,
+    case_keys,
+    censored=None,
+) -> SensorSweepCurve:
+    values = np.asarray(values, dtype=np.float64)
+    counts = np.asarray(sensor_counts, dtype=np.int64)
+    if values.shape != (len(case_keys), counts.size):
+        raise ValueError(
+            f"{metric} has shape {values.shape}; expected "
+            f"({len(case_keys)}, {counts.size})"
+        )
+    if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError(f"{metric} must contain finite non-negative values")
+    censored_values = None
+    if censored is not None:
+        censored_values = np.asarray(censored, dtype=bool)
+        if censored_values.shape != values.shape:
+            raise ValueError(f"{metric} censoring mask does not match its values")
+    return SensorSweepCurve(
+        metric=metric,
+        unit=unit,
+        sensor_counts=counts,
+        case_keys=tuple(case_keys),
+        case_values=values,
+        median=np.median(values, axis=0),
+        q25=np.percentile(values, 25.0, axis=0),
+        q75=np.percentile(values, 75.0, axis=0),
+        censored=censored_values,
+    )
+
+
+def inverse_sensor_sweep_summaries(
+    table: pd.DataFrame,
+    *,
+    sensor_counts: tuple[int, ...] = (8, 16, 32),
+) -> dict[str, InverseSensorSweepSummary]:
+    """Reduce F18 at the paired inversion-case level.
+
+    Lines connect identical ``(sim_id, noise_seed, init_seed)`` cases across the
+    three discrete sensor counts. Medians and IQRs are descriptive across those
+    cases; with eight cases no inferential confidence interval is estimated.
+    """
+    pairing = ["sim_id", "noise_seed", "init_seed"]
+    output: dict[str, InverseSensorSweepSummary] = {}
+    for benchmark in sorted(table["benchmark"].dropna().astype(str).unique()):
+        try:
+            columns = _INVERSE_SENSOR_METRICS[benchmark]
+        except KeyError:
+            raise ValueError(
+                f"unsupported inverse sensor sweep benchmark {benchmark!r}"
+            ) from None
+        part = table.loc[table["benchmark"].astype(str) == benchmark].copy()
+        counts = tuple(sorted(part["n_sensors"].astype(int).unique()))
+        if counts != tuple(sensor_counts):
+            raise ValueError(
+                f"{benchmark} sensor counts {counts} do not match {sensor_counts}"
+            )
+        if part.duplicated(["n_sensors", *pairing]).any():
+            raise ValueError(f"{benchmark} has duplicate paired sensor-sweep rows")
+
+        case_keys = tuple(sorted({
+            tuple(int(value) for value in row)
+            for row in part[pairing].itertuples(index=False, name=None)
+        }))
+        matrices: dict[str, np.ndarray] = {}
+        numeric_columns = (
+            columns["truth"], columns["estimate"], columns["absolute_error"],
+            "fv_resid_rms_K", "fv_resid_over_noise", "noise_std_K",
+            columns["profile_low"], columns["profile_high"],
+        )
+        for column in numeric_columns:
+            columns_by_count = []
+            for count in counts:
+                arm = part.loc[part["n_sensors"].astype(int) == count].copy()
+                arm["_pair"] = [
+                    tuple(int(value) for value in row)
+                    for row in arm[pairing].itertuples(index=False, name=None)
+                ]
+                values = arm.set_index("_pair")[column].reindex(case_keys)
+                if values.isna().any():
+                    raise ValueError(
+                        f"{benchmark} {column} is not paired across sensor counts"
+                    )
+                columns_by_count.append(values.to_numpy(dtype=np.float64))
+            matrices[column] = np.column_stack(columns_by_count)
+
+        censored_columns = []
+        for count in counts:
+            arm = part.loc[part["n_sensors"].astype(int) == count].copy()
+            arm["_pair"] = [
+                tuple(int(value) for value in row)
+                for row in arm[pairing].itertuples(index=False, name=None)
+            ]
+            flags = arm.set_index("_pair")["profile_bound_limited"].reindex(case_keys)
+            if flags.isna().any():
+                raise ValueError(
+                    f"{benchmark} profile censoring is not paired across counts"
+                )
+            censored_columns.append(flags.astype(bool).to_numpy())
+        censored = np.column_stack(censored_columns)
+
+        truth = matrices[columns["truth"]]
+        estimate = matrices[columns["estimate"]]
+        absolute_error = matrices[columns["absolute_error"]]
+        if not np.allclose(truth, truth[:, :1], rtol=1e-9, atol=1e-12):
+            raise ValueError(f"{benchmark} changes the true estimand across sensor counts")
+        if not np.allclose(
+            absolute_error, np.abs(estimate - truth), rtol=1e-6, atol=1e-12
+        ):
+            raise ValueError(f"{benchmark} absolute recovery error is inconsistent")
+
+        fv = matrices["fv_resid_rms_K"]
+        noise = matrices["noise_std_K"]
+        over_noise = matrices["fv_resid_over_noise"]
+        if np.any(noise <= 0.0):
+            raise ValueError(f"{benchmark} noise_std_K must be positive")
+        if not np.allclose(fv / noise, over_noise, rtol=1e-5, atol=1e-8):
+            raise ValueError(f"{benchmark} FV/noise ratio is inconsistent")
+
+        profile_width = (
+            matrices[columns["profile_high"]]
+            - matrices[columns["profile_low"]]
+        )
+        recovery_curve = _sensor_sweep_curve(
+            absolute_error, metric="absolute recovery error",
+            unit=columns["unit"], sensor_counts=counts, case_keys=case_keys,
+        )
+        fv_curve = _sensor_sweep_curve(
+            fv, metric="FV residual at recovered parameter", unit="K",
+            sensor_counts=counts, case_keys=case_keys,
+        )
+        noise_curve = _sensor_sweep_curve(
+            noise, metric="measurement noise standard deviation", unit="K",
+            sensor_counts=counts, case_keys=case_keys,
+        )
+        width_curve = _sensor_sweep_curve(
+            profile_width, metric="profile interval width",
+            unit=columns["unit"], sensor_counts=counts, case_keys=case_keys,
+            censored=censored,
+        )
+        output[benchmark] = InverseSensorSweepSummary(
+            benchmark=benchmark,
+            estimand=columns["estimand"],
+            estimand_unit=columns["unit"],
+            recovery_error=recovery_curve,
+            fv_residual=fv_curve,
+            noise_floor=noise_curve,
+            profile_width=width_curve,
+            fv_over_noise_median=np.median(over_noise, axis=0),
+            bound_limited_cases=np.count_nonzero(censored, axis=0),
+        )
+    return output
+
+
+def contact_jump_curve(lead_times, truth, pred) -> ContactJumpCurve:
+    """Reduce ``(simulation, lead, y)`` contact jumps without pseudo-replication.
+
+    Each truth and prediction profile is first reduced to an RMS magnitude over
+    ``y``. Error is likewise an RMSE over ``y`` and relative error is its
+    profile-L2 ratio. Medians and IQRs are then computed across simulations at
+    each lead time.
+    """
+    lead = np.asarray(lead_times, dtype=np.float64)
+    truth = np.asarray(truth, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    if truth.shape != pred.shape or truth.ndim != 3:
+        raise ValueError(
+            "truth and pred must have the same (n_sims, n_leads, Ny) shape"
+        )
+    if truth.shape[1] != lead.size:
+        raise ValueError(
+            f"lead_times has {lead.size} entries for {truth.shape[1]} lead slices"
+        )
+    if truth.shape[0] == 0 or truth.shape[2] == 0:
+        raise ValueError("contact-jump arrays must contain simulations and y nodes")
+    if not np.all(np.isfinite(truth)) or not np.all(np.isfinite(pred)):
+        raise ValueError("contact-jump arrays must be finite")
+
+    truth_energy = np.sum(truth ** 2, axis=2)
+    pred_energy = np.sum(pred ** 2, axis=2)
+    error_energy = np.sum((pred - truth) ** 2, axis=2)
+    ny = truth.shape[2]
+    truth_rms = np.sqrt(truth_energy / ny)
+    pred_rms = np.sqrt(pred_energy / ny)
+    rmse = np.sqrt(error_energy / ny)
+    relative = np.full(error_energy.shape, np.nan, dtype=np.float64)
+    usable = truth_energy > 1e-12
+    relative[usable] = 100.0 * np.sqrt(error_energy[usable] / truth_energy[usable])
+
+    def _percentile(values, q):
+        return np.nanpercentile(values, q, axis=0)
+
+    return ContactJumpCurve(
+        lead_times=lead,
+        truth_median=np.median(truth_rms, axis=0),
+        pred_median=np.median(pred_rms, axis=0),
+        rmse_median=np.median(rmse, axis=0),
+        rmse_q25=np.percentile(rmse, 25, axis=0),
+        rmse_q75=np.percentile(rmse, 75, axis=0),
+        relative_median_pct=_percentile(relative, 50),
+        relative_q25_pct=_percentile(relative, 25),
+        relative_q75_pct=_percentile(relative, 75),
+        n_sims=int(truth.shape[0]),
+    )
+
+
+def _rollout_per_sim(records) -> pd.DataFrame:
+    """Pool one rollout arm to ``(seed, benchmark, sim_id, exact lead)``."""
+    df = getattr(records, "df", records).copy()
+    actual_lead = pd.to_numeric(
+        df.get("lead_time_actual", pd.Series(index=df.index, dtype=float)),
+        errors="coerce",
+    )
+    lead_col = "lead_time_actual" if actual_lead.notna().all() else "t_bar"
+    required = {
+        "seed", "benchmark", "sim_id", "s", "j", lead_col,
+        "sse_K2", "target_sse_K2",
+    }
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise KeyError(f"rollout records are missing columns {missing}")
+    df["_lead_index"] = (
+        pd.to_numeric(df["j"], errors="coerce")
+        - pd.to_numeric(df["s"], errors="coerce")
+    )
+    df["_lead_physical"] = pd.to_numeric(df[lead_col], errors="coerce")
+    if df[["_lead_index", "_lead_physical"]].isna().any().any():
+        raise ValueError("rollout records contain non-finite lead times")
+
+    keys = ["seed", "benchmark", "sim_id", "_lead_index"]
+    grouped = df.groupby(keys, dropna=False, observed=True)
+    out = grouped.size().rename("n_pair_rows").reset_index()
+    sums = grouped[["sse_K2", "target_sse_K2"]].sum(min_count=1).reset_index()
+    out = out.merge(sums, on=keys, how="left")
+    lead_lookup = (
+        df.groupby("_lead_index", observed=True)["_lead_physical"]
+        .median().rename("_lead").reset_index()
+    )
+    out = out.merge(lead_lookup, on="_lead_index", how="left")
+    out["rel_l2_pct"] = pooled_rel_l2_pct(out["sse_K2"], out["target_sse_K2"])
+    if not np.all(np.isfinite(out["rel_l2_pct"])):
+        raise ValueError("rollout records contain unusable pooled relative-L2 sums")
+    return out
+
+
+def rollout_delta_curves(arms) -> dict[int, RolloutDeltaCurve]:
+    """Reduce aligned rollout arms using simulations as the replication unit.
+
+    Every arm is first pooled within simulation and exact lead time. The plotted
+    quantity is then computed as a within-simulation paired difference,
+    autoregressive minus direct, before taking its median and IQR across
+    simulations.
+    """
+    if set(arms) != {1, 2, 4, 8}:
+        raise ValueError(
+            f"rollout_delta_curves expects arms [1, 2, 4, 8], got {sorted(arms)}"
+        )
+    raw = {int(substeps): getattr(arm, "records", arm)
+           for substeps, arm in arms.items()}
+    pooled = {substeps: _rollout_per_sim(records)
+              for substeps, records in raw.items()}
+    direct = pooled[1]
+    match_on = ["seed", "benchmark", "sim_id", "_lead_index"]
+    output: dict[int, RolloutDeltaCurve] = {}
+    for substeps in (2, 4, 8):
+        merged = direct.merge(
+            pooled[substeps], on=match_on, how="outer", indicator=True,
+            suffixes=("_direct", "_rollout"),
+        )
+        if not (merged["_merge"] == "both").all():
+            raise ValueError(
+                f"K={substeps} is not aligned to direct at the simulation/lead level"
+            )
+        if not np.allclose(
+            merged["target_sse_K2_direct"], merged["target_sse_K2_rollout"],
+            rtol=1e-10, atol=1e-10,
+        ):
+            raise ValueError(f"K={substeps} and direct use different targets")
+        if not np.allclose(
+            merged["_lead_direct"], merged["_lead_rollout"],
+            rtol=1e-6, atol=1e-8,
+        ):
+            raise ValueError(f"K={substeps} and direct use different lead times")
+        merged["_lead"] = merged["_lead_direct"]
+        merged["delta_pp"] = (
+            merged["rel_l2_pct_rollout"] - merged["rel_l2_pct_direct"]
+        )
+
+        leads = np.sort(merged["_lead"].unique().astype(np.float64))
+        medians, q25, q75, direct_medians = [], [], [], []
+        counts: list[int] = []
+        for lead in leads:
+            at_lead = merged.loc[merged["_lead"] == lead]
+            delta = at_lead["delta_pp"].to_numpy(dtype=np.float64)
+            baseline = at_lead["rel_l2_pct_direct"].to_numpy(dtype=np.float64)
+            medians.append(float(np.median(delta)))
+            q25.append(float(np.percentile(delta, 25)))
+            q75.append(float(np.percentile(delta, 75)))
+            direct_medians.append(float(np.median(baseline)))
+            counts.append(int(delta.size))
+        if len(set(counts)) != 1:
+            raise ValueError(
+                f"K={substeps} has different simulation counts across lead times: "
+                f"{counts}"
+            )
+        output[substeps] = RolloutDeltaCurve(
+            substeps=substeps,
+            lead_times=leads,
+            median_pp=np.asarray(medians),
+            q25_pp=np.asarray(q25),
+            q75_pp=np.asarray(q75),
+            direct_median_pct=np.asarray(direct_medians),
+            n_sims=counts[0],
+            n_snapshot_pairs=int(len(getattr(raw[substeps], "df", raw[substeps]))),
+        )
+    return output
 
 
 def summarize(sims: SimFrame, metric: str, *, strata=(),
@@ -846,6 +1255,7 @@ def paired_seed_delta(sims_a: SimFrame, sims_b: SimFrame, metric: str, *,
 
 
 __all__ = [
+    "ContactJumpCurve",
     "DEFAULT_METRICS",
     "DEFAULT_N_BOOT",
     "DEFAULT_RNG_SEED",
@@ -854,12 +1264,15 @@ __all__ = [
     "MIN_SEEDS_FOR_SPREAD",
     "MIN_SIMS_FOR_CI",
     "MIN_SIMS_FOR_P99",
+    "InverseSensorSweepSummary",
     "MetricSpec",
     "POOLED_METRICS",
     "PairedDelta",
     "RATIO_METRICS",
     "RankCorrelation",
     "RateCI",
+    "RolloutDeltaCurve",
+    "SensorSweepCurve",
     "STRATUM_SPECS",
     "SeedRoll",
     "SimFrame",
@@ -870,15 +1283,18 @@ __all__ = [
     "assert_same_space",
     "assign_strata",
     "bootstrap_ci",
+    "contact_jump_curve",
     "ecdf",
     "ecdf_band",
     "exceedance_rate",
+    "inverse_sensor_sweep_summaries",
     "metric_spec",
     "paired_seed_delta",
     "per_sim",
     "pooled_rel_l2_pct",
     "pooled_rmse",
     "proportion",
+    "rollout_delta_curves",
     "shared_bin_edges",
     "spearman",
     "stratum_order",

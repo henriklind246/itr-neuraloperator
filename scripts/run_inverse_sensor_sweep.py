@@ -14,6 +14,7 @@ import math
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,11 +31,6 @@ from scripts.invert import (  # noqa: E402
     _checkpoint_fingerprint,
     build_interface_sensor_mask,
     prepare_inversion_dataset,
-)
-from visual.inverse_plots import (  # noqa: E402
-    plot_sensor_sweep_recovery,
-    plot_sensor_sweep_uq,
-    spec_for,
 )
 
 
@@ -65,12 +61,69 @@ class CalibrationGateError(RuntimeError):
     pass
 
 
-class PlotGenerationError(RuntimeError):
-    pass
-
-
 class SummaryGenerationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SweepMetricSpec:
+    lead_name: str
+    lead_description: str
+    lead_unit_text: str
+    lead_hat_col: str
+    lead_true_col: str
+    lead_abserr_col: str
+    lead_profile_ci_low_col: str
+    lead_profile_ci_high_col: str
+
+
+_SWEEP_METRIC_SPECS = {
+    "forcing": SweepMetricSpec(
+        lead_name="R_c",
+        lead_description="contact resistance R_c",
+        lead_unit_text="m² K/W",
+        lead_hat_col="R_c_map",
+        lead_true_col="R_c_true",
+        lead_abserr_col="R_c_abs_error",
+        lead_profile_ci_low_col="profile_R_c_ci_low",
+        lead_profile_ci_high_col="profile_R_c_ci_high",
+    ),
+    "forcing_itr": SweepMetricSpec(
+        lead_name="S_R",
+        lead_description=(
+            "integrated excess resistance S_R = ∫(R_c − R_base) dy"
+        ),
+        lead_unit_text="m³ K/W",
+        lead_hat_col="excess_int_hat",
+        lead_true_col="excess_int_true",
+        lead_abserr_col="excess_int_abserr",
+        lead_profile_ci_low_col="profile_excess_ci_low",
+        lead_profile_ci_high_col="profile_excess_ci_high",
+    ),
+    "source_itr_sin": SweepMetricSpec(
+        lead_name="S_R",
+        lead_description=(
+            "integrated excess resistance S_R = ∫(R_c − R_base) dy"
+        ),
+        lead_unit_text="m³ K/W",
+        lead_hat_col="excess_int_hat",
+        lead_true_col="excess_int_true",
+        lead_abserr_col="excess_int_abserr",
+        lead_profile_ci_low_col="profile_excess_ci_low",
+        lead_profile_ci_high_col="profile_excess_ci_high",
+    ),
+}
+
+
+def spec_for(benchmark: str) -> SweepMetricSpec:
+    """Return the table contract for one supported sensor sweep."""
+    try:
+        return _SWEEP_METRIC_SPECS[benchmark]
+    except KeyError:
+        raise ValueError(
+            f"No inverse sweep metric spec for benchmark {benchmark!r}; "
+            f"known: {sorted(_SWEEP_METRIC_SPECS)}"
+        ) from None
 
 
 def _utc_now() -> str:
@@ -547,6 +600,8 @@ def generate_paper_summary(
         "benchmark",
         "sim_id",
         "n_sensors",
+        "noise_seed",
+        "init_seed",
         spec.lead_hat_col,
         spec.lead_true_col,
         spec.lead_abserr_col,
@@ -592,6 +647,22 @@ def generate_paper_summary(
         raise ValueError(
             f"paper summary requires the same {N_CASES} paired simulations; "
             f"got {ids_by_count}."
+        )
+    pairing_by_count = {
+        count: tuple(sorted(
+            (
+                int(_summary_float(row_by_key[(count, sim_id)], "sim_id")),
+                int(_summary_float(row_by_key[(count, sim_id)], "noise_seed")),
+                int(_summary_float(row_by_key[(count, sim_id)], "init_seed")),
+            )
+            for sim_id in sim_ids
+        ))
+        for count in counts
+    }
+    if any(keys != pairing_by_count[counts[0]] for keys in pairing_by_count.values()):
+        raise ValueError(
+            "paper summary requires identical (sim_id, noise_seed, init_seed) "
+            f"pairing across sensor counts; got {pairing_by_count}."
         )
 
     by_sensor_count = []
@@ -675,6 +746,7 @@ def generate_paper_summary(
         "sensor_counts": list(counts),
         "n_paired_simulations": len(sim_ids),
         "simulation_ids": list(sim_ids),
+        "pairing_fields": ["benchmark", "sim_id", "noise_seed", "init_seed"],
         "source_csv": str(combined_path.resolve()),
         "source_columns": source_columns,
         "reported_statistics": [
@@ -763,32 +835,6 @@ def _validate_artifacts(artifact_dir: Path, sim_ids: list[int]) -> list[str]:
     return [str(path) for path in expected]
 
 
-def generate_sweep_plots(
-    combined_path: Path,
-    *,
-    benchmark: str,
-    out_dir: Path,
-) -> dict:
-    plot_dir = out_dir / "plots"
-    spec = spec_for(benchmark)
-    recovery = plot_sensor_sweep_recovery(
-        combined_path,
-        spec,
-        out_dir=plot_dir,
-    )
-    uncertainty = plot_sensor_sweep_uq(
-        combined_path,
-        spec,
-        out_dir=plot_dir,
-    )
-    return {
-        "status": "complete",
-        "directory": str(plot_dir.resolve()),
-        "recovery": recovery,
-        "uncertainty": uncertainty,
-    }
-
-
 def run_sweep(
     *,
     benchmark: str,
@@ -820,7 +866,7 @@ def run_sweep(
     previous_manifest = _load_json(manifest_path)
     checkpoint_fingerprint = _checkpoint_fingerprint(str(checkpoint))
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "running",
         "started_utc": _utc_now(),
         "benchmark": benchmark,
@@ -845,6 +891,10 @@ def run_sweep(
             "reported_statistics": [
                 "recovery_error", "fv_verification", "profile_interval"
             ],
+            "pairing": (
+                "identical (benchmark, sim_id, noise_seed, init_seed) cases "
+                "across n_sensors = 8, 16, 32"
+            ),
         },
         "arms": {},
     }
@@ -1010,6 +1060,7 @@ def run_sweep(
         _write_csv(combined_path, combined_rows)
         manifest["dataset_fingerprint"] = dataset_fingerprints.pop()
         manifest["combined_csv"] = str(combined_path)
+        manifest["canonical_csv"] = str(combined_path)
         manifest["combined_row_count"] = len(combined_rows)
         manifest["status"] = "summarizing"
         _write_json(manifest_path, manifest)
@@ -1028,30 +1079,12 @@ def run_sweep(
                 f"inverse sweep completed but paper-summary generation failed: {exc}"
             ) from exc
         _print_paper_summary(manifest["paper_summary"])
-        manifest["status"] = "plotting"
-        _write_json(manifest_path, manifest)
-        try:
-            manifest["plots"] = generate_sweep_plots(
-                combined_path,
-                benchmark=benchmark,
-                out_dir=out_dir,
-            )
-        except Exception as exc:
-            manifest["status"] = "plotting_failed"
-            manifest["plot_error"] = f"{type(exc).__name__}: {exc}"
-            manifest["completed_utc"] = _utc_now()
-            _write_json(manifest_path, manifest)
-            raise PlotGenerationError(
-                f"inverse sweep completed but manuscript plot generation failed: {exc}"
-            ) from exc
         manifest["status"] = "complete"
         manifest["completed_utc"] = _utc_now()
         _write_json(manifest_path, manifest)
     except CalibrationGateError:
         raise
     except SummaryGenerationError:
-        raise
-    except PlotGenerationError:
         raise
     except Exception as exc:
         manifest["status"] = "failed"

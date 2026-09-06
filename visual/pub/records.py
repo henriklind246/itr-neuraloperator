@@ -18,6 +18,8 @@ Schema versions of ``test_records.csv``:
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -118,6 +120,57 @@ class RecordFrame:
         return self.schema_version >= 2
 
 
+@dataclass(frozen=True)
+class RolloutArmRecords:
+    """One direct or autoregressive arm with its linked run provenance."""
+
+    benchmark: str
+    representation: str
+    seed: str
+    substeps: int
+    prediction_mode: str
+    records: RecordFrame
+    provenance: dict
+
+
+@dataclass(frozen=True)
+class ResolutionStudy:
+    """Reported fixed-checkpoint errors over one resolution ladder."""
+
+    label: str
+    benchmark: str
+    material_side: bool
+    seed: str
+    checkpoint_epoch: int
+    resolutions: tuple[int, ...]
+    global_rel_l2_pct: tuple[float, ...]
+    interface_rel_l2_pct: tuple[float, ...]
+    boundary_rel_l2_pct: tuple[float, ...]
+    n_simulations: int
+    pairs_per_simulation: int
+    comparison_caveat: str
+
+
+@dataclass(frozen=True)
+class ResolutionDrift:
+    """Metric-matched FV discretization drift to the finest grid."""
+
+    resolutions: tuple[int, ...]
+    global_rel_l2_pct: tuple[float, ...]
+    interface_rel_l2_pct: tuple[float, ...]
+    boundary_rel_l2_pct: tuple[float, ...]
+    reference_resolution: int
+
+
+@dataclass(frozen=True)
+class ResolutionStudies:
+    """The original/material-side checkpoint comparison and FV reference."""
+
+    original: ResolutionStudy
+    material_side: ResolutionStudy
+    fv_drift: ResolutionDrift
+
+
 def seed_from_path(csv_path: Path) -> str:
     """Return the seed tag from a ``.../seed42/test_records.csv`` style path."""
     name = Path(csv_path).parent.name
@@ -189,7 +242,7 @@ def load_test_record_provenance(records_path: str | Path) -> dict:
     provenance_path = provenance_path_for(records_path)
     if not provenance_path.exists():
         raise SchemaError(f"test-record provenance not found: {provenance_path}")
-    payload = __import__("json").loads(provenance_path.read_text())
+    payload = json.loads(provenance_path.read_text())
     if payload.get("schema") != "test-records-provenance/v1":
         raise SchemaError(
             f"{provenance_path} has unsupported schema {payload.get('schema')!r}"
@@ -314,7 +367,384 @@ def records_by_benchmark(source, *, require_version: int = 2
     return out
 
 
+INVERSE_SENSOR_COUNTS = (8, 16, 32)
+INVERSE_SENSOR_BENCHMARKS = ("forcing", "forcing_itr")
+_INVERSE_SENSOR_BASE_COLUMNS = (
+    "benchmark", "sim_id", "n_sensors", "noise_seed", "init_seed",
+    "noise_std_K", "fv_resid_rms_K", "fv_resid_over_noise",
+    "profile_bound_limited",
+)
+_INVERSE_SENSOR_COLUMNS = {
+    "forcing": (
+        "R_c_true", "R_c_map", "R_c_abs_error",
+        "profile_R_c_ci_low", "profile_R_c_ci_high",
+    ),
+    "forcing_itr": (
+        "excess_int_true", "excess_int_hat", "excess_int_abserr",
+        "profile_excess_ci_low", "profile_excess_ci_high",
+    ),
+}
+
+
+def load_inverse_sensor_sweep(
+    source,
+    *,
+    sensor_counts: tuple[int, ...] = INVERSE_SENSOR_COUNTS,
+    benchmarks: tuple[str, ...] = INVERSE_SENSOR_BENCHMARKS,
+    n_cases: int = 8,
+) -> pd.DataFrame:
+    """Load the paired per-case inverse sweep used by F18.
+
+    One table per benchmark or one combined table are both accepted. Every
+    benchmark must contain the same case/noise/initialization keys at each of
+    the three discrete sensor counts. This function validates table identity
+    and shape only; numerical reductions remain in ``visual.pub.stats``.
+    """
+    paths = artifact_paths(source, "inverse_csv")
+    if not paths:
+        raise SchemaError("inverse sensor sweep source contains no CSV artifacts")
+
+    frames = [
+        load_csv_table(path, required_columns=_INVERSE_SENSOR_BASE_COLUMNS)
+        for path in paths
+    ]
+    table = pd.concat(frames, ignore_index=True, sort=False)
+    table["benchmark"] = table["benchmark"].fillna("").astype(str)
+
+    unexpected = sorted(set(table["benchmark"]) - set(benchmarks))
+    if unexpected:
+        raise SchemaError(
+            f"inverse sensor sweep contains unsupported benchmarks {unexpected}"
+        )
+    missing_benchmarks = [
+        benchmark for benchmark in benchmarks
+        if not (table["benchmark"] == benchmark).any()
+    ]
+    if missing_benchmarks:
+        raise SchemaError(
+            f"inverse sensor sweep is missing benchmarks {missing_benchmarks}"
+        )
+
+    numeric_base = (
+        "sim_id", "n_sensors", "noise_seed", "init_seed", "noise_std_K",
+        "fv_resid_rms_K", "fv_resid_over_noise",
+    )
+    for column in numeric_base:
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+    if table[list(numeric_base)].isna().any().any():
+        raise SchemaError("inverse sensor sweep has non-numeric pairing or FV fields")
+
+    bool_values = table["profile_bound_limited"].map(
+        {True: True, False: False, 1: True, 0: False,
+         "True": True, "False": False, "true": True, "false": False,
+         "1": True, "0": False, "1.0": True, "0.0": False}
+    )
+    if bool_values.isna().any():
+        raise SchemaError("inverse sensor sweep has invalid profile_bound_limited values")
+    table["profile_bound_limited"] = bool_values.astype(bool)
+
+    expected_counts = tuple(sensor_counts)
+    pairing_columns = ["sim_id", "noise_seed", "init_seed"]
+    for benchmark in benchmarks:
+        part = table.loc[table["benchmark"] == benchmark]
+        conditional = _INVERSE_SENSOR_COLUMNS[benchmark]
+        missing = [column for column in conditional if column not in part.columns]
+        if missing:
+            raise SchemaError(
+                f"inverse sensor sweep for {benchmark} is missing columns {missing}"
+            )
+        for column in conditional:
+            table.loc[part.index, column] = pd.to_numeric(
+                part[column], errors="coerce"
+            )
+        if table.loc[part.index, list(conditional)].isna().any().any():
+            raise SchemaError(
+                f"inverse sensor sweep for {benchmark} has non-numeric metric fields"
+            )
+
+        counts = tuple(sorted(part["n_sensors"].astype(int).unique()))
+        if counts != expected_counts:
+            raise SchemaError(
+                f"inverse sensor sweep for {benchmark} has sensor counts {counts}; "
+                f"expected {expected_counts}"
+            )
+        if part.duplicated(["n_sensors", *pairing_columns]).any():
+            raise SchemaError(
+                f"inverse sensor sweep for {benchmark} contains duplicate paired rows"
+            )
+
+        keys_by_count = {
+            count: {
+                tuple(int(value) for value in row)
+                for row in part.loc[
+                    part["n_sensors"].astype(int) == count, pairing_columns
+                ].itertuples(index=False, name=None)
+            }
+            for count in expected_counts
+        }
+        reference = keys_by_count[expected_counts[0]]
+        if len(reference) != n_cases or any(
+            keys != reference for keys in keys_by_count.values()
+        ):
+            raise SchemaError(
+                f"inverse sensor sweep for {benchmark} requires the same "
+                f"{n_cases} (sim_id, noise_seed, init_seed) cases at every "
+                f"sensor count; got {keys_by_count}"
+            )
+
+    return table.sort_values(
+        ["benchmark", "sim_id", "noise_seed", "init_seed", "n_sensors"]
+    ).reset_index(drop=True)
+
+
+def load_rollout_arms(source, *, require_version: int = 4
+                      ) -> dict[str, dict[int, RolloutArmRecords]]:
+    """Load and validate pair-aligned direct/K rollout record sets.
+
+    Arm identity comes from each schema-v4 provenance sidecar rather than its
+    filename. Within a benchmark, every arm must use the same checkpoint and
+    evaluation population, and its raw ``(sim_id, s, j)`` keys must match the
+    direct arm exactly.
+    """
+    paths = artifact_paths(source, "test_records")
+    if not paths:
+        raise SchemaError("rollout source contains no test_records artifacts")
+
+    by_benchmark: dict[str, dict[int, RolloutArmRecords]] = {}
+    pair_keys: dict[tuple[str, int], set[tuple[int, int, int]]] = {}
+    for path in paths:
+        frame = load_test_records(path, require_version=require_version)
+        if frame.schema_version < require_version:
+            raise SchemaError(
+                f"{path} is schema v{frame.schema_version}; rollout comparison "
+                f"requires v{require_version}"
+            )
+        provenance = load_test_record_provenance(path)
+        benchmark = str(provenance.get("benchmark", ""))
+        representation = str(provenance.get("representation", ""))
+        seed = str(provenance.get("seed", frame.seed))
+        prediction_mode = str(provenance.get("prediction_mode", ""))
+        substeps = int(provenance.get("rollout_num_substeps", 0))
+        enabled = bool(provenance.get("rollout_enabled", False))
+
+        if not benchmark or representation != "temporal_encoder":
+            raise SchemaError(
+                f"{path} has unsupported rollout provenance: "
+                f"benchmark={benchmark!r}, representation={representation!r}"
+            )
+        direct = prediction_mode == "direct_pair" and not enabled and substeps == 1
+        autoregressive = (
+            prediction_mode == f"autoregressive_{substeps}_substeps"
+            and enabled and substeps > 1
+        )
+        if not (direct or autoregressive):
+            raise SchemaError(
+                f"{path} has inconsistent rollout mode {prediction_mode!r}, "
+                f"enabled={enabled}, substeps={substeps}"
+            )
+
+        arms = by_benchmark.setdefault(benchmark, {})
+        if substeps in arms:
+            raise SchemaError(
+                f"duplicate {benchmark} rollout arm with {substeps} substeps"
+            )
+        arms[substeps] = RolloutArmRecords(
+            benchmark=benchmark,
+            representation=representation,
+            seed=seed,
+            substeps=substeps,
+            prediction_mode=prediction_mode,
+            records=frame,
+            provenance=provenance,
+        )
+        pair_keys[(benchmark, substeps)] = {
+            (int(sim_id), int(s), int(j))
+            for sim_id, s, j in frame.df[["sim_id", "s", "j"]].itertuples(
+                index=False, name=None
+            )
+        }
+
+    for benchmark, arms in by_benchmark.items():
+        if set(arms) != {1, 2, 4, 8}:
+            raise SchemaError(
+                f"{benchmark} rollout arms are {sorted(arms)}; expected [1, 2, 4, 8]"
+            )
+        invariant_fields = (
+            "evaluation_population_hash", "checkpoint_sha256", "seed",
+            "representation", "rollout_partition",
+        )
+        for field_name in invariant_fields:
+            values = {str(arm.provenance.get(field_name)) for arm in arms.values()}
+            if len(values) != 1 or values <= {"", "None"}:
+                raise SchemaError(
+                    f"{benchmark} rollout arms disagree on {field_name}: "
+                    f"{sorted(values)}"
+                )
+        direct_keys = pair_keys[(benchmark, 1)]
+        for substeps in (2, 4, 8):
+            if pair_keys[(benchmark, substeps)] != direct_keys:
+                raise SchemaError(
+                    f"{benchmark} K={substeps} does not contain the direct arm's "
+                    "exact (sim_id, s, j) evaluation population"
+                )
+
+    return dict(sorted(by_benchmark.items()))
+
+
+_RESOLUTION_REPORT_RE = re.compile(r"seed_report_r(?P<resolution>\d+)\.json$")
+
+
+def _json_payload(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SchemaError(f"invalid JSON report {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SchemaError(f"JSON report must contain an object: {path}")
+    return payload
+
+
+def _under(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def load_resolution_studies(source) -> ResolutionStudies:
+    """Load E32, E33 material-side, and the normalized FV drift ladder."""
+    paths = artifact_paths(source, "json_report")
+    manifest_paths = [p for p in paths if p.name == "study_manifest.json"]
+    drift_paths = [p for p in paths if p.name == "fv_drift_baseline.json"]
+    if len(manifest_paths) != 2:
+        raise SchemaError(
+            f"resolution source needs two study manifests, found {len(manifest_paths)}"
+        )
+    if len(drift_paths) != 1:
+        raise SchemaError(
+            f"resolution source needs one metric-matched FV drift report, "
+            f"found {len(drift_paths)}"
+        )
+
+    studies: list[ResolutionStudy] = []
+    for manifest_path in manifest_paths:
+        study_root = manifest_path.parent
+        manifest = _json_payload(manifest_path)
+        expected_resolutions = tuple(int(v) for v in manifest.get("resolutions", ()))
+        reports: dict[int, dict] = {}
+        for path in paths:
+            match = _RESOLUTION_REPORT_RE.match(path.name)
+            if match and _under(path, study_root):
+                reports[int(match.group("resolution"))] = _json_payload(path)
+        if tuple(sorted(reports)) != expected_resolutions:
+            raise SchemaError(
+                f"{manifest_path} declares {expected_resolutions}, but its report "
+                f"set is {tuple(sorted(reports))}"
+            )
+
+        per_resolution: list[dict] = []
+        for resolution in expected_resolutions:
+            per_seed = reports[resolution].get("per_seed") or []
+            if len(per_seed) != 1:
+                raise SchemaError(
+                    f"{study_root} r{resolution} must report exactly one fixed seed"
+                )
+            per_resolution.append(per_seed[0])
+
+        seeds = {str(row.get("seed")) for row in per_resolution}
+        epochs = {int(row.get("best_epoch")) for row in per_resolution}
+        sim_counts = {int(row.get("num_sims")) for row in per_resolution}
+        if len(seeds) != 1 or len(epochs) != 1 or len(sim_counts) != 1:
+            raise SchemaError(
+                f"{study_root} changes seed, checkpoint epoch, or simulation "
+                "count across resolutions"
+            )
+        benchmark = str(manifest.get("benchmark", ""))
+        if benchmark != "forcing":
+            raise SchemaError(
+                f"{manifest_path} is benchmark {benchmark!r}; expected 'forcing'"
+            )
+
+        material_side = bool(manifest.get("material_side", False))
+        pairs_per_sim = int(manifest.get("pairs_per_sim", 0))
+        if not pairs_per_sim:
+            validations = [
+                _json_payload(p) for p in paths
+                if p.name == "validation.json" and _under(p, study_root)
+            ]
+            if len(validations) == 1:
+                pairs_per_sim = int(validations[0].get("pairs_per_sim", 0))
+        if pairs_per_sim <= 0:
+            raise SchemaError(f"{study_root} does not report pairs_per_sim")
+
+        studies.append(ResolutionStudy(
+            label="E33 material-side" if material_side else "E32 original",
+            benchmark=benchmark,
+            material_side=material_side,
+            seed=next(iter(seeds)),
+            checkpoint_epoch=next(iter(epochs)),
+            resolutions=expected_resolutions,
+            global_rel_l2_pct=tuple(
+                float(row["test_rel_l2_norm"]) for row in per_resolution
+            ),
+            interface_rel_l2_pct=tuple(
+                float(row["test_iface_rel_l2_norm"]) for row in per_resolution
+            ),
+            boundary_rel_l2_pct=tuple(
+                float(row["test_boundary_rel_l2_norm"]) for row in per_resolution
+            ),
+            n_simulations=next(iter(sim_counts)),
+            pairs_per_simulation=pairs_per_sim,
+            comparison_caveat=str(manifest.get("comparison_caveat", "")),
+        ))
+
+    originals = [study for study in studies if not study.material_side]
+    variants = [study for study in studies if study.material_side]
+    if len(originals) != 1 or len(variants) != 1:
+        raise SchemaError(
+            "resolution comparison needs one original and one material-side study"
+        )
+    original, material_side = originals[0], variants[0]
+    if original.resolutions != material_side.resolutions:
+        raise SchemaError("resolution studies use different evaluation grids")
+    if original.n_simulations != material_side.n_simulations:
+        raise SchemaError("resolution studies use different simulation counts")
+    if original.pairs_per_simulation != material_side.pairs_per_simulation:
+        raise SchemaError("resolution studies use different pair counts")
+    if original.seed != material_side.seed:
+        raise SchemaError("resolution studies use different model seeds")
+
+    drift_payload = _json_payload(drift_paths[0])
+    drift_rows = drift_payload.get("per_resolution") or []
+    drift_resolutions = tuple(int(row["resolution"]) for row in drift_rows)
+    if drift_resolutions != original.resolutions:
+        raise SchemaError(
+            f"FV drift grids {drift_resolutions} do not match model grids "
+            f"{original.resolutions}"
+        )
+    references = [
+        int(row["resolution"]) for row in drift_rows if row.get("is_reference")
+    ]
+    if len(references) != 1:
+        raise SchemaError("FV drift report must identify exactly one reference grid")
+    drift = ResolutionDrift(
+        resolutions=drift_resolutions,
+        global_rel_l2_pct=tuple(float(row["global_rel_l2_pct"])
+                                for row in drift_rows),
+        interface_rel_l2_pct=tuple(float(row["interface_rel_l2_pct"])
+                                   for row in drift_rows),
+        boundary_rel_l2_pct=tuple(float(row["boundary_rel_l2_pct"])
+                                  for row in drift_rows),
+        reference_resolution=references[0],
+    )
+    return ResolutionStudies(original=original, material_side=material_side,
+                             fv_drift=drift)
+
+
 __all__ = [
+    "INVERSE_SENSOR_BENCHMARKS",
+    "INVERSE_SENSOR_COUNTS",
     "TEST_RECORD_FIELDS",
     "SCHEMA_V1_COLUMNS",
     "SCHEMA_V2_REQUIRED",
@@ -322,6 +752,10 @@ __all__ = [
     "SCHEMA_V4_REQUIRED",
     "SchemaError",
     "RecordFrame",
+    "ResolutionDrift",
+    "ResolutionStudies",
+    "ResolutionStudy",
+    "RolloutArmRecords",
     "artifact_paths",
     "detect_schema_version",
     "seed_from_path",
@@ -331,6 +765,9 @@ __all__ = [
     "load_many_test_records",
     "load_train_metrics",
     "load_csv_table",
+    "load_inverse_sensor_sweep",
+    "load_resolution_studies",
+    "load_rollout_arms",
     "count_simulations",
     "available_strata",
     "records_by_benchmark",

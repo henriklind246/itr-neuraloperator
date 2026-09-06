@@ -38,6 +38,7 @@ import numpy as np
 from problems.base import OODAxis
 from problems.registry import get_problem
 from data.generate_dataset import build_base_setup, run_solves, save_dataset
+from src.physics.init_conditions import IC_FAMILIES
 
 DATA_DIR = Path(__file__).resolve().parent
 
@@ -257,9 +258,25 @@ def generate_ood_dataset(
         setup["Nt_saved"], setup["Nx"], setup["Ny"], verbose=verbose,
     )
 
+    problem_version = getattr(spec, "problem_version", None)
+    meta = None
+    if problem_version is not None or rng_seed != 0:
+        meta = {
+            "problem_version": problem_version,
+            "ic_mode": getattr(spec, "ic_mode", None),
+            "ic_families": list(IC_FAMILIES.keys()),
+            "rng_seed": int(rng_seed),
+            "seed_streams": {
+                "ood_latents_base": int(rng_seed + _RNG_BASE),
+                "ood_forcing_profile_base": int(rng_seed + _RNG_PROFILE_OFFSET),
+                "per_repeat_increment": 1,
+            },
+            "ood_axis": axis.name,
+        }
+
     save_path = save_dataset(
         save_dir, x, y, t, save_stride, setup["dt"], setup["t_ramp"],
-        trajectories, sim_params,
+        trajectories, sim_params, meta=meta,
     )
 
     _write_sidecar(save_path, records)

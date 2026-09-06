@@ -101,7 +101,7 @@ CMAP_RESIDUAL = "RdBu_r"
 CMAP_JUMP = "cividis"
 CMAP_SEQ_ORDINAL = "viridis"
 
-# Okabe-Ito, colorblind-safe. Mirrors visual/paper_plots.py:58.
+# Okabe-Ito, colorblind-safe.
 BENCHMARK_COLORS: dict[str, str] = {
     "forcing": "#0072B2",
     "source": "#E69F00",

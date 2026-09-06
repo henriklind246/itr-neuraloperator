@@ -424,6 +424,139 @@ def pairwise_orders(steps, errors) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ============================================================
+# Rollout and resolution-study panels
+# ============================================================
+
+
+def rollout_delta_panel(ax, curves, *, title: str = "", ylabel: str = "",
+                        legend: bool = False) -> None:
+    """Paired autoregressive-minus-direct curves with simulation IQR bands."""
+    colors = {2: "#0072B2", 4: "#E69F00", 8: "#D55E00"}
+    linestyles = {2: "-", 4: "--", 8: ":"}
+    markers = {2: "o", 4: "s", 8: "^"}
+    for substeps in (2, 4, 8):
+        curve = curves[substeps]
+        color = colors[substeps]
+        ax.fill_between(
+            curve.lead_times, curve.q25_pp, curve.q75_pp,
+            color=color, alpha=0.13, linewidth=0, zorder=1,
+        )
+        ax.plot(
+            curve.lead_times, curve.median_pp,
+            color=color, linestyle=linestyles[substeps],
+            marker=markers[substeps], markersize=3.2,
+            markerfacecolor="white", markeredgewidth=0.8,
+            linewidth=1.1, label=f"K={substeps}", zorder=3,
+        )
+    ax.axhline(0.0, color="0.3", linewidth=0.8, zorder=2)
+    first = curves[2]
+    ax.set_xticks(first.lead_times)
+    ax.set_xlabel("Exact lead time")
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    if legend:
+        ax.legend(fontsize=5.5, loc="best", title="rollout substeps",
+                  title_fontsize=5.5)
+
+
+def resolution_curve_panel(ax, studies, drift, *, value_attr: str,
+                           title: str = "", ylabel: str = "",
+                           legend: bool = False) -> None:
+    """Two fixed-checkpoint resolution curves and metric-matched FV drift."""
+    series = (
+        (studies.original, "#0072B2", "-", "o"),
+        (studies.material_side, "#E69F00", "--", "s"),
+    )
+    for study, color, linestyle, marker in series:
+        ax.plot(
+            study.resolutions, getattr(study, value_attr),
+            color=color, linestyle=linestyle, marker=marker,
+            markersize=3.4, markerfacecolor="white", markeredgewidth=0.8,
+            linewidth=1.1, label=study.label, zorder=3,
+        )
+    ax.plot(
+        drift.resolutions, getattr(drift, value_attr),
+        color="0.35", linestyle=":", marker="^", markersize=3.2,
+        markerfacecolor="white", markeredgewidth=0.8, linewidth=1.0,
+        label=f"FV drift to N={drift.reference_resolution}", zorder=2,
+    )
+    ax.set_xticks(studies.original.resolutions)
+    ax.set_xlabel(r"Evaluation grid $N \times N$")
+    ax.set_ylabel(ylabel)
+    ax.set_ylim(bottom=0.0)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    if legend:
+        ax.legend(fontsize=5.3, loc="best")
+
+
+# ============================================================
+# Paired inverse-sweep panels
+# ============================================================
+
+
+def paired_sensor_sweep_panel(
+    ax,
+    curve,
+    *,
+    color: str,
+    ylabel: str,
+    title: str = "",
+    reference=None,
+    legend: bool = False,
+) -> None:
+    """Draw paired cases and median/IQR at discrete sensor counts.
+
+    Connecting segments join the same inversion case across adjacent protocol
+    levels; they are not a fitted or interpolated sensor-count trend.
+    """
+    x = np.arange(len(curve.sensor_counts), dtype=float)
+    for index, values in enumerate(curve.case_values):
+        ax.plot(
+            x, values, color="0.72", linewidth=0.55, alpha=0.65,
+            marker="o", markersize=1.8, markeredgewidth=0,
+            label="paired cases" if index == 0 else None, zorder=1,
+        )
+    ax.vlines(
+        x, curve.q25, curve.q75, color=color, linewidth=2.0,
+        alpha=0.75, label="IQR", zorder=3,
+    )
+    ax.plot(
+        x, curve.median, color=color, linewidth=1.15, marker="o",
+        markersize=4.2, markeredgecolor="black", markeredgewidth=0.4,
+        label="median", zorder=4,
+    )
+
+    if reference is not None:
+        ax.plot(
+            x, reference.median, color="0.25", linestyle="--", linewidth=0.9,
+            marker="s", markersize=2.8, markerfacecolor="white",
+            label="noise std.", zorder=2,
+        )
+    if curve.censored is not None and np.any(curve.censored):
+        rows, columns = np.where(curve.censored)
+        ax.plot(
+            x[columns], curve.case_values[rows, columns], linestyle="none",
+            marker="x", color="black", markersize=3.2, markeredgewidth=0.8,
+            label="bound-limited", zorder=5,
+        )
+
+    ax.set_xticks(x, [str(int(value)) for value in curve.sensor_counts])
+    ax.set_xlim(-0.35, len(x) - 0.65)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel("Interface sensors (discrete)")
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, axis="y", alpha=0.25)
+    if legend:
+        ax.legend(fontsize=5.3, loc="best")
+
+
+# ============================================================
 # Distribution panels
 # ============================================================
 
@@ -762,8 +895,11 @@ __all__ = [
     "field_map",
     "order_estimates",
     "pairwise_orders",
+    "paired_sensor_sweep_panel",
     "rate_bars",
     "recovery_scatter",
+    "resolution_curve_panel",
+    "rollout_delta_panel",
     "schematic_arrow",
     "schematic_box",
     "seed_dots",

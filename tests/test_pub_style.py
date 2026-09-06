@@ -102,7 +102,7 @@ class TestColorLimits:
     def test_sequential_of_one_field_is_not_the_shared_scale(self):
         """Guards the per-row-norm pattern this function replaces.
 
-        ``_render_tpr_row`` in ``visual/paper_plots.py`` normalized each row on
+        The legacy field renderer normalized each row on
         its own values, so two panels printed side by side used different scales.
         """
         truth = np.array([300.0, 310.0])
@@ -485,15 +485,23 @@ class TestModuleOwnership:
 
 
 class TestPackageBoundaries:
-    def test_nothing_imports_paper_plots(self):
-        """This package replaces ``visual/paper_plots.py``; it must not depend on it.
-
-        That module is the one carrying the pair-level aggregation defect, and it
-        is scheduled for deletion once F04-F15 exist.
-        """
+    def test_legacy_publication_modules_are_deleted_and_unreferenced(self):
+        """The superseded pair-weighted publication paths must not return."""
+        for filename in (
+            "paper_plots.py",
+            "inverse_plots.py",
+            "rollout_plots.py",
+            "resinv_plots.py",
+        ):
+            assert not (PUB_DIR.parent / filename).exists()
         offenders = [
             p.name for p in pub_sources()
-            if TestModuleOwnership._imports(p, "visual.paper_plots")
+            if any(TestModuleOwnership._imports(p, module) for module in (
+                "visual.paper_plots",
+                "visual.inverse_plots",
+                "visual.rollout_plots",
+                "visual.resinv_plots",
+            ))
         ]
         assert offenders == []
 

@@ -12,11 +12,6 @@ import numpy as np
 
 PLOT_REGISTRY: dict[str, str] = {
     # group: physics
-    "final_temperature":         "physics",
-    "layer_geometry":            "physics",
-    "face_conductance":          "physics",
-    "multilayer_evolution":      "physics",
-    "heat_flux_profile":         "physics",
     "bc_verification":           "physics",
     "itr_temperature_jump_sweep": "physics",
     # group: mms
@@ -26,103 +21,45 @@ PLOT_REGISTRY: dict[str, str] = {
     "training_curves":           "training",
     "seed_comparison":           "training",
     # group: data
-    "trajectory_heatmap":        "data",
-    "trajectory_deviation_heatmap": "data",
-    "spatial_family_breakdown":  "data",
-    "initial_conditions":        "data",
-    "ic_uniform_progression":         "data",
-    "ic_random_sinusoid_progression": "data",
-    "ic_grf_progression":             "data",
-    "ic_hot_spot_progression":        "data",
-    "snapshot_pair_samples":     "data",
     "prediction_vs_truth":       "data",
     "interface_error":           "data",
     "lead_time_coverage":        "data",
-    "lead_time_error":           "data",
-    "parameter_error_slices":    "data",
-    "dataset_summary":           "data",
-    "interface_jump_summary":    "data",
     # group: forcing
     "forcing_temporal_families":            "forcing",
     "forcing_spatial_profiles":             "forcing",
     "forcing_separable_assembly":           "forcing",
-    "forcing_sinusoid_temporal_panels":      "forcing",
-    "forcing_zero_shot_field_jump":          "forcing",
     "forcing_seq_tokens":                   "forcing",
-    "forcing_summary_scalars":              "forcing",
-    "forcing_param_distributions_design":   "forcing",
-    "forcing_param_distributions_empirical": "forcing",
-    # group: resinv
-    "resolution_invariance":     "resinv",
     # group: source
-    "source_dataset_summary":    "source",
-    "patch_param_scatter":       "source",
-    "source_temporal_profile":   "source",
-    "source_field_snapshots":    "source",
-    "patch_overlay_trajectory":  "source",
     "energy_budget":             "source",
-    "regime_error_breakdown":    "source",
-    "patch_error_slices":        "source",
     "patch_region_error_map":    "source",
-    "source_error_vs_params":    "source",
     "source_interface_zone_error": "source",
     "source_itr_void_profiles":  "source",
-    "source_itr_error_vs_void_params": "source",
     # group: interfaces
-    "interface_y_perturbation":  "interfaces",
-    "interface_lhs_scatter":     "interfaces",
-    "vary_interface_lhs_scatter": "interfaces",
-    "interface_flux_profiles":   "interfaces",
-    "sin_forcing_profiles":      "interfaces",
     "interface_x_breakdown":     "interfaces",
-    "ic_family_trajectory_breakdown": "interfaces",
-    "vary_interface_dataset_summary": "interfaces",
-    # group: paper
-    "forcing_test_error_summary":               "paper",
-    "forcing_prediction_truth_residual":        "paper",
-    "forcing_temperature_profiles":             "paper",
-    "forcing_interface_jump_profiles":          "paper",
-    "source_test_error_summary":                "paper",
-    "source_prediction_truth_residual":         "paper",
-    "source_itr_test_error_summary":            "paper",
-    "source_itr_prediction_truth_residual":     "paper",
-    "source_temperature_profiles":              "paper",
-    "source_interface_jump_profiles":           "paper",
-    "source_itr_temperature_profiles":          "paper",
-    "source_itr_interface_jump_profiles":       "paper",
-    "interfaces_test_error_summary":            "paper",
-    "interfaces_prediction_truth_residual":     "paper",
-    "interfaces_temperature_profiles":          "paper",
-    "interfaces_interface_jump_profiles":       "paper",
-    "all_benchmarks_error_summary":             "paper",
-    "all_benchmarks_prediction_truth_residual": "paper",
-    "forcing_interface_jump":                   "paper",
-    "source_interface_jump":                    "paper",
-    "interfaces_interface_jump":                "paper",
-    "all_benchmarks_interface_jump":            "paper",
-    "forcing_tail_errors":                      "paper",
-    "source_tail_errors":                       "paper",
-    "interfaces_tail_errors":                   "paper",
-    "all_benchmarks_tail_errors":               "paper",
-    "benchmark_overview":                       "paper",
-    # group: rollout
-    "rollout_partition_error":                  "rollout",
-    # group: inverse
-    "forcing_parameter_recovery":               "inverse",
-    "forcing_identifiability":                  "inverse",
-    "forcing_surrogate_fidelity":               "inverse",
-    "forcing_uncertainty":                      "inverse",
-    "forcing_itr_parameter_recovery":           "inverse",
-    "forcing_itr_identifiability":               "inverse",
-    "forcing_itr_surrogate_fidelity":            "inverse",
-    "forcing_itr_uncertainty":                   "inverse",
-    "source_itr_parameter_recovery":            "inverse",
-    "source_itr_identifiability":               "inverse",
-    "source_itr_surrogate_fidelity":            "inverse",
-    "source_itr_uncertainty":                   "inverse",
 }
 
-GROUPS = {"physics", "mms", "training", "data", "forcing", "source", "interfaces", "paper", "resinv", "rollout", "inverse"}
+PLOT_RERUN_TRIGGERS: dict[str, str] = {
+    "bc_verification": "FV boundary-condition or boundary-stencil change",
+    "itr_temperature_jump_sweep": "interface-resistance physics or ProblemSpec change",
+    "mms_convergence": "2D numerical-scheme or solver change",
+    "mms_order_estimation": "2D numerical-scheme or solver change",
+    "training_curves": "completed or actively monitored training run",
+    "seed_comparison": "completed replicated-seed experiment",
+    "prediction_vs_truth": "new checkpoint or changed field-evaluation path",
+    "interface_error": "new checkpoint on an interface-bearing benchmark",
+    "lead_time_coverage": "snapshot pairing, split, or curriculum change",
+    "forcing_temporal_families": "temporal forcing builder or sampler change",
+    "forcing_spatial_profiles": "spatial forcing builder or sampler change",
+    "forcing_separable_assembly": "separable forcing assembly change",
+    "forcing_seq_tokens": "forcing representation or token-contract change",
+    "energy_budget": "source term, FV balance, or regenerated source dataset",
+    "patch_region_error_map": "new source-family checkpoint",
+    "source_interface_zone_error": "new source-family checkpoint",
+    "source_itr_void_profiles": "void-profile sampler or normalization change",
+    "interface_x_breakdown": "regenerated interfaces dataset or geometry-sampling change",
+}
+
+GROUPS = {"physics", "mms", "training", "data", "forcing", "source", "interfaces"}
 
 PLOT_STYLE = {
     "font.size": 10,
@@ -244,20 +181,3 @@ def _resolve_interface_metadata(config: dict | None = None, solver=None,
         "interface_x": resolved_x,
         "interface_half_width": float(interface_half_width),
     }
-
-
-def _evaluate_q_left_field(solver) -> np.ndarray:
-    """Sample solver.q_left on solver.t × solver.grid_y as shape (Nt, Ny).
-
-    Broadcasts the legacy scalar path so callers always see a 2D field.
-    """
-    Ny = solver.Ny
-    is_vector = bool(getattr(solver, "_q_left_is_vector", False))
-    Q = np.empty((len(solver.t), Ny), dtype=float)
-    for i, ti in enumerate(solver.t):
-        val = np.asarray(solver.q_left(ti), dtype=float)
-        if is_vector:
-            Q[i, :] = val
-        else:
-            Q[i, :] = float(val)
-    return Q

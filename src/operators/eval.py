@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 from data.dataset import (
-    TEMPORAL_SAMPLES,
     T_EPS,
     apply_protocol_pairs,
     assert_dataset_problem_version,
@@ -15,6 +14,7 @@ from data.dataset import (
     problem_from_config,
     split_sim_ids,
 )
+from src.physics.boundary_forcing import FORCING_TEMPORAL_SAMPLES
 from src.operators.fno2d import FNO2d
 from src.operators.losses import (
     EPS_JUMP,
@@ -22,7 +22,6 @@ from src.operators.losses import (
     build_boundary_mask,
     build_interface_band,
     build_interface_mask,
-    compute_interface_rel_l2,
     get_batch_interface_x,
     interface_flanking_nodes,
     interface_flanking_nodes_per_sample,
@@ -50,8 +49,8 @@ from datetime import datetime, timezone
 Per-seed result keys:
     test_rel_l2_norm        normalized-space relative L2 (%) — comparable to val_rel_l2
     test_rel_l2             physical-space (Kelvin) relative L2 (%)
-    test_iface_rel_l2_norm  normalized-space interface-weighted relative L2 (%)
-    test_iface_rel_l2       physical-space interface-weighted relative L2 (%)
+    test_iface_rel_l2_norm  normalized-space pooled interface-band relative L2 (%)
+    test_iface_rel_l2       physical-space pooled interface-band relative L2 (%)
 """
 
 # -------- LOAD TEST SET ---------
@@ -136,7 +135,9 @@ def build_test_loader(
         time_norm_horizon=time_norm_horizon,
         ramp_seconds=ramp_seconds,
         num_workers=0,
-        temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
+        temporal_samples=config["model"]["parameters"].get(
+            "temporal_samples", FORCING_TEMPORAL_SAMPLES
+        ),
         problem=problem,
     )
 
@@ -178,17 +179,23 @@ def build_test_loader(
 
 # -------- EVAL MODEL ON TEST SET  ---------
 
-def _band_rel_l2(y_pred, y_true, band_float):
-    """Per-sample interface-band rel L2 (%), masked-sum form.
+def _region_squared_sums(y_pred, y_true, mask):
+    """Return error/target sums of squares for pooling across batches or pairs.
 
-    ``band_float`` is a (B, Nx, 1, 1) float tensor selecting each sample's
-    interface columns. The voxel count cancels between numerator and
-    denominator, so this matches ``compute_interface_rel_l2``'s mean/mean ratio
-    while allowing the band to differ per sample.
+    ``mask`` is either a fixed (Nx, Ny) mask or a broadcastable per-sample
+    (B, Nx, 1, 1) band. Empty regions contribute zero to both sums.
     """
-    num = torch.sum(band_float * (y_pred - y_true) ** 2)
-    den = torch.sum(band_float * y_true ** 2)
-    return (torch.sqrt(num / den) * 100).item()
+    if mask.ndim == 2:
+        y_pred = y_pred[:, mask, :]
+        y_true = y_true[:, mask, :]
+        return np.array([
+            torch.sum((y_pred - y_true) ** 2).item(),
+            torch.sum(y_true ** 2).item(),
+        ])
+    return np.array([
+        torch.sum(mask * (y_pred - y_true) ** 2).item(),
+        torch.sum(mask * y_true ** 2).item(),
+    ])
 
 
 def evaluate(
@@ -212,10 +219,19 @@ def evaluate(
         rel_l2_phys:        relative L2 (%) after denormalizing to Kelvin —
                             small because the ~300 K baseline inflates the
                             denominator. Useful for "% of absolute T" intuition.
-        iface_rel_l2_norm:  interface-weighted relative L2 (%) on normalized outputs.
-        iface_rel_l2_phys:  interface-weighted relative L2 (%) in Kelvin.
+        iface_rel_l2_norm:  pooled interface-band relative L2 (%) on normalized outputs.
+        iface_rel_l2_phys:  pooled interface-band relative L2 (%) in Kelvin.
         boundary_rel_l2_norm/phys:  edge-band relative L2 (%) — diagnostic for the
                             absolute-pad confound in cross-resolution eval.
+        gnrmse_pct:         pooled field RMSE_K / training temperature-rise RMS
+                            * 100; the scale is sqrt(sigma_train**2 +
+                            (mu_train - temperature_reference_K)**2).
+        gnrmse_pct_p99:     p99 of pair RMSE_K / the same rise scale * 100.
+        node_jump_gnrmse_pct: mean pair jump RMSE / training sigma * 100
+                            (the legacy jump diagnostic, identical in train/val).
+
+    All region rel-L2 scores pool squared errors and squared targets before
+    taking the ratio, matching train/validation and independent of batching.
     """
     if rollout_is_active(rollout_options):
         return _evaluate_rollout(
@@ -250,10 +266,10 @@ def evaluate(
         num_error_cells = 0
         training_mu_values: list[torch.Tensor] = []
         training_sigma_values: list[torch.Tensor] = []
-        iface_rel_l2_norm = 0.0
-        iface_rel_l2_phys = 0.0
-        boundary_rel_l2_norm = 0.0
-        boundary_rel_l2_phys = 0.0
+        iface_sums_norm = np.zeros(2, dtype=np.float64)
+        iface_sums_phys = np.zeros(2, dtype=np.float64)
+        boundary_sums_norm = np.zeros(2, dtype=np.float64)
+        boundary_sums_phys = np.zeros(2, dtype=np.float64)
 
         # Unified per-sample metric accumulators (mean-over-pairs convention).
         nrmse_all: list[torch.Tensor] = []
@@ -318,23 +334,22 @@ def evaluate(
             if iface_x is not None and x_grid_t is not None:
                 band = build_interface_band(x_grid_t, iface_x, interface_half_width)
                 bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
-                iface_rel_l2_norm += _band_rel_l2(y_pred, y_batch, bf)
-                iface_rel_l2_phys += _band_rel_l2(y_pred_phys, y_true_phys, bf)
+                iface_sums_norm += _region_squared_sums(y_pred, y_batch, bf)
+                iface_sums_phys += _region_squared_sums(y_pred_phys, y_true_phys, bf)
             elif iface_mask is not None:
-                iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
-                iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
+                iface_sums_norm += _region_squared_sums(y_pred, y_batch, iface_mask)
+                iface_sums_phys += _region_squared_sums(y_pred_phys, y_true_phys, iface_mask)
 
             if boundary_mask is not None:
-                boundary_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, boundary_mask)
-                boundary_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, boundary_mask)
+                boundary_sums_norm += _region_squared_sums(y_pred, y_batch, boundary_mask)
+                boundary_sums_phys += _region_squared_sums(y_pred_phys, y_true_phys, boundary_mask)
 
-        n_batches = len(test_loader)
         rel_l2_norm = (sse_norm / sst_norm) ** 0.5 * 100 if sst_norm > 0 else 0.0
         rel_l2_phys = (sse_phys / sst_phys) ** 0.5 * 100 if sst_phys > 0 else 0.0
-        iface_rel_l2_norm /= n_batches
-        iface_rel_l2_phys /= n_batches
-        boundary_rel_l2_norm /= n_batches
-        boundary_rel_l2_phys /= n_batches
+        iface_rel_l2_norm = math.sqrt(iface_sums_norm[0] / max(iface_sums_norm[1], 1e-12)) * 100.0
+        iface_rel_l2_phys = math.sqrt(iface_sums_phys[0] / max(iface_sums_phys[1], 1e-12)) * 100.0
+        boundary_rel_l2_norm = math.sqrt(boundary_sums_norm[0] / max(boundary_sums_norm[1], 1e-12)) * 100.0
+        boundary_rel_l2_phys = math.sqrt(boundary_sums_phys[0] / max(boundary_sums_phys[1], 1e-12)) * 100.0
 
     nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
     rmse_K_stats = tail_stats(torch.cat(rmse_K_all)) if rmse_K_all else tail_stats(torch.empty(0))
@@ -431,10 +446,10 @@ def _evaluate_rollout(
         sst_norm = 0.0
         sse_phys = 0.0
         sst_phys = 0.0
-        iface_rel_l2_norm = 0.0
-        iface_rel_l2_phys = 0.0
-        boundary_rel_l2_norm = 0.0
-        boundary_rel_l2_phys = 0.0
+        iface_sums_norm = np.zeros(2, dtype=np.float64)
+        iface_sums_phys = np.zeros(2, dtype=np.float64)
+        boundary_sums_norm = np.zeros(2, dtype=np.float64)
+        boundary_sums_phys = np.zeros(2, dtype=np.float64)
 
         for idx in range(len(dataset)):
             sim_id, s, j = dataset._pairs[idx]
@@ -469,23 +484,22 @@ def _evaluate_rollout(
             if iface_x is not None and x_grid_t is not None:
                 band = build_interface_band(x_grid_t, iface_x, interface_half_width)
                 bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
-                iface_rel_l2_norm += _band_rel_l2(y_pred, y_batch, bf)
-                iface_rel_l2_phys += _band_rel_l2(y_pred_phys, y_true_phys, bf)
+                iface_sums_norm += _region_squared_sums(y_pred, y_batch, bf)
+                iface_sums_phys += _region_squared_sums(y_pred_phys, y_true_phys, bf)
             elif iface_mask is not None:
-                iface_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, iface_mask)
-                iface_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, iface_mask)
+                iface_sums_norm += _region_squared_sums(y_pred, y_batch, iface_mask)
+                iface_sums_phys += _region_squared_sums(y_pred_phys, y_true_phys, iface_mask)
 
             if boundary_mask is not None:
-                boundary_rel_l2_norm += compute_interface_rel_l2(y_pred, y_batch, boundary_mask)
-                boundary_rel_l2_phys += compute_interface_rel_l2(y_pred_phys, y_true_phys, boundary_mask)
+                boundary_sums_norm += _region_squared_sums(y_pred, y_batch, boundary_mask)
+                boundary_sums_phys += _region_squared_sums(y_pred_phys, y_true_phys, boundary_mask)
 
-        n_items = len(dataset)
         rel_l2_norm = (sse_norm / sst_norm) ** 0.5 * 100 if sst_norm > 0 else 0.0
         rel_l2_phys = (sse_phys / sst_phys) ** 0.5 * 100 if sst_phys > 0 else 0.0
-        iface_rel_l2_norm /= n_items
-        iface_rel_l2_phys /= n_items
-        boundary_rel_l2_norm /= n_items
-        boundary_rel_l2_phys /= n_items
+        iface_rel_l2_norm = math.sqrt(iface_sums_norm[0] / max(iface_sums_norm[1], 1e-12)) * 100.0
+        iface_rel_l2_phys = math.sqrt(iface_sums_phys[0] / max(iface_sums_phys[1], 1e-12)) * 100.0
+        boundary_rel_l2_norm = math.sqrt(boundary_sums_norm[0] / max(boundary_sums_norm[1], 1e-12)) * 100.0
+        boundary_rel_l2_phys = math.sqrt(boundary_sums_phys[0] / max(boundary_sums_phys[1], 1e-12)) * 100.0
 
     return {
         "rel_l2_norm": rel_l2_norm,

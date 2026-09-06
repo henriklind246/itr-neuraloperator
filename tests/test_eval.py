@@ -600,3 +600,144 @@ class TestTestRecordSufficientStatistics:
             assert 100.0 * math.sqrt(sse / target_sse) == pytest.approx(
                 float(row["rel_l2_pct"]), rel=1e-5
             )
+
+
+class _MetricPairs(list):
+    @property
+    def _pairs(self):
+        return [(i, 0, 1) for i in range(len(self))]
+
+
+class _MetricPrediction(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.offset = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, spatial, cond_static, forcing_seq=None):
+        return spatial[..., :1] + self.offset
+
+
+def _heterogeneous_metric_pairs():
+    x = torch.linspace(0, 1, 6).reshape(6, 1, 1)
+    y = torch.linspace(0, 1, 3).reshape(1, 3, 1)
+    pairs = _MetricPairs()
+    for amplitude, error, center in zip(
+        [1.0, 3.0, 10.0, 30.0, 100.0],
+        [8.0, 0.2, 4.0, 30.0, 1.0],
+        [0.1, 0.2, 0.5, 0.6, 0.9],
+    ):
+        target = amplitude * (1 + x + y)
+        pairs.append({
+            "spatial": target + error * (1 + 2 * x + y),
+            "Y": target,
+            "cond_static": torch.zeros(2),
+            "forcing_seq": torch.zeros(128, 3),
+            "T_stats": torch.tensor([307.0, 5.0, center]),
+        })
+    return pairs
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
+def test_region_metrics_pool_squared_errors(dynamic, batch_size):
+    from src.operators.losses import build_boundary_mask, build_interface_mask
+    from src.operators.train import validate
+    from data.dataset import T_EPS
+
+    dataset = _heterogeneous_metric_pairs()
+    loader = DataLoader(dataset, batch_size=batch_size)
+    grid = torch.linspace(0, 1, 6)
+    y_grid = torch.linspace(0, 1, 3)
+    iface = build_interface_mask(grid.numpy(), y_grid.numpy(), interface_half_width=0.12)
+    boundary = build_boundary_mask(grid.numpy(), y_grid.numpy())
+    model = _MetricPrediction()
+    metrics = evaluate(
+        model, loader, "cpu", iface_mask=iface, boundary_mask=boundary,
+        x_grid=grid, interface_half_width=0.12, use_per_sample_interface=dynamic,
+    )
+    batch = next(iter(DataLoader(dataset, batch_size=len(dataset))))
+    pred, target = batch["spatial"], batch["Y"]
+    if dynamic:
+        centers = batch["T_stats"][:, 2, None]
+        band = (abs(grid[None, :] - centers) <= 0.12)[:, :, None, None]
+    else:
+        band = iface[None, :, :, None]
+    for region, mask in [("iface", band), ("boundary", boundary[None, :, :, None])]:
+        for space in ["norm", "phys"]:
+            yp, yt = pred, target
+            if space == "phys":
+                yp, yt = yp * (5.0 + T_EPS) + 307.0, yt * (5.0 + T_EPS) + 307.0
+            expected = 100 * torch.sqrt(((yp - yt).square() * mask).sum() / (yt.square() * mask).sum())
+            assert metrics[f"{region}_rel_l2_{space}"] == pytest.approx(expected.item(), rel=1e-6)
+    val = validate(
+        model, loader, "cpu", iface_mask=iface, x_grid_t=grid,
+        interface_half_width=0.12, use_per_sample_interface=dynamic,
+    )
+    assert metrics["iface_rel_l2_norm"] == pytest.approx(val["iface_rel_l2"], rel=1e-6)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_rollout_region_metrics_match_direct_pooling(monkeypatch, dynamic):
+    from src.operators.losses import build_boundary_mask, build_interface_mask
+    from src.operators.rollout import RolloutOptions
+
+    dataset = _heterogeneous_metric_pairs()
+    loader = DataLoader(dataset, batch_size=2)
+    grid = torch.linspace(0, 1, 6).numpy()
+    y_grid = torch.linspace(0, 1, 3).numpy()
+    kwargs = dict(
+        iface_mask=build_interface_mask(grid, y_grid, interface_half_width=0.12),
+        boundary_mask=build_boundary_mask(grid, y_grid), x_grid=grid,
+        interface_half_width=0.12, use_per_sample_interface=dynamic,
+    )
+    monkeypatch.setattr(
+        "src.operators.eval.predict_autoregressive",
+        lambda **kw: kw["dataset"][kw["sim_id"]]["spatial"].unsqueeze(0),
+    )
+    model = _MetricPrediction()
+    direct = evaluate(model, loader, "cpu", **kwargs)
+    rollout = evaluate(
+        model, loader, "cpu", rollout_options=RolloutOptions(enabled=True, num_substeps=2),
+        **kwargs,
+    )
+    for key, value in rollout.items():
+        assert value == pytest.approx(direct[key], rel=1e-6)
+
+
+def test_empty_regions_contribute_zero():
+    mask = torch.zeros(6, 3, dtype=torch.bool)
+    metrics = evaluate(
+        _MetricPrediction(), DataLoader(_heterogeneous_metric_pairs(), batch_size=2),
+        "cpu", iface_mask=mask, boundary_mask=mask,
+    )
+    for region in ["iface", "boundary"]:
+        for space in ["norm", "phys"]:
+            assert metrics[f"{region}_rel_l2_{space}"] == 0.0
+
+
+def test_sigma_nrmse_and_gnrmse_have_distinct_names_and_definitions():
+    from src.operators.losses import SpatiallyWeightedMSE
+    from src.operators.train import train_one_epoch, validate
+
+    dataset = _heterogeneous_metric_pairs()
+    loader = DataLoader(dataset, batch_size=2)
+    model = _MetricPrediction()
+    grid = torch.linspace(0, 1, 6).numpy()
+    y_grid = torch.linspace(0, 1, 3).numpy()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    train = train_one_epoch(
+        model, loader, optimizer, SpatiallyWeightedMSE(grid, y_grid), "cpu",
+        sigma_global=5.0,
+    )
+    val = validate(model, loader, "cpu", sigma_global=5.0)
+    test = evaluate(model, loader, "cpu")
+    errors = torch.stack([row["spatial"] - row["Y"] for row in dataset])
+    pair_rms = errors.square().mean(dim=(1, 2, 3)).sqrt()
+    for metrics in [train, val]:
+        assert "gnrmse_pct" not in metrics
+        assert metrics["sigma_nrmse_pct"] == pytest.approx(100 * pair_rms.mean().item())
+    assert val["sigma_nrmse_pct_p99"] == pytest.approx(100 * torch.quantile(pair_rms, 0.99).item())
+    assert "sigma_nrmse_pct" not in test
+    expected = 100 * 5.0 * errors.square().mean().sqrt().item() / math.sqrt(5.0**2 + 7.0**2)
+    assert test["gnrmse_pct"] == pytest.approx(expected, rel=1e-6)
+    assert test["gnrmse_pct"] != pytest.approx(val["sigma_nrmse_pct"])

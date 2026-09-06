@@ -121,6 +121,10 @@ _SPECS: tuple[FigureSpec, ...] = (
           benchmark="interfaces"),
     _spec("F21_tail_reliability", "Tail reliability across benchmarks",
           "visual.pub.fig_crossbench", "tail_reliability", 1, "two_col"),
+    _spec("F26_contact_jump_vs_lead",
+          "Physical contact-jump fidelity across benchmarks",
+          "visual.pub.fig_crossbench", "physical_contact_jump_vs_lead", 1,
+          "two_col"),
 
     # ------------------------------- tier 3: blocked on experiments not yet run
     _spec("F16_inverse_forcing_recovery", "Parameter recovery: forcing",

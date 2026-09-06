@@ -487,7 +487,7 @@ class TestValidate:
             "iface_rel_l2",
             "nrmse",
             "rmse_K",
-            "gnrmse_pct",
+            "sigma_nrmse_pct",
             "node_jump_rmse_K",
             "node_jump_nrmse",
             "node_jump_gnrmse_pct",
@@ -524,7 +524,8 @@ class TestValidate:
             ):
                 assert row[empty_col] == ""
 
-    def test_per_pair_csv_metrics_use_normalized_tensors(self, tmp_path, synthetic_trajectories, synthetic_sim_params):
+    @pytest.mark.parametrize("legacy_header", [False, True])
+    def test_per_pair_csv_metrics_use_normalized_tensors(self, tmp_path, synthetic_trajectories, synthetic_sim_params, legacy_header):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         dataset = SnapshotPairDataset(
             trajectories=trajectories,
@@ -541,6 +542,14 @@ class TestValidate:
         iface_mask = build_interface_mask(x_grid, y_grid)
         csv_path = tmp_path / "val_pairs.csv"
 
+        if legacy_header:
+            from src.operators.train import VAL_PAIR_FIELDNAMES
+            with csv_path.open("w", newline="") as f:
+                csv.writer(f).writerow([
+                    "gnrmse_pct" if key == "sigma_nrmse_pct" else key
+                    for key in VAL_PAIR_FIELDNAMES
+                ])
+
         validate(
             ZeroModel(),
             loader,
@@ -549,6 +558,7 @@ class TestValidate:
             dataset=dataset,
             pair_csv_path=csv_path,
             epoch=7,
+            sigma_global=2.0,
         )
 
         with csv_path.open("r", newline="") as f:
@@ -558,6 +568,8 @@ class TestValidate:
         for row in rows:
             assert float(row["rel_l2"]) == pytest.approx(100.0)
             assert float(row["iface_rel_l2"]) == pytest.approx(100.0)
+            key = "gnrmse_pct" if legacy_header else "sigma_nrmse_pct"
+            assert float(row[key]) == pytest.approx(float(row["rmse_K"]) / 2.0 * 100)
 
     def _capped_dataset(self, synthetic_trajectories, synthetic_sim_params):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
@@ -1061,7 +1073,7 @@ class TestRunOneSeedResume:
         train_cols = (
             "train_nrmse", "train_rmse_K", "train_max_err_K",
             "train_node_jump_rmse_K", "train_node_jump_nrmse",
-            "train_gnrmse_pct", "train_node_jump_gnrmse_pct",
+            "train_sigma_nrmse_pct", "train_node_jump_gnrmse_pct",
         )
         for col in train_cols:
             assert col in rows[0], col
@@ -1074,7 +1086,7 @@ class TestRunOneSeedResume:
             "val_nrmse", "val_nrmse_p50", "val_nrmse_iqr",
             "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
             "val_rmse_K", "val_rmse_K_p90", "val_rmse_K_p99", "val_rmse_K_max",
-            "val_gnrmse_pct", "val_gnrmse_pct_p99", "val_max_err_K",
+            "val_sigma_nrmse_pct", "val_sigma_nrmse_pct_p99", "val_max_err_K",
             "val_node_jump_rmse_K", "val_node_jump_nrmse",
             "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
             "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
@@ -1285,7 +1297,8 @@ class TestRunOneSeedResume:
         header_count = sum(1 for line in lines if line.startswith("epoch,"))
         assert header_count == 1, f"Expected 1 header row, found {header_count}"
 
-    def test_csv_epochs_continue_after_resume(self, tmp_path, seed_config):
+    @pytest.mark.parametrize("legacy_metrics", [False, True])
+    def test_csv_epochs_continue_after_resume(self, tmp_path, seed_config, legacy_metrics):
         """Resumed epochs should start after the last epoch in the existing CSV."""
         run_dir = tmp_path / "seed0"
 
@@ -1294,6 +1307,14 @@ class TestRunOneSeedResume:
 
         best_ckpt = torch.load(run_dir / "fno2d_best.pt", map_location="cpu", weights_only=False)
         torch.save(best_ckpt, run_dir / "fno2d_latest.pt")
+
+        retained = {}
+        for name in ("train_metrics.csv", "val_pairs.csv"):
+            path = run_dir / name
+            with path.open(newline="") as f:
+                retained[name] = next(csv.DictReader(f))
+            if legacy_metrics:
+                path.write_text(path.read_text().replace("sigma_nrmse", "gnrmse"))
 
         resume_config = {**seed_config, "training": {**seed_config["training"], "epochs": 6}}
         run_one_seed(resume_config, seed=0, run_dir=run_dir)
@@ -1307,6 +1328,13 @@ class TestRunOneSeedResume:
         assert epochs == sorted(set(epochs))
         # Should have epochs from the resumed portion (starting after epoch from checkpoint)
         assert len(epochs) > 2
+        for name, expected in retained.items():
+            with (run_dir / name).open(newline="") as f:
+                row = next(csv.DictReader(f))
+            for key in expected:
+                if "sigma_nrmse" in key:
+                    assert row[key] == expected[key]
+                    assert key.replace("sigma_nrmse", "gnrmse") not in row
 
     def test_resume_rejects_optimizer_scheduler_mismatch(self, tmp_path, seed_config):
         """Resuming should fail clearly when optimizer or scheduler family changes."""
@@ -1446,3 +1474,30 @@ class TestRunConfigSeeds:
         summary = run_config_seeds(seed_config, base_run_dir=run_dir, seeds=None)
         # config has seeds: [0, 1]
         assert summary["num_seeds"] == 2
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_metrics_summary_preserves_sigma_definition(tmp_path, legacy):
+    from src.operators.train import _summarize_metrics_csv
+
+    row = {
+        "epoch": 0, "is_best": 1,
+        "train_sigma_nrmse_pct": 2.5,
+        "val_sigma_nrmse_pct": 4.5,
+        "val_sigma_nrmse_pct_p99": 9.0,
+        "val_node_jump_gnrmse_pct": 6.0,
+    }
+    if legacy:
+        row = {key.replace("sigma_nrmse", "gnrmse"): value for key, value in row.items()}
+    path = tmp_path / "train_metrics.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    summary = _summarize_metrics_csv(path)
+    for key in ("best_row", "final_row"):
+        assert summary[key]["train_sigma_nrmse_pct"] == 2.5
+        assert summary[key]["val_sigma_nrmse_pct"] == 4.5
+        assert summary[key]["val_sigma_nrmse_pct_p99"] == 9.0
+        assert summary[key]["val_node_jump_gnrmse_pct"] == 6.0
+        assert "val_gnrmse_pct" not in summary[key]

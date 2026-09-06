@@ -54,3 +54,54 @@ sources:
     - table: visual/ood/forcing_time/ood_per_sim.csv
   ood_transfer:
     - table: visual/ood/interfaces/ood_per_sim.csv
+
+  rollout_records:
+    - table: rollout_studies/forcing_pub_forcing/ckpt/seed32/records_direct.csv
+      seed: 32
+    - table: rollout_studies/forcing_pub_forcing/ckpt/seed32/records_k2.csv
+      seed: 32
+    - table: rollout_studies/forcing_pub_forcing/ckpt/seed32/records_k4.csv
+      seed: 32
+    - table: rollout_studies/forcing_pub_forcing/ckpt/seed32/records_k8.csv
+      seed: 32
+    - table: rollout_studies/source_pub_source/ckpt/seed32/records_direct.csv
+      seed: 32
+    - table: rollout_studies/source_pub_source/ckpt/seed32/records_k2.csv
+      seed: 32
+    - table: rollout_studies/source_pub_source/ckpt/seed32/records_k4.csv
+      seed: 32
+    - table: rollout_studies/source_pub_source/ckpt/seed32/records_k8.csv
+      seed: 32
+    - table: rollout_studies/interfaces_neumann_ic_v1/ckpt/seed32/records_direct.csv
+      seed: 32
+    - table: rollout_studies/interfaces_neumann_ic_v1/ckpt/seed32/records_k2.csv
+      seed: 32
+    - table: rollout_studies/interfaces_neumann_ic_v1/ckpt/seed32/records_k4.csv
+      seed: 32
+    - table: rollout_studies/interfaces_neumann_ic_v1/ckpt/seed32/records_k8.csv
+      seed: 32
+
+  resinv_reports:
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/study_manifest.json
+      seed: 32
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/validation.json
+      seed: 32
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r100.json
+      seed: 32
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r150.json
+      seed: 32
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r200.json
+      seed: 32
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r256.json
+      seed: 32
+    - table: resolution_studies/forcing_E32_checkpoint_20260830/data/normalized_fv_baseline/fv_drift_baseline.json
+    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/study_manifest.json
+      seed: 32
+    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r100.json
+      seed: 32
+    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r150.json
+      seed: 32
+    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r200.json
+      seed: 32
+    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r256.json
+      seed: 32

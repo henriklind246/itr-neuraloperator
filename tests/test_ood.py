@@ -20,6 +20,7 @@ from data.dataset import (
     PROTOCOLS,
     SnapshotPairDataset,
     apply_protocol_pairs,
+    assert_dataset_problem_version,
     build_protocol_pairs,
 )
 from data.generate_dataset import build_base_setup, run_solves
@@ -199,6 +200,14 @@ def test_crn_pairing_compound_axis(tmp_path, benchmark, axis, values):
     # Different repeats draw different backgrounds.
     all_hashes = {next(iter(h)) for h in by_repeat.values()}
     assert len(all_hashes) == 2
+
+    problem_version = getattr(get_problem(benchmark), "problem_version", None)
+    if problem_version is not None:
+        meta = assert_dataset_problem_version(
+            get_problem(benchmark), save_path / "t_grid.npy"
+        )
+        assert meta["problem_version"] == problem_version
+        assert meta["ood_axis"] == axis
 
 
 # ---------------------------------------------------------------------------

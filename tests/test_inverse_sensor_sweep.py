@@ -382,7 +382,6 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     data_dir = _data_dir(tmp_path / "data")
     out_dir = tmp_path / "out"
     commands = []
-    plot_calls = []
 
     def fake_run(command):
         commands.append(command)
@@ -392,29 +391,10 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
         else:
             _write_mock_forcing_results(command)
 
-    def fake_generate_plots(combined_path, *, benchmark, out_dir):
-        plot_calls.append((combined_path, benchmark, out_dir))
-        return {
-            "status": "complete",
-            "recovery": {
-                "files": {
-                    "png": str(out_dir / "plots" / "sensor_recovery_vs_sensors.png"),
-                    "pdf": str(out_dir / "plots" / "sensor_recovery_vs_sensors.pdf"),
-                }
-            },
-            "uncertainty": {
-                "files": {
-                    "png": str(out_dir / "plots" / "sensor_uq_vs_sensors.png"),
-                    "pdf": str(out_dir / "plots" / "sensor_uq_vs_sensors.pdf"),
-                }
-            },
-        }
-
     monkeypatch.setattr(sweep, "_run_command", fake_run)
     monkeypatch.setattr(
         sweep, "_checkpoint_fingerprint", lambda _: "mock-checkpoint"
     )
-    monkeypatch.setattr(sweep, "generate_sweep_plots", fake_generate_plots)
     combined = sweep.run_sweep(
         benchmark="forcing",
         checkpoint=checkpoint,
@@ -434,8 +414,6 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     ]
     assert sum("--calibration-out" in command for command in commands) == 3
     assert sum("--out-csv" in command for command in commands) == 3
-    assert plot_calls == [(combined, "forcing", out_dir.resolve())]
-
     with combined.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 24
@@ -453,12 +431,13 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
         manifest = json.load(handle)
     assert manifest["status"] == "complete"
     assert manifest["combined_row_count"] == 24
+    assert Path(manifest["canonical_csv"]) == combined
     assert manifest["calibration_sim_ids"] == list(
         range(sweep.N_CASES, sweep.N_CASES + sweep.CALIBRATION_FLOOR)
     )
     assert manifest["evaluation_sim_ids"] == list(range(sweep.N_CASES))
-    assert manifest["plots"]["status"] == "complete"
-    assert manifest["schema_version"] == 2
+    assert "plots" not in manifest
+    assert manifest["schema_version"] == 3
     assert manifest["paper_summary"]["status"] == "complete"
     assert Path(manifest["paper_summary"]["json"]).is_file()
     assert Path(manifest["paper_summary"]["csv"]).is_file()
@@ -482,7 +461,6 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     )
     assert resumed == combined
     assert commands == []
-    assert len(plot_calls) == 2
     with (out_dir / "sweep_manifest.json").open() as handle:
         resumed_manifest = json.load(handle)
     assert all(
@@ -502,50 +480,12 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
         device="cpu",
     )
     assert len(commands) == 6
-    assert len(plot_calls) == 3
 
 
-def test_run_sweep_preserves_results_when_plotting_fails(tmp_path, monkeypatch):
-    checkpoint = _checkpoint(tmp_path / "model.pt")
-    data_dir = _data_dir(tmp_path / "data")
-    out_dir = tmp_path / "out"
-
-    def fake_run(command):
-        if "--calibration-out" in command:
-            _write_mock_calibration(Path(_option(command, "--calibration-out")))
-        else:
-            _write_mock_forcing_results(command)
-
-    monkeypatch.setattr(sweep, "_run_command", fake_run)
-    monkeypatch.setattr(
-        sweep, "_checkpoint_fingerprint", lambda _: "mock-checkpoint"
-    )
-    monkeypatch.setattr(
-        sweep,
-        "generate_sweep_plots",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("render failed")),
-    )
-
-    with pytest.raises(sweep.PlotGenerationError, match="render failed"):
-        sweep.run_sweep(
-            benchmark="forcing",
-            checkpoint=checkpoint,
-            data_dir=data_dir,
-            out_dir=out_dir,
-            device="cpu",
-        )
-
-    assert (out_dir / "inverse_sensor_sweep.csv").is_file()
-    assert (out_dir / "inverse_sensor_sweep_summary.json").is_file()
-    assert (out_dir / "inverse_sensor_sweep_summary.csv").is_file()
-    for count in sweep.SENSOR_COUNTS:
-        assert (out_dir / f"sensors_{count:02d}" / "inverse_results.csv").is_file()
-        assert len(list((out_dir / f"sensors_{count:02d}" / "artifacts").glob("*.npz"))) == 8
-    with (out_dir / "sweep_manifest.json").open() as handle:
-        manifest = json.load(handle)
-    assert manifest["status"] == "plotting_failed"
-    assert "render failed" in manifest["plot_error"]
-    assert manifest["paper_summary"]["status"] == "complete"
+def test_sweep_runner_has_no_legacy_plot_dependency():
+    source = Path(sweep.__file__).read_text()
+    assert "generate_sweep_plots" not in source
+    assert "PlotGenerationError" not in source
 
 
 def test_run_sweep_preserves_results_when_summary_generation_fails(

@@ -215,3 +215,17 @@ runs/
 .claude/
 .DS_Store
 visual/**/*.png
+
+# Generated experiment and visualization artifacts
+/data/ood/
+/ood_studies/
+/resolution_studies/
+/rollout_studies/
+/tmp/
+/visual/forcing/
+/visual/forcing_E32_error_stratifications/
+/visual/interfaces_neumann_ic_v1/
+/visual/ood/
+/visual/paper/
+/visual/physics/
+/visual/pub_out/

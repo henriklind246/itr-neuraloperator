@@ -10,6 +10,7 @@ import csv
 
 import matplotlib
 import numpy as np
+import pandas as pd
 import pytest
 
 matplotlib.use("Agg")
@@ -124,6 +125,34 @@ class TestCondCols:
         assert ivp._cond_cols(df, "source") == ["t_s", "t_bar", "R_c", "x_h", "y_h", "A"]
 
 
+class TestSimulationTailSummary:
+    def test_reduces_pairs_within_simulation_before_tail_statistics(self):
+        df = pd.DataFrame({
+            "sim_id": [0, 0, 0, 1],
+            "rel_l2": [1.0, 1.0, 10.0, 5.0],
+        })
+        rows = ivp.simulation_tail_rows(df, "interfaces", [])
+        row = next(r for r in rows if r["metric"] == "rel_l2")
+
+        assert row["n_sims"] == 2
+        assert row["n_pairs"] == 4
+        assert row["mean"] == pytest.approx(((1.0 + 1.0 + 10.0) / 3.0 + 5.0) / 2.0)
+        assert np.isnan(row["p99"])
+        assert row["p99_determined"] is False
+
+    def test_categorical_and_numeric_strata_are_exported(self):
+        df = pd.DataFrame({
+            "sim_id": np.repeat(np.arange(10), 2),
+            "rel_l2": np.linspace(0.1, 2.0, 20),
+            "temporal_family": np.tile(["sin", "exp"], 10),
+            "t_bar": np.linspace(0.01, 0.3, 20),
+        })
+        rows = ivp.simulation_tail_rows(df, "forcing", ["t_bar"])
+        assert {r["stratum"] for r in rows} == {
+            "overall", "temporal_family", "t_bar_quintile",
+        }
+
+
 # ===================== end-to-end dispatch =====================
 
 class TestMainDispatch:
@@ -140,5 +169,9 @@ class TestMainDispatch:
         produced = {p.name for p in out.glob("*.png")}
         expected = UNIVERSAL_PNGS | {STRUCTURE_PNG[benchmark]}
         assert produced == expected
+        tail = pd.read_csv(out / "tail_summary_sim.csv")
+        assert list(tail.columns) == list(ivp.TAIL_SUMMARY_FIELDS)
+        assert set(tail["benchmark"]) == {benchmark}
+        assert int(tail.loc[tail["stratum"] == "overall", "n_sims"].iloc[0]) == 6
         # The report header must name the detected benchmark.
         assert f"Benchmark: {benchmark}" in capsys.readouterr().out

@@ -28,10 +28,14 @@ from visual.pub._blocked import blocked
 # these, so the table is the figure's specification.
 DIFFICULTY_STRATA = {
     "forcing": ("lead_bin", "temporal_family", "spatial_family"),
-    "source": ("lead_bin", "regime", "patch_x_bin", "amplitude_bin"),
+    "source": ("lead_bin", "regime", "patch_x_bin", "amplitude_bin", "R_c_bin"),
     "source_itr": ("lead_bin", "void_severity", "R_c_bin"),
     "interfaces": ("lead_bin", "interface_x_bin", "R_c_bin"),
 }
+
+# Source uses its fifth panel for global physical error across contact resistance
+# instead of repeating the normalized per-simulation error distribution.
+DIFFICULTY_ECDF_BENCHMARKS = frozenset({"forcing", "source_itr", "interfaces"})
 
 _DIFFICULTY_KEYS = {
     "forcing": "F08_forcing_difficulty",
@@ -280,7 +284,8 @@ def difficulty(*, benchmark: str, source=None, spec=None, requirement=None):
 
     One panel per stratum in ``DIFFICULTY_STRATA[benchmark]``, each a median
     with IQR whisker and bootstrap CI over **per-simulation** values, plus an
-    ECDF over simulations and one interaction panel on shared bin edges.
+    optional ECDF over simulations and one interaction panel on shared bin
+    edges.
 
     The current versions of these figures are long-tail histograms over
     ``(sim_id, s, j)`` pairs: the tail crushes the body, and the pair count is a
@@ -296,8 +301,10 @@ def difficulty(*, benchmark: str, source=None, spec=None, requirement=None):
                 key=key)
 
     strata = _available_strata(frame, benchmark)
+    wants_ecdf = benchmark in DIFFICULTY_ECDF_BENCHMARKS
     wants_void = benchmark == "source_itr" and bool(fields.run_dirs(source, benchmark))
-    n_panels = len(strata) + 1 + (1 if INTERACTIONS.get(benchmark) else 0) \
+    n_panels = len(strata) + (1 if wants_ecdf else 0) \
+        + (1 if INTERACTIONS.get(benchmark) else 0) \
         + (1 if wants_void else 0)
     ncol = min(n_panels, 3)
     nrow = int(np.ceil(n_panels / ncol))
@@ -320,16 +327,18 @@ def difficulty(*, benchmark: str, source=None, spec=None, requirement=None):
             for s, lab in zip(summaries, labels)
         }
 
-    # ECDF over simulations: the exceedance fraction at any threshold is
-    # readable directly, which a histogram of a heavy tail is not.
     sims_flat = stats.per_sim(frame, metrics=(DIFFICULTY_METRIC, "rel_l2_pct"))
-    ax = flat[used]; used += 1
-    panels.ecdf_curves(ax,
-                       {benchmark: sims_flat.df["rel_l2_pct"].to_numpy(dtype=float)},
-                       colors={benchmark: color},
-                       xlabel=style.axis_label("rel_l2_pct"), logx=True,
-                       reference=1.0, reference_label="1% target",
-                       title="Per-simulation relative $L_2$")
+    if wants_ecdf:
+        # The exceedance fraction at any threshold is readable directly, which
+        # a histogram of a heavy tail is not.
+        ax = flat[used]; used += 1
+        panels.ecdf_curves(
+            ax,
+            {benchmark: sims_flat.df["rel_l2_pct"].to_numpy(dtype=float)},
+            colors={benchmark: color},
+            xlabel=style.axis_label("rel_l2_pct"), logx=True,
+            reference=1.0, reference_label="1% target",
+            title="Per-simulation relative $L_2$")
 
     interaction = None
     kelvin_axes = list(flat[:len(strata)])
@@ -487,7 +496,7 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                            colorbar_rows={last: ((0, 1), (2,))},
                            extra_rows=1, extra_row_height=0.78,
                            extra_row_inset_in=0.24,
-                           max_map_in=1.35, cbar_label_in=0.60)
+                           max_map_in=1.65, cbar_label_in=0.60)
     fig, axes = grid.fig, grid.maps
     y_grid = np.asarray(bundle.y_grid, dtype=float)
     color = style.benchmark_color(benchmark)

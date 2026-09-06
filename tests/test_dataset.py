@@ -3,9 +3,6 @@ import pytest
 import torch
 
 from data.dataset import (
-    TEMPORAL_SAMPLES,
-    TEMPORAL_TOKEN_DIM,
-    A_AMP_REF,
     compute_global_stats,
     load_sim_data,
     split_sim_ids,
@@ -13,10 +10,9 @@ from data.dataset import (
     SnapshotPairDataset,
     create_dataloaders,
     collate_fn,
-    build_forcing_seq,
-    build_forcing_summary,
 )
 from problems.forcing import (
+    A_AMP_REF,
     COND_STATIC_DIM,
     FORCING_SPATIAL_DESCRIPTOR_SLICE,
     FORCING_TEMPORAL_SAMPLES,
@@ -38,8 +34,6 @@ _SYNTH_MU = 0.0
 _SYNTH_SIGMA = 1.0
 # Active dataset default = forcing benchmark, temporal_encoder representation:
 # 4 spatial channels [T_tilde, x, y, s_y], 10 static cond dims, (128, 3) tokens.
-# TEMPORAL_SAMPLES / TEMPORAL_TOKEN_DIM (64, 5) imported above stay scoped to the
-# legacy standalone build_forcing_seq / build_forcing_summary helper tests.
 SPATIAL_IN_CHANNELS = SPATIAL_CHANNELS_TEMPORAL
 
 
@@ -515,36 +509,6 @@ class TestSnapshotPairDataset:
         assert dataset_subsampled._pairs[-1] in pairs
 
 
-# ===================== build_forcing_seq helper =====================
-
-class TestBuildForcingSeq:
-    def test_shape_and_dtype(self):
-        q = lambda t: np.zeros_like(np.atleast_1d(t), dtype=np.float64)
-        z = build_forcing_seq(q, t_s=0.0, t_j=0.5, t_final=1.0)
-        assert z.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
-        assert z.dtype == np.float32
-
-    def test_constant_a_gives_linear_cumulative(self):
-        A = 100.0
-        q = lambda t: np.full_like(np.atleast_1d(t).astype(np.float64), A, dtype=np.float64)
-        t_s, t_j, t_final = 0.0, 0.5, 1.0
-        z = build_forcing_seq(q, t_s=t_s, t_j=t_j, t_final=t_final)
-        # Final cumulative should equal A * (t_j - t_s) / A_cum_ref
-        A_cum_ref = A_AMP_REF * t_final
-        expected_final = A * (t_j - t_s) / A_cum_ref
-        assert z[-1, 2] == pytest.approx(expected_final, abs=1e-5)
-        # cumulative starts at zero
-        assert z[0, 2] == pytest.approx(0.0, abs=1e-6)
-
-    def test_scalar_callable_broadcasts(self):
-        """A callable returning a python float must be broadcast to (M,)."""
-        q = lambda t: 42.0
-        z = build_forcing_seq(q, t_s=0.0, t_j=0.1, t_final=1.0)
-        assert z.shape == (TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM)
-        # tok1 = a_m / A_AMP_REF should equal 42 / 300 everywhere
-        assert np.allclose(z[:, 1], 42.0 / A_AMP_REF)
-
-
 # ===================== create_dataloaders =====================
 
 class TestCreateDataloaders:
@@ -840,71 +804,6 @@ class TestCondStaticLayout:
             )
         for other in s_ys[1:]:
             assert not torch.allclose(s_ys[0], other)
-
-
-# ===================== build_forcing_summary helper =====================
-
-
-class TestBuildForcingSummary:
-    """Closed-form checks for constant a(t) and zero forcing."""
-
-    def _grid(self, t_s, t_j, M=TEMPORAL_SAMPLES):
-        return np.linspace(t_s, t_j, M, dtype=np.float64)
-
-    def test_shape_and_dtype(self):
-        t_vals = self._grid(0.0, 0.5)
-        a_vals = np.zeros_like(t_vals)
-        s = build_forcing_summary(a_vals, t_vals, t_s=0.0, t_j=0.5, t_final=1.0)
-        assert s.shape == (8,)
-        assert s.dtype == np.float32
-
-    def test_zero_forcing_all_zero(self):
-        t_vals = self._grid(0.0, 0.7)
-        a_vals = np.zeros_like(t_vals)
-        s = build_forcing_summary(a_vals, t_vals, t_s=0.0, t_j=0.7, t_final=1.0)
-        assert np.allclose(s, 0.0, atol=1e-7)
-
-    def test_constant_positive(self):
-        A = 60.0
-        t_s, t_j, t_final = 0.1, 0.6, 1.0
-        t_vals = self._grid(t_s, t_j)
-        a_vals = np.full_like(t_vals, A)
-        s = build_forcing_summary(a_vals, t_vals, t_s=t_s, t_j=t_j, t_final=t_final)
-        mass = A * (t_j - t_s) / (A_AMP_REF * t_final)
-        # S1, S2, S3, S4
-        assert s[0] == pytest.approx(mass,  rel=1e-5)
-        assert s[1] == pytest.approx(mass,  rel=1e-5)
-        assert s[2] == pytest.approx(mass,  rel=1e-5)
-        assert s[3] == pytest.approx(0.0,   abs=1e-7)
-        # S5, S6, S7, S8
-        assert s[4] == pytest.approx(A / A_AMP_REF, rel=1e-5)
-        assert s[5] == pytest.approx(A / A_AMP_REF, rel=1e-5)
-        assert s[6] == pytest.approx(A / A_AMP_REF, rel=1e-5)
-        assert s[7] == pytest.approx(A / A_AMP_REF, rel=1e-5)
-
-    def test_constant_negative(self):
-        A = 80.0
-        t_s, t_j, t_final = 0.0, 0.4, 1.0
-        t_vals = self._grid(t_s, t_j)
-        a_vals = np.full_like(t_vals, -A)
-        s = build_forcing_summary(a_vals, t_vals, t_s=t_s, t_j=t_j, t_final=t_final)
-        mass = A * (t_j - t_s) / (A_AMP_REF * t_final)
-        # S1 = -mass, S2 = mass, S3 = 0, S4 = mass
-        assert s[0] == pytest.approx(-mass, rel=1e-5)
-        assert s[1] == pytest.approx( mass, rel=1e-5)
-        assert s[2] == pytest.approx(0.0,   abs=1e-7)
-        assert s[3] == pytest.approx( mass, rel=1e-5)
-        # S5 = -A/A_ref, S6 = A/A_ref, S7 = A/A_ref, S8 = -A/A_ref
-        assert s[4] == pytest.approx(-A / A_AMP_REF, rel=1e-5)
-        assert s[5] == pytest.approx( A / A_AMP_REF, rel=1e-5)
-        assert s[6] == pytest.approx( A / A_AMP_REF, rel=1e-5)
-        assert s[7] == pytest.approx(-A / A_AMP_REF, rel=1e-5)
-
-    def test_zero_interval_does_not_divide_by_zero(self):
-        t_vals = np.array([0.3, 0.3], dtype=np.float64)
-        a_vals = np.array([10.0, 10.0], dtype=np.float64)
-        s = build_forcing_summary(a_vals, t_vals, t_s=0.3, t_j=0.3, t_final=1.0)
-        assert np.all(np.isfinite(s))
 
 
 # ===================== collate_fn =====================

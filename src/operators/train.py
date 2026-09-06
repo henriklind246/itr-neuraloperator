@@ -20,7 +20,6 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam, AdamW
 
 from data.dataset import (
-    TEMPORAL_SAMPLES,
     SnapshotPairDataset,
     assert_dataset_problem_version,
     build_normalization_provenance,
@@ -33,6 +32,7 @@ from data.dataset import (
     problem_from_config,
     split_sim_ids,
 )
+from src.physics.boundary_forcing import FORCING_TEMPORAL_SAMPLES
 from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
 from src.operators.soap import SOAP
@@ -69,7 +69,7 @@ BASE_VAL_PAIR_FIELDNAMES = [
     "iface_rel_l2",
     "nrmse",
     "rmse_K",
-    "gnrmse_pct",
+    "sigma_nrmse_pct",
     "node_jump_rmse_K",
     "node_jump_nrmse",
     "node_jump_gnrmse_pct",
@@ -420,16 +420,17 @@ def _summarize_metrics_csv(csv_path: Path) -> dict:
         rows = list(csv.DictReader(f))
 
     def _f(row, key):
-        v = row.get(key, "")
+        legacy_key = key.replace("sigma_nrmse", "gnrmse")
+        v = row.get(key, row.get(legacy_key, ""))
         return float(v) if v not in ("", None) else None
 
     _extra_keys = (
-        "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
+        "train_nrmse", "train_rmse_K", "train_sigma_nrmse_pct", "train_max_err_K",
         "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
         "val_nrmse", "val_nrmse_p50", "val_nrmse_iqr",
         "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
         "val_rmse_K", "val_rmse_K_p90", "val_rmse_K_p99", "val_rmse_K_max",
-        "val_gnrmse_pct", "val_gnrmse_pct_p99", "val_max_err_K",
+        "val_sigma_nrmse_pct", "val_sigma_nrmse_pct_p99", "val_max_err_K",
         "val_node_jump_rmse_K", "val_node_jump_nrmse",
         "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
         "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
@@ -503,8 +504,8 @@ def _write_final_metrics(
             "val_rmse_K_p90": best["val_rmse_K_p90"],
             "val_rmse_K_p99": best["val_rmse_K_p99"],
             "val_rmse_K_max": best["val_rmse_K_max"],
-            "val_gnrmse_pct": best["val_gnrmse_pct"],
-            "val_gnrmse_pct_p99": best["val_gnrmse_pct_p99"],
+            "val_sigma_nrmse_pct": best["val_sigma_nrmse_pct"],
+            "val_sigma_nrmse_pct_p99": best["val_sigma_nrmse_pct_p99"],
             "val_max_err_K": best["val_max_err_K"],
             "val_node_jump_rmse_K": best["val_node_jump_rmse_K"],
             "val_node_jump_nrmse": best["val_node_jump_nrmse"],
@@ -512,7 +513,7 @@ def _write_final_metrics(
             "val_node_jump_gnrmse_pct_p99": best["val_node_jump_gnrmse_pct_p99"],
             "train_nrmse": best["train_nrmse"],
             "train_rmse_K": best["train_rmse_K"],
-            "train_gnrmse_pct": best["train_gnrmse_pct"],
+            "train_sigma_nrmse_pct": best["train_sigma_nrmse_pct"],
             "train_max_err_K": best["train_max_err_K"],
             "train_node_jump_rmse_K": best["train_node_jump_rmse_K"],
             "train_node_jump_nrmse": best["train_node_jump_nrmse"],
@@ -524,7 +525,7 @@ def _write_final_metrics(
             "train_iface_rel_l2": final["train_iface_rel_l2"],
             "train_nrmse": final["train_nrmse"],
             "train_rmse_K": final["train_rmse_K"],
-            "train_gnrmse_pct": final["train_gnrmse_pct"],
+            "train_sigma_nrmse_pct": final["train_sigma_nrmse_pct"],
             "train_max_err_K": final["train_max_err_K"],
             "train_node_jump_rmse_K": final["train_node_jump_rmse_K"],
             "train_node_jump_nrmse": final["train_node_jump_nrmse"],
@@ -902,6 +903,9 @@ def train_one_epoch(
     ``node_jump_nrmse``) are accumulated as **summed per-sample** scalars and
     divided by ``n_samples`` after the reduce, so the train headline equals the
     mean-over-pairs definition used by validate/evaluate (not a pooled RMSE).
+    ``sigma_nrmse_pct`` is mean pair normalized RMS * 100, equivalently mean
+    pair RMSE_K / training sigma * 100. It differs from test ``gnrmse_pct``,
+    which pools squared errors and uses the training temperature-rise scale.
     ``max_err_K`` is a worst-case over the split (MAX-reduced under DDP).
     """
     if dist_info is None:
@@ -939,7 +943,7 @@ def train_one_epoch(
     # Unified metric accumulators (summed per-sample; mean after the reduce).
     nrmse_sum = 0.0
     rmse_K_sum = 0.0
-    gnrmse_sum = 0.0  # sum of per-sample normalized RMS (= rmse_K/sigma); *100 for pct
+    sigma_nrmse_sum = 0.0  # sum of per-sample normalized RMS (= rmse_K/sigma); *100 for pct
     node_jump_rmse_K_sum = 0.0
     node_jump_nrmse_sum = 0.0
     node_jump_gnrmse_sum = 0.0  # sum of per-sample normalized jump RMS; *100 for pct
@@ -992,7 +996,7 @@ def train_one_epoch(
             rms_i = per_sample_sq_rms(y_pred, y_batch)  # (B,)
             nrmse_sum += torch.sum(per_sample_nrmse(y_pred, y_batch)).item()
             rmse_K_sum += torch.sum(rms_i).item() * sigma_global
-            gnrmse_sum += torch.sum(rms_i).item()
+            sigma_nrmse_sum += torch.sum(rms_i).item()
             max_abs_err = max(max_abs_err, torch.max(torch.abs(y_pred - y_batch)).item())
 
             left, right = fixed_left, fixed_right
@@ -1029,7 +1033,7 @@ def train_one_epoch(
             [loss_sum, mse_sum, target_sq_sum, iface_mse_sum, iface_target_sq_sum,
              float(n_samples), float(n_iface_voxels),
              nrmse_sum, rmse_K_sum, node_jump_rmse_K_sum, node_jump_nrmse_sum,
-             gnrmse_sum, node_jump_gnrmse_sum],
+             sigma_nrmse_sum, node_jump_gnrmse_sum],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -1044,7 +1048,7 @@ def train_one_epoch(
         rmse_K_sum = t[8].item()
         node_jump_rmse_K_sum = t[9].item()
         node_jump_nrmse_sum = t[10].item()
-        gnrmse_sum = t[11].item()
+        sigma_nrmse_sum = t[11].item()
         node_jump_gnrmse_sum = t[12].item()
 
         m = torch.tensor([max_abs_err], device=device, dtype=torch.float64)
@@ -1067,7 +1071,7 @@ def train_one_epoch(
         "iface_rel_l2": train_iface_rel_l2,
         "nrmse": (nrmse_sum / denom) * 100.0,
         "rmse_K": rmse_K_sum / denom,
-        "gnrmse_pct": (gnrmse_sum / denom) * 100.0,
+        "sigma_nrmse_pct": (sigma_nrmse_sum / denom) * 100.0,
         "max_err_K": max_abs_err * sigma_global,
         "node_jump_rmse_K": node_jump_rmse_K_sum / denom,
         "node_jump_nrmse": (node_jump_nrmse_sum / denom) * 100.0,
@@ -1139,7 +1143,7 @@ def _write_val_pair_rows(
     iface_rel_l2: torch.Tensor,
     nrmse: torch.Tensor,
     rmse_K: torch.Tensor,
-    gnrmse_pct: torch.Tensor,
+    sigma_nrmse_pct: torch.Tensor,
     node_jump_rmse_K: torch.Tensor,
     node_jump_nrmse: torch.Tensor,
     node_jump_gnrmse_pct: torch.Tensor,
@@ -1161,7 +1165,8 @@ def _write_val_pair_rows(
             "iface_rel_l2": float(iface_rel_l2[row_idx].item()),
             "nrmse": float(nrmse[row_idx].item()),
             "rmse_K": float(rmse_K[row_idx].item()),
-            "gnrmse_pct": float(gnrmse_pct[row_idx].item()),
+            ("sigma_nrmse_pct" if "sigma_nrmse_pct" in writer.fieldnames else "gnrmse_pct"):
+                float(sigma_nrmse_pct[row_idx].item()),
             "node_jump_rmse_K": float(node_jump_rmse_K[row_idx].item()),
             "node_jump_nrmse": float(node_jump_nrmse[row_idx].item()),
             "node_jump_gnrmse_pct": float(node_jump_gnrmse_pct[row_idx].item()),
@@ -1201,9 +1206,11 @@ def validate(
     DDP forward would deadlock other ranks waiting on a collective.
     Validation is intended to run on rank 0 only; the caller broadcasts results.
 
-    ``rel_l2`` keeps the global-ratio semantics of `train_one_epoch`. The new
-    headline metrics use the mean-over-pairs convention (per-sample values
-    aggregated), so they compare directly to `evaluate`.
+    ``rel_l2`` keeps the global-ratio semantics of `train_one_epoch`.
+    ``sigma_nrmse_pct`` is mean pair normalized RMS * 100; its p99 is taken
+    over those pair values. The per-pair CSV uses the same sigma denominator.
+    Test ``gnrmse_pct`` instead pools squared errors and normalizes by training
+    temperature-rise RMS. Other headline metrics use mean-over-pairs aggregation.
     """
     with torch.no_grad():
         model.eval()
@@ -1216,7 +1223,7 @@ def validate(
         nrmse_all: list[torch.Tensor] = []
         rmse_K_all: list[torch.Tensor] = []
         rel_l2_all: list[torch.Tensor] = []  # per-pair rel-L2 % (for lead stratification)
-        gnrmse_all: list[torch.Tensor] = []  # per-sample normalized RMS (= rms_i)
+        sigma_nrmse_all: list[torch.Tensor] = []  # per-sample normalized RMS (= rms_i)
         node_jump_rmse_K_all: list[torch.Tensor] = []
         node_jump_nrmse_all: list[torch.Tensor] = []
         node_jump_gnrmse_all: list[torch.Tensor] = []  # per-sample normalized jump RMS
@@ -1245,9 +1252,13 @@ def validate(
             pair_path = Path(pair_csv_path)
             pair_path.parent.mkdir(parents=True, exist_ok=True)
             write_header = not pair_path.exists() or pair_path.stat().st_size == 0
+            pair_fieldnames = VAL_PAIR_FIELDNAMES
+            if not write_header:
+                with pair_path.open("r", newline="") as existing:
+                    pair_fieldnames = next(csv.reader(existing))
             pair_file = pair_path.open("a", newline="")
             pair_writer = csv.DictWriter(
-                pair_file, fieldnames=VAL_PAIR_FIELDNAMES, restval="", extrasaction="ignore"
+                pair_file, fieldnames=pair_fieldnames, restval="", extrasaction="ignore"
             )
             if write_header:
                 pair_writer.writeheader()
@@ -1292,7 +1303,7 @@ def validate(
                 rms_i = per_sample_sq_rms(y_pred, y_batch)
                 nrmse_all.append(per_sample_nrmse(y_pred, y_batch).cpu())
                 rmse_K_all.append((rms_i * sigma_global).cpu())
-                gnrmse_all.append(rms_i.cpu())
+                sigma_nrmse_all.append(rms_i.cpu())
                 if lead_cutoff_time is not None:
                     rel_l2_all.append(_per_pair_rel_l2_percent(y_pred, y_batch).cpu())
                 max_abs_err = max(
@@ -1341,7 +1352,7 @@ def validate(
                             pairs = base_pairs
                             nrmse_pct = nrmse_all[-1] * 100.0
                             rmse_K_b = rmse_K_all[-1]
-                            gnrmse_pct_b = gnrmse_all[-1] * 100.0
+                            sigma_nrmse_pct_b = sigma_nrmse_all[-1] * 100.0
                             jump_src = jump_nrmse_i
                             node_jump_rmse_src = (
                                 node_jump_rmse_K_all[-1] if jump_nrmse_i is not None else None
@@ -1357,7 +1368,7 @@ def validate(
                             pairs = [base_pairs[i] for i in local]
                             nrmse_pct = (nrmse_all[-1] * 100.0)[idx_cpu]
                             rmse_K_b = rmse_K_all[-1][idx_cpu]
-                            gnrmse_pct_b = (gnrmse_all[-1] * 100.0)[idx_cpu]
+                            sigma_nrmse_pct_b = (sigma_nrmse_all[-1] * 100.0)[idx_cpu]
                             jump_src = jump_nrmse_i[idx_cpu] if jump_nrmse_i is not None else None
                             node_jump_rmse_src = (
                                 node_jump_rmse_K_all[-1][idx_cpu] if jump_nrmse_i is not None else None
@@ -1386,7 +1397,7 @@ def validate(
                             node_jump_gnrmse_pct_b = torch.zeros_like(rel_l2)
                         _write_val_pair_rows(
                             pair_writer, int(epoch), dataset, pairs, rel_l2, iface_rel_l2,
-                            nrmse_pct, rmse_K_b, gnrmse_pct_b, node_jump_rmse_K_b,
+                            nrmse_pct, rmse_K_b, sigma_nrmse_pct_b, node_jump_rmse_K_b,
                             node_jump_nrmse_pct, node_jump_gnrmse_pct_b,
                         )
                     pair_cursor += batch_size
@@ -1412,7 +1423,7 @@ def validate(
 
         nrmse_stats = tail_stats(torch.cat(nrmse_all)) if nrmse_all else tail_stats(torch.empty(0))
         rmse_K_stats = tail_stats(torch.cat(rmse_K_all)) if rmse_K_all else tail_stats(torch.empty(0))
-        gnrmse_stats = tail_stats(torch.cat(gnrmse_all)) if gnrmse_all else tail_stats(torch.empty(0))
+        sigma_nrmse_stats = tail_stats(torch.cat(sigma_nrmse_all)) if sigma_nrmse_all else tail_stats(torch.empty(0))
         if node_jump_nrmse_all:
             jump_nrmse_stats = tail_stats(torch.cat(node_jump_nrmse_all))
             node_jump_rmse_K_mean = float(torch.cat(node_jump_rmse_K_all).mean())
@@ -1467,8 +1478,8 @@ def validate(
             "rmse_K_p90": rmse_K_stats["p90"],
             "rmse_K_p99": rmse_K_stats["p99"],
             "rmse_K_max": rmse_K_stats["max"],
-            "gnrmse_pct": gnrmse_stats["mean"] * 100.0,
-            "gnrmse_pct_p99": gnrmse_stats["p99"] * 100.0,
+            "sigma_nrmse_pct": sigma_nrmse_stats["mean"] * 100.0,
+            "sigma_nrmse_pct_p99": sigma_nrmse_stats["p99"] * 100.0,
             "max_err_K": max_abs_err * sigma_global,
             "node_jump_rmse_K": node_jump_rmse_K_mean,
             "node_jump_nrmse": jump_nrmse_stats["mean"] * 100.0,
@@ -1570,7 +1581,9 @@ def run_one_seed(
             num_workers=num_workers,
             dt=solver_dt,
             ramp_seconds=ramp_seconds,
-            temporal_samples=config["model"]["parameters"].get("temporal_samples", TEMPORAL_SAMPLES),
+            temporal_samples=config["model"]["parameters"].get(
+                "temporal_samples", FORCING_TEMPORAL_SAMPLES
+            ),
             world_size=dist_info.world_size,
             rank=dist_info.rank,
             sampler_seed=seed,
@@ -1810,13 +1823,13 @@ def run_one_seed(
     fieldnames = [
         "epoch", "train_loss",
         "train_rel_l2", "train_iface_rel_l2",
-        "train_nrmse", "train_rmse_K", "train_gnrmse_pct", "train_max_err_K",
+        "train_nrmse", "train_rmse_K", "train_sigma_nrmse_pct", "train_max_err_K",
         "train_node_jump_rmse_K", "train_node_jump_nrmse", "train_node_jump_gnrmse_pct",
         "val_rel_l2", "val_iface_rel_l2",
         "val_nrmse", "val_nrmse_p50", "val_nrmse_iqr",
         "val_nrmse_p90", "val_nrmse_p99", "val_nrmse_max",
         "val_rmse_K", "val_rmse_K_p90", "val_rmse_K_p99", "val_rmse_K_max",
-        "val_gnrmse_pct", "val_gnrmse_pct_p99", "val_max_err_K",
+        "val_sigma_nrmse_pct", "val_sigma_nrmse_pct_p99", "val_max_err_K",
         "val_node_jump_rmse_K", "val_node_jump_nrmse",
         "val_node_jump_nrmse_p90", "val_node_jump_nrmse_p99", "val_node_jump_nrmse_max",
         "val_node_jump_gnrmse_pct", "val_node_jump_gnrmse_pct_p99",
@@ -1840,6 +1853,14 @@ def run_one_seed(
             csv_file = csv_path.open("w", newline="")
             csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             csv_writer.writeheader()
+            for row in kept_rows:
+                for old, new in (
+                    ("train_gnrmse_pct", "train_sigma_nrmse_pct"),
+                    ("val_gnrmse_pct", "val_sigma_nrmse_pct"),
+                    ("val_gnrmse_pct_p99", "val_sigma_nrmse_pct_p99"),
+                ):
+                    if old in row:
+                        row[new] = row.pop(old)
             csv_writer.writerows(kept_rows)
         else:
             csv_file = csv_path.open("w", newline="")
@@ -1855,6 +1876,9 @@ def run_one_seed(
                     f, fieldnames=VAL_PAIR_FIELDNAMES, restval="", extrasaction="ignore"
                 )
                 writer.writeheader()
+                for row in kept_rows:
+                    if "gnrmse_pct" in row:
+                        row["sigma_nrmse_pct"] = row.pop("gnrmse_pct")
                 writer.writerows(kept_rows)
         elif not resuming and val_pairs_path.exists():
             val_pairs_path.unlink()
@@ -1963,7 +1987,7 @@ def run_one_seed(
             print(
                 f"Epoch {epoch}: train_loss={train_loss:.6f}, "
                 f"train_rel_l2={train_rel_l2:.4f}%, iface_rel_l2={train_iface_rel_l2:.4f}% | "
-                f"nrmse={train_metrics['nrmse']:.3f}% gnrmse={train_metrics['gnrmse_pct']:.3f}% "
+                f"nrmse={train_metrics['nrmse']:.3f}% sigma_nrmse={train_metrics['sigma_nrmse_pct']:.3f}% "
                 f"rmse_K={train_metrics['rmse_K']:.4f}K max_err_K={train_metrics['max_err_K']:.4f}K "
                 f"node_jump_rmse_K={train_metrics['node_jump_rmse_K']:.4f}K",
                 flush=True,
@@ -2004,8 +2028,8 @@ def run_one_seed(
                     f"p99={val_metrics['rmse_K_p99']:.4f}K "
                     f"max_sample={val_metrics['rmse_K_max']:.4f}K | "
                     f"pointwise max_err_K={val_metrics['max_err_K']:.4f}K\n"
-                    f"    dimensionless: gnrmse_pct mean={val_metrics['gnrmse_pct']:.3f}% "
-                    f"p99={val_metrics['gnrmse_pct_p99']:.3f}% | "
+                    f"    dimensionless: sigma_nrmse_pct mean={val_metrics['sigma_nrmse_pct']:.3f}% "
+                    f"p99={val_metrics['sigma_nrmse_pct_p99']:.3f}% | "
                     f"nrmse mean={val_metrics['nrmse']:.3f}% median={val_metrics['nrmse_p50']:.3f}% "
                     f"IQR={val_metrics['nrmse_iqr']:.3f}% p99={val_metrics['nrmse_p99']:.3f}% "
                     f"max={val_metrics['nrmse_max']:.3f}%\n"
@@ -2135,7 +2159,7 @@ def run_one_seed(
                     "train_iface_rel_l2": float(train_iface_rel_l2),
                     "train_nrmse": float(train_metrics["nrmse"]),
                     "train_rmse_K": float(train_metrics["rmse_K"]),
-                    "train_gnrmse_pct": float(train_metrics["gnrmse_pct"]),
+                    "train_sigma_nrmse_pct": float(train_metrics["sigma_nrmse_pct"]),
                     "train_max_err_K": float(train_metrics["max_err_K"]),
                     "train_node_jump_rmse_K": float(train_metrics["node_jump_rmse_K"]),
                     "train_node_jump_nrmse": float(train_metrics["node_jump_nrmse"]),
@@ -2152,8 +2176,8 @@ def run_one_seed(
                     "val_rmse_K_p90": _vm("rmse_K_p90"),
                     "val_rmse_K_p99": _vm("rmse_K_p99"),
                     "val_rmse_K_max": _vm("rmse_K_max"),
-                    "val_gnrmse_pct": _vm("gnrmse_pct"),
-                    "val_gnrmse_pct_p99": _vm("gnrmse_pct_p99"),
+                    "val_sigma_nrmse_pct": _vm("sigma_nrmse_pct"),
+                    "val_sigma_nrmse_pct_p99": _vm("sigma_nrmse_pct_p99"),
                     "val_max_err_K": _vm("max_err_K"),
                     "val_node_jump_rmse_K": _vm("node_jump_rmse_K"),
                     "val_node_jump_nrmse": _vm("node_jump_nrmse"),

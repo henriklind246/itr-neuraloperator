@@ -1,4 +1,4 @@
-"""Evaluate a checkpoint on one selected case and return physical-Kelvin fields.
+"""Evaluate checkpoints on selected cases and return physical-Kelvin fields.
 
 F05, F06, F09, F11, F13 and F15 all need the same three things: the run's
 checkpoint, the trajectories that run was scored on, and the truth / prediction /
@@ -29,6 +29,9 @@ _K_LEFT_DEFAULT = 2.0
 _K_RIGHT_DEFAULT = 1.0
 _K_LEFT_SOURCE = 3.0
 _K_RIGHT_SOURCE = 35.0
+
+CONTACT_JUMP_COHORT_SIZE = 24
+CONTACT_JUMP_COHORT_SEED = 20260728
 
 
 @dataclass
@@ -99,6 +102,19 @@ class CaseFields:
         args = (self.x_grid, self.interface_x, self.R_c, self.k_left, self.k_right)
         return (jump_mod.contact_flux_map(self.truth, *args),
                 jump_mod.contact_flux_map(self.pred, *args))
+
+
+@dataclass(frozen=True)
+class ContactJumpCohort:
+    """Physical contact jumps for a fixed simulation cohort and lead grid."""
+
+    benchmark: str
+    sim_ids: tuple[int, ...]
+    source_index: int
+    target_indices: tuple[int, ...]
+    lead_times: np.ndarray
+    truth: np.ndarray          # (n_sims, n_targets, Ny) Kelvin
+    pred: np.ndarray           # (n_sims, n_targets, Ny) Kelvin
 
 
 # --------------------------------------------------------------------- loading
@@ -297,6 +313,68 @@ def evaluate_case(bundle_: RunBundle, sim_id: int, s: int,
         R_c=resistance(bundle_, sim_id),
         k_left=k_left, k_right=k_right,
         params=bundle_.sim_params[int(sim_id)],
+    )
+
+
+def evaluate_contact_jump_cohort(
+    bundle_: RunBundle,
+    records_,
+    *,
+    n_sims: int = CONTACT_JUMP_COHORT_SIZE,
+    source_index: int = 0,
+    rng_seed: int = CONTACT_JUMP_COHORT_SEED,
+) -> ContactJumpCohort:
+    """Evaluate a reproducible simulation cohort on every future saved time.
+
+    The cohort is sampled without replacement from simulation IDs present in
+    the records and valid for the resolved run. No field or simulation-level
+    reduction happens here; :mod:`visual.pub.stats` owns those operations.
+    """
+    frame = getattr(records_, "df", records_)
+    if "sim_id" not in frame.columns:
+        raise KeyError("contact-jump cohort selection requires sim_id")
+    if n_sims <= 0:
+        raise ValueError("n_sims must be positive")
+
+    candidates = np.asarray(frame["sim_id"], dtype=np.int64)
+    candidates = np.unique(candidates[
+        (candidates >= 0) & (candidates < bundle_.n_sims)
+    ])
+    if candidates.size == 0:
+        raise ValueError("no record simulation IDs are valid for the run bundle")
+
+    rng = np.random.default_rng(rng_seed)
+    size = min(int(n_sims), int(candidates.size))
+    sim_ids = np.sort(rng.choice(candidates, size=size, replace=False))
+
+    s = int(source_index)
+    if not 0 <= s < bundle_.n_times - 1:
+        raise ValueError(
+            f"source_index must leave at least one future time; got {s} for "
+            f"{bundle_.n_times} saved times"
+        )
+    targets = tuple(range(s + 1, bundle_.n_times))
+
+    truth, pred = [], []
+    lead_times = None
+    for sim_id in sim_ids:
+        case = evaluate_case(bundle_, int(sim_id), s, targets)
+        truth_jump, pred_jump = case.contact_jumps()
+        truth.append(truth_jump)
+        pred.append(pred_jump)
+        if lead_times is None:
+            lead_times = case.lead_times
+        elif not np.allclose(lead_times, case.lead_times):
+            raise ValueError("contact-jump cohort cases do not share a lead grid")
+
+    return ContactJumpCohort(
+        benchmark=bundle_.benchmark,
+        sim_ids=tuple(int(v) for v in sim_ids),
+        source_index=s,
+        target_indices=targets,
+        lead_times=np.asarray(lead_times, dtype=np.float64),
+        truth=np.stack(truth),
+        pred=np.stack(pred),
     )
 
 
@@ -533,15 +611,19 @@ def case_metrics(case: CaseFields) -> list[dict]:
 
 
 __all__ = [
+    "CONTACT_JUMP_COHORT_SEED",
+    "CONTACT_JUMP_COHORT_SIZE",
     "MIN_JUMP_CONTRAST_K",
     "MIN_TRANSVERSE_FRACTION",
     "CaseFields",
+    "ContactJumpCohort",
     "RunBundle",
     "bundle",
     "bundles",
     "case_metrics",
     "checkpoint_path",
     "evaluate_case",
+    "evaluate_contact_jump_cohort",
     "interface_location",
     "jump_contrast",
     "jump_contrast_note",

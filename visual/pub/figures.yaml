@@ -126,15 +126,26 @@ requirement_sets:
 
   inverse_sensor_sweep:
     kind: inverse_csv
+    benchmarks: [forcing, forcing_itr]
     min_seeds: 1
     schema_min: 0
-    required_columns: [sim_id, n_sensors, noise_seed, init_seed]
+    required_columns:
+      - benchmark
+      - sim_id
+      - n_sensors
+      - noise_seed
+      - init_seed
+      - noise_std_K
+      - fv_resid_rms_K
+      - fv_resid_over_noise
+      - profile_bound_limited
     note: >-
-      requires >= 2 distinct n_sensors values with identical simulations, noise
-      realizations, and initialization seeds paired across counts.
+      requires exactly 8, 16, and 32 sensors with the same eight simulations,
+      noise realizations, and initialization seeds paired across counts for both
+      forcing and forcing_itr.
     regenerate: >-
-      sweep driver over scripts/invert.py --sensor-n-y {4,8,16,32,64} with a
-      fixed (sim, noise_seed, init_seed) grid
+      python scripts/run_inverse_sensor_sweep.py --benchmark <forcing|forcing_itr>
+      --checkpoint <matching-checkpoint>
 
   # --------------------------------------------------------------------- ood
   ood_time:
@@ -154,21 +165,33 @@ requirement_sets:
   # ------------------------------------------------------------- conditional
   rollout_records:
     kind: test_records
+    benchmarks: [forcing, source, interfaces]
+    representation: temporal_encoder
     min_seeds: 1
-    schema_min: 2
+    schema_min: 4
+    required_columns:
+      - provenance_id
+      - sim_id
+      - s
+      - j
+      - lead_time_actual
+      - sse_K2
+      - target_sse_K2
     note: >-
-      evaluation.rollout.enabled is false in every surviving config; rollout
-      partition records do not exist yet.
-    regenerate: python scripts/run_eval.py <run_dir> evaluation.rollout.enabled=true
+      pair-aligned direct and homogeneous K={2,4,8} rollout records for the
+      forcing, source, and current interfaces studies.
+    regenerate: python scripts/run_rollout_study.py ...
 
   resinv_reports:
     kind: json_report
     min_seeds: 1
     schema_min: 0
-    note: seed_report_r*.json across resolutions, plus the FV drift baseline.
+    note: >-
+      E32 original and E33 material-side seed_report_r*.json ladders, their
+      study manifests, and the checkpoint-normalized FV drift baseline.
     regenerate: >-
       python scripts/fv_convergence_baseline.py ... and the per-resolution
-      seed reports consumed by visual/resinv_plots.py
+      evaluation reports
 
 figures:
 
@@ -286,12 +309,24 @@ figures:
 
   F23_direct_vs_autoregressive:
     requires: [rollout_records]
-    metric_space: kelvin
+    metric_space: normalized
 
   F24_resolution_invariance:
     requires: [resinv_reports]
-    metric_space: kelvin
+    metric_space: normalized
 
   F25_mms_convergence:
     requires: []
     metric_space: none
+
+  F26_contact_jump_vs_lead:
+    requires:
+      - forcing_records
+      - source_records
+      - source_itr_records
+      - interfaces_records
+      - forcing_checkpoint
+      - source_checkpoint
+      - source_itr_checkpoint
+      - interfaces_checkpoint
+    metric_space: kelvin

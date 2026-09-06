@@ -10,6 +10,7 @@ registered key that an empty manifest produces an exception and no file on disk.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import matplotlib
 import pandas as pd
@@ -361,20 +362,19 @@ class TestNoSilentSkip:
     @pytest.mark.parametrize("key", sorted(registry.FIGURES))
     def test_allow_missing_render_still_writes_nothing_for_blocked_figures(
             self, key, tmp_path, empty_manifest, capsys):
-        """Under ``--allow-missing`` the provenance gate opens; the design gate holds.
-
-        Every quantitative figure in this repo is blocked twice over: it has no
-        manifest entry, and its drawing function has no data to draw. Relaxing
-        the first must not produce an empty or fabricated figure.
-        """
+        """Relaxing provenance must not produce an empty or fabricated figure."""
         out = tmp_path / "out"
         if key in SCHEMATIC_KEYS:
             pytest.skip("renderable today; covered by tests/test_pub_figures.py")
-        with pytest.raises(NotImplementedError) as exc:
+        with pytest.raises((NotImplementedError, records_mod.SchemaError)) as exc:
             registry.render(key, manifest=empty_manifest, out_dir=out,
                             strict=False, formats=("png",))
-        assert key in str(exc.value)
-        assert "--verify" in str(exc.value)
+        if isinstance(exc.value, NotImplementedError):
+            assert key in str(exc.value)
+            assert "--verify" in str(exc.value)
+        else:
+            assert key in {"F23_direct_vs_autoregressive",
+                           "F24_resolution_invariance"}
         assert "DEGRADED" in capsys.readouterr().out
         assert not out.exists() or not list(out.rglob("*.png"))
 
@@ -458,6 +458,17 @@ class TestSidecar:
         __import__("os").remove(resolved.artifacts[0].path)
         assert any(f["status"] == "MISSING" for f in audit(out))
 
+    def test_audit_names_table_sidecars_by_table_key(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "table.provenance.json").write_text(__import__("json").dumps({
+            "schema": "visual.pub.table-provenance/1",
+            "table_key": "T01_primary_results",
+            "sources": [],
+        }))
+        findings = audit(out)
+        assert findings[0]["figure_key"] == "T01_primary_results"
+
 
 # ---------------------------------------------------------------------------
 # schema detection
@@ -522,6 +533,61 @@ class TestSchema:
         run = make_run(tmp_path, seed="1234", version=2)
         frame = records_mod.load_test_records(run / "test_records.csv")
         assert frame.seed == "1234"
+
+    def test_inverse_sensor_loader_requires_exact_case_pairing(self, tmp_path):
+        paths = []
+        for benchmark in ("forcing", "forcing_itr"):
+            rows = []
+            for sim_id in range(8):
+                for count in (8, 16, 32):
+                    truth = 0.4 + 0.01 * sim_id
+                    error = 0.01 * (8.0 / count)
+                    row = {
+                        "benchmark": benchmark,
+                        "sim_id": sim_id,
+                        "n_sensors": count,
+                        "noise_seed": sim_id,
+                        "init_seed": 0,
+                        "noise_std_K": 0.05,
+                        "fv_resid_rms_K": 0.04,
+                        "fv_resid_over_noise": 0.8,
+                        "profile_bound_limited": False,
+                    }
+                    if benchmark == "forcing":
+                        row.update({
+                            "R_c_true": truth, "R_c_map": truth + error,
+                            "R_c_abs_error": error,
+                            "profile_R_c_ci_low": truth - 0.05,
+                            "profile_R_c_ci_high": truth + 0.05,
+                        })
+                    else:
+                        row.update({
+                            "excess_int_true": truth,
+                            "excess_int_hat": truth + error,
+                            "excess_int_abserr": error,
+                            "profile_excess_ci_low": truth - 0.05,
+                            "profile_excess_ci_high": truth + 0.05,
+                        })
+                    rows.append(row)
+            path = tmp_path / f"{benchmark}.csv"
+            pd.DataFrame(rows).to_csv(path, index=False)
+            paths.append(path)
+
+        source = SimpleNamespace(artifacts=[
+            SimpleNamespace(kind="inverse_csv", path=str(path), benchmarks=())
+            for path in paths
+        ])
+        loaded = records_mod.load_inverse_sensor_sweep(source)
+        assert len(loaded) == 48
+
+        forcing = pd.read_csv(paths[0])
+        forcing.loc[
+            (forcing["sim_id"] == 0) & (forcing["n_sensors"] == 16),
+            "noise_seed",
+        ] = 99
+        forcing.to_csv(paths[0], index=False)
+        with pytest.raises(records_mod.SchemaError, match="same 8"):
+            records_mod.load_inverse_sensor_sweep(source)
 
 
 # ---------------------------------------------------------------------------

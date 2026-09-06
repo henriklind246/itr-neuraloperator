@@ -10,15 +10,8 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
 from src.physics.boundary_forcing import (
-    SPATIAL_FAMILIES,
-    SPATIAL_BUILDERS,
-    PATCH_W_RANGE,
-    GAUSS_SIGMA_RANGE,
-    TRIANGLE_ELL_RANGE,
-    TEMPORAL_BUILDERS,
-    TEMPORAL_FAMILY_ORDER,
+    FORCING_TEMPORAL_SAMPLES,
     default_ramp_seconds,
-    SIN_AMP_RANGE,
 )
 from problems.base import ProblemSpec
 from problems.registry import get_problem
@@ -88,227 +81,7 @@ def problem_from_config(config: dict) -> ProblemSpec:
     return spec
 
 
-RC_RANGE = (0.05, 1.0)
 T_EPS = 1e-6  # epsilon for temperature normalization
-
-# LEGACY (single-experiment) static-conditioning helpers.
-#
-# The active dataset path routes every item through
-# `SnapshotPairDataset.__getitem__` -> `self.problem.build_item`, so the live
-# conditioning vector is built by the per-benchmark ProblemSpec (e.g.
-# `problems/forcing.py: build_cond_vector`, a 10-dim family-independent vector)
-# and its width is owned by `ProblemDims.cond_static_dim`. The module-level
-# `COND_STATIC_DIM = 23`, `TEMPORAL_SAMPLES = 64`, `TEMPORAL_TOKEN_DIM = 5`, and
-# the `build_cond_vector` / `build_forcing_seq` / `build_forcing_summary`
-# helpers below describe the OLD forcing-only representation and are NOT used by
-# training or eval. They are retained only because legacy diagnostic and
-# visualization code (visual/forcing_plots.py, visual/dataset_plots.py) and
-# their tests still import them. Do not treat these as the current contract.
-#
-# Legacy static conditioning layout (23 dims):
-#   [0:3]    base:             t_bar_norm, t_s_norm, R_c_norm
-#   [3:7]    spatial onehot:   uniform, patch, gaussian, triangle
-#   [7:11]   spatial params:   y_c_norm, w_norm, sigma_y_norm, ell_norm
-#   [11:15]  temporal onehot:  sin, exp, pulse_train, exp_train
-#   [15:23]  forcing summary:  S1..S8 (signed/abs/pos/neg impulse, mean, RMS, peak, final)
-#
-# The forcing summary block gave the conditioning MLP global, interval-level
-# scalar descriptors of a(t) over [t_s, t_j] — complementary to the learned
-# TemporalForcingEncoder embedding.
-SPATIAL_FAMILY_ORDER = ("uniform", "patch", "gaussian", "triangle")
-
-_BASE_DIM             = 3
-_SPATIAL_ONEHOT_DIM   = len(SPATIAL_FAMILY_ORDER)
-_SPATIAL_PARAM_DIM    = 4
-_TEMPORAL_ONEHOT_DIM  = len(TEMPORAL_FAMILY_ORDER)
-_FORCING_SUMMARY_DIM  = 8
-COND_STATIC_DIM = (
-    _BASE_DIM + _SPATIAL_ONEHOT_DIM + _SPATIAL_PARAM_DIM
-    + _TEMPORAL_ONEHOT_DIM + _FORCING_SUMMARY_DIM
-)  # 23
-
-# Defaults for the temporal forcing branch.
-TEMPORAL_SAMPLES   = 64
-TEMPORAL_TOKEN_DIM = 5
-A_AMP_REF          = 300.0    # matches SIN_AMP_RANGE[1] from boundary_forcing
-
-# log-uniform sigma_y is min-max normalized in log-space so coverage matches
-# the sampler's log-uniform distribution.
-_LOG_SIGMA_LO = float(np.log(GAUSS_SIGMA_RANGE[0]))
-_LOG_SIGMA_HI = float(np.log(GAUSS_SIGMA_RANGE[1]))
-
-
-def build_cond_vector(t_bar_norm: float, t_s_norm: float, R_c: float,
-                      spatial_family: str, spatial_params: dict,
-                      temporal_family: str,
-                      forcing_summary: np.ndarray) -> np.ndarray:
-    """Assemble the legacy 23-dim static conditioning vector.
-
-    LEGACY: superseded by the per-benchmark `ProblemSpec.build_cond_vector`
-    (e.g. `problems/forcing.py`). Retained only for legacy plotting code and its
-    tests; the active dataset does not call this.
-
-    `R_c` is the raw contact resistance (not pre-normalized) — normalization
-    happens here once. `forcing_summary` is the (_FORCING_SUMMARY_DIM,) vector
-    built by `build_forcing_summary` from the same a(t) samples that feed
-    `forcing_seq`; required (no default) so callers cannot silently ship a
-    zero-padded conditioning vector.
-    """
-    R_c_norm = (R_c - RC_RANGE[0]) / (RC_RANGE[1] - RC_RANGE[0])
-    base = np.array([t_bar_norm, t_s_norm, R_c_norm], dtype=np.float32)
-
-    spatial_oh = np.zeros(_SPATIAL_ONEHOT_DIM, dtype=np.float32)
-    spatial_oh[SPATIAL_FAMILY_ORDER.index(spatial_family)] = 1.0
-    y_c_norm = w_norm = sigma_y_norm = ell_norm = 0.0
-    if spatial_family == "patch":
-        y_c_norm = float(spatial_params["y_c"])
-        w_norm = (spatial_params["w"] - PATCH_W_RANGE[0]) / (PATCH_W_RANGE[1] - PATCH_W_RANGE[0])
-    elif spatial_family == "gaussian":
-        y_c_norm = float(spatial_params["y_c"])
-        sigma_y_norm = (np.log(spatial_params["sigma_y"]) - _LOG_SIGMA_LO) / (_LOG_SIGMA_HI - _LOG_SIGMA_LO)
-    elif spatial_family == "triangle":
-        y_c_norm = float(spatial_params["y_c"])
-        ell_norm = (spatial_params["ell"] - TRIANGLE_ELL_RANGE[0]) / (TRIANGLE_ELL_RANGE[1] - TRIANGLE_ELL_RANGE[0])
-    spatial_p = np.array([y_c_norm, w_norm, sigma_y_norm, ell_norm], dtype=np.float32)
-
-    temporal_oh = np.zeros(_TEMPORAL_ONEHOT_DIM, dtype=np.float32)
-    temporal_oh[TEMPORAL_FAMILY_ORDER.index(temporal_family)] = 1.0
-
-    fs = np.asarray(forcing_summary, dtype=np.float32).reshape(-1)
-    if fs.shape[0] != _FORCING_SUMMARY_DIM:
-        raise ValueError(
-            f"forcing_summary must have shape ({_FORCING_SUMMARY_DIM},), got {fs.shape}"
-        )
-
-    return np.concatenate([base, spatial_oh, spatial_p, temporal_oh, fs]).astype(np.float32)
-
-
-def _sample_a(q, t_s: float, t_j: float, M: int) -> tuple[np.ndarray, np.ndarray]:
-    """Evaluate a(t) at M uniform samples spanning [t_s, t_j] (both endpoints).
-
-    Returns (t_samples, a_m), both float32 arrays of shape (M,). Endpoint
-    inclusion matters: the final sample is a(t_j), which the forcing-summary
-    `S8` reads as the most recent forcing value.
-    """
-    t_bar = float(t_j) - float(t_s)
-    r = np.linspace(0.0, 1.0, int(M), dtype=np.float32)
-    t_samples = (float(t_s) + r * t_bar).astype(np.float32)
-
-    try:
-        a_m = np.asarray(q(t_samples), dtype=np.float32)
-    except Exception:
-        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
-    if a_m.shape == ():
-        a_m = np.full_like(t_samples, float(a_m), dtype=np.float32)
-    elif a_m.shape != t_samples.shape:
-        a_m = np.array([q(float(tk)) for tk in t_samples], dtype=np.float32)
-    return t_samples, a_m
-
-
-def _forcing_seq_from_samples(
-    t_samples: np.ndarray,
-    a_m: np.ndarray,
-    t_s: float,
-    t_j: float,
-    t_final: float,
-    A_amp_ref: float,
-    A_cum_ref: float,
-) -> np.ndarray:
-    t_bar = float(t_j) - float(t_s)
-    M = t_samples.shape[0]
-    r = np.linspace(0.0, 1.0, M, dtype=np.float32)
-
-    # Signed cumulative trapezoid over the M sample grid. NO clamping — solver
-    # uses signed flux, so the encoder must see the same signed values.
-    A_cum = np.empty_like(a_m)
-    A_cum[0] = 0.0
-    A_cum[1:] = np.cumsum(0.5 * (a_m[1:] + a_m[:-1]) * np.diff(t_samples))
-
-    tok0 = r
-    tok1 = a_m / np.float32(A_amp_ref)
-    tok2 = A_cum / np.float32(A_cum_ref)
-    tok3 = ((1.0 - r) * t_bar / float(t_final)).astype(np.float32)
-    tok4 = (t_samples / float(t_final)).astype(np.float32)
-    return np.stack([tok0, tok1, tok2, tok3, tok4], axis=-1).astype(np.float32)
-
-
-def build_forcing_seq(
-    q,
-    t_s: float,
-    t_j: float,
-    t_final: float,
-    M: int = TEMPORAL_SAMPLES,
-    A_amp_ref: float = A_AMP_REF,
-    A_cum_ref: float | None = None,
-) -> np.ndarray:
-    """Sample a(t) on M points over [t_s, t_j] and build the (M, 5) token array.
-
-    Tokens:
-        [0] r_m = m / (M-1)
-        [1] a_m / A_amp_ref
-        [2] A_m / A_cum_ref            (signed trapezoidal cumulative)
-        [3] (t_j - t_m) / t_final      (time to target)
-        [4] t_m / t_final              (absolute normalized time)
-
-    `q` is a callable returning a(t). We attempt vectorized evaluation and
-    fall back to scalar iteration if the callable does not broadcast.
-    """
-    if A_cum_ref is None:
-        A_cum_ref = float(A_amp_ref) * float(t_final)
-
-    t_samples, a_m = _sample_a(q, t_s, t_j, int(M))
-    return _forcing_seq_from_samples(t_samples, a_m, t_s, t_j, t_final, A_amp_ref, A_cum_ref)
-
-
-def build_forcing_summary(
-    a_vals: np.ndarray,
-    t_vals: np.ndarray,
-    t_s: float,
-    t_j: float,
-    t_final: float,
-    A_amp_ref: float = A_AMP_REF,
-) -> np.ndarray:
-    """Global interval-level descriptors of a(t) over [t_s, t_j].
-
-    Returns float32 shape (_FORCING_SUMMARY_DIM,):
-        S1 = ∫a(t)dt / (A_ref * t_final)           signed impulse
-        S2 = ∫|a(t)|dt / (A_ref * t_final)         absolute impulse
-        S3 = ∫max(a,0)dt / (A_ref * t_final)       positive impulse
-        S4 = ∫max(-a,0)dt / (A_ref * t_final)      negative impulse magnitude
-        S5 = mean(a) / A_ref                       mean forcing
-        S6 = sqrt(<a^2>) / A_ref                   RMS forcing
-        S7 = max|a| / A_ref                         peak abs forcing
-        S8 = a(t_j) / A_ref                         final forcing value
-
-    `t_vals` must include both endpoints (t_s, t_j) so that `S8 = a_vals[-1]`
-    is genuinely a(t_j). Caller is expected to share t_vals/a_vals with
-    `build_forcing_seq` via `_sample_a` to guarantee both descriptors see the
-    same underlying samples.
-    """
-    A_ref = float(A_amp_ref)
-    dt_interval = max(float(t_j) - float(t_s), 1e-8)
-    denom_impulse = A_ref * float(t_final)
-
-    if hasattr(np, "trapezoid"):
-        trapz = np.trapezoid
-    else:
-        trapz = np.trapz
-    I_signed = float(trapz(a_vals, t_vals))
-    I_abs    = float(trapz(np.abs(a_vals), t_vals))
-    I_pos    = float(trapz(np.clip(a_vals, 0.0, None), t_vals))
-    I_neg    = float(trapz(np.clip(-a_vals, 0.0, None), t_vals))
-    I_sq     = float(trapz(a_vals ** 2, t_vals))
-
-    S1 = I_signed / denom_impulse
-    S2 = I_abs    / denom_impulse
-    S3 = I_pos    / denom_impulse
-    S4 = I_neg    / denom_impulse
-    S5 = (I_signed / dt_interval) / A_ref
-    S6 = np.sqrt(max(I_sq / dt_interval, 0.0)) / A_ref
-    S7 = float(np.max(np.abs(a_vals))) / A_ref
-    S8 = float(a_vals[-1]) / A_ref
-
-    return np.array([S1, S2, S3, S4, S5, S6, S7, S8], dtype=np.float32)
 
 # --------- SNAPSHOT PAIR DATASET ---------
 
@@ -359,7 +132,7 @@ class SnapshotPairDataset(Dataset):
         t_final: float | None = None,
         time_norm_horizon: float | None = None,
         ramp_seconds: float | None = None,
-        temporal_samples: int = TEMPORAL_SAMPLES,
+        temporal_samples: int = FORCING_TEMPORAL_SAMPLES,
         problem: ProblemSpec | None = None,
         max_target_time: float | None = None,
         max_lead_time: float | None = None,
@@ -1020,7 +793,7 @@ def create_dataloaders(
     t_final: float | None = None,
     time_norm_horizon: float | None = None,
     ramp_seconds: float | None = None,
-    temporal_samples: int = TEMPORAL_SAMPLES,
+    temporal_samples: int = FORCING_TEMPORAL_SAMPLES,
     world_size: int = 1,
     rank: int = 0,
     sampler_seed: int = 0,

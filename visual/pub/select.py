@@ -2,7 +2,7 @@
 
 A truth/prediction/residual panel is a claim about the model, so which case it
 shows must be a pre-registered rule rather than an ad hoc choice. This module
-replaces ``visual/paper_plots.py:_representative_row``, which ranks *pairs*
+replaces the legacy representative-row selector, which ranked *pairs*
 (pairs are correlated, so the median pair is not the median simulation), has no
 tie-break, and records nothing about what it chose.
 

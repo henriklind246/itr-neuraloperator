@@ -25,16 +25,20 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import pytest
+import yaml
 
 import visual.pub as pub
 from visual.pub import __main__ as cli
-from visual.pub import registry
+from visual.pub import fields, fig_benchmark, fig_crossbench, registry
 from visual.pub.manifest import SIDECAR_SCHEMA, Manifest, ProvenanceError
 
 REPO_ROOT = Path(pub.__file__).resolve().parents[2]
@@ -57,6 +61,74 @@ SIDECAR_KEYS = {
     "generator_git_dirty", "metric_space", "metric_definition", "params",
     "requirement_sets", "runs", "sources", "counts", "selection", "degradations",
 }
+
+
+def test_source_difficulty_replaces_rel_l2_ecdf_with_contact_resistance():
+    assert fig_benchmark.DIFFICULTY_STRATA["source"] == (
+        "lead_bin", "regime", "patch_x_bin", "amplitude_bin", "R_c_bin")
+    assert "source" not in fig_benchmark.DIFFICULTY_ECDF_BENCHMARKS
+    assert fig_benchmark.DIFFICULTY_ECDF_BENCHMARKS == frozenset({
+        "forcing", "source_itr", "interfaces"})
+
+
+def test_contact_jump_cohort_is_reproducible(monkeypatch):
+    bundle = SimpleNamespace(benchmark="forcing", n_sims=40, n_times=4)
+    frame = pd.DataFrame({"sim_id": np.repeat(np.arange(30), 2)})
+
+    class Case:
+        lead_times = np.array([0.1, 0.2, 0.3])
+
+        def __init__(self, sim_id):
+            self.sim_id = sim_id
+
+        def contact_jumps(self):
+            truth = np.full((3, 5), float(self.sim_id))
+            return truth, truth + 1.0
+
+    monkeypatch.setattr(
+        fields, "evaluate_case",
+        lambda _bundle, sim_id, _source, targets: Case(sim_id),
+    )
+    first = fields.evaluate_contact_jump_cohort(
+        bundle, frame, n_sims=8, rng_seed=7,
+    )
+    second = fields.evaluate_contact_jump_cohort(
+        bundle, frame, n_sims=8, rng_seed=7,
+    )
+
+    assert first.sim_ids == second.sim_ids
+    assert len(first.sim_ids) == 8
+    assert first.target_indices == (1, 2, 3)
+    assert first.truth.shape == first.pred.shape == (8, 3, 5)
+
+
+def test_contact_jump_figure_uses_simulation_level_curves(monkeypatch):
+    frames = {b: pd.DataFrame({"sim_id": [0, 1, 2]})
+              for b in fig_crossbench.BENCH_ORDER}
+    monkeypatch.setattr(fig_crossbench.records, "records_by_benchmark",
+                        lambda _source: frames)
+    monkeypatch.setattr(fields, "run_dirs", lambda _source, _benchmark: [Path("run")])
+    monkeypatch.setattr(fields, "bundle", lambda _source, benchmark: benchmark)
+
+    def cohort(benchmark, _records):
+        truth = np.ones((3, 2, 4), dtype=float)
+        pred = truth + 0.1
+        return fields.ContactJumpCohort(
+            benchmark=benchmark, sim_ids=(0, 1, 2), source_index=0,
+            target_indices=(1, 2), lead_times=np.array([0.1, 0.2]),
+            truth=truth, pred=pred,
+        )
+
+    monkeypatch.setattr(fields, "evaluate_contact_jump_cohort", cohort)
+    fig, selection, definition = fig_crossbench.physical_contact_jump_vs_lead(
+        source=object(), spec=SimpleNamespace(width="two_col"), requirement=None,
+    )
+
+    assert selection is None
+    assert len(fig.axes) == 3
+    assert definition["replication_unit"] == "sim_id"
+    assert definition["requested_simulations_per_benchmark"] == 24
+    assert set(definition["cohorts"]) == set(fig_crossbench.BENCH_ORDER)
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +158,84 @@ def run_cli(*argv: str) -> tuple[int, str, str]:
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = cli.main(list(argv))
     return code, out.getvalue(), err.getvalue()
+
+
+def write_inverse_sensor_sweep(path: Path, benchmark: str) -> Path:
+    rows = []
+    for sim_id in range(8):
+        truth = 0.4 + 0.02 * sim_id
+        for count in (8, 16, 32):
+            error = 0.01 * (sim_id + 1) * (8.0 / count)
+            width = 0.12 * (8.0 / count) + 0.002 * sim_id
+            fv = 0.04 * (8.0 / count) + 0.001 * sim_id
+            row = {
+                "benchmark": benchmark,
+                "sim_id": sim_id,
+                "n_sensors": count,
+                "noise_seed": 100 + sim_id,
+                "init_seed": 0,
+                "noise_std_K": 0.05,
+                "fv_resid_rms_K": fv,
+                "fv_resid_over_noise": fv / 0.05,
+                "profile_bound_limited": sim_id == 0 and count == 8,
+            }
+            if benchmark == "forcing":
+                row.update({
+                    "R_c_true": truth,
+                    "R_c_map": truth + error,
+                    "R_c_abs_error": error,
+                    "profile_R_c_ci_low": truth - width / 2.0,
+                    "profile_R_c_ci_high": truth + width / 2.0,
+                })
+            else:
+                row.update({
+                    "excess_int_true": truth,
+                    "excess_int_hat": truth - error,
+                    "excess_int_abserr": error,
+                    "profile_excess_ci_low": truth - width / 2.0,
+                    "profile_excess_ci_high": truth + width / 2.0,
+                })
+            rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def write_inverse_result(path: Path, benchmark: str) -> Path:
+    rows = []
+    for sim_id in range(10):
+        if benchmark == "forcing":
+            truth = 0.1 + 0.08 * sim_id
+            estimate = truth + 0.01 * (sim_id + 1)
+            rows.append({
+                "benchmark": benchmark,
+                "sim_id": sim_id,
+                "n_sensors": 8,
+                "R_c_true": truth,
+                "R_c_map": estimate,
+                "R_c_abs_error": abs(estimate - truth),
+                "fno_vs_fv_resid": 0.002 * (sim_id + 1),
+                "fno_resid": 0.003 * (sim_id + 1),
+                "profile_R_c_covered": sim_id < 9,
+            })
+        else:
+            row = {
+                "benchmark": benchmark,
+                "sim_id": sim_id,
+                "cond_number": 2.0 + sim_id,
+                "least_dir_R_base": 0.2,
+                "least_dir_R_amp": 0.8,
+                "least_dir_y0": 0.3,
+                "least_dir_sigma": 0.45,
+            }
+            for offset, stem in enumerate(
+                ("R_base", "R_amp", "y0", "sigma", "excess_int")
+            ):
+                truth = 0.1 * (offset + 1) + 0.01 * sim_id
+                row[f"{stem}_true"] = truth
+                row[f"{stem}_hat"] = truth + 0.005 * (sim_id + 1)
+            rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +283,7 @@ class TestRenderable:
          for k in RENDERABLE])
     def test_render_leaks_no_figures(self, key, tmp_path, empty_manifest):
         """``style.save`` closes the figure; a leak here becomes a memory leak
-        when ``--all`` renders twenty-five of them in one process."""
+        when ``--all`` renders the full registered figure suite in one process."""
         registry.render(key, manifest=empty_manifest, out_dir=tmp_path,
                         strict=True, formats=("png",))
         assert plt.get_fignums() == []
@@ -196,6 +346,65 @@ class TestRenderable:
         assert [r.key for r in results] == ["F01_problem_schematic",
                                             "F02_architecture"]
 
+    def test_f18_renders_paired_8_16_32_sweep_in_strict_mode(self, tmp_path):
+        forcing = write_inverse_sensor_sweep(tmp_path / "forcing.csv", "forcing")
+        forcing_itr = write_inverse_sensor_sweep(
+            tmp_path / "forcing_itr.csv", "forcing_itr"
+        )
+        manifest_path = tmp_path / "manifest.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "sources": {
+                "inverse_sensor_sweep": [
+                    {"table": str(forcing), "seed": "0"},
+                    {"table": str(forcing_itr), "seed": "0"},
+                ]
+            }
+        }))
+        manifest = Manifest.load(manifest_path, root=tmp_path)
+        result = registry.render(
+            "F18_sensor_count", manifest=manifest, out_dir=tmp_path / "out",
+            strict=True, formats=("png", "pdf"),
+        )
+
+        assert not result.degraded
+        assert all(path.stat().st_size > 5000 for path in result.paths)
+        definition = json.loads(result.sidecar.read_text())["metric_definition"]
+        assert definition["sensor_counts"] == [8, 16, 32]
+        assert definition["pairing_fields"] == [
+            "benchmark", "sim_id", "noise_seed", "init_seed"
+        ]
+        assert definition["n_cases"] == {"forcing": 8, "forcing_itr": 8}
+        assert definition["inferential_interval"].startswith("none")
+
+    @pytest.mark.parametrize(
+        ("key", "requirement", "benchmark"),
+        [
+            ("F16_inverse_forcing_recovery", "inverse_forcing", "forcing"),
+            ("F17_inverse_forcing_itr", "inverse_forcing_itr", "forcing_itr"),
+            ("F22_surrogate_fidelity", "inverse_forcing", "forcing"),
+        ],
+    )
+    def test_inverse_publication_figures_render_without_legacy_module(
+        self, tmp_path, key, requirement, benchmark
+    ):
+        table = write_inverse_result(tmp_path / f"{benchmark}.csv", benchmark)
+        manifest_path = tmp_path / "manifest.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "sources": {requirement: [{"table": str(table), "seed": "0"}]}
+        }))
+        manifest = Manifest.load(manifest_path, root=tmp_path)
+        result = registry.render(
+            key, manifest=manifest, out_dir=tmp_path / "out", strict=True,
+            formats=("png",),
+        )
+
+        assert not result.degraded
+        assert result.paths[0].stat().st_size > 5000
+        definition = json.loads(result.sidecar.read_text())["metric_definition"]
+        assert definition["n_cases"] == 10
+        if key == "F17_inverse_forcing_itr":
+            assert "least-determined direction" in definition["identifiability"]
+
 
 class TestMmsNumbers:
     """F25 is the one figure whose content can be checked, not just its bytes.
@@ -256,7 +465,7 @@ class TestBlocked:
     def test_the_blocked_set_is_the_whole_registry_minus_three(self):
         """If this changes, a figure was built or a key was added; both are news."""
         assert len(BLOCKED) == len(registry.FIGURES) - 3
-        assert len(registry.FIGURES) == 25
+        assert len(registry.FIGURES) == 26
 
     def test_every_renderable_key_is_tier_two(self):
         for key in RENDERABLE:

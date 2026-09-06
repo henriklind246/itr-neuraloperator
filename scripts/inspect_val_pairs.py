@@ -3,8 +3,8 @@
 Run:
     python scripts/inspect_val_pairs.py <path/to/val_pairs.csv> [--out <dir>]
 
-Produces a text report on stdout and a set of diagnostic PNGs in --out
-(defaults to <repo>/visual/val_pairs/).
+Produces a text report, a simulation-level tail summary CSV, and a set of
+diagnostic PNGs in --out (defaults to <repo>/visual/val_pairs/).
 
 The CSV carries a ``benchmark`` column (one of ``forcing``, ``interfaces``,
 ``source``). Universal plots (training dynamics, lead-time error, conditioning
@@ -45,9 +45,25 @@ BENCHMARK_COND_COLS = {
 # point is to expose that the relative metric (nrmse) and the Kelvin metric
 # (rmse_K) move in opposite directions across the regime / x_h axis: the
 # small-signal nrmse divergence is a metric artifact confined to the regime
-# where the model is most accurate in Kelvin. gnrmse_pct is the fixed-scale
+# where the model is most accurate in Kelvin. sigma_nrmse_pct is the fixed-scale
 # dimensionless companion (= rmse_K / sigma_global * 100), so it tracks rmse_K.
-STRAT_METRICS = ["rel_l2", "rmse_K", "gnrmse_pct", "nrmse"]
+STRAT_METRICS = ["rel_l2", "rmse_K", "sigma_nrmse_pct", "nrmse"]
+
+TAIL_CATEGORICAL_COLS = {
+    "forcing": ("temporal_family", "spatial_family"),
+    "forcing_itr": ("temporal_family", "spatial_family"),
+    "source": ("regime",),
+    "source_itr": ("regime",),
+    "interfaces": (),
+}
+
+TAIL_SUMMARY_FIELDS = (
+    "benchmark", "metric", "stratum", "group", "n_sims", "n_pairs",
+    "pairs_per_sim_min", "pairs_per_sim_max", "mean", "median", "p90",
+    "p99", "p99_determined", "max",
+)
+
+MIN_SIMS_FOR_P99 = 100
 
 
 def _quantile(q: float):
@@ -151,7 +167,7 @@ def report_regime_stratification(latest: pd.DataFrame, cond_cols: list[str]) -> 
     metrics = _present_strat_metrics(latest)
     print(f"metrics reported per stratum: {metrics} (+ nrmse_p99 when available)")
     print(
-        "watch for nrmse rising while rmse_K/gnrmse_pct fall across a stratum "
+        "watch for nrmse rising while rmse_K/sigma_nrmse_pct fall across a stratum "
         "axis -> small-signal nrmse divergence (a metric artifact)."
     )
     if not cond_cols:
@@ -228,21 +244,103 @@ def report_between_vs_within(latest: pd.DataFrame) -> None:
     )
 
 
-def report_tails(latest: pd.DataFrame, cond_cols: list[str]) -> None:
-    print("\n=== 6. Tail vs mean (final epoch) ===")
-    s = latest["rel_l2"]
-    print(
-        f"mean={s.mean():.4f}  p50={s.median():.4f}  "
-        f"p90={s.quantile(0.9):.4f}  p99={s.quantile(0.99):.4f}  max={s.max():.4f}"
-    )
-    print("\nTop-20 worst pairs (by rel_l2):")
-    struct_cols = [c for c in ("temporal_family", "spatial_family", "regime") if c in latest.columns]
-    metric_cols = [c for c in ("nrmse", "rmse_K", "gnrmse_pct") if c in latest.columns]
-    cols = ["sim_id", *struct_cols, *cond_cols, "rel_l2", *metric_cols]
-    if "iface_rel_l2" in latest.columns:
-        cols.append("iface_rel_l2")
-    cols = list(dict.fromkeys(cols))  # dedupe, preserve order
-    print(latest.nlargest(20, "rel_l2")[cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+def _tail_groups(latest: pd.DataFrame, benchmark: str,
+                 cond_cols: list[str]):
+    """Yield ``(stratum, group, rows)`` with strata assigned before reduction."""
+    yield "overall", "all", latest
+
+    for col in TAIL_CATEGORICAL_COLS.get(benchmark, ()):
+        if col not in latest.columns or latest[col].dropna().nunique() < 2:
+            continue
+        for group, part in latest.groupby(col, observed=True, dropna=False):
+            if pd.isna(group) or str(group) == "":
+                continue
+            yield col, str(group), part
+
+    for col in cond_cols:
+        if not _is_varying_numeric(latest, col):
+            continue
+        bins = pd.qcut(latest[col], 5, duplicates="drop")
+        for group, part in latest.groupby(bins, observed=True):
+            yield f"{col}_quintile", str(group), part
+
+
+def simulation_tail_rows(latest: pd.DataFrame, benchmark: str,
+                         cond_cols: list[str]) -> list[dict]:
+    """Summarize metric tails after reducing snapshot pairs within simulations.
+
+    A row's statistic is computed over per-simulation mean pair errors. The
+    99th percentile is deliberately left blank below 100 simulations because
+    that sample cannot determine it reliably.
+    """
+    metrics = [
+        metric for metric in _present_strat_metrics(latest)
+        if pd.to_numeric(latest[metric], errors="coerce").notna().any()
+    ]
+    rows: list[dict] = []
+    for stratum, group, part in _tail_groups(latest, benchmark, cond_cols):
+        for metric in metrics:
+            by_sim = (
+                part.assign(_metric=pd.to_numeric(part[metric], errors="coerce"))
+                .dropna(subset=["_metric"])
+                .groupby("sim_id", observed=True)["_metric"]
+                .agg(["mean", "count"])
+            )
+            if by_sim.empty:
+                continue
+            values = by_sim["mean"].to_numpy(dtype=np.float64)
+            n_sims = int(values.size)
+            rows.append({
+                "benchmark": benchmark,
+                "metric": metric,
+                "stratum": stratum,
+                "group": group,
+                "n_sims": n_sims,
+                "n_pairs": int(by_sim["count"].sum()),
+                "pairs_per_sim_min": int(by_sim["count"].min()),
+                "pairs_per_sim_max": int(by_sim["count"].max()),
+                "mean": float(np.mean(values)),
+                "median": float(np.median(values)),
+                "p90": float(np.percentile(values, 90)),
+                "p99": (float(np.percentile(values, 99))
+                        if n_sims >= MIN_SIMS_FOR_P99 else float("nan")),
+                "p99_determined": n_sims >= MIN_SIMS_FOR_P99,
+                "max": float(np.max(values)),
+            })
+    return rows
+
+
+def write_simulation_tail_summary(latest: pd.DataFrame, benchmark: str,
+                                  cond_cols: list[str], out_path: Path) -> Path:
+    """Write the corrected simulation-level tail diagnostic as CSV."""
+    rows = simulation_tail_rows(latest, benchmark, cond_cols)
+    pd.DataFrame(rows, columns=TAIL_SUMMARY_FIELDS).to_csv(out_path, index=False)
+    return out_path
+
+
+def report_tails(latest: pd.DataFrame, benchmark: str,
+                 cond_cols: list[str]) -> None:
+    print("\n=== 6. Simulation-level tails (final epoch) ===")
+    rows = simulation_tail_rows(latest, benchmark, cond_cols)
+    overall = [row for row in rows if row["stratum"] == "overall"]
+    if not overall:
+        print("(no finite tail metrics)")
+        return
+    table = pd.DataFrame(overall).set_index("metric")[[
+        "n_sims", "n_pairs", "mean", "median", "p90", "p99",
+        "p99_determined", "max",
+    ]]
+    print(table.to_string(float_format=lambda x: f"{x:.4f}"))
+    if not bool(table["p99_determined"].all()):
+        print(
+            f"p99 is blank below {MIN_SIMS_FOR_P99} simulations; snapshot pairs "
+            "do not count as independent tail samples."
+        )
+
+    print("\nTop-20 hardest simulations (mean pair rel_l2):")
+    per_sim = latest.groupby("sim_id", observed=True)["rel_l2"].agg(["mean", "count"])
+    print(per_sim.nlargest(20, "mean").to_string(
+        float_format=lambda x: f"{x:.4f}"))
 
 
 # --------------------------------------------------------------------------- #
@@ -590,6 +688,8 @@ def main() -> None:
 
     print(f"Loading {args.csv} ...")
     df = pd.read_csv(args.csv)
+    if "gnrmse_pct" in df and "sigma_nrmse_pct" not in df:
+        df = df.rename(columns={"gnrmse_pct": "sigma_nrmse_pct"})
     benchmark = _detect_benchmark(df, Path(args.csv))
     cond_cols = _cond_cols(df, benchmark)
     print(
@@ -606,8 +706,12 @@ def main() -> None:
     report_xh_deciles(latest, benchmark)
     report_structure(latest, benchmark)
     report_between_vs_within(latest)
-    report_tails(latest, cond_cols)
+    report_tails(latest, benchmark, cond_cols)
     report_lead_binned_rmse_k(latest, args.lead_cutoff, args.lead_bins)
+
+    tail_path = write_simulation_tail_summary(
+        latest, benchmark, cond_cols, out / "tail_summary_sim.csv",
+    )
 
     plot_training_curves(df, out)
     plot_regime_stratification(latest, cond_cols, out)
@@ -616,7 +720,8 @@ def main() -> None:
     plot_lead_binned_rmse_k(latest, args.lead_cutoff, args.lead_bins, out)
     plot_structure(latest, benchmark, out)
 
-    print(f"\nPlots written to {out}/")
+    print(f"\nSimulation-level tail summary written to {tail_path}")
+    print(f"Plots written to {out}/")
 
 
 if __name__ == "__main__":

@@ -668,21 +668,24 @@ def audit(out_dir: str | Path) -> list[dict]:
     findings = []
     for path in sorted(out_dir.glob("**/*.provenance.json")):
         payload = json.loads(path.read_text())
+        artifact_key = (
+            payload.get("figure_key") or payload.get("table_key") or path.stem
+        )
         sources = payload.get("sources", [])
         if not sources:
-            findings.append({"figure_key": payload.get("figure_key"),
+            findings.append({"figure_key": artifact_key,
                              "path": str(path), "status": "OK",
                              "detail": "no hashed sources"})
             continue
         for entry in sources:
             src = Path(entry["path"])
             if not src.exists():
-                findings.append({"figure_key": payload.get("figure_key"),
+                findings.append({"figure_key": artifact_key,
                                  "path": str(src), "status": "MISSING"})
                 continue
             digest = sha256_file(src)
             findings.append({
-                "figure_key": payload.get("figure_key"),
+                "figure_key": artifact_key,
                 "path": str(src),
                 "status": "OK" if digest == entry.get("sha256") else "DRIFT",
                 "expected_sha256": entry.get("sha256"),

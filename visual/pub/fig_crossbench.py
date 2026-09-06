@@ -1,4 +1,4 @@
-"""Cross-benchmark figures: F04, F05, F07, F21.
+"""Cross-benchmark figures: F04, F05, F07, F21 and F26.
 
 These are the figures the statistical redesign is *for*. Every reduction below
 comes from ``visual.pub.stats``: the defect being corrected is that the current
@@ -101,7 +101,7 @@ def headline_accuracy(*, source=None, spec=None, requirement=None):
 
     The jump metric here is the adjacent-node difference that training and
     monitoring use. The physical contact jump :math:`R_c(y) q_n(y, t)` requires
-    the field, not the record, and is drawn in F06.
+    the field, not the record, and is drawn in F06 and F26.
     """
     metrics = ("rmse_K", "iface_rmse_K", "node_jump_rmse_K", "rel_l2_pct")
     frames, order, sims = _load(source, requirement, "F04_headline_accuracy",
@@ -152,7 +152,7 @@ def headline_accuracy(*, source=None, spec=None, requirement=None):
         "metrics": {m: stats.metric_spec(m).label for m in metrics},
         "spaces": {m: stats.metric_spec(m).space for m in metrics},
         "jump": "adjacent-node temperature difference (training proxy); the "
-                "physical contact jump R_c(y) q_n(y,t) is F06",
+                "physical contact jump R_c(y) q_n(y,t) is F06 and F26",
         "target_rel_l2_pct": TARGET_REL_L2_PCT,
         "benchmarks": order,
         "n_simulations": counts.get("rmse_K", {}),
@@ -429,12 +429,113 @@ def truth_pred_residual(*, source=None, spec=None, requirement=None):
     return fig, selections[0], metric_definition
 
 
+def physical_contact_jump_vs_lead(*, source=None, spec=None, requirement=None):
+    """F26 -- physical contact-jump fidelity across benchmarks (supplemental).
+
+    A fixed cohort of simulations is evaluated from the initial snapshot to
+    every future saved time. Interface profiles are reduced within each
+    simulation first, then the median and IQR are taken across simulations.
+    """
+    frames = records.records_by_benchmark(source)
+    if not frames:
+        blocked(requirement, _RECORDS_NEEDED,
+                key="F26_contact_jump_vs_lead")
+    order = [b for b in benchmark_order(frames) if fields.run_dirs(source, b)]
+    if not order:
+        blocked(requirement, _CHECKPOINT_NEEDED,
+                key="F26_contact_jump_vs_lead")
+
+    width = spec.width if spec is not None else "two_col"
+    fig, axes = plt.subplots(1, 3, figsize=style.figsize(width, row_height="std"))
+    cohorts, curves = {}, {}
+
+    for bench in order:
+        cohort = fields.evaluate_contact_jump_cohort(
+            fields.bundle(source, bench), frames[bench],
+        )
+        curve = stats.contact_jump_curve(
+            cohort.lead_times, cohort.truth, cohort.pred,
+        )
+        cohorts[bench] = cohort
+        curves[bench] = curve
+        color = style.benchmark_color(bench)
+        lead = curve.lead_times
+
+        axes[0].plot(lead, curve.truth_median, color=color, linewidth=1.0,
+                     label=bench)
+        axes[0].plot(lead, curve.pred_median, color=color, linewidth=1.0,
+                     linestyle="--")
+
+        axes[1].fill_between(
+            lead, curve.rmse_q25, curve.rmse_q75,
+            color=color, alpha=0.12, linewidth=0,
+        )
+        axes[1].plot(lead, curve.rmse_median, color=color, linewidth=1.0)
+
+        axes[2].fill_between(
+            lead, curve.relative_q25_pct, curve.relative_q75_pct,
+            color=color, alpha=0.12, linewidth=0,
+        )
+        axes[2].plot(lead, curve.relative_median_pct, color=color, linewidth=1.0)
+
+    axes[0].set_title("Physical jump magnitude", fontsize=7)
+    axes[0].set_ylabel(r"RMS $|R_c q_n|$ [K]")
+    axes[1].set_title("Physical jump error", fontsize=7)
+    axes[1].set_ylabel("contact-jump RMSE [K]")
+    axes[2].set_title("Relative physical jump error", fontsize=7)
+    axes[2].set_ylabel("profile relative $L_2$ [%]")
+    for ax in axes:
+        ax.set_xlabel(r"lead time $\bar{t}$")
+        ax.grid(True, alpha=0.25)
+
+    benchmark_handles = [
+        Line2D([0], [0], color=style.benchmark_color(b), linewidth=1.2,
+               label=b)
+        for b in order
+    ]
+    encoding_handles = [
+        Line2D([0], [0], color="0.25", linewidth=1.0, label="FV truth"),
+        Line2D([0], [0], color="0.25", linewidth=1.0, linestyle="--",
+               label="FNO prediction"),
+    ]
+    axes[0].legend(handles=[*benchmark_handles, *encoding_handles], fontsize=5.2,
+                   loc="best", ncol=2, columnspacing=0.8, handletextpad=0.4)
+    style.panel_letters(axes)
+    fig.tight_layout()
+
+    metric_definition = {
+        "space": "kelvin",
+        "physical_quantity": "contact jump R_c(y) q_n(y,t)",
+        "protocol": "source snapshot s=0; every subsequent saved target time",
+        "cohort_selection": "sample without replacement from record sim_id values",
+        "cohort_rng_seed": fields.CONTACT_JUMP_COHORT_SEED,
+        "requested_simulations_per_benchmark": fields.CONTACT_JUMP_COHORT_SIZE,
+        "replication_unit": "sim_id",
+        "aggregation": "profile RMS/RMSE/relative L2 over y within each "
+                       "simulation and lead; median and IQR across simulations",
+        "interval": "IQR across simulations; descriptive, not a confidence interval",
+        "benchmarks": order,
+        "cohorts": {
+            b: {
+                "n_simulations": curves[b].n_sims,
+                "sim_ids": list(cohorts[b].sim_ids),
+                "source_index": cohorts[b].source_index,
+                "target_indices": list(cohorts[b].target_indices),
+                "lead_times": cohorts[b].lead_times.tolist(),
+            }
+            for b in order
+        },
+    }
+    return fig, None, metric_definition
+
+
 __all__ = [
     "BENCH_ORDER",
     "TARGET_REL_L2_PCT",
     "benchmark_order",
     "headline_accuracy",
     "jump_vs_lead",
+    "physical_contact_jump_vs_lead",
     "tail_reliability",
     "truth_pred_residual",
 ]
