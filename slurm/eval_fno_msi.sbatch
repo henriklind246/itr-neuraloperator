@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fno_eval
-#SBATCH --partition=msigpu
+#SBATCH --partition=interactive-gpu
 #SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
