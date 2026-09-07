@@ -337,7 +337,7 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
         assert _option(command, "--sensor-layout") == "interface_band"
         assert float(_option(command, "--sensor-x-halfwidth")) == 0.005
         assert int(_option(command, "--sensor-n-y")) == 16
-        assert float(_option(command, "--noise-std")) == 0.05
+        assert float(_option(command, "--noise-std")) == 0.01
         assert int(_option(command, "--seed")) == 0
         assert int(_option(command, "--noise-seed")) == 0
         # Both subprocesses rebuild the identical disjoint partition so their
@@ -345,6 +345,10 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
         assert int(_option(command, "--n-invert")) == sweep.N_CASES
         assert int(_option(command, "--n-calibration")) == sweep.CALIBRATION_FLOOR
     assert int(_option(inversion, "--n-starts")) == 8
+    assert _option(inversion, "--optimizer") == "nelder_mead"
+    assert int(_option(inversion, "--nm-maxiter")) == 60
+    assert float(_option(inversion, "--nm-xatol")) == 1e-4
+    assert float(_option(inversion, "--nm-fatol")) == 1e-14
     # The three reported statistics are unconditional in the entry point, so
     # the protocol carries no per-statistic flags. The retired ones no longer
     # exist as flags at all.
@@ -430,6 +434,11 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     with (out_dir / "sweep_manifest.json").open() as handle:
         manifest = json.load(handle)
     assert manifest["status"] == "complete"
+    assert manifest["fixed_protocol"]["optimizer"] == "nelder_mead"
+    assert manifest["fixed_protocol"]["noise_std_norm"] == 0.01
+    assert manifest["fixed_protocol"]["nm_maxiter"] == 60
+    assert manifest["fixed_protocol"]["nm_xatol"] == 1e-4
+    assert manifest["fixed_protocol"]["nm_fatol"] == 1e-14
     assert manifest["combined_row_count"] == 24
     assert Path(manifest["canonical_csv"]) == combined
     assert manifest["calibration_sim_ids"] == list(
@@ -469,6 +478,17 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     )
     assert resumed_manifest["dataset_fingerprint"] == "mock-dataset"
     assert resumed_manifest["paper_summary"]["status"] == "complete"
+
+    del resumed_manifest["fixed_protocol"]["optimizer"]
+    sweep._write_json(out_dir / "sweep_manifest.json", resumed_manifest)
+    sweep.run_sweep(
+        benchmark="forcing",
+        checkpoint=checkpoint,
+        data_dir=data_dir,
+        out_dir=out_dir,
+        device="cpu",
+    )
+    assert len(commands) == 6
 
     commands.clear()
     other_data_dir = _data_dir(tmp_path / "other_data")

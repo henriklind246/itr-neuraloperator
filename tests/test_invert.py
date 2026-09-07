@@ -250,7 +250,8 @@ def test_predict_fullfield_changes_with_theta():
     assert not torch.allclose(pa, pb)
 
 
-def test_invert_sim_recovers_theta_against_self_generated_target():
+@pytest.mark.parametrize("optimizer", ["adam_lbfgs", "nelder_mead"])
+def test_invert_sim_recovers_theta_against_self_generated_target(optimizer):
     """End-to-end loop sanity: with the tiny model as its *own* ground truth,
     the optimizer drives the data loss down and lands a finite theta in-box.
 
@@ -268,7 +269,7 @@ def test_invert_sim_recovers_theta_against_self_generated_target():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
 
     cfg = inv.InversionConfig(n_starts=4, adam_steps=150, adam_lr=0.1,
-                              lbfgs_steps=30, seed=1)
+                              lbfgs_steps=30, seed=1, optimizer=optimizer)
     result = inv.invert_sim(model, obs, cfg)
     assert result.loss < 1e-4
     # Landed theta is inside the physical box.
@@ -1382,7 +1383,8 @@ def test_forcing_adapter_build_fv_solver_roundtrip():
     assert params["R_c"] != pytest.approx(0.7)
 
 
-def test_forcing_adapter_scalar_recovery_through_cin_conditioning():
+@pytest.mark.parametrize("optimizer", ["adam_lbfgs", "nelder_mead"])
+def test_forcing_adapter_scalar_recovery_through_cin_conditioning(optimizer):
     adapter = ForcingAdapter()
     model = _tiny_forcing_model()
     obs = _fake_forcing_observation_set()
@@ -1390,13 +1392,23 @@ def test_forcing_adapter_scalar_recovery_through_cin_conditioning():
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star, adapter).detach()
 
+    if optimizer == "nelder_mead":
+        def require_forward_only(module, inputs):
+            assert not torch.is_grad_enabled()
+
+        model.register_forward_pre_hook(require_forward_only)
+
     cfg = inv.InversionConfig(
         n_starts=3, adam_steps=120, adam_lr=0.08, lbfgs_steps=25,
-        seed=4, start_sampling="lhs",
+        seed=4, start_sampling="lhs", optimizer=optimizer,
     )
     result = inv.invert_sim(model, obs, cfg, adapter)
     assert result.loss < 1e-7
     assert abs(float(result.theta_hat[0]) - float(theta_star[0])) < 2e-2
+    assert len(result.per_start_losses) == cfg.n_starts
+    assert result.loss == min(result.per_start_losses)
+    best_start = int(np.argmin(result.per_start_losses))
+    torch.testing.assert_close(result.theta_hat, result.per_start_theta[best_start])
 
 
 def test_forcing_adapter_one_dimensional_uq_smoke():

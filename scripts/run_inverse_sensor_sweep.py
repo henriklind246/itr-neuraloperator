@@ -36,8 +36,12 @@ from scripts.invert import (  # noqa: E402
 
 SENSOR_COUNTS = (8, 16, 32)
 SENSOR_X_HALFWIDTH = 0.005
-NOISE_STD = 0.05
+NOISE_STD = 0.01
 N_STARTS = 8
+OPTIMIZER = "nelder_mead"
+NM_MAXITER = 60
+NM_XATOL = 1e-4
+NM_FATOL = 1e-14
 UQ_LEVEL = 0.95
 INIT_SEED = 0
 NOISE_SEED = 0
@@ -325,6 +329,14 @@ def build_inversion_command(
         str(NOISE_SEED),
         "--n-starts",
         str(N_STARTS),
+        "--optimizer",
+        OPTIMIZER,
+        "--nm-maxiter",
+        str(NM_MAXITER),
+        "--nm-xatol",
+        str(NM_XATOL),
+        "--nm-fatol",
+        str(NM_FATOL),
         "--seed",
         str(INIT_SEED),
         "--device",
@@ -884,6 +896,10 @@ def run_sweep(
             "sensor_x_halfwidth": SENSOR_X_HALFWIDTH,
             "noise_std_norm": NOISE_STD,
             "n_starts": N_STARTS,
+            "optimizer": OPTIMIZER,
+            "nm_maxiter": NM_MAXITER,
+            "nm_xatol": NM_XATOL,
+            "nm_fatol": NM_FATOL,
             "init_seed": INIT_SEED,
             "noise_seed": NOISE_SEED,
             "fv_refine": True,

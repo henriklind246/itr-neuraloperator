@@ -19,9 +19,10 @@ The pipeline that produces the estimate is unchanged:
     through a masked interface-proximal *sensor operator* M (paired
     interface-adjacent nodes or a finite interface band crossed with physical y
     coordinates; full-field is the all-pixels case),
-  * LHS multistart Adam -> L-BFGS over an unconstrained reparameterization that
-    keeps every iterate inside the physical box and honors the R_base-dependent
-    R_amp ceiling (so the FNO is never queried out-of-distribution),
+  * LHS multistart Adam -> L-BFGS or Nelder-Mead over an unconstrained
+    reparameterization that keeps every iterate inside the physical box and
+    honors the R_base-dependent R_amp ceiling (so the FNO is never queried
+    out-of-distribution),
   * iid Gaussian sensor noise added once to the observations.
 
 **Three statistics are reported per simulation, and only these three.** Each
@@ -98,6 +99,7 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch
+from scipy.optimize import minimize
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -787,7 +789,7 @@ def lhs_starts_u(n_starts: int, rng: np.random.Generator, eps: float = 1e-3) -> 
 
 
 # ---------------------------------------------------------------------------
-# MAP optimization: multistart Adam -> L-BFGS.
+# MAP optimization.
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -800,6 +802,10 @@ class InversionConfig:
     reg_weight: float = 0.0  # weak Gaussian-in-u optimization regularizer
     device: str = "cpu"
     start_sampling: str = "lhs"  # "lhs" (Stage 3) or "normal" (legacy N(0,1))
+    optimizer: str = "adam_lbfgs"
+    nm_maxiter: int = 60
+    nm_xatol: float = 1e-4
+    nm_fatol: float = 1e-14
 
 
 @dataclass
@@ -851,26 +857,47 @@ def invert_sim(
 
     for start in range(cfg.n_starts):
         u0 = torch.from_numpy(starts_u[start]).to(device)
-        u = u0.clone().requires_grad_(True)
+        if cfg.optimizer == "nelder_mead":
+            def objective(u_np):
+                candidate = torch.as_tensor(u_np, dtype=u0.dtype, device=device)
+                with torch.no_grad():
+                    return float(
+                        _data_loss(model, obs, candidate, cfg.reg_weight, adapter)
+                    )
 
-        adam = torch.optim.Adam([u], lr=cfg.adam_lr)
-        for _ in range(cfg.adam_steps):
-            adam.zero_grad()
-            loss = _data_loss(model, obs, u, cfg.reg_weight, adapter)
-            loss.backward()
-            adam.step()
+            optimized = minimize(
+                objective,
+                starts_u[start].astype(np.float64),
+                method="Nelder-Mead",
+                options={
+                    "maxiter": cfg.nm_maxiter,
+                    "xatol": cfg.nm_xatol,
+                    "fatol": cfg.nm_fatol,
+                },
+            )
+            u = torch.as_tensor(optimized.x, dtype=u0.dtype, device=device)
+        elif cfg.optimizer == "adam_lbfgs":
+            u = u0.clone().requires_grad_(True)
+            adam = torch.optim.Adam([u], lr=cfg.adam_lr)
+            for _ in range(cfg.adam_steps):
+                adam.zero_grad()
+                loss = _data_loss(model, obs, u, cfg.reg_weight, adapter)
+                loss.backward()
+                adam.step()
 
-        lbfgs = torch.optim.LBFGS(
-            [u], max_iter=cfg.lbfgs_steps, line_search_fn="strong_wolfe"
-        )
+            lbfgs = torch.optim.LBFGS(
+                [u], max_iter=cfg.lbfgs_steps, line_search_fn="strong_wolfe"
+            )
 
-        def closure():
-            lbfgs.zero_grad()
-            loss = _data_loss(model, obs, u, cfg.reg_weight, adapter)
-            loss.backward()
-            return loss
+            def closure():
+                lbfgs.zero_grad()
+                loss = _data_loss(model, obs, u, cfg.reg_weight, adapter)
+                loss.backward()
+                return loss
 
-        lbfgs.step(closure)
+            lbfgs.step(closure)
+        else:
+            raise ValueError(f"Unknown optimizer {cfg.optimizer!r}")
 
         with torch.no_grad():
             final_loss = float(_data_loss(model, obs, u, cfg.reg_weight, adapter))
@@ -2157,6 +2184,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Exact physical observation times; no interpolation or nearest substitution",
     )
     ap.add_argument("--n-starts", type=int, default=8)
+    ap.add_argument("--optimizer", choices=("adam_lbfgs", "nelder_mead"),
+                    default="adam_lbfgs", help="Optimizer for the FNO parameter fit")
+    ap.add_argument("--nm-maxiter", type=int, default=60)
+    ap.add_argument("--nm-xatol", type=float, default=1e-4)
+    ap.add_argument("--nm-fatol", type=float, default=1e-14)
     ap.add_argument("--adam-steps", type=int, default=400)
     ap.add_argument("--adam-lr", type=float, default=0.05)
     ap.add_argument("--lbfgs-steps", type=int, default=50)
@@ -2358,6 +2390,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         n_starts=args.n_starts, adam_steps=args.adam_steps, adam_lr=args.adam_lr,
         lbfgs_steps=args.lbfgs_steps, reg_weight=args.reg_weight, seed=args.seed,
         device=args.device, start_sampling=args.start_sampling,
+        optimizer=args.optimizer, nm_maxiter=args.nm_maxiter,
+        nm_xatol=args.nm_xatol, nm_fatol=args.nm_fatol,
     )
 
     # Statistic 2 is unconditional, so the FV operator is always rebuilt.
@@ -2433,6 +2467,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         theta_hat = result.theta_hat.to(args.device)
         summary = summarize(result, obs.y_grid, adapter)
         summary["benchmark"] = adapter.benchmark
+        summary["optimizer"] = cfg.optimizer
         summary["sim_id"] = int(sid)
         summary["time_indices"] = ";".join(str(t) for t in time_indices)
         summary["observation_times"] = ";".join(
