@@ -62,8 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     strictness.add_argument("--allow-missing", dest="strict", action="store_false",
                             help="render degraded figures into out/degraded/")
 
-    p.add_argument("--formats", default="png,pdf",
-                   help="comma-separated output formats (default: png,pdf)")
+    p.add_argument("--formats", default=None,
+                   help="comma-separated formats (default: figure-specific; png,pdf,svg for F27/F28)")
     p.add_argument("--footer", dest="footer", action="store_true", default=False,
                    help="stamp the provenance line under the figure; off by "
                         "default, since the sidecar already carries it")
@@ -205,7 +205,7 @@ def main(argv=None) -> int:
         build_parser().print_help()
         return EXIT_OK
 
-    formats = tuple(f.strip() for f in args.formats.split(",") if f.strip())
+    formats = tuple(f.strip() for f in args.formats.split(",") if f.strip()) if args.formats else None
     any_degraded = False
     for key in keys:
         try:

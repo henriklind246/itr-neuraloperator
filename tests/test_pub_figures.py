@@ -465,7 +465,7 @@ class TestBlocked:
     def test_the_blocked_set_is_the_whole_registry_minus_three(self):
         """If this changes, a figure was built or a key was added; both are news."""
         assert len(BLOCKED) == len(registry.FIGURES) - 3
-        assert len(registry.FIGURES) == 26
+        assert len(registry.FIGURES) == 28
 
     def test_every_renderable_key_is_tier_two(self):
         for key in RENDERABLE:

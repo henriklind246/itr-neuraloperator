@@ -1,4 +1,4 @@
-"""Cross-benchmark figures: F04, F05, F07, F21 and F26.
+"""Cross-benchmark figures: F04, F05, F07, F21 and F26-F28.
 
 These are the figures the statistical redesign is *for*. Every reduction below
 comes from ``visual.pub.stats``: the defect being corrected is that the current
@@ -12,9 +12,11 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from matplotlib.ticker import LogLocator, MaxNLocator, NullFormatter, StrMethodFormatter
 
 from visual.pub import fields, panels, records, select, stats, style, tables
 from visual.pub._blocked import blocked
+from visual.pub.manifest import ProvenanceError
 
 _RECORDS_NEEDED = (
     "needs schema-v2 test_records.csv for forcing, source, source_itr and "
@@ -529,7 +531,153 @@ def physical_contact_jump_vs_lead(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
+_FIELD_MARKERS = {"forcing": "o", "source": "s", "source_itr": "^", "interfaces": "D"}
+_FIELD_LINES = {"forcing": "-", "source": "--", "source_itr": "-.", "interfaces": ":"}
+
+
+def _global_field_error_figure(*, axis, source, spec, requirement):
+    try:
+        frames, metadata = records.load_global_field_records(source)
+    except (records.SchemaError, FileNotFoundError) as exc:
+        raise ProvenanceError(str(exc)) from exc
+    if not frames:
+        key = "F27_global_field_error_vs_lead" if axis == "lead" else "F28_global_field_error_vs_itr"
+        blocked(requirement, _RECORDS_NEEDED, key=key)
+    summary = stats.global_field_error_summary(frames, metadata=metadata)
+    rows = summary[axis]
+    fig, ax = plt.subplots(figsize=style.figsize("one_col", row_height="std"))
+    fig.subplots_adjust(left=0.19, right=0.97, bottom=0.21, top=0.78)
+    handles = []
+    for benchmark in BENCH_ORDER:
+        points = [row for row in rows if row["benchmark"] == benchmark]
+        xname = "lead_time" if axis == "lead" else "median_resistance"
+        x = np.asarray([row[xname] for row in points], dtype=float)
+        y = np.asarray([row["median_rmse_K"] for row in points], dtype=float)
+        lo = np.asarray([row["ci_lower_K"] for row in points], dtype=float)
+        hi = np.asarray([row["ci_upper_K"] for row in points], dtype=float)
+        color = style.benchmark_color(benchmark)
+        marker, linestyle = _FIELD_MARKERS[benchmark], _FIELD_LINES[benchmark]
+        if axis == "lead":
+            ax.fill_between(x, lo, hi, color=color, alpha=0.10, linewidth=0)
+            ax.plot(x, y, color=color, linestyle=linestyle, linewidth=1.2,
+                    marker=marker, markersize=3.2, markevery=max(1, len(x) // 7),
+                    markerfacecolor="white", markeredgewidth=0.8)
+        else:
+            ax.plot(x, y, color=color, linestyle=linestyle, linewidth=0.6, alpha=0.45)
+            # Draw interval endpoints directly: a BCa interval need not contain
+            # its sample median, unlike Matplotlib's nonnegative yerr contract.
+            valid = np.isfinite(lo) & np.isfinite(hi)
+            ax.vlines(x[valid], lo[valid], hi[valid], color=color, linewidth=0.8, zorder=3)
+            ax.plot(x[valid], lo[valid], "_", color=color, markersize=4, markeredgewidth=0.8)
+            ax.plot(x[valid], hi[valid], "_", color=color, markersize=4, markeredgewidth=0.8)
+            ax.plot(x, y, linestyle="none", marker=marker, markersize=4,
+                    color=color, markerfacecolor="white", markeredgewidth=1.0, zorder=4)
+        handles.append(Line2D([], [], color=color, linestyle=linestyle, marker=marker,
+                              markersize=3.5, markerfacecolor="white", linewidth=1.2,
+                              label=tables.BENCH_LABEL[benchmark]))
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.54, 0.99),
+               ncol=2, fontsize=7, frameon=False, handlelength=2.2,
+               columnspacing=1.2, handletextpad=0.5, labelspacing=0.45)
+    ax.set_xlabel(r"Lead time $\Delta t=t_j-t_s$" if axis == "lead" else
+                  r"Interface-mean $\overline{R_c}$ [m$^2$ K/W]", fontsize=8)
+    ax.set_ylabel("Median global RMSE [K]", fontsize=8)
+    ax.set_xscale("linear")
+    ax.set_yscale(summary["yscale"])
+    ax.set_ylim(summary["ylim"])
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+    if summary["yscale"] == "log":
+        ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5), numticks=8))
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    else:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.tick_params(labelsize=7, width=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, axis="y", which="major", color="0.7", alpha=0.35,
+            linewidth=0.5, linestyle="-")
+    ax.set_axisbelow(True)
+    ax.margins(x=0.06)
+
+    title = ("Global field RMSE versus lead time" if axis == "lead" else
+             "Global field RMSE stratified by interface-mean resistance")
+    seed_note = "; ".join(f"{tables.BENCH_LABEL[b]}: K={summary['seed_counts'][b]}"
+                          for b in BENCH_ORDER)
+    caption = (
+        f"{title}. Median simulation-level global field RMSE over held-out test simulations. "
+        "SSE and evaluated cell counts are pooled across eligible pairs within each simulation "
+        "and stratum before taking the square root; simulation RMSE is then averaged across "
+        "fixed model seeds before the cohort median. Pointwise 95% BCa bootstrap intervals "
+        "resample simulations and are not simultaneous confidence bands. Intervals quantify "
+        "test-cohort uncertainty conditional on the trained models, not training-seed variability. "
+        "Averaging errors across seeds does not evaluate an ensemble-averaged prediction. "
+        f"Evaluated model seeds: {seed_note}. "
+    )
+    if summary["unequal_seed_counts"]:
+        caption += "Seed counts differ by benchmark; the amount of training-seed averaging is unequal. "
+    if any(row["interval_method"] == "none" and row["n_simulations"] for row in rows):
+        caption += f"Intervals are omitted for strata with fewer than {stats.MIN_SIMS_FOR_CI} simulations. "
+    if any(row["interval_method"] == "percentile" for row in rows):
+        caption += "Degenerate BCa cases use percentile intervals, identified in the statistics. "
+    if axis == "itr":
+        caption += (
+            "Common quantile bins count each simulation once; points sit at each benchmark's "
+            "median resistance within its bin. Scalar R_c is used for uniform interfaces; "
+            "Source + ITR uses the finite-domain mean of R_c(y), not an effective resistance. "
+            "Points represent marginal error stratifications over interface resistance and should "
+            "not be interpreted as the isolated effect of resistance because other benchmark "
+            "parameters vary concurrently. "
+        )
+    else:
+        caption += "All evaluated positive leads are retained without smoothing or extrapolation. "
+    caption += f"The RMSE axis is {summary['yscale']}; resistance and lead axes are linear."
+    representations = {
+        b: sorted({m["representation"] for m in metadata.get(b, {}).values()
+                   if m.get("representation")}) for b in BENCH_ORDER
+    }
+    if any(reps != ["temporal_encoder"] for reps in representations.values() if reps):
+        caption += " Evaluated representations: " + "; ".join(
+            f"{tables.BENCH_LABEL[b]}: {', '.join(reps).replace('_', ' ')}"
+            for b, reps in representations.items() if reps) + "."
+    if source.degradations:
+        caption += " This descriptive comparison has publication-cohort limitations detailed in the provenance sidecar."
+    definition = {
+        "space": "kelvin", "metric": "rmse_K", "title": title, "caption": caption,
+        "aggregation": "cells -> pair sufficient statistics -> pooled simulation RMSE -> seed mean -> cohort median",
+        "simulation_rmse": "sqrt(sum_pair(sse_K2) / sum_pair(num_error_cells))",
+        "replication_unit": "sim_id within benchmark; equal simulation weights",
+        "interval": "pointwise 95% BCa simulation bootstrap; not a simultaneous band",
+        "interval_interpretation": "test-cohort uncertainty conditional on fixed trained models; not training-seed variability",
+        "minimum_simulations_for_ci": stats.MIN_SIMS_FOR_CI,
+        "n_boot": summary["n_boot"], "rng_seed": summary["rng_seed"],
+        "seed_counts": summary["seed_counts"], "seed_ids": summary["seeds"],
+        "unequal_seed_counts": summary["unequal_seed_counts"],
+        "seed_averaging": "mean of simulation errors; not an ensemble-averaged prediction",
+        "pair_counts": "eligible_pairs_by_seed counts evaluated pairs before pooling; eligible_pair_rows_total sums across seeds; unique_simulation_pairs counts (sim_id,s,j) once across seeds",
+        "resistance_definition": "R_c for scalar interfaces; (d-c)^-1 integral_c^d [R_c + R_c_amp exp(-((y-R_c_y0)/R_c_sigma)^2)] dy for source_itr",
+        "resistance_definitions_by_seed": summary["resistance_definitions"],
+        "resistance_bin_edges": summary["resistance_bin_edges"],
+        "bin_closure": "left closed, right open; final upper endpoint included; constant values occupy one bin",
+        "protocols": summary["protocols"], "record_metadata": metadata,
+        "yscale": summary["yscale"], "ylim": summary["ylim"],
+        "statistics": rows,
+        "degradations": [str(d) for d in source.degradations],
+    }
+    return fig, None, definition
+
+
+def global_field_error_vs_lead(*, source=None, spec=None, requirement=None):
+    """F27: pointwise uncertainty of simulation-level error at exact leads."""
+    return _global_field_error_figure(axis="lead", source=source, spec=spec, requirement=requirement)
+
+
+def global_field_error_vs_itr(*, source=None, spec=None, requirement=None):
+    """F28: marginal simulation-level error strata over mean resistance."""
+    return _global_field_error_figure(axis="itr", source=source, spec=spec, requirement=requirement)
+
+
 __all__ = [
+    "global_field_error_vs_lead",
+    "global_field_error_vs_itr",
     "BENCH_ORDER",
     "TARGET_REL_L2_PCT",
     "benchmark_order",

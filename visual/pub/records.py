@@ -278,6 +278,90 @@ def load_many_test_records(paths, *, require_version: int = 2) -> RecordFrame:
                        seed=",".join(seeds), degradations=degradations)
 
 
+def load_global_field_records(source):
+    """Load F27/F28 records and evaluation metadata without loading a model."""
+    import numpy as np
+    import yaml
+    from visual.pub.manifest import _inspect_artifact, sha256_file
+
+    by_benchmark, metadata, extra_sources = {}, {}, []
+    runs = {Path(run.run_dir).resolve(): run for run in getattr(source, "runs", ())}
+    for ref in list(getattr(source, "artifacts", ())):
+        if ref.kind != "test_records":
+            continue
+        path = Path(ref.path)
+        record = load_test_records(path, seed=ref.seed)
+        if record.schema_version < 2:
+            raise SchemaError(f"{path}: F27/F28 require schema-v2 pooled statistics")
+        if len(record.benchmarks) != 1:
+            raise SchemaError(f"{path}: expected one benchmark per test-record artifact")
+        benchmark = record.benchmarks[0]
+        seed = str(record.seed)
+        if set(record.df["seed"]) != {seed}:
+            raise SchemaError(f"{path}: record seed does not match the manifest seed")
+        if seed in metadata.get(benchmark, {}):
+            raise SchemaError(f"{benchmark}: duplicate record files for seed {seed}")
+        run = runs.get(path.parent.resolve())
+        if run is not None and run.benchmark != benchmark:
+            raise SchemaError(f"{path}: benchmark disagrees with config_used.yaml")
+        config_path = path.parent / "config_used.yaml"
+        config = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        meta = {"representation": run.representation if run else None}
+        provenance = None
+        if record.schema_version >= 4:
+            provenance = load_test_record_provenance(path)
+            if provenance.get("benchmark") != benchmark or str(provenance.get("seed")) != seed:
+                raise SchemaError(f"{path}: provenance benchmark/seed mismatch")
+            if provenance.get("prediction_mode") != "direct_pair" or provenance.get("rollout_enabled"):
+                raise SchemaError(f"{path}: F27/F28 require direct prediction records")
+            if run is not None and run.representation != provenance.get("representation"):
+                raise SchemaError(f"{path}: representation disagrees with run provenance")
+            population = provenance["evaluation_population"]
+            meta.update({"t_grid": population["t_grid"],
+                         "time_grid_source": str(provenance_path_for(path)),
+                         "prediction_mode": provenance["prediction_mode"],
+                         "evaluation_population_hash": provenance["evaluation_population_hash"],
+                         "representation": provenance.get("representation")})
+            extra_sources.append(_inspect_artifact(provenance_path_for(path), "json_report", seed=seed))
+        elif (config.get("evaluation", {}).get("rollout") or {}).get("enabled"):
+            raise SchemaError(f"{path}: legacy run config enables rollout; direct records required")
+        if config_path.exists():
+            extra_sources.append(_inspect_artifact(config_path, "json_report", seed=seed))
+        data = config.get("data", {})
+        for axis in ("t", "y"):
+            raw = data.get(f"{axis}_grid_path")
+            if not raw:
+                continue
+            grid_path = Path(raw)
+            if not grid_path.is_absolute():
+                from visual.pub.manifest import PROJECT_ROOT
+                grid_path = PROJECT_ROOT / grid_path
+            if not grid_path.exists():
+                continue
+            if provenance is not None:
+                expected = provenance["evaluation_population"]["dataset_file_hashes"].get(f"{axis}_grid")
+                if expected != sha256_file(grid_path):
+                    raise SchemaError(f"{grid_path}: grid differs from the evaluated dataset")
+            grid = np.load(grid_path, allow_pickle=False)
+            if grid.ndim != 1 or grid.size < 2 or not np.isfinite(grid).all() or np.any(np.diff(grid) <= 0):
+                raise SchemaError(f"{grid_path}: invalid coordinate grid")
+            if axis == "t":
+                if "t_grid" in meta and not np.array_equal(grid, meta["t_grid"]):
+                    raise SchemaError(f"{grid_path}: time grid disagrees with provenance")
+                meta.update(t_grid=grid.tolist(), time_grid_source=str(grid_path))
+            else:
+                meta.update(y_bounds=[float(grid[0]), float(grid[-1])], bounds_source=str(grid_path))
+            extra_sources.append(_inspect_artifact(grid_path, "json_report", seed=seed))
+        by_benchmark.setdefault(benchmark, []).append(record.df)
+        metadata.setdefault(benchmark, {})[seed] = meta
+    known = {ref.path for ref in getattr(source, "artifacts", ())}
+    for ref in extra_sources:
+        if ref.path not in known:
+            source.artifacts.append(ref)
+            known.add(ref.path)
+    return {b: pd.concat(parts, ignore_index=True) for b, parts in by_benchmark.items()}, metadata
+
+
 def load_train_metrics(path: str | Path) -> pd.DataFrame:
     """Load a ``train_metrics.csv`` and tag it with its seed."""
     path = Path(path)

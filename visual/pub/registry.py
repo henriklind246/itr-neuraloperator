@@ -17,7 +17,9 @@ in torch.
 
 from __future__ import annotations
 
+import csv
 import importlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +54,8 @@ class FigureSpec:
     tier: int
     width: str = "two_col"
     params: dict = field(default_factory=dict)
+    formats: tuple[str, ...] = ("png", "pdf")
+    preserve_size: bool = False
 
     def __post_init__(self) -> None:
         if self.tier not in (1, 2, 3):
@@ -70,9 +74,10 @@ class FigureSpec:
             ) from None
 
 
-def _spec(key, title, module, func, tier, width="two_col", **params) -> FigureSpec:
+def _spec(key, title, module, func, tier, width="two_col", *,
+          formats=("png", "pdf"), preserve_size=False, **params) -> FigureSpec:
     return FigureSpec(key=key, title=title, module=module, func=func, tier=tier,
-                      width=width, params=params)
+                      width=width, params=params, formats=formats, preserve_size=preserve_size)
 
 
 _SPECS: tuple[FigureSpec, ...] = (
@@ -125,6 +130,12 @@ _SPECS: tuple[FigureSpec, ...] = (
           "Physical contact-jump fidelity across benchmarks",
           "visual.pub.fig_crossbench", "physical_contact_jump_vs_lead", 1,
           "two_col"),
+    _spec("F27_global_field_error_vs_lead", "Global field RMSE versus lead time",
+          "visual.pub.fig_crossbench", "global_field_error_vs_lead", 1, "one_col",
+          formats=("png", "pdf", "svg"), preserve_size=True),
+    _spec("F28_global_field_error_vs_itr", "Global field RMSE stratified by interface-mean resistance",
+          "visual.pub.fig_crossbench", "global_field_error_vs_itr", 1, "one_col",
+          formats=("png", "pdf", "svg"), preserve_size=True),
 
     # ------------------------------- tier 3: blocked on experiments not yet run
     _spec("F16_inverse_forcing_recovery", "Parameter recovery: forcing",
@@ -207,7 +218,7 @@ def _commit_changed(out_dir: Path, key: str) -> str | None:
 
 def render(key: str, *, manifest: Manifest | str | Path | None = None,
            out_dir: str | Path = DEFAULT_OUT_DIR, strict: bool = True,
-           formats: tuple[str, ...] = ("png", "pdf"),
+           formats: tuple[str, ...] | None = None,
            footer: bool = False, force: bool = False) -> RenderResult:
     """Resolve provenance, draw one figure, and optionally stamp it.
 
@@ -255,7 +266,19 @@ def render(key: str, *, manifest: Manifest | str | Path | None = None,
 
     if footer:
         style.add_provenance_footer(fig, key, source=source, selection=selection)
-    paths = style.save(fig, target, key, formats=formats)
+    save_style = {"savefig.bbox": None, "svg.fonttype": "none"} if spec.preserve_size else {}
+    with style.pub_style(extra=save_style):
+        paths = style.save(fig, target, key, formats=spec.formats if formats is None else formats)
+    if "statistics" in metric_definition:
+        statistics_path = target / f"{key}.statistics.csv"
+        rows = metric_definition["statistics"]
+        with statistics_path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows({k: json.dumps(v, sort_keys=True) if isinstance(v, (list, dict)) else v
+                              for k, v in row.items()} for row in rows)
+        metric_definition["statistics_file"] = statistics_path.name
+        paths.append(statistics_path)
     sidecar = write_sidecar(
         target, source,
         metric_space=requirement.metric_space,

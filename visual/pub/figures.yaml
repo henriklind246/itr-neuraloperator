@@ -330,3 +330,11 @@ figures:
       - source_itr_checkpoint
       - interfaces_checkpoint
     metric_space: kelvin
+
+  F27_global_field_error_vs_lead:
+    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    metric_space: kelvin
+
+  F28_global_field_error_vs_itr:
+    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    metric_space: kelvin

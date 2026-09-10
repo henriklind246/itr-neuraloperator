@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from visual.pub.manifest import Degradation
+from visual.pub.manifest import Degradation, ProvenanceError
 
 # Guard thresholds. Below these the corresponding statistic is emitted as NaN
 # with a Degradation instead of being reported as if it were determined.
@@ -1254,7 +1254,242 @@ def paired_seed_delta(sims_a: SimFrame, sims_b: SimFrame, metric: str, *,
     )
 
 
+GLOBAL_FIELD_BENCHMARKS = ("forcing", "source", "source_itr", "interfaces")
+
+
+def interface_mean_resistance(frame: pd.DataFrame, benchmark: str,
+                              bounds=(0.0, 1.0)) -> np.ndarray:
+    """Finite-domain arithmetic mean of the recorded scalar/Gaussian ITR."""
+    from scipy.special import erf
+
+    base = frame["R_c"].to_numpy(dtype=float)
+    if not np.all(np.isfinite(base) & (base >= 0)):
+        raise ProvenanceError(f"{benchmark}: invalid scalar/base resistance")
+    if benchmark != "source_itr":
+        return base
+    names = ["R_c_amp", "R_c_y0", "R_c_sigma"]
+    missing = set(names) - set(frame.columns)
+    if missing:
+        raise ProvenanceError(f"source_itr: missing Gaussian parameters {sorted(missing)}")
+    amp, center, sigma = frame[names].to_numpy(dtype=float).T
+    if not np.all(np.isfinite([amp, center, sigma])) or np.any(amp < 0) or np.any(sigma <= 0):
+        raise ProvenanceError("source_itr: invalid Gaussian resistance parameters")
+    if "R_c_base" in frame and not np.allclose(frame["R_c_base"], base):
+        raise ProvenanceError("source_itr: R_c must agree with R_c_base")
+    c, d = bounds
+    if not np.isfinite([c, d]).all() or d <= c:
+        raise ProvenanceError("invalid interface domain bounds")
+    return base + amp * sigma * np.sqrt(np.pi) / (2 * (d - c)) * (
+        erf((d - center) / sigma) - erf((c - center) / sigma))
+
+
+def _resolved_field_leads(frame, grid=None):
+    if grid is None:
+        nodes = pd.concat([
+            frame[["s", "t_s"]].rename(columns={"s": "index", "t_s": "time"}),
+            pd.DataFrame({"index": frame["j"], "time": frame["t_s"] + frame["t_bar"]}),
+        ], ignore_index=True)
+        grouped = nodes.groupby("index")["time"]
+        times = grouped.median()
+        if not np.allclose(grouped.min(), grouped.max(), rtol=1e-7, atol=1e-9):
+            raise ProvenanceError("records disagree on the time of a snapshot index")
+    else:
+        times = pd.Series(np.asarray(grid, dtype=float))
+    if not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
+        raise ProvenanceError("snapshot time grid must be finite and increasing")
+    start = frame["s"].map(times).to_numpy(dtype=float)
+    target = frame["j"].map(times).to_numpy(dtype=float)
+    lead = target - start
+    if (not np.isfinite(lead).all()
+            or not np.allclose(start, frame["t_s"], rtol=1e-7, atol=1e-9)
+            or not np.allclose(lead, frame["t_bar"], rtol=1e-7, atol=1e-9)):
+        raise ProvenanceError("record times disagree with the snapshot time grid")
+    if "lead_time_actual" in frame:
+        actual = pd.to_numeric(frame["lead_time_actual"], errors="coerce")
+        valid = actual.notna()
+        if not np.allclose(actual[valid], lead[valid], rtol=1e-7, atol=1e-9):
+            raise ProvenanceError("lead_time_actual disagrees with the snapshot grid")
+    # Subtraction at different start indices introduces roundoff even on an
+    # exact regular grid. Resolve only differences below the grid's precision.
+    unique = np.sort(np.unique(lead))
+    canonical = []
+    for value in unique:
+        if not canonical or not np.isclose(value, canonical[-1], rtol=1e-7, atol=1e-9):
+            canonical.append(float(value))
+    canonical = np.asarray(canonical)
+    indices = np.abs(lead[:, None] - canonical).argmin(axis=1)
+    return canonical[indices], times
+
+
+def global_field_error_summary(frames, *, metadata=None,
+                               n_boot=DEFAULT_N_BOOT, rng_seed=DEFAULT_RNG_SEED):
+    """F27/F28 reductions: pooled simulation RMSE, seed mean, cohort median.
+
+    Both strata are reduced together so their exported axes share the same
+    range, including when only one figure is requested through the CLI.
+    """
+    metadata = metadata or {}
+    missing = set(GLOBAL_FIELD_BENCHMARKS) - set(frames)
+    if missing:
+        raise ProvenanceError(f"global field figures missing benchmarks: {sorted(missing)}")
+    prepared, seeds, resistance_info, protocol_info = {}, {}, {}, {}
+    reference_protocol = None
+    required = {"seed", "benchmark", "sim_id", "s", "j", "t_s", "t_bar",
+                "R_c", "sse_K2", "num_error_cells"}
+    for benchmark in GLOBAL_FIELD_BENCHMARKS:
+        frame = getattr(frames[benchmark], "df", frames[benchmark]).copy()
+        if required - set(frame.columns):
+            raise ProvenanceError(f"{benchmark}: missing columns {sorted(required - set(frame.columns))}")
+        if set(frame["benchmark"]) != {benchmark}:
+            raise ProvenanceError(f"{benchmark}: inconsistent record benchmark")
+        for name in ("sim_id", "s", "j"):
+            values = frame[name].to_numpy(dtype=float)
+            if not np.all(np.isfinite(values) & (values >= 0) & (values == np.floor(values))):
+                raise ProvenanceError(f"{benchmark}: invalid {name}")
+            frame[name] = values.astype(np.int64)
+        for name in ("t_s", "t_bar", "sse_K2", "num_error_cells"):
+            values = frame[name].to_numpy(dtype=float)
+            if not np.all(np.isfinite(values) & (values >= 0)):
+                raise ProvenanceError(f"{benchmark}: invalid {name}")
+        if (frame["num_error_cells"] <= 0).any():
+            raise ProvenanceError(f"{benchmark}: nonpositive error-cell count")
+        for name, allowed in (("protocol", {"", "direct_pair"}),
+                              ("distribution_class", {"", "in_distribution"}),
+                              ("ood_axis", {""})):
+            if name in frame and not set(frame[name].fillna("").astype(str)).issubset(allowed):
+                raise ProvenanceError(f"{benchmark}: incompatible {name}; requires in-distribution direct pairs")
+        frame["seed"] = frame["seed"].astype(str)
+        evaluated_seeds = set(frame["seed"])
+        if not np.array_equal(frame["j"] > frame["s"], frame["t_bar"] > 0):
+            raise ProvenanceError(f"{benchmark}: snapshot ordering disagrees with lead-time sign")
+        frame = frame.loc[(frame["j"] > frame["s"]) & (frame["t_bar"] > 0)].copy()
+        if frame.empty:
+            raise ProvenanceError(f"{benchmark}: no positive-lead prediction pairs")
+        if set(frame["seed"]) != evaluated_seeds:
+            raise ProvenanceError(f"{benchmark}: an evaluated seed has no eligible positive-lead pairs")
+        if frame.duplicated(["seed", "sim_id", "s", "j"]).any():
+            raise ProvenanceError(f"{benchmark}: duplicate simulation-pair records")
+        seeds[benchmark] = sorted(frame["seed"].unique().tolist())
+        seed_parts, first_keys, populations = [], None, []
+        for seed in seeds[benchmark]:
+            part = frame.loc[frame["seed"] == seed].sort_values(["sim_id", "s", "j"]).copy()
+            keys = part[["sim_id", "s", "j"]].to_numpy()
+            if first_keys is not None and not np.array_equal(keys, first_keys):
+                raise ProvenanceError(f"{benchmark}: mismatched simulation cohorts or eligible pairs across seeds")
+            first_keys = keys
+            meta = metadata.get(benchmark, {}).get(seed, {})
+            population = meta.get("evaluation_population_hash")
+            populations.append(population)
+            part["lead_time"], times = _resolved_field_leads(part, meta.get("t_grid"))
+            part["source_time"] = part["s"].map(times)
+            bounds = tuple(meta.get("y_bounds", (0.0, 1.0)))
+            part["R_c_mean"] = interface_mean_resistance(part, benchmark, bounds)
+            protocol = part[["s", "j", "source_time", "lead_time"]].drop_duplicates().sort_values(["s", "j"])
+            protocol = protocol.to_numpy(dtype=float)
+            if reference_protocol is not None and (
+                    protocol.shape != reference_protocol.shape
+                    or not np.allclose(protocol, reference_protocol, rtol=1e-7, atol=1e-9)):
+                raise ProvenanceError("incompatible snapshot-pair evaluation protocols across benchmarks/seeds")
+            if reference_protocol is None:
+                reference_protocol = protocol
+            canonical_pairs = {(int(s), int(j)): float(lead)
+                               for s, j, _, lead in reference_protocol}
+            part["lead_time"] = [canonical_pairs[(s, j)] for s, j in zip(part.s, part.j)]
+            protocol_info.setdefault(benchmark, {})[seed] = {
+                "time_grid_source": meta.get("time_grid_source", "validated record snapshot times"),
+                "snapshot_times": {str(int(i)): float(t) for i, t in times.items()},
+                "prediction_mode": meta.get("prediction_mode", "direct_pair (legacy test-record contract)"),
+                "cohort_verification": "evaluation population hash" if population else
+                                       "legacy simulation/pair keys and recorded parameters",
+            }
+            resistance_info.setdefault(benchmark, {})[seed] = {
+                "kind": "finite-domain Gaussian mean" if benchmark == "source_itr" else "scalar R_c",
+                "y_bounds": list(bounds),
+                "bounds_source": meta.get("bounds_source", "benchmark unit-domain convention"),
+            }
+            seed_parts.append(part)
+        if len(set(populations)) > 1:
+            raise ProvenanceError(f"{benchmark}: mismatched evaluation populations across seeds")
+        combined = pd.concat(seed_parts, ignore_index=True)
+        invariant_cols = ["R_c", "R_c_mean"]
+        if benchmark == "source_itr":
+            invariant_cols += ["R_c_amp", "R_c_y0", "R_c_sigma"]
+        grouped = combined.groupby("sim_id")[invariant_cols]
+        if not np.allclose(grouped.min(), grouped.max(), rtol=1e-10, atol=1e-12):
+            raise ProvenanceError(f"{benchmark}: simulation resistance changes across pairs or seeds")
+        identity_fields = [name for name in ("temporal_family", "spatial_family", "regime",
+                                             "x_h", "y_h", "A", "freq", "x_I")
+                           if name in combined]
+        if identity_fields and (combined.groupby("sim_id")[identity_fields].nunique(dropna=False) > 1).to_numpy().any():
+            raise ProvenanceError(f"{benchmark}: recorded simulation parameters differ across pairs or seeds")
+        prepared[benchmark] = combined
+
+    resistance_values = np.concatenate([
+        frame.drop_duplicates("sim_id")["R_c_mean"].to_numpy()
+        for frame in prepared.values()])
+    edges = np.unique(np.quantile(resistance_values, np.linspace(0, 1, 6)))
+    if len(edges) == 1:
+        edges = np.repeat(edges, 2)
+    lead_rows, itr_rows = [], []
+    for benchmark, frame in prepared.items():
+        frame["resistance_bin"] = np.clip(
+            np.searchsorted(edges, frame["R_c_mean"], side="right") - 1,
+            0, len(edges) - 2)
+        for stratum, rows, levels in (
+                ("lead_time", lead_rows, np.sort(frame["lead_time"].unique())),
+                ("resistance_bin", itr_rows, range(len(edges) - 1))):
+            pooled = frame.groupby([stratum, "sim_id", "seed"], sort=True).agg(
+                sse=("sse_K2", "sum"), cells=("num_error_cells", "sum"),
+                n_pairs=("s", "size"), resistance=("R_c_mean", "first"))
+            pooled["rmse_K"] = pooled_rmse(pooled["sse"], pooled["cells"])
+            simulations = pooled.groupby([stratum, "sim_id"]).agg(
+                rmse_K=("rmse_K", "mean"), resistance=("resistance", "first"))
+            for level in levels:
+                present = level in simulations.index.get_level_values(stratum)
+                sample = simulations.xs(level, level=stratum) if present else simulations.iloc[:0]
+                values = sample["rmse_K"].to_numpy(dtype=float)
+                lo, hi, method = bootstrap_ci(values, n_boot=n_boot, rng_seed=rng_seed)
+                part = frame.loc[frame[stratum] == level]
+                pair_counts = {seed: int((part["seed"] == seed).sum()) for seed in seeds[benchmark]}
+                row = {
+                    "benchmark": benchmark, "n_simulations": int(len(values)),
+                    "n_seeds": len(seeds[benchmark]), "seed_ids": seeds[benchmark],
+                    "eligible_pairs_by_seed": pair_counts,
+                    "eligible_pair_rows_total": int(len(part)),
+                    "unique_simulation_pairs": int(len(part.drop_duplicates(["sim_id", "s", "j"]))),
+                    "median_rmse_K": float(np.median(values)) if len(values) else None,
+                    "ci_lower_K": float(lo) if np.isfinite(lo) else None,
+                    "ci_upper_K": float(hi) if np.isfinite(hi) else None,
+                    "interval_method": method,
+                }
+                if stratum == "lead_time":
+                    row["lead_time"] = float(level)
+                else:
+                    row.update({"bin_index": int(level), "bin_lower": float(edges[level]),
+                                "bin_upper": float(edges[level + 1]),
+                                "median_resistance": float(sample["resistance"].median()) if len(values) else None})
+                rows.append(row)
+    values = [row[name] for row in lead_rows + itr_rows
+              for name in ("median_rmse_K", "ci_lower_K", "ci_upper_K")
+              if row[name] is not None]
+    lower, upper = min(values), max(values)
+    if lower > 0:
+        padding = max((np.log10(upper) - np.log10(lower)) * 0.08, 0.06)
+        yscale, ylim = "log", [10 ** (np.log10(lower) - padding), 10 ** (np.log10(upper) + padding)]
+    else:
+        yscale, ylim = "linear", [0.0, upper * 1.08 if upper > 0 else 1.0]
+    counts = {b: len(s) for b, s in seeds.items()}
+    return {"lead": lead_rows, "itr": itr_rows, "seeds": seeds,
+            "seed_counts": counts, "unequal_seed_counts": len(set(counts.values())) > 1,
+            "resistance_bin_edges": edges.tolist(), "resistance_definitions": resistance_info,
+            "protocols": protocol_info, "yscale": yscale, "ylim": ylim,
+            "n_boot": n_boot, "rng_seed": rng_seed}
+
+
 __all__ = [
+    "GLOBAL_FIELD_BENCHMARKS",
+    "global_field_error_summary",
+    "interface_mean_resistance",
     "ContactJumpCurve",
     "DEFAULT_METRICS",
     "DEFAULT_N_BOOT",
