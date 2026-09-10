@@ -354,3 +354,55 @@ def test_seed_with_no_eligible_pairs_is_not_silently_dropped():
     frame.loc[frame.seed == "1", "t_bar"] = 0
     with pytest.raises(ProvenanceError, match="seed has no eligible"):
         summarize(frames)
+
+
+def test_global_field_discovery_selects_all_seeds_and_rejects_ambiguity(tmp_path):
+    import shutil
+    manifest = write_field_manifest(tmp_path / 'runs', n_sims=3)
+    root = tmp_path / 'runs'
+    shutil.copytree(root / 'forcing' / 'seed0', root / 'forcing' / 'seed1')
+    discovered = Manifest.discover_global_field(root)
+    assert [e['seed'] for e in discovered.sources['forcing_records']] == [0, 1]
+    assert discovered.path is None
+    assert len(discovered.sources) == 4
+    shutil.copytree(root / 'forcing' / 'seed0', root / 'another' / 'seed0')
+    with pytest.raises(ProvenanceError, match='--run forcing='):
+        Manifest.discover_global_field(root)
+    selected = Manifest.discover_global_field(root, selections={'forcing': str(root / 'forcing')})
+    assert len(selected.sources['forcing_records']) == 2
+    with pytest.raises(ProvenanceError, match='found 0'):
+        Manifest.discover_global_field(root, selections={'forcing': str(root / 'absent')})
+    with pytest.raises(ProvenanceError, match='Unknown benchmark'):
+        Manifest.discover_global_field(root, selections={'typo': str(root)})
+
+
+def test_global_field_discovery_missing_records_and_config(tmp_path):
+    with pytest.raises(ProvenanceError, match='does not exist'):
+        Manifest.discover_global_field(tmp_path / 'absent')
+    with pytest.raises(ProvenanceError, match='No eligible records'):
+        Manifest.discover_global_field(tmp_path)
+    (tmp_path / 'test_records.csv').write_text('sim_id\n1\n')
+    with pytest.raises(ProvenanceError, match='Missing run configuration'):
+        Manifest.discover_global_field(tmp_path)
+
+
+def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from visual.pub import __main__ as cli
+    write_field_manifest(tmp_path / 'runs', n_sims=3)
+    calls = []
+    def fake_render(key, **kwargs):
+        calls.append((key, kwargs))
+        return SimpleNamespace(degraded=not kwargs['strict'], paths=[], sidecar=tmp_path/'preview.json')
+    monkeypatch.setattr(cli, 'render', fake_render)
+    command = ['--global-field', '--runs-root', str(tmp_path / 'runs')]
+    assert cli.main(command) == 2
+    assert [key for key, _ in calls] == list(KEYS)
+    assert all(not kw['strict'] and str(kw['out_dir']) == 'figures/global_field' for _, kw in calls)
+    assert 'Selected forcing_records' in capsys.readouterr().out
+    calls.clear()
+    assert cli.main(command + ['--strict', '--out', str(tmp_path / 'figures')]) == 0
+    assert all(kw['strict'] and kw['out_dir'] == tmp_path / 'figures' for _, kw in calls)
+    for invalid in (['--runs-root', str(tmp_path)], command + ['--all'], command + ['--manifest', 'custom.yaml']):
+        with pytest.raises(SystemExit):
+            cli.main(invalid)

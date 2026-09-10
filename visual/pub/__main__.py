@@ -42,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--figure", nargs="+", metavar="KEY",
                    help="figure keys to render")
+    p.add_argument("--global-field", action="store_true",
+                   help="render F27 and F28; defaults to descriptive rendering with disclosures")
+    p.add_argument("--runs-root", type=Path,
+                   help="discover global-field records recursively under this directory")
+    p.add_argument("--run", action="append", default=[], metavar="BENCHMARK=CONFIG_DIR",
+                   help="select an experiment when discovery finds multiple candidates (repeatable)")
     p.add_argument(
         "--table",
         choices=("T01_primary_results", "T01_primary_results_descriptive"),
@@ -52,13 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="tier ceiling for --all (default: 2)")
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST,
                    help=f"manifest.yaml path (default: {DEFAULT_MANIFEST})")
-    p.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR,
-                   help=f"output directory (default: {DEFAULT_OUT_DIR})")
+    p.add_argument("--out", type=Path, default=None,
+                   help=f"output directory (default: {DEFAULT_OUT_DIR}; --global-field: figures/global_field)")
 
     strictness = p.add_mutually_exclusive_group()
     strictness.add_argument("--strict", dest="strict", action="store_true",
-                            default=True,
-                            help="fail on any unmet requirement (default)")
+                            default=None,
+                            help="fail on any unmet requirement (default except with --global-field)")
     strictness.add_argument("--allow-missing", dest="strict", action="store_false",
                             help="render degraded figures into out/degraded/")
 
@@ -157,6 +163,8 @@ def cmd_audit(out_dir: Path, fmt: str) -> int:
 
 
 def _selected_keys(args) -> list[str]:
+    if args.global_field:
+        return ["F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr"]
     if args.figure:
         for key in args.figure:
             get_figure(key)
@@ -167,12 +175,39 @@ def _selected_keys(args) -> list[str]:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.global_field and any((args.figure, args.all, args.table, args.do_list, args.verify, args.audit)):
+        parser.error("--global-field cannot be combined with other figure/table/inspection selectors")
+    if (args.runs_root or args.run) and not args.global_field:
+        parser.error("--runs-root and --run require --global-field")
+    if args.run and not args.runs_root:
+        parser.error("--run requires --runs-root")
+    if args.runs_root and args.manifest != DEFAULT_MANIFEST:
+        parser.error("choose --runs-root or --manifest, not both")
+    args.strict = not args.global_field if args.strict is None else args.strict
+    args.out = args.out or (Path("figures/global_field") if args.global_field else DEFAULT_OUT_DIR)
 
     if args.audit is not None:
         return cmd_audit(args.audit, args.format)
 
-    mf = _requirements(args.manifest)
+    try:
+        if args.runs_root:
+            selections = {}
+            for value in args.run:
+                benchmark, separator, directory = value.partition("=")
+                if not separator or not directory or benchmark in selections:
+                    parser.error("--run requires a unique BENCHMARK=CONFIG_DIR selection")
+                selections[benchmark] = directory
+            mf = Manifest.discover_global_field(args.runs_root, selections=selections)
+            for name, entries in mf.sources.items():
+                for entry in entries:
+                    print(f"Selected {name}: {entry['run']} (seed {entry['seed']})")
+        else:
+            mf = _requirements(args.manifest)
+    except ProvenanceError as exc:
+        print(f"FAILED discovery: {exc}", file=sys.stderr)
+        return EXIT_PROVENANCE
 
     if args.do_list:
         return cmd_list(mf, args.format)
@@ -219,6 +254,8 @@ def main(argv=None) -> int:
             print(f"FAILED {key}: {exc}", file=sys.stderr)
             return EXIT_PROVENANCE
         any_degraded |= result.degraded
+        for path in [*(p for p in result.paths if p.suffix == ".csv"), result.sidecar]:
+            print(f"Saved {key} -> {path}")
 
     return EXIT_DEGRADED if any_degraded else EXIT_OK
 

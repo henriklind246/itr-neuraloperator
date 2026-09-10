@@ -412,6 +412,56 @@ class Manifest:
     path: Path | None = None
 
     @classmethod
+    def discover_global_field(cls, runs_root: str | Path, *,
+                              selections: dict[str, str] | None = None) -> Manifest:
+        """Discover complete seed records, requiring one experiment per benchmark."""
+        benchmarks = ("forcing", "source", "source_itr", "interfaces")
+        root = Path(runs_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ProvenanceError(f"Runs directory does not exist: {root}")
+        selections = selections or {}
+        unknown = set(selections) - set(benchmarks)
+        if unknown:
+            raise ProvenanceError(f"Unknown benchmark selection: {sorted(unknown)}")
+        candidates = {b: {} for b in benchmarks}
+        for record in sorted(root.rglob("test_records.csv")):
+            run = record.parent.resolve()
+            config_path = run / "config_used.yaml"
+            if not config_path.is_file():
+                raise ProvenanceError(f"Missing run configuration: {config_path}")
+            try:
+                config = _read_yaml(config_path)
+            except yaml.YAMLError as exc:
+                raise ProvenanceError(f"Invalid run configuration: {config_path}: {exc}") from exc
+            if not isinstance(config, dict):
+                raise ProvenanceError(f"Expected a configuration mapping: {config_path}")
+            benchmark = config.get("benchmark")
+            if isinstance(benchmark, dict):
+                benchmark = benchmark.get("name")
+            if benchmark not in benchmarks:
+                continue
+            if not run.name.startswith("seed") or not run.name[4:].isdigit():
+                raise ProvenanceError(f"Expected a seed<number> directory: {run}")
+            candidates[benchmark].setdefault(run.parent, {})[run] = {
+                "run": str(run), "seed": int(run.name[4:]),
+            }
+        sources = {}
+        for benchmark, experiments in candidates.items():
+            if benchmark in selections:
+                selected = Path(selections[benchmark]).expanduser().resolve()
+                experiments = {p: entries for p, entries in experiments.items() if p == selected}
+            if len(experiments) != 1:
+                choices = "\n".join(f"  --run {benchmark}={p}" for p in candidates[benchmark])
+                raise ProvenanceError(
+                    f"{benchmark}: expected one experiment with test_records.csv under {root}; "
+                    f"found {len(experiments)} matching experiments. "
+                    "Select its config directory with --run benchmark=/absolute/path/config0.\n"
+                    + (choices or "  No eligible records found.")
+                )
+            sources[f"{benchmark}_records"] = list(next(iter(experiments.values())).values())
+        return cls(sources=sources, requirements=FigureRequirements.load())
+
+    @classmethod
     def load(cls, path: str | Path | None = None, *,
              figures_yaml: str | Path = FIGURES_YAML,
              root: Path = PROJECT_ROOT) -> Manifest:
