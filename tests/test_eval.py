@@ -741,3 +741,72 @@ def test_sigma_nrmse_and_gnrmse_have_distinct_names_and_definitions():
     expected = 100 * 5.0 * errors.square().mean().sqrt().item() / math.sqrt(5.0**2 + 7.0**2)
     assert test["gnrmse_pct"] == pytest.approx(expected, rel=1e-6)
     assert test["gnrmse_pct"] != pytest.approx(val["sigma_nrmse_pct"])
+
+
+@pytest.mark.parametrize('options', [{}, {'long_lead_only': True}, {'rollout_num_substeps': 2}])
+def test_combined_evaluation_reuses_predictions_and_preserves_outputs(records_run, monkeypatch, options):
+    import json
+    import src.operators.eval as evaluation
+
+    run_root, seed_dir, n_test_sims = records_run
+    checkpoint = torch.load(seed_dir / 'fno2d_best.pt', map_location='cpu')
+    checkpoint.update(epoch=3, seed=42)
+    torch.save(checkpoint, seed_dir / 'fno2d_best.pt')
+    original_forward = evaluation.FNO2d.forward
+    forward_calls = []
+
+    def counted_forward(self, *args, **kwargs):
+        forward_calls.append(args[0].shape[0])
+        return original_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(evaluation.FNO2d, 'forward', counted_forward)
+    baseline = evaluation.eval_all_seeds(run_root, device='cpu', **options)
+    expected_calls = list(forward_calls)
+    forward_calls.clear()
+    combined = evaluation.eval_all_seeds(run_root, device='cpu', write_records=True, **options)
+    assert forward_calls == expected_calls
+    assert len(combined) == 1
+    for key, expected in baseline[0].items():
+        actual = combined[0][key]
+        if isinstance(expected, float):
+            assert actual == pytest.approx(expected, nan_ok=True, rel=1e-6, abs=1e-7), key
+        else:
+            assert actual == expected, key
+    rows = _read_records(seed_dir / 'test_records.csv')
+    assert len(rows) == n_test_sims * (1 if options.get('long_lead_only') else 6)
+    provenance = json.loads((seed_dir / 'test_records.provenance.json').read_text())
+    assert provenance['n_pairs'] == len(rows)
+    assert provenance['rollout_enabled'] == (options.get('rollout_num_substeps', 1) > 1)
+    assert combined[0]['test_records'] == str(seed_dir / 'test_records.csv')
+    assert {r['provenance_id'] for r in rows} == {provenance['provenance_id']}
+    if not options.get('long_lead_only'):
+        standalone = evaluation.write_test_records(
+            run_root, seed=42, device='cpu', out_name='standalone.csv',
+            inference_batch_size=4, **options,
+        )
+        for actual, expected in zip(rows, _read_records(standalone), strict=True):
+            assert {k: v for k, v in actual.items() if k != 'provenance_id'} == {
+                k: v for k, v in expected.items() if k != 'provenance_id'
+            }
+
+
+def test_run_eval_combined_cli_writes_report_and_all_seed_records(records_run, monkeypatch):
+    import json
+    from scripts import run_eval
+    run_root, seed_dir, _ = records_run
+    checkpoint = torch.load(seed_dir / 'fno2d_best.pt', map_location='cpu')
+    checkpoint.update(epoch=3, seed=42)
+    torch.save(checkpoint, seed_dir / 'fno2d_best.pt')
+    other_seed = run_root / 'seed43'
+    other_seed.mkdir()
+    checkpoint['seed'] = 43
+    torch.save(checkpoint, other_seed / 'fno2d_best.pt')
+    monkeypatch.setattr('sys.argv', ['run_eval.py', str(run_root), '--write-test-records',
+                                   '--device', 'cpu', '--rollout-num-substeps', '1',
+                                   '--records-name', 'custom.csv', '--report-name', 'custom.json'])
+    assert run_eval.main() == 0
+    report = json.loads((run_root / 'custom.json').read_text())
+    assert report
+    for seed in (seed_dir, other_seed):
+        assert _read_records(seed / 'custom.csv')
+        assert (seed / 'custom.provenance.json').exists()

@@ -16,6 +16,18 @@ def main() -> int:
         help="Path to a config directory containing seed*/ subdirs (e.g. $HOME/fno_runs/exp/config0).",
     )
     parser.add_argument(
+        "--write-test-records", action="store_true",
+        help="Also write per-pair CSVs and provenance beside each seed checkpoint using the same inference pass.",
+    )
+    parser.add_argument(
+        "--records-name", default="test_records.csv",
+        help="CSV filename per seed when --write-test-records is enabled (default: test_records.csv).",
+    )
+    parser.add_argument(
+        "--device", choices=("cpu", "cuda", "mps", "auto"), default=None,
+        help="Override the checkpoint's evaluation device.",
+    )
+    parser.add_argument(
         "--data-dir",
         default=None,
         help=(
@@ -133,6 +145,9 @@ def main() -> int:
         time_norm_horizon=args.time_norm_horizon,
         target_times=target_times,
         protocols=args.protocol,
+        write_records=args.write_test_records,
+        records_name=args.records_name,
+        device=args.device,
     )
     if not results:
         print(f"error: no fno2d_best.pt checkpoints found under {run_root}", file=sys.stderr)

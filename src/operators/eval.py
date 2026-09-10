@@ -210,6 +210,7 @@ def evaluate(
     use_per_sample_interface: bool = False,
     interface_x: float = 0.5,
     temperature_reference_K: float = 300.0,
+    prediction_batches=None,
 ):
     """Return a dict of test metrics in both normalized and physical space.
 
@@ -232,6 +233,8 @@ def evaluate(
 
     All region rel-L2 scores pool squared errors and squared targets before
     taking the ratio, matching train/validation and independent of batching.
+    ``prediction_batches`` can supply (batch, prediction) pairs so record export
+    and report reduction share inference without retaining full predicted fields.
     """
     if rollout_is_active(rollout_options):
         return _evaluate_rollout(
@@ -244,6 +247,7 @@ def evaluate(
             x_grid=x_grid,
             interface_half_width=interface_half_width,
             use_per_sample_interface=use_per_sample_interface,
+            prediction_batches=prediction_batches,
         )
 
     x_grid_t = None
@@ -279,14 +283,17 @@ def evaluate(
         node_jump_gnrmse_all: list[torch.Tensor] = []
         max_err_K = 0.0
 
-        for batch in test_loader:
-            x_spatial = batch["spatial"].to(device)
-            cond_static = batch["cond_static"].to(device)
-            forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
+        batches = prediction_batches if prediction_batches is not None else (
+            (batch, None) for batch in test_loader
+        )
+        for batch, y_pred in batches:
             y_batch = batch["Y"].to(device)
             T_stats = batch["T_stats"].to(device)
-
-            y_pred = model(x_spatial, cond_static, forcing_seq)
+            if y_pred is None:
+                x_spatial = batch["spatial"].to(device)
+                cond_static = batch["cond_static"].to(device)
+                forcing_seq = batch["forcing_seq"].to(device) if "forcing_seq" in batch else None
+                y_pred = model(x_spatial, cond_static, forcing_seq)
 
             # Normalized-space metric (same convention as train/val_rel_l2)
             sse_norm += torch.sum((y_pred - y_batch) ** 2).item()
@@ -428,6 +435,7 @@ def _evaluate_rollout(
     x_grid=None,
     interface_half_width: float = 0.05,
     use_per_sample_interface: bool = False,
+    prediction_batches=None,
 ):
     dataset = test_loader.dataset
     if not hasattr(dataset, "_pairs"):
@@ -451,22 +459,22 @@ def _evaluate_rollout(
         boundary_sums_norm = np.zeros(2, dtype=np.float64)
         boundary_sums_phys = np.zeros(2, dtype=np.float64)
 
-        for idx in range(len(dataset)):
-            sim_id, s, j = dataset._pairs[idx]
-            item = dataset[idx]
-            y_batch = item["Y"].unsqueeze(0).to(device)
-            T_stats = item["T_stats"].unsqueeze(0).to(device)
-            item_batch = {"T_stats": T_stats}
+        def rollout_batches():
+            for idx in range(len(dataset)):
+                sim_id, s, j = dataset._pairs[idx]
+                item = dataset[idx]
+                batch = {key: value.unsqueeze(0) for key, value in item.items()}
+                prediction = predict_autoregressive(
+                    model=model, dataset=dataset, sim_id=int(sim_id),
+                    s=int(s), j=int(j), num_substeps=rollout_options.num_substeps,
+                    device=device,
+                )
+                yield batch, prediction
 
-            y_pred = predict_autoregressive(
-                model=model,
-                dataset=dataset,
-                sim_id=int(sim_id),
-                s=int(s),
-                j=int(j),
-                num_substeps=rollout_options.num_substeps,
-                device=device,
-            )
+        batches = prediction_batches if prediction_batches is not None else rollout_batches()
+        for item_batch, y_pred in batches:
+            y_batch = item_batch["Y"].to(device)
+            T_stats = item_batch["T_stats"].to(device)
 
             sse_norm += torch.sum((y_pred - y_batch) ** 2).item()
             sst_norm += torch.sum(y_batch ** 2).item()
@@ -526,9 +534,15 @@ def eval_all_seeds(
     time_norm_horizon: float | None = None,
     target_times: list[float] | None = None,
     protocols: list[str] | None = None,
+    write_records: bool = False,
+    records_name: str = "test_records.csv",
+    device: str | None = None,
 ):
     run_root = Path(run_root)
     results = []
+    device_override = device
+    if write_records and (Path(records_name).name != records_name or not records_name.endswith(".csv")):
+        raise ValueError("records_name must be a CSV filename within each seed directory")
 
     print("Testing started.")
     if data_dir is not None:
@@ -541,7 +555,7 @@ def eval_all_seeds(
 
         ckpt = torch.load(ckpt_path, map_location="cpu")
         config = ckpt['conf']
-        device = resolve_device(config.get("training", {}).get("device", "auto"))
+        device = resolve_device(device_override or config.get("training", {}).get("device", "auto"))
         rollout_options = rollout_options_from_config(
             config,
             enabled=rollout_enabled,
@@ -622,15 +636,26 @@ def eval_all_seeds(
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
 
-        metrics = evaluate(
-            model=fno, test_loader=test_loader, device=device,
+        report_kwargs = dict(
             iface_mask=iface_mask, boundary_mask=boundary_mask,
-            rollout_options=rollout_options,
             x_grid=x_grid,
             interface_half_width=loss_cfg.get("interface_half_width", 0.05),
             use_per_sample_interface=use_per_sample_interface,
             interface_x=loss_cfg.get("interface_x", 0.5),
         )
+        if write_records:
+            records_path, metrics = _write_test_records_for_model(
+                seed_dir=seed_dir, ckpt=ckpt, config=config, test_loader=test_loader,
+                x_grid=x_grid, y_grid=y_grid, fno=fno, device=device,
+                rollout_options=rollout_options, out_name=records_name,
+                inference_batch_size=test_loader.batch_size,
+                report_kwargs=report_kwargs,
+            )
+        else:
+            metrics = evaluate(
+                model=fno, test_loader=test_loader, device=device,
+                rollout_options=rollout_options, **report_kwargs,
+            )
 
         results.append(
             {
@@ -681,6 +706,9 @@ def eval_all_seeds(
                 "ckpt": str(ckpt_path),
             }
         )
+        if write_records:
+            results[-1]["test_records"] = str(records_path)
+            results[-1]["test_records_provenance"] = str(records_path.with_suffix(".provenance.json"))
 
     # sort by normalized test performance (apples-to-apples with val_rel_l2)
     results.sort(key=lambda r: r["test_rel_l2_norm"])
@@ -1160,13 +1188,6 @@ def write_test_records(
         config["data"]["t_grid_path"] = str(data_dir_path / "t_grid.npy")
         config["data"]["sim_params_path"] = str(data_dir_path / "sim_params.npy")
 
-    # OOD identity sidecar lives beside the trajectories (data_dir override or the
-    # checkpoint-baked dataset). Absent file -> in-distribution defaults below.
-    sidecar_dir = Path(data_dir) if data_dir is not None else Path(
-        config["data"]["trajectories.npy"]
-    ).parent
-    ood_sidecar = _load_ood_sidecar(sidecar_dir)
-
     test_loader, x_grid, y_grid, _num_sims = build_test_loader(
         config,
         mu_global=ckpt.get("mu_global"),
@@ -1177,13 +1198,7 @@ def write_test_records(
         protocols=protocols,
         n_snapshots_test=n_snapshots_test,
     )
-    dataset = test_loader.dataset
-    pair_tags = getattr(dataset, "_pair_tags", None)
-    ds_t_final = float(dataset.t_final)
-    ds_norm_horizon = float(getattr(dataset, "time_norm_horizon", dataset.t_final))
-    problem = problem_from_config(config)
-    benchmark = problem.name
-    dims = problem.dims
+    dims = problem_from_config(config).dims
 
     model_cfg = config["model"]["parameters"]
     fno = FNO2d(
@@ -1225,6 +1240,25 @@ def write_test_records(
     fno.to(device)
     fno.eval()
 
+    out_path, _ = _write_test_records_for_model(
+        seed_dir=seed_dir, ckpt=ckpt, config=config, test_loader=test_loader,
+        x_grid=x_grid, y_grid=y_grid, fno=fno, device=device,
+        rollout_options=rollout_options, out_name=out_name,
+        inference_batch_size=inference_batch_size,
+    )
+    return out_path
+
+
+def _write_test_records_for_model(*, seed_dir, ckpt, config, test_loader,
+                                  x_grid, y_grid, fno, device, rollout_options,
+                                  out_name, inference_batch_size, report_kwargs=None):
+    """Write pair records and optionally reduce the same predictions for a report."""
+    dataset = test_loader.dataset
+    pair_tags = getattr(dataset, "_pair_tags", None)
+    ds_t_final = float(dataset.t_final)
+    ds_norm_horizon = float(getattr(dataset, "time_norm_horizon", dataset.t_final))
+    benchmark = problem_from_config(config).name
+    ood_sidecar = _load_ood_sidecar(Path(config["data"]["trajectories.npy"]).parent)
     hw = float(config.get("training", {}).get("loss", {}).get("interface_half_width", 0.05))
 
     mask_cache: dict[float, torch.Tensor] = {}
@@ -1349,23 +1383,17 @@ def write_test_records(
             for offset, row in enumerate(values)
         ]
 
-    def _prediction_items():
+    def _prediction_batches():
         if rollout_is_active(rollout_options):
             for idx in range(len(dataset)):
                 sim_id, s, j = map(int, dataset._pairs[idx])
                 item = dataset[idx]
                 prediction = predict_autoregressive(
-                    model=fno,
-                    dataset=dataset,
-                    sim_id=sim_id,
-                    s=s,
-                    j=j,
-                    num_substeps=rollout_options.num_substeps,
-                    device=device,
+                    model=fno, dataset=dataset, sim_id=sim_id, s=s, j=j,
+                    num_substeps=rollout_options.num_substeps, device=device,
                 )
-                yield idx, item, _batch_metrics(idx, [item], prediction)[0]
+                yield idx, [item], prediction
             return
-
         total = len(dataset)
         for start in range(0, total, inference_batch_size):
             stop = min(start + inference_batch_size, total)
@@ -1373,135 +1401,152 @@ def write_test_records(
             spatial = torch.stack([item["spatial"] for item in items]).to(device)
             cond = torch.stack([item["cond_static"] for item in items]).to(device)
             forcing = torch.stack([item["forcing_seq"] for item in items]).to(device)
-            predictions = fno(spatial, cond, forcing)
-            batch_metrics = _batch_metrics(start, items, predictions)
-            for offset, (item, metrics) in enumerate(zip(items, batch_metrics, strict=True)):
-                yield start + offset, item, metrics
+            yield start, items, fno(spatial, cond, forcing)
             if start == 0 or stop == total or stop % 5000 < inference_batch_size:
                 print(f"Scored {stop}/{total} test pairs", flush=True)
 
     rows = []
-    with torch.no_grad():
-        for idx, item, metrics in _prediction_items():
-            sim_id, s, j = dataset._pairs[idx]
-            sim_id, s, j = int(sim_id), int(s), int(j)
 
-            params = dataset.sim_params[sim_id]
-            interface_x = float(params.get("interface_x", 0.5))
-            rel_l2 = metrics["rel_l2"]
-            iface_rel_l2 = metrics["iface_rel_l2"]
-            nrmse_pct = metrics["nrmse_pct"]
-            rmse_K = metrics["rmse_K"]
-            gnrmse_pct = 100.0 * rmse_K / temperature_rise_scale_K
-            node_jump_rmse_K = metrics["node_jump_rmse_K"]
-            node_jump_gnrmse_pct = metrics["node_jump_gnrmse_pct"]
-            node_jump_nrmse_pct = metrics["node_jump_nrmse_pct"]
-            node_jump_abs_max_pred_K = metrics["node_jump_abs_max_pred_K"]
-            node_jump_abs_max_true_K = metrics["node_jump_abs_max_true_K"]
+    def record_batches():
+        for start, items, predictions in _prediction_batches():
+            batch_metrics = _batch_metrics(start, items, predictions)
+            for offset, metrics in enumerate(batch_metrics):
+                idx = start + offset
+                sim_id, s, j = dataset._pairs[idx]
+                sim_id, s, j = int(sim_id), int(s), int(j)
 
-            t_s_val = float(dataset.t_grid[s])
-            t_j_val = float(dataset.t_grid[j])
-            A, freq = _amp_freq_from_params(params)
+                params = dataset.sim_params[sim_id]
+                interface_x = float(params.get("interface_x", 0.5))
+                rel_l2 = metrics["rel_l2"]
+                iface_rel_l2 = metrics["iface_rel_l2"]
+                nrmse_pct = metrics["nrmse_pct"]
+                rmse_K = metrics["rmse_K"]
+                gnrmse_pct = 100.0 * rmse_K / temperature_rise_scale_K
+                node_jump_rmse_K = metrics["node_jump_rmse_K"]
+                node_jump_gnrmse_pct = metrics["node_jump_gnrmse_pct"]
+                node_jump_nrmse_pct = metrics["node_jump_nrmse_pct"]
+                node_jump_abs_max_pred_K = metrics["node_jump_abs_max_pred_K"]
+                node_jump_abs_max_true_K = metrics["node_jump_abs_max_true_K"]
 
-            # OOD identity: sidecar record joined by sim_id, in-distribution
-            # defaults otherwise.
-            rec = ood_sidecar.get(sim_id)
-            if rec is None:
-                ood_axis = _OOD_RECORD_DEFAULT["ood_axis"]
-                ood_value = _OOD_RECORD_DEFAULT["ood_value"]
-                ood_repeat = _OOD_RECORD_DEFAULT["ood_repeat"]
-                latents_hash = _OOD_RECORD_DEFAULT["latents_hash"]
-                distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
-                rec_t_final = ds_t_final
-                rec_norm_horizon = ds_norm_horizon
-            else:
-                ood_axis = rec.get("ood_axis", "")
-                ood_value = rec.get("ood_value")
-                ood_value = "" if ood_value is None else ood_value
-                ood_repeat = rec.get("ood_repeat", "")
-                latents_hash = rec.get("latents_hash", "")
-                distribution_class = rec.get("distribution_class")
-                rec_t_final = float(rec.get("dataset_t_final", ds_t_final))
-                rec_norm_horizon = float(rec.get("time_norm_horizon", ds_norm_horizon))
+                t_s_val = float(dataset.t_grid[s])
+                t_j_val = float(dataset.t_grid[j])
+                A, freq = _amp_freq_from_params(params)
 
-            # Protocol tag (set by apply_protocol_pairs); empty without protocols.
-            tag = pair_tags[idx] if pair_tags is not None else None
-            if tag is None:
-                protocol = ""
-                src_time_req = ""
-                src_time_act = ""
-                lead_time_act = ""
-                tgt_time_req = ""
-                tgt_time_act = ""
-            else:
-                protocol = tag["protocol"]
-                src_time_req = float(tag["source_time_requested"])
-                src_time_act = float(tag["source_time_actual"])
-                lead_time_act = float(tag["lead_time_actual"])
-                tgt_time_req = float(tag["target_time_requested"])
-                tgt_time_act = float(tag["target_time_actual"])
-                # Evaluation-time axis: the sidecar leaves ood_value null per sim;
-                # the realized target time is the OOD value, classified vs horizon.
-                if ood_value == "" and rec is not None:
-                    ood_value = tgt_time_act
+                # OOD identity: sidecar record joined by sim_id, in-distribution
+                # defaults otherwise.
+                rec = ood_sidecar.get(sim_id)
+                if rec is None:
+                    ood_axis = _OOD_RECORD_DEFAULT["ood_axis"]
+                    ood_value = _OOD_RECORD_DEFAULT["ood_value"]
+                    ood_repeat = _OOD_RECORD_DEFAULT["ood_repeat"]
+                    latents_hash = _OOD_RECORD_DEFAULT["latents_hash"]
+                    distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
+                    rec_t_final = ds_t_final
+                    rec_norm_horizon = ds_norm_horizon
+                else:
+                    ood_axis = rec.get("ood_axis", "")
+                    ood_value = rec.get("ood_value")
+                    ood_value = "" if ood_value is None else ood_value
+                    ood_repeat = rec.get("ood_repeat", "")
+                    latents_hash = rec.get("latents_hash", "")
+                    distribution_class = rec.get("distribution_class")
+                    rec_t_final = float(rec.get("dataset_t_final", ds_t_final))
+                    rec_norm_horizon = float(rec.get("time_norm_horizon", ds_norm_horizon))
+
+                # Protocol tag (set by apply_protocol_pairs); empty without protocols.
+                tag = pair_tags[idx] if pair_tags is not None else None
+                if tag is None:
+                    protocol = ""
+                    src_time_req = ""
+                    src_time_act = ""
+                    lead_time_act = ""
+                    tgt_time_req = ""
+                    tgt_time_act = ""
+                else:
+                    protocol = tag["protocol"]
+                    src_time_req = float(tag["source_time_requested"])
+                    src_time_act = float(tag["source_time_actual"])
+                    lead_time_act = float(tag["lead_time_actual"])
+                    tgt_time_req = float(tag["target_time_requested"])
+                    tgt_time_act = float(tag["target_time_actual"])
+                    # Evaluation-time axis: the sidecar leaves ood_value null per sim;
+                    # the realized target time is the OOD value, classified vs horizon.
+                    if ood_value == "" and rec is not None:
+                        ood_value = tgt_time_act
+                    if distribution_class is None:
+                        distribution_class = _classify_time_target(
+                            tgt_time_act, rec_norm_horizon
+                        )
                 if distribution_class is None:
-                    distribution_class = _classify_time_target(
-                        tgt_time_act, rec_norm_horizon
-                    )
-            if distribution_class is None:
-                distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
+                    distribution_class = _OOD_RECORD_DEFAULT["distribution_class"]
 
-            rows.append({
-                "provenance_id": provenance_id,
-                "sim_id": sim_id,
-                "s": s,
-                "j": j,
-                "t_s": t_s_val,
-                "t_bar": t_j_val - t_s_val,
-                "R_c": float(params.get("R_c", "")) if "R_c" in params else "",
-                "benchmark": benchmark,
-                "temporal_family": params.get("temporal_family", ""),
-                "spatial_family": params.get("spatial_family", ""),
-                "x_h": float(params["x_h"]) if "x_h" in params else "",
-                "y_h": float(params["y_h"]) if "y_h" in params else "",
-                "A": "" if A is None else A,
-                "freq": "" if freq is None else freq,
-                "regime": params.get("regime", ""),
-                "R_c_amp": float(params["R_c_amp"]) if "R_c_amp" in params else "",
-                "R_c_y0": float(params["R_c_y0"]) if "R_c_y0" in params else "",
-                "R_c_sigma": float(params["R_c_sigma"]) if "R_c_sigma" in params else "",
-                "R_c_A": float(params["R_c_A"]) if "R_c_A" in params else "",
-                "x_I": interface_x,
-                "rel_l2_pct": rel_l2,
-                "iface_rel_l2_pct": iface_rel_l2,
-                "nrmse_pct": nrmse_pct,
-                "rmse_K": rmse_K,
-                "gnrmse_pct": gnrmse_pct,
-                "node_jump_rmse_K": node_jump_rmse_K,
-                "node_jump_nrmse_pct": node_jump_nrmse_pct,
-                "node_jump_gnrmse_pct": node_jump_gnrmse_pct,
-                "node_jump_abs_max_pred_K": node_jump_abs_max_pred_K,
-                "node_jump_abs_max_true_K": node_jump_abs_max_true_K,
-                "ood_axis": ood_axis,
-                "ood_value": ood_value,
-                "ood_repeat": ood_repeat,
-                "latents_hash": latents_hash,
-                "distribution_class": distribution_class,
-                "protocol": protocol,
-                "source_time_requested": src_time_req,
-                "source_time_actual": src_time_act,
-                "lead_time_actual": lead_time_act,
-                "target_time_requested": tgt_time_req,
-                "target_time_actual": tgt_time_act,
-                "dataset_t_final": rec_t_final,
-                "time_norm_horizon": rec_norm_horizon,
-                "sse_K2": metrics["sse_K2"],
-                "num_error_cells": metrics["num_error_cells"],
-                "interface_sse_K2": metrics["interface_sse_K2"],
-                "num_interface_cells": metrics["num_interface_cells"],
-                "target_sse_K2": metrics["target_sse_K2"],
-                "interface_target_sse_K2": metrics["interface_target_sse_K2"],
-            })
+                rows.append({
+                    "provenance_id": provenance_id,
+                    "sim_id": sim_id,
+                    "s": s,
+                    "j": j,
+                    "t_s": t_s_val,
+                    "t_bar": t_j_val - t_s_val,
+                    "R_c": float(params.get("R_c", "")) if "R_c" in params else "",
+                    "benchmark": benchmark,
+                    "temporal_family": params.get("temporal_family", ""),
+                    "spatial_family": params.get("spatial_family", ""),
+                    "x_h": float(params["x_h"]) if "x_h" in params else "",
+                    "y_h": float(params["y_h"]) if "y_h" in params else "",
+                    "A": "" if A is None else A,
+                    "freq": "" if freq is None else freq,
+                    "regime": params.get("regime", ""),
+                    "R_c_amp": float(params["R_c_amp"]) if "R_c_amp" in params else "",
+                    "R_c_y0": float(params["R_c_y0"]) if "R_c_y0" in params else "",
+                    "R_c_sigma": float(params["R_c_sigma"]) if "R_c_sigma" in params else "",
+                    "R_c_A": float(params["R_c_A"]) if "R_c_A" in params else "",
+                    "x_I": interface_x,
+                    "rel_l2_pct": rel_l2,
+                    "iface_rel_l2_pct": iface_rel_l2,
+                    "nrmse_pct": nrmse_pct,
+                    "rmse_K": rmse_K,
+                    "gnrmse_pct": gnrmse_pct,
+                    "node_jump_rmse_K": node_jump_rmse_K,
+                    "node_jump_nrmse_pct": node_jump_nrmse_pct,
+                    "node_jump_gnrmse_pct": node_jump_gnrmse_pct,
+                    "node_jump_abs_max_pred_K": node_jump_abs_max_pred_K,
+                    "node_jump_abs_max_true_K": node_jump_abs_max_true_K,
+                    "ood_axis": ood_axis,
+                    "ood_value": ood_value,
+                    "ood_repeat": ood_repeat,
+                    "latents_hash": latents_hash,
+                    "distribution_class": distribution_class,
+                    "protocol": protocol,
+                    "source_time_requested": src_time_req,
+                    "source_time_actual": src_time_act,
+                    "lead_time_actual": lead_time_act,
+                    "target_time_requested": tgt_time_req,
+                    "target_time_actual": tgt_time_act,
+                    "dataset_t_final": rec_t_final,
+                    "time_norm_horizon": rec_norm_horizon,
+                    "sse_K2": metrics["sse_K2"],
+                    "num_error_cells": metrics["num_error_cells"],
+                    "interface_sse_K2": metrics["interface_sse_K2"],
+                    "num_interface_cells": metrics["num_interface_cells"],
+                    "target_sse_K2": metrics["target_sse_K2"],
+                    "interface_target_sse_K2": metrics["interface_target_sse_K2"],
+                })
+
+            batch = {key: torch.stack([item[key] for item in items]) for key in items[0]}
+            yield batch, predictions
+
+    with torch.no_grad():
+        fno.eval()
+        if report_kwargs is None:
+            for _ in record_batches():
+                pass
+            report_metrics = None
+        else:
+            report_metrics = evaluate(
+                model=fno, test_loader=test_loader, device=device,
+                rollout_options=rollout_options, prediction_batches=record_batches(),
+                **report_kwargs,
+            )
 
     rows.sort(key=lambda r: (r["sim_id"], r["s"], r["j"]))
 
@@ -1512,4 +1557,4 @@ def write_test_records(
         writer.writerows(rows)
     print(f"Saved {len(rows)} test records ({benchmark}) -> {out_path}")
     print(f"Saved test-record provenance -> {provenance_path}")
-    return out_path
+    return out_path, report_metrics
