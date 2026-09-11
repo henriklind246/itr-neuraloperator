@@ -3,7 +3,7 @@
 # draw-family-disjoint dataset.
 set -u
 cd "$(dirname "$0")/.."
-for B in forcing source source_itr interfaces; do
+for B in forcing source source_itr_sin interfaces; do
   SEED=$(basename "$(ls -d runs/pub_$B/config0/seed*)" | sed 's/seed//')
   echo "=== $B (seed $SEED) ==="
   .venv/bin/python -u scripts/write_test_records.py "runs/pub_$B/config0" \

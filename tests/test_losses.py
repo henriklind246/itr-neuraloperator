@@ -434,7 +434,7 @@ class TestPerSampleNodeJumpErrors:
         torch.testing.assert_close(t0, t1)
 
 
-# ===================== contact-jump RMSE (source_itr) =====================
+# ===================== contact-jump RMSE (source_itr_sin) =====================
 
 class TestPerSampleContactJumpRMSE:
     def test_matches_weighted_reference(self):

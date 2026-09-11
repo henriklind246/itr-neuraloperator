@@ -130,7 +130,7 @@ def plot_bc_verification(
 # benchmark's ProblemSpec.configure_solver so geometry, conductivities, forcing,
 # and the (scalar or (Ny,)) interface_R are always correct per benchmark.
 
-# Cap mirrors src/physics/internal_source.py:R_PEAK_MAX so source_itr void peaks
+# Cap mirrors src/physics/internal_source.py:R_PEAK_MAX so source_itr_sin sinusoidal profile peaks
 # stay inside the sampled R_c(y) range.
 _ITR_R_PEAK_MAX = 3.0
 
@@ -142,8 +142,8 @@ _ITR_SIN_TEMPORAL_PARAMS = {
 }
 
 _ITR_SWEEP_FIELDS = (
-    "benchmark", "itr_kind", "itr_value", "R_c", "R_c_base", "R_c_amp",
-    "R_c_peak", "R_c_y0", "R_c_sigma", "interface_x", "time_requested",
+    "benchmark", "itr_kind", "itr_value", "R_c", "R_c_base", "R_c_A",
+    "R_c_peak", "interface_x", "time_requested",
     "time_actual", "time_index", "mean_abs_jump_K", "rms_jump_K",
     "peak_abs_jump_K",
 )
@@ -156,7 +156,7 @@ def _itr_canonical_params(benchmark: str, itr_value: float,
     ``solver_params`` keys match the benchmark's ``configure_solver``; a wrong or
     missing key raises immediately when round-tripped, so these dicts cannot
     silently drift. ``record_meta`` carries the ITR bookkeeping columns for the
-    CSV/records (kind, swept value, and void params for source_itr).
+    CSV/records (kind, swept value, and sinusoidal profile params for source_itr_sin).
     """
     T_right = 300.0
     if benchmark == "forcing":
@@ -171,7 +171,7 @@ def _itr_canonical_params(benchmark: str, itr_value: float,
         meta = {"itr_kind": "scalar_Rc", "itr_value": float(itr_value), "R_c": float(itr_value)}
         return params, meta
 
-    if benchmark in ("source", "source_itr", "source_itr_sin"):
+    if benchmark in ("source", "source_itr_sin"):
         t_off = 0.75 * float(base_kwargs["t_final"])
         params = {
             "interface_x": 0.5,
@@ -198,21 +198,6 @@ def _itr_canonical_params(benchmark: str, itr_value: float,
                 "R_c_base": R_c_base, "R_c_A": R_c_A, "R_c_peak": R_c_peak,
             }
             return params, meta
-        # source_itr: itr_value is the void peak R_c,peak (capped); amp is the
-        # excess over the base, mirroring the benchmark's universal-column rule
-        # of storing R_c == R_c_base.
-        R_c_amp = R_c_peak - R_c_base
-        params.update({
-            "R_c_base": R_c_base, "R_c_amp": R_c_amp,
-            "R_c_y0": 0.5, "R_c_sigma": 0.12, "R_c": R_c_base,
-        })
-        meta = {
-            "itr_kind": "Rc_peak", "itr_value": R_c_peak, "R_c": R_c_base,
-            "R_c_base": R_c_base, "R_c_amp": R_c_amp, "R_c_peak": R_c_peak,
-            "R_c_y0": 0.5, "R_c_sigma": 0.12,
-        }
-        return params, meta
-
     if benchmark == "interfaces":
         from src.physics.init_conditions import build_ic
         # Asymmetric two-bump IC (positive bump left of the interface, negative
@@ -262,7 +247,7 @@ def _write_itr_sweep_csv(records: list[dict], out_path: Path) -> Path:
 
 
 def plot_itr_temperature_jump_sweep(
-    benchmarks: tuple[str, ...] = ("forcing", "source", "source_itr", "interfaces"),
+    benchmarks: tuple[str, ...] = ("forcing", "source", "source_itr_sin", "interfaces"),
     Nx: int = 40,
     Ny: int = 40,
     dt: float = 0.005,
@@ -275,8 +260,8 @@ def plot_itr_temperature_jump_sweep(
     """Solver-truth sweep of contact temperature-jump magnitude vs ITR.
 
     For each benchmark, the thermal driver is held fixed while interface thermal
-    resistance is swept (scalar ``R_c`` for forcing/source/interfaces; void peak
-    ``R_c,peak`` for source_itr). Every solve is wired through the production
+    resistance is swept (scalar ``R_c`` for forcing/source/interfaces; sinusoidal profile peak
+    ``R_c,peak`` for source_itr_sin). Every solve is wired through the production
     ``ProblemSpec.configure_solver`` so per-benchmark physics is never re-derived
     here. Returns ``{"png", "csv", "records"}``; ``records`` is one dict per
     (benchmark, itr_value, requested_time).
@@ -284,7 +269,7 @@ def plot_itr_temperature_jump_sweep(
     # Reusing the underscore-prefixed contact-jump helpers across visual modules
     # is acceptable for now; if a third caller appears these should move to a
     # shared visual/jump_utils.py. Lazy-imported here to keep physics_plots light
-    # and avoid an import cycle with dataset_plots.
+    # and asinusoidal profile an import cycle with dataset_plots.
     from visual.dataset_plots import (
         _interface_contact_jump_map,
         _contact_jump_reductions,
@@ -323,7 +308,7 @@ def plot_itr_temperature_jump_sweep(
         spec = get_problem(benchmark)
         sweep_values = (
             rc_peak_values
-            if benchmark in ("source_itr", "source_itr_sin")
+            if benchmark in ("source_itr_sin")
             else scalar_rc_values
         )
         panel_data[benchmark] = {t_req: {"x": [], "y": []} for t_req in requested_times}
@@ -362,10 +347,8 @@ def plot_itr_temperature_jump_sweep(
                     "itr_value": meta["itr_value"],
                     "R_c": meta.get("R_c"),
                     "R_c_base": meta.get("R_c_base"),
-                    "R_c_amp": meta.get("R_c_amp"),
+                    "R_c_A": meta.get("R_c_A"),
                     "R_c_peak": meta.get("R_c_peak"),
-                    "R_c_y0": meta.get("R_c_y0"),
-                    "R_c_sigma": meta.get("R_c_sigma"),
                     "interface_x": interface_x,
                     "time_requested": t_req,
                     "time_actual": time_actual,
@@ -401,7 +384,7 @@ def plot_itr_temperature_jump_sweep(
             ax.set_title(benchmark)
             ax.set_xlabel(
                 r"$R_{c,\mathrm{peak}}$"
-                if benchmark in ("source_itr", "source_itr_sin")
+                if benchmark in ("source_itr_sin")
                 else r"$R_c$"
             )
             ax.set_ylabel(r"mean $|\Delta T_{\mathrm{contact}}|$ [K]")

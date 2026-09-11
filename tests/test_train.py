@@ -498,9 +498,7 @@ class TestValidate:
             "temporal_family",
             "x_h",
             "y_h",
-            "R_c_amp",
-            "R_c_y0",
-            "R_c_sigma",
+            "R_c_A",
             "R_c_A",
             "S_R",
         }
@@ -517,9 +515,7 @@ class TestValidate:
                 "regime",
                 "x_h",
                 "y_h",
-                "R_c_amp",
-                "R_c_y0",
-                "R_c_sigma",
+                "R_c_A",
                 "R_c_A",
             ):
                 assert row[empty_col] == ""

@@ -251,7 +251,7 @@ def _build_source_rollout_item(
     return out
 
 
-def _build_source_itr_rollout_item(
+def _build_source_itr_sin_rollout_item(
     out: dict[str, np.ndarray],
     ds,
     problem,
@@ -330,8 +330,8 @@ def build_rollout_item_from_base(
         return _build_interfaces_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     if problem.name == "source":
         return _build_source_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
-    if problem.name in ("source_itr", "source_itr_sin"):
-        return _build_source_itr_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
+    if problem.name in ("source_itr_sin"):
+        return _build_source_itr_sin_rollout_item(out, dataset, problem, sid, current, t_lo, t_hi)
     raise ValueError(f"Unsupported benchmark for rollout: {problem.name!r}")
 
 

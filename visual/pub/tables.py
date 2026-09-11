@@ -11,12 +11,12 @@ import pandas as pd
 from visual.pub import records
 from visual.pub.manifest import FigureSource, ProvenanceError, sha256_file
 
-BENCH_ORDER = ("forcing", "interfaces", "source", "source_itr")
+BENCH_ORDER = ("forcing", "interfaces", "source", "source_itr_sin")
 BENCH_LABEL = {
     "forcing": "Forcing",
     "interfaces": "Interfaces",
     "source": "Source",
-    "source_itr": "Source + ITR",
+    "source_itr_sin": "Source + ITR",
 }
 N_BOOT = 10_000
 BOOTSTRAP_RNG_SEED = 20260728
@@ -754,7 +754,7 @@ def write_descriptive_results(
         "strict_table_unchanged": True,
         "strict_cohort_blockers": [
             "one checkpoint per benchmark; at least three predeclared seeds are required",
-            "source_itr uses bins; the strict cohort requires temporal_encoder",
+            "source_itr_sin uses bins; the strict cohort requires temporal_encoder",
         ],
         "mixed_representation": len(representations) > 1,
         "cohort": cohort,

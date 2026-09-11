@@ -40,7 +40,7 @@ from src.physics.internal_source import RC_MIN
 # boundary-adjacent face slots, and the horizon must match the standard 0.30 so
 # the pulse-train sampler has room (it draws spacings against t_final).
 _TINY = dict(nx=24, ny=24, t_final=0.30, dt=0.05, save_stride=1)
-_BENCHMARKS = ("forcing", "source", "source_itr", "interfaces")
+_BENCHMARKS = ("forcing", "source", "source_itr_sin", "interfaces")
 
 
 def _tiny_setup(num_sims):
@@ -174,7 +174,7 @@ def _latents_hash_by_repeat(save_path):
     "benchmark,axis,values",
     [
         ("interfaces", "family_transfer", [("sin", "uniform"), ("exp", "patch")]),
-        ("source_itr", "rc_severity", [0.1, 1.5]),
+        ("source_itr_sin", "rc_severity", [0.1, 0.9]),
     ],
 )
 def test_crn_pairing_compound_axis(tmp_path, benchmark, axis, values):
@@ -427,12 +427,12 @@ def test_pooled_rmse_differs_from_mean_pair_rmse():
 
 
 # ---------------------------------------------------------------------------
-# (h) Zero / sub-floor resistance. The log-normalized source_itr rc_base axis
+# (h) Zero / sub-floor resistance. The log-normalized source_itr_sin rc_base axis
 #     rejects values below RC_MIN; the linearly-normalized scalar-R_c axes
 #     accept R_c=0 as a labeled limiting case.
 # ---------------------------------------------------------------------------
-def test_source_itr_rc_base_rejects_subfloor():
-    spec = get_problem("source_itr", "temporal_encoder")
+def test_source_itr_sin_rc_base_rejects_subfloor():
+    spec = get_problem("source_itr_sin", "temporal_encoder")
     setup = _tiny_setup(num_sims=2)
     axis = spec.ood_axes()["rc_base"]
     latents = spec.draw_latents(

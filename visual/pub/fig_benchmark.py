@@ -29,25 +29,25 @@ from visual.pub._blocked import blocked
 DIFFICULTY_STRATA = {
     "forcing": ("lead_bin", "temporal_family", "spatial_family"),
     "source": ("lead_bin", "regime", "patch_x_bin", "amplitude_bin", "R_c_bin"),
-    "source_itr": ("lead_bin", "void_severity", "R_c_bin"),
+    "source_itr_sin": ("lead_bin", "itr_amplitude", "R_c_bin"),
     "interfaces": ("lead_bin", "interface_x_bin", "R_c_bin"),
 }
 
 # Source uses its fifth panel for global physical error across contact resistance
 # instead of repeating the normalized per-simulation error distribution.
-DIFFICULTY_ECDF_BENCHMARKS = frozenset({"forcing", "source_itr", "interfaces"})
+DIFFICULTY_ECDF_BENCHMARKS = frozenset({"forcing", "source_itr_sin", "interfaces"})
 
 _DIFFICULTY_KEYS = {
     "forcing": "F08_forcing_difficulty",
     "source": "F10_source_difficulty",
-    "source_itr": "F12_source_itr_void",
+    "source_itr_sin": "F12_source_itr_sin_resistance",
     "interfaces": "F14_interfaces_difficulty",
 }
 
 _CASE_KEYS = {
     "forcing": "F09_forcing_cases",
     "source": "F11_source_cases",
-    "source_itr": "F13_source_itr_cases",
+    "source_itr_sin": "F13_source_itr_sin_cases",
     "interfaces": "F15_interfaces_profiles",
 }
 
@@ -62,7 +62,7 @@ DIFFICULTY_METRIC = "rmse_K"
 INTERACTIONS = {
     "forcing": ("temporal_family", "spatial_family"),
     "source": ("regime", "lead_bin"),
-    "source_itr": ("void_severity", "lead_bin"),
+    "source_itr_sin": ("itr_amplitude", "lead_bin"),
     "interfaces": ("interface_x_bin", "R_c_bin"),
 }
 
@@ -74,7 +74,7 @@ INTERACTIONS = {
 CASE_CONTRAST = {
     "forcing": ("temporal_family", ("sin", "exp", "pulse_train", "exp_train")),
     "source": ("regime", ("left", "near", "right")),
-    "source_itr": ("void_severity", None),
+    "source_itr_sin": ("itr_amplitude", None),
     "interfaces": ("interface_x_bin", None),
 }
 
@@ -204,15 +204,15 @@ def _interaction_panel(ax, frame, benchmark: str):
     return pair
 
 
-def _void_panel(ax, source, frame):
-    """``R_c(y)`` and the face conductance it produces, for source_itr.
+def _itr_panel(ax, source, frame):
+    """``R_c(y)`` and the face conductance it produces, for source_itr_sin.
 
-    This is what makes F12 a combined void-and-difficulty figure rather than a
-    fourth copy of the stratum grid: the void is the benchmark.
+    This is what makes F12 a combined resistance profile-and-difficulty figure rather than a
+    fourth copy of the stratum grid: the resistance profile is the benchmark.
     """
-    bundle = fields.bundle(source, "source_itr")
+    bundle = fields.bundle(source, "source_itr_sin")
     y = np.asarray(bundle.y_grid, dtype=float)
-    amp = np.asarray(frame.df["R_c_amp"], dtype=float)
+    amp = np.asarray(frame.df["R_c_A"], dtype=float)
     sim_ids = np.asarray(frame.df["sim_id"], dtype=np.int64)
     order = np.argsort(amp, kind="mergesort")
     picks = dict.fromkeys(int(sim_ids[order[k]])
@@ -302,10 +302,10 @@ def difficulty(*, benchmark: str, source=None, spec=None, requirement=None):
 
     strata = _available_strata(frame, benchmark)
     wants_ecdf = benchmark in DIFFICULTY_ECDF_BENCHMARKS
-    wants_void = benchmark == "source_itr" and bool(fields.run_dirs(source, benchmark))
+    wants_itr = benchmark == "source_itr_sin" and bool(fields.run_dirs(source, benchmark))
     n_panels = len(strata) + (1 if wants_ecdf else 0) \
         + (1 if INTERACTIONS.get(benchmark) else 0) \
-        + (1 if wants_void else 0)
+        + (1 if wants_itr else 0)
     ncol = min(n_panels, 3)
     nrow = int(np.ceil(n_panels / ncol))
 
@@ -352,8 +352,8 @@ def difficulty(*, benchmark: str, source=None, spec=None, requirement=None):
             kelvin_axes.append(ax)
             used += 1
 
-    if wants_void:
-        _void_panel(flat[used], source, frame)
+    if wants_itr:
+        _itr_panel(flat[used], source, frame)
         used += 1
 
     for ax in flat[used:]:
@@ -413,8 +413,8 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
       - ``source``: ``regime`` left / near-interface / right, with the patch
         outline drawn on every panel so the reader can see where the heat went
         in.
-      - ``source_itr``: field plus contact jump, with the localized jump error
-        around the void made visible as a zoom or difference strip -- the void
+      - ``source_itr_sin``: field plus contact jump, with the localized jump error
+        around the resistance profile made visible as a zoom or difference strip -- the resistance profile
         is the point of the benchmark and it is small.
       - ``interfaces``: temperature and contact-jump **profiles** rather than a
         field grid, since the interesting variation is along ``y`` at the
@@ -548,9 +548,6 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                             fontsize=7)
             ax_j.legend(fontsize=5.5, loc="best", handletextpad=0.3,
                         borderpad=0.2, labelspacing=0.2)
-        void = fields.void_profile(case.params)
-        if void is not None:
-            style.add_void_shading(ax_j, void[0], void[1], label=None)
 
         axes[0][col].text(
             0.02, 0.02,

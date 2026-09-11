@@ -28,7 +28,7 @@ def learning_curves(*, source=None, spec=None, requirement=None):
     """
     blocked(requirement,
             "needs multi-seed train_metrics.csv for forcing, source, "
-            "source_itr and interfaces; no canonical training run survives in "
+            "source_itr_sin and interfaces; no canonical training run survives in "
             "this workspace.",
             key="F03_learning_curves")
 

@@ -25,7 +25,7 @@ _T_OFF = 0.2
 
 _TEMPORAL_ORDER = ("sin", "exp", "pulse_train", "exp_train")
 _SPATIAL_ORDER = ("uniform", "patch", "gaussian", "triangle")
-_BENCHMARK_ORDER = ("forcing", "source", "source_itr", "interfaces")
+_BENCHMARK_ORDER = ("forcing", "source", "source_itr_sin", "interfaces")
 
 _K_LEFT = 2.0
 _K_RIGHT = 1.0
@@ -171,27 +171,19 @@ def _draw_source_panel(ax) -> None:
                  fontsize=7, color=style.benchmark_color("source"))
 
 
-def _draw_source_itr_panel(ax) -> None:
-    """What varies in ``source_itr``: the Gaussian void in R_c(y)."""
-    from src.physics.internal_source import RC_VOID_RANGES, make_rc_void_profile
+def _draw_source_itr_sin_panel(ax) -> None:
+    from src.physics.internal_source import make_rc_sin_profile
 
     y = np.linspace(0.0, 1.0, 400)
-    voids = ((0.15, 1.2, 0.35, 0.06), (0.15, 2.4, 0.55, 0.12),
-             (0.50, 1.0, 0.75, 0.18))
+    profiles = ((0.15, 0.5), (0.15, 2.4), (0.50, 1.0))
     cmap = style.plt.get_cmap(style.CMAP_SEQ_ORDINAL)
-    for k, (base, amp, y0, sigma) in enumerate(voids):
-        ax.plot(y, make_rc_void_profile(y, base, amp, y0, sigma), linewidth=1.0,
-                color=cmap(k / max(len(voids) - 1, 1)),
-                label=rf"$\sigma$ = {sigma:.2f}")
+    for k, (base, amp) in enumerate(profiles):
+        ax.plot(y, make_rc_sin_profile(y, base, amp), linewidth=1.0,
+                color=cmap(k / (len(profiles) - 1)), label=f"A = {amp:.2f}")
     ax.set_xlabel(r"$y$")
-    ax.set_ylabel(r"$R_c(y)$  [m$^2$K/W]")
-    ax.set_title("source_itr\n"
-                 r"$R_c(y) = R_b + R_a e^{-((y-y_0)/\sigma)^2}$",
-                 fontsize=7, color=style.benchmark_color("source_itr"))
-    ax.text(0.02, 0.97,
-            f"$\\sigma \\in [{RC_VOID_RANGES['sigma'][0]:.2f}, "
-            f"{RC_VOID_RANGES['sigma'][1]:.2f}]$",
-            transform=ax.transAxes, ha="left", va="top", fontsize=5.5, color="0.35")
+    ax.set_ylabel(r"$R_c(y)$ [m$^2$ K/W]")
+    ax.set_title("Source + ITR\n" r"$R_c(y)=R_b+A\sin(\pi y)$",
+                 fontsize=7, color=style.benchmark_color("source_itr_sin"))
     ax.legend(fontsize=5.0, loc="upper right", handlelength=1.2, borderpad=0.2)
 
 
@@ -239,7 +231,7 @@ def problem_schematic(*, source=None, spec=None, requirement=None):
 
     _draw_forcing_panel(ax_forcing)
     _draw_source_panel(ax_source)
-    _draw_source_itr_panel(ax_itr)
+    _draw_source_itr_sin_panel(ax_itr)
     _draw_interfaces_panel(ax_iface)
 
     style.panel_letters([ax_geo], loc=(-0.02, 1.00))

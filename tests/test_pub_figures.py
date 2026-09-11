@@ -68,7 +68,7 @@ def test_source_difficulty_replaces_rel_l2_ecdf_with_contact_resistance():
         "lead_bin", "regime", "patch_x_bin", "amplitude_bin", "R_c_bin")
     assert "source" not in fig_benchmark.DIFFICULTY_ECDF_BENCHMARKS
     assert fig_benchmark.DIFFICULTY_ECDF_BENCHMARKS == frozenset({
-        "forcing", "source_itr", "interfaces"})
+        "forcing", "source_itr_sin", "interfaces"})
 
 
 def test_contact_jump_cohort_is_reproducible(monkeypatch):
@@ -223,12 +223,10 @@ def write_inverse_result(path: Path, benchmark: str) -> Path:
                 "sim_id": sim_id,
                 "cond_number": 2.0 + sim_id,
                 "least_dir_R_base": 0.2,
-                "least_dir_R_amp": 0.8,
-                "least_dir_y0": 0.3,
-                "least_dir_sigma": 0.45,
+                "least_dir_A": 0.8,
             }
             for offset, stem in enumerate(
-                ("R_base", "R_amp", "y0", "sigma", "excess_int")
+                ("R_base", "A", "excess_int")
             ):
                 truth = 0.1 * (offset + 1) + 0.01 * sim_id
                 row[f"{stem}_true"] = truth
@@ -348,15 +346,15 @@ class TestRenderable:
 
     def test_f18_renders_paired_8_16_32_sweep_in_strict_mode(self, tmp_path):
         forcing = write_inverse_sensor_sweep(tmp_path / "forcing.csv", "forcing")
-        forcing_itr = write_inverse_sensor_sweep(
-            tmp_path / "forcing_itr.csv", "forcing_itr"
+        forcing_itr_sin = write_inverse_sensor_sweep(
+            tmp_path / "forcing_itr_sin.csv", "forcing_itr_sin"
         )
         manifest_path = tmp_path / "manifest.yaml"
         manifest_path.write_text(yaml.safe_dump({
             "sources": {
                 "inverse_sensor_sweep": [
                     {"table": str(forcing), "seed": "0"},
-                    {"table": str(forcing_itr), "seed": "0"},
+                    {"table": str(forcing_itr_sin), "seed": "0"},
                 ]
             }
         }))
@@ -373,14 +371,14 @@ class TestRenderable:
         assert definition["pairing_fields"] == [
             "benchmark", "sim_id", "noise_seed", "init_seed"
         ]
-        assert definition["n_cases"] == {"forcing": 8, "forcing_itr": 8}
+        assert definition["n_cases"] == {"forcing": 8, "forcing_itr_sin": 8}
         assert definition["inferential_interval"].startswith("none")
 
     @pytest.mark.parametrize(
         ("key", "requirement", "benchmark"),
         [
             ("F16_inverse_forcing_recovery", "inverse_forcing", "forcing"),
-            ("F17_inverse_forcing_itr", "inverse_forcing_itr", "forcing_itr"),
+            ("F17_inverse_forcing_itr_sin", "inverse_forcing_itr_sin", "forcing_itr_sin"),
             ("F22_surrogate_fidelity", "inverse_forcing", "forcing"),
         ],
     )
@@ -402,7 +400,7 @@ class TestRenderable:
         assert result.paths[0].stat().st_size > 5000
         definition = json.loads(result.sidecar.read_text())["metric_definition"]
         assert definition["n_cases"] == 10
-        if key == "F17_inverse_forcing_itr":
+        if key == "F17_inverse_forcing_itr_sin":
             assert "least-determined direction" in definition["identifiability"]
 
 

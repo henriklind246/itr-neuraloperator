@@ -19,7 +19,7 @@ from visual.pub._blocked import blocked
 from visual.pub.manifest import ProvenanceError
 
 _RECORDS_NEEDED = (
-    "needs schema-v2 test_records.csv for forcing, source, source_itr and "
+    "needs schema-v2 test_records.csv for forcing, source, source_itr_sin and "
     "interfaces; no records artifact resolved from the manifest."
 )
 
@@ -28,7 +28,7 @@ _CHECKPOINT_NEEDED = (
     "figure evaluates the model, it does not read a precomputed field."
 )
 
-BENCH_ORDER = ("forcing", "source", "source_itr", "interfaces")
+BENCH_ORDER = ("forcing", "source", "source_itr_sin", "interfaces")
 
 # The relative-L2 target the project states for itself. It is the only
 # threshold in the repo that was declared in advance rather than read off the
@@ -531,8 +531,8 @@ def physical_contact_jump_vs_lead(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
-_FIELD_MARKERS = {"forcing": "o", "source": "s", "source_itr": "^", "interfaces": "D"}
-_FIELD_LINES = {"forcing": "-", "source": "--", "source_itr": "-.", "interfaces": ":"}
+_FIELD_MARKERS = {"forcing": "o", "source": "s", "source_itr_sin": "^", "interfaces": "D"}
+_FIELD_LINES = {"forcing": "-", "source": "--", "source_itr_sin": "-.", "interfaces": ":"}
 
 
 def _global_field_error_figure(*, axis, source, spec, requirement):
@@ -653,7 +653,7 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
         "unequal_seed_counts": summary["unequal_seed_counts"],
         "seed_averaging": "mean of simulation errors; not an ensemble-averaged prediction",
         "pair_counts": "eligible_pairs_by_seed counts evaluated pairs before pooling; eligible_pair_rows_total sums across seeds; unique_simulation_pairs counts (sim_id,s,j) once across seeds",
-        "resistance_definition": "R_c for scalar interfaces; (d-c)^-1 integral_c^d [R_c + R_c_amp exp(-((y-R_c_y0)/R_c_sigma)^2)] dy for source_itr",
+        "resistance_definition": "R_c for scalar interfaces; (d-c)^-1 integral_c^d [R_c + R_c_A sin(pi y)] dy for source_itr_sin",
         "resistance_definitions_by_seed": summary["resistance_definitions"],
         "resistance_bin_edges": summary["resistance_bin_edges"],
         "bin_closure": "left closed, right open; final upper endpoint included; constant values occupy one bin",

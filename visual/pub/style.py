@@ -106,8 +106,8 @@ BENCHMARK_COLORS: dict[str, str] = {
     "forcing": "#0072B2",
     "source": "#E69F00",
     "interfaces": "#009E73",
-    "source_itr": "#CC79A7",
-    "forcing_itr": "#D55E00",
+    "source_itr_sin": "#CC79A7",
+    "forcing_itr_sin": "#D55E00",
     "source_itr_sin": "#9467BD",
     "forcing_itr_sin": "#8C564B",
 }
@@ -276,31 +276,6 @@ def add_reference_line(ax, value: float = 1.0, label: str = "1% target",
                     ha="left", va="top", fontsize=6, color="0.3", rotation=90)
 
 
-def add_void_shading(ax, y0: float, sigma: float, *, n_sigma: float = 2.0,
-                     axis: str = "x", label: str | None = "void") -> None:
-    """Shade the +/- n_sigma band of a Gaussian R_c(y) void profile.
-
-    The band is clipped to the range already on the axes. A void centred near a
-    domain edge has a +/-2 sigma extent that runs past it, and axvspan
-    autoscales, so without the clip the panel grows a margin of empty axis on
-    one side and stops lining up with its neighbours.
-    """
-    lo, hi = y0 - n_sigma * sigma, y0 + n_sigma * sigma
-    span, limits = ((ax.axvspan, ax.get_xlim()) if axis == "x"
-                    else (ax.axhspan, ax.get_ylim()))
-    lo, hi = max(lo, min(limits)), min(hi, max(limits))
-    span(lo, hi, color="0.75", alpha=0.28, zorder=0, linewidth=0)
-    if axis == "x":
-        ax.set_xlim(*limits)
-    else:
-        ax.set_ylim(*limits)
-    if label:
-        if axis == "x":
-            ax.text(y0, 0.98, label, transform=ax.get_xaxis_transform(),
-                    ha="center", va="top", fontsize=6, color="0.35")
-        else:
-            ax.text(0.02, y0, label, transform=ax.get_yaxis_transform(),
-                    ha="left", va="center", fontsize=6, color="0.35")
 
 
 def _footer_text(figure_key: str, source, selection) -> str:

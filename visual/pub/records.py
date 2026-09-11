@@ -29,12 +29,11 @@ from src.operators.eval import TEST_RECORD_FIELDS
 from visual.pub.manifest import Degradation
 
 # The 26 columns actually present in the surviving v1 artifact
-# (runs/source_itr_smoke3/config0/seed42/test_records.csv).
+# (runs/source_itr_sin_smoke3/config0/seed42/test_records.csv).
 SCHEMA_V1_COLUMNS: tuple[str, ...] = (
     "sim_id", "s", "j", "t_s", "t_bar", "R_c", "benchmark",
     "temporal_family", "spatial_family",
     "x_h", "y_h", "A", "freq", "regime",
-    "R_c_amp", "R_c_y0", "R_c_sigma",
     "x_I", "rel_l2_pct", "iface_rel_l2_pct",
     "nrmse_pct", "rmse_K", "gnrmse_pct",
     "node_jump_rmse_K", "node_jump_nrmse_pct", "node_jump_gnrmse_pct",
@@ -452,7 +451,7 @@ def records_by_benchmark(source, *, require_version: int = 2
 
 
 INVERSE_SENSOR_COUNTS = (8, 16, 32)
-INVERSE_SENSOR_BENCHMARKS = ("forcing", "forcing_itr")
+INVERSE_SENSOR_BENCHMARKS = ("forcing", "forcing_itr_sin")
 _INVERSE_SENSOR_BASE_COLUMNS = (
     "benchmark", "sim_id", "n_sensors", "noise_seed", "init_seed",
     "noise_std_K", "fv_resid_rms_K", "fv_resid_over_noise",
@@ -463,7 +462,7 @@ _INVERSE_SENSOR_COLUMNS = {
         "R_c_true", "R_c_map", "R_c_abs_error",
         "profile_R_c_ci_low", "profile_R_c_ci_high",
     ),
-    "forcing_itr": (
+    "forcing_itr_sin": (
         "excess_int_true", "excess_int_hat", "excess_int_abserr",
         "profile_excess_ci_low", "profile_excess_ci_high",
     ),

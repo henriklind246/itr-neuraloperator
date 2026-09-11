@@ -14,7 +14,7 @@ from scipy.integrate import quad
 
 from visual.pub import records, registry, stats, style
 from visual.pub.manifest import FigureSource, Manifest, ProvenanceError, audit
-from src.physics.internal_source import make_rc_void_profile
+from src.physics.internal_source import make_rc_sin_profile
 
 
 KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
@@ -36,8 +36,7 @@ def field_records(n_sims=25, seed_counts=None):
                         row.update({"seed": str(seed), "benchmark": benchmark, "sim_id": sim,
                                     "s": s, "j": j, "t_s": grid[s], "t_bar": grid[j] - grid[s],
                                     "R_c": 0.05 + 0.95 * sim / max(n_sims - 1, 1),
-                                    "R_c_amp": 0.8 if benchmark == "source_itr" else np.nan,
-                                    "R_c_y0": 0.2, "R_c_sigma": 0.1,
+                                    "R_c_A": 0.8 if benchmark == "source_itr_sin" else np.nan,
                                     "rmse_K": error, "sse_K2": error ** 2 * cells,
                                     "num_error_cells": cells, "target_sse_K2": 100.0,
                                     "interface_sse_K2": error ** 2,
@@ -144,12 +143,12 @@ def test_grid_resolves_float_duplicates_and_rejects_protocol_mismatch():
         summarize(frames, metadata=metadata)
 
 
-@pytest.mark.parametrize("bounds,center,amp", [((0, 1), .5, 0), ((0, 1), .01, 2), ((-.2, .8), .79, 1)])
-def test_gaussian_mean_matches_finite_domain_quadrature(bounds, center, amp):
-    f = pd.DataFrame({"R_c": [.2], "R_c_amp": [amp], "R_c_y0": [center], "R_c_sigma": [.1]})
-    expected = quad(lambda y: float(make_rc_void_profile(np.array(y), .2, amp, center, .1)), *bounds)[0]
+@pytest.mark.parametrize("bounds,amp", [((0, 1), 0), ((0, 1), 2), ((-.2, .8), 1)])
+def test_sinusoidal_mean_matches_finite_domain_quadrature(bounds, amp):
+    f = pd.DataFrame({"R_c": [.2], "R_c_A": [amp]})
+    expected = quad(lambda y: float(make_rc_sin_profile(np.array(y), .2, amp)), *bounds)[0]
     expected /= bounds[1] - bounds[0]
-    assert stats.interface_mean_resistance(f, "source_itr", bounds)[0] == pytest.approx(expected)
+    assert stats.interface_mean_resistance(f, "source_itr_sin", bounds)[0] == pytest.approx(expected)
 
 
 def test_bins_are_common_seed_invariant_and_preserve_fixed_zero_resistance():
@@ -164,7 +163,7 @@ def test_bins_are_common_seed_invariant_and_preserve_fixed_zero_resistance():
     assert summarize(frames)["resistance_bin_edges"] == result["resistance_bin_edges"]
     for f in frames.values():
         f["R_c"] = 0.0
-        f["R_c_amp"] = 0.0
+        f["R_c_A"] = 0.0
     result = summarize(frames)
     assert result["resistance_bin_edges"] == [0.0, 0.0]
     assert len(result["itr"]) == 4
@@ -257,7 +256,7 @@ def test_render_exports_vectors_dimensions_statistics_and_provenance(tmp_path):
         assert "pointwise" in definition["caption"].lower()
         assert payload["degradations"]
     assert all(row["status"] == "OK" for row in audit(tmp_path / "out"))
-    assert {"F08_forcing_difficulty", "F10_source_difficulty", "F12_source_itr_void", "F14_interfaces_difficulty"} <= set(registry.FIGURES)
+    assert {"F08_forcing_difficulty", "F10_source_difficulty", "F12_source_itr_sin_resistance", "F14_interfaces_difficulty"} <= set(registry.FIGURES)
 
 
 def test_loader_rejects_legacy_rollout_and_reads_grid_metadata(tmp_path):
@@ -406,3 +405,17 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
     for invalid in (['--runs-root', str(tmp_path)], command + ['--all'], command + ['--manifest', 'custom.yaml']):
         with pytest.raises(SystemExit):
             cli.main(invalid)
+
+
+def test_sinusoidal_records_accept_legacy_empty_gaussian_columns(tmp_path):
+    manifest = write_field_manifest(tmp_path, n_sims=3)
+    csv = tmp_path / 'source_itr_sin' / 'seed0' / 'test_records.csv'
+    frame = pd.read_csv(csv)
+    for column in ('R_c_amp', 'R_c_y0', 'R_c_sigma'):
+        frame[column] = np.nan
+    frame.to_csv(csv, index=False)
+    found = Manifest.discover_global_field(tmp_path)
+    source = found.resolve(KEYS[0], strict=False)
+    frames, metadata = records.load_global_field_records(source)
+    result = summarize(frames, metadata=metadata)
+    assert result['resistance_definitions']['source_itr_sin']['0']['kind'] == 'finite-domain sinusoidal mean'

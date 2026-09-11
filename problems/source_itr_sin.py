@@ -6,31 +6,35 @@ from typing import Any
 import numpy as np
 
 from problems.base import OODAxis, ProblemDims
-from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+
+from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM, T_EPS, _forcing_seq_3tok_from_samples, _sample_a
 from problems.source import (
     SourceProblem,
     _classify_regime,
     _lhs_unit,
+    _patch_center_ranges,
     _validate_patch_bounds,
-)
-from problems.source_itr import (
-    RC_Y_CHANNEL,  # noqa: F401  (documented channel index; kept for parity)
-    S_Y_CHANNEL,
-    SPATIAL_CHANNELS_TEMPORAL,
-    SourceItrProblem,
 )
 from src.physics.internal_source import (
     RC_MIN,
     RC_SIN_RANGES,
     R_PEAK_MAX,
     make_rc_sin_profile,
+    integrate_sin2_pulse,
+    make_sin2_pulse,
+    rc_log_norm,
 )
+
+SPATIAL_CHANNELS_TEMPORAL = 5
+S_Y_CHANNEL = 3
+RC_Y_CHANNEL = 4
+DEFAULT_RC_ELL = 0.05
 
 # ----- representation constants (source_itr_sin tensor contract) ---------------
 
 # cond_static: lead time + 2 sinusoid scalars [R_base, A] + 4 patch scalars
-# [x_h, y_h, w_h, h_h]. The four Gaussian-void scalars of `source_itr` collapse
-# to the two sinusoid parameters; A (patch amplitude) still never conditions.
+# [x_h, y_h, w_h, h_h]; patch amplitude never conditions.
 COND_STATIC_DIM = 7
 
 # Spatial-descriptor conditioning ablation slice. cond layout is
@@ -90,20 +94,8 @@ def _sin_severity(A: float) -> float:
     return float(A) * 2.0 / np.pi
 
 
-class SourceItrSinProblem(SourceItrProblem):
-    """Source benchmark with a *sinusoidal* interface resistance R_c(y).
-
-    Subclasses :class:`SourceItrProblem`, reusing its patch/amplitude/IC sampling
-    and inheriting `build_item`, `configure_solver`, and `_rc_channel` unchanged.
-    The interface at x = 0.5 carries a single-hump profile
-        R_c(y) = R_base + A * sin(pi * y)
-    (2 parameters) instead of the 4-parameter Gaussian void. On [0, 1],
-    sin(pi y) >= 0, so with A in [0, R_PEAK_MAX - R_base] the profile stays in
-    [R_base, R_base + A] subset [RC_MIN, R_PEAK_MAX] -- strictly positive, so the
-    inherited rc_log_norm channel works unchanged. Only the two parent hooks
-    `_canonical_profile` and `_cond_vector` are overridden; the Gaussian-void
-    `source_itr` benchmark is untouched.
-    """
+class SourceItrSinProblem(SourceProblem):
+    """Source benchmark with R_c(y) = R_base + A sin(pi y)."""
 
     name = "source_itr_sin"
 
@@ -113,7 +105,6 @@ class SourceItrSinProblem(SourceItrProblem):
         self.representation = representation
         self.rc_channel_mode = "broadcast"
         # rc_ell only matters in localized mode; keep the parent default.
-        from problems.source_itr import DEFAULT_RC_ELL
 
         self.rc_ell = DEFAULT_RC_ELL
 
@@ -140,16 +131,11 @@ class SourceItrSinProblem(SourceItrProblem):
         grids: dict[str, np.ndarray],
         time_cfg: dict[str, Any],
     ) -> list[dict]:
-        # Reuse the parent's (Gaussian-void) patch/A/IC sampling so the patch
-        # distribution stays identical, then overwrite the interface params with
-        # the 2-param sinusoid. The parent writes the void keys R_c_amp/R_c_y0/
-        # R_c_sigma, which this benchmark's validate_schema forbids, so pop them.
         sim_params = super().sample_sim_params(rng, rng_profile, grids, time_cfg)
         num_sims = len(sim_params)
         lhs_seed = int(time_cfg.get("lhs_seed", 0))
 
-        # Fresh 2-col LHS stream for [R_base, u_A]; offset from the parent void
-        # stream (+991) so the two do not alias.
+        # Keep the established independent sinusoid stream for checkpoint/data parity.
         sin_rng = np.random.default_rng(lhs_seed + 993)
         u = _lhs_unit(num_sims, 2, sin_rng)
 
@@ -161,13 +147,10 @@ class SourceItrSinProblem(SourceItrProblem):
         A = u_A * (R_PEAK_MAX - R_base)
 
         for i, params in enumerate(sim_params):
-            params.pop("R_c_amp", None)
-            params.pop("R_c_y0", None)
-            params.pop("R_c_sigma", None)
             R_c_base = float(R_base[i])
             params["R_c_base"] = R_c_base
             params["R_c_A"] = float(A[i])
-            # Universal R_c column mirrors R_base (as in source_itr).
+            # Universal R_c column mirrors R_base (as in source_itr_sin).
             params["R_c"] = R_c_base
 
         return sim_params
@@ -299,9 +282,6 @@ class SourceItrSinProblem(SourceItrProblem):
         time_cfg: dict[str, Any],
         axis: OODAxis,
     ) -> dict[str, Any]:
-        # Reuse the grandparent Source patch / amplitude / IC background. Skip the
-        # SourceItrProblem override (which draws the 4 void background scalars we
-        # do not use) by calling SourceProblem.draw_latents directly.
         latents = SourceProblem.draw_latents(
             self, rng, rng_profile, grids, time_cfg, axis
         )
@@ -379,3 +359,133 @@ class SourceItrSinProblem(SourceItrProblem):
 
     def resolution_scale(self, axis: OODAxis, params: dict) -> float | None:
         return None
+
+
+    def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
+        y_grid = base_kwargs["y_grid"]
+        x_I = float(params["interface_x"])
+        a = float(base_kwargs["a"])
+        b = float(base_kwargs["b"])
+        layers = [
+            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=3.0),
+            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=35.0),
+        ]
+        q_left_fn = lambda t: np.zeros_like(y_grid)
+        # Build the source via the parent's patch builder by delegating the
+        # rest of the wiring; only interface_R changes (scalar -> R_c(y)).
+        from src.physics.internal_source import build_patch_source
+
+        source = build_patch_source(
+            x_h=params["x_h"], y_h=params["y_h"],
+            w=params["w_h"], h=params["h_h"],
+            A=params["A"], t_off=params["t_off"],
+        )
+        Rc_profile = self._canonical_profile(params, y_grid)
+        return FVSolver2D(
+            a=base_kwargs["a"], b=base_kwargs["b"],
+            c=base_kwargs["c"], d=base_kwargs["d"],
+            Nx=base_kwargs["Nx"], Ny=base_kwargs["Ny"],
+            lam_target=base_kwargs["lam_target"],
+            layers=layers,
+            t_final=base_kwargs["t_final"],
+            flux_f=base_kwargs["flux_f"], flux_A=base_kwargs["flux_A"],
+            t_on=base_kwargs["t_on"], t_off=float(params["t_off"]),
+            phase=base_kwargs["phase"],
+            dt=base_kwargs["dt"], tukey_alpha=base_kwargs["tukey_alpha"],
+            interface_R=[Rc_profile],
+            q_left_fn=q_left_fn,
+            source=source,
+        )
+
+
+    def _rc_channel(self, ds, params: dict) -> np.ndarray:
+        """Build the (Nx, Ny) normalized R_c(y) input channel for one sim."""
+        Rc_y = self._canonical_profile(params, ds.y_grid)
+        Rc_y_norm = rc_log_norm(Rc_y)  # (Ny,)
+        if self.rc_channel_mode == "broadcast":
+            channel = np.broadcast_to(Rc_y_norm[None, :], (ds.Nx, ds.Ny))
+        elif self.rc_channel_mode == "localized":
+            x_I = float(params.get("interface_x", 0.5))
+            env = np.exp(-(((ds._X - x_I) / self.rc_ell) ** 2))
+            channel = Rc_y_norm[None, :] * env
+        else:
+            raise ValueError(
+                f"Unknown rc_channel_mode {self.rc_channel_mode!r}; "
+                f"expected 'broadcast' or 'localized'."
+            )
+        return np.ascontiguousarray(channel, dtype=np.float32)
+
+
+    def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
+        sid = int(sid)
+        params = ds.sim_params[sid]
+        interface_x = float(params.get("interface_x", 0.5))
+
+        T_source = ds.trajectories[sid, s, :, :]
+        T_target = ds.trajectories[sid, j, :, :]
+
+        T_source_norm = (T_source - ds.mu_global) / (ds.sigma_global + T_EPS)
+        T_target_norm = (T_target - ds.mu_global) / (ds.sigma_global + T_EPS)
+
+        if ds.noise_std > 0:
+            T_source_norm = T_source_norm + np.random.randn(
+                *T_source_norm.shape
+            ).astype(np.float32) * ds.noise_std
+
+        t_s_val = float(ds.t_grid[s])
+        t_j_val = float(ds.t_grid[j])
+        t_bar_norm = (t_j_val - t_s_val) / ds.time_norm_horizon
+
+        S_h = self._patch_mask(ds, sid)
+        Rc_channel = self._rc_channel(ds, params)
+        spatial_channels = [
+            T_source_norm, ds.X_norm, ds.Y_norm, S_h, Rc_channel,
+        ]
+        if getattr(self, "spatial_input_material_side", False):
+            spatial_channels.append(
+                self._material_side_channel(ds, interface_x)
+            )
+        spatial_base = np.stack(spatial_channels, axis=-1).astype(np.float32)
+
+        x_lo, x_hi = float(ds.x_grid[0]), float(ds.x_grid[-1])
+        y_lo, y_hi = float(ds.y_grid[0]), float(ds.y_grid[-1])
+        x_center_range, y_center_range = _patch_center_ranges(
+            x_lo, x_hi, y_lo, y_hi, float(params["w_h"]), float(params["h_h"]),
+        )
+        cond_static = self._cond_vector(
+            params,
+            t_bar_norm=float(t_bar_norm),
+            x_center_range=x_center_range,
+            y_center_range=y_center_range,
+            x_length_scale=(x_hi - x_lo),
+            y_length_scale=(y_hi - y_lo),
+        )
+        cond_static = self._apply_spatial_conditioning_mask(cond_static)
+
+        Y = T_target_norm[:, :, None].astype(np.float32)
+        T_stats = np.array(
+            [ds.mu_global, ds.sigma_global, interface_x], dtype=np.float32
+        )
+
+        A = float(params["A"])
+        t_off = float(params["t_off"])
+        if sid not in ds._q_callables:
+            ds._q_callables[sid] = make_sin2_pulse(A, t_off)
+        q = ds._q_callables[sid]
+        t_samples, a_m = _sample_a(q, t_s_val, t_j_val, ds.temporal_samples)
+        forcing_seq = _forcing_seq_3tok_from_samples(
+            t_samples,
+            a_m,
+            interval_integral_fn=lambda t_lo, t_hi: integrate_sin2_pulse(
+                A, t_off, t_lo, t_hi
+            ),
+            A_amp_ref=ds.a_amp_ref,
+        )
+
+        return {
+            "spatial": spatial_base,
+            "cond_static": cond_static,
+            "forcing_seq": forcing_seq,
+            "Y": Y,
+            "T_stats": T_stats,
+        }

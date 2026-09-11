@@ -158,14 +158,14 @@ def main():
             sim_params = np.load(args.params, allow_pickle=True)
             solver_dt = load_solver_dt(args.t_grid)
 
-    if requested("source_itr_void_profiles") and y_grid is None:
+    if requested("source_itr_sin_resistance_profiles") and y_grid is None:
         missing = [
             flag
             for flag, value in (("--y-grid", args.y_grid), ("--params", args.params))
             if value is None
         ]
         if missing:
-            _print_skip("source_itr_void_profiles", "need " + ", ".join(missing))
+            _print_skip("source_itr_sin_resistance_profiles", "need " + ", ".join(missing))
         else:
             y_grid = np.load(args.y_grid)
             x_grid = np.load(args.x_grid) if args.x_grid else None
@@ -258,12 +258,12 @@ def main():
             )
 
     source_dir = out_dir / "source"
-    if sim_params is not None and y_grid is not None and requested("source_itr_void_profiles"):
-        dataset_plots.plot_source_itr_void_profiles(
+    if sim_params is not None and y_grid is not None and requested("source_itr_sin_resistance_profiles"):
+        dataset_plots.plot_source_itr_sin_resistance_profiles(
             sim_params,
             y_grid,
             x_grid=x_grid,
-            save_path=source_dir / "source_itr_void_profiles.png",
+            save_path=source_dir / "source_itr_sin_resistance_profiles.png",
         )
     if trajectories is not None:
         if requested("energy_budget"):

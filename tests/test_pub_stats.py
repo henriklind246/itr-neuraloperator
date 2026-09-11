@@ -56,7 +56,7 @@ def make_records(*, n_sims: int, n_pairs: int, seed: str = "42",
 
 def make_inverse_sensor_sweep() -> pd.DataFrame:
     rows = []
-    for benchmark in ("forcing", "forcing_itr"):
+    for benchmark in ("forcing", "forcing_itr_sin"):
         for sim_id in range(8):
             truth = 0.4 + 0.02 * sim_id
             for count in (8, 16, 32):
@@ -203,7 +203,7 @@ class TestInverseSensorSweep:
             forcing.recovery_error.median, [0.045, 0.0225, 0.01125]
         )
         np.testing.assert_array_equal(forcing.bound_limited_cases, [1, 0, 0])
-        assert summaries["forcing_itr"].estimand == "S_R"
+        assert summaries["forcing_itr_sin"].estimand == "S_R"
 
     def test_rejects_truth_changes_or_inconsistent_derived_metrics(self):
         changed_truth = make_inverse_sensor_sweep()

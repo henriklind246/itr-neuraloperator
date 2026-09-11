@@ -77,7 +77,7 @@ class TestPlotRegistry:
             "energy_budget": "source",
             "patch_region_error_map": "source",
             "source_interface_zone_error": "source",
-            "source_itr_void_profiles": "source",
+            "source_itr_sin_resistance_profiles": "source",
             "interface_x_breakdown": "interfaces",
         }
         assert _common.PLOT_REGISTRY == expected
@@ -99,7 +99,7 @@ class TestPlotRegistry:
             "patch_param_scatter", "source_temporal_profile",
             "source_field_snapshots", "patch_overlay_trajectory",
             "regime_error_breakdown", "patch_error_slices",
-            "source_error_vs_params", "source_itr_error_vs_void_params",
+            "source_error_vs_params", "source_itr_sin_error_vs_void_params",
             "interface_y_perturbation", "interface_lhs_scatter",
             "vary_interface_lhs_scatter", "interface_flux_profiles",
             "sin_forcing_profiles", "ic_family_trajectory_breakdown",
@@ -142,9 +142,9 @@ class TestItrTemperatureJumpSweep:
             assert np.isfinite(row["peak_abs_jump_K"])
             assert row["mean_abs_jump_K"] >= 0.0
 
-    def test_source_itr_metadata(self, tmp_path):
+    def test_source_itr_sin_metadata(self, tmp_path):
         result = physics_plots.plot_itr_temperature_jump_sweep(
-            benchmarks=("source_itr",),
+            benchmarks=("source_itr_sin",),
             Nx=20, Ny=20, t_final=0.1,
             rc_peak_values=(0.05, 1.00),
             requested_times=(0.05, 0.10),
@@ -157,18 +157,18 @@ class TestItrTemperatureJumpSweep:
             assert row["itr_kind"] == "Rc_peak"
             assert row["R_c_base"] == 0.05
             assert row["R_c_peak"] == row["itr_value"]
-            assert row["R_c_amp"] == pytest.approx(row["R_c_peak"] - 0.05)
+            assert row["R_c_A"] == pytest.approx(row["R_c_peak"] - 0.05)
 
         # The R_c_peak == 0.05 endpoint is the "no void excess" baseline.
         base_rows = [r for r in records if r["itr_value"] == 0.05]
         assert base_rows
         for row in base_rows:
-            assert row["R_c_amp"] == pytest.approx(0.0)
+            assert row["R_c_A"] == pytest.approx(0.0)
 
     def test_forcing_jump_grows_with_resistance(self, tmp_path):
         # Physical sanity, scoped to the canonical forcing case at the final
         # requested time only: contact-jump magnitude is larger-or-comparable as
-        # R_c grows. source/source_itr/interfaces trends are intentionally not
+        # R_c grows. source/source_itr_sin/interfaces trends are intentionally not
         # asserted (patch placement and local R_c(y) can break monotonicity).
         rc_values = (0.05, 1.00)
         final_time = 0.10
@@ -460,14 +460,14 @@ class TestPhysicsPlots:
         assert out_path.exists()
 
 
-def _source_itr_params_from_source(synthetic_source_sim_params):
+def _source_itr_sin_params_from_source(synthetic_source_sim_params):
     params = []
     for i, p in enumerate(synthetic_source_sim_params):
         q = dict(p)
         R_base = 0.08 + 0.035 * (i % 12)
         R_amp = 0.0 if i % 6 == 0 else 0.25 + 0.08 * (i % 5)
         q["R_c_base"] = float(R_base)
-        q["R_c_amp"] = float(R_amp)
+        q["R_c_A"] = float(R_amp)
         q["R_c_y0"] = float(0.15 + 0.7 * ((i * 3) % 19) / 18.0)
         q["R_c_sigma"] = float(0.05 + 0.15 * ((i * 5) % 19) / 18.0)
         q["R_c"] = float(R_base)
@@ -498,33 +498,33 @@ def _interfaces_params_from_forcing(synthetic_sim_params):
 
 
 class TestSourcePlots:
-    def test_source_itr_void_severity_handles_flat_profile(self, synthetic_source_sim_params):
+    def test_source_itr_sin_itr_amplitude_handles_flat_profile(self, synthetic_source_sim_params):
         y_grid = np.linspace(0.0, 1.0, 101, dtype=np.float32)
-        params = _source_itr_params_from_source(synthetic_source_sim_params[:3])
-        params[0]["R_c_amp"] = 0.0
-        params[1]["R_c_amp"] = 0.4
+        params = _source_itr_sin_params_from_source(synthetic_source_sim_params[:3])
+        params[0]["R_c_A"] = 0.0
+        params[1]["R_c_A"] = 0.4
         params[1]["R_c_sigma"] = 0.05
-        params[2]["R_c_amp"] = 0.4
+        params[2]["R_c_A"] = 0.4
         params[2]["R_c_sigma"] = 0.16
 
-        severity = dataset_plots._void_severity_arrays(params, y_grid)
+        severity = dataset_plots._itr_amplitude_arrays(params, y_grid)
 
         assert severity["R_c_excess_integral"][0] == pytest.approx(0.0)
         assert severity["conductance_deficit"][0] == pytest.approx(0.0)
-        assert severity["is_void_active"][0] == np.bool_(False)
+        assert severity["is_itr_active"][0] == np.bool_(False)
         assert severity["R_c_excess_integral"][2] > severity["R_c_excess_integral"][1]
 
-    def test_source_itr_void_profiles_smoke(
+    def test_source_itr_sin_resistance_profiles_smoke(
         self,
         tmp_path,
         synthetic_trajectories,
         synthetic_source_sim_params,
     ):
         _trajectories, x_grid, y_grid, _t_grid = synthetic_trajectories
-        sim_params = _source_itr_params_from_source(synthetic_source_sim_params)
-        out_path = tmp_path / "source_itr_void_profiles.png"
+        sim_params = _source_itr_sin_params_from_source(synthetic_source_sim_params)
+        out_path = tmp_path / "source_itr_sin_resistance_profiles.png"
 
-        dataset_plots.plot_source_itr_void_profiles(
+        dataset_plots.plot_source_itr_sin_resistance_profiles(
             sim_params,
             y_grid,
             x_grid=x_grid,

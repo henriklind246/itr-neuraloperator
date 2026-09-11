@@ -9,7 +9,7 @@ from data.dataset import SnapshotPairDataset
 from problems import forcing as forcing_problem
 from problems import interfaces as interfaces_problem
 from problems import source as source_problem
-from problems import source_itr as source_itr_problem
+from problems import source_itr_sin as source_itr_sin_problem
 from problems.registry import get_problem
 from src.operators.eval import evaluate
 from src.operators.fno2d import FNO2d
@@ -23,12 +23,12 @@ from src.operators.rollout import (
 )
 
 # (benchmark, representation) pairs the rollout dispatch supports.
-# forcing_itr has no rollout branch.
+# forcing_itr_sin has no rollout branch.
 ROLLOUT_CASES = [
     ("forcing", "temporal_encoder"),
     ("interfaces", "temporal_encoder"),
     ("source", "temporal_encoder"),
-    ("source_itr", "temporal_encoder"),
+    ("source_itr_sin", "temporal_encoder"),
     ("source_itr_sin", "temporal_encoder"),
 ]
 
@@ -78,7 +78,7 @@ def _adapter_sim_params(spec, trajectories, x_grid, y_grid, t_grid):
 def _sim_params_for(benchmark, spec, trajectories, x_grid, y_grid, t_grid, fixtures):
     """Pick the sim_params source for a benchmark.
 
-    forcing/source/source_itr use hand-built fixtures whose schema is pinned to
+    forcing/source/source_itr_sin use hand-built fixtures whose schema is pinned to
     the live sampler; interfaces round-trips through the spec's own sampler
     because its params (interface_x, sampled ICs) have no shortcut.
     """
@@ -201,7 +201,7 @@ class TestSingleSubstepItemIdentity:
     def test_k1_item_matches_direct_item(
         self, benchmark, representation, synthetic_trajectories,
         synthetic_sim_params, synthetic_source_sim_params,
-        synthetic_source_itr_sim_params,
+        synthetic_source_itr_sin_sim_params,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         spec = get_problem(benchmark, representation)
@@ -210,7 +210,7 @@ class TestSingleSubstepItemIdentity:
             {
                 "forcing": synthetic_sim_params,
                 "source": synthetic_source_sim_params,
-                "source_itr": synthetic_source_itr_sim_params,
+                "source_itr_sin": synthetic_source_itr_sin_sim_params,
             },
         )
         ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
@@ -262,7 +262,7 @@ class TestShortSubintervalIntegrity:
     def test_shortest_lead_partition_and_features_are_well_formed(
         self, benchmark, representation, synthetic_trajectories,
         synthetic_sim_params, synthetic_source_sim_params,
-        synthetic_source_itr_sim_params,
+        synthetic_source_itr_sin_sim_params,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         spec = get_problem(benchmark, representation)
@@ -271,7 +271,7 @@ class TestShortSubintervalIntegrity:
             {
                 "forcing": synthetic_sim_params,
                 "source": synthetic_source_sim_params,
-                "source_itr": synthetic_source_itr_sim_params,
+                "source_itr_sin": synthetic_source_itr_sin_sim_params,
             },
         )
         ds = _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec)
@@ -307,12 +307,12 @@ class TestShortSubintervalIntegrity:
 
 class TestSourceItrRollout:
     def test_rc_y_channel_survives_and_forcing_seq_recomputes(
-        self, synthetic_trajectories, synthetic_source_itr_sim_params
+        self, synthetic_trajectories, synthetic_source_itr_sin_sim_params
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        spec = get_problem("source_itr", "temporal_encoder")
+        spec = get_problem("source_itr_sin", "temporal_encoder")
         ds = _make_dataset(
-            trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sim_params, spec
+            trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sin_sim_params, spec
         )
         sid, s, k, j = 0, 0, 10, 20
         base = spec.build_item(ds, sid, s, j)
@@ -323,14 +323,14 @@ class TestSourceItrRollout:
             base, ds, spec, sid, current, float(t_grid[s]), float(t_grid[k])
         )
 
-        assert rollout["cond_static"].shape == (source_itr_problem.COND_STATIC_DIM,)
-        assert source_itr_problem.COND_STATIC_DIM == 9
+        assert rollout["cond_static"].shape == (source_itr_sin_problem.COND_STATIC_DIM,)
+        assert source_itr_sin_problem.COND_STATIC_DIM == 7
         np.testing.assert_allclose(rollout["cond_static"], direct_sub["cond_static"])
 
         # R_c(y) is time-invariant, so _copy_item carries it through untouched.
-        rc = rollout["spatial"][..., source_itr_problem.RC_Y_CHANNEL]
+        rc = rollout["spatial"][..., source_itr_sin_problem.RC_Y_CHANNEL]
         np.testing.assert_array_equal(
-            rc, base["spatial"][..., source_itr_problem.RC_Y_CHANNEL]
+            rc, base["spatial"][..., source_itr_sin_problem.RC_Y_CHANNEL]
         )
         # Non-constant along y: a plain `source` item has no void profile here.
         assert float(rc[0].std()) > 0.0
@@ -361,11 +361,11 @@ class TestRolloutTimeNormalizationHorizon:
         return ds
 
     @pytest.mark.parametrize(
-        "benchmark", ["forcing", "interfaces", "source", "source_itr"]
+        "benchmark", ["forcing", "interfaces", "source", "source_itr_sin"]
     )
     def test_subinterval_time_features_match_direct_item_past_horizon(
         self, benchmark, synthetic_trajectories, synthetic_sim_params,
-        synthetic_source_sim_params, synthetic_source_itr_sim_params,
+        synthetic_source_sim_params, synthetic_source_itr_sin_sim_params,
     ):
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
         spec = get_problem(benchmark, "temporal_encoder")
@@ -374,7 +374,7 @@ class TestRolloutTimeNormalizationHorizon:
             {
                 "forcing": synthetic_sim_params,
                 "source": synthetic_source_sim_params,
-                "source_itr": synthetic_source_itr_sim_params,
+                "source_itr_sin": synthetic_source_itr_sin_sim_params,
             },
         )
         ds = self._dataset(spec, trajectories, x_grid, y_grid, t_grid, sim_params)
@@ -423,18 +423,18 @@ class TestPredictAutoregressive:
 
         torch.testing.assert_close(rollout, direct)
 
-    def test_single_substep_matches_direct_for_source_itr(
-        self, synthetic_trajectories, synthetic_source_itr_sim_params
+    def test_single_substep_matches_direct_for_source_itr_sin(
+        self, synthetic_trajectories, synthetic_source_itr_sin_sim_params
     ):
-        """Same equivalence through the new source_itr branch, end to end.
+        """Same equivalence through the new source_itr_sin branch, end to end.
 
         rtol is loosened relative to the item-level tests because this compares
         two forward passes, not two arrays.
         """
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
-        spec = get_problem("source_itr", "temporal_encoder")
+        spec = get_problem("source_itr_sin", "temporal_encoder")
         ds = _make_dataset(
-            trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sim_params, spec
+            trajectories, x_grid, y_grid, t_grid, synthetic_source_itr_sin_sim_params, spec
         )
         model = FNO2d(
             modes1=2,

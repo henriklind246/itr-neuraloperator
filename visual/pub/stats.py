@@ -183,8 +183,8 @@ STRATUM_SPECS: dict[str, StratumSpec] = {
         edges=(0.2, 0.35, 0.5, 0.65, 0.8), label="Interface position $x_I$"),
     "R_c_bin": StratumSpec(
         "R_c_bin", "R_c", "quantile", n_bins=4, label="Contact resistance $R_c$"),
-    "void_severity": StratumSpec(
-        "void_severity", "R_c_amp", "quantile", n_bins=3, label="Void severity"),
+    "itr_amplitude": StratumSpec(
+        "itr_amplitude", "R_c_A", "quantile", n_bins=3, label="ITR amplitude"),
     "patch_x_bin": StratumSpec(
         "patch_x_bin", "x_h", "quantile", n_bins=4, label="Patch position $x_h$"),
     "amplitude_bin": StratumSpec(
@@ -559,7 +559,7 @@ _INVERSE_SENSOR_METRICS = {
         "profile_low": "profile_R_c_ci_low",
         "profile_high": "profile_R_c_ci_high",
     },
-    "forcing_itr": {
+    "forcing_itr_sin": {
         "estimand": "S_R",
         "unit": "m³ K/W",
         "truth": "excess_int_true",
@@ -1254,33 +1254,28 @@ def paired_seed_delta(sims_a: SimFrame, sims_b: SimFrame, metric: str, *,
     )
 
 
-GLOBAL_FIELD_BENCHMARKS = ("forcing", "source", "source_itr", "interfaces")
+GLOBAL_FIELD_BENCHMARKS = ("forcing", "source", "source_itr_sin", "interfaces")
 
 
 def interface_mean_resistance(frame: pd.DataFrame, benchmark: str,
                               bounds=(0.0, 1.0)) -> np.ndarray:
-    """Finite-domain arithmetic mean of the recorded scalar/Gaussian ITR."""
-    from scipy.special import erf
-
+    """Finite-domain arithmetic mean of the recorded scalar/sinusoidal ITR."""
     base = frame["R_c"].to_numpy(dtype=float)
     if not np.all(np.isfinite(base) & (base >= 0)):
         raise ProvenanceError(f"{benchmark}: invalid scalar/base resistance")
-    if benchmark != "source_itr":
+    if benchmark != "source_itr_sin":
         return base
-    names = ["R_c_amp", "R_c_y0", "R_c_sigma"]
-    missing = set(names) - set(frame.columns)
-    if missing:
-        raise ProvenanceError(f"source_itr: missing Gaussian parameters {sorted(missing)}")
-    amp, center, sigma = frame[names].to_numpy(dtype=float).T
-    if not np.all(np.isfinite([amp, center, sigma])) or np.any(amp < 0) or np.any(sigma <= 0):
-        raise ProvenanceError("source_itr: invalid Gaussian resistance parameters")
+    if "R_c_A" not in frame:
+        raise ProvenanceError("source_itr_sin: missing sinusoidal parameter R_c_A")
+    amp = frame["R_c_A"].to_numpy(dtype=float)
+    if not np.all(np.isfinite(amp) & (amp >= 0)):
+        raise ProvenanceError("source_itr_sin: invalid sinusoidal resistance amplitude")
     if "R_c_base" in frame and not np.allclose(frame["R_c_base"], base):
-        raise ProvenanceError("source_itr: R_c must agree with R_c_base")
+        raise ProvenanceError("source_itr_sin: R_c must agree with R_c_base")
     c, d = bounds
     if not np.isfinite([c, d]).all() or d <= c:
         raise ProvenanceError("invalid interface domain bounds")
-    return base + amp * sigma * np.sqrt(np.pi) / (2 * (d - c)) * (
-        erf((d - center) / sigma) - erf((c - center) / sigma))
+    return base + amp * (np.cos(np.pi*c) - np.cos(np.pi*d)) / (np.pi*(d-c))
 
 
 def _resolved_field_leads(frame, grid=None):
@@ -1403,7 +1398,7 @@ def global_field_error_summary(frames, *, metadata=None,
                                        "legacy simulation/pair keys and recorded parameters",
             }
             resistance_info.setdefault(benchmark, {})[seed] = {
-                "kind": "finite-domain Gaussian mean" if benchmark == "source_itr" else "scalar R_c",
+                "kind": "finite-domain sinusoidal mean" if benchmark == "source_itr_sin" else "scalar R_c",
                 "y_bounds": list(bounds),
                 "bounds_source": meta.get("bounds_source", "benchmark unit-domain convention"),
             }
@@ -1412,8 +1407,8 @@ def global_field_error_summary(frames, *, metadata=None,
             raise ProvenanceError(f"{benchmark}: mismatched evaluation populations across seeds")
         combined = pd.concat(seed_parts, ignore_index=True)
         invariant_cols = ["R_c", "R_c_mean"]
-        if benchmark == "source_itr":
-            invariant_cols += ["R_c_amp", "R_c_y0", "R_c_sigma"]
+        if benchmark == "source_itr_sin":
+            invariant_cols += ["R_c_A"]
         grouped = combined.groupby("sim_id")[invariant_cols]
         if not np.allclose(grouped.min(), grouped.max(), rtol=1e-10, atol=1e-12):
             raise ProvenanceError(f"{benchmark}: simulation resistance changes across pairs or seeds")

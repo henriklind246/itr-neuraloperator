@@ -20,7 +20,7 @@ from visual.pub._blocked import blocked
 
 # The benchmark this figure most wants, then the fallbacks.
 #
-# source and source_itr are last despite having the most interesting R_c(y).
+# source and source_itr_sin are last despite having the most interesting R_c(y).
 # They drive a localized internal source in the left slab across a resistive
 # interface, and over the eval set the right slab's temperature rise never
 # exceeds ~9% of the left's (median 2%). Rows 1-2 must share one temperature
@@ -29,7 +29,7 @@ from visual.pub._blocked import blocked
 # carrying no information. interfaces (median 84%) and forcing (median 35%)
 # keep both slabs alive, and both still give a y-varying contact jump: the
 # interface location moves in one and the flux profile s(y) varies in the other.
-PREFERRED = ("interfaces", "forcing", "source_itr", "source")
+PREFERRED = ("interfaces", "forcing", "source_itr_sin", "source")
 
 LEAD_QUANTILES = (0.1, 0.5, 0.9)
 
@@ -98,7 +98,6 @@ def signature(*, source=None, spec=None, requirement=None):
                            extra_rows=1, extra_row_height=0.78)
     fig, axes = grid.fig, grid.maps
     y_grid = np.asarray(cases[0].y_grid, dtype=float)
-    void = fields.void_profile(cases[0].params)
 
     for col, case in enumerate(cases):
         iface = case.interface_x
@@ -116,9 +115,6 @@ def signature(*, source=None, spec=None, requirement=None):
                   linewidth=1.0, linestyle="--", label="FNO")
         ax_j.axhline(0.0, color="0.6", linewidth=0.5, zorder=0)
         ax_j.set_xlabel("$y$")
-        if void is not None:
-            style.add_void_shading(ax_j, void[0], void[1],
-                                   label="void" if col == 0 else None)
 
         axes[0][col].text(
             0.03, 0.97,

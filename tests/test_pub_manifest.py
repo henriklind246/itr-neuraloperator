@@ -52,7 +52,7 @@ def empty_manifest(tmp_path) -> Manifest:
 
 
 def write_records(path, *, version: int, n_sims: int = 3, n_pairs: int = 4,
-                  benchmark: str = "source_itr", seed: str = "42"):
+                  benchmark: str = "source_itr_sin", seed: str = "42"):
     """A test_records.csv at the requested schema version."""
     columns = list(records_mod.SCHEMA_V1_COLUMNS)
     if version >= 2:
@@ -78,8 +78,8 @@ def write_records(path, *, version: int, n_sims: int = 3, n_pairs: int = 4,
     return path
 
 
-def make_run(root, *, name="pub_source_itr", seed="42", version=2,
-             benchmark="source_itr", representation="temporal_encoder"):
+def make_run(root, *, name="pub_source_itr_sin", seed="42", version=2,
+             benchmark="source_itr_sin", representation="temporal_encoder"):
     """A minimal run directory carrying the metadata the manifest reads."""
     run_dir = root / "runs" / name / "config0" / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -223,43 +223,43 @@ class TestStrictResolution:
         silently backing a figure whose statistics need pooled sufficient
         statistics it does not carry.
         """
-        run = make_run(tmp_path, name="pub_source_itr", version=1)
+        run = make_run(tmp_path, name="pub_source_itr_sin", version=1)
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [{"run": str(run.relative_to(tmp_path))}]})
+            "source_itr_sin_records": [{"run": str(run.relative_to(tmp_path))}]})
         with pytest.raises(ProvenanceError, match="SCHEMA_BELOW_REQUIRED"):
-            mf.resolve("F12_source_itr_void", strict=True)
+            mf.resolve("F12_source_itr_sin_resistance", strict=True)
 
     def test_too_few_seeds_raises(self, tmp_path):
-        run = make_run(tmp_path, name="pub_source_itr", version=2)
+        run = make_run(tmp_path, name="pub_source_itr_sin", version=2)
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [{"run": str(run.relative_to(tmp_path))}]})
+            "source_itr_sin_records": [{"run": str(run.relative_to(tmp_path))}]})
         with pytest.raises(ProvenanceError, match="TOO_FEW_SEEDS"):
-            mf.resolve("F12_source_itr_void", strict=True)
+            mf.resolve("F12_source_itr_sin_resistance", strict=True)
 
     def test_representation_mismatch_raises(self, tmp_path):
         runs = [make_run(tmp_path, seed=s, version=2) for s in ("1", "2")]
         runs.append(make_run(tmp_path, seed="3", version=2,
                              representation="bins"))
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [{"run": str(r.relative_to(tmp_path))}
+            "source_itr_sin_records": [{"run": str(r.relative_to(tmp_path))}
                                    for r in runs]})
         with pytest.raises(ProvenanceError, match="REPRESENTATION_MISMATCH"):
-            mf.resolve("F12_source_itr_void", strict=True)
+            mf.resolve("F12_source_itr_sin_resistance", strict=True)
 
     def test_three_good_seeds_resolve_clean(self, tmp_path):
         runs = [make_run(tmp_path, seed=s, version=2) for s in ("1", "2", "3")]
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [
+            "source_itr_sin_records": [
                 {"run": str(r.relative_to(tmp_path)), "seed": int(r.name[4:])}
                 for r in runs
             ]})
-        source = mf.resolve("F12_source_itr_void", strict=True)
+        source = mf.resolve("F12_source_itr_sin_resistance", strict=True)
         assert not source.is_degraded
         assert source.n_seeds == 3
         assert source.seeds == ("1", "2", "3")
         assert source.n_simulations == 9
         assert source.n_pairs == 36
-        assert source.benchmarks == ("source_itr",)
+        assert source.benchmarks == ("source_itr_sin",)
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +284,8 @@ class TestDegraded:
     def test_v1_records_degrade_with_a_named_code(self, tmp_path):
         run = make_run(tmp_path, version=1)
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [{"run": str(run.relative_to(tmp_path))}]})
-        source = mf.resolve("F12_source_itr_void", strict=False)
+            "source_itr_sin_records": [{"run": str(run.relative_to(tmp_path))}]})
+        source = mf.resolve("F12_source_itr_sin_resistance", strict=False)
         codes = {d.code for d in source.degradations}
         assert "SCHEMA_BELOW_REQUIRED" in codes
         assert source.artifacts[0].schema_version == 1
@@ -297,12 +297,12 @@ class TestDegraded:
             )
             for seed in ("1", "2", "3")
         ]
-        source_itr_runs = [
+        source_itr_sin_runs = [
             make_run(
                 tmp_path,
-                name="pub_source_itr",
+                name="pub_source_itr_sin",
                 seed=seed,
-                benchmark="source_itr",
+                benchmark="source_itr_sin",
                 representation="bins",
             )
             for seed in ("1", "2", "3")
@@ -311,8 +311,8 @@ class TestDegraded:
             "forcing_records": [
                 {"run": str(run.relative_to(tmp_path))} for run in forcing_runs
             ],
-            "source_itr_records": [
-                {"run": str(run.relative_to(tmp_path))} for run in source_itr_runs
+            "source_itr_sin_records": [
+                {"run": str(run.relative_to(tmp_path))} for run in source_itr_sin_runs
             ],
         })
         source = mf.resolve("F04_headline_accuracy", strict=False)
@@ -322,7 +322,7 @@ class TestDegraded:
             if degradation.code == "REPRESENTATION_MISMATCH"
         ]
         assert len(mismatches) == 3
-        assert all("source_itr_records" in detail for detail in mismatches)
+        assert all("source_itr_sin_records" in detail for detail in mismatches)
         assert not any("forcing_records" in detail for detail in mismatches)
 
     def test_satisfiability_table_covers_every_figure(self, empty_manifest):
@@ -403,17 +403,17 @@ class TestSidecar:
     def source(self, tmp_path) -> tuple[Manifest, FigureSource]:
         runs = [make_run(tmp_path, seed=s, version=2) for s in ("1", "2", "3")]
         mf = manifest_with(tmp_path, {
-            "source_itr_records": [{"run": str(r.relative_to(tmp_path))}
+            "source_itr_sin_records": [{"run": str(r.relative_to(tmp_path))}
                                    for r in runs]})
-        return mf, mf.resolve("F12_source_itr_void", strict=True)
+        return mf, mf.resolve("F12_source_itr_sin_resistance", strict=True)
 
     def test_round_trip_carries_every_required_key(self, source, tmp_path):
         _, resolved = source
         out = tmp_path / "out"
         write_sidecar(out, resolved, metric_space="kelvin",
                       metric_definition={"quantity": "pooled RMSE"},
-                      selection={"sim_id": 7}, params={"benchmark": "source_itr"})
-        payload = read_sidecar(out, "F12_source_itr_void")
+                      selection={"sim_id": 7}, params={"benchmark": "source_itr_sin"})
+        payload = read_sidecar(out, "F12_source_itr_sin_resistance")
         required = {"schema", "figure_key", "generated_utc", "generator_git_commit",
                     "metric_space", "metric_definition", "requirement_sets", "runs",
                     "sources", "counts", "selection", "degradations", "params"}
@@ -426,7 +426,7 @@ class TestSidecar:
         _, resolved = source
         out = tmp_path / "out"
         write_sidecar(out, resolved, metric_space="kelvin")
-        payload = read_sidecar(out, "F12_source_itr_void")
+        payload = read_sidecar(out, "F12_source_itr_sin_resistance")
         assert len(payload["sources"]) == 3
         for entry in payload["sources"]:
             assert len(entry["sha256"]) == 64
@@ -536,7 +536,7 @@ class TestSchema:
 
     def test_inverse_sensor_loader_requires_exact_case_pairing(self, tmp_path):
         paths = []
-        for benchmark in ("forcing", "forcing_itr"):
+        for benchmark in ("forcing", "forcing_itr_sin"):
             rows = []
             for sim_id in range(8):
                 for count in (8, 16, 32):
@@ -595,7 +595,7 @@ class TestSchema:
 # ---------------------------------------------------------------------------
 
 
-REAL_RUN = "runs/source_itr_smoke3/config0/seed42"
+REAL_RUN = "runs/source_itr_sin_smoke3/config0/seed42"
 
 
 class TestRealArtifact:
@@ -622,19 +622,19 @@ class TestRealArtifact:
         from visual.pub.manifest import PROJECT_ROOT
         path = tmp_path / "manifest.yaml"
         path.write_text(yaml.safe_dump({"sources": {
-            "source_itr_records": [{"run": REAL_RUN}]}}))
+            "source_itr_sin_records": [{"run": REAL_RUN}]}}))
         mf = Manifest.load(path, root=PROJECT_ROOT)
         with pytest.raises(ProvenanceError, match="SCHEMA_BELOW_REQUIRED"):
-            mf.resolve("F12_source_itr_void", strict=True)
+            mf.resolve("F12_source_itr_sin_resistance", strict=True)
 
     def test_degrades_with_both_codes(self, run_dir, tmp_path):
         from visual.pub.manifest import PROJECT_ROOT
         path = tmp_path / "manifest.yaml"
         path.write_text(yaml.safe_dump({"sources": {
-            "source_itr_records": [{"run": REAL_RUN}]}}))
+            "source_itr_sin_records": [{"run": REAL_RUN}]}}))
         mf = Manifest.load(path, root=PROJECT_ROOT)
-        source = mf.resolve("F12_source_itr_void", strict=False)
+        source = mf.resolve("F12_source_itr_sin_resistance", strict=False)
         codes = {d.code for d in source.degradations}
         assert {"SCHEMA_BELOW_REQUIRED", "TOO_FEW_SEEDS"} <= codes
         assert source.n_seeds == 1
-        assert source.artifacts[0].benchmarks == ("source_itr",)
+        assert source.artifacts[0].benchmarks == ("source_itr_sin",)

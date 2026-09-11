@@ -33,7 +33,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "energy_budget":             "source",
     "patch_region_error_map":    "source",
     "source_interface_zone_error": "source",
-    "source_itr_void_profiles":  "source",
+    "source_itr_sin_resistance_profiles":  "source",
     # group: interfaces
     "interface_x_breakdown":     "interfaces",
 }
@@ -55,7 +55,7 @@ PLOT_RERUN_TRIGGERS: dict[str, str] = {
     "energy_budget": "source term, FV balance, or regenerated source dataset",
     "patch_region_error_map": "new source-family checkpoint",
     "source_interface_zone_error": "new source-family checkpoint",
-    "source_itr_void_profiles": "void-profile sampler or normalization change",
+    "source_itr_sin_resistance_profiles": "resistance profile-profile sampler or normalization change",
     "interface_x_breakdown": "regenerated interfaces dataset or geometry-sampling change",
 }
 

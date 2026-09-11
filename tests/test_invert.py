@@ -1,10 +1,10 @@
-"""Tests for the source_itr inverse solver (Stage 1 MVP).
+"""Tests for the source_itr_sin inverse solver (Stage 1 MVP).
 
 The load-bearing checks are checkpoint-free: the torch reparameterization must
 reproduce the two theta injection points *bit-for-bit* (within float tolerance)
 against the real forward pipeline:
 
-  1. cond_static[1:5]  <- build_cond_vector_itr  (linear over RC_VOID_RANGES)
+  1. cond_static[1:5]  <- build_cond_vector_sin  (linear over RC_SIN_RANGES)
   2. spatial[..., 4]   <- _rc_channel            (rc_log_norm o make_rc_void_profile)
 
 A mismatch in either silently queries the FNO off-distribution and degrades
@@ -19,25 +19,22 @@ import torch
 
 from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
 from problems.source import _patch_center_ranges
-from problems.source_itr import (
+from problems.source_itr_sin import (
     RC_Y_CHANNEL,
-    build_cond_vector_itr,
+    build_cond_vector_sin,
     rc_log_norm,
 )
 from src.physics.internal_source import (
     RC_MIN,
     RC_SIN_RANGES,
-    RC_VOID_RANGES,
     R_PEAK_MAX,
     make_rc_sin_profile,
-    make_rc_void_profile,
 )
 from scripts import invert as inv
 from scripts.inverse_adapters import (
     ForcingAdapter,
     ForcingItrSinAdapter,
     InverseAdapter,
-    SourceItrAdapter,
     SourceItrSinAdapter,
 )
 
@@ -45,10 +42,10 @@ from scripts.inverse_adapters import (
 def test_legacy_forcing_checkpoint_adaptation_is_exact_at_zero_source_time():
     from problems.registry import get_problem
 
-    dims = get_problem("forcing_itr", "temporal_encoder").dims
+    dims = get_problem("forcing_itr_sin", "temporal_encoder").dims
     embed_dim = 4
     config = {
-        "benchmark": {"name": "forcing_itr"},
+        "benchmark": {"name": "forcing_itr_sin"},
         "model": {
             "parameters": {
                 "cond_static_dim": dims.cond_static_dim + 1,
@@ -94,30 +91,30 @@ def test_legacy_forcing_checkpoint_adaptation_is_exact_at_zero_source_time():
 # A handful of physical thetas spanning the box, including the dependent-ceiling
 # edge (R_amp near R_PEAK_MAX - R_base) and the no-void floor (R_amp ~ 0).
 THETAS = [
-    (0.20, 0.50, 0.50, 0.10),
-    (0.05, 2.90, 0.30, 0.05),   # near amp ceiling at the R_base floor
-    (0.90, 0.10, 0.80, 0.20),
-    (0.50, 0.00, 0.10, 0.08),   # no-void floor
-    (0.75, 1.20, 0.65, 0.15),
+    (0.20, 0.50),
+    (0.05, 2.90),   # near amp ceiling at the R_base floor
+    (0.90, 0.10),
+    (0.50, 0.00),   # no-void floor
+    (0.75, 1.20),
 ]
 
 
 @pytest.mark.parametrize("theta", THETAS)
-def test_cond_slice_matches_build_cond_vector_itr(theta):
-    R_base, R_amp, y0, sigma = theta
+def test_cond_slice_matches_build_cond_vector_sin(theta):
+    R_base, R_amp = theta
     # Reference: the real cond builder. Patch slots are irrelevant here; we only
-    # compare the void slice cond[1:5], so any valid patch is fine.
+    # compare the void slice cond[1:3], so any valid patch is fine.
     x_lo, x_hi, y_lo, y_hi = 0.0, 1.0, 0.0, 1.0
     w_h = h_h = 0.1
     xcr, ycr = _patch_center_ranges(x_lo, x_hi, y_lo, y_hi, w_h, h_h)
-    cond = build_cond_vector_itr(
+    cond = build_cond_vector_sin(
         t_bar_norm=0.3,
-        R_base=R_base, R_amp=R_amp, y0=y0, sigma=sigma,
+        R_base=R_base, A=R_amp,
         x_h=0.5, y_h=0.5, w_h=w_h, h_h=h_h,
         x_center_range=xcr, y_center_range=ycr,
         x_length_scale=(x_hi - x_lo), y_length_scale=(y_hi - y_lo),
     )
-    ref_slice = cond[1:5]
+    ref_slice = cond[1:3]
 
     theta_t = torch.tensor(theta, dtype=torch.float64)
     got = inv.theta_to_cond_slice(theta_t).numpy()
@@ -126,11 +123,11 @@ def test_cond_slice_matches_build_cond_vector_itr(theta):
 
 @pytest.mark.parametrize("theta", THETAS)
 def test_rc_channel_matches_reference(theta):
-    R_base, R_amp, y0, sigma = theta
+    R_base, R_amp = theta
     Ny, Nx = 100, 100
     y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
 
-    Rc_y = make_rc_void_profile(y_grid, R_base=R_base, R_amp=R_amp, y0=y0, sigma=sigma)
+    Rc_y = make_rc_sin_profile(y_grid, R_base=R_base, A=R_amp)
     ref_channel = np.broadcast_to(rc_log_norm(Rc_y)[None, :], (Nx, Ny))
 
     theta_t = torch.tensor(theta, dtype=torch.float64)
@@ -151,41 +148,37 @@ def test_unconstrained_theta_roundtrip(theta):
 
 def test_theta_from_unconstrained_respects_box_and_ceiling():
     rng = np.random.default_rng(0)
-    u = torch.from_numpy(rng.normal(0, 3.0, size=(500, 4)))
+    u = torch.from_numpy(rng.normal(0, 3.0, size=(500, 2)))
     theta = inv.theta_from_unconstrained(u)
-    R_base, R_amp, y0, sigma = (theta[:, i] for i in range(4))
+    R_base, R_amp = (theta[:, i] for i in range(2))
 
-    base_lo, base_hi = RC_VOID_RANGES["R_base"]
-    y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-    sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
+    base_lo, base_hi = RC_SIN_RANGES["R_base"]
 
     assert torch.all(R_base >= base_lo - 1e-9) and torch.all(R_base <= base_hi + 1e-9)
-    assert torch.all(y0 >= y0_lo - 1e-9) and torch.all(y0 <= y0_hi + 1e-9)
-    assert torch.all(sigma >= sig_lo - 1e-9) and torch.all(sigma <= sig_hi + 1e-9)
     # Dependent amplitude ceiling: R_amp <= R_PEAK_MAX - R_base, i.e. peak <= R_PEAK_MAX.
     assert torch.all(R_amp >= -1e-9)
     assert torch.all(R_base + R_amp <= R_PEAK_MAX + 1e-6)
 
 
 def test_integrated_excess_resistance_matches_numpy():
-    theta = torch.tensor([0.3, 1.0, 0.5, 0.12], dtype=torch.float64)
+    theta = torch.tensor([0.3, 1.0], dtype=torch.float64)
     y_grid = torch.linspace(0.0, 1.0, 200, dtype=torch.float64)
     got = inv.integrated_excess_resistance(theta, y_grid)
 
     y = y_grid.numpy()
-    excess = 1.0 * np.exp(-(((y - 0.5) / 0.12) ** 2))
+    excess = np.sin(np.pi*y)
     trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     ref = float(trapz(excess, y))
     assert abs(got - ref) < 1e-9
 
 
 # ---------------------------------------------------------------------------
-# Operator wiring + gradient flow, using a tiny untrained source_itr FNO.
+# Operator wiring + gradient flow, using a tiny untrained source_itr_sin FNO.
 # ---------------------------------------------------------------------------
 
-def _tiny_source_itr_model():
+def _tiny_source_itr_sin_model():
     from src.operators.fno2d import FNO2d
-    from problems.source_itr import COND_STATIC_DIM, SPATIAL_CHANNELS_TEMPORAL
+    from problems.source_itr_sin import COND_STATIC_DIM, SPATIAL_CHANNELS_TEMPORAL
     from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
 
     torch.manual_seed(1)
@@ -205,7 +198,7 @@ def _fake_observation_set(Nx=16, Ny=16, N=3, M=128):
     spatial = torch.zeros(N, Nx, Ny, 5)
     spatial[..., 1] = torch.linspace(0, 1, Nx)[None, :, None]
     spatial[..., 2] = torch.linspace(0, 1, Ny)[None, None, :]
-    cond = torch.zeros(N, 9)
+    cond = torch.zeros(N, 7)
     cond[:, 0] = torch.linspace(0.3, 1.0, N)  # t_bar_norm early/mid/late
     forcing_seq = torch.zeros(N, M, FORCING_TEMPORAL_TOKEN_DIM)
     forcing_seq[..., 0] = torch.linspace(0, 1, M)
@@ -215,17 +208,17 @@ def _fake_observation_set(Nx=16, Ny=16, N=3, M=128):
         sid=0, time_indices=list(range(N)),
         spatial=spatial, cond=cond, forcing_seq=forcing_seq,
         targets=targets, y_grid=y_grid, Nx=Nx,
-        theta_true=torch.tensor([0.3, 1.0, 0.5, 0.12]),
+        theta_true=torch.tensor([0.3, 1.0]),
     )
 
 
 def test_predict_fullfield_injects_both_points_and_is_differentiable():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set()
 
-    u = torch.zeros(4, requires_grad=True)
+    u = torch.zeros(2, requires_grad=True)
     theta = inv.theta_from_unconstrained(u)
     pred = inv.predict_fullfield(model, obs, theta)
     assert pred.shape == (obs.spatial.shape[0], obs.Nx, obs.spatial.shape[2], 1)
@@ -233,17 +226,17 @@ def test_predict_fullfield_injects_both_points_and_is_differentiable():
     loss = (pred ** 2).mean()
     loss.backward()
     # Gradient must flow back to all four unconstrained params through the two
-    # injection points (channel 4 + cond[1:5]).
+    # injection points (channel 4 + cond[1:3]).
     assert u.grad is not None
     assert torch.all(torch.isfinite(u.grad))
     assert torch.any(u.grad != 0)
 
 
 def test_predict_fullfield_changes_with_theta():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
-    theta_a = torch.tensor([0.2, 0.1, 0.3, 0.08])
-    theta_b = torch.tensor([0.8, 2.0, 0.7, 0.18])
+    theta_a = torch.tensor([0.2, 0.1])
+    theta_b = torch.tensor([0.8, 2.0])
     with torch.no_grad():
         pa = inv.predict_fullfield(model, obs, theta_a)
         pb = inv.predict_fullfield(model, obs, theta_b)
@@ -259,12 +252,12 @@ def test_invert_sim_recovers_theta_against_self_generated_target(optimizer):
     capability claim — the model is untrained, so "truth" here is whatever the
     model maps a planted theta to.
     """
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set()
 
-    theta_star = torch.tensor([0.4, 1.5, 0.55, 0.13])
+    theta_star = torch.tensor([0.4, 1.5])
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
 
@@ -335,7 +328,7 @@ def test_apply_sensor_mask_gather_and_fullfield_flatten():
 
 
 def test_data_loss_fullfield_matches_none_mask():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set()
@@ -355,7 +348,7 @@ def test_invert_sim_recovers_theta_with_sparse_sensors():
     as its own ground truth, the optimizer still drives the masked data loss
     down and lands an in-box theta. Wiring/plumbing check, not a capability
     claim (untrained model)."""
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set(Nx=16, Ny=16)
@@ -368,7 +361,7 @@ def test_invert_sim_recovers_theta_with_sparse_sensors():
     )
     assert int(obs.mask.sum()) < Nx * Ny  # genuinely sparse
 
-    theta_star = torch.tensor([0.4, 1.5, 0.55, 0.13])
+    theta_star = torch.tensor([0.4, 1.5])
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
 
@@ -390,9 +383,9 @@ def test_lhs_starts_are_stratified():
     rng = np.random.default_rng(0)
     n = 8
     u = inv.lhs_starts_u(n, rng)
-    assert u.shape == (n, 4)
+    assert u.shape == (n, 2)
     frac = 1.0 / (1.0 + np.exp(-u))  # sigmoid: u -> box fraction
-    for j in range(4):
+    for j in range(2):
         s = np.sort(frac[:, j])
         for k in range(n):
             assert k / n - 1e-9 <= s[k] <= (k + 1) / n + 1e-9
@@ -402,21 +395,19 @@ def test_lhs_starts_map_into_theta_box():
     rng = np.random.default_rng(1)
     u = torch.from_numpy(inv.lhs_starts_u(16, rng))
     theta = inv.theta_from_unconstrained(u)
-    R_base, R_amp, y0, sigma = (theta[:, i] for i in range(4))
+    R_base, R_amp = (theta[:, i] for i in range(2))
     assert torch.all(R_base >= 0.05 - 1e-6) and torch.all(R_base <= 1.0 + 1e-6)
     assert torch.all(R_amp >= -1e-6)
     assert torch.all(R_base + R_amp <= R_PEAK_MAX + 1e-4)  # dependent ceiling
-    assert torch.all(y0 >= 0.1 - 1e-6) and torch.all(y0 <= 0.9 + 1e-6)
-    assert torch.all(sigma >= 0.05 - 1e-6) and torch.all(sigma <= 0.2 + 1e-6)
 
 
 def test_invert_sim_lhs_and_normal_both_recover():
     """The new default LHS starts and the legacy normal starts both converge."""
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set()
-    theta_star = torch.tensor([0.4, 1.5, 0.55, 0.13])
+    theta_star = torch.tensor([0.4, 1.5])
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
     for sampling in ("lhs", "normal"):
@@ -427,16 +418,16 @@ def test_invert_sim_lhs_and_normal_both_recover():
 
 
 def test_observation_jacobian_shape_finite_nonzero():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set(Nx=8, Ny=8, N=2)
-    theta = torch.tensor([0.4, 1.2, 0.5, 0.12])
+    theta = torch.tensor([0.4, 1.2])
 
     # Full-field: m = N * Nx * Ny * C.
     J = inv.observation_jacobian(model, obs, theta)
     m_full = obs.spatial.shape[0] * obs.Nx * obs.spatial.shape[2] * 1
-    assert J.shape == (m_full, 4)
+    assert J.shape == (m_full, 2)
     assert torch.all(torch.isfinite(J))
     assert torch.any(J != 0)
 
@@ -446,26 +437,9 @@ def test_observation_jacobian_shape_finite_nonzero():
         interface_x=0.5, x_halfwidth=0.2, n_y=4,
     )
     Js = inv.observation_jacobian(model, obs, theta)
-    assert Js.shape == (obs.spatial.shape[0] * int(obs.mask.sum()) * 1, 4)
+    assert Js.shape == (obs.spatial.shape[0] * int(obs.mask.sum()) * 1, 2)
 
 
-def test_svd_identifiability_flags_ramp_sigma_ridge():
-    """A Jacobian whose R_amp and sigma columns are collinear must surface a
-    near-null direction lying in the (R_amp, sigma) plane — the void-mass ridge.
-    """
-    rng = np.random.default_rng(0)
-    m = 50
-    a = rng.normal(size=m)   # R_base response
-    c = rng.normal(size=m)   # y0 response
-    d = rng.normal(size=m)   # shared amp/sigma response
-    J = np.stack([a, 2.0 * d, c, 1.0 * d], axis=1)  # cols 1,3 collinear (2:1)
-    rep = inv.svd_identifiability(J)
-    S = rep["singular_values"]
-    assert S[-1] < 1e-8 * S[0]                      # genuinely rank-deficient
-    assert rep["cond_number"] > 1e7
-    assert rep["ramp_sigma_alignment"] > 0.99       # null dir is the ridge
-    least = rep["least_identified_dir"]
-    assert abs(least[0]) < 1e-6 and abs(least[2]) < 1e-6
 
 
 def test_svd_identifiability_flags_weak_parameter():
@@ -477,28 +451,26 @@ def test_svd_identifiability_flags_weak_parameter():
     rep = inv.svd_identifiability(cols)
     least = rep["least_identified_dir"]
     assert abs(least[0]) > 0.99
-    assert rep["ramp_sigma_alignment"] < 0.05
     assert rep["param_sensitivity"][0] < rep["param_sensitivity"][1:].min()
 
 
 def test_sensitivity_report_orthonormal_and_summary_columns():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set(Nx=8, Ny=8, N=2)
-    theta = torch.tensor([0.4, 1.2, 0.5, 0.12])
+    theta = torch.tensor([0.4, 1.2])
     rep = inv.sensitivity_report(model, obs, theta)
 
     S = rep["singular_values"]
     assert np.all(np.diff(S) <= 1e-9)                       # descending
     V = rep["right_vectors"]
-    np.testing.assert_allclose(V.T @ V, np.eye(4), atol=1e-6)  # orthonormal
+    np.testing.assert_allclose(V.T @ V, np.eye(2), atol=1e-6)  # orthonormal
     assert rep["cond_number"] >= 1.0 - 1e-9
-    assert 0.0 <= rep["ramp_sigma_alignment"] <= 1.0 + 1e-9
 
     flat = inv.sensitivity_summary(rep)
-    for k in ("cond_number", "ramp_sigma_alignment",
-              "sv_0", "sens_R_amp", "least_dir_sigma"):
+    for k in ("cond_number",
+              "sv_0", "sens_A", "least_dir_A"):
         assert k in flat and np.isfinite(flat[k])
 
 
@@ -506,7 +478,7 @@ def test_sensitivity_report_orthonormal_and_summary_columns():
 # Stage 4: FV refinement + theta-local surrogate error.
 #
 # The load-bearing check is checkpoint-free and needs no trained model: a tiny
-# *real* source_itr FV dataset is generated with the exact data-generation
+# *real* source_itr_sin FV dataset is generated with the exact data-generation
 # operator, and ``fv_predict_masked`` at the stored theta_true must reproduce
 # the stored trajectory snapshots. This proves the FV operator is rebuilt
 # correctly (k=3/35 layers, interface_R=[Rc(y)], the patch source, the IC, the
@@ -514,8 +486,8 @@ def test_sensitivity_report_orthonormal_and_summary_columns():
 # real solver.
 # ---------------------------------------------------------------------------
 
-def _tiny_source_itr_fv_dataset(Nx=12, Ny=12, num_sims=2, t_final=0.06, dt=0.01):
-    """Build a tiny *real* source_itr FV dataset (save_stride=1) in memory.
+def _tiny_source_itr_sin_fv_dataset(Nx=12, Ny=12, num_sims=2, t_final=0.06, dt=0.01):
+    """Build a tiny *real* source_itr_sin FV dataset (save_stride=1) in memory.
 
     Mirrors ``data/generate_dataset.py`` with the same generation constants the
     inverse solver's ``build_fv_base_kwargs`` reconstructs, so the FV solve
@@ -526,7 +498,7 @@ def _tiny_source_itr_fv_dataset(Nx=12, Ny=12, num_sims=2, t_final=0.06, dt=0.01)
     from src.physics.fv_solver_1d import build_time_grid
     from data.dataset import SnapshotPairDataset, compute_global_stats
 
-    spec = get_problem("source_itr", "temporal_encoder")
+    spec = get_problem("source_itr_sin", "temporal_encoder")
     a, b, c, d = 0.0, 1.0, 0.0, 1.0
     x_grid = np.linspace(a, b, Nx)
     y_grid = np.linspace(c, d, Ny)
@@ -589,10 +561,10 @@ def test_build_dataset_from_dir_disjoint_partition(tmp_path):
     reserved for surrogate calibration (``val``), never overlapping, with no
     training reservation. Keeping them disjoint is what stops calibration from
     measuring surrogate error on the very sims being inverted."""
-    ds, mu_global, sigma_global = _tiny_source_itr_fv_dataset(num_sims=5)
+    ds, mu_global, sigma_global = _tiny_source_itr_sin_fv_dataset(num_sims=5)
     _write_inverse_dataset_dir(ds, tmp_path)
 
-    config = {"benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
+    config = {"benchmark": {"name": "source_itr_sin", "representation": "temporal_encoder"}}
     built = inv.build_dataset_from_dir(
         str(tmp_path), config, mu_global=mu_global, sigma_global=sigma_global,
         n_invert=2, n_calibration=3,
@@ -610,9 +582,9 @@ def test_build_dataset_from_dir_disjoint_partition(tmp_path):
 
 def test_build_dataset_from_dir_rejects_oversized_partition(tmp_path):
     """The partition cannot request more sims than the dataset holds."""
-    ds, mu_global, sigma_global = _tiny_source_itr_fv_dataset(num_sims=4)
+    ds, mu_global, sigma_global = _tiny_source_itr_sin_fv_dataset(num_sims=4)
     _write_inverse_dataset_dir(ds, tmp_path)
-    config = {"benchmark": {"name": "source_itr", "representation": "temporal_encoder"}}
+    config = {"benchmark": {"name": "source_itr_sin", "representation": "temporal_encoder"}}
     with pytest.raises(ValueError):
         inv.build_dataset_from_dir(
             str(tmp_path), config, mu_global=mu_global, sigma_global=sigma_global,
@@ -649,7 +621,7 @@ def test_prepare_inversion_dataset_generates_disjoint_slices(tmp_path):
 
 @pytest.fixture(scope="module")
 def tiny_fv_dataset():
-    return _tiny_source_itr_fv_dataset()
+    return _tiny_source_itr_sin_fv_dataset()
 
 
 def test_build_fv_base_kwargs_raises_without_dt(tiny_fv_dataset):
@@ -757,7 +729,7 @@ def test_fv_refine_report_columns_and_zero_residual_at_truth(tiny_fv_dataset):
     summary carries the expected columns."""
     ds, mu, sigma = tiny_fv_dataset
     bk = inv.build_fv_base_kwargs(ds)
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
 
@@ -788,7 +760,7 @@ def test_fv_polish_holds_or_improves_from_perturbed_start(tiny_fv_dataset):
     in-box theta. (Cheap: few iters, tiny grid.)"""
     ds, mu, sigma = tiny_fv_dataset
     bk = inv.build_fv_base_kwargs(ds)
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     for p in model.parameters():
         p.requires_grad_(False)
 
@@ -803,8 +775,6 @@ def test_fv_polish_holds_or_improves_from_perturbed_start(tiny_fv_dataset):
     theta_start = torch.tensor([
         float(theta_true[0]) + 0.05,
         max(0.0, float(theta_true[1]) - 0.1),
-        min(0.9, float(theta_true[2]) + 0.03),
-        float(theta_true[3]),
     ], dtype=torch.float32)
 
     mask_cpu = obs.mask.cpu()
@@ -826,7 +796,7 @@ def test_fv_polish_holds_or_improves_from_perturbed_start(tiny_fv_dataset):
     assert float(tp[1]) >= -1e-6 and (float(tp[0]) + float(tp[1])) <= R_PEAK_MAX + 1e-4
 
     flat = inv.fv_refine_summary(res, obs, obs.y_grid)
-    for name in ("R_base", "R_amp", "y0", "sigma"):
+    for name in ("R_base", "A"):
         assert f"{name}_fvpolish" in flat and np.isfinite(flat[f"{name}_fvpolish"])
         assert f"{name}_fvpolish_abserr" in flat
     assert np.isfinite(flat["excess_int_fvpolish"])
@@ -935,7 +905,7 @@ def test_add_measurement_noise_reproducible_and_noop():
 
 
 def test_neg_log_likelihood_zero_at_fit_and_scales_inverse_variance():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     theta = obs.theta_true.to(torch.float32)
     # Make the data exactly the model's own prediction -> residual is ~zero.
@@ -970,7 +940,7 @@ def test_threshold_crossings_interpolates_ushape():
     assert lo3 == hi3 == pytest.approx(grid[int(np.argmin(delta))])
 
 
-@pytest.mark.parametrize("fixed_index", [0, 1, 2, 3])
+@pytest.mark.parametrize("fixed_index", [0, 1])
 def test_theta_profile_pins_coord_and_respects_amp_ceiling(fixed_index):
     torch.manual_seed(0)
     u = torch.randn(4, dtype=torch.float64)
@@ -988,7 +958,7 @@ def test_theta_profile_high_pinned_amp_caps_free_base():
     # R_base + R_amp never exceeds R_PEAK_MAX. A large positive u0 (sigmoid -> 1)
     # would map R_base to base_hi=1.0 without the cap, giving 1.0 + 2.8 = 3.8.
     pinned_amp = 2.8
-    u = torch.tensor([20.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    u = torch.tensor([20.0, 0.0], dtype=torch.float64)
     theta = inv._theta_profile(u, fixed_index=1, fixed_value=pinned_amp)
     R_base, R_amp = float(theta[0]), float(theta[1])
     assert R_amp == pytest.approx(pinned_amp)
@@ -996,13 +966,13 @@ def test_theta_profile_high_pinned_amp_caps_free_base():
     assert R_base == pytest.approx(base_ceiling, abs=1e-6)
     assert (R_base + R_amp) <= R_PEAK_MAX + 1e-9
     # Lower edge of the shrunk box still reaches base_lo at u0 -> -inf.
-    u_lo = torch.tensor([-20.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    u_lo = torch.tensor([-20.0, 0.0], dtype=torch.float64)
     theta_lo = inv._theta_profile(u_lo, fixed_index=1, fixed_value=pinned_amp)
-    assert float(theta_lo[0]) == pytest.approx(RC_VOID_RANGES["R_base"][0], abs=1e-6)
+    assert float(theta_lo[0]) == pytest.approx(RC_SIN_RANGES["R_base"][0], abs=1e-6)
 
 
 def test_profile_likelihood_summary_columns_present():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5  # nonzero residuals against the untrained net
     theta_hat = obs.theta_true.to(torch.float32)
@@ -1011,7 +981,7 @@ def test_profile_likelihood_summary_columns_present():
         param_index=1, n_grid=5, span=0.3, level=0.95,
         adam_steps=8, lbfgs_steps=3,
     )
-    assert res.param_name == "R_amp"
+    assert res.param_name == "A"
     assert res.excess_ci_low <= res.excess_ci_high
     assert np.isfinite(res.excess_ci_high - res.excess_ci_low)
     assert res.ci_low <= res.ci_high
@@ -1019,7 +989,7 @@ def test_profile_likelihood_summary_columns_present():
     assert res.nll.min() >= res.nll_min - 1e-6
 
 
-@pytest.mark.parametrize("adapter_cls", [SourceItrAdapter, SourceItrSinAdapter])
+@pytest.mark.parametrize("adapter_cls", [SourceItrSinAdapter])
 def test_theta_profile_severity_realizes_pinned_severity(adapter_cls):
     adapter = adapter_cls()
     y_grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
@@ -1046,35 +1016,35 @@ def test_theta_profile_severity_caps_at_amp_ceiling():
     # Pinning above the feasible ceiling clamps the amplitude (severity is then
     # the max attainable rather than the requested value) and keeps R_base+amp
     # inside the physical box.
-    adapter = SourceItrAdapter()
+    adapter = SourceItrSinAdapter()
     y_grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
     s_max = adapter.max_feasible_severity(y_grid)
-    u = torch.tensor([20.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    u = torch.tensor([20.0, 0.0], dtype=torch.float64)
     theta = adapter.theta_profile_severity(u, 10.0 * s_max, y_grid)
     R_base, R_amp = float(theta[0]), float(theta[1])
-    assert R_amp <= (R_PEAK_MAX - RC_VOID_RANGES["R_base"][0]) + 1e-6
+    assert R_amp <= (R_PEAK_MAX - RC_SIN_RANGES["R_base"][0]) + 1e-6
     assert R_base + R_amp <= R_PEAK_MAX + 1e-6
 
 
 def test_theta_profile_severity_is_differentiable():
-    adapter = SourceItrAdapter()
+    adapter = SourceItrSinAdapter()
     y_grid = torch.linspace(0.0, 1.0, 32, dtype=torch.float64)
     s_max = adapter.max_feasible_severity(y_grid)
-    u = torch.zeros(4, dtype=torch.float64, requires_grad=True)
+    u = torch.zeros(2, dtype=torch.float64, requires_grad=True)
     theta = adapter.theta_profile_severity(u, 0.4 * s_max, y_grid)
     theta.sum().backward()
     assert u.grad is not None and torch.isfinite(u.grad).all()
 
 
 def test_severity_profile_likelihood_is_valid_profile_interval():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5  # nonzero residuals against the untrained net
     theta_hat = obs.theta_true.to(torch.float32)
     res = inv.severity_profile_likelihood(
         model, obs, theta_hat, sigma_eff2=0.05,
         n_grid=5, span=0.5, level=0.95, adam_steps=8, lbfgs_steps=3,
-        adapter=inv._SOURCE_ITR_ADAPTER,
+        adapter=inv._SOURCE_ITR_SIN_ADAPTER,
     )
     assert res.param_name == "S_R"
     # Direct severity profile: the reported CI *is* the severity CI.
@@ -1082,11 +1052,11 @@ def test_severity_profile_likelihood_is_valid_profile_interval():
     assert res.excess_ci_high == pytest.approx(res.ci_high)
     assert res.ci_low <= res.ci_high
     # Grid stays inside the feasible severity range.
-    s_max = inv._SOURCE_ITR_ADAPTER.max_feasible_severity(obs.y_grid)
+    s_max = inv._SOURCE_ITR_SIN_ADAPTER.max_feasible_severity(obs.y_grid)
     assert res.grid.min() > 0.0 and res.grid.max() <= s_max + 1e-6
     # Profiled NLL never beats the unconstrained min by construction.
     assert res.nll.min() >= res.nll_min - 1e-6
-    summ = inv.profile_interval_summary(res, inv._SOURCE_ITR_ADAPTER)
+    summ = inv.profile_interval_summary(res, inv._SOURCE_ITR_SIN_ADAPTER)
     assert summ["profile_param"] == "S_R"
     assert summ["profile_excess_ci_low"] <= summ["profile_excess_ci_high"]
     assert summ["profile_excess_ci_width"] == pytest.approx(
@@ -1098,13 +1068,13 @@ def test_severity_profile_likelihood_is_valid_profile_interval():
 def test_profile_refit_keeps_best_of_several_starts():
     # The nuisance objective is the same nonconvex surface the MAP fit needs
     # multistart for, so a refit must return the *best* start, not the last.
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     seeds = [
-        torch.zeros(4, dtype=torch.float32),
-        torch.full((4,), -3.0, dtype=torch.float32),
-        torch.full((4,), 3.0, dtype=torch.float32),
+        torch.zeros(2, dtype=torch.float32),
+        torch.full((2,), -3.0, dtype=torch.float32),
+        torch.full((2,), 3.0, dtype=torch.float32),
     ]
     singles = [
         inv._profile_refit(
@@ -1116,19 +1086,19 @@ def test_profile_refit_keeps_best_of_several_starts():
         model, obs, 0.05, 1, 0.4, seeds, adam_steps=8, lbfgs_steps=3
     )
     assert multi_nll <= min(singles) + 1e-9
-    assert multi_theta.shape == (4,) and multi_u.shape == (4,)
+    assert multi_theta.shape == (2,) and multi_u.shape == (2,)
     assert float(multi_theta[1]) == pytest.approx(0.4, abs=1e-6)
 
 
 def test_profile_sweep_reports_nonnegative_gap_and_is_deterministic():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     theta_hat = obs.theta_true.to(torch.float32)
     kwargs = dict(
         sigma_eff2=0.05, n_grid=4, span=0.4, level=0.95,
         adam_steps=6, lbfgs_steps=2, n_starts=3, seed=1,
-        adapter=inv._SOURCE_ITR_ADAPTER,
+        adapter=inv._SOURCE_ITR_SIN_ADAPTER,
     )
     a = inv.severity_profile_likelihood(model, obs, theta_hat, **kwargs)
     b = inv.severity_profile_likelihood(model, obs, theta_hat, **kwargs)
@@ -1138,7 +1108,7 @@ def test_profile_sweep_reports_nonnegative_gap_and_is_deterministic():
     np.testing.assert_allclose(a.nll, b.nll)
     np.testing.assert_allclose(a.grid, b.grid)
     assert a.ci_low == pytest.approx(b.ci_low)
-    summ = inv.profile_interval_summary(a, inv._SOURCE_ITR_ADAPTER)
+    summ = inv.profile_interval_summary(a, inv._SOURCE_ITR_SIN_ADAPTER)
     assert summ["profile_n_starts"] == 3
     assert summ["profile_sweep_gap"] >= 0.0
 
@@ -1147,7 +1117,7 @@ def test_profile_multistart_never_worse_than_single_start():
     # Adding starts can only enlarge the candidate set at each pin, so the
     # profiled NLL curve must not rise anywhere. A rising profile is exactly the
     # failure mode that shrinks a Wilks interval below its nominal level.
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     theta_hat = obs.theta_true.to(torch.float32)
@@ -1177,7 +1147,7 @@ def test_profile_refit_scalar_adapter_ignores_extra_starts():
 
 
 def test_laplace_spectrum_eigs_are_singular_values_squared_over_variance():
-    model = _tiny_source_itr_model().eval()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     theta_hat = obs.theta_true.to(torch.float32)
@@ -1191,9 +1161,9 @@ def test_laplace_spectrum_eigs_are_singular_values_squared_over_variance():
     )
     flat = inv.laplace_summary(spec)
     assert np.isfinite(flat["laplace_cond"]) or flat["laplace_cond"] == float("inf")
-    for i in range(4):
+    for i in range(2):
         assert f"laplace_eig_{i}" in flat
-    for nm in ("R_base", "R_amp", "y0", "sigma"):
+    for nm in ("R_base", "A"):
         assert f"laplace_least_dir_{nm}" in flat
     # Eigenvalues are sorted descending (cond uses [0]/[-1]).
     eig = spec["eigenvalues"]
@@ -1444,8 +1414,8 @@ def test_inverse_adapter_dispatch_and_validation(tiny_fv_dataset):
     from problems.registry import get_problem
 
     assert isinstance(
-        InverseAdapter.from_config({"benchmark": {"name": "source_itr"}}),
-        SourceItrAdapter,
+        InverseAdapter.from_config({"benchmark": {"name": "source_itr_sin"}}),
+        SourceItrSinAdapter,
     )
     assert isinstance(
         InverseAdapter.from_config({"benchmark": {"name": "forcing"}}),
@@ -1482,11 +1452,11 @@ def test_inverse_adapter_dispatch_and_validation(tiny_fv_dataset):
 # Per-sim NPZ artifact dump (--artifact-dir): keys/shapes for both benchmarks.
 # ---------------------------------------------------------------------------
 
-def test_artifact_dir_writes_expected_npz_keys_source_itr(tmp_path):
+def test_artifact_dir_writes_expected_npz_keys_source_itr_sin(tmp_path):
     from types import SimpleNamespace
 
-    adapter = SourceItrAdapter()
-    model = _tiny_source_itr_model().eval()
+    adapter = SourceItrSinAdapter()
+    model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     theta_hat = obs.theta_true.to(torch.float32)
@@ -1515,18 +1485,17 @@ def test_artifact_dir_writes_expected_npz_keys_source_itr(tmp_path):
         "dataset_path", "dataset_fingerprint", "split_seed", "split_name",
     ):
         assert key in d, f"missing schema key {key}"
-    assert str(d["benchmark"]) == "source_itr"
+    assert str(d["benchmark"]) == "source_itr_sin"
     assert int(d["sim_id"]) == 7
-    assert d["theta_hat"].shape == (4,)
-    assert d["theta_true"].shape == (4,)
-    assert d["theta_bounds"].shape == (4, 2)
-    assert d["param_scales"].shape == (4,)
+    assert d["theta_hat"].shape == (2,)
+    assert d["theta_true"].shape == (2,)
+    assert d["theta_bounds"].shape == (2, 2)
+    assert d["param_scales"].shape == (2,)
     assert str(d["dataset_path"]) == "data/sourceitr_smoke"
     assert str(d["split_name"]) == "test"
-    # Sensitivity block: source_itr persists the (4,4) right vectors + alignment.
-    assert d["right_vectors"].shape == (4, 4)
-    assert d["singular_values"].shape == (4,)
-    assert "ramp_sigma_alignment" in d
+    # Sensitivity block: source_itr_sin persists the (4,4) right vectors + alignment.
+    assert d["right_vectors"].shape == (2, 2)
+    assert d["singular_values"].shape == (2,)
     assert d["observation_jacobian"].shape[1] == 4
     # Inflation scalars mirror the UQ columns.
     assert float(d["sigma_eff2"]) == pytest.approx(0.1)

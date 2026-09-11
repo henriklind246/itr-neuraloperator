@@ -517,19 +517,19 @@ class TestPerRowInterfaceResistance:
             assert np.allclose(G[ii, :], G[ii, 0], rtol=0, atol=0)
 
     def test_flat_void_profile_full_solve_matches_scalar(self):
-        """R_amp=0 (flat profile) full solve equals the constant-R_c solve.
+        """A=0 (flat profile) full solve equals the constant-R_c solve.
 
         Proves existing constant-R_c benchmarks are unaffected by the per-row
-        code path: a flat make_rc_void_profile is bit-for-bit the scalar solve.
+        code path: a flat make_rc_sin_profile is bit-for-bit the scalar solve.
         """
-        from src.physics.internal_source import make_rc_void_profile
+        from src.physics.internal_source import make_rc_sin_profile
 
         Nx = Ny = 24
         kw = self._two_layer_kwargs(Nx=Nx, Ny=Ny)
         R_base = 0.42
         sim_scalar = FVSolver2D(interface_R=[R_base], **kw)
-        flat = make_rc_void_profile(
-            sim_scalar.grid_y, R_base=R_base, R_amp=0.0, y0=0.5, sigma=0.1
+        flat = make_rc_sin_profile(
+            sim_scalar.grid_y, R_base=R_base, A=0.0
         )
         sim_array = FVSolver2D(interface_R=[flat], **kw)
 
@@ -542,12 +542,12 @@ class TestPerRowInterfaceResistance:
 
     def test_void_increases_local_resistance(self):
         """A central void (higher R_c) lowers interface conductance there."""
-        from src.physics.internal_source import make_rc_void_profile
+        from src.physics.internal_source import make_rc_sin_profile
 
         Ny = 40
         kw = self._two_layer_kwargs(Nx=Ny, Ny=Ny)
-        prof = make_rc_void_profile(
-            np.linspace(0.0, 1.0, Ny), R_base=0.1, R_amp=1.0, y0=0.5, sigma=0.1
+        prof = make_rc_sin_profile(
+            np.linspace(0.0, 1.0, Ny), R_base=0.1, A=1.0
         )
         sim = FVSolver2D(interface_R=[prof], **kw)
         G = sim._build_face_conductance_x()

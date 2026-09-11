@@ -243,7 +243,7 @@ def test_strict_table_still_blocks_bins_representation(publication_source, tmp_p
     path = next(
         Path(artifact.path)
         for artifact in publication_source.artifacts
-        if artifact.benchmarks == ("source_itr",)
+        if artifact.benchmarks == ("source_itr_sin",)
     )
     payload = json.loads(records.provenance_path_for(path).read_text())
     payload["representation"] = "bins"
@@ -315,7 +315,7 @@ def test_descriptive_table_accepts_one_checkpoint_and_labels_mixed_representatio
             tmp_path,
             benchmark,
             "7",
-            representation="bins" if benchmark == "source_itr" else "temporal_encoder",
+            representation="bins" if benchmark == "source_itr_sin" else "temporal_encoder",
         )
         for benchmark in tables.BENCH_ORDER
     ]

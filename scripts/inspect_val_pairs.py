@@ -35,10 +35,10 @@ LEAD_BINS = 12
 BASE_COND_COLS = ["t_s", "t_bar", "R_c"]
 BENCHMARK_COND_COLS = {
     "forcing": [],
-    "forcing_itr": ["R_c_amp", "R_c_sigma", "S_R"],
+    "forcing_itr_sin": ["R_c_A", "S_R"],
     "interfaces": ["interface_x"],
     "source": ["x_h", "y_h", "A"],
-    "source_itr": ["x_h", "y_h", "A"],
+    "source_itr_sin": ["x_h", "y_h", "A", "R_c_A"],
 }
 
 # Per-pair metrics to report side-by-side in every stratification table. The
@@ -51,9 +51,9 @@ STRAT_METRICS = ["rel_l2", "rmse_K", "sigma_nrmse_pct", "nrmse"]
 
 TAIL_CATEGORICAL_COLS = {
     "forcing": ("temporal_family", "spatial_family"),
-    "forcing_itr": ("temporal_family", "spatial_family"),
+    "forcing_itr_sin": ("temporal_family", "spatial_family"),
     "source": ("regime",),
-    "source_itr": ("regime",),
+    "source_itr_sin": ("regime",),
     "interfaces": (),
 }
 
@@ -181,14 +181,14 @@ def report_regime_stratification(latest: pd.DataFrame, cond_cols: list[str]) -> 
 
 
 def report_xh_deciles(latest: pd.DataFrame, benchmark: str) -> None:
-    """Source/source_itr: stratify the new metrics by x_h decile.
+    """Source/source_itr_sin: stratify the new metrics by x_h decile.
 
     x_h (patch x-position relative to the fixed interface at x=0.5) is the regime
     axis for the source benchmarks: high-x_h patches sit in the near-isothermal
     right slab where per-sample signal scale collapses and nrmse diverges while
     rmse_K stays small. This is the paper's central stratification proof.
     """
-    if benchmark not in ("source", "source_itr"):
+    if benchmark not in ("source", "source_itr_sin"):
         return
     if not _is_varying_numeric(latest, "x_h"):
         return
@@ -209,7 +209,7 @@ def report_xh_deciles(latest: pd.DataFrame, benchmark: str) -> None:
 
 def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
     print(f"\n=== 4. Structure breakdown for benchmark={benchmark!r} (final epoch) ===")
-    if benchmark in ("forcing", "forcing_itr") and {
+    if benchmark in ("forcing", "forcing_itr_sin") and {
         "temporal_family", "spatial_family"
     } <= set(latest.columns):
         agg = latest.groupby(["temporal_family", "spatial_family"])["rel_l2"].agg(
@@ -220,7 +220,7 @@ def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
         bins = pd.qcut(latest["interface_x"], 5, duplicates="drop")
         agg = latest.groupby(bins, observed=True)["rel_l2"].agg(["mean", "median", _quantile(0.99)])
         print(agg.to_string(float_format=lambda x: f"{x:.4f}"))
-    elif benchmark in ("source", "source_itr") and "regime" in latest.columns:
+    elif benchmark in ("source", "source_itr_sin") and "regime" in latest.columns:
         agg = latest.groupby("regime")["rel_l2"].agg(["mean", "median", "count"])
         print(agg.sort_values("mean").to_string(float_format=lambda x: f"{x:.4f}"))
     else:
@@ -566,11 +566,11 @@ def plot_interface_ratio(latest: pd.DataFrame, out: Path) -> None:
 
 def plot_structure(latest: pd.DataFrame, benchmark: str, out: Path) -> None:
     """Benchmark-specific final plot (the 5th figure)."""
-    if benchmark in ("forcing", "forcing_itr"):
+    if benchmark in ("forcing", "forcing_itr_sin"):
         _plot_ic_family_heatmap(latest, out)
     elif benchmark == "interfaces":
         _plot_error_vs_interface_x(latest, out)
-    elif benchmark in ("source", "source_itr"):
+    elif benchmark in ("source", "source_itr_sin"):
         _plot_source_structure(latest, out)
     else:
         print(f"  [skip] 05_structure: no structure plot for benchmark={benchmark!r}")

@@ -300,14 +300,6 @@ class TestAnnotation:
         assert [ax.texts[0].get_text() for ax in axes] == ["(d)", "(e)"]
         plt.close(fig)
 
-    def test_void_shading_spans_two_sigma_each_side(self):
-        fig, ax = plt.subplots()
-        style.add_void_shading(ax, y0=0.5, sigma=0.1, n_sigma=2.0, label=None)
-        (patch,) = list(ax.patches)
-        lo = patch.get_x()
-        assert lo == pytest.approx(0.3)
-        assert lo + patch.get_width() == pytest.approx(0.7)
-        plt.close(fig)
 
     def test_reference_line_sits_at_the_requested_value(self):
         fig, ax = plt.subplots()
@@ -571,7 +563,7 @@ class TestSingleJumpImplementation:
         np.testing.assert_allclose(dT, R_c * flux, rtol=1e-12, atol=1e-12)
 
     def test_a_vector_resistance_profile_is_accepted(self):
-        """``source_itr`` is the whole reason the jump must be a function of y."""
+        """``source_itr_sin`` is the whole reason the jump must be a function of y."""
         from visual.pub import jump
 
         x_grid = np.linspace(0.0, 1.0, 17)

@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Benchmarks with a branch in rollout.build_rollout_item_from_base. Anything else
 # would raise mid-study, after dataset generation has already been paid for.
-ROLLOUT_BENCHMARKS = ("forcing", "interfaces", "source", "source_itr", "diffusion")
+ROLLOUT_BENCHMARKS = ("forcing", "interfaces", "source", "source_itr_sin", "diffusion")
 
 
 def lead_of(row):

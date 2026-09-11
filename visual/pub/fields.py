@@ -82,7 +82,7 @@ class CaseFields:
     t_targets: np.ndarray
     lead_times: np.ndarray
     interface_x: float
-    R_c: np.ndarray | float    # scalar, or (Ny,) for source_itr
+    R_c: np.ndarray | float    # scalar, or (Ny,) for source_itr_sin
     k_left: float
     k_right: float
     params: object
@@ -215,7 +215,7 @@ def bundles(source) -> dict[str, RunBundle]:
 # ------------------------------------------------------------------ evaluation
 
 def layer_conductivities(bundle_: RunBundle) -> tuple[float, float]:
-    if bundle_.benchmark in ("source", "source_itr", "source_itr_sin"):
+    if bundle_.benchmark in ("source", "source_itr_sin"):
         return _K_LEFT_SOURCE, _K_RIGHT_SOURCE
     layers = bundle_.config.get("physics", {}).get("layers")
     if layers and len(layers) >= 2:
@@ -238,16 +238,9 @@ def _param_names(params) -> tuple[str, ...]:
 
 
 def resistance(bundle_: RunBundle, sim_id: int) -> np.ndarray | float:
-    """``R_c`` for one simulation: a scalar, or the ``(Ny,)`` void profile."""
+    """``R_c`` for one simulation: a scalar, or the ``(Ny,)`` sinusoidal profile."""
     params = bundle_.sim_params[int(sim_id)]
     names = _param_names(params)
-    if all(k in names for k in ("R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma")):
-        from src.physics.internal_source import make_rc_void_profile
-        return make_rc_void_profile(
-            np.asarray(bundle_.y_grid, dtype=np.float64),
-            R_base=float(params["R_c_base"]), R_amp=float(params["R_c_amp"]),
-            y0=float(params["R_c_y0"]), sigma=float(params["R_c_sigma"]),
-        )
     if all(k in names for k in ("R_c_base", "R_c_A")):
         from src.physics.internal_source import make_rc_sin_profile
         return make_rc_sin_profile(
@@ -257,18 +250,12 @@ def resistance(bundle_: RunBundle, sim_id: int) -> np.ndarray | float:
     return float(params["R_c"])
 
 
-def void_profile(params) -> tuple[float, float] | None:
-    """``(y0, sigma)`` of the Gaussian ``R_c(y)`` void, or ``None`` if uniform."""
-    names = _param_names(params)
-    if "R_c_y0" in names and "R_c_sigma" in names:
-        return float(params["R_c_y0"]), float(params["R_c_sigma"])
-    return None
 
 
 def source_patch(params) -> tuple[float, float, float, float] | None:
     """``(x_h, y_h, w_h, h_h)`` of the volumetric heating patch, or ``None``.
 
-    Only ``source`` and ``source_itr`` have one. Figures draw its outline so a
+    Only ``source`` and ``source_itr_sin`` have one. Figures draw its outline so a
     reader can see where the heat entered the domain.
     """
     names = _param_names(params)
@@ -387,7 +374,7 @@ def evaluate_contact_jump_cohort(
 #
 # Large parts of every benchmark are like that, and not by accident. `forcing`
 # with a `uniform` spatial profile is 1-D by construction. `source` and
-# `source_itr` start 2-D at the patch and diffuse toward a 1-D profile, so the
+# `source_itr_sin` start 2-D at the patch and diffuse toward a 1-D profile, so the
 # structure is gone by the late target times. `interfaces` drives all four
 # benchmarks' least transverse variation of all: uniform/sin forcing, with only
 # the initial condition breaking symmetry.
@@ -636,5 +623,4 @@ __all__ = [
     "transverse_fraction",
     "transverse_note",
     "transverse_pairs",
-    "void_profile",
 ]

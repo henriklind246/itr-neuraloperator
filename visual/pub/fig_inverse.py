@@ -16,7 +16,7 @@ from visual.pub._blocked import blocked
 
 _RECOVERY_KEYS = {
     "forcing": "F16_inverse_forcing_recovery",
-    "forcing_itr": "F17_inverse_forcing_itr",
+    "forcing_itr_sin": "F17_inverse_forcing_itr_sin",
 }
 
 # Recovered quantities per inverse benchmark, in the order they are drawn:
@@ -27,9 +27,7 @@ _FORCING_PARAMS = (("R_c", r"$R_c$"),)
 
 _FORCING_ITR_PARAMS = (
     ("R_base", r"$R_{\mathrm{base}}$"),
-    ("R_amp", r"$R_{\mathrm{amp}}$"),
-    ("y0", r"$y_0$"),
-    ("sigma", r"$\sigma$"),
+    ("A", r"$A$"),
     ("excess_int", r"$\int (R_c - R_{\mathrm{base}})\,\mathrm{d}y$"),
 )
 
@@ -37,16 +35,12 @@ _FORCING_ITR_PARAMS = (
 # the combination of parameters the boundary data constrains worst.
 _ITR_DIRECTION = (
     ("least_dir_R_base", r"$R_{\mathrm{base}}$"),
-    ("least_dir_R_amp", r"$R_{\mathrm{amp}}$"),
-    ("least_dir_y0", r"$y_0$"),
-    ("least_dir_sigma", r"$\sigma$"),
+    ("least_dir_A", r"$A$"),
 )
 
 _DIRECTION_COLORS = {
     r"$R_{\mathrm{base}}$": "#0072B2",
-    r"$R_{\mathrm{amp}}$": "#D55E00",
-    r"$y_0$": "#009E73",
-    r"$\sigma$": "#CC79A7",
+    r"$A$": "#D55E00",
 }
 
 _NOMINAL_COVERAGE = 0.95
@@ -93,18 +87,18 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
     ``forcing`` recovers a scalar :math:`R_c`, so the figure is one scatter, the
     error distribution, and interval coverage.
 
-    ``forcing_itr`` recovers a Gaussian void profile, four parameters plus the
+    ``forcing_itr_sin`` recovers a sinusoidal profile, two parameters plus the
     integrated excess resistance. Its last panel is the identifiability
     statement: the squared components of the least-determined direction of the
     local sensitivity, one bar per case, ordered by condition number. When a bar
     is a single colour the boundary data does not separate that parameter at
     all.
 
-    The second inverse benchmark is ``forcing_itr``, not ``source_itr``; the
-    existing ``source_itr`` inverse figures are retired.
+    The second inverse benchmark is ``forcing_itr_sin``, not ``source_itr_sin``; the
+    existing ``source_itr_sin`` inverse figures are retired.
     """
     key = _RECOVERY_KEYS.get(benchmark, f"recovery[{benchmark}]")
-    params = _FORCING_ITR_PARAMS if benchmark == "forcing_itr" else _FORCING_PARAMS
+    params = _FORCING_ITR_PARAMS if benchmark == "forcing_itr_sin" else _FORCING_PARAMS
     df, path = _table(
         source, requirement, key,
         f"needs an inverse result CSV for {benchmark}; none resolved from the "
@@ -115,7 +109,7 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
     n_cases = records.count_simulations(df)
     width = spec.width if spec is not None else "two_col"
 
-    n_panels = len(params) + (2 if benchmark != "forcing_itr" else 1)
+    n_panels = len(params) + (2 if benchmark != "forcing_itr_sin" else 1)
     ncols = min(3, n_panels)
     nrows = int(np.ceil(n_panels / ncols))
     fig, axes = plt.subplots(nrows, ncols,
@@ -134,7 +128,7 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
 
     used = len(params)
 
-    if benchmark == "forcing_itr":
+    if benchmark == "forcing_itr_sin":
         order = np.argsort(np.asarray(df["cond_number"], dtype=float))
         weights = {}
         for column, label in _ITR_DIRECTION:
@@ -185,11 +179,11 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
         "failed_cases": "no case is dropped; every inversion in the table is drawn",
         "coverage": "Wilson 95% interval on the fraction of cases whose stated "
                     "95% interval contains the truth"
-                    if benchmark != "forcing_itr" else None,
+                    if benchmark != "forcing_itr_sin" else None,
         "identifiability": (
             "squared components of the unit least-determined direction of the "
             "local sensitivity, cases ordered by condition number"
-            if benchmark == "forcing_itr" else None),
+            if benchmark == "forcing_itr_sin" else None),
         "degradations": _too_few(n_cases),
     }
     return fig, None, metric_definition
@@ -209,14 +203,14 @@ def sensor_count(*, source=None, spec=None, requirement=None):
     if not records.artifact_paths(source, "inverse_csv"):
         blocked(
             requirement,
-            "needs the paired forcing and forcing_itr sweep at 8, 16, and 32 "
+            "needs the paired forcing and forcing_itr_sin sweep at 8, 16, and 32 "
             "sensors; no canonical inverse_sensor_sweep.csv resolved from the "
             "manifest.",
             key="F18_sensor_count",
         )
     table = records.load_inverse_sensor_sweep(source)
     summaries = stats.inverse_sensor_sweep_summaries(table)
-    benchmark_order = ("forcing", "forcing_itr")
+    benchmark_order = ("forcing", "forcing_itr_sin")
     width = spec.width if spec is not None else "two_col"
     fig, axes = plt.subplots(
         len(benchmark_order), 3,
@@ -273,7 +267,7 @@ def sensor_count(*, source=None, spec=None, requirement=None):
         },
         "recovery_estimands": {
             "forcing": "absolute error in scalar R_c",
-            "forcing_itr": "absolute error in integrated excess resistance S_R",
+            "forcing_itr_sin": "absolute error in integrated excess resistance S_R",
         },
         "fv_residual": (
             "physical RMS sensor residual in Kelvin from the real finite-volume "

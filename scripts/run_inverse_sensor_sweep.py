@@ -50,7 +50,7 @@ NOISE_SEED = 0
 # training corpus (see scripts/invert.prepare_inversion_dataset).
 N_CASES = 8
 
-BENCHMARKS = ("forcing", "forcing_itr", "source_itr_sin")
+BENCHMARKS = ("forcing", "forcing_itr_sin", "source_itr_sin")
 REQUIRED_DATA_FILES = (
     "trajectories.npy",
     "x_grid.npy",
@@ -92,7 +92,7 @@ _SWEEP_METRIC_SPECS = {
         lead_profile_ci_low_col="profile_R_c_ci_low",
         lead_profile_ci_high_col="profile_R_c_ci_high",
     ),
-    "forcing_itr": SweepMetricSpec(
+    "forcing_itr_sin": SweepMetricSpec(
         lead_name="S_R",
         lead_description=(
             "integrated excess resistance S_R = ∫(R_c − R_base) dy"

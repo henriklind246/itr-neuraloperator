@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from typing import Any
+from src.physics.boundary_forcing import build_qL, build_qL_integral, default_ramp_seconds
+from src.physics.fv_solver_2d import FVSolver2D
+from problems.source_itr_sin import RC_Y_CHANNEL
 
 import numpy as np
 
@@ -9,19 +12,15 @@ from problems.forcing import (
     COND_STATIC_DIM as FORCING_COND_STATIC_DIM,
     FORCING_TEMPORAL_TOKEN_DIM,
     SPATIAL_PROFILE_BINS,
-)
-from problems.forcing_itr import (
-    DEFAULT_ITR_PROFILE_SEED,
-    SPATIAL_CHANNELS_TEMPORAL,
-    S_Y_CHANNEL,
-    ForcingItrProblem,
-    _lhs_unit,
+    ForcingProblem,
+    SPATIAL_CHANNELS_TEMPORAL as FORCING_SPATIAL_CHANNELS_TEMPORAL,
 )
 from src.physics.internal_source import (
     RC_SIN_RANGES,
     R_PEAK_MAX,
     integrated_excess_resistance,
     make_rc_sin_profile,
+    rc_log_norm,
 )
 
 
@@ -33,7 +32,28 @@ FORCING_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE = slice(
     COND_STATIC_DIM,
 )
 
-DEFAULT_SIN_PROFILE_SEED = DEFAULT_ITR_PROFILE_SEED + 993
+DEFAULT_SIN_PROFILE_SEED = 1985
+DEFAULT_FORCING_PROFILE_SEED = 1
+FORCING_SAMPLER_VERSION = "forcing-v1"
+SPATIAL_CHANNELS_TEMPORAL = FORCING_SPATIAL_CHANNELS_TEMPORAL + 1
+S_Y_CHANNEL = 3
+REQUIRED_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
+
+def _lhs_unit(n: int, d: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    edges = np.linspace(0.0, 1.0, n + 1, dtype=np.float64)
+    points = edges[:-1, None] + np.diff(edges)[:, None] * rng.random((n, d))
+    for j in range(d):
+        rng.shuffle(points[:, j])
+    return points
+
+
+def forcing_sample_key(sample_index: int, *, seed: int) -> str:
+    return (
+        f"{FORCING_SAMPLER_VERSION}:seed={int(seed)}:"
+        f"index={int(sample_index):06d}"
+    )
+
 
 
 def build_cond_vector_forcing_itr_sin(
@@ -49,7 +69,7 @@ def build_cond_vector_forcing_itr_sin(
     conditioning normalization A_norm = A / (R_PEAK_MAX - RC_MIN) over the constant
     RC_SIN_RANGES["A"] (NOT the headroom fraction A / (R_PEAK_MAX - R_base) used for
     sampling/OOD/inverse) so the conditioning channel stays stationary across sims.
-    Mirrors :func:`build_cond_vector_forcing_itr` for the 2-param sinusoid.
+    Mirrors :func:`build_cond_vector_forcing_itr_sin` for the 2-param sinusoid.
     """
     parent = np.asarray(parent_cond, dtype=np.float32)
     if parent.shape != (FORCING_COND_STATIC_DIM,):
@@ -69,19 +89,12 @@ def build_cond_vector_forcing_itr_sin(
     return np.concatenate([parent[:1], itr, parent[2:]]).astype(np.float32)
 
 
-class ForcingItrSinProblem(ForcingItrProblem):
-    """Forcing benchmark with a *sinusoidal* interface resistance R_c(y).
-
-    Subclasses :class:`ForcingItrProblem`, reusing its forcing-family sampling and
-    inheriting `build_item`, `configure_solver`, and the R_c(y) spatial channel
-    unchanged. The interface at x = 0.5 carries a single-hump profile
-        R_c(y) = R_base + A * sin(pi * y)
-    (2 parameters) instead of the 4-parameter Gaussian void. Only the two parent
-    hooks `_canonical_profile` and `_cond_vector` are overridden; the Gaussian-void
-    `forcing_itr` benchmark is untouched.
-    """
+class ForcingItrSinProblem(ForcingProblem):
+    """Forcing benchmark with R_c(y) = R_base + A sin(pi y)."""
 
     name = "forcing_itr_sin"
+    supports_scalar_spatial_input = False
+    required_observation_times = REQUIRED_OBSERVATION_TIMES
     spatial_descriptor_cond_slice = FORCING_ITR_SIN_SPATIAL_DESCRIPTOR_SLICE
 
     def __init__(self, representation: str = "temporal_encoder"):
@@ -110,19 +123,14 @@ class ForcingItrSinProblem(ForcingItrProblem):
         grids: dict[str, np.ndarray],
         time_cfg: dict[str, Any],
     ) -> list[dict]:
-        # Reuse the parent's (Gaussian-void) forcing-family sampling so the
-        # temporal/spatial forcing distribution and R_c_base stay identical, then
-        # overwrite the interface params with the 2-param sinusoid. The parent
-        # writes the void keys R_c_amp/R_c_y0/R_c_sigma, forbidden here, so pop them.
         params = super().sample_sim_params(rng, rng_profile, grids, time_cfg)
         n = len(params)
         sin_seed = int(time_cfg.get("sin_profile_seed", DEFAULT_SIN_PROFILE_SEED))
         u = _lhs_unit(n, 1, sin_seed)
         for i, entry in enumerate(params):
-            entry.pop("R_c_amp", None)
-            entry.pop("R_c_y0", None)
-            entry.pop("R_c_sigma", None)
-            R_base = float(entry["R_c_base"])
+            R_base = float(entry["R_c"])
+            entry.update(R_c_base=R_base, parent_benchmark="forcing", parent_sim_id=i,
+                         forcing_sample_key=forcing_sample_key(i, seed=int(time_cfg.get("forcing_profile_seed", DEFAULT_FORCING_PROFILE_SEED))))
             # Headroom fraction (NOT the global conditioning norm): keeps R_c(y)
             # in [RC_MIN, R_PEAK_MAX] by construction; (R_base, A) jointly
             # triangular.
@@ -201,3 +209,80 @@ class ForcingItrSinProblem(ForcingItrProblem):
 
     def ood_axes(self) -> dict[str, OODAxis]:
         return {}
+
+
+    def configure_solver(self, params: dict, base_kwargs: dict) -> FVSolver2D:
+        physics = self.physics_parameters(
+            base_kwargs["a"], base_kwargs["b"],
+            base_kwargs["c"], base_kwargs["d"],
+        )
+        y_grid = np.asarray(base_kwargs["y_grid"], dtype=np.float64)
+        ramp = base_kwargs.get("ramp_seconds")
+        t_ramp = (
+            float(ramp)
+            if ramp is not None
+            else default_ramp_seconds(base_kwargs["dt"])
+        )
+        q_left_fn, _ = build_qL(
+            temporal_family=params["temporal_family"],
+            temporal_params=params["temporal_params"],
+            spatial_family=params["spatial_family"],
+            spatial_params=params["spatial_params"],
+            y_grid=y_grid,
+            t_ramp=t_ramp,
+        )
+        q_left_integral_fn, _ = build_qL_integral(
+            temporal_family=params["temporal_family"],
+            temporal_params=params["temporal_params"],
+            spatial_family=params["spatial_family"],
+            spatial_params=params["spatial_params"],
+            y_grid=y_grid,
+            t_ramp=t_ramp,
+        )
+        profile = self._canonical_profile(params, y_grid)
+        return FVSolver2D(
+            a=base_kwargs["a"], b=base_kwargs["b"],
+            c=base_kwargs["c"], d=base_kwargs["d"],
+            Nx=base_kwargs["Nx"], Ny=base_kwargs["Ny"],
+            lam_target=base_kwargs["lam_target"],
+            layers=physics["layers"],
+            t_final=base_kwargs["t_final"],
+            flux_f=base_kwargs["flux_f"], flux_A=base_kwargs["flux_A"],
+            t_on=base_kwargs["t_on"], t_off=base_kwargs["t_off"],
+            phase=base_kwargs["phase"],
+            dt=base_kwargs["dt"], tukey_alpha=base_kwargs["tukey_alpha"],
+            interface_R=[profile],
+            q_left_fn=q_left_fn,
+            q_left_integral_fn=q_left_integral_fn,
+        )
+
+
+    def setup_dataset(self, ds) -> None:
+        if self.rc_channel_mode != "broadcast":
+            raise ValueError("forcing_itr_sin currently supports rc_channel_mode='broadcast'.")
+        self.validate_schema(ds.sim_params, ds.sim_ids)
+        super().setup_dataset(ds)
+
+
+    def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
+        params = ds.sim_params[int(sid)]
+        parent = self._build_item_with_resistance(
+            ds, sid, s, j, R_c=float(params["R_c_base"])
+        )
+        profile = self._canonical_profile(params, ds.y_grid)
+        rc_channel = np.broadcast_to(
+            rc_log_norm(profile)[None, :], (ds.Nx, ds.Ny)
+        )[..., None]
+        parent["spatial"] = np.concatenate(
+            [
+                parent["spatial"][..., :RC_Y_CHANNEL],
+                rc_channel,
+                parent["spatial"][..., RC_Y_CHANNEL:],
+            ],
+            axis=-1,
+        ).astype(np.float32)
+        parent["cond_static"] = self._cond_vector(params, parent["cond_static"])
+        parent["cond_static"] = self._apply_spatial_conditioning_mask(
+            parent["cond_static"]
+        )
+        return parent

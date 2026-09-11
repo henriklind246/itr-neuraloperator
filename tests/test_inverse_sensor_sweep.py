@@ -142,7 +142,7 @@ def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
     ("benchmark", "estimand", "unit"),
     [
         ("forcing", "R_c", "m² K/W"),
-        ("forcing_itr", "S_R", "m³ K/W"),
+        ("forcing_itr_sin", "S_R", "m³ K/W"),
         ("source_itr_sin", "S_R", "m³ K/W"),
     ],
 )
@@ -234,7 +234,7 @@ def test_cli_data_dir_optional_and_overrides(tmp_path):
     assert minimal.data_dir is None
     assert set(sweep.BENCHMARKS) == {
         "forcing",
-        "forcing_itr",
+        "forcing_itr_sin",
         "source_itr_sin",
     }
 
@@ -371,7 +371,7 @@ def test_run_sweep_rejects_checkpoint_benchmark_mismatch(tmp_path):
     checkpoint = _checkpoint(tmp_path / "model.pt", benchmark="forcing")
     with pytest.raises(ValueError, match="does not match checkpoint benchmark"):
         sweep.run_sweep(
-            benchmark="forcing_itr",
+            benchmark="forcing_itr_sin",
             checkpoint=checkpoint,
             data_dir=tmp_path / "unused",
             out_dir=tmp_path / "out",

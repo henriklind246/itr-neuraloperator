@@ -123,72 +123,11 @@ def build_patch_source(
 
 
 # ---------------------------------------------------------------------------
-# Spatially-varying interface resistance (Gaussian void)
+# Spatially-varying interface resistance (sinusoidal profile)
 # ---------------------------------------------------------------------------
-# R_c(y) = R_base + R_amp * exp(-((y - y0) / sigma)^2)
-#
-# Models a localized delamination / air-gap void in the thermal interface
-# material along the fixed x = 0.5 interface: a single smooth positive bump in
-# the contact resistance centered at y0 with width sigma. The amplitude bound is
-# *dependent* on R_base so the profile is physical by construction (no clipping):
-#   R_c(y) in [R_base, R_base + R_amp] subset [RC_MIN, R_PEAK_MAX].
-# Sampling R_amp in [0, R_PEAK_MAX - R_base] makes the (R_base, R_amp) joint
-# distribution triangular (high base => low admissible amp); this is an
-# in-distribution correlation, so avoid independence/extrapolation claims on it.
 RC_MIN: float = 0.05
 R_PEAK_MAX: float = 3.0
-RC_VOID_RANGES: dict[str, tuple[float, float]] = {
-    "R_base": (0.05, 1.0),
-    # Upper amp bound is resolved per-sample as (R_PEAK_MAX - R_base); the value
-    # here is the global maximum used for normalization (R_base at its floor).
-    "R_amp": (0.0, R_PEAK_MAX - RC_MIN),
-    "y0": (0.1, 0.9),
-    # sigma >= 0.05 spans ~5 cells on Ny = 100, keeping the void resolved.
-    "sigma": (0.05, 0.2),
-}
 
-
-def make_rc_void_profile(
-    y_grid: np.ndarray,
-    R_base: float,
-    R_amp: float,
-    y0: float,
-    sigma: float,
-) -> np.ndarray:
-    """Return the (Ny,) Gaussian-void interface-resistance profile R_c(y).
-
-    Evaluated at the interface-row coordinates `y_grid`:
-        R_c(y) = R_base + R_amp * exp(-((y - y0) / sigma)^2).
-    With R_amp = 0 this returns a flat R_base profile (used by the parity /
-    regression tests). Returns float64 so it feeds the solver's series-resistance
-    formula at full precision.
-    """
-    if sigma <= 0.0:
-        raise ValueError(f"sigma must be positive, got {sigma}.")
-    y = np.asarray(y_grid, dtype=np.float64)
-    return R_base + R_amp * np.exp(-(((y - y0) / sigma) ** 2))
-
-
-# ---------------------------------------------------------------------------
-# Spatially-varying interface resistance (sinusoidal hump)
-# ---------------------------------------------------------------------------
-# R_c(y) = R_base + A * sin(pi * y)
-#
-# A smooth single-hump alternative to the Gaussian void, used by the
-# source_itr_sin / forcing_itr_sin benchmarks. On [0, 1], sin(pi y) >= 0 with a
-# single peak at y = 0.5, so with A >= 0 and the *dependent* bound
-# A <= R_PEAK_MAX - R_base the profile stays in
-#   R_c(y) in [R_base, R_base + A] subset [RC_MIN, R_PEAK_MAX],
-# strictly positive by construction (rc_log_norm and the [RC_MIN, R_PEAK_MAX]
-# normalization apply unchanged). Sampling A in [0, R_PEAK_MAX - R_base] makes
-# the (R_base, A) joint distribution triangular, mirroring the void's amp bound.
-#
-# Two distinct normalizations of A are used downstream and MUST NOT be conflated:
-#   - network conditioning uses the fixed global A_norm = A / (R_PEAK_MAX - RC_MIN)
-#     over RC_SIN_RANGES["A"] below (constant denominator, stationary channel);
-#   - sampling / OOD / inverse unconstrained space uses the headroom fraction
-#     u_A = A / (R_PEAK_MAX - R_base), so A = u_A * (R_PEAK_MAX - R_base).
-# RC_SIN_RANGES is the single source of truth for the *global* denominator only.
 RC_SIN_RANGES: dict[str, tuple[float, float]] = {
     "R_base": (0.05, 1.0),
     # Global max used for conditioning normalization (R_base at its floor); the
@@ -272,3 +211,17 @@ def equivalent_scalar_resistance(
     if np.any(Rc <= 0.0):
         raise ValueError("Rc_profile must be strictly positive.")
     return float(np.sum(weights) / np.sum(weights / Rc))
+
+
+def rc_log_norm(Rc_y: np.ndarray) -> np.ndarray:
+    """Log-normalize a physical R_c(y) profile to roughly [-1, 1].
+
+    Linear normalization over the 60x span [RC_MIN, R_PEAK_MAX] = [0.05, 3.0]
+    wastes most of the range because realistic R_base clusters in [0.05, 1.0];
+    log-spacing spends resolution where the samples are. R_c(y) >= R_base >=
+    RC_MIN, so the log argument is always positive.
+    """
+    log_min = np.log(RC_MIN)
+    log_max = np.log(R_PEAK_MAX)
+    Rc = np.asarray(Rc_y, dtype=np.float64)
+    return (2.0 * (np.log(Rc) - log_min) / (log_max - log_min) - 1.0).astype(np.float32)

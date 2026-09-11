@@ -37,17 +37,17 @@ requirement_sets:
       benchmark=source representation=temporal_encoder ; then
       python scripts/write_test_records.py runs/pub_source/config0 --seed <s>
 
-  source_itr_records:
+  source_itr_sin_records:
     kind: test_records
-    benchmarks: [source_itr]
+    benchmarks: [source_itr_sin]
     representation: temporal_encoder
     split: test
     min_seeds: 3
     schema_min: 2
     regenerate: >-
-      python scripts/run_train_fixed.py experiment.name=pub_source_itr
-      benchmark=source_itr representation=temporal_encoder ; then
-      python scripts/write_test_records.py runs/pub_source_itr/config0 --seed <s>
+      python scripts/run_train_fixed.py experiment.name=pub_source_itr_sin
+      benchmark=source_itr_sin representation=temporal_encoder ; then
+      python scripts/write_test_records.py runs/pub_source_itr_sin/config0 --seed <s>
 
   interfaces_records:
     kind: test_records
@@ -73,9 +73,9 @@ requirement_sets:
     benchmarks: [source]
     min_seeds: 3
 
-  source_itr_train:
+  source_itr_sin_train:
     kind: train_metrics
-    benchmarks: [source_itr]
+    benchmarks: [source_itr_sin]
     min_seeds: 3
 
   interfaces_train:
@@ -94,9 +94,9 @@ requirement_sets:
     benchmarks: [source]
     min_seeds: 1
 
-  source_itr_checkpoint:
+  source_itr_sin_checkpoint:
     kind: checkpoint
-    benchmarks: [source_itr]
+    benchmarks: [source_itr_sin]
     min_seeds: 1
     note: >-
       needed to render predicted fields and the contact jump; the signature
@@ -116,17 +116,17 @@ requirement_sets:
     required_columns: [sim_id, n_sensors]
     regenerate: python scripts/invert.py --benchmark forcing ...
 
-  inverse_forcing_itr:
+  inverse_forcing_itr_sin:
     kind: inverse_csv
-    benchmarks: [forcing_itr]
+    benchmarks: [forcing_itr_sin]
     min_seeds: 1
     schema_min: 0
     required_columns: [sim_id]
-    regenerate: python scripts/invert.py --benchmark forcing_itr ...
+    regenerate: python scripts/invert.py --benchmark forcing_itr_sin ...
 
   inverse_sensor_sweep:
     kind: inverse_csv
-    benchmarks: [forcing, forcing_itr]
+    benchmarks: [forcing, forcing_itr_sin]
     min_seeds: 1
     schema_min: 0
     required_columns:
@@ -142,9 +142,9 @@ requirement_sets:
     note: >-
       requires exactly 8, 16, and 32 sensors with the same eight simulations,
       noise realizations, and initialization seeds paired across counts for both
-      forcing and forcing_itr.
+      forcing and forcing_itr_sin.
     regenerate: >-
-      python scripts/run_inverse_sensor_sweep.py --benchmark <forcing|forcing_itr>
+      python scripts/run_inverse_sensor_sweep.py --benchmark <forcing|forcing_itr_sin>
       --checkpoint <matching-checkpoint>
 
   # --------------------------------------------------------------------- ood
@@ -204,11 +204,11 @@ figures:
     metric_space: none
 
   F03_learning_curves:
-    requires: [forcing_train, source_train, source_itr_train, interfaces_train]
+    requires: [forcing_train, source_train, source_itr_sin_train, interfaces_train]
     metric_space: normalized
 
   F04_headline_accuracy:
-    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     # mixed: three Kelvin panels plus one normalized panel carrying the 1%
     # target line. The target is defined on relative L2, so it cannot be drawn
     # on a Kelvin axis; each panel is a single metric and is labelled with its
@@ -219,24 +219,24 @@ figures:
     requires:
       - forcing_records
       - source_records
-      - source_itr_records
+      - source_itr_sin_records
       - interfaces_records
       - forcing_checkpoint
       - source_checkpoint
-      - source_itr_checkpoint
+      - source_itr_sin_checkpoint
       - interfaces_checkpoint
     metric_space: kelvin
 
-  # interfaces, not source_itr: the signature figure shares one temperature
+  # interfaces, not source_itr_sin: the signature figure shares one temperature
   # scale across truth and prediction, and under a localized internal source the
   # right slab never rises past ~9% of the left, so half of every source /
-  # source_itr panel would be one flat block. See PREFERRED in fig_signature.py.
+  # source_itr_sin panel would be one flat block. See PREFERRED in fig_signature.py.
   F06_signature:
     requires: [interfaces_records, interfaces_checkpoint]
     metric_space: kelvin
 
   F07_jump_vs_lead:
-    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     metric_space: mixed
 
   F08_forcing_difficulty:
@@ -255,12 +255,12 @@ figures:
     requires: [source_records, source_checkpoint]
     metric_space: kelvin
 
-  F12_source_itr_void:
-    requires: [source_itr_records]
+  F12_source_itr_sin_resistance:
+    requires: [source_itr_sin_records]
     metric_space: kelvin
 
-  F13_source_itr_cases:
-    requires: [source_itr_records, source_itr_checkpoint]
+  F13_source_itr_sin_cases:
+    requires: [source_itr_sin_records, source_itr_sin_checkpoint]
     metric_space: kelvin
 
   F14_interfaces_difficulty:
@@ -275,8 +275,8 @@ figures:
     requires: [inverse_forcing]
     metric_space: mixed
 
-  F17_inverse_forcing_itr:
-    requires: [inverse_forcing_itr]
+  F17_inverse_forcing_itr_sin:
+    requires: [inverse_forcing_itr_sin]
     metric_space: mixed
 
   F18_sensor_count:
@@ -298,7 +298,7 @@ figures:
     metric_space: normalized
 
   F21_tail_reliability:
-    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     # mixed: Kelvin order statistics plus the exceedance of the 1% relative
     # target, which is the only threshold the project has actually declared.
     metric_space: mixed
@@ -323,18 +323,18 @@ figures:
     requires:
       - forcing_records
       - source_records
-      - source_itr_records
+      - source_itr_sin_records
       - interfaces_records
       - forcing_checkpoint
       - source_checkpoint
-      - source_itr_checkpoint
+      - source_itr_sin_checkpoint
       - interfaces_checkpoint
     metric_space: kelvin
 
   F27_global_field_error_vs_lead:
-    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     metric_space: kelvin
 
   F28_global_field_error_vs_itr:
-    requires: [forcing_records, source_records, source_itr_records, interfaces_records]
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     metric_space: kelvin

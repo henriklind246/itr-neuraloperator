@@ -1,89 +1,10 @@
-"""Benchmark-adapter inverse solver for source_itr, forcing, and forcing_itr.
+"""Inverse estimation for scalar and sinusoidal interface resistance.
 
-For a real forcing checkpoint + held-out sims, run:
-
-    PYTHONPATH=$(pwd) .venv/bin/python scripts/invert.py --checkpoint <forcing_run>/seed42/fno2d_best.pt --data-dir <forcing_data_dir> --sim-ids <ids...>
-
-Use the *frozen forward FNO* as a
-differentiable surrogate to recover inverse parameters
-
-    source_itr / forcing_itr: theta = (R_base, R_amp, y0, sigma)
-    forcing:    theta = (R_c,)
-
-from observed temperatures, via a MAP / least-squares fit. The forward code is
-untouched; this script only *imports* it.
-
-The pipeline that produces the estimate is unchanged:
-  * direct-from-IC observation operator with every non-theta input held fixed,
-  * observations at several times spanning early/mid/late, either full-field or
-    through a masked interface-proximal *sensor operator* M (paired
-    interface-adjacent nodes or a finite interface band crossed with physical y
-    coordinates; full-field is the all-pixels case),
-  * LHS multistart Adam -> L-BFGS or Nelder-Mead over an unconstrained
-    reparameterization that keeps every iterate inside the physical box and
-    honors the R_base-dependent R_amp ceiling (so the FNO is never queried
-    out-of-distribution),
-  * iid Gaussian sensor noise added once to the observations.
-
-**Three statistics are reported per simulation, and only these three.** Each
-run emits them all; there are no flags to turn individual ones on or off.
-
-  1. *Recovery error of the lead estimand* (``summarize``). ``R_c`` for
-     forcing, the integrated excess resistance ``S_R`` for the spatial-ITR
-     benchmarks: the estimate, the truth, and the absolute error. This is the
-     statistic the inverse claim rests on.
-
-  2. *FV-verified sensor residual at theta_hat* (``fv_refine_report`` +
-     ``fv_verification_summary``). The FNO is the fast exploration engine, but
-     the conservative Crank-Nicolson finite-volume solver is the accuracy
-     engine, so ``theta_hat`` is re-evaluated with the **real** ``FVSolver2D``
-     (rebuilt via ``ds.problem.configure_solver``, i.e. the exact
-     data-generation operator) and the residual is reported in Kelvin against
-     the measurement noise floor. Without it, "the surrogate recovered theta"
-     is indistinguishable from "the surrogate fit its own error".
-
-  3. *Profile-likelihood interval on the lead estimand*
-     (``profile_likelihood`` + ``profile_interval_summary``). A Wilks interval
-     from the Gaussian NLL at the frozen validation-calibrated variance
-     ``sigma_eff^2 = (sigma_meas^2 + sigma_FNO,cal^2) * D``, where ``D`` is the
-     residual design effect that deflates the effective sensor/time count to
-     account for correlated surrogate error the sum-of-squares NLL would treat
-     as independent. Deterministic, with no sampler to mistune. Each pinned
-     nuisance refit is multistart (``--profile-starts``) with bidirectional
-     continuation across the grid, for the same reason the MAP fit is
-     multistart: a nuisance fit stuck in a local minimum reports an inflated
-     NLL, which biases the Wilks interval *narrow*. ``profile_sweep_gap``
-     records how much the reverse sweep improved on the forward one and should
-     be ~0. Requires ``--calibration-artifact``; without one it is skipped with
-     a printed note rather than silently faked.
-
-The diagnostics the earlier report computed beyond these three (the Jacobian-SVD
-identifiability block, the Laplace spectrum, the FV polish, and the
-equivalent-scalar comparison) are retained verbatim at the bottom of this file
-under "RETIRED DIAGNOSTICS", where the header records why each one left the
-reported set. Nothing on the live path calls them. The statistics-only members
-of that block - the RW-Metropolis MCMC (a second interval on the same scalar the
-profile already covers, and mistuned when live), the ``profile_summary`` /
-``mcmc_summary`` coverage flatteners, and their ``theta_logabsdet_du`` prior
-Jacobian - have been removed outright.
-
-theta enters the FNO in *two* places, and both must agree with the data
-pipeline exactly:
-  1. ``cond_static[1:5]`` — linear-normalized over ``RC_VOID_RANGES``
-     (mirrors the active spatial-ITR condition builder).
-  2. spatial channel ``RC_Y_CHANNEL`` (=4) — ``rc_log_norm(make_rc_void_profile(...))``
-     broadcast across x.
-
-Everything Stage 1 needs that is *not* theta (IC snapshot, x/y channels, known
-forcing/source fields, forcing sequence, and non-ITR condition slots) is taken verbatim from the
-real ``problem.build_item(ds, sid, s=0, j=n)`` so the scaffolding cannot drift
-from training. Only channel 4 and cond[1:5] are replaced by torch functions of
-theta, so autograd produces dT/dtheta through the frozen model.
-
-The profile interval is conditional on one frozen global calibration scale, not
-a test-case oracle covariance. The recoverable quantity under sparse sensing is
-the integrated excess resistance S_R, not necessarily the individual
-R_amp/sigma shape scalars.
+Supports forcing, forcing_itr_sin and source_itr_sin via InverseAdapter.
+Sinusoidal profiles use theta=(R_base, A), with A bounded by R_PEAK_MAX-R_base.
+The trained model is frozen; only interface conditioning is optimized.
+Sensor noise, surrogate-error calibration, profile likelihood, FV refinement
+and sensitivity diagnostics retain their existing metric conventions.
 """
 
 from __future__ import annotations
@@ -111,12 +32,12 @@ from data.dataset import (  # noqa: E402
 )
 from scripts.inverse_adapters import (  # noqa: E402
     InverseAdapter,
-    SourceItrAdapter,
-    VOID_PARAM_NAMES,
+    SourceItrSinAdapter,
+    SIN_PARAM_NAMES,
 )
 from src.operators.fno2d import FNO2d  # noqa: E402
 
-_SOURCE_ITR_ADAPTER = SourceItrAdapter()
+_SOURCE_ITR_SIN_ADAPTER = SourceItrSinAdapter()
 PAPER_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
 PAPER_SENSOR_Y = tuple(np.linspace(0.1, 0.9, 8))
 
@@ -138,25 +59,25 @@ CALIBRATION_FLOOR = 32
 # ---------------------------------------------------------------------------
 
 def theta_from_unconstrained(u: torch.Tensor) -> torch.Tensor:
-    """Legacy source_itr wrapper for ``SourceItrAdapter.theta_from_unconstrained``."""
-    return _SOURCE_ITR_ADAPTER.theta_from_unconstrained(u)
+    """Source-ITR sinusoid wrapper for ``SourceItrSinAdapter.theta_from_unconstrained``."""
+    return _SOURCE_ITR_SIN_ADAPTER.theta_from_unconstrained(u)
 
 
 def unconstrained_from_theta(theta: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Legacy source_itr wrapper for ``SourceItrAdapter.unconstrained_from_theta``."""
-    return _SOURCE_ITR_ADAPTER.unconstrained_from_theta(theta)
+    """Source-ITR sinusoid wrapper for ``SourceItrSinAdapter.unconstrained_from_theta``."""
+    return _SOURCE_ITR_SIN_ADAPTER.unconstrained_from_theta(theta)
 
 
 def theta_to_cond_slice(theta: torch.Tensor) -> torch.Tensor:
-    """Legacy source_itr wrapper for cond-static injection parity tests."""
-    return _SOURCE_ITR_ADAPTER.cond_slice_from_theta(theta)
+    """Source-ITR sinusoid wrapper for cond-static injection parity tests."""
+    return _SOURCE_ITR_SIN_ADAPTER.cond_slice_from_theta(theta)
 
 
 def theta_to_rc_channel(
     theta: torch.Tensor, y_grid: torch.Tensor, Nx: int
 ) -> torch.Tensor:
-    """Legacy source_itr wrapper for the normalized R_c(y) spatial channel."""
-    return _SOURCE_ITR_ADAPTER.spatial_channel_from_theta(theta, y_grid, Nx)
+    """Source-ITR sinusoid wrapper for the normalized R_c(y) spatial channel."""
+    return _SOURCE_ITR_SIN_ADAPTER.spatial_channel_from_theta(theta, y_grid, Nx)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +273,7 @@ def _adapt_legacy_zero_source_time_state(
         if isinstance(benchmark_cfg, dict)
         else str(benchmark_cfg)
     )
-    forcing_benchmarks = {"forcing", "forcing_itr", "forcing_itr_sin"}
+    forcing_benchmarks = {"forcing", "forcing_itr_sin"}
     if (
         benchmark not in forcing_benchmarks
         or checkpoint_cond_dim != dims.cond_static_dim + 1
@@ -434,7 +355,7 @@ def load_checkpoint(ckpt_path: str, device: str = "cpu") -> LoadedModel:
 
 
 # ---------------------------------------------------------------------------
-# Dataset construction over a local source_itr artifact directory.
+# Dataset construction over a local source_itr_sin artifact directory.
 # ---------------------------------------------------------------------------
 
 def prepare_inversion_dataset(
@@ -575,7 +496,7 @@ class ObservationSet:
     Built once from ``problem.build_item(ds, sid, s=0, j=n)`` for each
     observation time index ``n``. ``spatial`` carries the four theta-independent
     channels verbatim; channel ``RC_Y_CHANNEL`` is overwritten per-theta in the
-    loss. ``cond`` carries the lead/patch slots; columns 1:5 are overwritten.
+    loss. ``cond`` carries the lead/patch slots; columns 1:3 are overwritten.
     """
 
     sid: int
@@ -606,7 +527,7 @@ def build_observation_set(
     time_indices: list[int],
     device: str = "cpu",
     *,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
     interface_x: float = 0.5,
     sensor_x_halfwidth: Optional[float] = None,
     sensor_n_y: int = 8,
@@ -720,13 +641,13 @@ def predict_fullfield(
     model: FNO2d,
     obs: ObservationSet,
     theta: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> torch.Tensor:
     """G_theta over all observation times: returns (N, Nx, Ny, 1) normalized T.
 
     ``theta`` is a single physical (4,) vector. Both injection points are
     rebuilt from theta and spliced into the (otherwise detached) scaffolding so
-    autograd flows only through cond[1:5] and channel RC_Y_CHANNEL.
+    autograd flows only through cond[1:3] and channel RC_Y_CHANNEL.
 
     The splice is done out-of-place (``torch.where`` / ``torch.cat`` rather than
     indexed assignment) so the function is safe under ``vmap`` — needed for the
@@ -783,9 +704,9 @@ def lhs_starts_u(n_starts: int, rng: np.random.Generator, eps: float = 1e-3) -> 
 
     LHS is taken on the sigmoid-fraction cube (which *is* the physical box via
     :func:`theta_from_unconstrained`), then mapped to ``u`` with the logit so the
-    starts evenly tile every void scalar's range. Returns ``(n_starts, 4)``.
+    starts evenly tile each sinusoidal parameter's range. Returns ``(n_starts, 2)``.
     """
-    return _SOURCE_ITR_ADAPTER.lhs_starts_unconstrained(n_starts, rng, eps)
+    return _SOURCE_ITR_SIN_ADAPTER.lhs_starts_unconstrained(n_starts, rng, eps)
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +743,7 @@ def _data_loss(
     obs: ObservationSet,
     u: torch.Tensor,
     reg_weight: float,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ):
     theta = adapter.theta_from_unconstrained(u)
     pred = predict_fullfield(model, obs, theta, adapter)
@@ -839,7 +760,7 @@ def invert_sim(
     model: FNO2d,
     obs: ObservationSet,
     cfg: InversionConfig,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> InversionResult:
     device = cfg.device
     rng = np.random.default_rng(cfg.seed)
@@ -922,14 +843,14 @@ def invert_sim(
 # ---------------------------------------------------------------------------
 
 def integrated_excess_resistance(theta: torch.Tensor, y_grid: torch.Tensor) -> float:
-    """Trapezoidal integral of (R_c(y) - R_base) over y: total void "mass"."""
-    return _SOURCE_ITR_ADAPTER.uq_quantity(theta, y_grid)
+    """Trapezoidal integral of (R_c(y) - R_base) over y: integrated excess resistance."""
+    return _SOURCE_ITR_SIN_ADAPTER.uq_quantity(theta, y_grid)
 
 
 def summarize(
     result: InversionResult,
     y_grid: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> dict:
     return adapter.summarize_result(result, y_grid)
 
@@ -957,8 +878,8 @@ def _default_time_indices(Nt: int) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def build_fv_base_kwargs(ds: SnapshotPairDataset) -> dict:
-    """Legacy source_itr wrapper for exact FV base kwargs."""
-    return _SOURCE_ITR_ADAPTER.fv_base_kwargs(ds)
+    """Source-ITR sinusoid wrapper for exact FV base kwargs."""
+    return _SOURCE_ITR_SIN_ADAPTER.fv_base_kwargs(ds)
 
 
 def _theta_to_numpy(theta) -> np.ndarray:
@@ -1014,12 +935,12 @@ def fv_predict_masked(
     mu_global: float,
     sigma_global: float,
     mask: Optional[torch.Tensor],
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
     obs: Optional[ObservationSet] = None,
 ) -> torch.Tensor:
     """FV forward of ``theta`` at the observation sensors/times (normalized).
 
-    Overrides only the four void scalars (and the mirrored ``R_c`` slot) in a
+    Overrides only the two sinusoidal parameters (and the mirrored ``R_c`` slot) in a
     copy of the stored ``sim_params[sid]`` so the patch / IC / interface_x are
     bit-identical to data generation, rebuilds the solver, integrates from the
     stored IC, selects the observation snapshots by nearest solver time, and
@@ -1078,7 +999,7 @@ def fv_refine_report(
     sigma_global: float,
     polish: bool = False,
     polish_maxiter: int = 60,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> FVRefineResult:
     """FNO-vs-FV residual report at ``theta_hat`` (+ optional FV polish)."""
     mask_cpu = None if obs.mask is None else obs.mask.cpu()
@@ -1116,7 +1037,7 @@ def fv_refine_summary(
     res: FVRefineResult,
     obs: ObservationSet,
     y_grid: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> dict:
     """Flatten a :func:`fv_refine_report` into scalar CSV columns."""
     return adapter.fv_refine_summary(res, obs, y_grid)
@@ -1270,7 +1191,7 @@ def _masked_residual(
     model: FNO2d,
     obs: ObservationSet,
     theta: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> torch.Tensor:
     """Flat residual vector ``(m,)`` ``= masked(G_theta) - masked(obs)``."""
     pred = predict_fullfield(model, obs, theta, adapter)
@@ -1284,7 +1205,7 @@ def neg_log_likelihood(
     obs: ObservationSet,
     theta: torch.Tensor,
     sigma_eff2: float,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> torch.Tensor:
     """Gaussian negative log-likelihood (sum convention) at ``theta``.
 
@@ -1325,8 +1246,8 @@ def add_measurement_noise(
 def _theta_profile(
     u: torch.Tensor, fixed_index: int, fixed_value: float
 ) -> torch.Tensor:
-    """Legacy source_itr wrapper for profile pinning tests."""
-    return _SOURCE_ITR_ADAPTER.theta_profile(u, fixed_index, fixed_value)
+    """Source-ITR sinusoid wrapper for profile pinning tests."""
+    return _SOURCE_ITR_SIN_ADAPTER.theta_profile(u, fixed_index, fixed_value)
 
 
 def _profile_refit(
@@ -1340,7 +1261,7 @@ def _profile_refit(
     adam_steps: int = 150,
     adam_lr: float = 0.05,
     lbfgs_steps: int = 30,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
     theta_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> tuple[float, torch.Tensor, torch.Tensor]:
     """Re-optimize the free scalars at a pinned constraint, over several starts.
@@ -1541,18 +1462,18 @@ def profile_likelihood(
     lbfgs_steps: int = 30,
     n_starts: int = 3,
     seed: int = 0,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> ProfileResult:
-    """Profile-likelihood interval for one void scalar (default ``R_amp``).
+    """Profile-likelihood interval for one sinusoidal parameter (default ``A``).
 
     Pins ``theta[param_index]`` to each of ``n_grid`` physical values spanning
     ``theta_hat[param_index] +/- span`` (clamped to the parameter's physical
-    range), re-fits the other three by minimizing the Gaussian NLL, and traces
+    range), re-fits the remaining parameter by minimizing the Gaussian NLL, and traces
     the profile. The confidence interval uses Wilks' theorem
     (``2*(NLL - NLL_min) <= chi2_{1,level}``). Crucially we also record the
     integrated severity along the profile and report its min/max inside the CI:
     that severity interval is the well-conditioned lead deliverable, while the
-    ``R_amp`` CI itself is expected to be wide / boundary-limited.
+    ``A`` CI itself is expected to be wide / boundary-limited.
 
     Each nuisance refit is multistart (``n_starts`` seeds: ``theta_hat`` plus
     LHS) with bidirectional continuation across the grid; see ``_profile_sweep``.
@@ -1603,12 +1524,12 @@ def severity_profile_likelihood(
     lbfgs_steps: int = 30,
     n_starts: int = 3,
     seed: int = 0,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> ProfileResult:
     """Direct profile-likelihood interval for the integrated severity ``S_R``.
 
     Unlike ``profile_likelihood`` (which profiles a single scalar such as
-    ``R_amp`` and then reads off the severity *along that path*), this pins the
+    ``A`` and then reads off the severity *along that path*), this pins the
     severity itself onto a grid and re-fits *all* remaining freedom by
     minimizing the Gaussian NLL, so the reported interval is a genuine
     profile-likelihood CI for ``S_R``: ``l_p(s) = min_{theta: S_R(theta)=s}
@@ -1621,9 +1542,7 @@ def severity_profile_likelihood(
     severity has no fixed scale across benchmarks. The grid is clamped to
     ``(0, max_feasible_severity]``.
 
-    The nuisance fit here is over the void *shape* ``(y0, sigma)`` plus
-    ``R_base``, which is genuinely multimodal in ``y0``, so each pin is refit
-    from ``n_starts`` seeds with bidirectional continuation (``_profile_sweep``).
+    The nuisance fit uses the remaining free resistance parameter.
     """
     y_grid = obs.y_grid
     s_hat = float(adapter.uq_quantity(theta_hat, y_grid))
@@ -1664,7 +1583,7 @@ def severity_profile_likelihood(
 
 def profile_interval_summary(
     res: ProfileResult,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> dict:
     """Reported form of statistic 3: the lead-estimand interval, no coverage.
 
@@ -2247,7 +2166,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--uq-level", type=float, default=0.95,
                     help="Confidence level for the profile-likelihood interval")
     ap.add_argument("--profile-index", type=int, default=None,
-                    help="Parameter index to profile (adapter default: R_amp for spatial ITR, R_c for scalar forcing)")
+                    help="Parameter index to profile (adapter default: A for spatial ITR, R_c for scalar forcing)")
     ap.add_argument("--profile-grid", type=int, default=11,
                     help="Number of pinned grid points for the profile (default 11)")
     ap.add_argument("--profile-starts", type=int, default=3,
@@ -2646,7 +2565,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 #     Reached only via fv_refine_report(polish=True), which main() never sets.
 #   * _solve_scalar_fv_masked / equivalent_scalar_fv_summary - the
 #     "is R_c(y) distinguishable from a conductance-matched scalar" question.
-#     A separate study with its own protocol, and forcing_itr-only.
+#     A separate study with its own protocol, and forcing_itr_sin-only.
 #
 # The statistics-only members of the old block were removed outright rather than
 # kept here: the RW-Metropolis MCMC (MCMCResult / _autocovariance /
@@ -2662,7 +2581,6 @@ def main(argv: Optional[list[str]] = None) -> int:
 # ---------------------------------------------------------------------------
 # Sensitivity / identifiability diagnostics (Stage 3): J = dG_theta/dtheta at a
 # point, and the SVD of J that exposes ill-conditioned directions (notably the
-# coupled R_amp/sigma void-"mass" ridge). This is *diagnostic only* — no UQ,
 # no Laplace/Hessian intervals (those are Stage 5).
 # ---------------------------------------------------------------------------
 
@@ -2670,12 +2588,12 @@ def observation_jacobian(
     model: FNO2d,
     obs: ObservationSet,
     theta: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> torch.Tensor:
     """Jacobian ``J = d(masked G_theta)/d theta`` at ``theta``: ``(m, 4)``.
 
     ``m`` is the number of observed scalars (sensor pixels times observation
-    times times channels). The model is frozen; only the four physical void
+    time points times channels). The model is frozen; only the two sinusoidal
     scalars are differentiated, through both injection points.
     """
     theta0 = theta.detach().to(obs.spatial.device)
@@ -2694,18 +2612,16 @@ def observation_jacobian(
 
 
 def svd_identifiability(J: np.ndarray) -> dict:
-    """Identifiability summary from the observation Jacobian ``J`` (m, 4).
+    """Identifiability summary from the observation Jacobian ``J`` (m, n_parameters).
 
     Pure linear algebra (unit-tested independently of the FNO):
       * ``singular_values`` — descending; small values flag directions the data
         cannot constrain.
-      * ``right_vectors`` — (4, 4), columns are orthonormal directions in
-        theta-space ``(R_base, R_amp, y0, sigma)``.
+      * ``right_vectors`` — (n_parameters, n_parameters), columns are orthonormal directions in
+        theta-space ``(R_base, A)``.
       * ``param_sensitivity`` — per-parameter column norms ``||dG/dtheta_k||``.
       * ``least_identified_dir`` — right singular vector of the *smallest*
         singular value (the worst-constrained combination).
-      * ``ramp_sigma_alignment`` — source_itr-only fraction of that direction's
-        norm lying in the ``(R_amp, sigma)`` plane.
       * ``cond_number`` — s_max / s_min.
     """
     Jn = np.asarray(J, dtype=np.float64)
@@ -2714,18 +2630,12 @@ def svd_identifiability(J: np.ndarray) -> dict:
     V = Vt.T
     least = V[:, -1]
     least = least / (np.linalg.norm(least) + 1e-300)
-    ramp_sigma_alignment = (
-        float(np.linalg.norm(least[[1, 3]]) / (np.linalg.norm(least) + 1e-300))
-        if least.shape[0] > 3
-        else float("nan")
-    )
     cond_number = float(S[0] / S[-1]) if S[-1] > 0 else float("inf")
     return {
         "singular_values": S,
         "right_vectors": V,
         "param_sensitivity": param_sensitivity,
         "least_identified_dir": least,
-        "ramp_sigma_alignment": ramp_sigma_alignment,
         "cond_number": cond_number,
     }
 
@@ -2734,7 +2644,7 @@ def sensitivity_report(
     model: FNO2d,
     obs: ObservationSet,
     theta: torch.Tensor,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> dict:
     """``svd_identifiability`` of the observation Jacobian at ``theta``."""
     J = observation_jacobian(model, obs, theta, adapter)
@@ -2742,7 +2652,7 @@ def sensitivity_report(
 
 
 def sensitivity_summary(
-    report: dict, adapter: InverseAdapter = _SOURCE_ITR_ADAPTER
+    report: dict, adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER
 ) -> dict:
     """Flatten a :func:`sensitivity_report` into scalar CSV columns."""
     return adapter.sensitivity_summary(report)
@@ -2834,7 +2744,7 @@ def fv_polish(
     mu_global: float,
     sigma_global: float,
     maxiter: int = 60,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> tuple[torch.Tensor, float, int]:
     """Derivative-free FV polish of ``theta_hat`` against the FV sensor residual.
 
@@ -2876,7 +2786,7 @@ def laplace_spectrum(
     obs: ObservationSet,
     theta_hat: torch.Tensor,
     sigma_eff2: float,
-    adapter: InverseAdapter = _SOURCE_ITR_ADAPTER,
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> dict:
     """Gauss-Newton eigen-spectrum at ``theta_hat`` (degeneracy diagnostic).
 
@@ -2884,10 +2794,10 @@ def laplace_spectrum(
     Hessian of the NLL ``H = J^T J / sigma_eff2``. Its eigenvalues are
     ``S_k^2 / sigma_eff2`` and eigenvectors the right singular vectors of ``J``,
     so this reuses :func:`svd_identifiability`. Small eigenvalues + an
-    ``(R_amp, sigma)``-aligned least-identified direction confirm the ridge the
+    least-identified direction describe the uncertainty that the
     profile must handle. Reported as a diagnostic; NOT used for intervals
     (the Gaussian-around-MAP is least valid exactly along this degenerate
-    direction and at the R_amp~0 boundary).
+    direction and at the A=0 boundary).
     """
     J = observation_jacobian(model, obs, theta_hat, adapter).cpu().numpy()
     ident = svd_identifiability(J)
@@ -2897,13 +2807,12 @@ def laplace_spectrum(
         "eigenvalues": eig,                       # descending
         "right_vectors": ident["right_vectors"],
         "least_identified_dir": ident["least_identified_dir"],
-        "ramp_sigma_alignment": ident["ramp_sigma_alignment"],
         "cond_number": float(eig[0] / eig[-1]) if eig[-1] > 0 else float("inf"),
     }
 
 
 def laplace_summary(
-    spec: dict, adapter: InverseAdapter = _SOURCE_ITR_ADAPTER
+    spec: dict, adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER
 ) -> dict:
     """Flatten a :func:`laplace_spectrum` into CSV columns."""
     return adapter.laplace_summary(spec)

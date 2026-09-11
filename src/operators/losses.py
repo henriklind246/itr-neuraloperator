@@ -356,7 +356,7 @@ def per_sample_contact_jump_rmse(
     right,
     weight_y: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-sample contact-jump RMSE (normalized), source_itr only.
+    """Per-sample contact-jump RMSE (normalized), source_itr_sin only.
 
     The contact jump weights the node jump by the per-row contact law
     ``R_c(y) * G(y)`` (see ``visual/dataset_plots.py:_interface_contact_jump_map``):

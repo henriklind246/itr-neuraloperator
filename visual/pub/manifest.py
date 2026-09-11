@@ -415,7 +415,7 @@ class Manifest:
     def discover_global_field(cls, runs_root: str | Path, *,
                               selections: dict[str, str] | None = None) -> Manifest:
         """Discover complete seed records, requiring one experiment per benchmark."""
-        benchmarks = ("forcing", "source", "source_itr", "interfaces")
+        benchmarks = ("forcing", "source", "source_itr_sin", "interfaces")
         root = Path(runs_root).expanduser().resolve()
         if not root.is_dir():
             raise ProvenanceError(f"Runs directory does not exist: {root}")

@@ -17,14 +17,13 @@ from data.dataset import (
 )
 from src.physics.boundary_forcing import FORCING_TEMPORAL_SAMPLES
 from problems.source import INTERFACE_X
-from problems.source_itr import rc_log_norm
+from src.physics.internal_source import rc_log_norm
 from src.physics.internal_source import (
     PATCH_H,
     PATCH_W,
-    RC_VOID_RANGES,
     interface_control_volume_weights,
     integrated_excess_resistance,
-    make_rc_void_profile,
+    make_rc_sin_profile,
     make_patch_indicator,
     make_sin2_pulse,
 )
@@ -964,15 +963,13 @@ def _patch_param_arrays(sim_params: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
-def _void_param_arrays(sim_params: np.ndarray) -> dict[str, np.ndarray]:
-    """Pull source-ITR Gaussian-void parameters into arrays."""
+def _itr_param_arrays(sim_params: np.ndarray) -> dict[str, np.ndarray]:
+    """Pull source-ITR sinusoidal parameters into arrays."""
     R_base = np.array([float(p["R_c_base"]) for p in sim_params], dtype=np.float64)
-    R_amp = np.array([float(p["R_c_amp"]) for p in sim_params], dtype=np.float64)
+    R_amp = np.array([float(p["R_c_A"]) for p in sim_params], dtype=np.float64)
     return {
         "R_c_base": R_base,
-        "R_c_amp": R_amp,
-        "R_c_y0": np.array([float(p["R_c_y0"]) for p in sim_params], dtype=np.float64),
-        "R_c_sigma": np.array([float(p["R_c_sigma"]) for p in sim_params], dtype=np.float64),
+        "R_c_A": R_amp,
         "R_c_peak": R_base + R_amp,
     }
 
@@ -999,24 +996,22 @@ def _interface_conductance_profile(
     return 1.0 / ((0.5 * dy) / float(k_left) + Rc + (0.5 * dy) / float(k_right))
 
 
-def _void_severity_arrays(
+def _itr_amplitude_arrays(
     sim_params: np.ndarray,
     y_grid: np.ndarray,
     x_grid: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Return sampled void parameters plus integrated severity metrics."""
-    arrs = _void_param_arrays(sim_params)
+    """Return sampled resistance profile parameters plus integrated severity metrics."""
+    arrs = _itr_param_arrays(sim_params)
     y = np.asarray(y_grid, dtype=np.float64)
     excess_integral = np.zeros(len(sim_params), dtype=np.float64)
     conductance_deficit = np.zeros(len(sim_params), dtype=np.float64)
 
     for i, p in enumerate(sim_params):
-        Rc_y = make_rc_void_profile(
+        Rc_y = make_rc_sin_profile(
             y,
             R_base=float(p["R_c_base"]),
-            R_amp=float(p["R_c_amp"]),
-            y0=float(p["R_c_y0"]),
-            sigma=float(p["R_c_sigma"]),
+            A=float(p["R_c_A"]),
         )
         base = np.full_like(Rc_y, float(p["R_c_base"]), dtype=np.float64)
         G_base = _interface_conductance_profile(
@@ -1034,17 +1029,17 @@ def _void_severity_arrays(
 
     arrs["R_c_excess_integral"] = excess_integral
     arrs["conductance_deficit"] = conductance_deficit
-    arrs["is_void_active"] = arrs["R_c_amp"] > 1e-12
+    arrs["is_itr_active"] = arrs["R_c_A"] > 1e-12
     return arrs
 
 
-def _representative_void_sim_ids(
+def _representative_itr_sim_ids(
     sim_params: np.ndarray,
     y_grid: np.ndarray,
     x_grid: np.ndarray | None = None,
 ) -> list[int]:
     """Pick deterministic low/median/high severity source-ITR samples."""
-    severity = _void_severity_arrays(sim_params, y_grid, x_grid)["R_c_excess_integral"]
+    severity = _itr_amplitude_arrays(sim_params, y_grid, x_grid)["R_c_excess_integral"]
     if len(severity) == 0:
         return []
     order = np.argsort(severity)
@@ -1056,8 +1051,8 @@ def _representative_void_sim_ids(
     return out
 
 
-def _require_source_itr_params(sim_params: np.ndarray) -> None:
-    required = ("R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma")
+def _require_source_itr_sin_params(sim_params: np.ndarray) -> None:
+    required = ("R_c_base", "R_c_A")
     for i, p in enumerate(sim_params):
         missing = [key for key in required if key not in p]
         if missing:
@@ -1133,27 +1128,25 @@ def _bilinear_resample(
 # SOURCE BENCHMARK — plots (ported from experiment/source-itr)
 # ============================================================
 
-def plot_source_itr_void_profiles(
+def plot_source_itr_sin_resistance_profiles(
     sim_params: np.ndarray,
     y_grid: np.ndarray,
     x_grid: np.ndarray | None = None,
     save_path: str | Path | None = None,
 ):
-    """Explain sampled Gaussian-void interface resistance profiles."""
-    _require_source_itr_params(sim_params)
+    """Explain sampled sinusoidal interface resistance profiles."""
+    _require_source_itr_sin_params(sim_params)
     y = np.asarray(y_grid, dtype=np.float64)
-    severity = _void_severity_arrays(sim_params, y, x_grid)
-    representative_ids = _representative_void_sim_ids(sim_params, y, x_grid)
+    severity = _itr_amplitude_arrays(sim_params, y, x_grid)
+    representative_ids = _representative_itr_sim_ids(sim_params, y, x_grid)
 
     profile_rows = []
     for sid in representative_ids:
         p = sim_params[int(sid)]
-        Rc_y = make_rc_void_profile(
+        Rc_y = make_rc_sin_profile(
             y,
             R_base=float(p["R_c_base"]),
-            R_amp=float(p["R_c_amp"]),
-            y0=float(p["R_c_y0"]),
-            sigma=float(p["R_c_sigma"]),
+            A=float(p["R_c_A"]),
         )
         G_y = _interface_conductance_profile(
             y, Rc_y, x_grid=x_grid, interface_x=float(p.get("interface_x", INTERFACE_X))
@@ -1161,7 +1154,7 @@ def plot_source_itr_void_profiles(
         profile_rows.append((int(sid), p, Rc_y, rc_log_norm(Rc_y), G_y))
 
     colors = plt.cm.viridis(np.linspace(0.15, 0.85, max(len(profile_rows), 1)))
-    active = severity["is_void_active"]
+    active = severity["is_itr_active"]
 
     with plt.rc_context(PLOT_STYLE):
         fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
@@ -1169,12 +1162,10 @@ def plot_source_itr_void_profiles(
         ax = axes[0, 0]
         for color, (sid, p, Rc_y, _Rc_norm, _G_y) in zip(colors, profile_rows):
             label = (
-                f"sim {sid}: peak={float(p['R_c_base']) + float(p['R_c_amp']):.2f}, "
+                f"sim {sid}: peak={float(p['R_c_base']) + float(p['R_c_A']):.2f}, "
                 f"area={severity['R_c_excess_integral'][sid]:.3f}"
             )
             ax.plot(y, Rc_y, color=color, label=label)
-            if float(p["R_c_amp"]) > 1e-12:
-                ax.axvline(float(p["R_c_y0"]), color=color, linestyle=":", linewidth=1.0, alpha=0.5)
         ax.set_xlabel("y")
         ax.set_ylabel(r"$R_c(y)$")
         ax.set_title("Physical interface resistance")
@@ -1200,44 +1191,15 @@ def plot_source_itr_void_profiles(
         ax.grid(True)
 
         ax = axes[1, 1]
-        if np.any(active):
-            peak_active = severity["R_c_peak"][active]
-            peak_size = (peak_active - float(np.min(peak_active))) / max(
-                float(np.max(peak_active) - np.min(peak_active)), 1e-12
-            )
-            scatter = ax.scatter(
-                severity["R_c_y0"][active],
-                severity["R_c_sigma"][active],
-                c=severity["R_c_excess_integral"][active],
-                s=35 + 70 * peak_size,
-                cmap="magma",
-                alpha=0.78,
-                edgecolors="white",
-                linewidths=0.4,
-            )
-            fig.colorbar(scatter, ax=ax, label=r"$\int (R_c(y)-R_{base})\,dy$")
-        if np.any(~active):
-            ax.scatter(
-                np.full(int(np.sum(~active)), np.nanmean(severity["R_c_y0"])),
-                np.full(int(np.sum(~active)), RC_VOID_RANGES["sigma"][0]),
-                marker="x",
-                color="0.45",
-                s=32,
-                alpha=0.8,
-                label="flat profile",
-            )
-            ax.legend(loc="upper right")
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-        ax.set_xlim(y0_lo - 0.03, y0_hi + 0.03)
-        ax.set_ylim(sig_lo * 0.85, sig_hi * 1.08)
-        ax.set_xlabel(r"void center $y_0$")
-        ax.set_ylabel(r"void width $\sigma$")
-        ax.set_title("Void location/width coverage")
+        scatter = ax.scatter(severity["R_c_base"], severity["R_c_A"],
+                             c=severity["R_c_excess_integral"], cmap="magma")
+        fig.colorbar(scatter, ax=ax, label=r"$\int (R_c(y)-R_{base})\,dy$")
+        ax.set_xlabel(r"Base resistance $R_b$")
+        ax.set_ylabel(r"Amplitude $A$")
+        ax.set_title("Sinusoidal profile coverage")
         ax.grid(True)
-
-        fig.suptitle("Source-ITR Gaussian Void Profiles")
-        _save_figure(fig, save_path, "source", "source_itr_void_profiles", layout="constrained")
+        fig.suptitle("Source-ITR Sinusoidal Profiles")
+        _save_figure(fig, save_path, "source", "source_itr_sin_resistance_profiles", layout="constrained")
 
 
 def plot_source_interface_zone_error(

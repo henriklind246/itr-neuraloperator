@@ -9,22 +9,19 @@ import torch
 from problems.forcing import RC_RANGE
 from problems.forcing import ForcingProblem
 from problems.registry import get_problem
-from problems.source_itr import RC_Y_CHANNEL
+from problems.source_itr_sin import RC_Y_CHANNEL
 from src.physics.fv_solver_2d import Layer2D
 from src.physics.internal_source import (
     RC_MIN,
     RC_SIN_RANGES,
-    RC_VOID_RANGES,
     R_PEAK_MAX,
     equivalent_scalar_resistance,
     integrated_excess_resistance,
     interface_control_volume_weights,
     make_rc_sin_profile,
-    make_rc_void_profile,
 )
 
 
-VOID_PARAM_NAMES = ("R_base", "R_amp", "y0", "sigma")
 SIN_PARAM_NAMES = ("R_base", "A")
 
 _GEN_DOMAIN = dict(a=0.0, b=1.0, c=0.0, d=1.0)
@@ -97,10 +94,8 @@ class InverseAdapter(ABC):
         bench = config.get("benchmark", {})
         name = bench.get("name", "forcing") if isinstance(bench, dict) else str(bench)
         adapters = {
-            "source_itr": SourceItrAdapter,
             "source_itr_sin": SourceItrSinAdapter,
             "forcing": ForcingAdapter,
-            "forcing_itr": ForcingItrAdapter,
             "forcing_itr_sin": ForcingItrSinAdapter,
         }
         adapter_cls = adapters.get(name)
@@ -318,335 +313,6 @@ class InverseAdapter(ABC):
         ...
 
 
-class SourceItrAdapter(InverseAdapter):
-    benchmark = "source_itr"
-    theta_dim = 4
-    param_names = VOID_PARAM_NAMES
-
-    @property
-    def default_profile_index(self) -> int:
-        return 1
-
-    @property
-    def reports_spatial_severity(self) -> bool:
-        return True
-
-    def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_VOID_RANGES["R_base"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-
-        s = torch.sigmoid(u)
-        R_base = base_lo + (base_hi - base_lo) * s[..., 0]
-        amp_unit = s[..., 1]
-        R_amp = amp_unit * (R_PEAK_MAX - R_base)
-        y0 = y0_lo + (y0_hi - y0_lo) * s[..., 2]
-        sigma = sig_lo + (sig_hi - sig_lo) * s[..., 3]
-        return torch.stack([R_base, R_amp, y0, sigma], dim=-1)
-
-    def unconstrained_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_VOID_RANGES["R_base"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-
-        R_base = theta[..., 0]
-        R_amp = theta[..., 1]
-        y0 = theta[..., 2]
-        sigma = theta[..., 3]
-
-        p_base = (R_base - base_lo) / (base_hi - base_lo)
-        ceil = (R_PEAK_MAX - R_base).clamp_min(_dtype_eps(theta.dtype))
-        p_amp = R_amp / ceil
-        p_y0 = (y0 - y0_lo) / (y0_hi - y0_lo)
-        p_sigma = (sigma - sig_lo) / (sig_hi - sig_lo)
-        return torch.stack(
-            [_logit(p_base), _logit(p_amp), _logit(p_y0), _logit(p_sigma)], dim=-1
-        )
-
-    def theta_from_sim_params(
-        self, sim_params: dict, *, dtype: torch.dtype = torch.float32, device=None
-    ) -> torch.Tensor:
-        return torch.tensor(
-            [
-                float(sim_params["R_c_base"]),
-                float(sim_params["R_c_amp"]),
-                float(sim_params["R_c_y0"]),
-                float(sim_params["R_c_sigma"]),
-            ],
-            dtype=dtype,
-            device=device,
-        )
-
-    def cond_slice_indices(self) -> tuple[int, int]:
-        return (1, 5)
-
-    def cond_slice_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_VOID_RANGES["R_base"]
-        amp_lo, amp_hi = RC_VOID_RANGES["R_amp"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-
-        R_base = theta[..., 0]
-        R_amp = theta[..., 1]
-        y0 = theta[..., 2]
-        sigma = theta[..., 3]
-
-        R_base_norm = (R_base - base_lo) / (base_hi - base_lo)
-        R_amp_norm = (R_amp - amp_lo) / (amp_hi - amp_lo)
-        y0_norm = (y0 - y0_lo) / (y0_hi - y0_lo)
-        sigma_norm = (sigma - sig_lo) / (sig_hi - sig_lo)
-        return torch.stack([R_base_norm, R_amp_norm, y0_norm, sigma_norm], dim=-1)
-
-    def spatial_channel_index(self) -> Optional[int]:
-        return RC_Y_CHANNEL
-
-    def spatial_channel_from_theta(
-        self, theta: torch.Tensor, y_grid: torch.Tensor, Nx: int
-    ) -> torch.Tensor:
-        R_base = theta[..., 0:1]
-        R_amp = theta[..., 1:2]
-        y0 = theta[..., 2:3]
-        sigma = theta[..., 3:4]
-
-        y = y_grid.to(dtype=theta.dtype, device=theta.device)
-        Rc_y = R_base + R_amp * torch.exp(-(((y - y0) / sigma) ** 2))
-
-        log_min = float(np.log(RC_MIN))
-        log_max = float(np.log(R_PEAK_MAX))
-        Rc_y_norm = 2.0 * (torch.log(Rc_y) - log_min) / (log_max - log_min) - 1.0
-        return Rc_y_norm.unsqueeze(-2).expand(*Rc_y_norm.shape[:-1], Nx, y.shape[0])
-
-    def inject_theta_into_sim_params(self, sim_params: dict, theta) -> dict:
-        th = _to_numpy_theta(theta, self.theta_dim)
-        params = dict(sim_params)
-        params["R_c_base"] = float(th[0])
-        params["R_c_amp"] = float(th[1])
-        params["R_c_y0"] = float(th[2])
-        params["R_c_sigma"] = float(th[3])
-        params["R_c"] = float(th[0])
-        return params
-
-    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
-        size = int(grid_size) if grid_size is not None else int(ds.Nx)
-        y_grid = np.linspace(
-            _GEN_DOMAIN["c"], _GEN_DOMAIN["d"], size, dtype=np.float64
-        )
-        return dict(
-            a=_GEN_DOMAIN["a"], b=_GEN_DOMAIN["b"],
-            c=_GEN_DOMAIN["c"], d=_GEN_DOMAIN["d"],
-            Nx=size, Ny=size,
-            lam_target=_GEN_LAM_TARGET,
-            t_final=_snap_t_final(ds),
-            flux_f=_GEN_FLUX_F, flux_A=_GEN_FLUX_A,
-            t_on=_GEN_T_ON, phase=_GEN_PHASE,
-            dt=float(ds.dt), tukey_alpha=_GEN_TUKEY_ALPHA,
-            y_grid=y_grid,
-        )
-
-    def validate_dataset(self, ds) -> None:
-        if getattr(ds.problem, "name", None) != self.benchmark:
-            raise ValueError(
-                f"SourceItrAdapter expected dataset benchmark 'source_itr', got "
-                f"{getattr(ds.problem, 'name', None)!r}."
-            )
-        if getattr(ds.problem, "rc_channel_mode", None) != "broadcast":
-            raise ValueError(
-                "source_itr inversion only supports rc_channel_mode='broadcast'; "
-                f"got {getattr(ds.problem, 'rc_channel_mode', None)!r}."
-            )
-        first_sid = int(ds.sim_ids[0])
-        sample = ds.problem.build_item(ds, first_sid, 0, min(1, ds.Nt - 1))
-        spatial_channels = int(sample["spatial"].shape[-1])
-        if ds.problem.dims.in_channels != spatial_channels:
-            raise ValueError(
-                f"Dataset spatial schema has {spatial_channels} channels, "
-                f"expected {ds.problem.dims.in_channels}."
-            )
-        required = {"R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma"}
-        missing = required - set(dict(ds.sim_params[first_sid]).keys())
-        if missing:
-            raise ValueError(f"source_itr sim_params missing keys: {sorted(missing)}")
-
-    def profile_bounds(self, param_index: int) -> tuple[float, float]:
-        if param_index == 0:
-            return tuple(RC_VOID_RANGES["R_base"])
-        if param_index == 1:
-            return (0.0, R_PEAK_MAX - RC_MIN)
-        if param_index == 2:
-            return tuple(RC_VOID_RANGES["y0"])
-        if param_index == 3:
-            return tuple(RC_VOID_RANGES["sigma"])
-        raise ValueError(f"profile param_index {param_index} out of range")
-
-    def theta_profile(
-        self, u: torch.Tensor, fixed_index: int, fixed_value: float
-    ) -> torch.Tensor:
-        base_lo, base_hi = RC_VOID_RANGES["R_base"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-        s = torch.sigmoid(u)
-
-        if fixed_index == 1:
-            R_amp = torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-            base_ceiling = min(base_hi, R_PEAK_MAX - float(fixed_value))
-            R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
-        else:
-            R_base = (
-                torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-                if fixed_index == 0
-                else base_lo + (base_hi - base_lo) * s[..., 0]
-            )
-            R_amp = s[..., 1] * (R_PEAK_MAX - R_base)
-        y0 = (
-            torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-            if fixed_index == 2
-            else y0_lo + (y0_hi - y0_lo) * s[..., 2]
-        )
-        sigma = (
-            torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-            if fixed_index == 3
-            else sig_lo + (sig_hi - sig_lo) * s[..., 3]
-        )
-        return torch.stack([R_base, R_amp, y0, sigma], dim=-1)
-
-    def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
-        R_base, R_amp, y0, sigma = (theta[i].item() for i in range(4))
-        y = y_grid.detach().cpu().numpy().astype(np.float64)
-        profile = make_rc_void_profile(y, R_base, R_amp, y0, sigma)
-        return integrated_excess_resistance(
-            y, profile, R_base,
-            bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"]),
-        )
-
-    def _severity_weights(self, y_grid: torch.Tensor) -> torch.Tensor:
-        y = y_grid.detach().cpu().numpy().astype(np.float64)
-        w = interface_control_volume_weights(
-            y, (_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
-        )
-        return torch.as_tensor(w, dtype=y_grid.dtype, device=y_grid.device)
-
-    def theta_profile_severity(
-        self, u: torch.Tensor, fixed_severity: float, y_grid: torch.Tensor
-    ) -> torch.Tensor:
-        base_lo, base_hi = RC_VOID_RANGES["R_base"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        sig_lo, sig_hi = RC_VOID_RANGES["sigma"]
-
-        s = torch.sigmoid(u)
-        y0 = y0_lo + (y0_hi - y0_lo) * s[..., 2]
-        sigma = sig_lo + (sig_hi - sig_lo) * s[..., 3]
-
-        y = y_grid.to(dtype=u.dtype, device=u.device)
-        w = self._severity_weights(y_grid).to(dtype=u.dtype)
-        # S_R = R_amp * sum_k w_k exp(-((y_k - y0)/sigma)^2); solve for R_amp.
-        coeff = torch.sum(w * torch.exp(-(((y - y0) / sigma) ** 2)))
-        coeff = coeff.clamp_min(_dtype_eps(u.dtype))
-        S = torch.as_tensor(fixed_severity, dtype=u.dtype, device=u.device)
-        amp_ceiling = torch.as_tensor(
-            R_PEAK_MAX - base_lo, dtype=u.dtype, device=u.device
-        )
-        R_amp = torch.minimum((S / coeff).clamp_min(0.0), amp_ceiling)
-        # Shrink the free R_base box so R_base + R_amp never exceeds R_PEAK_MAX.
-        base_ceiling = torch.clamp(R_PEAK_MAX - R_amp, min=base_lo, max=base_hi)
-        R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
-        return torch.stack([R_base, R_amp, y0, sigma], dim=-1)
-
-    def max_feasible_severity(self, y_grid: torch.Tensor) -> float:
-        # S_R = R_amp * coeff(y0, sigma) with coeff = sum_k w_k exp(-((y_k-y0)/sigma)^2).
-        # The severity a *single* void can realize is capped by the widest
-        # profile, not sum(w): coeff grows with sigma, so it peaks at sig_hi over
-        # the best-centered y0. Scan the (y0, sigma) box for that max coefficient
-        # so the returned bound is actually attainable by some shape.
-        base_lo, _ = RC_VOID_RANGES["R_base"]
-        y0_lo, y0_hi = RC_VOID_RANGES["y0"]
-        _, sig_hi = RC_VOID_RANGES["sigma"]
-        y = y_grid.detach().cpu().numpy().astype(np.float64)
-        w = interface_control_volume_weights(
-            y, (_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
-        )
-        y0s = np.linspace(y0_lo, y0_hi, 65)
-        coeff = (
-            w[None, :] * np.exp(-(((y[None, :] - y0s[:, None]) / sig_hi) ** 2))
-        ).sum(axis=1)
-        return float((R_PEAK_MAX - base_lo) * float(coeff.max()))
-
-    def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
-        out = {
-            "loss": result.loss,
-            "R_base_hat": float(result.theta_hat[0]),
-            "R_amp_hat": float(result.theta_hat[1]),
-            "y0_hat": float(result.theta_hat[2]),
-            "sigma_hat": float(result.theta_hat[3]),
-            "excess_int_hat": self.uq_quantity(result.theta_hat, y_grid),
-        }
-        if result.theta_true is not None:
-            t = result.theta_true
-            out.update(
-                {
-                    "R_base_true": float(t[0]),
-                    "R_amp_true": float(t[1]),
-                    "y0_true": float(t[2]),
-                    "sigma_true": float(t[3]),
-                    "excess_int_true": self.uq_quantity(t, y_grid),
-                    "R_base_abserr": abs(float(result.theta_hat[0]) - float(t[0])),
-                    "R_amp_abserr": abs(float(result.theta_hat[1]) - float(t[1])),
-                    "y0_abserr": abs(float(result.theta_hat[2]) - float(t[2])),
-                    "sigma_abserr": abs(float(result.theta_hat[3]) - float(t[3])),
-                }
-            )
-            out["excess_int_abserr"] = abs(
-                out["excess_int_hat"] - out["excess_int_true"]
-            )
-        return out
-
-    def sensitivity_summary(self, report: dict) -> dict:
-        S = report["singular_values"]
-        least = report["least_identified_dir"]
-        sens = report["param_sensitivity"]
-        out = {
-            "cond_number": report["cond_number"],
-            "ramp_sigma_alignment": report["ramp_sigma_alignment"],
-        }
-        for i, name in enumerate(self.param_names):
-            out[f"sv_{i}"] = float(S[i]) if i < len(S) else float("nan")
-            out[f"sens_{name}"] = float(sens[i])
-            out[f"least_dir_{name}"] = float(least[i])
-        return out
-
-    def fv_refine_summary(self, res, obs, y_grid: torch.Tensor) -> dict:
-        out = {
-            "fno_resid": res.fno_resid,
-            "fv_resid": res.fv_resid,
-            "fno_vs_fv_resid": res.fno_vs_fv_resid,
-        }
-        if res.theta_fv_polish is not None:
-            tp = res.theta_fv_polish
-            out["fv_polish_resid"] = res.fv_polish_resid
-            out["fv_polish_evals"] = res.fv_polish_evals
-            for i, name in enumerate(self.param_names):
-                out[f"{name}_fvpolish"] = float(tp[i])
-            out["excess_int_fvpolish"] = self.uq_quantity(tp, y_grid)
-            if obs.theta_true is not None:
-                t = obs.theta_true
-                for i, name in enumerate(self.param_names):
-                    out[f"{name}_fvpolish_abserr"] = abs(float(tp[i]) - float(t[i]))
-                out["excess_int_fvpolish_abserr"] = abs(
-                    out["excess_int_fvpolish"] - self.uq_quantity(t, y_grid)
-                )
-        return out
-
-    def laplace_summary(self, spec: dict) -> dict:
-        eig = spec["eigenvalues"]
-        least = spec["least_identified_dir"]
-        out = {
-            "laplace_cond": spec["cond_number"],
-            "laplace_ramp_sigma_align": spec["ramp_sigma_alignment"],
-        }
-        for i in range(len(eig)):
-            out[f"laplace_eig_{i}"] = float(eig[i])
-        for i, nm in enumerate(self.param_names):
-            out[f"laplace_least_dir_{nm}"] = float(least[i])
-        return out
 
 
 class ForcingAdapter(InverseAdapter):
@@ -795,73 +461,12 @@ class ForcingAdapter(InverseAdapter):
         }
 
 
-class ForcingItrAdapter(SourceItrAdapter):
-    benchmark = "forcing_itr"
-
-    @property
-    def supports_equivalent_scalar(self) -> bool:
-        return True
-
-    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
-        return ForcingAdapter().fv_base_kwargs(ds, grid_size=grid_size)
-
-    def validate_dataset(self, ds) -> None:
-        if getattr(ds.problem, "name", None) != self.benchmark:
-            raise ValueError(
-                f"ForcingItrAdapter expected dataset benchmark 'forcing_itr', got "
-                f"{getattr(ds.problem, 'name', None)!r}."
-            )
-        if getattr(ds.problem, "rc_channel_mode", None) != "broadcast":
-            raise ValueError(
-                "forcing_itr inversion only supports rc_channel_mode='broadcast'."
-            )
-        first_sid = int(ds.sim_ids[0])
-        sample = ds.problem.build_item(ds, first_sid, 0, min(1, ds.Nt - 1))
-        if int(sample["spatial"].shape[-1]) != ds.problem.dims.in_channels:
-            raise ValueError("forcing_itr dataset spatial schema does not match its spec.")
-        required = {
-            "R_c_base", "R_c_amp", "R_c_y0", "R_c_sigma",
-            "temporal_family", "temporal_params", "spatial_family", "spatial_params",
-        }
-        missing = required - set(dict(ds.sim_params[first_sid]))
-        if missing:
-            raise ValueError(f"forcing_itr sim_params missing keys: {sorted(missing)}")
-
-    def equivalent_scalar_values(
-        self, theta: torch.Tensor, y_grid: torch.Tensor
-    ) -> tuple[float, float]:
-        values = _to_numpy_theta(theta, self.theta_dim)
-        y = y_grid.detach().cpu().numpy().astype(np.float64)
-        profile = make_rc_void_profile(y, *values)
-        req = equivalent_scalar_resistance(
-            y, profile, bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
-        )
-        return float(values[0]), req
-
-    def build_scalar_fv_solver(
-        self, ds, sim_params: dict, resistance: float, base_kwargs: dict
-    ):
-        params = dict(sim_params)
-        params["R_c"] = float(resistance)
-        return ForcingProblem(self._representation(ds)).configure_solver(
-            params, base_kwargs
-        )
-
-    @staticmethod
-    def _representation(ds) -> str:
-        return str(getattr(ds.problem, "representation", "temporal_encoder"))
 
 
-class SourceItrSinAdapter(SourceItrAdapter):
-    """Inverse adapter for the sinusoid interface-resistance source benchmark.
+class SourceItrSinAdapter(InverseAdapter):
+    """Inverse adapter for theta=(R_base, A) with a dependent amplitude bound.
 
-    Two parameters ``theta = (R_base, A)`` reparameterize ``source_itr``'s
-    Gaussian-void quartet. The unconstrained -> theta map mirrors the void's
-    ``R_base``/``R_amp`` pair (the dependent-amplitude construction is identical),
-    so the Jacobian is lower-triangular. All patch/IC bookkeeping is
-    inherited; only the theta-shaped hooks change. Conditioning uses the **global**
-    ``A_norm = A / (R_PEAK_MAX - RC_MIN)`` over ``RC_SIN_RANGES["A"]`` to match the
-    forward ``build_cond_vector_sin`` (NOT the headroom fraction).
+    Conditioning uses A/(R_PEAK_MAX-RC_MIN), matching the forward model.
     """
 
     benchmark = "source_itr_sin"
@@ -870,7 +475,7 @@ class SourceItrSinAdapter(SourceItrAdapter):
 
     @property
     def default_profile_index(self) -> int:
-        return 1  # profile over A (depth), matching the void's R_amp default.
+        return 1
 
     def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
         base_lo, base_hi = RC_SIN_RANGES["R_base"]
@@ -1041,10 +646,96 @@ class SourceItrSinAdapter(SourceItrAdapter):
         return out
 
 
+    @property
+    def reports_spatial_severity(self) -> bool:
+        return True
+
+
+    def spatial_channel_index(self) -> Optional[int]:
+        return RC_Y_CHANNEL
+
+
+    def fv_base_kwargs(self, ds, grid_size: Optional[int] = None) -> dict:
+        size = int(grid_size) if grid_size is not None else int(ds.Nx)
+        y_grid = np.linspace(
+            _GEN_DOMAIN["c"], _GEN_DOMAIN["d"], size, dtype=np.float64
+        )
+        return dict(
+            a=_GEN_DOMAIN["a"], b=_GEN_DOMAIN["b"],
+            c=_GEN_DOMAIN["c"], d=_GEN_DOMAIN["d"],
+            Nx=size, Ny=size,
+            lam_target=_GEN_LAM_TARGET,
+            t_final=_snap_t_final(ds),
+            flux_f=_GEN_FLUX_F, flux_A=_GEN_FLUX_A,
+            t_on=_GEN_T_ON, phase=_GEN_PHASE,
+            dt=float(ds.dt), tukey_alpha=_GEN_TUKEY_ALPHA,
+            y_grid=y_grid,
+        )
+
+
+    def _severity_weights(self, y_grid: torch.Tensor) -> torch.Tensor:
+        y = y_grid.detach().cpu().numpy().astype(np.float64)
+        w = interface_control_volume_weights(
+            y, (_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
+        )
+        return torch.as_tensor(w, dtype=y_grid.dtype, device=y_grid.device)
+
+
+    def sensitivity_summary(self, report: dict) -> dict:
+        S = report["singular_values"]
+        least = report["least_identified_dir"]
+        sens = report["param_sensitivity"]
+        out = {
+            "cond_number": report["cond_number"],
+        }
+        for i, name in enumerate(self.param_names):
+            out[f"sv_{i}"] = float(S[i]) if i < len(S) else float("nan")
+            out[f"sens_{name}"] = float(sens[i])
+            out[f"least_dir_{name}"] = float(least[i])
+        return out
+
+
+    def fv_refine_summary(self, res, obs, y_grid: torch.Tensor) -> dict:
+        out = {
+            "fno_resid": res.fno_resid,
+            "fv_resid": res.fv_resid,
+            "fno_vs_fv_resid": res.fno_vs_fv_resid,
+        }
+        if res.theta_fv_polish is not None:
+            tp = res.theta_fv_polish
+            out["fv_polish_resid"] = res.fv_polish_resid
+            out["fv_polish_evals"] = res.fv_polish_evals
+            for i, name in enumerate(self.param_names):
+                out[f"{name}_fvpolish"] = float(tp[i])
+            out["excess_int_fvpolish"] = self.uq_quantity(tp, y_grid)
+            if obs.theta_true is not None:
+                t = obs.theta_true
+                for i, name in enumerate(self.param_names):
+                    out[f"{name}_fvpolish_abserr"] = abs(float(tp[i]) - float(t[i]))
+                out["excess_int_fvpolish_abserr"] = abs(
+                    out["excess_int_fvpolish"] - self.uq_quantity(t, y_grid)
+                )
+        return out
+
+
+    def laplace_summary(self, spec: dict) -> dict:
+        eig = spec["eigenvalues"]
+        least = spec["least_identified_dir"]
+        out = {
+            "laplace_cond": spec["cond_number"],
+        }
+        for i in range(len(eig)):
+            out[f"laplace_eig_{i}"] = float(eig[i])
+        for i, nm in enumerate(self.param_names):
+            out[f"laplace_least_dir_{nm}"] = float(least[i])
+        return out
+
+
+
 class ForcingItrSinAdapter(SourceItrSinAdapter):
     """Inverse adapter for the sinusoid interface-resistance forcing benchmark.
 
-    Mirrors :class:`ForcingItrAdapter` for the 2-param sinusoid: reuses the
+    Mirrors :class:`ForcingItrSinAdapter` for the 2-param sinusoid: reuses the
     forcing FV domain/layers, exposes the equivalent-scalar diagnostic on the
     sin profile, and builds the scalar comparison solver through
     :class:`ForcingProblem`.
