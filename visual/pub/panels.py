@@ -565,6 +565,7 @@ def rc_profile_recovery_panel(
     *,
     color: str,
     title: str = "",
+    xlabel: str = "$y$",
     ylabel: str = "",
     legend: bool = False,
 ) -> None:
@@ -574,6 +575,9 @@ def rc_profile_recovery_panel(
     the caller must set identical ``y`` and ``R_c`` limits on every panel it
     draws. Rescaling between panels would make a worse reconstruction look
     equally good.
+
+    ``xlabel`` is settable so a stacked column of these can carry one shared
+    label on its bottom panel instead of repeating it three times.
     """
     y = np.asarray(y, dtype=float)
     rc_true = np.asarray(rc_true, dtype=float)
@@ -589,14 +593,20 @@ def rc_profile_recovery_panel(
     ax.plot(y, rc_hat, color=color, linewidth=1.3, linestyle="--",
             label="recovered", zorder=3)
     ax.set_xlim(float(y.min()), float(y.max()))
-    ax.set_xlabel("$y$")
+    if xlabel:
+        ax.set_xlabel(xlabel)
     if ylabel:
         ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title, fontsize=7)
     ax.grid(True, alpha=0.25)
     if legend:
-        ax.legend(fontsize=5.5, loc="best")
+        # Larger than the 5.3-5.5 pt legends elsewhere in this module. Those
+        # label five or six series and are read as a key; this one labels two
+        # curves whose solid/dashed distinction *is* the figure, so it has to
+        # survive the reduction to a single column.
+        ax.legend(fontsize=7.0, loc="best", handlelength=2.4,
+                  borderpad=0.4, labelspacing=0.35)
 
 
 def profile_likelihood_panel(

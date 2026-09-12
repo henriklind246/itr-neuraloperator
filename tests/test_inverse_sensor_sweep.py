@@ -572,3 +572,164 @@ def test_run_sweep_preserves_failed_calibration_artifact(tmp_path, monkeypatch):
         manifest = json.load(handle)
     assert manifest["status"] == "calibration_gate_failed"
     assert manifest["failed_sensor_count"] == 8
+
+
+# --------------------------------------------------------------- paper figures
+
+
+def _sweep_with_mocked_subprocesses(tmp_path, monkeypatch, **kwargs):
+    """A complete ``forcing`` sweep with the inversion subprocess stubbed out."""
+    checkpoint = _checkpoint(tmp_path / "model.pt")
+    data_dir = _data_dir(tmp_path / "data")
+    out_dir = tmp_path / "out"
+
+    def fake_run(command):
+        if "--calibration-out" in command:
+            _write_mock_calibration(Path(_option(command, "--calibration-out")))
+        else:
+            _write_mock_forcing_results(command)
+
+    monkeypatch.setattr(sweep, "_run_command", fake_run)
+    monkeypatch.setattr(
+        sweep, "_checkpoint_fingerprint", lambda _: "mock-checkpoint"
+    )
+    sweep.run_sweep(
+        benchmark="forcing",
+        checkpoint=checkpoint,
+        data_dir=data_dir,
+        out_dir=out_dir,
+        device="cpu",
+        **kwargs,
+    )
+    with (out_dir / "sweep_manifest.json").open() as handle:
+        return out_dir, json.load(handle)
+
+
+def test_a_benchmark_with_no_registered_figures_is_skipped_not_failed(
+    tmp_path, monkeypatch
+):
+    # F29/F30 read the sinusoidal R_c(y) profile, which the scalar-R_c forcing
+    # benchmark does not have. Having nothing to draw is a property of the
+    # benchmark, so it must not look like an error in the manifest.
+    out_dir, manifest = _sweep_with_mocked_subprocesses(tmp_path, monkeypatch)
+
+    assert manifest["status"] == "complete"
+    assert manifest["paper_figures"]["status"] == "skipped"
+    assert "forcing" in manifest["paper_figures"]["reason"]
+    assert not (out_dir / "figures").exists()
+
+
+def test_a_figure_failure_does_not_invalidate_the_sweep(tmp_path, monkeypatch):
+    """The whole reason the figure hook is wrapped separately from the summary.
+
+    The summary *is* the sweep's numeric result. The figures are a redrawing of
+    a CSV already on disk, so a backend or font-cache problem must not mark
+    hours of GPU time as failed.
+    """
+    monkeypatch.setattr(
+        sweep,
+        "generate_paper_figures",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("no display available")
+        ),
+    )
+    out_dir, manifest = _sweep_with_mocked_subprocesses(tmp_path, monkeypatch)
+
+    assert manifest["status"] == "complete"
+    assert manifest["paper_figures"]["status"] == "failed"
+    assert "no display available" in manifest["paper_figures"]["error"]
+    assert (out_dir / "inverse_sensor_sweep.csv").is_file()
+    assert manifest["paper_summary"]["status"] == "complete"
+
+
+def test_figures_can_be_turned_off_without_touching_anything_else(
+    tmp_path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        sweep,
+        "generate_paper_figures",
+        lambda *args, **kwargs: calls.append(kwargs) or {},
+    )
+    out_dir, manifest = _sweep_with_mocked_subprocesses(
+        tmp_path, monkeypatch, figures=False
+    )
+
+    assert calls == []
+    assert manifest["paper_figures"] == {"status": "disabled", "figures": []}
+    assert manifest["status"] == "complete"
+    assert (out_dir / "inverse_sensor_sweep.csv").is_file()
+
+
+def test_cli_draws_figures_unless_asked_not_to():
+    base = ["--benchmark", "forcing_itr_sin", "--checkpoint", "model.pt"]
+    assert sweep._build_parser().parse_args(base).figures is True
+    assert sweep._build_parser().parse_args(base + ["--no-figures"]).figures is False
+
+
+def test_generate_paper_figures_renders_the_registered_keys_from_its_own_csv(
+    tmp_path,
+):
+    """Renders for real, deliberately: a mocked ``registry.render`` proves only
+    that arguments were passed, and the requirement set this builds a manifest
+    for has gates (min_seeds, required columns, benchmark coverage) that a mock
+    would sail straight past.
+
+    Provenance is the point. The strict in-memory manifest built from
+    ``combined_path`` is what stops the sweep from redrawing whatever
+    ``visual/pub/manifest.yaml`` happens to point at, which would produce a
+    figure whose numbers came from a different run.
+    """
+    from tests.test_pub_figures import (
+        REPRESENTATIVE_SIM,
+        write_itr_sin_sweep_with_artifacts,
+    )
+
+    combined = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+    out_dir = tmp_path / "out"
+    status = sweep.generate_paper_figures(
+        combined, benchmark="forcing_itr_sin", out_dir=out_dir,
+        seed="mock-checkpoint",
+    )
+
+    assert status["status"] == "complete"
+    assert status["dir"] == str(out_dir / "figures")
+    assert [figure["key"] for figure in status["figures"]] == list(
+        sweep.PAPER_FIGURES["forcing_itr_sin"]
+    )
+    for figure in status["figures"]:
+        paths = [Path(path) for path in figure["paths"]]
+        assert {path.suffix for path in paths} == {".png", ".pdf"}
+        assert all(path.is_file() for path in paths)
+        # Strict, so nothing may land in degraded/.
+        assert all("degraded" not in path.parts for path in paths)
+        # The chosen case is the one thing about these figures that is not
+        # already recoverable from the sweep's numeric outputs, so it is lifted
+        # out of the sidecar and into the sweep manifest.
+        assert figure["selection"]["sim_id"] == REPRESENTATIVE_SIM
+
+
+def test_a_sidecar_without_a_selection_is_not_an_error(tmp_path):
+    assert sweep.read_sidecar_selection(tmp_path / "absent.json") == {}
+
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"figure": "F29_inverse_rc_profile_recovery"}))
+    assert sweep.read_sidecar_selection(empty) == {}
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        ({"status": "skipped", "reason": "no paper figures for forcing"},
+         "no paper figures for forcing"),
+        ({"status": "disabled", "figures": []}, "--no-figures"),
+        ({"status": "complete", "dir": "/out/figures",
+          "figures": [{"key": "F29_inverse_rc_profile_recovery",
+                       "paths": ["/out/figures/F29.png"],
+                       "selection": {"sim_id": 3}}]},
+         "sim_id=3"),
+    ],
+)
+def test_every_figure_state_prints_something_legible(status, expected, capsys):
+    sweep._print_paper_figures(status)
+    assert expected in capsys.readouterr().out

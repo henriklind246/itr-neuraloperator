@@ -40,6 +40,11 @@ sources:
   inverse_forcing:
     - table: results_inverse.csv
   inverse_forcing_itr_sin: []
+  # Both point at runs/inverse_sensor_sweeps/<benchmark>/<fingerprint>/
+  # inverse_sensor_sweep.csv once the sweep has been run on MSI. The paired set
+  # takes both benchmarks' CSVs; the itr_sin set takes only that benchmark's.
+  inverse_sensor_sweep: []
+  inverse_sensor_sweep_itr_sin: []
 
   ood_time:
     - table: visual/ood/forcing_time/ood_per_sim.csv

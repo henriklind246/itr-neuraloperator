@@ -256,8 +256,10 @@ def write_inverse_result(path: Path, benchmark: str) -> Path:
 
 
 # The case ``stats.representative_inverse_case`` must pick out of the synthetic
-# sweep above: ``A_abserr`` there is 0.01*(sim_id+1) at the 8-sensor arm, so the
-# ranking is the sim order and the lower median of eight cases is index 3.
+# sweep above. Both parameter errors are -error with error = 0.01*(sim_id+1)*
+# (8/n_sensors), so the profile L2 is error*sqrt(1 + 2*(2/pi) + 1/2): monotone
+# in sim_id at every arm. The ranking is therefore the sim order whichever arm
+# is used, and the lower median of eight cases is index 3.
 REPRESENTATIVE_SIM = 3
 
 
@@ -302,19 +304,16 @@ def write_itr_sin_sweep_with_artifacts(root: Path, *, joint: bool = True,
 
 
 def itr_sin_manifest(tmp_path: Path, csv: Path) -> Manifest:
-    """A manifest for the shared ``inverse_sensor_sweep`` requirement set.
+    """A manifest for the ``inverse_sensor_sweep_itr_sin`` requirement set.
 
-    That set declares both benchmarks because F18 compares them, so the forcing
-    arm is written too even though F29 and F30 never read a row of it. This is
-    the real workflow -- the sweep script is run for both arms -- and it also
-    makes the tests exercise the per-benchmark artifact filtering that picks the
-    right CSV to derive the NPZ directory from.
+    One CSV, because that set declares one benchmark. F29 and F30 read no row of
+    the forcing arm, so requiring it would block them on a sweep they do not
+    depend on -- which is exactly what lets ``run_inverse_sensor_sweep.py``
+    render them strictly at the end of a single-benchmark run.
     """
-    forcing = write_inverse_sensor_sweep(tmp_path / "forcing.csv", "forcing")
     manifest_path = tmp_path / "manifest.yaml"
     manifest_path.write_text(yaml.safe_dump({
-        "sources": {"inverse_sensor_sweep": [
-            {"table": str(forcing), "seed": "0"},
+        "sources": {"inverse_sensor_sweep_itr_sin": [
             {"table": str(csv), "seed": "0"},
         ]}
     }))
@@ -540,9 +539,12 @@ class TestInverseProfileFigures:
 
         csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
         manifest = itr_sin_manifest(tmp_path, csv)
-        table = records.load_inverse_sensor_sweep(manifest.resolve(self.F29))
+        table = records.load_inverse_sensor_sweep(
+            manifest.resolve(self.F29), benchmarks=("forcing_itr_sin",))
+        # Default arm on purpose: the point is that the figure applies the
+        # module's rule, not that it agrees with a rule this test invented.
         expected = stats.representative_inverse_case(
-            table, benchmark="forcing_itr_sin", reference_sensors=8)
+            table, benchmark="forcing_itr_sin")
 
         _, selection, definition = self.draw(self.F29, manifest)
 
@@ -562,6 +564,40 @@ class TestInverseProfileFigures:
 
         truth = [ax.lines[0].get_ydata() for ax in axes]
         assert all(np.array_equal(truth[0], other) for other in truth[1:])
+
+    def test_f29_and_f30_are_stacked_single_column_figures(self, tmp_path):
+        """Both set into one column of a two-column page, so both are 3x1.
+
+        Pinned because the layout is a typesetting constraint the figure cannot
+        express: a 1x3 renders perfectly well and would only be caught at
+        submission, by which point the panels are illegible at column width.
+        """
+        from visual.pub import style
+
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        manifest = itr_sin_manifest(tmp_path, csv)
+
+        for key in (self.F29, self.F30):
+            fig, _, _ = self.draw(key, manifest)
+            assert registry.FIGURES[key].width == "one_col"
+            assert fig.get_size_inches()[0] == pytest.approx(
+                style.WIDTHS_IN["one_col"])
+            # A colorbar is an axes, and it inherits a subplotspec from the
+            # host it was split off, so it has to be excluded by name.
+            panels_ = [ax for ax in fig.axes if ax.get_label() != "<colorbar>"]
+            assert len(panels_) == 3
+            rows, cols = panels_[0].get_subplotspec().get_gridspec().get_geometry()
+            assert (rows, cols) == (3, 1)
+            assert fig.get_size_inches()[1] > fig.get_size_inches()[0]
+
+    def test_f29_labels_y_once_at_the_bottom(self, tmp_path):
+        """A shared x axis repeated three times is three times the ink."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        fig, _, _ = self.draw(self.F29, itr_sin_manifest(tmp_path, csv))
+
+        assert [ax.get_xlabel() for ax in fig.axes] == ["", "", "$y$"]
+        # The R_c axis is *not* shared, so every panel keeps its own label.
+        assert all(ax.get_ylabel() for ax in fig.axes)
 
     def test_f29_recovered_peak_is_the_recovered_r_base_plus_a(self, tmp_path):
         """R_c(y) peaks at R_base + A; if it does not, the curve is not the model."""
@@ -641,7 +677,11 @@ class TestInverseProfileFigures:
         assert "approximation" not in definition["joint_region_source"]
         assert "JOINT_REGION_LAPLACE_APPROXIMATION" not in definition["degradations"]
         assert definition["sim_id"] == REPRESENTATIVE_SIM
-        assert definition["n_sensors"] == 8
+        # The densest arm: F30 shows the method at its intended operating point,
+        # so a tilted region there is a property of the parameterization rather
+        # than of thin data. Read off the spec so the two cannot drift apart.
+        assert definition["n_sensors"] == 32
+        assert registry.FIGURES[self.F30].params["n_sensors"] == 32
 
     def test_f30_falls_back_to_the_quadratic_and_says_so(self, tmp_path):
         """An assumed ellipse must not be presentable as a measured shape."""

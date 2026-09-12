@@ -286,6 +286,24 @@ _RC_PEAK_MAX = 3.0
 _ITR_SIN_LABELS = {"R_base": r"$R_{\mathrm{base}}$", "A": r"$A$"}
 _RC_UNIT = r"m$^2$ K/W"
 
+# The arm the representative case is chosen on, and the arm F30 shows by
+# default. The densest arm is the method's intended operating point, so a median
+# case there is a statement about the method as deployed rather than about how
+# it degrades. F30's arm is a spec param, so the 8-sensor version -- where any
+# R_base/A compensation is widest and most visible -- can be rendered alongside
+# by adding a second spec, without touching the drawing code.
+_REFERENCE_SENSORS = 32
+
+# One string, cited by both figures' sidecars. F29 and F30 are only comparable
+# because they show the same inversion, so a rule that drifted between the two
+# descriptions would be a claim the figures no longer support.
+_SELECTION_RULE = (
+    f"cases ranked by the L2 error of the recovered R_c(y) profile over "
+    f"y in [0,1] at the {_REFERENCE_SENSORS}-sensor arm; the lower median is "
+    f"shown. Fixed in stats.representative_inverse_case and applied without "
+    f"consulting the drawn result."
+)
+
 
 def _itr_sin_sweep(source, requirement, key: str):
     """The forcing_itr_sin sweep table, its CSV path, and the case to show."""
@@ -293,9 +311,8 @@ def _itr_sin_sweep(source, requirement, key: str):
     if not paths:
         blocked(
             requirement,
-            "needs the paired forcing_itr_sin sweep at 8, 16, and 32 sensors; "
-            "no inverse sweep CSV for that benchmark resolved from the "
-            "manifest.",
+            "needs the forcing_itr_sin sweep at 8, 16, and 32 sensors; no "
+            "inverse sweep CSV for that benchmark resolved from the manifest.",
             key=key,
         )
     # Restricted to the one arm these figures read. F18 loads both and needs
@@ -303,7 +320,7 @@ def _itr_sin_sweep(source, requirement, key: str):
     # reason that has nothing to do with whether this figure can be drawn.
     table = records.load_inverse_sensor_sweep(source, benchmarks=(_ITR_SIN,))
     sim_id = stats.representative_inverse_case(
-        table, benchmark=_ITR_SIN, reference_sensors=8)
+        table, benchmark=_ITR_SIN, reference_sensors=_REFERENCE_SENSORS)
     return table, paths[0], int(sim_id)
 
 
@@ -327,8 +344,9 @@ def rc_profile_recovery(*, source=None, spec=None, requirement=None):
     One inversion case at 8, 16 and 32 interface sensors, two curves per panel,
     identical axes throughout, so the only thing that changes left to right is
     the sensor count. The case is picked by the pre-registered rule in
-    ``stats.representative_inverse_case`` -- the lower-median case by recovery
-    error at the hardest arm -- rather than by looking at the drawn result.
+    ``stats.representative_inverse_case`` -- the lower-median case by
+    :math:`R_c(y)` profile L2 error at the densest arm -- rather than by looking
+    at the drawn result.
 
     No uncertainty band is drawn around the recovered profile. The two 95%
     parameter intervals are marginal and correlated, so propagating them
@@ -368,24 +386,31 @@ def rc_profile_recovery(*, source=None, spec=None, requirement=None):
     pad = 0.08 * (high - low) or 0.05
     ylim = (low - pad, high + pad)
 
-    width = spec.width if spec is not None else "two_col"
-    fig, axes = plt.subplots(1, len(counts),
-                             figsize=style.figsize(width, row_height="std"))
+    # Stacked, not side by side: one column of a two-column page. The three
+    # panels share an x axis, so only the bottom one is labelled and ticked.
+    width = spec.width if spec is not None else "one_col"
+    fig, axes = plt.subplots(
+        len(counts), 1, sharex=True,
+        figsize=style.figsize(width, rows=len(counts), row_height="grid_row",
+                              extra_in=0.75),
+    )
     flat = np.atleast_1d(axes).ravel().tolist()
     color = style.benchmark_color(_ITR_SIN)
+    last = len(flat) - 1
 
     for index, (ax, count, rc_hat) in enumerate(zip(flat, counts, estimates)):
         panels.rc_profile_recovery_panel(
             ax, y, truth, rc_hat, color=color,
             title=f"{count} interface sensors",
-            ylabel=f"$R_c(y)$ [{_RC_UNIT}]" if index == 0 else "",
+            xlabel="$y$" if index == last else "",
+            ylabel=f"$R_c(y)$ [{_RC_UNIT}]",
             legend=(index == 0))
         ax.set_ylim(*ylim)
 
     fig.suptitle(f"One inversion case (sim {sim_id}) at three sensor counts",
-                 fontsize=8, y=0.99)
-    style.panel_letters(flat)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+                 fontsize=8, y=0.995)
+    style.panel_letters(flat, loc=(-0.16, 1.02))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
 
     metric_definition = {
         "question": (
@@ -398,12 +423,7 @@ def rc_profile_recovery(*, source=None, spec=None, requirement=None):
         "n_cases": 1,
         "sim_id": sim_id,
         "sensor_counts": list(counts),
-        "selection_rule": (
-            "cases ranked by absolute error in the last recovered parameter "
-            "at the 8-sensor arm; the lower median is shown. Fixed in "
-            "stats.representative_inverse_case and applied without consulting "
-            "the drawn result."
-        ),
+        "selection_rule": _SELECTION_RULE,
         "estimator": (
             "MAP in the unconstrained parameterization, FNO surrogate forward "
             "model"
@@ -431,15 +451,12 @@ def rc_profile_recovery(*, source=None, spec=None, requirement=None):
         ),
         "degradations": ["SINGLE_CASE_ILLUSTRATION"],
     }
-    selection = {
-        "sim_id": sim_id,
-        "rule": "lower-median absolute recovery error at the 8-sensor arm",
-    }
+    selection = {"sim_id": sim_id, "rule": _SELECTION_RULE}
     return fig, selection, metric_definition
 
 
-def identifiability(*, n_sensors: int = 8, source=None, spec=None,
-                    requirement=None):
+def identifiability(*, n_sensors: int = _REFERENCE_SENSORS, source=None,
+                    spec=None, requirement=None):
     """F30 -- are :math:`R_{\\mathrm{base}}` and :math:`A` separately identifiable?
 
     Panels (a) and (b) are the two 95% profile likelihoods for the same case
@@ -457,6 +474,12 @@ def identifiability(*, n_sensors: int = 8, source=None, spec=None,
 
     Blank cells are inadmissible: the parameterization enforces
     ``A <= R_PEAK_MAX - R_base``, so those pairs were never evaluated.
+
+    Drawn at the densest arm, where the inversion is at its best: a tilted
+    region there is a property of the parameterization rather than of thin data.
+    ``n_sensors`` is a spec parameter, so the 8-sensor view -- which is the one
+    that shows how much of the region the extra sensors closed -- can be added
+    as a second spec without touching this function.
     """
     key = "F30_inverse_identifiability"
     if int(n_sensors) not in records.INVERSE_SENSOR_COUNTS:
@@ -501,9 +524,16 @@ def identifiability(*, n_sensors: int = 8, source=None, spec=None,
     theta_hat = np.asarray(artifact.theta_hat, dtype=float)[order]
     theta_true = np.asarray(artifact.theta_true, dtype=float)[order]
 
-    width = spec.width if spec is not None else "two_col"
-    fig, axes = plt.subplots(1, 3,
-                             figsize=style.figsize(width, row_height="std"))
+    # Stacked, not side by side: one column of a two-column page. The three
+    # panels carry three different x axes, so none of them is shared. The joint
+    # region gets the tallest row -- its shape is the claim, and the flattest
+    # row of an even split reads as a tilt the likelihood does not have.
+    width = spec.width if spec is not None else "one_col"
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=style.figsize(width, rows=3, row_height="short", extra_in=0.7),
+        gridspec_kw={"height_ratios": [1.0, 1.0, 1.3]},
+    )
     flat = np.atleast_1d(axes).ravel().tolist()
     color = style.benchmark_color(_ITR_SIN)
 
@@ -515,7 +545,7 @@ def identifiability(*, n_sensors: int = 8, source=None, spec=None,
         panels.profile_likelihood_panel(
             flat[index], curve, color=color,
             xlabel=f"{_ITR_SIN_LABELS[name]} [{_RC_UNIT}]",
-            ylabel=r"$\Delta\ell_p$" if index == 0 else "",
+            ylabel=r"$\Delta\ell_p$",
             title=f"profile likelihood, {_ITR_SIN_LABELS[name]}",
             threshold=artifact.profile_threshold,
             legend=(index == 0))
@@ -531,9 +561,9 @@ def identifiability(*, n_sensors: int = 8, source=None, spec=None,
 
     fig.suptitle(
         f"One inversion case (sim {sim_id}) at {int(n_sensors)} sensors",
-        fontsize=8, y=0.99)
-    style.panel_letters(flat)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+        fontsize=8, y=0.995)
+    style.panel_letters(flat, loc=(-0.16, 1.03))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
 
     metric_definition = {
         "question": (
@@ -547,11 +577,7 @@ def identifiability(*, n_sensors: int = 8, source=None, spec=None,
         "n_cases": 1,
         "sim_id": sim_id,
         "n_sensors": int(n_sensors),
-        "selection_rule": (
-            "the same case F29 draws: cases ranked by absolute error in the "
-            "last recovered parameter at the 8-sensor arm, lower median taken. "
-            "Fixed in stats.representative_inverse_case."
-        ),
+        "selection_rule": f"the same case F29 draws: {_SELECTION_RULE}",
         "estimator": (
             f"profile likelihood at level {artifact.level}, sum-convention "
             "NLL 0.5 * sum(resid^2) / sigma_eff2"

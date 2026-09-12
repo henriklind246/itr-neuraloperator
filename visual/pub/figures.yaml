@@ -144,13 +144,38 @@ requirement_sets:
       forcing and forcing_itr_sin. Per-benchmark estimate columns (R_c_map, or
       R_base_hat and A_hat) are validated conditionally at load time rather than
       listed above, because the two benchmarks may be supplied as separate CSVs
-      and neither carries the other's columns. F29 and F30 additionally read the
-      per-sim NPZ artifacts beside each CSV
+      and neither carries the other's columns.
+    regenerate: >-
+      python scripts/run_inverse_sensor_sweep.py --benchmark <forcing|forcing_itr_sin>
+      --checkpoint <matching-checkpoint>
+
+  # Split from inverse_sensor_sweep rather than sharing it: F18 compares the two
+  # benchmarks against each other and is genuinely blocked without both arms,
+  # whereas F29 and F30 read only forcing_itr_sin and would otherwise be held
+  # hostage to a forcing sweep neither draws a single row of. The separation is
+  # also what lets run_inverse_sensor_sweep.py render these two at the end of a
+  # single-benchmark run without weakening the check to non-strict.
+  inverse_sensor_sweep_itr_sin:
+    kind: inverse_csv
+    benchmarks: [forcing_itr_sin]
+    min_seeds: 1
+    schema_min: 0
+    required_columns:
+      - benchmark
+      - sim_id
+      - n_sensors
+      - R_base_true
+      - A_true
+      - R_base_hat
+      - A_hat
+    note: >-
+      the forcing_itr_sin arm of the sensor sweep at 8, 16, and 32 sensors. F29
+      and F30 additionally read the per-sim NPZ artifacts beside the CSV
       (sensors_NN/artifacts/sim_NNNNN.npz, schema >= 3); F30 needs the joint NLL
       grid that --joint-nll-grid writes and falls back to a quadratic
       approximation, labelled as such, when only the sensitivity is stored.
     regenerate: >-
-      python scripts/run_inverse_sensor_sweep.py --benchmark <forcing|forcing_itr_sin>
+      python scripts/run_inverse_sensor_sweep.py --benchmark forcing_itr_sin
       --checkpoint <matching-checkpoint>
 
   # --------------------------------------------------------------------- ood
@@ -346,14 +371,14 @@ figures:
     metric_space: kelvin
 
   F29_inverse_rc_profile_recovery:
-    requires: [inverse_sensor_sweep]
+    requires: [inverse_sensor_sweep_itr_sin]
     # kelvin is this vocabulary's physical-units bucket; the actual unit here is
     # m^2 K/W on the R_c axis, as it is for F28. Nothing is normalized or
     # expressed as a ratio.
     metric_space: kelvin
 
   F30_inverse_identifiability:
-    requires: [inverse_sensor_sweep]
+    requires: [inverse_sensor_sweep_itr_sin]
     # mixed: the parameter axes are physical, the vertical axis is a
     # dimensionless log-likelihood difference against a chi-squared threshold.
     metric_space: mixed

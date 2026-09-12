@@ -724,6 +724,104 @@ def _print_paper_summary(summary: dict) -> None:
         print(f"    FV residual: {format_stats(fv['residual_K'])} K; {fv['over_noise_median']:.3g}x noise std", flush=True)
 
 
+# Publication figures this sweep can draw entirely from its own outputs, keyed
+# by the benchmark whose CSV and per-sim NPZ tree they read. Both consume
+# visual/pub's inverse_sensor_sweep_itr_sin requirement set.
+PAPER_FIGURES = {
+    "forcing_itr_sin": (
+        "F29_inverse_rc_profile_recovery",
+        "F30_inverse_identifiability",
+    ),
+}
+
+
+def generate_paper_figures(combined_path: Path, *, benchmark: str,
+                           out_dir: Path, seed: str) -> dict:
+    """Render the publication figures this sweep is the sole evidence for.
+
+    The sweep writes the CSV and the per-sim NPZ tree these figures read, so it
+    is also the only point at which they can be produced without a human
+    remembering to. Provenance is resolved strictly against an in-memory
+    manifest built from the path just written -- there is nothing to discover,
+    and a figure whose numbers came from somewhere else would be worse than no
+    figure.
+
+    Returns a status dict for ``sweep_manifest.json``. Benchmarks with no
+    registered figures return ``skipped``; that is not a failure.
+    """
+    keys = PAPER_FIGURES.get(benchmark, ())
+    if not keys:
+        return {"status": "skipped", "reason": f"no paper figures for {benchmark}",
+                "figures": []}
+
+    # Before visual.pub pulls in pyplot: compute nodes have no display, and the
+    # default backend would abort a sweep that has already done all its work.
+    import matplotlib
+    matplotlib.use("Agg")
+
+    from visual.pub import registry
+    from visual.pub.manifest import FigureRequirements, Manifest
+
+    figure_dir = Path(out_dir) / "figures"
+    # The seed is the checkpoint fingerprint: one sweep inverts against one
+    # frozen surrogate, so that is the replication unit visual.pub counts.
+    # Without it the entry contributes no seed at all and a strict render fails
+    # the requirement set's min_seeds gate.
+    manifest = Manifest(
+        sources={
+            "inverse_sensor_sweep_itr_sin": [
+                {"table": str(combined_path), "seed": str(seed)},
+            ],
+        },
+        requirements=FigureRequirements.load(),
+    )
+    rendered = []
+    for key in keys:
+        result = registry.render(key, manifest=manifest, out_dir=figure_dir,
+                                 strict=True, formats=("png", "pdf"),
+                                 force=True)
+        rendered.append({
+            "key": key,
+            "paths": [str(p) for p in result.paths],
+            "sidecar": str(result.sidecar),
+            "selection": (read_sidecar_selection(result.sidecar)),
+        })
+    return {"status": "complete", "dir": str(figure_dir), "figures": rendered}
+
+
+def read_sidecar_selection(sidecar: Path) -> dict:
+    """The case a figure chose, lifted into the sweep manifest.
+
+    Which of the eight simulations got drawn is the one thing about these
+    figures a reader cannot recover from the sweep's own numeric outputs.
+    """
+    payload = _load_json(Path(sidecar))
+    return (payload or {}).get("selection") or {}
+
+
+def _print_paper_figures(status: dict) -> None:
+    state = status.get("status")
+    if state == "skipped":
+        print(f"\nPaper figures: skipped ({status.get('reason', 'no reason given')})",
+              flush=True)
+        return
+    if state == "disabled":
+        print("\nPaper figures: disabled (--no-figures)", flush=True)
+        return
+
+    print(f"\nPaper figures -> {status.get('dir', '?')}", flush=True)
+    for entry in status.get("figures", []):
+        print(f"  {entry['key']}", flush=True)
+        for path in entry.get("paths", []):
+            print(f"    {path}", flush=True)
+        selection = entry.get("selection") or {}
+        # The selected sim_id is the only part of these figures that is not
+        # already in the CSV, so it is worth one line of stdout: a reader who
+        # wants to check a curve by hand needs to know which row to look at.
+        if "sim_id" in selection:
+            print(f"    case: sim_id={selection['sim_id']}", flush=True)
+
+
 def _validate_artifacts(artifact_dir: Path, sim_ids: list[int]) -> list[str]:
     expected = [artifact_dir / f"sim_{sid:05d}.npz" for sid in sim_ids]
     missing = [str(path) for path in expected if not path.is_file()]
@@ -739,6 +837,7 @@ def run_sweep(
     data_dir: Path | None,
     out_dir: Path,
     device: str,
+    figures: bool = True,
 ) -> Path:
     checkpoint = checkpoint.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
@@ -992,6 +1091,39 @@ def run_sweep(
                 f"inverse sweep completed but paper-summary generation failed: {exc}"
             ) from exc
         _print_paper_summary(manifest["paper_summary"])
+        # Non-fatal, unlike the summary above. The summary *is* the sweep's
+        # numeric result, so failing to produce it invalidates the run. The
+        # figures are a redrawing of a CSV that is already on disk and can be
+        # regenerated in seconds by visual.pub; letting a font cache or a
+        # backend quirk mark hours of GPU time as failed would be wrong.
+        if figures:
+            try:
+                manifest["paper_figures"] = generate_paper_figures(
+                    combined_path,
+                    benchmark=benchmark,
+                    out_dir=out_dir,
+                    seed=checkpoint_fingerprint,
+                )
+            except Exception as exc:
+                manifest["paper_figures"] = {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                print(
+                    f"WARNING: paper-figure generation failed: "
+                    f"{type(exc).__name__}: {exc}\n"
+                    f"         The sweep results are complete and unaffected.\n"
+                    f"         To draw them later, point "
+                    f"visual/pub/manifest.yaml's inverse_sensor_sweep_itr_sin\n"
+                    f"         at {combined_path} and run:\n"
+                    f"         python -m visual.pub --figure "
+                    f"{' '.join(PAPER_FIGURES.get(benchmark, ()))}",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                _print_paper_figures(manifest["paper_figures"])
+        else:
+            manifest["paper_figures"] = {"status": "disabled", "figures": []}
         manifest["status"] = "complete"
         manifest["completed_utc"] = _utc_now()
         _write_json(manifest_path, manifest)
@@ -1041,6 +1173,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "(default preference: cuda, mps, then cpu)."
         ),
     )
+    parser.add_argument(
+        "--no-figures",
+        dest="figures",
+        action="store_false",
+        help=(
+            "Skip rendering the publication figures this sweep is the sole "
+            "evidence for (currently F29/F30, forcing_itr_sin only). The CSV "
+            "and artifacts are written either way, so they can be drawn later "
+            "with visual.pub."
+        ),
+    )
+    parser.set_defaults(figures=True)
     return parser
 
 
@@ -1078,6 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir=data_dir,
             out_dir=out_dir,
             device=device,
+            figures=args.figures,
         )
     except CalibrationGateError as exc:
         print(f"calibration gate failure: {exc}", file=sys.stderr)

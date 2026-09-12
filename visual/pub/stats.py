@@ -567,6 +567,25 @@ _INVERSE_SENSOR_METRICS = {
     }.items()
 }
 
+# Gram matrix G[i,j] = \int_0^1 b_i(y) b_j(y) dy of the basis each benchmark's
+# parameters multiply in R_c(y), so that a parameter-error vector d has profile
+# error ||dR_c||_L2 = sqrt(d^T G d) in closed form -- no quadrature, no grid.
+#
+#   forcing:          R_c(y) = R_c                  basis (1,)
+#   *_itr_sin:        R_c(y) = R_base + A sin(pi y) basis (1, sin(pi y))
+#
+# \int sin(pi y) dy = 2/pi and \int sin^2(pi y) dy = 1/2 on [0, 1]. The
+# off-diagonal term is what makes this worth doing: sin(pi y) >= 0 everywhere on
+# the interface, so a positive R_base error and a positive A error push the
+# profile the same way at every y and compound, while opposite signs partly
+# cancel into a genuinely better reconstruction. Ranking on either parameter
+# alone cannot see that, and it is precisely the profile that F29 draws.
+_INVERSE_PROFILE_GRAM = {
+    "forcing": np.asarray([[1.0]]),
+    "forcing_itr_sin": np.asarray([[1.0, 2.0 / np.pi], [2.0 / np.pi, 0.5]]),
+    "source_itr_sin": np.asarray([[1.0, 2.0 / np.pi], [2.0 / np.pi, 0.5]]),
+}
+
 
 def _sensor_sweep_curve(
     values,
@@ -749,29 +768,67 @@ def inverse_sensor_sweep_summaries(
     return output
 
 
-def representative_inverse_case(
-    table: pd.DataFrame,
-    *,
-    benchmark: str,
-    reference_sensors: int = 8,
-) -> int:
-    """Pre-registered choice of the single inversion case a figure shows.
+def inverse_profile_l2_error(table: pd.DataFrame, *, benchmark: str) -> np.ndarray:
+    """Per-row L2 error of the recovered ``R_c(y)`` profile, in m² K/W.
 
-    Cases are ranked by absolute recovery error in the last recovered parameter
-    at the hardest (smallest) sensor arm, and the lower median is taken. Picking
-    the median rather than the best case keeps the figure from being selected in
-    its own favour, and fixing the rule here rather than inside each figure keeps
-    every figure that needs "the representative case" showing the same inversion.
+    ``sqrt(d^T G d)`` where ``d`` is the signed parameter-error vector and ``G``
+    is :data:`_INVERSE_PROFILE_GRAM`. This is the root-mean-square discrepancy
+    between the true and recovered resistance profiles over ``y`` in ``[0, 1]``,
+    which is the quantity F29 plots and the one a reader judges a reconstruction
+    by. For the scalar-``R_c`` benchmark ``G`` is ``[[1]]`` and it reduces
+    exactly to the absolute recovery error, so one statistic covers both.
     """
     try:
         columns = _INVERSE_SENSOR_METRICS[benchmark]
+        gram = _INVERSE_PROFILE_GRAM[benchmark]
     except KeyError:
         raise ValueError(
             f"unsupported inverse sensor sweep benchmark {benchmark!r}"
         ) from None
-    column = columns[-1]["absolute_error"]
-    if column not in table.columns:
-        raise ValueError(f"inverse sensor sweep has no {column} column to rank by")
+
+    needed = [c[key] for c in columns for key in ("truth", "estimate")]
+    missing = [c for c in needed if c not in table.columns]
+    if missing:
+        raise ValueError(f"inverse sensor sweep is missing columns {missing}")
+
+    delta = np.column_stack([
+        table[c["estimate"]].to_numpy(dtype=np.float64)
+        - table[c["truth"]].to_numpy(dtype=np.float64)
+        for c in columns
+    ])
+    return np.sqrt(np.maximum(np.einsum("ni,ij,nj->n", delta, gram, delta), 0.0))
+
+
+def representative_inverse_case(
+    table: pd.DataFrame,
+    *,
+    benchmark: str,
+    reference_sensors: int = 32,
+) -> int:
+    """Pre-registered choice of the single inversion case a figure shows.
+
+    Cases are ranked by :func:`inverse_profile_l2_error` at one sensor arm and
+    the lower median is taken. Three choices, each of which is a claim:
+
+    *Median, not best.* A best-case figure is selected in its own favour and
+    tells a reader nothing about what to expect. The median case is the one the
+    aggregate table's central tendency actually refers to.
+
+    *Profile L2, not one parameter's error.* The figure shows a curve, so it is
+    ranked by how far that curve is from the truth. Ranking on ``A`` alone would
+    call a case typical on the strength of one coefficient while the profile it
+    draws was off by a constant offset the ranking never looked at.
+
+    *One arm, declared by the caller.* Ranking on the best-resolved arm makes
+    the selection a statement about the method at its intended operating point.
+    Ranking separately per arm would let each panel of F29 show a different
+    simulation, which would destroy the controlled comparison the figure is.
+
+    Fixing the rule here rather than inside each figure is what keeps every
+    figure that needs "the representative case" showing the same inversion.
+    """
+    if benchmark not in _INVERSE_SENSOR_METRICS:
+        raise ValueError(f"unsupported inverse sensor sweep benchmark {benchmark!r}")
 
     arm = table.loc[
         (table["benchmark"].astype(str) == benchmark)
@@ -783,20 +840,21 @@ def representative_inverse_case(
         )
     ranked = pd.DataFrame({
         "sim_id": arm["sim_id"].astype(int).to_numpy(),
-        column: arm[column].to_numpy(dtype=np.float64),
+        "profile_l2": inverse_profile_l2_error(arm, benchmark=benchmark),
     })
     if ranked["sim_id"].duplicated().any():
         raise ValueError(
             f"{benchmark} repeats a sim_id in the {reference_sensors}-sensor arm"
         )
-    if not np.all(np.isfinite(ranked[column].to_numpy())):
+    if not np.all(np.isfinite(ranked["profile_l2"].to_numpy())):
         raise ValueError(
-            f"{benchmark} {column} is not finite at {reference_sensors} sensors"
+            f"{benchmark} profile L2 error is not finite at "
+            f"{reference_sensors} sensors"
         )
     # Lower median on an even count: the smaller of the two central ranks, so
     # the rule resolves to one existing case rather than an average of two cases
     # that cannot be averaged. sim_id breaks ties.
-    ranked = ranked.sort_values([column, "sim_id"], kind="mergesort")
+    ranked = ranked.sort_values(["profile_l2", "sim_id"], kind="mergesort")
     return int(ranked["sim_id"].to_numpy()[(len(ranked) - 1) // 2])
 
 
@@ -1684,6 +1742,7 @@ __all__ = [
     "ecdf",
     "ecdf_band",
     "exceedance_rate",
+    "inverse_profile_l2_error",
     "inverse_sensor_sweep_summaries",
     "laplace_joint_region",
     "metric_spec",

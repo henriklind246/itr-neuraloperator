@@ -156,13 +156,15 @@ _SPECS: tuple[FigureSpec, ...] = (
           "visual.pub.fig_supplement", "direct_vs_autoregressive", 3, "two_col"),
     _spec("F24_resolution_invariance", "Resolution invariance",
           "visual.pub.fig_supplement", "resolution_invariance", 3, "two_col"),
+    # one_col, not two_col: both are stacked 3x1 so they set into a single
+    # column of the two-column page rather than spanning it.
     _spec("F29_inverse_rc_profile_recovery",
           "Recovery of the spatially varying interfacial resistance",
-          "visual.pub.fig_inverse", "rc_profile_recovery", 3, "two_col"),
+          "visual.pub.fig_inverse", "rc_profile_recovery", 3, "one_col"),
     _spec("F30_inverse_identifiability",
           "Identifiability of the interfacial resistance parameters",
-          "visual.pub.fig_inverse", "identifiability", 3, "two_col",
-          n_sensors=8),
+          "visual.pub.fig_inverse", "identifiability", 3, "one_col",
+          n_sensors=32),
 )
 
 FIGURES: dict[str, FigureSpec] = {s.key: s for s in _SPECS}

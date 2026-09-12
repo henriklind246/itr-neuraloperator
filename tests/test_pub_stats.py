@@ -244,51 +244,114 @@ class TestInverseSensorSweep:
             stats.inverse_sensor_sweep_summaries(bad_ratio)
 
 
-class TestRepresentativeInverseCase:
-    def test_the_lower_median_case_at_the_hardest_arm_is_selected(self):
+def itr_sin_arm(table: pd.DataFrame, n_sensors: int) -> pd.Series:
+    return (
+        (table["benchmark"] == "forcing_itr_sin")
+        & (table["n_sensors"] == n_sensors)
+    )
+
+
+class TestInverseProfileL2Error:
+    """The statistic the representative case is ranked by."""
+
+    def test_it_equals_quadrature_of_the_profile_difference(self):
+        """The closed form is only a shortcut if it agrees with the integral."""
         table = make_inverse_sensor_sweep()
-        # A_abserr rises monotonically with sim_id, so the eight cases sort into
-        # sim_id order and the lower median of an even count is index 3.
+        arm = table.loc[itr_sin_arm(table, 32)]
+        got = stats.inverse_profile_l2_error(arm, benchmark="forcing_itr_sin")
+
+        y = np.linspace(0.0, 1.0, 200_001)
+        expected = [
+            np.sqrt(np.trapezoid(
+                ((row.R_base_hat - row.R_base_true)
+                 + (row.A_hat - row.A_true) * np.sin(np.pi * y)) ** 2, y))
+            for row in arm.itertuples()
+        ]
+        assert got == pytest.approx(expected, rel=1e-6)
+
+    def test_cancelling_parameter_errors_beat_compounding_ones(self):
+        """The reason for the off-diagonal, and the reason not to rank on A.
+
+        ``sin(pi y) >= 0`` across the whole interface, so a positive R_base
+        error and a positive A error push the profile the same way at every y.
+        Two cases with identical per-parameter absolute errors can therefore
+        reconstruct the profile very differently, which is what F29 draws and
+        what a per-parameter ranking cannot see.
+        """
+        table = pd.DataFrame([
+            {"R_base_true": 0.4, "A_true": 0.4,
+             "R_base_hat": 0.43, "A_hat": 0.42},   # same sign: compounds
+            {"R_base_true": 0.4, "A_true": 0.4,
+             "R_base_hat": 0.43, "A_hat": 0.38},   # opposite sign: cancels
+        ])
+        compounding, cancelling = stats.inverse_profile_l2_error(
+            table, benchmark="forcing_itr_sin")
+
+        assert cancelling < compounding
+        # Ranking on either parameter alone calls these two cases identical.
+        for stem in ("R_base", "A"):
+            per_parameter = (table[f"{stem}_hat"] - table[f"{stem}_true"]).abs()
+            assert per_parameter.iloc[0] == pytest.approx(per_parameter.iloc[1])
+
+    def test_the_scalar_benchmark_reduces_to_absolute_error(self):
+        """G is [[1]] there, so one statistic covers both benchmarks."""
+        table = make_inverse_sensor_sweep()
+        arm = table.loc[(table["benchmark"] == "forcing")
+                        & (table["n_sensors"] == 32)]
+        assert stats.inverse_profile_l2_error(arm, benchmark="forcing") == \
+            pytest.approx(arm["R_c_abs_error"].to_numpy())
+
+    def test_an_unknown_benchmark_or_missing_column_raises(self):
+        table = make_inverse_sensor_sweep()
+        with pytest.raises(ValueError, match="unsupported"):
+            stats.inverse_profile_l2_error(table, benchmark="interfaces")
+        with pytest.raises(ValueError, match="missing columns"):
+            stats.inverse_profile_l2_error(
+                table.drop(columns=["A_hat"]), benchmark="forcing_itr_sin")
+
+
+class TestRepresentativeInverseCase:
+    def test_the_lower_median_case_at_the_reference_arm_is_selected(self):
+        table = make_inverse_sensor_sweep()
+        # Both parameter errors grow with sim_id, so profile L2 does too: the
+        # eight cases sort into sim_id order and the lower median is index 3.
         assert stats.representative_inverse_case(
             table, benchmark="forcing_itr_sin"
         ) == 3
 
     def test_selection_is_ranked_not_positional(self):
         table = make_inverse_sensor_sweep()
-        arm = (
-            (table["benchmark"] == "forcing_itr_sin")
-            & (table["n_sensors"] == 8)
-        )
+        arm = itr_sin_arm(table, 32)
         # Reversing the error ordering must reverse the selection; a rule that
         # merely took the fourth row would not notice.
-        table.loc[arm, "A_abserr"] = 0.1 - table.loc[arm, "sim_id"] * 0.01
+        offset = 0.1 - table.loc[arm, "sim_id"] * 0.01
+        table.loc[arm, "R_base_hat"] = table.loc[arm, "R_base_true"] - offset
+        table.loc[arm, "A_hat"] = table.loc[arm, "A_true"] - offset
         assert stats.representative_inverse_case(
             table, benchmark="forcing_itr_sin"
         ) == 4
 
     def test_ties_are_broken_by_sim_id(self):
         table = make_inverse_sensor_sweep()
-        arm = (
-            (table["benchmark"] == "forcing_itr_sin")
-            & (table["n_sensors"] == 8)
-        )
-        table.loc[arm, "A_abserr"] = 0.05
+        arm = itr_sin_arm(table, 32)
+        table.loc[arm, "R_base_hat"] = table.loc[arm, "R_base_true"] - 0.05
+        table.loc[arm, "A_hat"] = table.loc[arm, "A_true"] - 0.05
         assert stats.representative_inverse_case(
             table, benchmark="forcing_itr_sin"
         ) == 3
 
     def test_the_reference_arm_is_the_one_that_decides(self):
+        """Default is the densest arm; a worse-resolved arm must not leak in."""
         table = make_inverse_sensor_sweep()
-        arm = (
-            (table["benchmark"] == "forcing_itr_sin")
-            & (table["n_sensors"] == 32)
-        )
-        table.loc[arm, "A_abserr"] = 0.1 - table.loc[arm, "sim_id"] * 0.01
+        arm = itr_sin_arm(table, 8)
+        offset = 0.1 - table.loc[arm, "sim_id"] * 0.01
+        table.loc[arm, "R_base_hat"] = table.loc[arm, "R_base_true"] - offset
+        table.loc[arm, "A_hat"] = table.loc[arm, "A_true"] - offset
         assert stats.representative_inverse_case(
             table, benchmark="forcing_itr_sin"
         ) == 3
         assert stats.representative_inverse_case(
-            table, benchmark="forcing_itr_sin", reference_sensors=32
+            table, benchmark="forcing_itr_sin", reference_sensors=8
         ) == 4
 
     def test_the_scalar_benchmark_ranks_by_its_own_error_column(self):
@@ -306,12 +369,8 @@ class TestRepresentativeInverseCase:
 
     def test_a_non_finite_ranking_value_is_refused(self):
         table = make_inverse_sensor_sweep()
-        row = (
-            (table["benchmark"] == "forcing_itr_sin")
-            & (table["n_sensors"] == 8)
-            & (table["sim_id"] == 2)
-        )
-        table.loc[row, "A_abserr"] = np.nan
+        row = itr_sin_arm(table, 32) & (table["sim_id"] == 2)
+        table.loc[row, "A_hat"] = np.nan
         with pytest.raises(ValueError, match="not finite"):
             stats.representative_inverse_case(table, benchmark="forcing_itr_sin")
 
