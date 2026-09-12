@@ -407,10 +407,11 @@ def rc_profile_recovery(*, source=None, spec=None, requirement=None):
             legend=(index == 0))
         ax.set_ylim(*ylim)
 
-    fig.suptitle(f"One inversion case (sim {sim_id}) at three sensor counts",
-                 fontsize=8, y=0.995)
+    # No suptitle: which case and how many arms are in the caption and the
+    # sidecar, and reserving a figure-wide title band costs vertical space this
+    # narrow three-row layout cannot spare.
     style.panel_letters(flat, loc=(-0.16, 1.02))
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+    fig.tight_layout()
 
     metric_definition = {
         "question": (
@@ -559,11 +560,10 @@ def identifiability(*, n_sensors: int = _REFERENCE_SENSORS, source=None,
         legend=True)
     panels.attach_colorbar(fig, filled, flat[2], r"$\Delta\ell$")
 
-    fig.suptitle(
-        f"One inversion case (sim {sim_id}) at {int(n_sensors)} sensors",
-        fontsize=8, y=0.995)
+    # See rc_profile_recovery: the case and sensor count live in the caption and
+    # the sidecar, not in a title band that eats the top of the figure.
     style.panel_letters(flat, loc=(-0.16, 1.03))
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+    fig.tight_layout()
 
     metric_definition = {
         "question": (
