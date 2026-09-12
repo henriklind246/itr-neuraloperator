@@ -909,23 +909,6 @@ def test_neg_log_likelihood_zero_at_fit_and_scales_inverse_variance():
     assert nll_a / nll_b == pytest.approx(0.08 / 0.02, rel=1e-5)
 
 
-def test_threshold_crossings_interpolates_ushape():
-    # delta(x) = (x - 2)^2 crosses thresh=1 at x = 1 and x = 3.
-    grid = np.linspace(-1.0, 5.0, 25)
-    delta = (grid - 2.0) ** 2
-    lo, hi = inv._threshold_crossings(grid, delta, 1.0)
-    assert lo == pytest.approx(1.0, abs=2e-2)
-    assert hi == pytest.approx(3.0, abs=2e-2)
-
-    # All-inside -> clamps to the grid edges.
-    lo2, hi2 = inv._threshold_crossings(grid, delta, 1e6)
-    assert lo2 == pytest.approx(grid[0]) and hi2 == pytest.approx(grid[-1])
-
-    # None-inside -> degenerate interval at the argmin.
-    lo3, hi3 = inv._threshold_crossings(grid, delta, -1.0)
-    assert lo3 == hi3 == pytest.approx(grid[int(np.argmin(delta))])
-
-
 @pytest.mark.parametrize("fixed_index", [0, 1])
 def test_theta_profile_pins_coord_and_respects_amp_ceiling(fixed_index):
     torch.manual_seed(0)
@@ -963,92 +946,94 @@ def test_profile_likelihood_summary_columns_present():
     obs.targets = obs.targets + 0.5  # nonzero residuals against the untrained net
     theta_hat = obs.theta_true.to(torch.float32)
     res = inv.profile_likelihood(
-        model, obs, theta_hat, sigma_eff2=0.05,
-        param_index=1, n_grid=5, span=0.3, level=0.95,
-        adam_steps=8, lbfgs_steps=3,
+        model, obs, theta_hat, sigma_eff2=0.05, param_index=1, level=0.95,
     )
     assert res.param_name == "A"
     assert np.isfinite(res.ci_high - res.ci_low)
     assert res.ci_low <= res.ci_high
-    # Profiled NLL never beats the unconstrained min by construction.
-    assert res.nll.min() >= res.nll_min - 1e-6
+    # A single call reports the reference it was given. Where the walk beat that
+    # reference it hands back the better theta instead of silently keeping it;
+    # reconciling the two is profile_parameters' job, not this function's.
+    assert res.nll.min() >= res.nll_min - 1e-6 or res.theta_mle is not None
+    summary = inv.profile_interval_summary(res)
+    assert summary["profile_A_ci_width"] == pytest.approx(res.ci_high - res.ci_low)
+    assert summary["profile_A_n_evals"] == res.n_evals == res.grid.size
+    assert summary["profile_A_bound_limited"] is not (
+        res.lower_closed and res.upper_closed
+    )
 
 
-def test_profile_refit_keeps_best_of_several_starts():
-    # The nuisance objective is the same nonconvex surface the MAP fit needs
-    # multistart for, so a refit must return the *best* start, not the last.
+def test_polish_unrestricted_lowers_the_likelihood_reference():
+    # The MAP fit minimizes a regularized mean-of-squares, so its optimum is not
+    # the likelihood's. The polish is what puts theta_hat on the NLL the Wilks
+    # threshold is measured against.
     model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
-    seeds = [
-        torch.zeros(2, dtype=torch.float32),
-        torch.full((2,), -3.0, dtype=torch.float32),
-        torch.full((2,), 3.0, dtype=torch.float32),
-    ]
-    singles = [
-        inv._profile_refit(
-            model, obs, 0.05, 1, 0.4, [s], adam_steps=8, lbfgs_steps=3
-        )[0]
-        for s in seeds
-    ]
-    multi_nll, multi_theta, multi_u = inv._profile_refit(
-        model, obs, 0.05, 1, 0.4, seeds, adam_steps=8, lbfgs_steps=3
+    seed = torch.zeros(2, dtype=torch.float32)
+    start = float(inv.neg_log_likelihood(
+        model, obs, inv._SOURCE_ITR_SIN_ADAPTER.theta_from_unconstrained(seed),
+        0.05, inv._SOURCE_ITR_SIN_ADAPTER,
+    ))
+    nll, theta = inv._polish_unrestricted(
+        model, obs, 0.05, seed, adam_steps=40, lbfgs_steps=10
     )
-    assert multi_nll <= min(singles) + 1e-9
-    assert multi_theta.shape == (2,) and multi_u.shape == (2,)
-    assert float(multi_theta[1]) == pytest.approx(0.4, abs=1e-6)
+    assert nll <= start + 1e-9
+    assert theta.shape == (2,)
 
 
-def test_profile_sweep_reports_nonnegative_gap_and_is_deterministic():
+def test_profile_is_deterministic_and_evaluates_only_endpoint_decisions():
     model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     theta_hat = obs.theta_true.to(torch.float32)
-    kwargs = dict(
-        sigma_eff2=0.05, n_grid=4, span=0.4, level=0.95,
-        adam_steps=6, lbfgs_steps=2, n_starts=3, seed=1,
-        adapter=inv._SOURCE_ITR_SIN_ADAPTER,
-    )
+    kwargs = dict(sigma_eff2=0.05, level=0.95,
+                  adapter=inv._SOURCE_ITR_SIN_ADAPTER)
     a = inv.profile_likelihood(model, obs, theta_hat, **kwargs)
     b = inv.profile_likelihood(model, obs, theta_hat, **kwargs)
-    # sweep_gap is how much the reverse sweep clawed back: never negative.
-    assert a.sweep_gap >= 0.0 and np.isfinite(a.sweep_gap)
-    assert a.n_starts == 3
     np.testing.assert_allclose(a.nll, b.nll)
     np.testing.assert_allclose(a.grid, b.grid)
     assert a.ci_low == pytest.approx(b.ci_low)
-    summ = inv.profile_interval_summary(a)
-    assert summ["profile_A_n_starts"] == 3
-    assert summ["profile_A_sweep_gap"] >= 0.0
+    assert a.ci_high == pytest.approx(b.ci_high)
+    # Bracket-and-bisect is what makes a dense profile mesh unnecessary: the walk
+    # is capped at two bound-to-bound marches plus two bisections.
+    assert a.n_evals <= 1 + 2 * (inv.PROFILE_WALK_MAX_STEPS + inv.PROFILE_ROOT_MAX_STEPS)
+    assert np.all(np.diff(a.grid) > 0)
 
 
-def test_profile_multistart_never_worse_than_single_start():
-    # Adding starts can only enlarge the candidate set at each pin, so the
-    # profiled NLL curve must not rise anywhere. A rising profile is exactly the
-    # failure mode that shrinks a Wilks interval below its nominal level.
+def test_profile_refit_scalar_pins_and_finds_the_global_nuisance_optimum():
+    # Pinning one of two coordinates leaves a single free sigmoid coordinate, so
+    # a brute-force sweep of that coordinate is the ground truth. The scan in
+    # front of Brent is what keeps this true: the objective is bimodal here and
+    # a bare local solver settles into the interior basin.
     model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
-    theta_hat = obs.theta_true.to(torch.float32)
-    grid = np.linspace(0.4, 1.0, 4)
-    u_hat = inv._SOURCE_ITR_SIN_ADAPTER.unconstrained_from_theta(theta_hat)
-    common = dict(adapter=inv._SOURCE_ITR_SIN_ADAPTER, pin_index=1,
-                  adam_steps=6, lbfgs_steps=2, seed=0)
-    one, _, _ = inv._profile_sweep(model, obs, 0.05, grid, u_hat, n_starts=1, **common)
-    many, _, _ = inv._profile_sweep(model, obs, 0.05, grid, u_hat, n_starts=4, **common)
-    assert np.all(many <= one + 1e-5)
+    scalar_nll, scalar_theta, _ = inv._profile_refit_scalar(model, obs, 0.05, 1, 0.4)
+
+    adapter = inv._SOURCE_ITR_SIN_ADAPTER
+    best = float("inf")
+    for s in np.linspace(1e-6, 1 - 1e-6, 201):
+        u = torch.zeros(2, dtype=torch.float32)
+        u[0] = float(np.log(s) - np.log1p(-s))
+        with torch.no_grad():
+            theta = adapter.theta_profile(u, 1, 0.4)
+            best = min(best, float(
+                inv.neg_log_likelihood(model, obs, theta, 0.05, adapter)
+            ))
+
+    assert float(scalar_theta[1]) == pytest.approx(0.4, abs=1e-6)
+    assert scalar_nll <= best + 1e-3
 
 
-def test_profile_refit_scalar_adapter_ignores_extra_starts():
-    # With a 1-D theta the pin leaves nothing free, so every seed gives the same
-    # theta: multistart must not be paid for there.
+def test_profile_refit_scalar_handles_a_one_parameter_adapter():
+    # With a 1-D theta the pin leaves nothing free, so the refit is a single
+    # likelihood evaluation at the pinned value.
     adapter = ForcingAdapter()
     model = _tiny_forcing_model()
     obs = _fake_forcing_observation_set(Nx=6, Ny=6, N=1)
-    seeds = [torch.zeros(1), torch.full((1,), 2.0), torch.full((1,), -2.0)]
-    nll, theta, _ = inv._profile_refit(
-        model, obs, 0.05, 0, 0.6, seeds, adam_steps=4, lbfgs_steps=1,
-        adapter=adapter,
+    nll, theta, _ = inv._profile_refit_scalar(
+        model, obs, 0.05, 0, 0.6, adapter=adapter
     )
     assert float(theta[0]) == pytest.approx(0.6, abs=1e-6)
     assert np.isfinite(nll)
@@ -1302,8 +1287,7 @@ def test_forcing_adapter_one_dimensional_uq_smoke():
 
     prof = inv.profile_likelihood(
         model, obs, theta_hat, sigma_eff2=0.05,
-        param_index=0, n_grid=5, span=0.2, level=0.9,
-        adam_steps=2, lbfgs_steps=1, adapter=adapter,
+        param_index=0, level=0.9, adapter=adapter,
     )
     assert prof.param_name == "R_c"
     assert prof.ci_low <= prof.ci_high
@@ -1611,15 +1595,13 @@ def test_parameter_profile_matches_correlated_gaussian(monkeypatch, param_index)
     monkeypatch.setattr(inv, "neg_log_likelihood", nll)
     obs = SimpleNamespace(spatial=torch.empty(0))
     res = inv.profile_likelihood(
-        None, obs, mean, 1.0, param_index=param_index, n_grid=5,
-        span=0.05, adam_steps=30, lbfgs_steps=25, n_starts=2,
+        None, obs, mean, 1.0, param_index=param_index,
     )
     half = np.sqrt(chi2.ppf(0.95, 1)) * float(scales[param_index])
     assert res.ci_low == pytest.approx(float(mean[param_index]) - half, abs=4e-4)
     assert res.ci_high == pytest.approx(float(mean[param_index]) + half, abs=4e-4)
     assert res.lower_closed and res.upper_closed
     assert res.nll_min == pytest.approx(0.0, abs=1e-8)
-    assert not res.disconnected
     flat = inv.profile_interval_summary(res)
     assert flat[f"profile_{res.param_name}_ci_width"] == pytest.approx(2 * half, abs=8e-4)
 
@@ -1630,7 +1612,7 @@ def test_parameter_profile_marks_physical_bounds(monkeypatch):
     monkeypatch.setattr(inv, "neg_log_likelihood", lambda model, obs, theta, sigma, adapter: (theta ** 2).sum() * 0)
     res = inv.profile_likelihood(
         None, SimpleNamespace(spatial=torch.empty(0)), torch.tensor([0.4, 0.8]),
-        1.0, param_index=0, n_grid=3, span=0.01, adam_steps=1, lbfgs_steps=1,
+        1.0, param_index=0,
     )
     assert (res.ci_low, res.ci_high) == (0.05, 1.0)
     assert not res.lower_closed and not res.upper_closed
@@ -1668,13 +1650,17 @@ def test_profiles_share_checked_optimum_and_persist_both_parameters(monkeypatch,
     adapter = SourceItrSinAdapter()
     theta, profiles = inv.profile_parameters(
         None, obs, torch.tensor([0.2, 1.2], dtype=torch.float64), 1.0,
-        adapter=adapter, n_grid=5, adam_steps=30, lbfgs_steps=25, n_starts=2,
+        adapter=adapter, adam_steps=200, lbfgs_steps=40,
     )
     np.testing.assert_allclose(theta, mean, atol=1e-5)
     assert [p.param_name for p in profiles] == ["R_base", "A"]
     for profile in profiles:
         assert profile.nll_min == pytest.approx(0.0, abs=1e-5)
         assert profile.ci_low < float(theta[profile.param_index]) < profile.ci_high
+        # The driver re-profiles until no walk beats the shared reference, so a
+        # returned profile never dips under the NLL its threshold is measured
+        # against. visual/pub/records.py rejects an artifact that does.
+        assert profile.nll.min() >= profile.nll_min - inv.PROFILE_OPTIMUM_ATOL
     path = inv._write_sim_artifact(
         str(tmp_path), 0, adapter, obs=obs, result=SimpleNamespace(theta_hat=theta),
         report=None, J=None, fv_res=None, profiles=profiles, sigma_eff2=1.0,
@@ -1688,6 +1674,121 @@ def test_profiles_share_checked_optimum_and_persist_both_parameters(monkeypatch,
             np.testing.assert_array_equal(stored[f"{stem}_nll"], profile.nll)
             assert float(stored[f"{stem}_ci_width"]) == pytest.approx(profile.ci_high - profile.ci_low)
         assert "profile_excess_int" not in stored.files
+        assert not [k for k in stored.files if k.startswith("joint_")]
+
+
+# ---------------------------------------------------------------------------
+# Joint (R_base, A) NLL grid (--joint-nll-grid): the measured joint region that
+# the identifiability figure contours. Both coordinates are pinned, so this is
+# not a quadratic approximation of the profile pair.
+# ---------------------------------------------------------------------------
+
+def _quadratic_nll(mean=(0.5, 1.0), scale=(0.08, 0.15)):
+    center = torch.tensor(mean, dtype=torch.float64)
+    width = torch.tensor(scale, dtype=torch.float64)
+
+    def nll(model, obs, theta, sigma, adapter):
+        return 0.5 * (((theta.to(torch.float64) - center) / width) ** 2).sum()
+
+    return nll
+
+
+def _profile_pair(adapter, grids):
+    return [inv.ProfileResult(
+        param_index=i, param_name=adapter.param_names[i], level=0.95,
+        grid=np.asarray(grid, dtype=np.float64),
+        nll=np.zeros(len(grid)), nll_min=0.0,
+        ci_low=float(min(grid)), ci_high=float(max(grid)),
+    ) for i, grid in enumerate(grids)]
+
+
+def test_joint_nll_grid_spans_profiles_clips_bounds_and_masks_the_ceiling(monkeypatch):
+    from scipy.stats import chi2
+
+    monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
+    adapter = SourceItrSinAdapter()
+    obs = _fake_observation_set()
+    theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64)
+    # R_base narrower than its bounds (span follows the profile); A wider
+    # (span is clipped back to the adapter bounds).
+    profiles = _profile_pair(adapter, ([0.3, 0.5, 0.7], [-1.0, 1.0, 5.0]))
+
+    joint = inv.joint_nll_grid(
+        None, obs, 1.0, adapter=adapter, profiles=profiles,
+        theta_hat=theta_hat, n_grid=5,
+    )
+
+    base_axis = joint["joint_nll_grid_R_base"]
+    amp_axis = joint["joint_nll_grid_A"]
+    np.testing.assert_allclose(base_axis, np.linspace(0.3, 0.7, 5))
+    np.testing.assert_allclose(amp_axis, np.linspace(*adapter.profile_bounds(1), 5))
+
+    nll = joint["joint_nll"]
+    assert nll.shape == (5, 5)
+    inadmissible = amp_axis[None, :] > (R_PEAK_MAX - base_axis[:, None])
+    assert inadmissible.any(), "test grid must straddle the dependent ceiling"
+    np.testing.assert_array_equal(np.isnan(nll), inadmissible)
+
+    # The reference is the fit the marginal profiles used, so delta-ell shares
+    # one scale with them and is never negative even though no grid point sits
+    # exactly on the optimum.
+    assert float(joint["joint_nll_min"]) == pytest.approx(0.0, abs=1e-12)
+    assert np.nanmin(nll) > 0.0
+    assert np.nanmin(nll - joint["joint_nll_min"]) >= 0.0
+    assert float(joint["joint_threshold"]) == pytest.approx(chi2.ppf(0.95, 2) / 2.0)
+
+
+def test_joint_nll_grid_rejects_unusable_requests(monkeypatch):
+    monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
+    adapter = SourceItrSinAdapter()
+    obs = _fake_observation_set()
+    theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64)
+    grids = ([0.3, 0.5, 0.7], [0.5, 1.0, 1.5])
+    kwargs = dict(adapter=adapter, profiles=_profile_pair(adapter, grids),
+                  theta_hat=theta_hat, n_grid=5)
+
+    with pytest.raises(ValueError, match="n_grid >= 3"):
+        inv.joint_nll_grid(None, obs, 1.0, **{**kwargs, "n_grid": 2})
+    with pytest.raises(ValueError, match="both parameters"):
+        inv.joint_nll_grid(None, obs, 1.0,
+                           **{**kwargs, "profiles": kwargs["profiles"][:1]})
+    with pytest.raises(ValueError, match="finite positive variance"):
+        inv.joint_nll_grid(None, obs, 0.0, **kwargs)
+
+    scalar = ForcingAdapter()
+    with pytest.raises(ValueError, match="2-parameter benchmark"):
+        inv.joint_nll_grid(None, obs, 1.0, adapter=scalar,
+                           profiles=kwargs["profiles"],
+                           theta_hat=theta_hat[:1], n_grid=5)
+
+
+def test_joint_grid_round_trips_through_the_artifact_at_schema_4(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
+    adapter = SourceItrSinAdapter()
+    obs = _fake_observation_set()
+    theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64)
+    profiles = _profile_pair(adapter, ([0.3, 0.5, 0.7], [0.5, 1.0, 1.5]))
+    joint = inv.joint_nll_grid(
+        None, obs, 1.0, adapter=adapter, profiles=profiles,
+        theta_hat=theta_hat, n_grid=4,
+    )
+
+    path = inv._write_sim_artifact(
+        str(tmp_path), 11, adapter, obs=obs,
+        result=SimpleNamespace(theta_hat=theta_hat), report=None, J=None,
+        fv_res=None, profiles=profiles, joint=joint, sigma_eff2=1.0, c_fno=None,
+        noise_std=0.01, ci_level=0.95, dataset_path="test",
+        dataset_fingerprint="abc", split_seed=0, split_name="test",
+    )
+    with np.load(path, allow_pickle=False) as stored:
+        assert int(stored["artifact_schema_version"]) == 4
+        for key, value in joint.items():
+            np.testing.assert_array_equal(stored[key], value)
+        # The joint threshold is the 2-d chi-square level; the marginal
+        # profiles keep the 1-d one. Conflating them would inflate the region.
+        assert float(stored["joint_threshold"]) > float(stored["profile_threshold"])
 
 
 @pytest.mark.parametrize("profile_index", [None, 0])
@@ -1753,18 +1854,84 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
     assert "relative error=" in stdout and "width=" in stdout
 
 
-def test_disconnected_profile_is_flagged(monkeypatch):
+def test_cli_joint_nll_grid_writes_the_block_and_guards_bad_invocations(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
-    def nll(model, obs, theta, sigma, adapter):
-        base, amp = theta
-        return 0.5 * (((base - 0.2) * (base - 0.8) / 0.04) ** 2 + ((amp - 0.7) / 0.1) ** 2)
-    monkeypatch.setattr(inv, "neg_log_likelihood", nll)
-    result = inv.profile_likelihood(
-        None, SimpleNamespace(spatial=torch.empty(0)), torch.tensor([0.2, 0.7], dtype=torch.float64),
-        1.0, param_index=0, n_grid=11, adam_steps=20, lbfgs_steps=15, n_starts=2,
+    adapter = SourceItrSinAdapter()
+    obs = _fake_observation_set()
+    ds = SimpleNamespace(
+        t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
+        y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
     )
-    assert result.disconnected
-    assert result.lower_closed and result.upper_closed
-    assert result.ci_low < 0.2 and result.ci_high > 0.8
-    assert inv.profile_interval_summary(result)["profile_R_base_disconnected"]
+    loaded = SimpleNamespace(
+        config={"benchmark": {"name": "source_itr_sin", "representation": "temporal_encoder"}},
+        mu_global=0.0, sigma_global=1.0, model=None,
+    )
+    monkeypatch.setattr(inv, "load_checkpoint", lambda *a, **k: loaded)
+    monkeypatch.setattr(SourceItrSinAdapter, "validate_model", lambda *a: None)
+    monkeypatch.setattr(SourceItrSinAdapter, "validate_dataset", lambda *a: None)
+    monkeypatch.setattr(SourceItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
+    monkeypatch.setattr(inv, "build_dataset_from_dir", lambda *a, **k: ds)
+    monkeypatch.setattr(inv, "build_observation_set", lambda *a, **k: obs)
+    monkeypatch.setattr(inv, "_checkpoint_fingerprint", lambda *a: "test")
+    monkeypatch.setattr(inv, "_dataset_fingerprint", lambda *a: "test")
+    monkeypatch.setattr(inv, "load_surrogate_calibration",
+                        lambda *a, **k: {"local_gate_pass": True, "sigma_fno_norm": 0.1})
+    monkeypatch.setattr(inv, "invert_sim",
+                        lambda *a: inv.InversionResult(obs.theta_true.clone(), 0.0, obs.theta_true))
+    monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
+    monkeypatch.setattr(inv, "_masked_residual", lambda *a: torch.tensor([0.1]))
+    monkeypatch.setattr(inv, "fv_refine_report", lambda *a, **k: inv.FVRefineResult(0.005, 0.005, 0.0))
+    fitted = torch.tensor([0.5, 1.0], dtype=torch.float64)
+    monkeypatch.setattr(inv, "profile_parameters", lambda *a, **k: (
+        fitted, _profile_pair(adapter, ([0.3, 0.5, 0.7], [0.5, 1.0, 1.5]))
+    ))
+
+    artifacts = tmp_path / "artifacts"
+    base = ["--checkpoint", "test", "--data-dir", "test", "--calibration-artifact", "test",
+            "--noise-std", "0.01", "--out-csv", str(tmp_path / "results.csv"),
+            "--sensor-layout", "full_field"]
+    assert inv.main(base + ["--joint-nll-grid", "4", "--artifact-dir", str(artifacts)]) == 0
+    with np.load(artifacts / "sim_00000.npz", allow_pickle=False) as stored:
+        assert stored["joint_nll"].shape == (4, 4)
+        assert stored["joint_nll_grid_R_base"].shape == (4,)
+        assert stored["joint_nll_grid_A"].shape == (4,)
+
+    # Off by default: the block must not appear without the flag.
+    plain = tmp_path / "plain"
+    assert inv.main(base + ["--artifact-dir", str(plain)]) == 0
+    with np.load(plain / "sim_00000.npz", allow_pickle=False) as stored:
+        assert not [k for k in stored.files if k.startswith("joint_")]
+
+    with pytest.raises(ValueError, match="at least 3"):
+        inv.main(base + ["--joint-nll-grid", "2", "--artifact-dir", str(artifacts)])
+    with pytest.raises(ValueError, match="nowhere to write"):
+        inv.main(base + ["--joint-nll-grid", "4"])
+    with pytest.raises(ValueError, match="drop --profile-index"):
+        inv.main(base + ["--joint-nll-grid", "4", "--artifact-dir", str(artifacts),
+                         "--profile-index", "0"])
+    loaded.config["benchmark"]["name"] = "forcing"
+    monkeypatch.setattr(ForcingAdapter, "validate_model", lambda *a: None)
+    with pytest.raises(ValueError, match="2-parameter benchmarks"):
+        inv.main(base + ["--joint-nll-grid", "4", "--artifact-dir", str(artifacts)])
+
+
+def test_profile_returns_a_better_optimum_found_while_bracketing(monkeypatch):
+    # The walk pins values theta_hat never visited, so it can land below the fit
+    # it started from. Reporting an interval against a reference that is not the
+    # minimum would make delta-NLL negative, so the better theta goes back out.
+    from types import SimpleNamespace
+
+    mean = torch.tensor([0.7, 0.9], dtype=torch.float64)
+
+    def nll(model, obs, theta, sigma, adapter):
+        z = (theta.to(torch.float64) - mean) / torch.tensor([0.05, 0.12], dtype=torch.float64)
+        return 0.5 * (z**2).sum()
+
+    monkeypatch.setattr(inv, "neg_log_likelihood", nll)
+    res = inv.profile_likelihood(
+        None, SimpleNamespace(spatial=torch.empty(0)),
+        torch.tensor([0.2, 0.9], dtype=torch.float64), 1.0, param_index=0,
+    )
+    assert res.theta_mle is not None
+    assert float(res.theta_mle[0]) == pytest.approx(0.7, abs=0.05)

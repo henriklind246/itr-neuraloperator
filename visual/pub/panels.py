@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as _field
 
 import matplotlib as mpl
+import matplotlib.patheffects as patheffects
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -556,6 +557,180 @@ def paired_sensor_sweep_panel(
         ax.legend(fontsize=5.3, loc="best")
 
 
+def rc_profile_recovery_panel(
+    ax,
+    y,
+    rc_true,
+    rc_hat,
+    *,
+    color: str,
+    title: str = "",
+    ylabel: str = "",
+    legend: bool = False,
+) -> None:
+    """Overlay a true and a recovered interfacial resistance profile.
+
+    Exactly two curves: the shrinking gap between them is the whole message, so
+    the caller must set identical ``y`` and ``R_c`` limits on every panel it
+    draws. Rescaling between panels would make a worse reconstruction look
+    equally good.
+    """
+    y = np.asarray(y, dtype=float)
+    rc_true = np.asarray(rc_true, dtype=float)
+    rc_hat = np.asarray(rc_hat, dtype=float)
+    if y.shape != rc_true.shape or y.shape != rc_hat.shape:
+        raise ValueError(
+            f"y {y.shape}, rc_true {rc_true.shape} and rc_hat {rc_hat.shape} "
+            "must share one shape"
+        )
+
+    ax.plot(y, rc_true, color=style.GREY, linewidth=1.3, linestyle="-",
+            label="true", zorder=2)
+    ax.plot(y, rc_hat, color=color, linewidth=1.3, linestyle="--",
+            label="recovered", zorder=3)
+    ax.set_xlim(float(y.min()), float(y.max()))
+    ax.set_xlabel("$y$")
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    if legend:
+        ax.legend(fontsize=5.5, loc="best")
+
+
+def profile_likelihood_panel(
+    ax,
+    curve,
+    *,
+    color: str,
+    xlabel: str,
+    title: str = "",
+    ylabel: str = "",
+    threshold: float,
+    legend: bool = False,
+) -> None:
+    """Draw one parameter's profile likelihood with its threshold and interval.
+
+    ``curve`` is a :class:`~visual.pub.records.ProfileCurve`. A ``bound_limited``
+    interval is annotated rather than drawn as a closed span, because a closed
+    bracket over an interval whose crossing was never found claims a constraint
+    the data did not supply.
+    """
+    values = np.asarray(curve.values, dtype=float)
+    delta = np.asarray(curve.delta_ell, dtype=float)
+    censored = bool(curve.bound_limited)
+
+    ax.plot(values, delta, color=color, linewidth=1.2, marker="o",
+            markersize=2.4, markeredgewidth=0, label=r"profile $\Delta\ell$",
+            zorder=3)
+    ax.axhline(threshold, color="0.25", linestyle="--", linewidth=0.9,
+               label="95% threshold", zorder=2)
+    ax.axvline(curve.theta_true, color=style.GREY, linestyle=":",
+               linewidth=1.0, label="true", zorder=2)
+    ax.plot([curve.theta_hat], [0.0], marker="D", color=color, markersize=4.0,
+            markeredgecolor="black", markeredgewidth=0.4, linestyle="none",
+            label="recovered", zorder=5)
+
+    if not censored:
+        ax.axvspan(curve.ci_low, curve.ci_high, color=color, alpha=0.12,
+                   linewidth=0, label="95% interval", zorder=1)
+    else:
+        ax.annotate(
+            "interval bound-limited", xy=(0.5, 0.94), xycoords="axes fraction",
+            ha="center", va="top", fontsize=5.5, color="black",
+        )
+
+    ax.set_xlim(float(values.min()), float(values.max()))
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel or r"$\Delta\ell$")
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    if legend:
+        ax.legend(fontsize=5.3, loc="best")
+
+
+def joint_nll_contour_panel(
+    ax,
+    region,
+    *,
+    theta_hat,
+    theta_true,
+    labels,
+    title: str = "",
+    legend: bool = False,
+    levels: int = 9,
+):
+    """Contour a 2-parameter joint likelihood region over its parameter plane.
+
+    ``region`` is either a measured :class:`~visual.pub.records.JointNLLGrid` or
+    a :class:`~visual.pub.stats.LaplaceJointRegion`; both expose ``axes``,
+    ``delta_ell``, ``threshold`` and ``approximate``. ``nan`` entries mark pairs
+    the parameterization cannot produce and are left blank, so the admissible set
+    reads as the triangle it is instead of a filled rectangle.
+
+    Returns the filled-contour mappable so the caller can attach a colorbar.
+    """
+    first, second = (np.asarray(axis, dtype=float) for axis in region.axes)
+    delta = np.asarray(region.delta_ell, dtype=float)
+    if delta.shape != (first.size, second.size):
+        raise ValueError(
+            f"delta_ell {delta.shape} does not match its axes "
+            f"({first.size}, {second.size})"
+        )
+
+    # Contour in (first, second) reading order: delta_ell rows index the first
+    # parameter, so it is transposed once here rather than at every call site.
+    grid_x, grid_y = np.meshgrid(first, second, indexing="xy")
+    surface = delta.T
+    ceiling = float(np.nanmax(surface))
+    top = max(ceiling, 1.5 * region.threshold)
+    filled = ax.contourf(
+        grid_x, grid_y, surface, levels=np.linspace(0.0, top, int(levels)),
+        cmap=style.CMAP_SEQ_ORDINAL, extend="max", zorder=1,
+    )
+    if ceiling > region.threshold:
+        ax.contour(
+            grid_x, grid_y, surface, levels=[region.threshold], colors="white",
+            linewidths=1.1, zorder=2,
+        )
+    # Both markers carry a dark outline. They may land on the viridis fill or on
+    # the blank inadmissible region, and a marker that vanishes against one of
+    # the two backgrounds reads as an absent value rather than a plotted one.
+    halo = [patheffects.withStroke(linewidth=2.0, foreground="black")]
+    ax.plot(
+        [theta_true[0]], [theta_true[1]], marker="x", color="white",
+        markersize=5.0, markeredgewidth=1.3, linestyle="none", label="true",
+        path_effects=halo, zorder=4,
+    )
+    ax.plot(
+        [theta_hat[0]], [theta_hat[1]], marker="D", color="white",
+        markersize=4.0, markeredgecolor="black", markeredgewidth=0.6,
+        linestyle="none", label="recovered", zorder=5,
+    )
+
+    # Limits cover the grid *and* both markers. A true value that falls outside
+    # the evaluated region is the finding, so it has to stay visible; cropping
+    # to the grid alone would silently drop the marker and read as agreement.
+    for axis, values, marker in (
+        (ax.set_xlim, first, (theta_true[0], theta_hat[0])),
+        (ax.set_ylim, second, (theta_true[1], theta_hat[1])),
+    ):
+        low = min(float(values.min()), *(float(m) for m in marker))
+        high = max(float(values.max()), *(float(m) for m in marker))
+        pad = 0.02 * (high - low)
+        axis(low - pad, high + pad)
+    ax.set_xlabel(labels[0])
+    ax.set_ylabel(labels[1])
+    if title:
+        ax.set_title(title, fontsize=7)
+    if legend:
+        ax.legend(fontsize=5.3, loc="best", framealpha=0.85)
+    return filled
+
+
 # ============================================================
 # Distribution panels
 # ============================================================
@@ -893,10 +1068,13 @@ __all__ = [
     "convergence_loglog",
     "ecdf_curves",
     "field_map",
+    "joint_nll_contour_panel",
     "order_estimates",
     "pairwise_orders",
     "paired_sensor_sweep_panel",
+    "profile_likelihood_panel",
     "rate_bars",
+    "rc_profile_recovery_panel",
     "recovery_scatter",
     "resolution_curve_panel",
     "rollout_delta_panel",

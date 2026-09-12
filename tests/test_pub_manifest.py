@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 import matplotlib
+import numpy as np
 import pandas as pd
 import pytest
 import yaml
@@ -580,7 +581,6 @@ class TestSchema:
                         error_col = f"{name}_abs_error" if name == "R_c" else f"{name}_abserr"
                         row[f"{name}_rel_error_pct"] = 100 * row[error_col] / abs(row[f"{name}_true"])
                         row[f"profile_{name}_bound_limited"] = limited
-                        row[f"profile_{name}_disconnected"] = False
                     rows.append(row)
             path = tmp_path / f"{benchmark}.csv"
             pd.DataFrame(rows).to_csv(path, index=False)
@@ -601,6 +601,154 @@ class TestSchema:
         forcing.to_csv(paths[0], index=False)
         with pytest.raises(records_mod.SchemaError, match="same 8"):
             records_mod.load_inverse_sensor_sweep(source)
+
+
+# ---------------------------------------------------------------------------
+# per-sim inverse artifacts (scripts/invert.py --artifact-dir)
+# ---------------------------------------------------------------------------
+
+
+def write_inverse_artifact(path, *, version=4, joint=True, theta_hat=(0.5, 1.0),
+                           theta_true=(0.52, 0.94), nll_shift=0.0, **overrides):
+    """A synthetic ``sim_*.npz`` written with the exact keys invert.py stores.
+
+    Deliberately synthetic rather than produced by ``scripts.invert``: it keeps
+    the reader tests free of torch and turns the NPZ key names into a contract
+    this test asserts independently of the writer.
+    """
+    names = ("R_base", "A")
+    payload = {
+        "artifact_schema_version": np.int64(version),
+        "benchmark": np.str_("forcing_itr_sin"),
+        "sim_id": np.int64(3),
+        "param_names": np.asarray(names, dtype="U32"),
+        "theta_hat": np.asarray(theta_hat, dtype=np.float64),
+        "theta_true": np.asarray(theta_true, dtype=np.float64),
+        "theta_bounds": np.asarray([[0.05, 1.0], [0.0, 2.95]], dtype=np.float64),
+        "param_scales": np.asarray([0.95, 2.95], dtype=np.float64),
+        "profile_level": np.float64(0.95),
+        "profile_threshold": np.float64(1.9207),
+        "sigma_eff2": np.float64(4e-4),
+        "observation_jacobian": np.asarray(
+            [[1.0, 0.2], [0.3, 1.4], [0.9, 0.1]], dtype=np.float64),
+    }
+    for index, name in enumerate(names):
+        grid = np.linspace(theta_hat[index] - 0.3, theta_hat[index] + 0.3, 7)
+        payload.update({
+            f"profile_{name}_grid": grid,
+            f"profile_{name}_nll": 10.0 + nll_shift + 40.0 * (grid - theta_hat[index]) ** 2,
+            f"profile_{name}_nll_min": np.float64(10.0),
+            f"profile_{name}_ci_low": np.float64(grid[1]),
+            f"profile_{name}_ci_high": np.float64(grid[-2]),
+            f"profile_{name}_bound_limited": np.bool_(False),
+        })
+    if joint:
+        base = np.linspace(0.2, 0.9, 5)
+        amp = np.linspace(0.4, 2.6, 4)
+        surface = 10.0 + 40.0 * (
+            (base[:, None] - theta_hat[0]) ** 2 + (amp[None, :] - theta_hat[1]) ** 2
+        )
+        surface[amp[None, :] > 3.0 - base[:, None]] = np.nan
+        payload.update({
+            "joint_nll_grid_R_base": base,
+            "joint_nll_grid_A": amp,
+            "joint_nll": surface,
+            "joint_nll_min": np.float64(10.0),
+            "joint_threshold": np.float64(2.9957),
+        })
+    payload.update(overrides)
+    for key in [k for k, v in payload.items() if v is None]:
+        del payload[key]
+    np.savez_compressed(path, **payload)
+    return path
+
+
+class TestInverseProfileArtifact:
+    def test_the_arm_path_is_derived_from_the_combined_csv(self):
+        derived = records_mod.inverse_artifact_path(
+            "/runs/sweeps/forcing_itr_sin/abc/inverse_sensor_sweep.csv",
+            n_sensors=8, sim_id=3,
+        )
+        assert derived.as_posix() == (
+            "/runs/sweeps/forcing_itr_sin/abc/sensors_08/artifacts/sim_00003.npz"
+        )
+
+    def test_a_full_artifact_decodes_profiles_and_the_joint_surface(self, tmp_path):
+        path = write_inverse_artifact(tmp_path / "sim_00003.npz")
+        art = records_mod.load_inverse_profile_artifact(path)
+
+        assert art.schema_version == 4
+        assert art.benchmark == "forcing_itr_sin"
+        assert art.sim_id == 3
+        assert art.param_names == ("R_base", "A")
+        assert art.level == pytest.approx(0.95)
+        assert art.sigma_eff2 == pytest.approx(4e-4)
+        assert art.observation_jacobian.shape == (3, 2)
+
+        base = art.profile("R_base")
+        assert base.param_index == 0
+        assert base.theta_hat == pytest.approx(0.5)
+        assert base.theta_true == pytest.approx(0.52)
+        # delta_ell is referenced to the stored minimum, so the threshold in the
+        # same artifact is directly comparable without rescaling.
+        assert base.delta_ell.min() == pytest.approx(0.0)
+        assert not base.bound_limited
+        assert art.profile("A").param_index == 1
+
+        joint = art.joint
+        assert joint.param_names == ("R_base", "A")
+        assert joint.delta_ell.shape == (5, 4)
+        assert joint.approximate is False
+        # The inadmissible corner stays nan: filling it would draw likelihood
+        # over parameter pairs the sampler cannot produce.
+        assert np.isnan(joint.delta_ell).any()
+        assert np.nanmin(joint.delta_ell) >= 0.0
+        assert joint.threshold > art.profile_threshold
+
+    def test_the_joint_block_is_optional_at_the_version_floor(self, tmp_path):
+        path = write_inverse_artifact(tmp_path / "sim.npz", version=3, joint=False)
+        art = records_mod.load_inverse_profile_artifact(path)
+        assert art.schema_version == 3
+        assert art.joint is None
+        assert len(art.profiles) == 2
+
+    def test_optional_blocks_absent_means_none_not_zero(self, tmp_path):
+        path = write_inverse_artifact(
+            tmp_path / "sim.npz", sigma_eff2=None, observation_jacobian=None,
+        )
+        art = records_mod.load_inverse_profile_artifact(path)
+        assert art.sigma_eff2 is None
+        assert art.observation_jacobian is None
+
+    def test_a_stale_schema_is_refused(self, tmp_path):
+        path = write_inverse_artifact(tmp_path / "sim.npz", version=2)
+        with pytest.raises(records_mod.SchemaError, match="v2"):
+            records_mod.load_inverse_profile_artifact(path)
+
+    def test_a_missing_artifact_raises_schema_error_not_oserror(self, tmp_path):
+        with pytest.raises(records_mod.SchemaError, match="not found"):
+            records_mod.load_inverse_profile_artifact(tmp_path / "absent.npz")
+
+    def test_a_profile_below_its_own_reference_is_refused(self, tmp_path):
+        # A negative delta_ell means the reported fit was not the optimum, so
+        # the threshold crossings are not the confidence interval at all.
+        path = write_inverse_artifact(tmp_path / "sim.npz", nll_shift=-1.0)
+        with pytest.raises(records_mod.SchemaError, match="not the optimum"):
+            records_mod.load_inverse_profile_artifact(path)
+
+    def test_a_joint_surface_inconsistent_with_its_axes_is_refused(self, tmp_path):
+        path = write_inverse_artifact(
+            tmp_path / "sim.npz", joint_nll=np.zeros((5, 5)),
+        )
+        with pytest.raises(records_mod.SchemaError, match="expected"):
+            records_mod.load_inverse_profile_artifact(path)
+
+    def test_a_missing_profile_block_is_refused(self, tmp_path):
+        path = write_inverse_artifact(
+            tmp_path / "sim.npz", joint=False, profile_A_grid=None,
+        )
+        with pytest.raises(records_mod.SchemaError, match="profile_A_grid"):
+            records_mod.load_inverse_profile_artifact(path)
 
 
 # ---------------------------------------------------------------------------

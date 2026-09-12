@@ -141,7 +141,14 @@ requirement_sets:
     note: >-
       requires exactly 8, 16, and 32 sensors with the same eight simulations,
       noise realizations, and initialization seeds paired across counts for both
-      forcing and forcing_itr_sin.
+      forcing and forcing_itr_sin. Per-benchmark estimate columns (R_c_map, or
+      R_base_hat and A_hat) are validated conditionally at load time rather than
+      listed above, because the two benchmarks may be supplied as separate CSVs
+      and neither carries the other's columns. F29 and F30 additionally read the
+      per-sim NPZ artifacts beside each CSV
+      (sensors_NN/artifacts/sim_NNNNN.npz, schema >= 3); F30 needs the joint NLL
+      grid that --joint-nll-grid writes and falls back to a quadratic
+      approximation, labelled as such, when only the sensitivity is stored.
     regenerate: >-
       python scripts/run_inverse_sensor_sweep.py --benchmark <forcing|forcing_itr_sin>
       --checkpoint <matching-checkpoint>
@@ -337,3 +344,16 @@ figures:
   F28_global_field_error_vs_itr:
     requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     metric_space: kelvin
+
+  F29_inverse_rc_profile_recovery:
+    requires: [inverse_sensor_sweep]
+    # kelvin is this vocabulary's physical-units bucket; the actual unit here is
+    # m^2 K/W on the R_c axis, as it is for F28. Nothing is normalized or
+    # expressed as a ratio.
+    metric_space: kelvin
+
+  F30_inverse_identifiability:
+    requires: [inverse_sensor_sweep]
+    # mixed: the parameter axes are physical, the vertical axis is a
+    # dimensionless log-likelihood difference against a chi-squared threshold.
+    metric_space: mixed

@@ -1,0 +1,189 @@
+"""Behavioural tests for the inverse-extension panels.
+
+``tests/test_pub_style.py`` already checks that ``panels.py`` stays a drawing
+layer. These tests check what it draws: that a censored interval is never shown
+as a closed bracket, that an inadmissible parameter pair stays blank, and that a
+marker outside the evaluated grid stays on the canvas. Each of those is a claim
+about the figure's honesty, so each is pinned rather than eyeballed.
+"""
+
+from __future__ import annotations
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pytest
+
+from visual.pub import panels, records, stats
+
+COLOR = "#8C564B"
+
+
+@pytest.fixture
+def ax():
+    figure, axes = plt.subplots()
+    yield axes
+    plt.close(figure)
+
+
+def make_curve(**overrides) -> records.ProfileCurve:
+    values = np.linspace(0.2, 0.7, 11)
+    fields = dict(
+        param_name="R_base", param_index=0, values=values,
+        delta_ell=40.0 * (values - 0.45) ** 2,
+        theta_hat=0.45, theta_true=0.40, ci_low=0.23, ci_high=0.67,
+        bound_limited=False,
+    )
+    fields.update(overrides)
+    return records.ProfileCurve(**fields)
+
+
+def make_region(**overrides) -> records.JointNLLGrid:
+    base = np.linspace(0.2, 0.9, 8)
+    amp = np.linspace(0.4, 2.6, 6)
+    surface = 40.0 * ((base[:, None] - 0.45) ** 2 + (amp[None, :] - 1.05) ** 2)
+    surface[amp[None, :] > 3.0 - base[:, None]] = np.nan
+    fields = dict(
+        param_names=("R_base", "A"), axes=(base, amp), delta_ell=surface,
+        threshold=2.9957,
+    )
+    fields.update(overrides)
+    return records.JointNLLGrid(**fields)
+
+
+class TestRcProfileRecoveryPanel:
+    def test_it_draws_exactly_two_curves_distinguished_by_dash_pattern(self, ax):
+        y = np.linspace(0.0, 1.0, 50)
+        panels.rc_profile_recovery_panel(
+            ax, y, 0.4 + 1.2 * np.sin(np.pi * y), 0.45 + 1.05 * np.sin(np.pi * y),
+            color=COLOR,
+        )
+        assert len(ax.lines) == 2
+        true_line, hat_line = ax.lines
+        assert true_line.get_label() == "true"
+        assert hat_line.get_label() == "recovered"
+        # Solid vs dashed is the only channel separating them in print, so a
+        # colour-only distinction would not survive a greyscale reproduction.
+        assert true_line.get_linestyle() != hat_line.get_linestyle()
+        assert hat_line.get_linestyle() in {"--", (0, (6.4, 1.6))}
+
+    def test_it_leaves_the_shared_y_scale_to_the_caller(self, ax):
+        """Rescaling per panel would make a worse reconstruction look as good."""
+        y = np.linspace(0.0, 1.0, 50)
+        ax.set_ylim(0.0, 4.0)
+        panels.rc_profile_recovery_panel(
+            ax, y, np.full_like(y, 0.4), np.full_like(y, 0.5), color=COLOR,
+        )
+        assert ax.get_ylim() == (0.0, 4.0)
+        assert ax.get_xlim() == (0.0, 1.0)
+
+    def test_mismatched_shapes_raise_rather_than_broadcast(self, ax):
+        with pytest.raises(ValueError, match="must share one shape"):
+            panels.rc_profile_recovery_panel(
+                ax, np.linspace(0.0, 1.0, 50), np.zeros(50), np.zeros(49),
+                color=COLOR,
+            )
+
+
+class TestProfileLikelihoodPanel:
+    def test_a_closed_interval_is_drawn_as_a_span(self, ax):
+        panels.profile_likelihood_panel(
+            ax, make_curve(), color=COLOR, xlabel="$R$", threshold=1.9207,
+        )
+        spans = [p for p in ax.patches if p.get_label() == "95% interval"]
+        assert len(spans) == 1
+        assert len(ax.texts) == 0
+
+    def test_a_censored_interval_is_annotated_not_bracketed(self, ax):
+        """A closed bracket over a censored interval overstates the constraint."""
+        panels.profile_likelihood_panel(
+            ax, make_curve(bound_limited=True), color=COLOR, xlabel="$R$",
+            threshold=1.9207,
+        )
+        assert [p for p in ax.patches if p.get_label() == "95% interval"] == []
+        assert [t.get_text() for t in ax.texts] == ["interval bound-limited"]
+
+    def test_the_threshold_and_true_value_are_drawn_where_asked(self, ax):
+        panels.profile_likelihood_panel(
+            ax, make_curve(), color=COLOR, xlabel="$R$", threshold=1.9207,
+        )
+        horizontals = [
+            line.get_ydata()[0] for line in ax.lines
+            if len(set(np.asarray(line.get_ydata(), dtype=float))) == 1
+            and len(line.get_xdata()) == 2
+        ]
+        assert pytest.approx(1.9207) in horizontals
+        verticals = [
+            float(np.asarray(line.get_xdata(), dtype=float)[0])
+            for line in ax.lines if line.get_label() == "true"
+        ]
+        assert verticals == [pytest.approx(0.40)]
+
+    def test_the_baseline_is_pinned_at_zero(self, ax):
+        """``delta_ell`` is a distance from the optimum; a floating base hides it."""
+        panels.profile_likelihood_panel(
+            ax, make_curve(), color=COLOR, xlabel="$R$", threshold=1.9207,
+        )
+        assert ax.get_ylim()[0] == pytest.approx(0.0)
+
+
+class TestJointNllContourPanel:
+    def test_it_consumes_a_measured_grid_and_a_laplace_region_alike(self, ax):
+        """The two producers are duck typed; a branch here would be a design smell."""
+        measured = make_region()
+        approximate = stats.laplace_joint_region(
+            np.array([[1.0, 0.2], [0.3, 1.4], [0.9, 0.1]]), 4e-4, [0.45, 1.05],
+            param_names=("R_base", "A"), peak_max=3.0,
+        )
+        assert measured.approximate is False
+        assert approximate.approximate is True
+        for region in (measured, approximate):
+            mappable = panels.joint_nll_contour_panel(
+                ax, region, theta_hat=[0.45, 1.05], theta_true=[0.40, 1.20],
+                labels=("$R$", "$A$"),
+            )
+            assert mappable is not None
+
+    def test_the_inadmissible_corner_is_left_blank(self, ax):
+        """``A > R_PEAK_MAX - R_base`` cannot occur, so it must not be shaded."""
+        region = make_region()
+        panels.joint_nll_contour_panel(
+            ax, region, theta_hat=[0.45, 1.05], theta_true=[0.40, 1.20],
+            labels=("$R$", "$A$"),
+        )
+        assert np.isnan(region.delta_ell).any()
+        # The contour set never received the masked entries, so the highest
+        # level it drew is bounded by the finite part of the surface.
+        assert np.nanmax(region.delta_ell) < np.inf
+
+    def test_a_marker_outside_the_grid_stays_visible(self, ax):
+        """A true value outside the evaluated region is the finding, not a gap."""
+        region = make_region()
+        panels.joint_nll_contour_panel(
+            ax, region, theta_hat=[0.45, 1.05], theta_true=[0.05, 2.90],
+            labels=("$R$", "$A$"),
+        )
+        low_x, high_x = ax.get_xlim()
+        low_y, high_y = ax.get_ylim()
+        assert low_x <= 0.05 and high_x >= 0.9
+        assert low_y <= 0.4 and high_y >= 2.90
+
+    def test_the_true_marker_carries_an_outline(self, ax):
+        """White on the blank corner would read as an absent value."""
+        panels.joint_nll_contour_panel(
+            ax, make_region(), theta_hat=[0.45, 1.05], theta_true=[0.40, 1.20],
+            labels=("$R$", "$A$"),
+        )
+        true_marker = next(l for l in ax.lines if l.get_label() == "true")
+        assert true_marker.get_path_effects() != []
+
+    def test_axes_and_surface_shape_must_agree(self, ax):
+        region = make_region(delta_ell=np.zeros((3, 3)))
+        with pytest.raises(ValueError, match="does not match its axes"):
+            panels.joint_nll_contour_panel(
+                ax, region, theta_hat=[0.45, 1.05], theta_true=[0.40, 1.20],
+                labels=("$R$", "$A$"),
+            )

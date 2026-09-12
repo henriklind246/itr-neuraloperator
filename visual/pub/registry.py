@@ -156,6 +156,13 @@ _SPECS: tuple[FigureSpec, ...] = (
           "visual.pub.fig_supplement", "direct_vs_autoregressive", 3, "two_col"),
     _spec("F24_resolution_invariance", "Resolution invariance",
           "visual.pub.fig_supplement", "resolution_invariance", 3, "two_col"),
+    _spec("F29_inverse_rc_profile_recovery",
+          "Recovery of the spatially varying interfacial resistance",
+          "visual.pub.fig_inverse", "rc_profile_recovery", 3, "two_col"),
+    _spec("F30_inverse_identifiability",
+          "Identifiability of the interfacial resistance parameters",
+          "visual.pub.fig_inverse", "identifiability", 3, "two_col",
+          n_sensors=8),
 )
 
 FIGURES: dict[str, FigureSpec] = {s.key: s for s in _SPECS}
@@ -283,11 +290,26 @@ def render(key: str, *, manifest: Manifest | str | Path | None = None,
         target, source,
         metric_space=requirement.metric_space,
         metric_definition=metric_definition,
-        selection=selection.to_dict() if selection is not None else {},
+        selection=_selection_dict(selection),
         params=spec.params,
     )
     return RenderResult(key=key, paths=paths, sidecar=sidecar, source=source,
                         degraded=degraded)
+
+
+def _selection_dict(selection) -> dict:
+    """Normalize whatever the drawing function chose to describe its case with.
+
+    Most qualitative figures pick a (sim, s, j) pair and return a
+    ``select.CaseSelection``. The inverse figures pick a whole inversion case,
+    which has no pair, no quantile rank, and no pair metric, so they return a
+    plain dict rather than fill two thirds of a CaseSelection with nulls.
+    """
+    if selection is None:
+        return {}
+    if hasattr(selection, "to_dict"):
+        return selection.to_dict()
+    return dict(selection)
 
 
 def _unpack(key: str, result):

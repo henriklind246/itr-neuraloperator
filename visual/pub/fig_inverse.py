@@ -1,9 +1,15 @@
-"""Inverse-problem figures: F16, F17, F18, F22.
+"""Inverse-problem figures: F16, F17, F18, F22, F29, F30.
 
 These read inverse result CSVs rather than ``test_records.csv``. F16, F17 and
 F22 describe one sensor protocol. F18 consumes the canonical paired sweep from
 ``scripts/run_inverse_sensor_sweep.py`` and compares the same eight cases at the
 three discrete sensor counts 8, 16 and 32.
+
+F29 and F30 read that same sweep but show a *single* pre-registered case, and
+descend into its per-sim NPZ artifacts for the profile likelihoods. They are
+structural, not distributional: F18 and the inverse tables already carry the
+across-case quantities, so these two must not be read as evidence about the
+distribution over cases.
 """
 
 from __future__ import annotations
@@ -167,7 +173,7 @@ def sensor_count(*, source=None, spec=None, requirement=None):
     Each row is one benchmark/parameter pair. Columns show absolute error,
     relative error, FV sensor residual, and the 95% parameter profile width.
     Cases remain paired across sensor counts. Width medians and IQRs exclude
-    intervals without both crossings and disconnected confidence sets.
+    intervals whose crossings were not both found inside the admissible range.
     """
     if not records.artifact_paths(source, "inverse_csv"):
         blocked(
@@ -247,7 +253,7 @@ def sensor_count(*, source=None, spec=None, requirement=None):
             "solver evaluated at the recovered parameter"
         ),
         "profile_interval": (
-            "width of each 95% parameter profile interval; bound-limited and disconnected intervals are marked and excluded from width summaries"
+            "width of each 95% parameter profile interval, endpoints bracketed and bisected with the nuisance re-optimized at every pinned value; bound-limited intervals are marked and excluded from width summaries"
         ),
         "bound_limited_cases_by_sensor_count": {
             f"{benchmark}:{parameter}": {
@@ -269,6 +275,319 @@ def sensor_count(*, source=None, spec=None, requirement=None):
         "degradations": ["TOO_FEW_SIMS_NO_CI"],
     }
     return fig, None, metric_definition
+
+
+_ITR_SIN = "forcing_itr_sin"
+_RC_PROFILE_SAMPLES = 201
+
+# Dependent ceiling of the sinusoidal parameterization, A <= R_PEAK_MAX - R_base.
+_RC_PEAK_MAX = 3.0
+
+_ITR_SIN_LABELS = {"R_base": r"$R_{\mathrm{base}}$", "A": r"$A$"}
+_RC_UNIT = r"m$^2$ K/W"
+
+
+def _itr_sin_sweep(source, requirement, key: str):
+    """The forcing_itr_sin sweep table, its CSV path, and the case to show."""
+    paths = records.artifact_paths(source, "inverse_csv", benchmark=_ITR_SIN)
+    if not paths:
+        blocked(
+            requirement,
+            "needs the paired forcing_itr_sin sweep at 8, 16, and 32 sensors; "
+            "no inverse sweep CSV for that benchmark resolved from the "
+            "manifest.",
+            key=key,
+        )
+    # Restricted to the one arm these figures read. F18 loads both and needs
+    # both; failing here because the scalar-R_c sweep is absent would report a
+    # reason that has nothing to do with whether this figure can be drawn.
+    table = records.load_inverse_sensor_sweep(source, benchmarks=(_ITR_SIN,))
+    sim_id = stats.representative_inverse_case(
+        table, benchmark=_ITR_SIN, reference_sensors=8)
+    return table, paths[0], int(sim_id)
+
+
+def _case_row(table, sim_id: int, n_sensors: int):
+    rows = table.loc[
+        (table["benchmark"].astype(str) == _ITR_SIN)
+        & (table["sim_id"].astype(int) == int(sim_id))
+        & (table["n_sensors"].astype(int) == int(n_sensors))
+    ]
+    if len(rows) != 1:
+        raise records.SchemaError(
+            f"{_ITR_SIN} sim {sim_id} has {len(rows)} rows at {n_sensors} "
+            "sensors; the paired sweep must carry exactly one"
+        )
+    return rows.iloc[0]
+
+
+def rc_profile_recovery(*, source=None, spec=None, requirement=None):
+    """F29 -- recovered :math:`R_c(y)` against the truth as sensors are added.
+
+    One inversion case at 8, 16 and 32 interface sensors, two curves per panel,
+    identical axes throughout, so the only thing that changes left to right is
+    the sensor count. The case is picked by the pre-registered rule in
+    ``stats.representative_inverse_case`` -- the lower-median case by recovery
+    error at the hardest arm -- rather than by looking at the drawn result.
+
+    No uncertainty band is drawn around the recovered profile. The two 95%
+    parameter intervals are marginal and correlated, so propagating them
+    independently onto :math:`R_c(y)` would assert a band the inversion never
+    computed. F30 panel (c) carries the joint statement instead.
+
+    Aggregate accuracy over all eight cases belongs to F18 and the inverse
+    tables; this figure exists to make those numbers physically legible.
+    """
+    from src.physics.internal_source import make_rc_sin_profile
+
+    key = "F29_inverse_rc_profile_recovery"
+    table, path, sim_id = _itr_sin_sweep(source, requirement, key)
+
+    counts = records.INVERSE_SENSOR_COUNTS
+    rows = [_case_row(table, sim_id, count) for count in counts]
+
+    truths = np.array([[float(r["R_base_true"]), float(r["A_true"])]
+                       for r in rows])
+    if not np.allclose(truths, truths[0]):
+        raise records.SchemaError(
+            f"{_ITR_SIN} sim {sim_id} carries different true (R_base, A) at "
+            "different sensor counts; the sweep arms are not paired"
+        )
+
+    y = np.linspace(0.0, 1.0, _RC_PROFILE_SAMPLES)
+    truth = make_rc_sin_profile(y, truths[0, 0], truths[0, 1])
+    estimates = [
+        make_rc_sin_profile(y, float(row["R_base_hat"]), float(row["A_hat"]))
+        for row in rows
+    ]
+
+    # One R_c range for all three panels: rescaling per panel would give a
+    # worse reconstruction the same visual gap as a better one.
+    stack = np.concatenate([truth, *estimates])
+    low, high = float(stack.min()), float(stack.max())
+    pad = 0.08 * (high - low) or 0.05
+    ylim = (low - pad, high + pad)
+
+    width = spec.width if spec is not None else "two_col"
+    fig, axes = plt.subplots(1, len(counts),
+                             figsize=style.figsize(width, row_height="std"))
+    flat = np.atleast_1d(axes).ravel().tolist()
+    color = style.benchmark_color(_ITR_SIN)
+
+    for index, (ax, count, rc_hat) in enumerate(zip(flat, counts, estimates)):
+        panels.rc_profile_recovery_panel(
+            ax, y, truth, rc_hat, color=color,
+            title=f"{count} interface sensors",
+            ylabel=f"$R_c(y)$ [{_RC_UNIT}]" if index == 0 else "",
+            legend=(index == 0))
+        ax.set_ylim(*ylim)
+
+    fig.suptitle(f"One inversion case (sim {sim_id}) at three sensor counts",
+                 fontsize=8, y=0.99)
+    style.panel_letters(flat)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+
+    metric_definition = {
+        "question": (
+            "As interface sensors are added, does the inversion recover the "
+            "shape of R_c(y) or only its scale?"
+        ),
+        "benchmark": _ITR_SIN,
+        "table": str(path),
+        "replication_unit": "one inversion case (sim_id)",
+        "n_cases": 1,
+        "sim_id": sim_id,
+        "sensor_counts": list(counts),
+        "selection_rule": (
+            "cases ranked by absolute error in the last recovered parameter "
+            "at the 8-sensor arm; the lower median is shown. Fixed in "
+            "stats.representative_inverse_case and applied without consulting "
+            "the drawn result."
+        ),
+        "estimator": (
+            "MAP in the unconstrained parameterization, FNO surrogate forward "
+            "model"
+        ),
+        "forward_model": "R_c(y) = R_base + A sin(pi y)",
+        "true_curve": {"R_base": float(truths[0, 0]), "A": float(truths[0, 1])},
+        "recovered_curves": {
+            int(count): {"R_base": float(row["R_base_hat"]),
+                         "A": float(row["A_hat"])}
+            for count, row in zip(counts, rows)
+        },
+        "axes": "identical y and R_c limits on all three panels",
+        "no_uncertainty_band": (
+            "the two 95% profile intervals are marginal and correlated, so no "
+            "band is propagated from them onto R_c(y); the joint statement is "
+            "F30 panel (c)"
+        ),
+        "aggregate_evidence": (
+            "across-case accuracy is reported by F18 and the inverse tables; "
+            "this figure is a single-case structural view and is not evidence "
+            "about the distribution over cases"
+        ),
+        "inferential_interval": (
+            "none; a single case carries no across-case interval"
+        ),
+        "degradations": ["SINGLE_CASE_ILLUSTRATION"],
+    }
+    selection = {
+        "sim_id": sim_id,
+        "rule": "lower-median absolute recovery error at the 8-sensor arm",
+    }
+    return fig, selection, metric_definition
+
+
+def identifiability(*, n_sensors: int = 8, source=None, spec=None,
+                    requirement=None):
+    """F30 -- are :math:`R_{\\mathrm{base}}` and :math:`A` separately identifiable?
+
+    Panels (a) and (b) are the two 95% profile likelihoods for the same case
+    F29 draws, each with its true value, its recovered value, and the
+    chi-squared threshold whose crossings define the reported interval. Panel
+    (c) contours the joint region over the same pair: a long tilted region says
+    the two parameters trade against each other, so a small marginal error can
+    coexist with a poorly determined profile; a compact one says they are
+    separately determined.
+
+    The joint region uses the 2-parameter chi-squared threshold. Taking the
+    product of the two 1-D intervals instead would understate the region
+    exactly where the parameters are correlated -- which is the case this
+    figure exists to detect.
+
+    Blank cells are inadmissible: the parameterization enforces
+    ``A <= R_PEAK_MAX - R_base``, so those pairs were never evaluated.
+    """
+    key = "F30_inverse_identifiability"
+    if int(n_sensors) not in records.INVERSE_SENSOR_COUNTS:
+        raise ValueError(
+            f"n_sensors={n_sensors} is not one of the swept counts "
+            f"{records.INVERSE_SENSOR_COUNTS}"
+        )
+    table, path, sim_id = _itr_sin_sweep(source, requirement, key)
+    del table
+
+    artifact_path = records.inverse_artifact_path(
+        path, n_sensors=int(n_sensors), sim_id=sim_id)
+    try:
+        artifact = records.load_inverse_profile_artifact(artifact_path)
+    except records.SchemaError as exc:
+        blocked(
+            requirement,
+            "needs the per-sim profile-likelihood artifact for the "
+            f"representative case: {exc}",
+            key=key,
+        )
+
+    degradations = ["SINGLE_CASE_ILLUSTRATION"]
+    region = artifact.joint
+    if region is None:
+        if artifact.observation_jacobian is None or artifact.sigma_eff2 is None:
+            blocked(
+                requirement,
+                f"{artifact_path} carries neither a measured joint NLL grid "
+                "nor the sensitivity needed for the quadratic fallback, so "
+                "the joint region cannot be drawn.",
+                key=key,
+            )
+        region = stats.laplace_joint_region(
+            artifact.observation_jacobian, artifact.sigma_eff2,
+            artifact.theta_hat, param_names=("R_base", "A"),
+            level=artifact.level, bounds=artifact.theta_bounds,
+            peak_max=_RC_PEAK_MAX)
+        degradations.append("JOINT_REGION_LAPLACE_APPROXIMATION")
+
+    order = [artifact.param_names.index(name) for name in region.param_names]
+    theta_hat = np.asarray(artifact.theta_hat, dtype=float)[order]
+    theta_true = np.asarray(artifact.theta_true, dtype=float)[order]
+
+    width = spec.width if spec is not None else "two_col"
+    fig, axes = plt.subplots(1, 3,
+                             figsize=style.figsize(width, row_height="std"))
+    flat = np.atleast_1d(axes).ravel().tolist()
+    color = style.benchmark_color(_ITR_SIN)
+
+    bound_limited = []
+    for index, name in enumerate(("R_base", "A")):
+        curve = artifact.profile(name)
+        if curve.bound_limited:
+            bound_limited.append(name)
+        panels.profile_likelihood_panel(
+            flat[index], curve, color=color,
+            xlabel=f"{_ITR_SIN_LABELS[name]} [{_RC_UNIT}]",
+            ylabel=r"$\Delta\ell_p$" if index == 0 else "",
+            title=f"profile likelihood, {_ITR_SIN_LABELS[name]}",
+            threshold=artifact.profile_threshold,
+            legend=(index == 0))
+
+    filled = panels.joint_nll_contour_panel(
+        flat[2], region, theta_hat=theta_hat, theta_true=theta_true,
+        labels=tuple(f"{_ITR_SIN_LABELS[name]} [{_RC_UNIT}]"
+                     for name in region.param_names),
+        title="joint region"
+              + (" (quadratic approx.)" if region.approximate else ""),
+        legend=True)
+    panels.attach_colorbar(fig, filled, flat[2], r"$\Delta\ell$")
+
+    fig.suptitle(
+        f"One inversion case (sim {sim_id}) at {int(n_sensors)} sensors",
+        fontsize=8, y=0.99)
+    style.panel_letters(flat)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+
+    metric_definition = {
+        "question": (
+            "Are R_base and A separately identifiable from the interface "
+            "sensor data, or do they compensate for each other?"
+        ),
+        "benchmark": _ITR_SIN,
+        "table": str(path),
+        "artifact": str(artifact_path),
+        "replication_unit": "one inversion case (sim_id)",
+        "n_cases": 1,
+        "sim_id": sim_id,
+        "n_sensors": int(n_sensors),
+        "selection_rule": (
+            "the same case F29 draws: cases ranked by absolute error in the "
+            "last recovered parameter at the 8-sensor arm, lower median taken. "
+            "Fixed in stats.representative_inverse_case."
+        ),
+        "estimator": (
+            f"profile likelihood at level {artifact.level}, sum-convention "
+            "NLL 0.5 * sum(resid^2) / sigma_eff2"
+        ),
+        "marginal_threshold": (
+            f"Delta-ell = chi2.ppf({artifact.level}, 1) / 2 = "
+            f"{artifact.profile_threshold:.4f}; interval endpoints are its "
+            "crossings, with the nuisance parameter re-optimized at every "
+            "pinned value"
+        ),
+        "joint_threshold": (
+            f"Delta-ell = chi2.ppf({artifact.level}, 2) / 2 = "
+            f"{float(region.threshold):.4f}; the 2-parameter threshold, not "
+            "the product of the two marginal intervals, which would understate "
+            "the region wherever the parameters are correlated"
+        ),
+        "joint_region_source": (
+            "Gauss-Newton quadratic approximation H = J^T J / sigma_eff2; "
+            "curvature beyond second order is not shown"
+            if region.approximate else
+            "measured NLL grid with both parameters pinned"
+        ),
+        "joint_condition_number": float(region.cond_number),
+        "inadmissible_region": (
+            "blank cells are pairs the parameterization forbids "
+            f"(A <= {_RC_PEAK_MAX} - R_base); they were not evaluated"
+        ),
+        "bound_limited_parameters": bound_limited,
+        "inferential_interval": (
+            "profile-likelihood intervals for this one case; no across-case "
+            "interval is claimed"
+        ),
+        "degradations": degradations,
+    }
+    selection = {"sim_id": sim_id, "n_sensors": int(n_sensors)}
+    return fig, selection, metric_definition
 
 
 def surrogate_fidelity(*, source=None, spec=None, requirement=None):
@@ -343,4 +662,10 @@ def surrogate_fidelity(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
-__all__ = ["recovery", "sensor_count", "surrogate_fidelity"]
+__all__ = [
+    "identifiability",
+    "rc_profile_recovery",
+    "recovery",
+    "sensor_count",
+    "surrogate_fidelity",
+]

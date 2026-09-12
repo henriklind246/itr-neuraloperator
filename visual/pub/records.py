@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.operators.eval import TEST_RECORD_FIELDS
@@ -461,7 +462,7 @@ _INVERSE_SENSOR_COLUMNS = {
         f"{name}_true", f"{name}_map" if name == "R_c" else f"{name}_hat",
         f"{name}_abs_error" if name == "R_c" else f"{name}_abserr",
         f"{name}_rel_error_pct", f"profile_{name}_ci_low", f"profile_{name}_ci_high",
-        f"profile_{name}_bound_limited", f"profile_{name}_disconnected",
+        f"profile_{name}_bound_limited",
     ))
     for benchmark, names in {"forcing": ("R_c",), "forcing_itr_sin": ("R_base", "A")}.items()
 }
@@ -492,11 +493,16 @@ def load_inverse_sensor_sweep(
     table = pd.concat(frames, ignore_index=True, sort=False)
     table["benchmark"] = table["benchmark"].fillna("").astype(str)
 
-    unexpected = sorted(set(table["benchmark"]) - set(benchmarks))
+    unexpected = sorted(set(table["benchmark"]) - set(INVERSE_SENSOR_BENCHMARKS))
     if unexpected:
         raise SchemaError(
             f"inverse sensor sweep contains unsupported benchmarks {unexpected}"
         )
+    # ``benchmarks`` narrows what is returned, so a single-arm consumer (F29,
+    # F30) works against either layout: its own CSV, or the combined table that
+    # also carries the arm it does not read.
+    table = table.loc[table["benchmark"].isin(benchmarks)].reset_index(drop=True)
+
     missing_benchmarks = [
         benchmark for benchmark in benchmarks
         if not (table["benchmark"] == benchmark).any()
@@ -526,7 +532,7 @@ def load_inverse_sensor_sweep(
                 f"inverse sensor sweep for {benchmark} is missing columns {missing}"
             )
         for column in conditional:
-            if column.endswith(("_bound_limited", "_disconnected")):
+            if column.endswith("_bound_limited"):
                 values = part[column].map({True: True, False: False, 1: True, 0: False,
                     "True": True, "False": False, "true": True, "false": False,
                     "1": True, "0": False, "1.0": True, "0.0": False})
@@ -569,6 +575,242 @@ def load_inverse_sensor_sweep(
     return table.sort_values(
         ["benchmark", "sim_id", "noise_seed", "init_seed", "n_sensors"]
     ).reset_index(drop=True)
+
+
+# The per-sim inverse artifacts written by scripts/invert.py --artifact-dir.
+# Schema 3 carries the per-parameter profile likelihoods; 4 adds the optional
+# joint_nll_* block (--joint-nll-grid). Readers that only need the profiles
+# accept >= 3 and treat the joint block as absent.
+INVERSE_ARTIFACT_MIN_VERSION = 3
+
+# A stored profile value below its own reference means the reported optimum was
+# not the optimum, which invalidates the interval rather than merely perturbing
+# it. Matches scripts/invert.PROFILE_OPTIMUM_ATOL.
+_PROFILE_OPTIMUM_ATOL = 1e-5
+
+
+@dataclass(frozen=True)
+class ProfileCurve:
+    """One parameter's profile likelihood, as stored by ``scripts/invert.py``.
+
+    ``delta_ell`` is ``nll - nll_min`` on the sum convention
+    ``0.5 * sum(resid^2) / sigma_eff2``, so it is directly comparable against
+    ``chi2.ppf(level, 1) / 2``.
+    """
+
+    param_name: str
+    param_index: int
+    values: np.ndarray
+    delta_ell: np.ndarray
+    theta_hat: float
+    theta_true: float
+    ci_low: float
+    ci_high: float
+    bound_limited: bool
+
+
+@dataclass(frozen=True)
+class JointNLLGrid:
+    """The measured joint ``delta_ell`` surface over a 2-parameter space.
+
+    Rows index ``param_names[0]``, columns index ``param_names[1]``. Entries are
+    ``nan`` where the pair violates the dependent ceiling, so the admissible set
+    is triangular and must be left blank rather than extrapolated.
+    ``approximate`` is always ``False`` here; the Gauss-Newton fallback in
+    ``visual.pub.stats`` produces the same duck type with ``True``.
+    """
+
+    param_names: tuple[str, str]
+    axes: tuple[np.ndarray, np.ndarray]
+    delta_ell: np.ndarray
+    threshold: float
+    approximate: bool = False
+    cond_number: float = float("nan")
+
+
+@dataclass(frozen=True)
+class InverseProfileArtifact:
+    """One ``sim_{id:05d}.npz`` from an inverse run, validated and decoded."""
+
+    path: Path
+    schema_version: int
+    benchmark: str
+    sim_id: int
+    param_names: tuple[str, ...]
+    theta_hat: np.ndarray
+    theta_true: np.ndarray
+    theta_bounds: np.ndarray
+    param_scales: np.ndarray
+    level: float
+    profile_threshold: float
+    profiles: tuple[ProfileCurve, ...]
+    observation_jacobian: np.ndarray | None
+    sigma_eff2: float | None
+    joint: JointNLLGrid | None
+
+    def profile(self, param_name: str) -> ProfileCurve:
+        for curve in self.profiles:
+            if curve.param_name == param_name:
+                return curve
+        raise SchemaError(
+            f"{self.path} has no profile for {param_name!r}; "
+            f"stored profiles are {[c.param_name for c in self.profiles]}"
+        )
+
+
+def inverse_artifact_path(csv_path: str | Path, *, n_sensors: int,
+                          sim_id: int) -> Path:
+    """Per-sim NPZ path for one arm of an inverse sensor sweep.
+
+    The layout is fixed by ``scripts/run_inverse_sensor_sweep.py`` and enforced
+    by its ``_validate_artifacts``, so it is derived from the resolved combined
+    CSV rather than declared 24 more times in the manifest. Keeping the
+    derivation here means exactly one place breaks if the sweep layout changes.
+    """
+    return (
+        Path(csv_path).parent
+        / f"sensors_{int(n_sensors):02d}"
+        / "artifacts"
+        / f"sim_{int(sim_id):05d}.npz"
+    )
+
+
+def _scalar(stored, key: str) -> float:
+    return float(np.asarray(stored[key]).reshape(()))
+
+
+def _flag(stored, key: str) -> bool:
+    return bool(np.asarray(stored[key]).reshape(()))
+
+
+def load_inverse_profile_artifact(
+    path: str | Path, *, require_version: int = INVERSE_ARTIFACT_MIN_VERSION
+) -> InverseProfileArtifact:
+    """Load one per-sim inverse artifact, including its profile likelihoods.
+
+    Raises :class:`SchemaError` for a missing file, a version below the floor, or
+    a profile block that is absent or internally inconsistent. A figure that
+    cannot show the real likelihood must be blocked, not quietly approximated.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise SchemaError(f"inverse artifact not found: {path}")
+
+    with np.load(path, allow_pickle=False) as stored:
+        keys = set(stored.files)
+        if "artifact_schema_version" not in keys:
+            raise SchemaError(f"{path} carries no artifact_schema_version")
+        version = int(_scalar(stored, "artifact_schema_version"))
+        if version < require_version:
+            raise SchemaError(
+                f"{path} is artifact schema v{version}; "
+                f"v{require_version} or later is required"
+            )
+
+        param_names = tuple(
+            str(name) for name in np.asarray(stored["param_names"]).ravel()
+        )
+        theta_hat = np.asarray(stored["theta_hat"], dtype=np.float64).ravel()
+        theta_true = np.asarray(stored["theta_true"], dtype=np.float64).ravel()
+        if len(param_names) != theta_hat.size or theta_hat.size != theta_true.size:
+            raise SchemaError(
+                f"{path} has {len(param_names)} parameter names but "
+                f"theta_hat/theta_true of size {theta_hat.size}/{theta_true.size}"
+            )
+        if "profile_threshold" not in keys or "profile_level" not in keys:
+            raise SchemaError(f"{path} stores no profile likelihood block")
+        threshold = _scalar(stored, "profile_threshold")
+        level = _scalar(stored, "profile_level")
+
+        curves = []
+        for index, name in enumerate(param_names):
+            stem = f"profile_{name}"
+            missing = [
+                f"{stem}_{suffix}" for suffix in
+                ("grid", "nll", "nll_min", "ci_low", "ci_high", "bound_limited")
+                if f"{stem}_{suffix}" not in keys
+            ]
+            if missing:
+                raise SchemaError(f"{path} is missing profile keys {missing}")
+            values = np.asarray(stored[f"{stem}_grid"], dtype=np.float64)
+            nll = np.asarray(stored[f"{stem}_nll"], dtype=np.float64)
+            if values.shape != nll.shape or values.size < 2:
+                raise SchemaError(
+                    f"{path} profile for {name} has grid/nll shapes "
+                    f"{values.shape}/{nll.shape}"
+                )
+            delta = nll - _scalar(stored, f"{stem}_nll_min")
+            if float(delta.min()) < -_PROFILE_OPTIMUM_ATOL:
+                raise SchemaError(
+                    f"{path} profile for {name} dips {-float(delta.min()):.3g} "
+                    "below its own reference: the stored fit is not the optimum "
+                    "and the interval is not usable"
+                )
+            curves.append(ProfileCurve(
+                param_name=name, param_index=index, values=values,
+                delta_ell=np.clip(delta, 0.0, None),
+                theta_hat=float(theta_hat[index]),
+                theta_true=float(theta_true[index]),
+                ci_low=_scalar(stored, f"{stem}_ci_low"),
+                ci_high=_scalar(stored, f"{stem}_ci_high"),
+                bound_limited=_flag(stored, f"{stem}_bound_limited"),
+            ))
+
+        joint = None
+        joint_axis_keys = tuple(f"joint_nll_grid_{name}" for name in param_names)
+        if "joint_nll" in keys:
+            if len(param_names) != 2 or not set(joint_axis_keys) <= keys:
+                raise SchemaError(
+                    f"{path} stores joint_nll without the matching "
+                    f"{list(joint_axis_keys)} axes"
+                )
+            axes = tuple(
+                np.asarray(stored[key], dtype=np.float64) for key in joint_axis_keys
+            )
+            surface = np.asarray(stored["joint_nll"], dtype=np.float64)
+            if surface.shape != (axes[0].size, axes[1].size):
+                raise SchemaError(
+                    f"{path} joint_nll has shape {surface.shape}; expected "
+                    f"{(axes[0].size, axes[1].size)} from its axes"
+                )
+            joint_min = _scalar(stored, "joint_nll_min")
+            delta = surface - joint_min
+            if np.nanmin(delta) < -_PROFILE_OPTIMUM_ATOL:
+                raise SchemaError(
+                    f"{path} joint_nll dips below its own reference; the stored "
+                    "optimum is wrong and the region would be misplaced"
+                )
+            joint = JointNLLGrid(
+                param_names=(param_names[0], param_names[1]),
+                axes=axes,
+                # nan marks the inadmissible corner and must survive the clip so
+                # the panel leaves it blank instead of filling it at zero.
+                delta_ell=np.where(np.isnan(delta), np.nan, np.clip(delta, 0.0, None)),
+                threshold=_scalar(stored, "joint_threshold"),
+            )
+
+        return InverseProfileArtifact(
+            path=path,
+            schema_version=version,
+            benchmark=str(np.asarray(stored["benchmark"]).reshape(())),
+            sim_id=int(_scalar(stored, "sim_id")),
+            param_names=param_names,
+            theta_hat=theta_hat,
+            theta_true=theta_true,
+            theta_bounds=np.asarray(stored["theta_bounds"], dtype=np.float64),
+            param_scales=np.asarray(stored["param_scales"], dtype=np.float64),
+            level=level,
+            profile_threshold=threshold,
+            profiles=tuple(curves),
+            observation_jacobian=(
+                np.asarray(stored["observation_jacobian"], dtype=np.float64)
+                if "observation_jacobian" in keys else None
+            ),
+            sigma_eff2=(
+                _scalar(stored, "sigma_eff2") if "sigma_eff2" in keys else None
+            ),
+            joint=joint,
+        )
 
 
 def load_rollout_arms(source, *, require_version: int = 4

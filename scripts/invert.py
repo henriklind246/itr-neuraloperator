@@ -16,11 +16,11 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 from scipy.stats import chi2
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,17 +37,27 @@ from scripts.inverse_adapters import (  # noqa: E402
     SIN_PARAM_NAMES,
 )
 from src.operators.fno2d import FNO2d  # noqa: E402
+from src.physics.internal_source import R_PEAK_MAX  # noqa: E402
 
 _SOURCE_ITR_SIN_ADAPTER = SourceItrSinAdapter()
 PAPER_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
 PAPER_SENSOR_Y = tuple(np.linspace(0.1, 0.9, 8))
-PROFILE_GRID = 11
-PROFILE_SPAN = 0.6
-PROFILE_STARTS = 3
-PROFILE_ROOT_RTOL = 1e-4
-PROFILE_ROOT_MAX_STEPS = 16
+# Outward march: one fixed step is 5% of the parameter's physical range, so the
+# walk reaches either bound within PROFILE_WALK_MAX_STEPS from anywhere inside.
+PROFILE_STEP_FRACTION = 0.05
+PROFILE_WALK_MAX_STEPS = 40
+PROFILE_ROOT_RTOL = 5e-5
+PROFILE_ROOT_MAX_STEPS = 24
+# Bounded scalar nuisance fit operates on the sigmoid coordinate s in (0, 1),
+# which maps linearly onto the free physical coordinate.
+PROFILE_NUISANCE_XATOL = 1e-6
+PROFILE_NUISANCE_EPS = 1e-9
+# Coarse sweep over the closed box before Brent refines. Brent is local and
+# skips the bounds, so without this a boundary or secondary optimum is missed.
+PROFILE_NUISANCE_SCAN = 9
 PROFILE_OPTIMUM_ATOL = 1e-5
-PROFILE_OPTIMUM_MAX_ROUNDS = 4
+# Re-profile rounds allowed when a walk finds a better optimum than its reference.
+PROFILE_OPTIMUM_MAX_ROUNDS = 3
 
 # Inversion always runs on a freshly generated dataset that is disjoint from the
 # training corpus. Training draws use ``rng_seed=0``; a non-zero seed here makes
@@ -1252,153 +1262,120 @@ def _theta_profile(
     return _SOURCE_ITR_SIN_ADAPTER.theta_profile(u, fixed_index, fixed_value)
 
 
-def _profile_refit(
+def _polish_unrestricted(
     model: FNO2d,
     obs: ObservationSet,
     sigma_eff2: float,
-    fixed_index: int,
-    fixed_value: float,
-    u_seeds: Sequence[torch.Tensor],
+    u_seed: torch.Tensor,
     *,
     adam_steps: int = 150,
     adam_lr: float = 0.05,
     lbfgs_steps: int = 30,
     adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
-    theta_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> tuple[float, torch.Tensor, torch.Tensor]:
-    """Re-optimize the free scalars at a pinned constraint, over several starts.
+) -> tuple[float, torch.Tensor]:
+    """Minimize the Gaussian NLL over all of ``u``, Adam then an L-BFGS polish.
 
-    Minimizes the Gaussian NLL over ``u`` (the pinned coord's ``u`` is inert),
-    Adam then an L-BFGS polish, from *each* seed in ``u_seeds``, and returns the
-    best ``(nll_min, theta, u)``. By default the pin is
-    ``theta[fixed_index] = fixed_value`` via ``adapter.theta_profile``. Pass
-    ``theta_fn=adapter.theta_from_unconstrained`` for an unrestricted fit.
-
-    Multistart is not optional decoration: the nuisance objective is the same
-    nonconvex surface the MAP fit already needs ``n_starts`` for, and a nuisance
-    refit stuck in a local minimum reports an inflated NLL, which pushes the
-    profile up and makes the Wilks interval too *narrow*.
+    Used once per inversion to move the MAP estimate onto the likelihood's own
+    optimum, which is the reference the Wilks threshold is measured against.
     """
-    if len(u_seeds) == 0:
-        raise ValueError("_profile_refit needs at least one seed")
-
-    def make_theta(u_: torch.Tensor) -> torch.Tensor:
-        if theta_fn is not None:
-            return theta_fn(u_)
-        return adapter.theta_profile(u_, fixed_index, fixed_value)
-
     device = obs.spatial.device
+    u = u_seed.clone().detach().to(device).requires_grad_(True)
 
-    if theta_fn is None and adapter.theta_dim == 1:
-        # Nothing is free once the single scalar is pinned: every seed gives the
-        # same theta, so extra starts would be pure cost.
-        u0 = u_seeds[0].detach().to(device)
-        theta_device = make_theta(u0)
-        final = float(neg_log_likelihood(model, obs, theta_device, sigma_eff2, adapter))
-        return final, theta_device.detach().cpu(), u0.detach().cpu()
-
-    best_nll = float("inf")
-    best_theta: Optional[torch.Tensor] = None
-    best_u: Optional[torch.Tensor] = None
-
-    for u_seed in u_seeds:
-        u = u_seed.clone().detach().to(device).requires_grad_(True)
-
-        def nll():
-            theta = make_theta(u)
-            return neg_log_likelihood(model, obs, theta, sigma_eff2, adapter)
-
-        adam = torch.optim.Adam([u], lr=adam_lr)
-        for _ in range(adam_steps):
-            adam.zero_grad()
-            loss = nll()
-            loss.backward()
-            adam.step()
-
-        lbfgs = torch.optim.LBFGS(
-            [u], max_iter=lbfgs_steps, line_search_fn="strong_wolfe"
+    def nll():
+        return neg_log_likelihood(
+            model, obs, adapter.theta_from_unconstrained(u), sigma_eff2, adapter
         )
 
-        def closure():
-            lbfgs.zero_grad()
-            loss = nll()
-            loss.backward()
-            return loss
+    adam = torch.optim.Adam([u], lr=adam_lr)
+    for _ in range(adam_steps):
+        adam.zero_grad()
+        loss = nll()
+        loss.backward()
+        adam.step()
 
-        lbfgs.step(closure)
+    lbfgs = torch.optim.LBFGS([u], max_iter=lbfgs_steps, line_search_fn="strong_wolfe")
 
-        with torch.no_grad():
-            theta_device = make_theta(u)
-            final = float(
-                neg_log_likelihood(model, obs, theta_device, sigma_eff2, adapter)
-            )
-        if final < best_nll:
-            best_nll = final
-            best_theta = theta_device.detach().cpu()
-            best_u = u.detach().cpu()
+    def closure():
+        lbfgs.zero_grad()
+        loss = nll()
+        loss.backward()
+        return loss
 
-    return best_nll, best_theta, best_u
+    lbfgs.step(closure)
+
+    with torch.no_grad():
+        theta = adapter.theta_from_unconstrained(u)
+        final = float(neg_log_likelihood(model, obs, theta, sigma_eff2, adapter))
+    return final, theta.detach().cpu()
 
 
-def _profile_sweep(
+def _profile_refit_scalar(
     model: FNO2d,
     obs: ObservationSet,
     sigma_eff2: float,
-    grid: np.ndarray,
-    u_hat: torch.Tensor,
+    fixed_index: int,
+    fixed_value: float,
     *,
-    adapter: InverseAdapter,
-    pin_index: int = -1,
-    n_starts: int = PROFILE_STARTS,
-    adam_steps: int = 150,
-    lbfgs_steps: int = 30,
-    seed: int = 0,
-) -> tuple[np.ndarray, list[torch.Tensor], float]:
-    """Trace a profile over ``grid`` with multistart + bidirectional continuation.
+    adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
+    xatol: float = PROFILE_NUISANCE_XATOL,
+) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """Re-optimize the one free scalar at a pinned constraint, in closed box form.
 
-    Two sweeps are run. The forward sweep (low to high) fits each point from the
-    MAP seed ``u_hat``, ``n_starts - 1`` LHS starts, and the previous point's
-    solution; the reverse sweep re-fits each point from its neighbor on the
-    other side. Each grid point keeps the lowest NLL seen by either sweep, so a
-    minimum found anywhere on the grid propagates to its neighbors instead of
-    leaving a spurious bump in the profile.
+    Pinning one of two physical coordinates leaves exactly one unknown, and
+    ``adapter.theta_profile`` reaches it only through ``sigmoid(u)[free]``. So
+    the nuisance problem is a bounded 1-D minimization over ``s in (0, 1)``,
+    which maps linearly onto the free physical coordinate and its dependent
+    ceiling. A coarse sweep of the closed box picks the bracket and Brent's
+    bounded method refines inside it, together a few tens of forward passes and
+    no backward passes at all.
 
-    Returns ``(nll, thetas, sweep_gap)`` where ``sweep_gap`` is the largest
-    amount the reverse sweep improved on the forward one — a residual-nonconvexity
-    diagnostic that should be at or near zero on a converged profile.
+    The sweep is not optional. Brent alone is local and never evaluates the
+    bounds, and this objective is bimodal on the tiny fixtures -- it converges to
+    an interior basin while the optimum sits against ``s = 0``. An overstated
+    profiled NLL pushes the Wilks crossings inward, so a missed nuisance optimum
+    reports an interval that is too narrow.
+
+    This is a genuine profile: the nuisance is re-optimized at every pin, never
+    held at its joint MLE.
     """
-    rng = np.random.default_rng(seed)
-    extra = adapter.lhs_starts_unconstrained(max(0, n_starts - 1), rng)
-    extra_seeds = [torch.from_numpy(row) for row in extra]
-
-    def refit(value: float, seeds: list[torch.Tensor]):
-        return _profile_refit(
-            model, obs, sigma_eff2, pin_index, value, seeds,
-            adam_steps=adam_steps, lbfgs_steps=lbfgs_steps, adapter=adapter,
+    if adapter.theta_dim > 2:
+        raise ValueError(
+            "scalar profile nuisance needs a 1- or 2-parameter benchmark; "
+            f"{adapter.benchmark} recovers {adapter.theta_dim}"
         )
+    device = obs.spatial.device
+    u = torch.zeros(max(adapter.theta_dim, 1), dtype=torch.float32, device=device)
 
-    n = len(grid)
-    nll = np.empty(n, dtype=np.float64)
-    thetas: list[Optional[torch.Tensor]] = [None] * n
-    u_best: list[Optional[torch.Tensor]] = [None] * n
+    def evaluate(u_: torch.Tensor) -> tuple[float, torch.Tensor]:
+        with torch.no_grad():
+            theta = adapter.theta_profile(u_, fixed_index, fixed_value)
+            return float(neg_log_likelihood(model, obs, theta, sigma_eff2, adapter)), theta
 
-    prev_u: Optional[torch.Tensor] = None
-    for i in range(n):
-        seeds = [u_hat] + extra_seeds
-        if prev_u is not None:
-            seeds.append(prev_u)
-        val, theta, u = refit(float(grid[i]), seeds)
-        nll[i], thetas[i], u_best[i] = val, theta, u
-        prev_u = u
+    if adapter.theta_dim == 1:
+        value, theta = evaluate(u)
+        return value, theta.detach().cpu(), u.detach().cpu()
 
-    forward_nll = nll.copy()
-    for i in range(n - 2, -1, -1):
-        val, theta, u = refit(float(grid[i]), [u_best[i + 1]])
-        if val < nll[i]:
-            nll[i], thetas[i], u_best[i] = val, theta, u
+    free = 1 - int(fixed_index)
 
-    sweep_gap = float(np.max(forward_nll - nll)) if n else 0.0
-    return nll, [t for t in thetas], sweep_gap
+    def objective(s: float) -> float:
+        u[free] = float(np.log(s) - np.log1p(-s))
+        return evaluate(u)[0]
+
+    scan = np.linspace(
+        PROFILE_NUISANCE_EPS, 1.0 - PROFILE_NUISANCE_EPS, PROFILE_NUISANCE_SCAN
+    )
+    scanned = [objective(float(s)) for s in scan]
+    best = int(np.argmin(scanned))
+    lo = float(scan[max(best - 1, 0)])
+    hi = float(scan[min(best + 1, PROFILE_NUISANCE_SCAN - 1)])
+
+    opt = minimize_scalar(
+        objective, bounds=(lo, hi), method="bounded", options={"xatol": xatol}
+    )
+    s_best = float(opt.x) if float(opt.fun) < scanned[best] else float(scan[best])
+    u[free] = float(np.log(s_best) - np.log1p(-s_best))
+    value, theta = evaluate(u)
+    return value, theta.detach().cpu(), u.detach().cpu()
 
 
 @dataclass
@@ -1406,45 +1383,15 @@ class ProfileResult:
     param_index: int
     param_name: str
     level: float
-    grid: np.ndarray            # (G,) pinned physical values
-    nll: np.ndarray             # (G,) profiled NLL at each grid value
+    grid: np.ndarray            # (G,) pinned physical values actually evaluated
+    nll: np.ndarray             # (G,) profiled NLL at each pin
     nll_min: float
     ci_low: float               # physical param CI (Wilks)
     ci_high: float
-    sweep_gap: float = 0.0      # max NLL the reverse sweep clawed back (~0 = converged)
-    n_starts: int = 1
+    n_evals: int = 0
     theta_mle: Optional[torch.Tensor] = None
     lower_closed: bool = False
     upper_closed: bool = False
-    disconnected: bool = False
-
-
-def _threshold_crossings(
-    grid: np.ndarray, delta: np.ndarray, thresh: float
-) -> tuple[float, float]:
-    """Linear-interpolated ``[lo, hi]`` where ``delta(grid) <= thresh``.
-
-    ``delta`` is ``NLL - NLL_min`` over the grid (assumed roughly U-shaped). The
-    interval is the outermost crossings of ``thresh``; if the boundary itself is
-    below ``thresh`` the interval is open there (clamped to the grid edge).
-    """
-    inside = delta <= thresh
-    if not inside.any():
-        k = int(np.argmin(delta))
-        return float(grid[k]), float(grid[k])
-    idx = np.where(inside)[0]
-    i0, i1 = idx[0], idx[-1]
-
-    def interp(a, b):
-        da, db = delta[a], delta[b]
-        if db == da:
-            return float(grid[a])
-        w = (thresh - da) / (db - da)
-        return float(grid[a] + w * (grid[b] - grid[a]))
-
-    lo = float(grid[i0]) if i0 == 0 else interp(i0, i0 - 1)
-    hi = float(grid[i1]) if i1 == len(grid) - 1 else interp(i1, i1 + 1)
-    return lo, hi
 
 
 def profile_likelihood(
@@ -1454,111 +1401,94 @@ def profile_likelihood(
     sigma_eff2: float,
     *,
     param_index: int = 1,
-    n_grid: int = PROFILE_GRID,
-    span: float = PROFILE_SPAN,
     level: float = 0.95,
-    adam_steps: int = 150,
-    lbfgs_steps: int = 30,
-    n_starts: int = PROFILE_STARTS,
-    seed: int = 0,
     adapter: InverseAdapter = _SOURCE_ITR_SIN_ADAPTER,
 ) -> ProfileResult:
-    """Profile one physical coordinate, re-fitting the other at every pin.
+    """Bracket and bisect the Wilks crossings of one profiled coordinate.
 
-    The grid includes both physical bounds and a continuous optimum. Crossings
-    are refined by nuisance re-optimization, never by holding the other
-    coordinate fixed. The NLL reference includes the unrestricted optimum.
+    The reported statistic is the interval width, not a rendered profile curve,
+    so the profile is only evaluated where it decides an endpoint: march outward
+    from ``theta_hat[param_index]`` in fixed steps until the threshold is
+    bracketed or a physical bound is reached, then bisect the bracket. Bisection
+    keeps the *outside* end, so a finite root tolerance can only widen the
+    interval, never shrink it below its nominal level.
+
+    The nuisance coordinate is re-optimized at every pin. Holding it at the
+    joint MLE would be an estimated (plug-in) likelihood, which under the
+    R_base/A correlation reports intervals that are too narrow.
     """
     if not (0 <= param_index < adapter.theta_dim):
         raise ValueError("profile parameter index is out of range")
-    if n_grid < 3 or n_starts < 1 or not np.isfinite(span) or span <= 0 or not np.isfinite(sigma_eff2) or sigma_eff2 <= 0 or not 0 < level < 1:
-        raise ValueError("profile requires grid >= 3, starts >= 1, finite positive span/variance, and 0 < level < 1")
+    if not np.isfinite(sigma_eff2) or sigma_eff2 <= 0 or not 0 < level < 1:
+        raise ValueError(
+            "profile requires a finite positive variance and 0 < level < 1"
+        )
     name = adapter.param_names[param_index]
     lo_b, hi_b = adapter.profile_bounds(param_index)
     theta_mle = theta_hat.detach().cpu()
-    u_hat = adapter.unconstrained_from_theta(theta_mle)
-    nll_min = float(neg_log_likelihood(
+    nll_hat = float(neg_log_likelihood(
         model, obs, theta_mle.to(obs.spatial.device), sigma_eff2, adapter
     ).detach())
-    center = float(theta_mle[param_index])
-    grid = np.unique(np.r_[
-        lo_b, np.linspace(max(lo_b, center - span), min(hi_b, center + span), n_grid),
-        center, hi_b,
-    ])
-    nll, thetas, sweep_gap = _profile_sweep(
-        model, obs, sigma_eff2, grid, u_hat, adapter=adapter,
-        pin_index=param_index, n_starts=n_starts,
-        adam_steps=adam_steps, lbfgs_steps=lbfgs_steps, seed=seed,
-    )
-    best = int(np.argmin(nll))
-    if nll[best] < nll_min:
-        nll_min, theta_mle = float(nll[best]), thetas[best]
-    value, theta, _ = _profile_refit(
-        model, obs, sigma_eff2, -1, 0.0,
-        [adapter.unconstrained_from_theta(theta_mle)],
-        adam_steps=adam_steps, lbfgs_steps=lbfgs_steps, adapter=adapter,
-        theta_fn=adapter.theta_from_unconstrained,
-    )
-    if value < nll_min:
-        nll_min, theta_mle = value, theta
-    cache = {float(x): (float(v), t) for x, v, t in zip(grid, nll, thetas)}
-    center = float(theta_mle[param_index])
-    # The unrestricted fit is itself feasible at this pin, even if a nuisance
-    # optimizer would otherwise lose it through a sigmoid round trip.
-    if center not in cache or nll_min < cache[center][0]:
-        cache[center] = (nll_min, theta_mle)
     threshold = float(chi2.ppf(level, 1) / 2.0)
-    extra = adapter.lhs_starts_unconstrained(
-        max(0, n_starts - 1), np.random.default_rng(seed)
-    )
+    cache: dict[float, tuple[float, torch.Tensor]] = {}
 
-    def evaluate(pin):
+    def profiled(pin: float) -> float:
         if pin not in cache:
-            nearest = min(cache, key=lambda x: abs(x - pin))
-            seeds = [adapter.unconstrained_from_theta(theta_mle),
-                     adapter.unconstrained_from_theta(cache[nearest][1])]
-            seeds.extend(torch.from_numpy(row) for row in extra)
-            val, th, _ = _profile_refit(
-                model, obs, sigma_eff2, param_index, pin, seeds,
-                adam_steps=adam_steps, lbfgs_steps=lbfgs_steps, adapter=adapter,
-            )
-            cache[pin] = (val, th)
-        return cache[pin][0] - nll_min - threshold
+            cache[pin] = _profile_refit_scalar(
+                model, obs, sigma_eff2, param_index, pin, adapter=adapter
+            )[:2]
+        return cache[pin][0]
 
-    ordered = sorted(cache)
-    inside = [i for i, x in enumerate(ordered) if evaluate(x) <= 0]
-    first, last = inside[0], inside[-1]
-    disconnected = any(evaluate(ordered[i]) > 0 for i in range(first, last + 1))
-    lower_closed, upper_closed = first > 0, last < len(ordered) - 1
+    center = float(np.clip(float(theta_mle[param_index]), lo_b, hi_b))
+    # Re-optimizing the nuisance at the centre pin can only lower the NLL, and
+    # the reference has to be the lowest value the profile itself can reach or
+    # delta-NLL would go negative and the interval would come out too wide.
+    nll_min = min(nll_hat, profiled(center))
 
-    def crossing(inside_x, outside_x):
-        # Keep the outside end, so finite root tolerance cannot shrink the CI.
+    def outside(pin: float) -> bool:
+        return profiled(pin) - nll_min > threshold
+
+    def bisect(inside_x: float, outside_x: float) -> float:
+        tol = PROFILE_ROOT_RTOL * (hi_b - lo_b)
         for _ in range(PROFILE_ROOT_MAX_STEPS):
-            if abs(outside_x - inside_x) <= PROFILE_ROOT_RTOL * (hi_b - lo_b):
+            if abs(outside_x - inside_x) <= tol:
                 break
             midpoint = 0.5 * (inside_x + outside_x)
-            if evaluate(midpoint) <= 0:
-                inside_x = midpoint
-            else:
+            if outside(midpoint):
                 outside_x = midpoint
+            else:
+                inside_x = midpoint
         return outside_x
 
-    ci_low = crossing(ordered[first], ordered[first - 1]) if lower_closed else lo_b
-    ci_high = crossing(ordered[last], ordered[last + 1]) if upper_closed else hi_b
+    def endpoint(direction: int) -> tuple[float, bool]:
+        bound = lo_b if direction < 0 else hi_b
+        step = direction * PROFILE_STEP_FRACTION * (hi_b - lo_b)
+        inside_x = center
+        for _ in range(PROFILE_WALK_MAX_STEPS):
+            if inside_x == bound:
+                return bound, False
+            nxt = float(np.clip(inside_x + step, lo_b, hi_b))
+            if outside(nxt):
+                return bisect(inside_x, nxt), True
+            inside_x = nxt
+        return bound, False
+
+    ci_low, lower_closed = endpoint(-1)
+    ci_high, upper_closed = endpoint(+1)
     grid = np.asarray(sorted(cache), dtype=np.float64)
-    nll = np.asarray([cache[x][0] for x in grid], dtype=np.float64)
+    nll = np.asarray([cache[float(x)][0] for x in grid], dtype=np.float64)
     best_x = min(cache, key=lambda x: cache[x][0])
-    # Return a better fit found during crossing refinement to the caller; the
-    # multi-parameter driver then recomputes both profiles against that fit.
+    # Hand a better fit found while bracketing back to the caller; the driver
+    # re-profiles against it rather than reporting an interval whose reference
+    # NLL was never the minimum.
     if cache[best_x][0] < nll_min - PROFILE_OPTIMUM_ATOL:
         theta_mle = cache[best_x][1]
     return ProfileResult(
         param_index=param_index, param_name=name, level=level,
         grid=grid, nll=nll, nll_min=nll_min,
         ci_low=float(ci_low), ci_high=float(ci_high),
-        sweep_gap=sweep_gap, n_starts=int(n_starts), theta_mle=theta_mle,
+        n_evals=len(cache), theta_mle=theta_mle,
         lower_closed=lower_closed, upper_closed=upper_closed,
-        disconnected=disconnected,
     )
 
 
@@ -1572,32 +1502,129 @@ def profile_interval_summary(res: ProfileResult) -> dict:
         f"{stem}_lower_closed": res.lower_closed,
         f"{stem}_upper_closed": res.upper_closed,
         f"{stem}_bound_limited": not (res.lower_closed and res.upper_closed),
-        f"{stem}_disconnected": res.disconnected,
-        f"{stem}_n_starts": res.n_starts,
-        f"{stem}_sweep_gap": res.sweep_gap,
+        f"{stem}_n_evals": res.n_evals,
     }
 
 
-def profile_parameters(model, obs, theta_hat, sigma_eff2, *, adapter, indices=None, **kwargs):
-    """Return a consistent MLE and parameter profiles using one NLL reference."""
+def profile_parameters(
+    model, obs, theta_hat, sigma_eff2, *, adapter, indices=None,
+    adam_steps: int = 150, lbfgs_steps: int = 30, **kwargs,
+):
+    """Polish the joint MLE, then profile every parameter against that one optimum.
+
+    Profiling can walk into a lower NLL than the reference it started from. The
+    interval it reported is then measured against a value that was never the
+    minimum, so it is too narrow. When that happens the better point is adopted
+    and every parameter is profiled again, which also keeps the parameters on a
+    shared reference.
+    """
     indices = list(range(adapter.theta_dim)) if indices is None else list(indices)
     theta = theta_hat.detach().cpu()
-    for _ in range(PROFILE_OPTIMUM_MAX_ROUNDS):
-        baseline = float(neg_log_likelihood(
-            model, obs, theta.to(obs.spatial.device), sigma_eff2, adapter
+
+    def nll_at(candidate: torch.Tensor) -> float:
+        return float(neg_log_likelihood(
+            model, obs, candidate.to(obs.spatial.device), sigma_eff2, adapter
         ).detach())
+
+    # The MAP fit minimizes a regularized mean-of-squares, so its optimum is not
+    # exactly the likelihood's. One unrestricted refit puts theta_hat on the NLL
+    # the Wilks threshold is measured against.
+    baseline = nll_at(theta)
+    value, polished = _polish_unrestricted(
+        model, obs, sigma_eff2, adapter.unconstrained_from_theta(theta),
+        adam_steps=adam_steps, lbfgs_steps=lbfgs_steps, adapter=adapter,
+    )
+    if value < baseline:
+        theta, baseline = polished, value
+
+    for _ in range(PROFILE_OPTIMUM_MAX_ROUNDS):
         profiles = [profile_likelihood(
             model, obs, theta, sigma_eff2, param_index=i, adapter=adapter, **kwargs
         ) for i in indices]
-        candidates = [theta] + [p.theta_mle for p in profiles]
-        values = [float(neg_log_likelihood(
-            model, obs, t.to(obs.spatial.device), sigma_eff2, adapter
-        ).detach()) for t in candidates]
-        best = int(np.argmin(values))
-        if baseline - values[best] <= PROFILE_OPTIMUM_ATOL:
+        found = [p.theta_mle for p in profiles if p.theta_mle is not None]
+        best = min(found, key=nll_at, default=None)
+        if best is None or nll_at(best) >= baseline - PROFILE_OPTIMUM_ATOL:
             return theta, profiles
-        theta = candidates[best]
-    raise RuntimeError("Profile nuisance fits keep finding a better optimum; intervals are unresolved.")
+        theta, baseline = best.detach().cpu(), nll_at(best)
+    return theta, profiles
+
+
+def joint_nll_grid(
+    model: FNO2d,
+    obs: ObservationSet,
+    sigma_eff2: float,
+    *,
+    adapter: InverseAdapter,
+    profiles: Sequence[ProfileResult],
+    theta_hat: torch.Tensor,
+    n_grid: int,
+    level: float = 0.95,
+) -> dict:
+    """Evaluate the NLL on an ``n_grid x n_grid`` physical grid over both parameters.
+
+    Unlike the per-parameter profiles, which re-fit the nuisance coordinate at
+    every pin, this fixes *both* coordinates. The result is therefore the
+    measured joint likelihood surface rather than a quadratic approximation of
+    it, which is what a joint-region figure has to claim. The span is the union
+    of the two profile grids clipped to the adapter bounds, so the joint surface
+    covers at least the range the marginal profiles already show.
+
+    Rows index ``param_names[0]``, columns index ``param_names[1]``. Points
+    violating the dependent ceiling ``A <= R_PEAK_MAX - R_base`` are outside the
+    sampled parameterization and stay ``nan``; the admissible set is triangular.
+    """
+    if adapter.theta_dim != 2:
+        raise ValueError(
+            f"joint NLL grid requires a 2-parameter benchmark; {adapter.benchmark} "
+            f"recovers {adapter.theta_dim}"
+        )
+    if n_grid < 3:
+        raise ValueError("joint NLL grid requires n_grid >= 3")
+    if not np.isfinite(sigma_eff2) or sigma_eff2 <= 0 or not 0 < level < 1:
+        raise ValueError("joint NLL grid requires a finite positive variance and 0 < level < 1")
+    by_index = {int(p.param_index): p for p in profiles}
+    if set(by_index) != {0, 1}:
+        raise ValueError("joint NLL grid requires a profile for both parameters")
+
+    axes = []
+    for index in (0, 1):
+        lo_b, hi_b = adapter.profile_bounds(index)
+        grid = np.asarray(by_index[index].grid, dtype=np.float64)
+        lo = max(float(lo_b), float(grid.min()))
+        hi = min(float(hi_b), float(grid.max()))
+        if not hi > lo:
+            raise ValueError(
+                f"joint NLL grid span for {adapter.param_names[index]} collapsed to a point"
+            )
+        axes.append(np.linspace(lo, hi, int(n_grid)))
+
+    theta_mle = theta_hat.detach().cpu().reshape(-1)
+    device = obs.spatial.device
+    nll = np.full((int(n_grid), int(n_grid)), np.nan, dtype=np.float64)
+    with torch.no_grad():
+        for i, r_base in enumerate(axes[0]):
+            for j, amp in enumerate(axes[1]):
+                if amp > R_PEAK_MAX - r_base:
+                    continue
+                theta = torch.tensor([r_base, amp], dtype=theta_mle.dtype)
+                nll[i, j] = float(neg_log_likelihood(
+                    model, obs, theta.to(device), sigma_eff2, adapter
+                ).detach())
+        at_mle = float(neg_log_likelihood(
+            model, obs, theta_mle.to(device), sigma_eff2, adapter
+        ).detach())
+    finite = nll[np.isfinite(nll)]
+    if finite.size == 0:
+        raise ValueError("joint NLL grid contains no admissible points")
+    # Reference against the fit the marginal profiles used, so delta-ell is on
+    # one scale across all three panels and can never come out negative.
+    return {
+        f"joint_nll_grid_{adapter.param_names[0]}": axes[0],
+        f"joint_nll_grid_{adapter.param_names[1]}": axes[1],
+        "joint_nll": nll,
+        "joint_nll_min": np.float64(min(at_mle, float(finite.min()))),
+        "joint_threshold": np.float64(chi2.ppf(level, 2) / 2.0),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1607,7 +1634,9 @@ def profile_parameters(model, obs, theta_hat, sigma_eff2, *, adapter, indices=No
 # (opt-in via --artifact-dir) we write one self-describing NPZ per sim.
 # ---------------------------------------------------------------------------
 
-_ARTIFACT_SCHEMA_VERSION = 3
+# 4 added the optional joint_nll_* block (--joint-nll-grid). Readers that only
+# need the version-3 keys should accept >= 3 and treat joint_nll_* as optional.
+_ARTIFACT_SCHEMA_VERSION = 4
 
 
 def _dataset_fingerprint(ds: SnapshotPairDataset) -> str:
@@ -1919,6 +1948,7 @@ def _write_sim_artifact(
     J: Optional[torch.Tensor],
     fv_res: Optional[FVRefineResult],
     profiles: Optional[list[ProfileResult]],
+    joint: Optional[dict] = None,
     sigma_eff2: Optional[float],
     c_fno: Optional[float],
     noise_std: float,
@@ -2028,6 +2058,8 @@ def _write_sim_artifact(
         payload[f"{stem}_nll_min"] = np.float64(prof.nll_min)
         payload.update(profile_interval_summary(prof))
 
+    payload.update(joint or {})
+
     if sigma_eff2 is not None:
         payload["sigma_eff2"] = np.float64(sigma_eff2)
     if c_fno is not None:
@@ -2130,15 +2162,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="Confidence level for the profile-likelihood interval")
     ap.add_argument("--profile-index", type=int, default=None,
                     help="Profile only this parameter index (default: every recovered parameter)")
-    ap.add_argument("--profile-grid", type=int, default=PROFILE_GRID,
-                    help="Number of pinned grid points for the profile (default 11)")
-    ap.add_argument("--profile-starts", type=int, default=PROFILE_STARTS,
-                    help="Optimization starts per profile grid point (theta_hat "
-                         "plus LHS). Bidirectional continuation across the grid "
-                         "is always on. 1 restores the old single-start refit")
-    ap.add_argument("--profile-span", type=float, default=PROFILE_SPAN,
-                    help="Grid half-width around theta_hat: a physical offset for "
-                         "the initial parameter grid; both physical bounds are also evaluated")
+    ap.add_argument("--joint-nll-grid", type=int, default=0,
+                    help="If > 0, also evaluate the NLL on an NxN grid over both "
+                         "physical parameters and store it in the artifact (a "
+                         "measured joint region, not a quadratic approximation). "
+                         "Two-parameter benchmarks only; 25 is a reasonable N")
     ap.add_argument("--artifact-dir", default=None,
                     help="If set, write one self-describing sim_<id>.npz per sim "
                          "(raw profile curves + split provenance) for the "
@@ -2151,6 +2179,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     adapter = InverseAdapter.from_config(loaded.config)
     adapter.validate_model(loaded)
     profile_indices = None if args.profile_index is None else [args.profile_index]
+    if args.joint_nll_grid:
+        if args.joint_nll_grid < 3:
+            raise ValueError("--joint-nll-grid must be 0 (off) or at least 3")
+        if adapter.theta_dim != 2:
+            raise ValueError(
+                f"--joint-nll-grid is only defined for 2-parameter benchmarks; "
+                f"{adapter.benchmark} recovers {adapter.theta_dim}"
+            )
+        if profile_indices is not None:
+            raise ValueError(
+                "--joint-nll-grid needs both parameter profiles; drop --profile-index"
+            )
+        if args.calibration_artifact is None:
+            raise ValueError(
+                "--joint-nll-grid needs the calibrated variance from "
+                "--calibration-artifact"
+            )
+        if not args.artifact_dir:
+            raise ValueError("--joint-nll-grid has nowhere to write without --artifact-dir")
 
     if args.data_dir is not None:
         data_dir = args.data_dir
@@ -2324,7 +2371,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # stay None for good now: they feed retired diagnostics, and
         # _write_sim_artifact omits their blocks when they are absent.
         report = J = None
-        fv_res = sigma_eff2 = None
+        fv_res = sigma_eff2 = joint = None
         profiles = []
         obs = build_observation_set(
             ds, int(sid), time_indices, device=args.device,
@@ -2354,9 +2401,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise ValueError("Profile likelihood requires positive calibrated variance")
             result.theta_hat, profiles = profile_parameters(
                 loaded.model, obs, result.theta_hat, sigma_eff2, adapter=adapter,
-                indices=profile_indices, n_grid=args.profile_grid, span=args.profile_span,
-                level=args.uq_level, n_starts=args.profile_starts, seed=args.seed,
+                indices=profile_indices, level=args.uq_level,
             )
+            if args.joint_nll_grid:
+                joint = joint_nll_grid(
+                    loaded.model, obs, sigma_eff2, adapter=adapter,
+                    profiles=profiles, theta_hat=result.theta_hat,
+                    n_grid=args.joint_nll_grid, level=args.uq_level,
+                )
             residual = _masked_residual(
                 loaded.model, obs, result.theta_hat.to(args.device), adapter
             )
@@ -2428,7 +2480,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             _write_sim_artifact(
                 args.artifact_dir, int(sid), adapter,
                 obs=obs, result=result, report=report, J=J,
-                fv_res=fv_res, profiles=profiles,
+                fv_res=fv_res, profiles=profiles, joint=joint,
                 sigma_eff2=sigma_eff2, c_fno=None,
                 noise_std=args.noise_std, ci_level=args.uq_level,
                 dataset_path=data_dir,
@@ -2457,8 +2509,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                          f"{summary[f'{stem}_ci_high']:.6g}], width={summary[f'{stem}_ci_width']:.6g}")
                 if summary[f"{stem}_bound_limited"]:
                     line += " (bound-limited)"
-                if summary[f"{stem}_disconnected"]:
-                    line += " (disconnected confidence set; displayed interval is its envelope)"
             print(line)
 
     if args.out_csv and rows:

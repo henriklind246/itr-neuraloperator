@@ -31,8 +31,8 @@ from scripts.inverse_adapters import (
 from scripts.invert import (  # noqa: E402
     CALIBRATION_FLOOR,
     INVERSION_DATASET_SEED,
-    PROFILE_GRID, PROFILE_SPAN, PROFILE_STARTS, PROFILE_ROOT_RTOL,
-    PROFILE_ROOT_MAX_STEPS, PROFILE_OPTIMUM_ATOL, PROFILE_OPTIMUM_MAX_ROUNDS,
+    PROFILE_STEP_FRACTION, PROFILE_WALK_MAX_STEPS,
+    PROFILE_ROOT_RTOL, PROFILE_ROOT_MAX_STEPS, PROFILE_OPTIMUM_ATOL,
     _checkpoint_fingerprint,
     build_interface_sensor_mask,
     prepare_inversion_dataset,
@@ -48,6 +48,10 @@ NM_MAXITER = 60
 NM_XATOL = 1e-4
 NM_FATOL = 1e-14
 UQ_LEVEL = 0.95
+# Measured joint likelihood surface over both parameters, for the identifiability
+# figure. Only defined where the benchmark recovers exactly two parameters; the
+# per-parameter profiles carry the uncertainty reporting on their own.
+JOINT_NLL_GRID = 25
 INIT_SEED = 0
 NOISE_SEED = 0
 # Fixed reviewer protocol: invert eight held-out cases, calibrate on a disjoint
@@ -265,6 +269,7 @@ def build_calibration_command(
 
 def build_inversion_command(
     *,
+    benchmark: str,
     checkpoint: Path,
     data_dir: Path,
     device: str,
@@ -274,6 +279,11 @@ def build_inversion_command(
     artifact_dir: Path,
     sim_ids: list[int],
 ) -> list[str]:
+    joint = (
+        ["--joint-nll-grid", str(JOINT_NLL_GRID)]
+        if len(specs_for(benchmark)) == 2
+        else []
+    )
     return [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "invert.py"),
@@ -313,9 +323,7 @@ def build_inversion_command(
         device,
         "--uq-level",
         str(UQ_LEVEL),
-        "--profile-grid", str(PROFILE_GRID),
-        "--profile-span", str(PROFILE_SPAN),
-        "--profile-starts", str(PROFILE_STARTS),
+        *joint,
         "--calibration-artifact",
         str(calibration_path),
         "--out-csv",
@@ -402,7 +410,7 @@ def _required_stage_columns(benchmark: str) -> tuple[str, ...]:
     for spec in specs_for(benchmark):
         columns.extend((spec.estimate_col, spec.truth_col, spec.absolute_error_col))
         columns.extend(f"profile_{spec.parameter}_{suffix}" for suffix in (
-            "ci_low", "ci_high", "ci_width", "bound_limited", "disconnected",
+            "ci_low", "ci_high", "ci_width", "bound_limited",
         ))
     return tuple(columns)
 
@@ -449,7 +457,7 @@ def validate_and_annotate_rows(
             value = row.get(column, "")
             if value is None or not value.strip():
                 raise ValueError(f"{result_path} is missing populated column {column!r}.")
-            if column.endswith(("_bound_limited", "_disconnected")):
+            if column.endswith("_bound_limited"):
                 _summary_bool(row, column)
             elif not math.isfinite(float(value)):
                 raise ValueError(f"{result_path} has non-finite {column}={value!r}.")
@@ -478,7 +486,7 @@ _PAPER_SUMMARY_COLUMNS = (
     *(f"{prefix}_{stat}" for prefix in ("absolute_error", "relative_error_pct", "profile_width", "fv_resid_K")
       for stat in _ROBUST_STATISTICS),
     "relative_error_undefined_cases", "recovery_rmse", "fv_resid_over_noise_median",
-    "profile_bound_limited_cases", "profile_disconnected_cases",
+    "profile_bound_limited_cases",
 )
 
 
@@ -548,7 +556,6 @@ def _flat_paper_row(*, benchmark, parameter, arm):
         "relative_error_undefined_cases": metrics["recovery"]["relative_error_undefined_cases"],
         "fv_resid_over_noise_median": arm["fv_verification"]["over_noise_median"],
         "profile_bound_limited_cases": metrics["profile_interval"]["bound_limited_cases"],
-        "profile_disconnected_cases": metrics["profile_interval"]["disconnected_cases"],
     }
     for prefix, stats in (
         ("absolute_error", metrics["recovery"]["absolute_error"]),
@@ -648,7 +655,6 @@ def generate_paper_summary(
             if np.any(high < low) or not np.allclose(widths, high - low, rtol=1e-6, atol=1e-12):
                 raise ValueError(f"inconsistent interval width for {spec.parameter}")
             limited = np.asarray([_summary_bool(row, f"{stem}_bound_limited") for row in arm_rows])
-            disconnected = np.asarray([_summary_bool(row, f"{stem}_disconnected") for row in arm_rows])
             parameters[spec.parameter] = {
                 "unit": spec.unit,
                 "recovery": {
@@ -658,9 +664,8 @@ def generate_paper_summary(
                     "rmse": float(np.sqrt(np.mean((estimate - truth) ** 2))),
                 },
                 "profile_interval": {
-                    "width": _robust_summary(widths[~(limited | disconnected)]),
+                    "width": _robust_summary(widths[~limited]),
                     "bound_limited_cases": int(limited.sum()),
-                    "disconnected_cases": int(disconnected.sum()),
                 },
             }
         by_sensor_count.append({
@@ -683,7 +688,7 @@ def generate_paper_summary(
             "relative_error_floor_fraction": RELATIVE_ERROR_FLOOR_FRACTION,
             "relative_error_floor": "undefined when abs(truth) <= floor_fraction * admissible parameter range",
             "rmse": "sqrt(mean((estimate - truth)^2)) across simulations",
-            "profile_interval": "95% parameter profile at frozen calibrated variance; width statistics use only connected intervals with both likelihood crossings; counts report exclusions",
+            "profile_interval": "95% parameter profile at frozen calibrated variance, endpoints bracketed and bisected with the nuisance re-optimized at every pinned value; width statistics use only intervals with both likelihood crossings inside the admissible range; counts report exclusions",
         },
         "by_sensor_count": by_sensor_count,
     }
@@ -714,7 +719,7 @@ def _print_paper_summary(summary: dict) -> None:
             print(f"      relative error [%]: {format_stats(recovery['relative_error_pct'])}; "
                   f"undefined={recovery['relative_error_undefined_cases']}")
             print(f"      95% profile width: {format_stats(profile['width'])} {metrics['unit']}; "
-                  f"bound-limited={profile['bound_limited_cases']}, disconnected={profile['disconnected_cases']}")
+                  f"bound-limited={profile['bound_limited_cases']}")
         fv = arm["fv_verification"]
         print(f"    FV residual: {format_stats(fv['residual_K'])} K; {fv['over_noise_median']:.3g}x noise std", flush=True)
 
@@ -786,13 +791,14 @@ def run_sweep(
             "uq_level": UQ_LEVEL,
             "parameter_reporting_version": 2,
             "profile_parameters": [spec.parameter for spec in specs_for(benchmark)],
-            "profile_grid": PROFILE_GRID,
-            "profile_span": PROFILE_SPAN,
-            "profile_starts": PROFILE_STARTS,
+            "profile_step_fraction": PROFILE_STEP_FRACTION,
+            "profile_walk_max_steps": PROFILE_WALK_MAX_STEPS,
+            "joint_nll_grid": (
+                JOINT_NLL_GRID if len(specs_for(benchmark)) == 2 else 0
+            ),
             "profile_root_rtol": PROFILE_ROOT_RTOL,
             "profile_root_max_steps": PROFILE_ROOT_MAX_STEPS,
             "profile_optimum_atol": PROFILE_OPTIMUM_ATOL,
-            "profile_optimum_max_rounds": PROFILE_OPTIMUM_MAX_ROUNDS,
             "relative_error_floor_fraction": RELATIVE_ERROR_FLOOR_FRACTION,
             "reported_statistics": [
                 "parameter_recovery", "fv_verification", "parameter_profile_intervals"
@@ -826,6 +832,7 @@ def run_sweep(
                 calibration_path=calibration_path,
             )
             inversion_command = build_inversion_command(
+                benchmark=benchmark,
                 checkpoint=checkpoint,
                 data_dir=data_dir,
                 device=device,

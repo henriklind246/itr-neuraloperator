@@ -548,7 +548,6 @@ class InverseSensorSweepSummary:
     profile_width: SensorSweepCurve
     fv_over_noise_median: np.ndarray
     bound_limited_cases: np.ndarray
-    disconnected_cases: np.ndarray
 
 
 _INVERSE_SENSOR_METRICS = {
@@ -561,7 +560,6 @@ _INVERSE_SENSOR_METRICS = {
         "profile_low": f"profile_{name}_ci_low",
         "profile_high": f"profile_{name}_ci_high",
         "limited": f"profile_{name}_bound_limited",
-        "disconnected": f"profile_{name}_disconnected",
     } for name in names)
     for benchmark, names in {
         "forcing": ("R_c",), "forcing_itr_sin": ("R_base", "A"),
@@ -671,9 +669,7 @@ def inverse_sensor_sweep_summaries(
                     columns_by_count.append(values.to_numpy(dtype=np.float64))
                 matrices[column] = np.column_stack(columns_by_count)
 
-            censored_columns = []
             limited_columns = []
-            disconnected_columns = []
             for count in counts:
                 arm = part.loc[part["n_sensors"].astype(int) == count].copy()
                 arm["_pair"] = [
@@ -685,13 +681,8 @@ def inverse_sensor_sweep_summaries(
                     raise ValueError(
                         f"{benchmark} profile censoring is not paired across counts"
                     )
-                disconnected = arm.set_index("_pair")[columns["disconnected"]].reindex(case_keys)
-                if disconnected.isna().any():
-                    raise ValueError(f"{benchmark} disconnected flags are not paired across counts")
                 limited_columns.append(flags.astype(bool).to_numpy())
-                disconnected_columns.append(disconnected.astype(bool).to_numpy())
-                censored_columns.append((flags.astype(bool) | disconnected.astype(bool)).to_numpy())
-            censored = np.column_stack(censored_columns)
+            censored = np.column_stack(limited_columns)
 
             truth = matrices[columns["truth"]]
             estimate = matrices[columns["estimate"]]
@@ -753,10 +744,156 @@ def inverse_sensor_sweep_summaries(
                 noise_floor=noise_curve,
                 profile_width=width_curve,
                 fv_over_noise_median=np.median(over_noise, axis=0),
-                bound_limited_cases=np.count_nonzero(np.column_stack(limited_columns), axis=0),
-                disconnected_cases=np.count_nonzero(np.column_stack(disconnected_columns), axis=0),
+                bound_limited_cases=np.count_nonzero(censored, axis=0),
             )
     return output
+
+
+def representative_inverse_case(
+    table: pd.DataFrame,
+    *,
+    benchmark: str,
+    reference_sensors: int = 8,
+) -> int:
+    """Pre-registered choice of the single inversion case a figure shows.
+
+    Cases are ranked by absolute recovery error in the last recovered parameter
+    at the hardest (smallest) sensor arm, and the lower median is taken. Picking
+    the median rather than the best case keeps the figure from being selected in
+    its own favour, and fixing the rule here rather than inside each figure keeps
+    every figure that needs "the representative case" showing the same inversion.
+    """
+    try:
+        columns = _INVERSE_SENSOR_METRICS[benchmark]
+    except KeyError:
+        raise ValueError(
+            f"unsupported inverse sensor sweep benchmark {benchmark!r}"
+        ) from None
+    column = columns[-1]["absolute_error"]
+    if column not in table.columns:
+        raise ValueError(f"inverse sensor sweep has no {column} column to rank by")
+
+    arm = table.loc[
+        (table["benchmark"].astype(str) == benchmark)
+        & (table["n_sensors"].astype(int) == int(reference_sensors))
+    ]
+    if arm.empty:
+        raise ValueError(
+            f"{benchmark} has no {reference_sensors}-sensor arm to rank cases by"
+        )
+    ranked = pd.DataFrame({
+        "sim_id": arm["sim_id"].astype(int).to_numpy(),
+        column: arm[column].to_numpy(dtype=np.float64),
+    })
+    if ranked["sim_id"].duplicated().any():
+        raise ValueError(
+            f"{benchmark} repeats a sim_id in the {reference_sensors}-sensor arm"
+        )
+    if not np.all(np.isfinite(ranked[column].to_numpy())):
+        raise ValueError(
+            f"{benchmark} {column} is not finite at {reference_sensors} sensors"
+        )
+    # Lower median on an even count: the smaller of the two central ranks, so
+    # the rule resolves to one existing case rather than an average of two cases
+    # that cannot be averaged. sim_id breaks ties.
+    ranked = ranked.sort_values([column, "sim_id"], kind="mergesort")
+    return int(ranked["sim_id"].to_numpy()[(len(ranked) - 1) // 2])
+
+
+@dataclass(frozen=True)
+class LaplaceJointRegion:
+    """Gauss-Newton approximation to a 2-parameter joint likelihood region.
+
+    Field-compatible with :class:`visual.pub.records.JointNLLGrid` so a contour
+    panel consumes either without branching, but ``approximate`` is ``True``:
+    this surface is quadratic by construction and so cannot show the curvature
+    the measured grid exists to reveal.
+    """
+
+    param_names: tuple[str, str]
+    axes: tuple[np.ndarray, np.ndarray]
+    delta_ell: np.ndarray
+    threshold: float
+    approximate: bool = True
+    cond_number: float = float("nan")
+
+
+def laplace_joint_region(
+    jacobian,
+    sigma_eff2: float,
+    theta_hat,
+    *,
+    param_names: tuple[str, str],
+    level: float = 0.95,
+    bounds=None,
+    peak_max: float | None = None,
+    n_grid: int = 81,
+    pad: float = 1.35,
+) -> LaplaceJointRegion:
+    """Quadratic fallback for the joint region when no measured grid was stored.
+
+    ``H = Jᵀ J / sigma_eff2`` and ``dell(theta) ~= 0.5 (theta-hat)ᵀ H (theta-hat)``,
+    contoured at ``chi2.ppf(level, 2) / 2``. The grid spans the bounding box of
+    the ``dell = threshold`` ellipse scaled by ``pad``, so it always contains the
+    region of interest without the caller having to guess a span.
+
+    ``peak_max`` applies the dependent ceiling ``theta_1 <= peak_max - theta_0``
+    as ``nan``; the caller supplies it because the ceiling is a property of the
+    benchmark's parameterization, not of the approximation.
+    """
+    from scipy.stats import chi2
+
+    jacobian = np.asarray(jacobian, dtype=np.float64)
+    theta_hat = np.asarray(theta_hat, dtype=np.float64).ravel()
+    if theta_hat.size != 2 or len(param_names) != 2:
+        raise ValueError("the joint region is only defined for two parameters")
+    if jacobian.ndim != 2 or jacobian.shape[1] != 2:
+        raise ValueError(f"jacobian has shape {jacobian.shape}; expected (m, 2)")
+    if not np.isfinite(sigma_eff2) or sigma_eff2 <= 0.0:
+        raise ValueError("sigma_eff2 must be positive and finite")
+
+    hessian = jacobian.T @ jacobian / float(sigma_eff2)
+    singular = np.linalg.svd(jacobian, compute_uv=False)
+    # numpy's matrix_rank tolerance: below it the inverse is numerical noise, so
+    # the "region" would be an artefact of round-off rather than a bound.
+    tolerance = singular.max() * max(jacobian.shape) * np.finfo(np.float64).eps
+    if singular.min() <= tolerance:
+        raise ValueError(
+            "the Jacobian is rank deficient: the quadratic region is unbounded "
+            "and would understate the uncertainty rather than approximate it"
+        )
+    threshold = float(chi2.ppf(level, 2) / 2.0)
+
+    # Half-widths of the ellipse bounding box: the largest |d_i| on
+    # d^T H d = 2c is sqrt(2c (H^-1)_ii), the marginal extent rather than the
+    # conditional one, so the box encloses the whole contour.
+    covariance = np.linalg.inv(hessian)
+    half = pad * np.sqrt(2.0 * threshold * np.diag(covariance))
+    axes = []
+    for index in range(2):
+        low = theta_hat[index] - half[index]
+        high = theta_hat[index] + half[index]
+        if bounds is not None:
+            limits = np.asarray(bounds, dtype=np.float64)[index]
+            low = max(low, float(limits[0]))
+            high = min(high, float(limits[1]))
+        axes.append(np.linspace(low, high, int(n_grid)))
+
+    offsets = np.stack(
+        np.meshgrid(axes[0] - theta_hat[0], axes[1] - theta_hat[1], indexing="ij"),
+        axis=-1,
+    )
+    delta = 0.5 * np.einsum("...i,ij,...j->...", offsets, hessian, offsets)
+    if peak_max is not None:
+        ceiling = axes[1][None, :] > float(peak_max) - axes[0][:, None]
+        delta = np.where(ceiling, np.nan, delta)
+    return LaplaceJointRegion(
+        param_names=(str(param_names[0]), str(param_names[1])),
+        axes=(axes[0], axes[1]),
+        delta_ell=delta,
+        threshold=threshold,
+        cond_number=float(singular.max() / singular.min()),
+    )
 
 
 def contact_jump_curve(lead_times, truth, pred) -> ContactJumpCurve:
@@ -1524,6 +1661,7 @@ __all__ = [
     "MIN_SIMS_FOR_CI",
     "MIN_SIMS_FOR_P99",
     "InverseSensorSweepSummary",
+    "LaplaceJointRegion",
     "MetricSpec",
     "POOLED_METRICS",
     "PairedDelta",
@@ -1547,7 +1685,9 @@ __all__ = [
     "ecdf_band",
     "exceedance_rate",
     "inverse_sensor_sweep_summaries",
+    "laplace_joint_region",
     "metric_spec",
+    "representative_inverse_case",
     "paired_seed_delta",
     "per_sim",
     "pooled_rel_l2_pct",

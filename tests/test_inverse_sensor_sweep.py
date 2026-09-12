@@ -71,7 +71,6 @@ def _write_mock_forcing_results(command: list[str]) -> None:
                 "profile_R_c_ci_low": 0.2,
                 "profile_R_c_ci_high": 0.8,
                 "profile_R_c_bound_limited": False,
-                "profile_R_c_disconnected": False,
                 "profile_R_c_ci_width": 0.6,
                 "R_c_rel_error_pct": 100 * abs(signed_error) / true_value,
             }
@@ -129,7 +128,6 @@ def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
                     f"{stem}_ci_high": truth + width / 2,
                     f"{stem}_ci_width": width,
                     f"{stem}_bound_limited": sim_id <= {8: 3, 16: 1, 32: 0}[count],
-                    f"{stem}_disconnected": False,
                 })
             rows.append(row)
     return rows
@@ -301,6 +299,7 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
     calibration = sweep.build_calibration_command(**common)
     inversion = sweep.build_inversion_command(
         **common,
+        benchmark="forcing",
         result_path=tmp_path / "results.csv",
         artifact_dir=tmp_path / "artifacts",
         sim_ids=list(range(8)),
@@ -337,6 +336,28 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
     assert "--calibration-artifact" in inversion
     assert "--allow-surrogate-limited" not in inversion
     assert float(_option(inversion, "--uq-level")) == 0.95
+
+
+def test_joint_nll_grid_is_requested_only_where_two_parameters_are_recovered(tmp_path):
+    common = {
+        "checkpoint": tmp_path / "model.pt",
+        "data_dir": tmp_path / "data",
+        "device": "cpu",
+        "sensor_count": 16,
+        "calibration_path": tmp_path / "calibration.npz",
+        "result_path": tmp_path / "results.csv",
+        "artifact_dir": tmp_path / "artifacts",
+        "sim_ids": list(range(8)),
+    }
+    # The joint surface is only defined over a 2-d parameter space, and
+    # scripts/invert.py rejects the flag outright for any other theta_dim, so
+    # requesting it for scalar R_c would abort the whole arm.
+    assert "--joint-nll-grid" not in sweep.build_inversion_command(
+        **common, benchmark="forcing"
+    )
+    for benchmark in ("forcing_itr_sin", "source_itr_sin"):
+        command = sweep.build_inversion_command(**common, benchmark=benchmark)
+        assert int(_option(command, "--joint-nll-grid")) == sweep.JOINT_NLL_GRID
 
 
 def test_run_sweep_rejects_checkpoint_benchmark_mismatch(tmp_path):
@@ -411,6 +432,10 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     assert manifest["fixed_protocol"]["nm_maxiter"] == 60
     assert manifest["fixed_protocol"]["nm_xatol"] == 1e-4
     assert manifest["fixed_protocol"]["nm_fatol"] == 1e-14
+    # Scalar R_c: the joint surface does not exist, and the manifest says so
+    # rather than staying silent, so a figure can tell "not requested" from
+    # "requested and missing".
+    assert manifest["fixed_protocol"]["joint_nll_grid"] == 0
     assert manifest["combined_row_count"] == 24
     assert Path(manifest["canonical_csv"]) == combined
     assert manifest["calibration_sim_ids"] == list(

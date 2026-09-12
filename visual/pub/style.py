@@ -284,7 +284,12 @@ def _footer_text(figure_key: str, source, selection) -> str:
     if source is not None:
         parts.extend(source.footer_fields())
     if selection is not None:
-        parts.append(selection.footer_field())
+        # The inverse figures select an inversion case, not a (sim, s, j) pair,
+        # so they hand back a plain dict instead of a select.CaseSelection.
+        parts.append(
+            selection.footer_field() if hasattr(selection, "footer_field")
+            else " ".join(f"{k}={v}" for k, v in dict(selection).items())
+        )
     parts.append(_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d"))
     return "  |  ".join(p for p in parts if p)
 

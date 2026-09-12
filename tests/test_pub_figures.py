@@ -22,6 +22,7 @@ failure, ``2`` degraded, with ``--list`` and ``--verify`` never importing torch.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,12 @@ import visual.pub as pub
 from visual.pub import __main__ as cli
 from visual.pub import fields, fig_benchmark, fig_crossbench, registry
 from visual.pub.manifest import SIDECAR_SCHEMA, Manifest, ProvenanceError
+
+# The per-sim NPZ writer lives with the reader tests that pin its key set.
+# F29/F30 have to consume the same bytes those tests validate, so it is shared
+# rather than restated -- two synthetic writers drifting apart would let a
+# figure pass against a layout the reader rejects.
+from tests.test_pub_manifest import write_inverse_artifact
 
 REPO_ROOT = Path(pub.__file__).resolve().parents[2]
 
@@ -207,7 +214,6 @@ def write_inverse_sensor_sweep(path: Path, benchmark: str) -> Path:
                 error_col = f"{name}_abs_error" if name == "R_c" else f"{name}_abserr"
                 row[f"{name}_rel_error_pct"] = 100 * row[error_col] / abs(row[f"{name}_true"])
                 row[f"profile_{name}_bound_limited"] = limited
-                row[f"profile_{name}_disconnected"] = False
             rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -247,6 +253,72 @@ def write_inverse_result(path: Path, benchmark: str) -> Path:
             rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
+
+
+# The case ``stats.representative_inverse_case`` must pick out of the synthetic
+# sweep above: ``A_abserr`` there is 0.01*(sim_id+1) at the 8-sensor arm, so the
+# ranking is the sim order and the lower median of eight cases is index 3.
+REPRESENTATIVE_SIM = 3
+
+
+def write_itr_sin_sweep_with_artifacts(root: Path, *, joint: bool = True,
+                                       jacobian: bool = True,
+                                       artifacts: bool = True) -> Path:
+    """A forcing_itr_sin sweep plus the per-sim NPZ tree F30 descends into.
+
+    The NPZ is placed at whatever ``records.inverse_artifact_path`` derives from
+    the CSV rather than at a path this test picks, so the layout contract with
+    ``run_inverse_sensor_sweep.py`` is what gets exercised.
+
+    ``theta`` matches the CSV row for the representative case at the 8-sensor
+    arm. Nothing in the figure cross-checks the two, but a fixture that
+    disagreed with itself would make any later mismatch unreadable.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    csv = write_inverse_sensor_sweep(root / "inverse_sensor_sweep.csv",
+                                     "forcing_itr_sin")
+    if not artifacts:
+        return csv
+
+    from visual.pub import records
+
+    truth = 0.4 + 0.02 * REPRESENTATIVE_SIM
+    for count in records.INVERSE_SENSOR_COUNTS:
+        estimate = truth - 0.01 * (REPRESENTATIVE_SIM + 1) * (8.0 / count)
+        path = records.inverse_artifact_path(csv, n_sensors=count,
+                                             sim_id=REPRESENTATIVE_SIM)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_inverse_artifact(
+            path, joint=joint,
+            theta_hat=(estimate, estimate), theta_true=(truth, truth),
+            # None is dropped by the writer, which is how the "no measured grid
+            # and no sensitivity either" case is built.
+            observation_jacobian=(
+                np.asarray([[1.0, 0.2], [0.3, 1.4], [0.9, 0.1]])
+                if jacobian else None
+            ),
+        )
+    return csv
+
+
+def itr_sin_manifest(tmp_path: Path, csv: Path) -> Manifest:
+    """A manifest for the shared ``inverse_sensor_sweep`` requirement set.
+
+    That set declares both benchmarks because F18 compares them, so the forcing
+    arm is written too even though F29 and F30 never read a row of it. This is
+    the real workflow -- the sweep script is run for both arms -- and it also
+    makes the tests exercise the per-benchmark artifact filtering that picks the
+    right CSV to derive the NPZ directory from.
+    """
+    forcing = write_inverse_sensor_sweep(tmp_path / "forcing.csv", "forcing")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(yaml.safe_dump({
+        "sources": {"inverse_sensor_sweep": [
+            {"table": str(forcing), "seed": "0"},
+            {"table": str(csv), "seed": "0"},
+        ]}
+    }))
+    return Manifest.load(manifest_path, root=tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +489,216 @@ class TestRenderable:
             assert "least-determined direction" in definition["identifiability"]
 
 
+class TestInverseProfileFigures:
+    """F29 and F30 show one case, so the case had better not be chosen by hand.
+
+    Both figures are structural: they make the inverse errors legible rather
+    than re-establishing them. That only holds if the case is fixed by a rule
+    before anything is drawn, so the rule is pinned here, and so is the
+    separation of concerns that makes these two figures honest -- F29 draws no
+    uncertainty band, F30 labels an approximated joint region as approximated.
+
+    Everything runs against synthetic tables: no ``forcing_itr_sin`` sweep
+    exists on disk yet, and waiting for one would mean shipping these untested.
+    """
+
+    F29 = "F29_inverse_rc_profile_recovery"
+    F30 = "F30_inverse_identifiability"
+
+    def draw(self, key: str, manifest: Manifest, **params):
+        """Call the drawing function directly, to inspect the axes it made."""
+        from visual.pub import style
+
+        spec = registry.FIGURES[key]
+        source = manifest.resolve(key, strict=True)
+        with style.pub_style():
+            return spec.load()(
+                source=source, spec=spec,
+                requirement=manifest.requirements.figures[key],
+                **{**spec.params, **params},
+            )
+
+    # ------------------------------------------------------------- F29
+
+    def test_f29_renders_one_case_at_three_sensor_counts(self, tmp_path):
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        result = registry.render(
+            self.F29, manifest=itr_sin_manifest(tmp_path, csv),
+            out_dir=tmp_path / "out", strict=True, formats=("png",),
+        )
+
+        assert not result.degraded
+        assert result.paths[0].stat().st_size > 5000
+        definition = json.loads(result.sidecar.read_text())["metric_definition"]
+        assert definition["n_cases"] == 1
+        assert definition["sim_id"] == REPRESENTATIVE_SIM
+        assert definition["sensor_counts"] == [8, 16, 32]
+
+    def test_f29_case_is_the_pre_registered_median_not_the_best(self, tmp_path):
+        """A figure that picked its own best case would be advertising, not evidence."""
+        from visual.pub import records, stats
+
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        manifest = itr_sin_manifest(tmp_path, csv)
+        table = records.load_inverse_sensor_sweep(manifest.resolve(self.F29))
+        expected = stats.representative_inverse_case(
+            table, benchmark="forcing_itr_sin", reference_sensors=8)
+
+        _, selection, definition = self.draw(self.F29, manifest)
+
+        assert selection["sim_id"] == expected == REPRESENTATIVE_SIM
+        # The synthetic errors rise with sim_id, so the best case is sim 0.
+        assert expected != 0
+
+    def test_f29_panels_share_one_axis_and_one_true_curve(self, tmp_path):
+        """The shrinking gap is the whole message; rescaling per panel erases it."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        fig, _, _ = self.draw(self.F29, itr_sin_manifest(tmp_path, csv))
+
+        axes = fig.axes
+        assert len(axes) == 3
+        assert all(len(ax.lines) == 2 for ax in axes)
+        assert len({ax.get_ylim() for ax in axes}) == 1
+
+        truth = [ax.lines[0].get_ydata() for ax in axes]
+        assert all(np.array_equal(truth[0], other) for other in truth[1:])
+
+    def test_f29_recovered_peak_is_the_recovered_r_base_plus_a(self, tmp_path):
+        """R_c(y) peaks at R_base + A; if it does not, the curve is not the model."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        fig, _, _ = self.draw(self.F29, itr_sin_manifest(tmp_path, csv))
+
+        truth = 0.4 + 0.02 * REPRESENTATIVE_SIM
+        peaks = [float(ax.lines[1].get_ydata().max()) for ax in fig.axes]
+        for peak, count in zip(peaks, (8, 16, 32)):
+            estimate = truth - 0.01 * (REPRESENTATIVE_SIM + 1) * (8.0 / count)
+            assert peak == pytest.approx(2 * estimate, abs=1e-6)
+
+        # More sensors, closer to the truth: the figure's entire claim.
+        assert peaks[0] < peaks[1] < peaks[2] < 2 * truth
+
+    def test_f29_draws_no_uncertainty_band(self, tmp_path):
+        """Two marginal intervals cannot be propagated into a joint band."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        fig, _, definition = self.draw(self.F29, itr_sin_manifest(tmp_path, csv))
+
+        # A band would be a PolyCollection from fill_between; two Line2D and
+        # nothing else is the whole content of every panel.
+        assert all(len(ax.collections) == 0 for ax in fig.axes)
+        assert definition["inferential_interval"].startswith("none")
+        assert "F30" in definition["no_uncertainty_band"]
+
+    def test_f29_is_blocked_when_only_the_forcing_arm_is_supplied(self, tmp_path):
+        """The sweep spans two benchmarks; only one of them carries R_base and A.
+
+        Built as a bare source rather than through the manifest: under
+        ``--allow-missing`` a half-populated sweep reaches the drawing function,
+        and it has to name the arm it is missing instead of dying inside pandas.
+        """
+        from visual.pub import fig_inverse
+
+        csv = write_inverse_sensor_sweep(tmp_path / "forcing.csv", "forcing")
+        source = SimpleNamespace(artifacts=[SimpleNamespace(
+            kind="inverse_csv", path=str(csv), benchmarks=("forcing",))])
+
+        with pytest.raises(NotImplementedError, match="forcing_itr_sin"):
+            fig_inverse.rc_profile_recovery(
+                source=source, spec=registry.FIGURES[self.F29], requirement=None)
+
+    def test_f29_reads_the_itr_sin_arm_out_of_a_combined_table(self, tmp_path):
+        """One CSV carrying both benchmarks is a documented layout; honour it."""
+        from visual.pub import fig_inverse, style
+
+        root = tmp_path / "sweep"
+        csv = write_itr_sin_sweep_with_artifacts(root)
+        combined = pd.concat([
+            pd.read_csv(write_inverse_sensor_sweep(tmp_path / "f.csv", "forcing")),
+            pd.read_csv(csv),
+        ], ignore_index=True, sort=False)
+        combined.to_csv(csv, index=False)
+
+        source = SimpleNamespace(artifacts=[SimpleNamespace(
+            kind="inverse_csv", path=str(csv),
+            benchmarks=("forcing", "forcing_itr_sin"))])
+        with style.pub_style():
+            _, selection, definition = fig_inverse.rc_profile_recovery(
+                source=source, spec=registry.FIGURES[self.F29], requirement=None)
+
+        assert selection["sim_id"] == REPRESENTATIVE_SIM
+        assert definition["n_cases"] == 1
+
+    # ------------------------------------------------------------- F30
+
+    def test_f30_prefers_the_measured_joint_grid(self, tmp_path):
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep", joint=True)
+        result = registry.render(
+            self.F30, manifest=itr_sin_manifest(tmp_path, csv),
+            out_dir=tmp_path / "out", strict=True, formats=("png",),
+        )
+
+        definition = json.loads(result.sidecar.read_text())["metric_definition"]
+        assert "measured" in definition["joint_region_source"]
+        assert "approximation" not in definition["joint_region_source"]
+        assert "JOINT_REGION_LAPLACE_APPROXIMATION" not in definition["degradations"]
+        assert definition["sim_id"] == REPRESENTATIVE_SIM
+        assert definition["n_sensors"] == 8
+
+    def test_f30_falls_back_to_the_quadratic_and_says_so(self, tmp_path):
+        """An assumed ellipse must not be presentable as a measured shape."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep", joint=False)
+        fig, _, definition = self.draw(self.F30, itr_sin_manifest(tmp_path, csv))
+
+        assert "approximation" in definition["joint_region_source"]
+        assert "measured" not in definition["joint_region_source"]
+        assert "JOINT_REGION_LAPLACE_APPROXIMATION" in definition["degradations"]
+        assert "approx" in fig.axes[2].get_title()
+
+    def test_f30_is_blocked_without_a_grid_or_a_sensitivity(self, tmp_path):
+        csv = write_itr_sin_sweep_with_artifacts(
+            tmp_path / "sweep", joint=False, jacobian=False)
+        with pytest.raises(NotImplementedError, match="joint"):
+            self.draw(self.F30, itr_sin_manifest(tmp_path, csv))
+
+    def test_f30_is_blocked_when_the_per_sim_artifact_is_absent(self, tmp_path):
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep",
+                                                 artifacts=False)
+        with pytest.raises(NotImplementedError, match="artifact"):
+            self.draw(self.F30, itr_sin_manifest(tmp_path, csv))
+
+    def test_f30_rejects_a_sensor_count_the_sweep_never_ran(self, tmp_path):
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        with pytest.raises(ValueError, match="12"):
+            self.draw(self.F30, itr_sin_manifest(tmp_path, csv), n_sensors=12)
+
+    def test_f30_uses_the_two_parameter_threshold_for_the_joint_region(self, tmp_path):
+        """chi2(0.95, 2)/2, not the marginal chi2(0.95, 1)/2 reused twice."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        _, _, definition = self.draw(self.F30, itr_sin_manifest(tmp_path, csv))
+
+        # The definitions are prose, so the number is read back out of them --
+        # the claim under test is that the two thresholds carry different
+        # degrees of freedom, and a definition that said "1" while the panel
+        # drew 2 would be the failure worth catching.
+        marginal = definition["marginal_threshold"]
+        joint = definition["joint_threshold"]
+        assert "chi2.ppf(0.95, 1) / 2" in marginal
+        assert "chi2.ppf(0.95, 2) / 2" in joint
+        assert float(re.search(r"= ([\d.]+);", marginal).group(1)) \
+            == pytest.approx(1.92, abs=0.01)
+        assert float(re.search(r"= ([\d.]+);", joint).group(1)) \
+            == pytest.approx(3.00, abs=0.01)
+
+    def test_f29_and_f30_describe_the_same_inversion(self, tmp_path):
+        """Two figures about one case are only comparable if it is one case."""
+        csv = write_itr_sin_sweep_with_artifacts(tmp_path / "sweep")
+        manifest = itr_sin_manifest(tmp_path, csv)
+
+        _, recovery_selection, _ = self.draw(self.F29, manifest)
+        _, joint_selection, _ = self.draw(self.F30, manifest)
+
+        assert recovery_selection["sim_id"] == joint_selection["sim_id"]
+
+
 class TestMmsNumbers:
     """F25 is the one figure whose content can be checked, not just its bytes.
 
@@ -476,7 +758,7 @@ class TestBlocked:
     def test_the_blocked_set_is_the_whole_registry_minus_three(self):
         """If this changes, a figure was built or a key was added; both are news."""
         assert len(BLOCKED) == len(registry.FIGURES) - 3
-        assert len(registry.FIGURES) == 28
+        assert len(registry.FIGURES) == 30
 
     def test_every_renderable_key_is_tier_two(self):
         for key in RENDERABLE:

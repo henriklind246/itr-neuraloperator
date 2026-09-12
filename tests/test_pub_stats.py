@@ -102,7 +102,6 @@ def make_inverse_sensor_sweep() -> pd.DataFrame:
                     error_col = f"{name}_abs_error" if name == "R_c" else f"{name}_abserr"
                     row[f"{name}_rel_error_pct"] = 100 * row[error_col] / abs(row[f"{name}_true"])
                     row[f"profile_{name}_bound_limited"] = limited
-                    row[f"profile_{name}_disconnected"] = False
                 rows.append(row)
     return pd.DataFrame(rows)
 
@@ -219,16 +218,14 @@ class TestInverseSensorSweep:
         assert summaries[("forcing_itr_sin", "R_base")].estimand == "R_base"
         assert summaries[("forcing_itr_sin", "A")].estimand == "A"
 
-    def test_width_statistics_exclude_unclosed_and_disconnected_cases(self):
+    def test_width_statistics_exclude_bound_limited_cases(self):
         table = make_inverse_sensor_sweep()
         selected = (table["benchmark"] == "forcing_itr_sin") & (table["n_sensors"] == 8)
         table.loc[selected, "profile_A_bound_limited"] = True
-        table.loc[selected, "profile_R_base_disconnected"] = True
         summaries = stats.inverse_sensor_sweep_summaries(table)
         assert np.isnan(summaries[("forcing_itr_sin", "A")].profile_width.median[0])
-        assert np.isnan(summaries[("forcing_itr_sin", "R_base")].profile_width.median[0])
         assert summaries[("forcing_itr_sin", "A")].bound_limited_cases[0] == 8
-        assert summaries[("forcing_itr_sin", "R_base")].disconnected_cases[0] == 8
+        assert np.isfinite(summaries[("forcing_itr_sin", "R_base")].profile_width.median[0])
 
     def test_rejects_truth_changes_or_inconsistent_derived_metrics(self):
         changed_truth = make_inverse_sensor_sweep()
@@ -245,6 +242,173 @@ class TestInverseSensorSweep:
         bad_ratio.loc[0, "fv_resid_over_noise"] = 99.0
         with pytest.raises(ValueError, match="FV/noise ratio"):
             stats.inverse_sensor_sweep_summaries(bad_ratio)
+
+
+class TestRepresentativeInverseCase:
+    def test_the_lower_median_case_at_the_hardest_arm_is_selected(self):
+        table = make_inverse_sensor_sweep()
+        # A_abserr rises monotonically with sim_id, so the eight cases sort into
+        # sim_id order and the lower median of an even count is index 3.
+        assert stats.representative_inverse_case(
+            table, benchmark="forcing_itr_sin"
+        ) == 3
+
+    def test_selection_is_ranked_not_positional(self):
+        table = make_inverse_sensor_sweep()
+        arm = (
+            (table["benchmark"] == "forcing_itr_sin")
+            & (table["n_sensors"] == 8)
+        )
+        # Reversing the error ordering must reverse the selection; a rule that
+        # merely took the fourth row would not notice.
+        table.loc[arm, "A_abserr"] = 0.1 - table.loc[arm, "sim_id"] * 0.01
+        assert stats.representative_inverse_case(
+            table, benchmark="forcing_itr_sin"
+        ) == 4
+
+    def test_ties_are_broken_by_sim_id(self):
+        table = make_inverse_sensor_sweep()
+        arm = (
+            (table["benchmark"] == "forcing_itr_sin")
+            & (table["n_sensors"] == 8)
+        )
+        table.loc[arm, "A_abserr"] = 0.05
+        assert stats.representative_inverse_case(
+            table, benchmark="forcing_itr_sin"
+        ) == 3
+
+    def test_the_reference_arm_is_the_one_that_decides(self):
+        table = make_inverse_sensor_sweep()
+        arm = (
+            (table["benchmark"] == "forcing_itr_sin")
+            & (table["n_sensors"] == 32)
+        )
+        table.loc[arm, "A_abserr"] = 0.1 - table.loc[arm, "sim_id"] * 0.01
+        assert stats.representative_inverse_case(
+            table, benchmark="forcing_itr_sin"
+        ) == 3
+        assert stats.representative_inverse_case(
+            table, benchmark="forcing_itr_sin", reference_sensors=32
+        ) == 4
+
+    def test_the_scalar_benchmark_ranks_by_its_own_error_column(self):
+        table = make_inverse_sensor_sweep()
+        assert stats.representative_inverse_case(table, benchmark="forcing") == 3
+
+    def test_a_missing_arm_or_unknown_benchmark_raises(self):
+        table = make_inverse_sensor_sweep()
+        with pytest.raises(ValueError, match="no 12-sensor arm"):
+            stats.representative_inverse_case(
+                table, benchmark="forcing_itr_sin", reference_sensors=12
+            )
+        with pytest.raises(ValueError, match="unsupported"):
+            stats.representative_inverse_case(table, benchmark="interfaces")
+
+    def test_a_non_finite_ranking_value_is_refused(self):
+        table = make_inverse_sensor_sweep()
+        row = (
+            (table["benchmark"] == "forcing_itr_sin")
+            & (table["n_sensors"] == 8)
+            & (table["sim_id"] == 2)
+        )
+        table.loc[row, "A_abserr"] = np.nan
+        with pytest.raises(ValueError, match="not finite"):
+            stats.representative_inverse_case(table, benchmark="forcing_itr_sin")
+
+
+class TestLaplaceJointRegion:
+    @staticmethod
+    def region(jacobian=None, **kwargs):
+        if jacobian is None:
+            # Near-orthogonal columns: a well-conditioned problem, so the region
+            # is small and the bounds never bite.
+            jacobian = np.array([[1.0, 0.05], [0.04, 1.2], [-0.02, 0.9]])
+        options = {
+            "param_names": ("R_base", "A"),
+            "bounds": [[0.05, 1.0], [0.0, 2.95]],
+            "peak_max": 3.0,
+        }
+        options.update(kwargs)
+        return stats.laplace_joint_region(jacobian, 4e-4, (0.5, 1.0), **options)
+
+    def test_the_region_is_labelled_as_an_approximation(self):
+        region = self.region()
+        assert region.approximate is True
+        assert region.param_names == ("R_base", "A")
+        assert region.cond_number > 1.0
+
+    def test_the_threshold_is_the_two_parameter_chi_square_level(self):
+        from scipy.stats import chi2
+
+        region = self.region()
+        assert region.threshold == pytest.approx(chi2.ppf(0.95, 2) / 2.0)
+        # Strictly above the 1-d threshold: a joint region built from the 1-d
+        # level would be too small and would overstate the constraint.
+        assert region.threshold > chi2.ppf(0.95, 1) / 2.0
+
+    def test_delta_ell_vanishes_at_the_estimate_and_grows_away_from_it(self):
+        region = self.region()
+        i = int(np.argmin(np.abs(region.axes[0] - 0.5)))
+        j = int(np.argmin(np.abs(region.axes[1] - 1.0)))
+        assert region.delta_ell[i, j] == pytest.approx(0.0, abs=5e-3)
+        assert np.nanmin(region.delta_ell) >= 0.0
+        assert region.delta_ell[0, 0] > region.threshold
+
+    def test_the_grid_encloses_the_threshold_contour(self):
+        region = self.region()
+        # The contour must close inside the grid, otherwise the panel would show
+        # an open region and imply an unbounded parameter.
+        edges = np.concatenate([
+            region.delta_ell[0, :], region.delta_ell[-1, :],
+            region.delta_ell[:, 0], region.delta_ell[:, -1],
+        ])
+        assert np.nanmin(edges) > region.threshold
+
+    def test_a_more_correlated_jacobian_widens_the_region(self):
+        tight = self.region()
+        compensating = self.region(
+            jacobian=np.array([[1.0, 0.95], [1.02, 0.97], [0.99, 0.94]])
+        )
+        assert compensating.cond_number > 10.0 * tight.cond_number
+        assert np.ptp(compensating.axes[0]) > np.ptp(tight.axes[0])
+
+    def test_the_dependent_ceiling_is_masked_not_extrapolated(self):
+        # Centre the region where the ceiling A <= 3 - R_base cuts the grid.
+        region = stats.laplace_joint_region(
+            np.array([[1.0, 0.05], [0.04, 1.2]]), 4e-4, (0.9, 2.9),
+            param_names=("R_base", "A"),
+            bounds=[[0.05, 1.0], [0.0, 2.95]], peak_max=3.0,
+        )
+        inadmissible = (
+            region.axes[1][None, :] > 3.0 - region.axes[0][:, None]
+        )
+        assert inadmissible.any()
+        assert np.all(np.isnan(region.delta_ell[inadmissible]))
+        assert not np.isnan(region.delta_ell[~inadmissible]).any()
+
+    def test_the_grid_is_clipped_to_the_parameter_bounds(self):
+        region = self.region(
+            jacobian=np.array([[1.0, 0.95], [1.02, 0.97], [0.99, 0.94]])
+        )
+        assert region.axes[0][0] >= 0.05 and region.axes[0][-1] <= 1.0
+        assert region.axes[1][0] >= 0.0 and region.axes[1][-1] <= 2.95
+
+    def test_degenerate_inputs_raise_rather_than_understate_uncertainty(self):
+        with pytest.raises(ValueError, match="rank deficient"):
+            self.region(jacobian=np.array([[1.0, 2.0], [2.0, 4.0]]))
+        with pytest.raises(ValueError, match="sigma_eff2 must be positive"):
+            stats.laplace_joint_region(
+                np.eye(2), 0.0, (0.5, 1.0), param_names=("R_base", "A")
+            )
+        with pytest.raises(ValueError, match="two parameters"):
+            stats.laplace_joint_region(
+                np.eye(3), 1.0, (0.5, 1.0, 0.2),
+                param_names=("R_base", "A", "extra"),
+            )
+        with pytest.raises(ValueError, match=r"expected \(m, 2\)"):
+            stats.laplace_joint_region(
+                np.eye(3), 1.0, (0.5, 1.0), param_names=("R_base", "A")
+            )
 
 
 class TestRolloutDeltaCurves:
