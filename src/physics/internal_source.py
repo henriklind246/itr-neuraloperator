@@ -147,8 +147,7 @@ def make_rc_sin_profile(
         R_c(y) = R_base + A * sin(pi * y).
     With A = 0 this returns a flat R_base profile. Returns float64 so it feeds
     the solver's series-resistance formula at full precision. The exact peak
-    R_base + A is attained at y = 0.5; the analytic severity over [0, 1] is
-    int_0^1 (R_c - R_base) dy = A * (2 / pi).
+    R_base + A is attained at y = 0.5.
     """
     y = np.asarray(y_grid, dtype=np.float64)
     return R_base + A * np.sin(np.pi * y)
@@ -176,23 +175,6 @@ def interface_control_volume_weights(
     if np.any(weights <= 0.0):
         raise ValueError("y_grid and bounds do not define positive control-volume widths.")
     return weights
-
-
-def integrated_excess_resistance(
-    y_grid: np.ndarray,
-    Rc_profile: np.ndarray,
-    R_base: float,
-    *,
-    bounds: tuple[float, float],
-) -> float:
-    """FV-quadrature estimate of the integrated excess resistance S_R."""
-    Rc = np.asarray(Rc_profile, dtype=np.float64)
-    weights = interface_control_volume_weights(y_grid, bounds)
-    if Rc.shape != weights.shape:
-        raise ValueError(
-            f"Rc_profile must have shape {weights.shape}, got {Rc.shape}."
-        )
-    return float(np.sum(weights * (Rc - float(R_base))))
 
 
 def equivalent_scalar_resistance(

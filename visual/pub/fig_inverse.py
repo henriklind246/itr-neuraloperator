@@ -28,20 +28,7 @@ _FORCING_PARAMS = (("R_c", r"$R_c$"),)
 _FORCING_ITR_PARAMS = (
     ("R_base", r"$R_{\mathrm{base}}$"),
     ("A", r"$A$"),
-    ("excess_int", r"$\int (R_c - R_{\mathrm{base}})\,\mathrm{d}y$"),
 )
-
-# Components of the least-determined direction of the local sensitivity, i.e.
-# the combination of parameters the boundary data constrains worst.
-_ITR_DIRECTION = (
-    ("least_dir_R_base", r"$R_{\mathrm{base}}$"),
-    ("least_dir_A", r"$A$"),
-)
-
-_DIRECTION_COLORS = {
-    r"$R_{\mathrm{base}}$": "#0072B2",
-    r"$A$": "#D55E00",
-}
 
 _NOMINAL_COVERAGE = 0.95
 
@@ -87,15 +74,8 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
     ``forcing`` recovers a scalar :math:`R_c`, so the figure is one scatter, the
     error distribution, and interval coverage.
 
-    ``forcing_itr_sin`` recovers a sinusoidal profile, two parameters plus the
-    integrated excess resistance. Its last panel is the identifiability
-    statement: the squared components of the least-determined direction of the
-    local sensitivity, one bar per case, ordered by condition number. When a bar
-    is a single colour the boundary data does not separate that parameter at
-    all.
-
-    The second inverse benchmark is ``forcing_itr_sin``, not ``source_itr_sin``; the
-    existing ``source_itr_sin`` inverse figures are retired.
+    ``forcing_itr_sin`` shows the two resistance parameters separately, with
+    one recovery scatter and one absolute-error distribution per parameter.
     """
     key = _RECOVERY_KEYS.get(benchmark, f"recovery[{benchmark}]")
     params = _FORCING_ITR_PARAMS if benchmark == "forcing_itr_sin" else _FORCING_PARAMS
@@ -109,7 +89,7 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
     n_cases = records.count_simulations(df)
     width = spec.width if spec is not None else "two_col"
 
-    n_panels = len(params) + (2 if benchmark != "forcing_itr_sin" else 1)
+    n_panels = len(params) + 2
     ncols = min(3, n_panels)
     nrows = int(np.ceil(n_panels / ncols))
     fig, axes = plt.subplots(nrows, ncols,
@@ -129,20 +109,12 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
     used = len(params)
 
     if benchmark == "forcing_itr_sin":
-        order = np.argsort(np.asarray(df["cond_number"], dtype=float))
-        weights = {}
-        for column, label in _ITR_DIRECTION:
-            if column not in df.columns:
-                continue
-            v = np.asarray(df[column], dtype=float)[order]
-            weights[label] = v * v
-        panels.component_bars(
-            flat[used], weights, colors=_DIRECTION_COLORS,
-            xticklabels=[f"{c:.0f}" for c in
-                         np.asarray(df["cond_number"], dtype=float)[order]],
-            xlabel="condition number", ylabel="squared component",
-            title="least-determined direction")
-        used += 1
+        for stem, label in params:
+            error = np.abs(np.asarray(df[f"{stem}_true"], dtype=float)
+                           - np.asarray(df[f"{stem}{suffix}"], dtype=float))
+            panels.ecdf_curves(flat[used], {label: error}, xlabel=f"|error| in {label}",
+                               ylabel="fraction of cases", title="parameter recovery error")
+            used += 1
     else:
         stem = params[0][0]
         err = np.abs(np.asarray(df[f"{stem}_true"], dtype=float)
@@ -192,13 +164,10 @@ def recovery(*, benchmark: str, source=None, spec=None, requirement=None):
 def sensor_count(*, source=None, spec=None, requirement=None):
     """F18 -- inversion accuracy against sensor count.
 
-    Each row is one inverse benchmark; the columns show absolute lead-estimand
-    recovery error, the FV residual at the recovered parameter, and the 95%
-    profile-likelihood interval width. Thin grey segments connect the same
-    ``(sim_id, noise_seed, init_seed)`` case across counts. The coloured marker
-    and whisker are the median and IQR across the eight cases, not an
-    inferential confidence interval. Crosses identify intervals stopped by a
-    physical bound, whose displayed widths are lower bounds.
+    Each row is one benchmark/parameter pair. Columns show absolute error,
+    relative error, FV sensor residual, and the 95% parameter profile width.
+    Cases remain paired across sensor counts. Width medians and IQRs exclude
+    intervals without both crossings and disconnected confidence sets.
     """
     if not records.artifact_paths(source, "inverse_csv"):
         blocked(
@@ -210,41 +179,45 @@ def sensor_count(*, source=None, spec=None, requirement=None):
         )
     table = records.load_inverse_sensor_sweep(source)
     summaries = stats.inverse_sensor_sweep_summaries(table)
-    benchmark_order = ("forcing", "forcing_itr_sin")
+    parameter_order = (("forcing", "R_c"), ("forcing_itr_sin", "R_base"), ("forcing_itr_sin", "A"))
     width = spec.width if spec is not None else "two_col"
     fig, axes = plt.subplots(
-        len(benchmark_order), 3,
-        figsize=style.figsize(width, rows=len(benchmark_order), row_height="grid_row",
+        len(parameter_order), 4,
+        figsize=style.figsize(width, rows=len(parameter_order), row_height="grid_row",
                              extra_in=0.35),
     )
     axes = np.atleast_2d(axes)
 
-    for row, benchmark in enumerate(benchmark_order):
-        summary = summaries[benchmark]
+    for row, (benchmark, parameter) in enumerate(parameter_order):
+        summary = summaries[(benchmark, parameter)]
         color = style.benchmark_color(benchmark)
-        estimand_label = r"$R_c$" if benchmark == "forcing" else r"$S_R$"
-        unit_label = "m$^2$ K/W" if benchmark == "forcing" else "m$^3$ K/W"
+        estimand_label = {"R_c": r"$R_c$", "R_base": r"$R_{\mathrm{base}}$", "A": r"$A$"}[parameter]
+        unit_label = "m$^2$ K/W"
         panels.paired_sensor_sweep_panel(
             axes[row, 0], summary.recovery_error, color=color,
             ylabel=f"Absolute error\n[{unit_label}]",
-            title=f"{benchmark}: {estimand_label} recovery", legend=(row == 0),
+            title=f"{'forcing' if benchmark == 'forcing' else 'forcing ITR'}: {estimand_label}", legend=(row == 0),
         )
         panels.paired_sensor_sweep_panel(
-            axes[row, 1], summary.fv_residual, color=color,
+            axes[row, 1], summary.relative_error, color=color,
+            ylabel="Relative error [%]", title="parameter recovery", legend=(row == 0),
+        )
+        panels.paired_sensor_sweep_panel(
+            axes[row, 2], summary.fv_residual, color=color,
             ylabel="FV sensor residual [K]", title="physical data fit",
             reference=summary.noise_floor, legend=(row == 0),
         )
         panels.paired_sensor_sweep_panel(
-            axes[row, 2], summary.profile_width, color=color,
+            axes[row, 3], summary.profile_width, color=color,
             ylabel=f"95% profile width\n[{unit_label}]",
             title="profile precision", legend=(row == 0),
         )
 
     fig.suptitle(
-        "n=8 paired cases per benchmark; same cases, noise, and initialization",
+        "Eight paired cases per benchmark; same noise and initialization",
         fontsize=8, y=0.985,
     )
-    style.panel_letters(axes.ravel())
+    style.panel_letters(axes.ravel(), loc=(0.0, 1.20))
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
 
     paths = records.artifact_paths(source, "inverse_csv")
@@ -262,37 +235,36 @@ def sensor_count(*, source=None, spec=None, requirement=None):
             "seeds are used at every sensor count within each benchmark"
         ),
         "n_cases": {
-            benchmark: summaries[benchmark].recovery_error.n_cases
-            for benchmark in benchmark_order
+            benchmark: summaries[(benchmark, parameter)].recovery_error.n_cases
+            for benchmark, parameter in parameter_order
         },
         "recovery_estimands": {
             "forcing": "absolute error in scalar R_c",
-            "forcing_itr_sin": "absolute error in integrated excess resistance S_R",
+            "forcing_itr_sin": "separate absolute and relative errors in R_base and A",
         },
         "fv_residual": (
             "physical RMS sensor residual in Kelvin from the real finite-volume "
             "solver evaluated at the recovered parameter"
         ),
         "profile_interval": (
-            "width of the 95% Wilks profile-likelihood interval on the lead "
-            "estimand; bound-limited widths are marked and are lower bounds"
+            "width of each 95% parameter profile interval; bound-limited and disconnected intervals are marked and excluded from width summaries"
         ),
         "bound_limited_cases_by_sensor_count": {
-            benchmark: {
+            f"{benchmark}:{parameter}": {
                 str(count): int(value)
                 for count, value in zip(
-                    summaries[benchmark].profile_width.sensor_counts,
-                    summaries[benchmark].bound_limited_cases,
+                    summaries[(benchmark, parameter)].profile_width.sensor_counts,
+                    summaries[(benchmark, parameter)].bound_limited_cases,
                 )
             }
-            for benchmark in benchmark_order
+            for benchmark, parameter in parameter_order
         },
         "summary": (
             "paired case trajectories plus median and IQR across cases at each "
             "discrete count; connecting segments are not fitted curves"
         ),
         "inferential_interval": (
-            "none: n=8 is below the 20-case floor for a confidence interval"
+            "none for the across-case median: the per-case parameter intervals use profile likelihood"
         ),
         "degradations": ["TOO_FEW_SIMS_NO_CI"],
     }

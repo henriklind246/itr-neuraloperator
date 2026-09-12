@@ -541,13 +541,13 @@ def paired_sensor_sweep_panel(
         ax.plot(
             x[columns], curve.case_values[rows, columns], linestyle="none",
             marker="x", color="black", markersize=3.2, markeredgewidth=0.8,
-            label="bound-limited", zorder=5,
+            label="CI excluded", zorder=5,
         )
 
     ax.set_xticks(x, [str(int(value)) for value in curve.sensor_counts])
     ax.set_xlim(-0.35, len(x) - 0.65)
     ax.set_ylim(bottom=0.0)
-    ax.set_xlabel("Interface sensors (discrete)")
+    ax.set_xlabel("Sensors")
     ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title, fontsize=7)

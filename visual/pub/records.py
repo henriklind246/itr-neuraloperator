@@ -455,17 +455,15 @@ INVERSE_SENSOR_BENCHMARKS = ("forcing", "forcing_itr_sin")
 _INVERSE_SENSOR_BASE_COLUMNS = (
     "benchmark", "sim_id", "n_sensors", "noise_seed", "init_seed",
     "noise_std_K", "fv_resid_rms_K", "fv_resid_over_noise",
-    "profile_bound_limited",
 )
 _INVERSE_SENSOR_COLUMNS = {
-    "forcing": (
-        "R_c_true", "R_c_map", "R_c_abs_error",
-        "profile_R_c_ci_low", "profile_R_c_ci_high",
-    ),
-    "forcing_itr_sin": (
-        "excess_int_true", "excess_int_hat", "excess_int_abserr",
-        "profile_excess_ci_low", "profile_excess_ci_high",
-    ),
+    benchmark: tuple(column for name in names for column in (
+        f"{name}_true", f"{name}_map" if name == "R_c" else f"{name}_hat",
+        f"{name}_abs_error" if name == "R_c" else f"{name}_abserr",
+        f"{name}_rel_error_pct", f"profile_{name}_ci_low", f"profile_{name}_ci_high",
+        f"profile_{name}_bound_limited", f"profile_{name}_disconnected",
+    ))
+    for benchmark, names in {"forcing": ("R_c",), "forcing_itr_sin": ("R_base", "A")}.items()
 }
 
 
@@ -517,15 +515,6 @@ def load_inverse_sensor_sweep(
     if table[list(numeric_base)].isna().any().any():
         raise SchemaError("inverse sensor sweep has non-numeric pairing or FV fields")
 
-    bool_values = table["profile_bound_limited"].map(
-        {True: True, False: False, 1: True, 0: False,
-         "True": True, "False": False, "true": True, "false": False,
-         "1": True, "0": False, "1.0": True, "0.0": False}
-    )
-    if bool_values.isna().any():
-        raise SchemaError("inverse sensor sweep has invalid profile_bound_limited values")
-    table["profile_bound_limited"] = bool_values.astype(bool)
-
     expected_counts = tuple(sensor_counts)
     pairing_columns = ["sim_id", "noise_seed", "init_seed"]
     for benchmark in benchmarks:
@@ -537,13 +526,15 @@ def load_inverse_sensor_sweep(
                 f"inverse sensor sweep for {benchmark} is missing columns {missing}"
             )
         for column in conditional:
-            table.loc[part.index, column] = pd.to_numeric(
-                part[column], errors="coerce"
-            )
-        if table.loc[part.index, list(conditional)].isna().any().any():
-            raise SchemaError(
-                f"inverse sensor sweep for {benchmark} has non-numeric metric fields"
-            )
+            if column.endswith(("_bound_limited", "_disconnected")):
+                values = part[column].map({True: True, False: False, 1: True, 0: False,
+                    "True": True, "False": False, "true": True, "false": False,
+                    "1": True, "0": False, "1.0": True, "0.0": False})
+            else:
+                values = pd.to_numeric(part[column], errors="coerce")
+            if values.isna().any() and not column.endswith("_rel_error_pct"):
+                raise SchemaError(f"inverse sensor sweep for {benchmark} has invalid {column}")
+            table.loc[part.index, column] = values
 
         counts = tuple(sorted(part["n_sensors"].astype(int).unique()))
         if counts != expected_counts:

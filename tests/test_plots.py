@@ -509,10 +509,10 @@ class TestSourcePlots:
 
         severity = dataset_plots._itr_amplitude_arrays(params, y_grid)
 
-        assert severity["R_c_excess_integral"][0] == pytest.approx(0.0)
+        assert severity["R_c_A"][0] == pytest.approx(0.0)
         assert severity["conductance_deficit"][0] == pytest.approx(0.0)
         assert severity["is_itr_active"][0] == np.bool_(False)
-        assert severity["R_c_excess_integral"][2] > severity["R_c_excess_integral"][1]
+        assert severity["R_c_A"][2] == pytest.approx(severity["R_c_A"][1])
 
     def test_source_itr_sin_resistance_profiles_smoke(
         self,

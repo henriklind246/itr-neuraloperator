@@ -22,7 +22,6 @@ from src.physics.internal_source import (
     PATCH_H,
     PATCH_W,
     interface_control_volume_weights,
-    integrated_excess_resistance,
     make_rc_sin_profile,
     make_patch_indicator,
     make_sin2_pulse,
@@ -1001,10 +1000,9 @@ def _itr_amplitude_arrays(
     y_grid: np.ndarray,
     x_grid: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Return sampled resistance profile parameters plus integrated severity metrics."""
+    """Return resistance parameters and a conductance-deficit diagnostic."""
     arrs = _itr_param_arrays(sim_params)
     y = np.asarray(y_grid, dtype=np.float64)
-    excess_integral = np.zeros(len(sim_params), dtype=np.float64)
     conductance_deficit = np.zeros(len(sim_params), dtype=np.float64)
 
     for i, p in enumerate(sim_params):
@@ -1022,12 +1020,8 @@ def _itr_amplitude_arrays(
         )
         bounds = (0.0, 1.0)
         weights = interface_control_volume_weights(y, bounds)
-        excess_integral[i] = integrated_excess_resistance(
-            y, Rc_y, float(p["R_c_base"]), bounds=bounds
-        )
         conductance_deficit[i] = float(np.sum(weights * (G_base - G_y)))
 
-    arrs["R_c_excess_integral"] = excess_integral
     arrs["conductance_deficit"] = conductance_deficit
     arrs["is_itr_active"] = arrs["R_c_A"] > 1e-12
     return arrs
@@ -1038,8 +1032,8 @@ def _representative_itr_sim_ids(
     y_grid: np.ndarray,
     x_grid: np.ndarray | None = None,
 ) -> list[int]:
-    """Pick deterministic low/median/high severity source-ITR samples."""
-    severity = _itr_amplitude_arrays(sim_params, y_grid, x_grid)["R_c_excess_integral"]
+    """Pick deterministic low/median/high amplitude source-ITR samples."""
+    severity = _itr_amplitude_arrays(sim_params, y_grid, x_grid)["R_c_A"]
     if len(severity) == 0:
         return []
     order = np.argsort(severity)
@@ -1163,7 +1157,7 @@ def plot_source_itr_sin_resistance_profiles(
         for color, (sid, p, Rc_y, _Rc_norm, _G_y) in zip(colors, profile_rows):
             label = (
                 f"sim {sid}: peak={float(p['R_c_base']) + float(p['R_c_A']):.2f}, "
-                f"area={severity['R_c_excess_integral'][sid]:.3f}"
+                f"amplitude={severity['R_c_A'][sid]:.3f}"
             )
             ax.plot(y, Rc_y, color=color, label=label)
         ax.set_xlabel("y")
@@ -1192,8 +1186,8 @@ def plot_source_itr_sin_resistance_profiles(
 
         ax = axes[1, 1]
         scatter = ax.scatter(severity["R_c_base"], severity["R_c_A"],
-                             c=severity["R_c_excess_integral"], cmap="magma")
-        fig.colorbar(scatter, ax=ax, label=r"$\int (R_c(y)-R_{base})\,dy$")
+                             c=severity["R_c_A"], cmap="magma")
+        fig.colorbar(scatter, ax=ax, label=r"Amplitude $A$")
         ax.set_xlabel(r"Base resistance $R_b$")
         ax.set_ylabel(r"Amplitude $A$")
         ax.set_title("Sinusoidal profile coverage")

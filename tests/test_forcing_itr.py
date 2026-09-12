@@ -1,5 +1,4 @@
 import copy
-import math
 
 import numpy as np
 import pytest
@@ -15,7 +14,6 @@ from src.physics.internal_source import (
     RC_SIN_RANGES,
     R_PEAK_MAX,
     equivalent_scalar_resistance,
-    integrated_excess_resistance,
     interface_control_volume_weights,
     make_rc_sin_profile,
 )
@@ -150,21 +148,13 @@ def test_forcing_itr_sin_solver_uses_sin_profile():
     np.testing.assert_allclose(prof, expected, rtol=1e-12, atol=1e-12)
 
 
-def test_fv_weights_severity_continuous_limit_and_general_domain_req():
+def test_fv_weights_and_general_domain_equivalent_resistance():
     y = np.linspace(0.0, 1.0, 101)
     weights = interface_control_volume_weights(y, (0.0, 1.0))
     h = y[1] - y[0]
     np.testing.assert_allclose(
         weights, np.r_[h / 2.0, np.full(y.size - 2, h), h / 2.0]
     )
-    R_base, R_amp, y0, sigma = 0.3, 1.2, 0.2, 0.1
-    profile = make_rc_sin_profile(y, R_base, R_amp)
-    discrete = integrated_excess_resistance(
-        y, profile, R_base, bounds=(0.0, 1.0)
-    )
-    analytic = 2 * R_amp / math.pi
-    assert discrete == pytest.approx(analytic, rel=2e-3)
-
     centers = np.array([-0.5, 0.5, 1.5])
     center_weights = interface_control_volume_weights(centers, (-1.0, 2.0))
     np.testing.assert_allclose(center_weights, 1.0)
@@ -173,7 +163,7 @@ def test_fv_weights_severity_continuous_limit_and_general_domain_req():
     ) == pytest.approx(2.0)
 
 
-def test_rc_sin_profile_invariants_peak_and_severity():
+def test_rc_sin_profile_invariants_and_peak():
     base_lo, base_hi = RC_SIN_RANGES["R_base"]
     rng = np.random.default_rng(0)
     y = np.linspace(0.0, 1.0, 100)  # deliberately excludes y = 0.5
@@ -193,13 +183,6 @@ def test_rc_sin_profile_invariants_peak_and_severity():
         peak = make_rc_sin_profile(np.array([0.5]), R_base, A)[0]
         np.testing.assert_allclose(peak, R_base + A)
 
-        # Numeric FV severity vs analytic int_0^1 (R_c - R_base) dy = A * 2 / pi.
-        y_fine = np.linspace(0.0, 1.0, 401)
-        prof_fine = make_rc_sin_profile(y_fine, R_base, A)
-        computed = integrated_excess_resistance(
-            y_fine, prof_fine, R_base, bounds=(0.0, 1.0)
-        )
-        np.testing.assert_allclose(computed, A * 2.0 / np.pi, rtol=2e-3, atol=1e-6)
 
 
 def test_interface_weights_match_solver_dy():
@@ -360,7 +343,7 @@ def test_validation_calibration_artifact_construction():
     assert int(calibration["simulation_count"]) == 2
     assert int(calibration["sample_count"]) == 2 * 3 * 16
     assert np.asarray(calibration["theta_true"]).shape == (2, 2)
-    assert np.asarray(calibration["S_R"]).shape == (2,)
+    assert "S_R" not in calibration
     assert np.asarray(calibration["interface_jump_rms_K"]).shape == (2,)
     assert float(calibration["sigma_fno_K"]) == pytest.approx(
         2.0 * float(calibration["sigma_fno_norm"])

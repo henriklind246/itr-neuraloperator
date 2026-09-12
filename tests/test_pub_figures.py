@@ -189,12 +189,25 @@ def write_inverse_sensor_sweep(path: Path, benchmark: str) -> Path:
                 })
             else:
                 row.update({
-                    "excess_int_true": truth,
-                    "excess_int_hat": truth - error,
-                    "excess_int_abserr": error,
-                    "profile_excess_ci_low": truth - width / 2.0,
-                    "profile_excess_ci_high": truth + width / 2.0,
+                    "R_base_true": truth,
+                    "R_base_hat": truth - error,
+                    "R_base_abserr": error,
+                    "profile_R_base_ci_low": truth - width / 2.0,
+                    "profile_R_base_ci_high": truth + width / 2.0,
                 })
+            if benchmark != "forcing":
+                row.update({
+                    "A_true": row["R_base_true"], "A_hat": row["R_base_hat"],
+                    "A_abserr": row["R_base_abserr"],
+                    "profile_A_ci_low": row["profile_R_base_ci_low"],
+                    "profile_A_ci_high": row["profile_R_base_ci_high"],
+                })
+            limited = row.pop("profile_bound_limited")
+            for name in (("R_c",) if benchmark == "forcing" else ("R_base", "A")):
+                error_col = f"{name}_abs_error" if name == "R_c" else f"{name}_abserr"
+                row[f"{name}_rel_error_pct"] = 100 * row[error_col] / abs(row[f"{name}_true"])
+                row[f"profile_{name}_bound_limited"] = limited
+                row[f"profile_{name}_disconnected"] = False
             rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
@@ -226,7 +239,7 @@ def write_inverse_result(path: Path, benchmark: str) -> Path:
                 "least_dir_A": 0.8,
             }
             for offset, stem in enumerate(
-                ("R_base", "A", "excess_int")
+                ("R_base", "A")
             ):
                 truth = 0.1 * (offset + 1) + 0.01 * sim_id
                 row[f"{stem}_true"] = truth

@@ -160,18 +160,6 @@ def test_theta_from_unconstrained_respects_box_and_ceiling():
     assert torch.all(R_base + R_amp <= R_PEAK_MAX + 1e-6)
 
 
-def test_integrated_excess_resistance_matches_numpy():
-    theta = torch.tensor([0.3, 1.0], dtype=torch.float64)
-    y_grid = torch.linspace(0.0, 1.0, 200, dtype=torch.float64)
-    got = inv.integrated_excess_resistance(theta, y_grid)
-
-    y = y_grid.numpy()
-    excess = np.sin(np.pi*y)
-    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-    ref = float(trapz(excess, y))
-    assert abs(got - ref) < 1e-9
-
-
 # ---------------------------------------------------------------------------
 # Operator wiring + gradient flow, using a tiny untrained source_itr_sin FNO.
 # ---------------------------------------------------------------------------
@@ -438,8 +426,6 @@ def test_observation_jacobian_shape_finite_nonzero():
     )
     Js = inv.observation_jacobian(model, obs, theta)
     assert Js.shape == (obs.spatial.shape[0] * int(obs.mask.sum()) * 1, 2)
-
-
 
 
 def test_svd_identifiability_flags_weak_parameter():
@@ -799,7 +785,7 @@ def test_fv_polish_holds_or_improves_from_perturbed_start(tiny_fv_dataset):
     for name in ("R_base", "A"):
         assert f"{name}_fvpolish" in flat and np.isfinite(flat[f"{name}_fvpolish"])
         assert f"{name}_fvpolish_abserr" in flat
-    assert np.isfinite(flat["excess_int_fvpolish"])
+    assert np.isfinite(flat["A_fvpolish"])
     assert flat["fv_polish_evals"] >= 1
 
 
@@ -982,87 +968,10 @@ def test_profile_likelihood_summary_columns_present():
         adam_steps=8, lbfgs_steps=3,
     )
     assert res.param_name == "A"
-    assert res.excess_ci_low <= res.excess_ci_high
-    assert np.isfinite(res.excess_ci_high - res.excess_ci_low)
+    assert np.isfinite(res.ci_high - res.ci_low)
     assert res.ci_low <= res.ci_high
     # Profiled NLL never beats the unconstrained min by construction.
     assert res.nll.min() >= res.nll_min - 1e-6
-
-
-@pytest.mark.parametrize("adapter_cls", [SourceItrSinAdapter])
-def test_theta_profile_severity_realizes_pinned_severity(adapter_cls):
-    adapter = adapter_cls()
-    y_grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
-    assert adapter.max_feasible_severity(y_grid) > 0.0
-    torch.manual_seed(0)
-    u = torch.randn(adapter.theta_dim, dtype=torch.float64)
-    # For a *fixed* shape u the realizable severity is capped by that shape's
-    # amplitude ceiling; read it back by pinning far above the cap (the solve
-    # clamps to the shape's max). Feasible pins are then realized exactly.
-    s_cap = float(adapter.uq_quantity(
-        adapter.theta_profile_severity(u, 1e9, y_grid), y_grid
-    ))
-    assert s_cap > 0.0
-    for frac in (0.1, 0.5, 0.9):
-        s_pin = frac * s_cap
-        theta = adapter.theta_profile_severity(u, s_pin, y_grid)
-        got = float(adapter.uq_quantity(theta, y_grid))
-        assert got == pytest.approx(s_pin, rel=1e-4, abs=1e-6)
-        # Peak resistance stays physical: R_base + amp <= R_PEAK_MAX.
-        assert float(theta[0]) + float(theta[1]) <= R_PEAK_MAX + 1e-4
-
-
-def test_theta_profile_severity_caps_at_amp_ceiling():
-    # Pinning above the feasible ceiling clamps the amplitude (severity is then
-    # the max attainable rather than the requested value) and keeps R_base+amp
-    # inside the physical box.
-    adapter = SourceItrSinAdapter()
-    y_grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
-    s_max = adapter.max_feasible_severity(y_grid)
-    u = torch.tensor([20.0, 0.0], dtype=torch.float64)
-    theta = adapter.theta_profile_severity(u, 10.0 * s_max, y_grid)
-    R_base, R_amp = float(theta[0]), float(theta[1])
-    assert R_amp <= (R_PEAK_MAX - RC_SIN_RANGES["R_base"][0]) + 1e-6
-    assert R_base + R_amp <= R_PEAK_MAX + 1e-6
-
-
-def test_theta_profile_severity_is_differentiable():
-    adapter = SourceItrSinAdapter()
-    y_grid = torch.linspace(0.0, 1.0, 32, dtype=torch.float64)
-    s_max = adapter.max_feasible_severity(y_grid)
-    u = torch.zeros(2, dtype=torch.float64, requires_grad=True)
-    theta = adapter.theta_profile_severity(u, 0.4 * s_max, y_grid)
-    theta.sum().backward()
-    assert u.grad is not None and torch.isfinite(u.grad).all()
-
-
-def test_severity_profile_likelihood_is_valid_profile_interval():
-    model = _tiny_source_itr_sin_model().eval()
-    obs = _fake_observation_set()
-    obs.targets = obs.targets + 0.5  # nonzero residuals against the untrained net
-    theta_hat = obs.theta_true.to(torch.float32)
-    res = inv.severity_profile_likelihood(
-        model, obs, theta_hat, sigma_eff2=0.05,
-        n_grid=5, span=0.5, level=0.95, adam_steps=8, lbfgs_steps=3,
-        adapter=inv._SOURCE_ITR_SIN_ADAPTER,
-    )
-    assert res.param_name == "S_R"
-    # Direct severity profile: the reported CI *is* the severity CI.
-    assert res.excess_ci_low == pytest.approx(res.ci_low)
-    assert res.excess_ci_high == pytest.approx(res.ci_high)
-    assert res.ci_low <= res.ci_high
-    # Grid stays inside the feasible severity range.
-    s_max = inv._SOURCE_ITR_SIN_ADAPTER.max_feasible_severity(obs.y_grid)
-    assert res.grid.min() > 0.0 and res.grid.max() <= s_max + 1e-6
-    # Profiled NLL never beats the unconstrained min by construction.
-    assert res.nll.min() >= res.nll_min - 1e-6
-    summ = inv.profile_interval_summary(res, inv._SOURCE_ITR_SIN_ADAPTER)
-    assert summ["profile_param"] == "S_R"
-    assert summ["profile_excess_ci_low"] <= summ["profile_excess_ci_high"]
-    assert summ["profile_excess_ci_width"] == pytest.approx(
-        summ["profile_excess_ci_high"] - summ["profile_excess_ci_low"]
-    )
-    assert isinstance(summ["profile_bound_limited"], bool)
 
 
 def test_profile_refit_keeps_best_of_several_starts():
@@ -1100,17 +1009,17 @@ def test_profile_sweep_reports_nonnegative_gap_and_is_deterministic():
         adam_steps=6, lbfgs_steps=2, n_starts=3, seed=1,
         adapter=inv._SOURCE_ITR_SIN_ADAPTER,
     )
-    a = inv.severity_profile_likelihood(model, obs, theta_hat, **kwargs)
-    b = inv.severity_profile_likelihood(model, obs, theta_hat, **kwargs)
+    a = inv.profile_likelihood(model, obs, theta_hat, **kwargs)
+    b = inv.profile_likelihood(model, obs, theta_hat, **kwargs)
     # sweep_gap is how much the reverse sweep clawed back: never negative.
     assert a.sweep_gap >= 0.0 and np.isfinite(a.sweep_gap)
     assert a.n_starts == 3
     np.testing.assert_allclose(a.nll, b.nll)
     np.testing.assert_allclose(a.grid, b.grid)
     assert a.ci_low == pytest.approx(b.ci_low)
-    summ = inv.profile_interval_summary(a, inv._SOURCE_ITR_SIN_ADAPTER)
-    assert summ["profile_n_starts"] == 3
-    assert summ["profile_sweep_gap"] >= 0.0
+    summ = inv.profile_interval_summary(a)
+    assert summ["profile_A_n_starts"] == 3
+    assert summ["profile_A_sweep_gap"] >= 0.0
 
 
 def test_profile_multistart_never_worse_than_single_start():
@@ -1121,14 +1030,13 @@ def test_profile_multistart_never_worse_than_single_start():
     obs = _fake_observation_set()
     obs.targets = obs.targets + 0.5
     theta_hat = obs.theta_true.to(torch.float32)
-    common = dict(
-        sigma_eff2=0.05, param_index=1, n_grid=4, span=0.3, level=0.95,
-        adam_steps=6, lbfgs_steps=2, seed=0,
-    )
-    one = inv.profile_likelihood(model, obs, theta_hat, n_starts=1, **common)
-    many = inv.profile_likelihood(model, obs, theta_hat, n_starts=4, **common)
-    np.testing.assert_allclose(one.grid, many.grid)
-    assert np.all(many.nll <= one.nll + 1e-6)
+    grid = np.linspace(0.4, 1.0, 4)
+    u_hat = inv._SOURCE_ITR_SIN_ADAPTER.unconstrained_from_theta(theta_hat)
+    common = dict(adapter=inv._SOURCE_ITR_SIN_ADAPTER, pin_index=1,
+                  adam_steps=6, lbfgs_steps=2, seed=0)
+    one, _, _ = inv._profile_sweep(model, obs, 0.05, grid, u_hat, n_starts=1, **common)
+    many, _, _ = inv._profile_sweep(model, obs, 0.05, grid, u_hat, n_starts=4, **common)
+    assert np.all(many <= one + 1e-5)
 
 
 def test_profile_refit_scalar_adapter_ignores_extra_starts():
@@ -1468,7 +1376,7 @@ def test_artifact_dir_writes_expected_npz_keys_source_itr_sin(tmp_path):
     path = inv._write_sim_artifact(
         str(tmp_path), 7, adapter,
         obs=obs, result=result, report=report, J=J,
-        fv_res=None, prof=None, sigma_eff2=0.1, c_fno=0.01,
+        fv_res=None, profiles=None, sigma_eff2=0.1, c_fno=0.01,
         noise_std=0.01, ci_level=0.95,
         dataset_path="data/sourceitr_smoke", dataset_fingerprint="abc123",
         split_seed=0, split_name="test",
@@ -1493,10 +1401,9 @@ def test_artifact_dir_writes_expected_npz_keys_source_itr_sin(tmp_path):
     assert d["param_scales"].shape == (2,)
     assert str(d["dataset_path"]) == "data/sourceitr_smoke"
     assert str(d["split_name"]) == "test"
-    # Sensitivity block: source_itr_sin persists the (4,4) right vectors + alignment.
     assert d["right_vectors"].shape == (2, 2)
     assert d["singular_values"].shape == (2,)
-    assert d["observation_jacobian"].shape[1] == 4
+    assert d["observation_jacobian"].shape[1] == 2
     # Inflation scalars mirror the UQ columns.
     assert float(d["sigma_eff2"]) == pytest.approx(0.1)
     assert float(d["c_fno"]) == pytest.approx(0.01)
@@ -1519,7 +1426,7 @@ def test_artifact_dir_writes_expected_npz_keys_forcing(tmp_path):
     path = inv._write_sim_artifact(
         str(tmp_path), 3, adapter,
         obs=obs, result=result, report=report, J=J,
-        fv_res=None, prof=None, sigma_eff2=None, c_fno=None,
+        fv_res=None, profiles=None, sigma_eff2=None, c_fno=None,
         noise_std=0.0, ci_level=0.95,
         dataset_path="data/forcing_inv", dataset_fingerprint="def456",
         split_seed=0, split_name="test",
@@ -1656,16 +1563,6 @@ def test_sin_adapter_theta_from_sim_params_and_injection():
     assert params["R_c_base"] == pytest.approx(0.4)  # source dict untouched
 
 
-def test_sin_adapter_uq_quantity_matches_analytic_severity():
-    adapter = SourceItrSinAdapter()
-    A = 1.3
-    theta = torch.tensor([0.4, A], dtype=torch.float64)
-    y_grid = torch.linspace(0.0, 1.0, 400, dtype=torch.float64)
-    got = adapter.uq_quantity(theta, y_grid)
-    # Analytic integrated excess int_0^1 (R_c - R_base) dy = A * (2/pi).
-    assert got == pytest.approx(A * 2.0 / np.pi, rel=1e-3)
-
-
 def test_sin_adapter_dispatch_from_config():
     assert isinstance(
         InverseAdapter.from_config({"benchmark": {"name": "source_itr_sin"}}),
@@ -1696,3 +1593,178 @@ def test_forcing_sin_adapter_equivalent_scalar_on_sin_profile():
     assert r_eq == pytest.approx(ref, rel=1e-9)
     # The single-hump profile raises the effective resistance above R_base.
     assert r_eq > R_base
+
+
+@pytest.mark.parametrize("param_index", [0, 1])
+def test_parameter_profile_matches_correlated_gaussian(monkeypatch, param_index):
+    from types import SimpleNamespace
+    from scipy.stats import chi2
+
+    mean = torch.tensor([0.4, 0.8], dtype=torch.float64)
+    scales = torch.tensor([0.06, 0.16], dtype=torch.float64)
+    rho = 0.8
+
+    def nll(model, obs, theta, sigma_eff2, adapter):
+        z = (theta - mean) / scales
+        return (z[0] ** 2 - 2 * rho * z[0] * z[1] + z[1] ** 2) / (2 * (1 - rho**2))
+
+    monkeypatch.setattr(inv, "neg_log_likelihood", nll)
+    obs = SimpleNamespace(spatial=torch.empty(0))
+    res = inv.profile_likelihood(
+        None, obs, mean, 1.0, param_index=param_index, n_grid=5,
+        span=0.05, adam_steps=30, lbfgs_steps=25, n_starts=2,
+    )
+    half = np.sqrt(chi2.ppf(0.95, 1)) * float(scales[param_index])
+    assert res.ci_low == pytest.approx(float(mean[param_index]) - half, abs=4e-4)
+    assert res.ci_high == pytest.approx(float(mean[param_index]) + half, abs=4e-4)
+    assert res.lower_closed and res.upper_closed
+    assert res.nll_min == pytest.approx(0.0, abs=1e-8)
+    assert not res.disconnected
+    flat = inv.profile_interval_summary(res)
+    assert flat[f"profile_{res.param_name}_ci_width"] == pytest.approx(2 * half, abs=8e-4)
+
+
+def test_parameter_profile_marks_physical_bounds(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(inv, "neg_log_likelihood", lambda model, obs, theta, sigma, adapter: (theta ** 2).sum() * 0)
+    res = inv.profile_likelihood(
+        None, SimpleNamespace(spatial=torch.empty(0)), torch.tensor([0.4, 0.8]),
+        1.0, param_index=0, n_grid=3, span=0.01, adam_steps=1, lbfgs_steps=1,
+    )
+    assert (res.ci_low, res.ci_high) == (0.05, 1.0)
+    assert not res.lower_closed and not res.upper_closed
+    assert inv.profile_interval_summary(res)["profile_R_base_bound_limited"]
+
+
+def test_parameter_errors_are_separate_and_zero_amplitude_is_undefined():
+    from types import SimpleNamespace
+    adapter = SourceItrSinAdapter()
+    result = SimpleNamespace(
+        theta_hat=torch.tensor([0.55, 0.3], dtype=torch.float64),
+        theta_true=torch.tensor([0.5, 0.2], dtype=torch.float64), loss=0.0,
+    )
+    flat = adapter.summarize_result(result, torch.linspace(0, 1, 8))
+    assert flat["R_base_abserr"] == pytest.approx(0.05)
+    assert flat["R_base_rel_error_pct"] == pytest.approx(10.0)
+    assert flat["A_abserr"] == pytest.approx(0.1)
+    assert flat["A_rel_error_pct"] == pytest.approx(50.0)
+    for near_zero in (0.0, 1e-7):
+        result.theta_true[1] = near_zero
+        flat = adapter.summarize_result(result, torch.linspace(0, 1, 8))
+        assert np.isnan(flat["A_rel_error_pct"])
+        assert np.isfinite(flat["A_abserr"])
+
+
+def test_profiles_share_checked_optimum_and_persist_both_parameters(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    mean = torch.tensor([0.4, 0.8], dtype=torch.float64)
+    def nll(model, obs, theta, sigma, adapter):
+        z = (theta - mean) / torch.tensor([0.08, 0.15], dtype=torch.float64)
+        return 0.5 * (z**2).sum()
+    monkeypatch.setattr(inv, "neg_log_likelihood", nll)
+    obs = _fake_observation_set()
+    adapter = SourceItrSinAdapter()
+    theta, profiles = inv.profile_parameters(
+        None, obs, torch.tensor([0.2, 1.2], dtype=torch.float64), 1.0,
+        adapter=adapter, n_grid=5, adam_steps=30, lbfgs_steps=25, n_starts=2,
+    )
+    np.testing.assert_allclose(theta, mean, atol=1e-5)
+    assert [p.param_name for p in profiles] == ["R_base", "A"]
+    for profile in profiles:
+        assert profile.nll_min == pytest.approx(0.0, abs=1e-5)
+        assert profile.ci_low < float(theta[profile.param_index]) < profile.ci_high
+    path = inv._write_sim_artifact(
+        str(tmp_path), 0, adapter, obs=obs, result=SimpleNamespace(theta_hat=theta),
+        report=None, J=None, fv_res=None, profiles=profiles, sigma_eff2=1.0,
+        c_fno=None, noise_std=0.01, ci_level=0.95,
+        dataset_path="test", dataset_fingerprint="abc", split_seed=0, split_name="test",
+    )
+    with np.load(path, allow_pickle=False) as stored:
+        for profile in profiles:
+            stem = f"profile_{profile.param_name}"
+            np.testing.assert_array_equal(stored[f"{stem}_grid"], profile.grid)
+            np.testing.assert_array_equal(stored[f"{stem}_nll"], profile.nll)
+            assert float(stored[f"{stem}_ci_width"]) == pytest.approx(profile.ci_high - profile.ci_low)
+        assert "profile_excess_int" not in stored.files
+
+
+@pytest.mark.parametrize("profile_index", [None, 0])
+def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_path, capsys, profile_index):
+    import csv
+    from types import SimpleNamespace
+
+    adapter = SourceItrSinAdapter()
+    obs = _fake_observation_set()
+    ds = SimpleNamespace(
+        t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
+        y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
+    )
+    loaded = SimpleNamespace(
+        config={"benchmark": {"name": "source_itr_sin", "representation": "temporal_encoder"}},
+        mu_global=0.0, sigma_global=1.0, model=None,
+    )
+    monkeypatch.setattr(inv, "load_checkpoint", lambda *a, **k: loaded)
+    monkeypatch.setattr(SourceItrSinAdapter, "validate_model", lambda *a: None)
+    monkeypatch.setattr(SourceItrSinAdapter, "validate_dataset", lambda *a: None)
+    monkeypatch.setattr(SourceItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
+    monkeypatch.setattr(inv, "build_dataset_from_dir", lambda *a, **k: ds)
+    monkeypatch.setattr(inv, "build_observation_set", lambda *a, **k: obs)
+    monkeypatch.setattr(inv, "_checkpoint_fingerprint", lambda *a: "test")
+    monkeypatch.setattr(inv, "_dataset_fingerprint", lambda *a: "test")
+    monkeypatch.setattr(inv, "load_surrogate_calibration", lambda *a, **k: {"local_gate_pass": True, "sigma_fno_norm": 0.1})
+    monkeypatch.setattr(inv, "invert_sim", lambda *a: inv.InversionResult(obs.theta_true.clone(), 0.0, obs.theta_true))
+    fitted = torch.tensor([0.45, 1.0])
+
+    def profiles(model, observed, theta, sigma, *, adapter, indices, **kwargs):
+        assert indices == (None if profile_index is None else [profile_index])
+        selected = range(2) if indices is None else indices
+        return fitted, [inv.ProfileResult(
+            param_index=i, param_name=adapter.param_names[i], level=0.95,
+            grid=np.array([0.1, 0.5, 1.1]), nll=np.array([2.0, 0.0, 2.0]),
+            nll_min=0.0, ci_low=0.1, ci_high=1.1,
+            theta_mle=fitted, lower_closed=True, upper_closed=True,
+        ) for i in selected]
+    monkeypatch.setattr(inv, "profile_parameters", profiles)
+    monkeypatch.setattr(inv, "_masked_residual", lambda *a: torch.tensor([0.1]))
+
+    def verify(model, dataset, base, observed, theta, **kwargs):
+        torch.testing.assert_close(theta, fitted)
+        return inv.FVRefineResult(0.005, 0.005, 0.0)
+    monkeypatch.setattr(inv, "fv_refine_report", verify)
+    output = tmp_path / "results.csv"
+    args = ["--checkpoint", "test", "--data-dir", "test", "--calibration-artifact", "test",
+            "--noise-std", "0.01", "--out-csv", str(output), "--sensor-layout", "full_field"]
+    if profile_index is not None:
+        args += ["--profile-index", str(profile_index)]
+    assert inv.main(args) == 0
+    with output.open() as handle:
+        row = next(csv.DictReader(handle))
+    for i, name in enumerate(adapter.param_names):
+        assert float(row[f"{name}_hat"]) == pytest.approx(float(fitted[i]))
+        assert float(row[f"{name}_abserr"]) == pytest.approx(abs(float(fitted[i]) - float(obs.theta_true[i])))
+        assert f"{name}_rel_error_pct" in row
+    assert "profile_R_base_ci_width" in row
+    assert ("profile_A_ci_width" in row) == (profile_index is None)
+    assert not any("excess" in key or "S_R" in key for key in row)
+    stdout = capsys.readouterr().out
+    assert "R_base: true=" in stdout and "A: true=" in stdout
+    assert "relative error=" in stdout and "width=" in stdout
+
+
+def test_disconnected_profile_is_flagged(monkeypatch):
+    from types import SimpleNamespace
+
+    def nll(model, obs, theta, sigma, adapter):
+        base, amp = theta
+        return 0.5 * (((base - 0.2) * (base - 0.8) / 0.04) ** 2 + ((amp - 0.7) / 0.1) ** 2)
+    monkeypatch.setattr(inv, "neg_log_likelihood", nll)
+    result = inv.profile_likelihood(
+        None, SimpleNamespace(spatial=torch.empty(0)), torch.tensor([0.2, 0.7], dtype=torch.float64),
+        1.0, param_index=0, n_grid=11, adam_steps=20, lbfgs_steps=15, n_starts=2,
+    )
+    assert result.disconnected
+    assert result.lower_closed and result.upper_closed
+    assert result.ci_low < 0.2 and result.ci_high > 0.8
+    assert inv.profile_interval_summary(result)["profile_R_base_disconnected"]

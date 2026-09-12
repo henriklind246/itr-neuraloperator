@@ -138,7 +138,6 @@ requirement_sets:
       - noise_std_K
       - fv_resid_rms_K
       - fv_resid_over_noise
-      - profile_bound_limited
     note: >-
       requires exactly 8, 16, and 32 sensors with the same eight simulations,
       noise realizations, and initialization seeds paired across counts for both

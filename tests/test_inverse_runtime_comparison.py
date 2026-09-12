@@ -52,9 +52,10 @@ def _case_rows():
                     "R_base_hat": 0.4,
                     "R_base_true": 0.5,
                     "R_base_abs_error": [0.1, 0.2, 0.3][sim_id],
-                    "S_R_hat": 0.6,
-                    "S_R_true": 0.5,
-                    "S_R_abs_error": [0.4, 0.2, 0.3][sim_id],
+                    "A_hat": 0.6, "A_true": 0.5,
+                    "A_abs_error": [0.4, 0.2, 0.3][sim_id],
+                    "R_base_rel_error_pct": [20.0, 40.0, 60.0][sim_id],
+                    "A_rel_error_pct": [80.0, 40.0, 60.0][sim_id],
                 }
             )
     return rows
@@ -225,7 +226,7 @@ def test_summary_uses_paired_medians_and_fv_speedup_baseline():
     assert by_method["fv_nelder_mead"][
         "speedup_vs_fv_nelder_mead"
     ] == pytest.approx(1.0)
-    assert by_method["fv_nelder_mead"]["median_S_R_abs_error"] == pytest.approx(0.3)
+    assert by_method["fv_nelder_mead"]["median_A_abs_error"] == pytest.approx(0.3)
     assert by_method["fv_nelder_mead"][
         "median_R_base_abs_error"
     ] == pytest.approx(0.2)

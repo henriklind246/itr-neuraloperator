@@ -35,7 +35,7 @@ LEAD_BINS = 12
 BASE_COND_COLS = ["t_s", "t_bar", "R_c"]
 BENCHMARK_COND_COLS = {
     "forcing": [],
-    "forcing_itr_sin": ["R_c_A", "S_R"],
+    "forcing_itr_sin": ["R_c_base", "R_c_A"],
     "interfaces": ["interface_x"],
     "source": ["x_h", "y_h", "A"],
     "source_itr_sin": ["x_h", "y_h", "A", "R_c_A"],

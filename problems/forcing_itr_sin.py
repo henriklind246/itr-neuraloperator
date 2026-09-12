@@ -18,7 +18,6 @@ from problems.forcing import (
 from src.physics.internal_source import (
     RC_SIN_RANGES,
     R_PEAK_MAX,
-    integrated_excess_resistance,
     make_rc_sin_profile,
     rc_log_norm,
 )
@@ -156,20 +155,15 @@ class ForcingItrSinProblem(ForcingProblem):
 
     # ---- val-pair logging ----
 
-    val_pair_fields = ("temporal_family", "spatial_family", "R_c_A", "S_R")
+    val_pair_fields = ("temporal_family", "spatial_family", "R_c_base", "R_c_A")
 
     def val_pair_row(self, ds, sim_id: int, s: int, j: int) -> dict[str, Any]:
         p = ds.sim_params[int(sim_id)]
-        profile = self._canonical_profile(p, ds.y_grid)
-        severity = integrated_excess_resistance(
-            ds.y_grid, profile, float(p["R_c_base"]),
-            bounds=(0.0, 1.0),
-        )
         return {
             "temporal_family": p["temporal_family"],
             "spatial_family": p["spatial_family"],
             "R_c_A": float(p["R_c_A"]),
-            "S_R": severity,
+            "R_c_base": float(p["R_c_base"]),
         }
 
     # ---- schema ----

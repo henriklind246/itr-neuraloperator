@@ -42,7 +42,7 @@ from scripts.invert import (  # noqa: E402
     load_checkpoint,
     resolve_observation_times,
 )
-from scripts.inverse_adapters import ForcingItrSinAdapter  # noqa: E402
+from scripts.inverse_adapters import ForcingItrSinAdapter, relative_error_percent  # noqa: E402
 
 
 BENCHMARK = "forcing_itr_sin"
@@ -85,16 +85,21 @@ CASE_COLUMNS = (
     "R_base_hat",
     "R_base_true",
     "R_base_abs_error",
-    "S_R_hat",
-    "S_R_true",
-    "S_R_abs_error",
+    "A_hat",
+    "A_true",
+    "A_abs_error",
+    "R_base_rel_error_pct",
+    "A_rel_error_pct",
 )
 
 SUMMARY_COLUMNS = (
     "method",
     "median_runtime_s",
     "speedup_vs_fv_nelder_mead",
-    "median_S_R_abs_error",
+    "median_A_abs_error",
+    "median_R_base_rel_error_pct",
+    "median_A_rel_error_pct",
+    "A_relative_error_defined_cases",
     "median_R_base_abs_error",
 )
 
@@ -398,8 +403,6 @@ def outcome_row(
     forward_model, optimizer = labels[method]
     theta_hat = outcome.theta_hat.detach().cpu()
     theta_true = theta_true.detach().cpu()
-    severity_hat = adapter.uq_quantity(theta_hat, y_grid.detach().cpu())
-    severity_true = adapter.uq_quantity(theta_true, y_grid.detach().cpu())
     base_hat = float(theta_hat[0])
     base_true = float(theta_true[0])
     return {
@@ -416,9 +419,11 @@ def outcome_row(
         "R_base_hat": base_hat,
         "R_base_true": base_true,
         "R_base_abs_error": abs(base_hat - base_true),
-        "S_R_hat": severity_hat,
-        "S_R_true": severity_true,
-        "S_R_abs_error": abs(severity_hat - severity_true),
+        "A_hat": float(theta_hat[1]),
+        "A_true": float(theta_true[1]),
+        "A_abs_error": abs(float(theta_hat[1]) - float(theta_true[1])),
+        "R_base_rel_error_pct": relative_error_percent(base_hat, base_true, adapter.param_scales[0]),
+        "A_rel_error_pct": relative_error_percent(float(theta_hat[1]), float(theta_true[1]), adapter.param_scales[1]),
     }
 
 
@@ -438,14 +443,17 @@ def summarize_rows(case_rows: list[dict[str, object]]) -> list[dict[str, object]
     for method in METHODS:
         rows = grouped[method]
         median_runtime = float(np.median([float(row["runtime_s"]) for row in rows]))
+        amp_relative = np.asarray([float(row["A_rel_error_pct"]) for row in rows])
+        amp_relative = amp_relative[np.isfinite(amp_relative)]
         summary.append(
             {
                 "method": method,
                 "median_runtime_s": median_runtime,
                 "speedup_vs_fv_nelder_mead": fv_runtime / median_runtime,
-                "median_S_R_abs_error": float(
-                    np.median([float(row["S_R_abs_error"]) for row in rows])
-                ),
+                "median_A_abs_error": float(np.median([float(row["A_abs_error"]) for row in rows])),
+                "median_R_base_rel_error_pct": float(np.median([float(row["R_base_rel_error_pct"]) for row in rows])),
+                "median_A_rel_error_pct": float(np.median(amp_relative)) if amp_relative.size else None,
+                "A_relative_error_defined_cases": int(amp_relative.size),
                 "median_R_base_abs_error": float(
                     np.median([float(row["R_base_abs_error"]) for row in rows])
                 ),
@@ -463,17 +471,10 @@ def _write_csv(path: Path, columns: tuple[str, ...], rows: list[dict]) -> None:
 
 def print_summary(summary_rows: list[dict[str, object]]) -> None:
     headers = SUMMARY_COLUMNS
-    formatted = []
-    for row in summary_rows:
-        formatted.append(
-            (
-                str(row["method"]),
-                f"{float(row['median_runtime_s']):.6g}",
-                f"{float(row['speedup_vs_fv_nelder_mead']):.4g}",
-                f"{float(row['median_S_R_abs_error']):.6g}",
-                f"{float(row['median_R_base_abs_error']):.6g}",
-            )
-        )
+    formatted = [tuple(
+        "unavailable" if row[key] is None else format(row[key], ".6g") if isinstance(row[key], (int, float)) else str(row[key])
+        for key in headers
+    ) for row in summary_rows]
     widths = [
         max(len(headers[i]), *(len(row[i]) for row in formatted))
         for i in range(len(headers))

@@ -25,9 +25,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.inverse_adapters import (
+    InverseAdapter, RELATIVE_ERROR_FLOOR_FRACTION, relative_error_percent,
+)
 from scripts.invert import (  # noqa: E402
     CALIBRATION_FLOOR,
     INVERSION_DATASET_SEED,
+    PROFILE_GRID, PROFILE_SPAN, PROFILE_STARTS, PROFILE_ROOT_RTOL,
+    PROFILE_ROOT_MAX_STEPS, PROFILE_OPTIMUM_ATOL, PROFILE_OPTIMUM_MAX_ROUNDS,
     _checkpoint_fingerprint,
     build_interface_sensor_mask,
     prepare_inversion_dataset,
@@ -71,63 +76,28 @@ class SummaryGenerationError(RuntimeError):
 
 @dataclass(frozen=True)
 class SweepMetricSpec:
-    lead_name: str
-    lead_description: str
-    lead_unit_text: str
-    lead_hat_col: str
-    lead_true_col: str
-    lead_abserr_col: str
-    lead_profile_ci_low_col: str
-    lead_profile_ci_high_col: str
+    parameter: str
+    estimate_col: str
+    truth_col: str
+    absolute_error_col: str
+    relative_error_col: str
+    parameter_range: float
+    unit: str = "m² K/W"
 
 
-_SWEEP_METRIC_SPECS = {
-    "forcing": SweepMetricSpec(
-        lead_name="R_c",
-        lead_description="contact resistance R_c",
-        lead_unit_text="m² K/W",
-        lead_hat_col="R_c_map",
-        lead_true_col="R_c_true",
-        lead_abserr_col="R_c_abs_error",
-        lead_profile_ci_low_col="profile_R_c_ci_low",
-        lead_profile_ci_high_col="profile_R_c_ci_high",
-    ),
-    "forcing_itr_sin": SweepMetricSpec(
-        lead_name="S_R",
-        lead_description=(
-            "integrated excess resistance S_R = ∫(R_c − R_base) dy"
-        ),
-        lead_unit_text="m³ K/W",
-        lead_hat_col="excess_int_hat",
-        lead_true_col="excess_int_true",
-        lead_abserr_col="excess_int_abserr",
-        lead_profile_ci_low_col="profile_excess_ci_low",
-        lead_profile_ci_high_col="profile_excess_ci_high",
-    ),
-    "source_itr_sin": SweepMetricSpec(
-        lead_name="S_R",
-        lead_description=(
-            "integrated excess resistance S_R = ∫(R_c − R_base) dy"
-        ),
-        lead_unit_text="m³ K/W",
-        lead_hat_col="excess_int_hat",
-        lead_true_col="excess_int_true",
-        lead_abserr_col="excess_int_abserr",
-        lead_profile_ci_low_col="profile_excess_ci_low",
-        lead_profile_ci_high_col="profile_excess_ci_high",
-    ),
-}
-
-
-def spec_for(benchmark: str) -> SweepMetricSpec:
-    """Return the table contract for one supported sensor sweep."""
-    try:
-        return _SWEEP_METRIC_SPECS[benchmark]
-    except KeyError:
-        raise ValueError(
-            f"No inverse sweep metric spec for benchmark {benchmark!r}; "
-            f"known: {sorted(_SWEEP_METRIC_SPECS)}"
-        ) from None
+def specs_for(benchmark: str) -> tuple[SweepMetricSpec, ...]:
+    adapter = InverseAdapter.from_config({"benchmark": {"name": benchmark}})
+    return tuple(
+        SweepMetricSpec(
+            parameter=name,
+            estimate_col=f"{name}_map" if name == "R_c" else f"{name}_hat",
+            truth_col=f"{name}_true",
+            absolute_error_col=f"{name}_abs_error" if name == "R_c" else f"{name}_abserr",
+            relative_error_col=f"{name}_rel_error_pct",
+            parameter_range=float(adapter.param_scales[i]),
+        )
+        for i, name in enumerate(adapter.param_names)
+    )
 
 
 def _utc_now() -> str:
@@ -343,6 +313,9 @@ def build_inversion_command(
         device,
         "--uq-level",
         str(UQ_LEVEL),
+        "--profile-grid", str(PROFILE_GRID),
+        "--profile-span", str(PROFILE_SPAN),
+        "--profile-starts", str(PROFILE_STARTS),
         "--calibration-artifact",
         str(calibration_path),
         "--out-csv",
@@ -425,11 +398,13 @@ def _resume_provenance_matches(previous: dict | None, current: dict) -> bool:
 
 
 def _required_stage_columns(benchmark: str) -> tuple[str, ...]:
-    """Columns the three reported statistics must have populated per sim."""
-    shared = ("fv_resid_rms_K", "fv_resid_over_noise")
-    if benchmark == "forcing":
-        return shared + ("profile_R_c_ci_low", "profile_R_c_ci_high")
-    return shared + ("profile_excess_ci_low", "profile_excess_ci_high")
+    columns = ["fv_resid_rms_K", "fv_resid_over_noise"]
+    for spec in specs_for(benchmark):
+        columns.extend((spec.estimate_col, spec.truth_col, spec.absolute_error_col))
+        columns.extend(f"profile_{spec.parameter}_{suffix}" for suffix in (
+            "ci_low", "ci_high", "ci_width", "bound_limited", "disconnected",
+        ))
+    return tuple(columns)
 
 
 def validate_and_annotate_rows(
@@ -474,8 +449,12 @@ def validate_and_annotate_rows(
             value = row.get(column, "")
             if value is None or not value.strip():
                 raise ValueError(f"{result_path} is missing populated column {column!r}.")
-            if not math.isfinite(float(value)):
+            if column.endswith(("_bound_limited", "_disconnected")):
+                _summary_bool(row, column)
+            elif not math.isfinite(float(value)):
                 raise ValueError(f"{result_path} has non-finite {column}={value!r}.")
+        for spec in specs_for(benchmark):
+            _relative_error_value(row, spec)
 
     _write_csv(result_path, rows)
     return rows
@@ -493,39 +472,13 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-# One block per reported statistic. Spread is median/Q1/Q3/IQR only: at
-# N_CASES = 8 a ddof=1 SD carries ~27% relative uncertainty and min/max are
-# single order statistics, so the earlier mean/SD/min/max block reported
-# precision the sample cannot support.
 _ROBUST_STATISTICS = ("n", "median", "q1", "q3", "iqr")
-
 _PAPER_SUMMARY_COLUMNS = (
-    "benchmark",
-    "estimand",
-    "unit",
-    "n_sensors",
-    "n_simulations",
-    # Statistic 1: lead-estimand recovery error.
-    "absolute_error_n",
-    "absolute_error_median",
-    "absolute_error_q1",
-    "absolute_error_q3",
-    "absolute_error_iqr",
-    "recovery_rmse",
-    # Statistic 2: FV-verified sensor residual (Kelvin) vs the noise floor.
-    "fv_resid_K_n",
-    "fv_resid_K_median",
-    "fv_resid_K_q1",
-    "fv_resid_K_q3",
-    "fv_resid_K_iqr",
-    "fv_resid_over_noise_median",
-    # Statistic 3: profile-likelihood interval width on the lead estimand.
-    "profile_width_n",
-    "profile_width_median",
-    "profile_width_q1",
-    "profile_width_q3",
-    "profile_width_iqr",
-    "profile_bound_limited_cases",
+    "benchmark", "parameter", "unit", "n_sensors", "n_simulations",
+    *(f"{prefix}_{stat}" for prefix in ("absolute_error", "relative_error_pct", "profile_width", "fv_resid_K")
+      for stat in _ROBUST_STATISTICS),
+    "relative_error_undefined_cases", "recovery_rmse", "fv_resid_over_noise_median",
+    "profile_bound_limited_cases", "profile_disconnected_cases",
 )
 
 
@@ -555,13 +508,13 @@ def _summary_bool(row: dict[str, str], column: str) -> bool:
     )
 
 
-def _robust_summary(values: np.ndarray) -> dict[str, float | int]:
+def _robust_summary(values: np.ndarray) -> dict[str, float | int | None]:
     """Median/quartile spread of a per-simulation quantity across one arm."""
     values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
-        raise ValueError(
-            "paper summary distributions require at least two finite values."
-        )
+    if values.ndim != 1 or not np.all(np.isfinite(values)):
+        raise ValueError("paper summary distributions require finite values")
+    if not values.size:
+        return {"n": 0, "median": None, "q1": None, "q3": None, "iqr": None}
     q1, median, q3 = np.percentile(values, [25.0, 50.0, 75.0])
     return {
         "n": int(values.size),
@@ -572,30 +525,38 @@ def _robust_summary(values: np.ndarray) -> dict[str, float | int]:
     }
 
 
-def _flat_paper_row(
-    *,
-    benchmark: str,
-    estimand: str,
-    unit: str,
-    arm: dict,
-) -> dict[str, object]:
-    row: dict[str, object] = {
-        "benchmark": benchmark,
-        "estimand": estimand,
-        "unit": unit,
-        "n_sensors": arm["n_sensors"],
-        "n_simulations": arm["n_simulations"],
-        "recovery_rmse": arm["recovery"]["rmse"],
+def _relative_error_value(row: dict, spec: SweepMetricSpec) -> float:
+    expected = relative_error_percent(
+        _summary_float(row, spec.estimate_col), _summary_float(row, spec.truth_col),
+        spec.parameter_range,
+    )
+    if spec.relative_error_col not in row:
+        raise ValueError(f"missing {spec.relative_error_col}")
+    raw = row[spec.relative_error_col]
+    actual = float(raw) if raw not in (None, "") else float("nan")
+    if not np.isclose(actual, expected, rtol=1e-6, atol=1e-12, equal_nan=True):
+        raise ValueError(f"inconsistent relative-error column {spec.relative_error_col}")
+    return actual
+
+
+def _flat_paper_row(*, benchmark, parameter, arm):
+    metrics = arm["parameters"][parameter]
+    row = {
+        "benchmark": benchmark, "parameter": parameter, "unit": metrics["unit"],
+        "n_sensors": arm["n_sensors"], "n_simulations": arm["n_simulations"],
+        "recovery_rmse": metrics["recovery"]["rmse"],
+        "relative_error_undefined_cases": metrics["recovery"]["relative_error_undefined_cases"],
         "fv_resid_over_noise_median": arm["fv_verification"]["over_noise_median"],
-        "profile_bound_limited_cases": arm["profile_interval"]["bound_limited_cases"],
+        "profile_bound_limited_cases": metrics["profile_interval"]["bound_limited_cases"],
+        "profile_disconnected_cases": metrics["profile_interval"]["disconnected_cases"],
     }
-    for prefix, summary in (
-        ("absolute_error", arm["recovery"]["absolute_error"]),
+    for prefix, stats in (
+        ("absolute_error", metrics["recovery"]["absolute_error"]),
+        ("relative_error_pct", metrics["recovery"]["relative_error_pct"]),
+        ("profile_width", metrics["profile_interval"]["width"]),
         ("fv_resid_K", arm["fv_verification"]["residual_K"]),
-        ("profile_width", arm["profile_interval"]["width"]),
     ):
-        for statistic in _ROBUST_STATISTICS:
-            row[f"{prefix}_{statistic}"] = summary[statistic]
+        row.update({f"{prefix}_{stat}": stats[stat] for stat in _ROBUST_STATISTICS})
     return row
 
 
@@ -605,29 +566,14 @@ def generate_paper_summary(
     benchmark: str,
     out_dir: Path,
 ) -> dict:
-    spec = spec_for(benchmark)
+    specs = specs_for(benchmark)
     with combined_path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     required_columns = (
-        "benchmark",
-        "sim_id",
-        "n_sensors",
-        "noise_seed",
-        "init_seed",
-        spec.lead_hat_col,
-        spec.lead_true_col,
-        spec.lead_abserr_col,
-        "fv_resid_rms_K",
-        "fv_resid_over_noise",
-        spec.lead_profile_ci_low_col,
-        spec.lead_profile_ci_high_col,
-        "profile_bound_limited",
+        "benchmark", "sim_id", "n_sensors", "noise_seed", "init_seed",
+        *_required_stage_columns(benchmark), *(spec.relative_error_col for spec in specs),
     )
-    missing = [
-        column
-        for column in required_columns
-        if not rows or any(column not in row for row in rows)
-    ]
+    missing = [column for column in required_columns if not rows or any(column not in row for row in rows)]
     if missing:
         raise ValueError(f"paper summary is missing required columns {missing}.")
 
@@ -678,165 +624,99 @@ def generate_paper_summary(
         )
 
     by_sensor_count = []
-    absolute_errors_by_count: dict[int, np.ndarray] = {}
     for count in counts:
         arm_rows = [row_by_key[(count, sim_id)] for sim_id in sim_ids]
-        truth = np.asarray(
-            [_summary_float(row, spec.lead_true_col) for row in arm_rows]
-        )
-        estimate = np.asarray(
-            [_summary_float(row, spec.lead_hat_col) for row in arm_rows]
-        )
-        signed_error = estimate - truth
-        absolute_error = np.asarray(
-            [_summary_float(row, spec.lead_abserr_col) for row in arm_rows]
-        )
-        if not np.allclose(
-            absolute_error, np.abs(signed_error), rtol=1e-6, atol=1e-12
-        ):
-            raise ValueError(
-                f"paper summary absolute-error column is inconsistent at {count} sensors."
-            )
-
-        fv_resid_K = np.asarray(
-            [_summary_float(row, "fv_resid_rms_K") for row in arm_rows]
-        )
-        fv_over_noise = np.asarray(
-            [_summary_float(row, "fv_resid_over_noise") for row in arm_rows]
-        )
-        if np.any(fv_resid_K < 0.0):
-            raise ValueError(
-                f"paper summary found a negative FV residual at {count} sensors."
-            )
-
-        profile_low = np.asarray(
-            [_summary_float(row, spec.lead_profile_ci_low_col) for row in arm_rows]
-        )
-        profile_high = np.asarray(
-            [_summary_float(row, spec.lead_profile_ci_high_col) for row in arm_rows]
-        )
-        if np.any(profile_high < profile_low):
-            raise ValueError(
-                f"paper summary found negative interval width at {count} sensors."
-            )
-        # Censored intervals are counted, not silently averaged in: an interval
-        # that stopped at the edge of the physical range never closed on a
-        # Wilks crossing, so its width is a lower bound, not a measurement.
-        bound_limited = sum(
-            1 for row in arm_rows if _summary_bool(row, "profile_bound_limited")
-        )
-
-        absolute_errors_by_count[count] = absolute_error
-        by_sensor_count.append(
-            {
-                "n_sensors": count,
-                "n_simulations": len(sim_ids),
-                "simulation_ids": list(sim_ids),
+        fv = np.asarray([_summary_float(row, "fv_resid_rms_K") for row in arm_rows])
+        ratios = np.asarray([_summary_float(row, "fv_resid_over_noise") for row in arm_rows])
+        if np.any(fv < 0) or np.any(ratios < 0):
+            raise ValueError("negative FV residual")
+        parameters = {}
+        for spec in specs:
+            truth = np.asarray([_summary_float(row, spec.truth_col) for row in arm_rows])
+            reference_truth = np.asarray([_summary_float(row_by_key[(counts[0], sid)], spec.truth_col) for sid in sim_ids])
+            if not np.allclose(truth, reference_truth, rtol=1e-9, atol=1e-12):
+                raise ValueError(f"{spec.parameter} truth changes across sensor counts")
+            estimate = np.asarray([_summary_float(row, spec.estimate_col) for row in arm_rows])
+            error = np.asarray([_summary_float(row, spec.absolute_error_col) for row in arm_rows])
+            if not np.allclose(error, np.abs(estimate - truth), rtol=1e-6, atol=1e-12):
+                raise ValueError(f"paper summary absolute-error column is inconsistent at {count} sensors")
+            relative = np.asarray([_relative_error_value(row, spec) for row in arm_rows])
+            stem = f"profile_{spec.parameter}"
+            low = np.asarray([_summary_float(row, f"{stem}_ci_low") for row in arm_rows])
+            high = np.asarray([_summary_float(row, f"{stem}_ci_high") for row in arm_rows])
+            widths = np.asarray([_summary_float(row, f"{stem}_ci_width") for row in arm_rows])
+            if np.any(high < low) or not np.allclose(widths, high - low, rtol=1e-6, atol=1e-12):
+                raise ValueError(f"inconsistent interval width for {spec.parameter}")
+            limited = np.asarray([_summary_bool(row, f"{stem}_bound_limited") for row in arm_rows])
+            disconnected = np.asarray([_summary_bool(row, f"{stem}_disconnected") for row in arm_rows])
+            parameters[spec.parameter] = {
+                "unit": spec.unit,
                 "recovery": {
-                    "absolute_error": _robust_summary(absolute_error),
-                    "rmse": float(np.sqrt(np.mean(np.square(signed_error)))),
-                },
-                "fv_verification": {
-                    "residual_K": _robust_summary(fv_resid_K),
-                    "over_noise_median": float(np.median(fv_over_noise)),
+                    "absolute_error": _robust_summary(error),
+                    "relative_error_pct": _robust_summary(relative[np.isfinite(relative)]),
+                    "relative_error_undefined_cases": int(np.count_nonzero(~np.isfinite(relative))),
+                    "rmse": float(np.sqrt(np.mean((estimate - truth) ** 2))),
                 },
                 "profile_interval": {
-                    "width": _robust_summary(profile_high - profile_low),
-                    "bound_limited_cases": int(bound_limited),
+                    "width": _robust_summary(widths[~(limited | disconnected)]),
+                    "bound_limited_cases": int(limited.sum()),
+                    "disconnected_cases": int(disconnected.sum()),
                 },
             }
-        )
-
-    source_columns = list(required_columns[3:])
+        by_sensor_count.append({
+            "n_sensors": count, "n_simulations": len(sim_ids),
+            "simulation_ids": list(sim_ids), "parameters": parameters,
+            "fv_verification": {"residual_K": _robust_summary(fv), "over_noise_median": float(np.median(ratios))},
+        })
     summary = {
-        "schema_version": 1,
-        "benchmark": benchmark,
-        "estimand": spec.lead_name,
-        "estimand_description": spec.lead_description,
-        "unit": spec.lead_unit_text,
-        "confidence_level": UQ_LEVEL,
-        "sensor_counts": list(counts),
-        "n_paired_simulations": len(sim_ids),
+        "schema_version": 2, "benchmark": benchmark,
+        "parameters": [spec.parameter for spec in specs], "confidence_level": UQ_LEVEL,
+        "sensor_counts": list(counts), "n_paired_simulations": len(sim_ids),
         "simulation_ids": list(sim_ids),
         "pairing_fields": ["benchmark", "sim_id", "noise_seed", "init_seed"],
-        "source_csv": str(combined_path.resolve()),
-        "source_columns": source_columns,
-        "reported_statistics": [
-            "recovery_error", "fv_verification", "profile_interval"
-        ],
+        "source_csv": str(combined_path.resolve()), "source_columns": list(required_columns),
+        "reported_statistics": ["parameter_recovery", "fv_verification", "parameter_profile_intervals"],
         "statistics_conventions": {
-            "spread": (
-                "median with Q1/Q3/IQR; no mean/SD, which n=8 cannot support"
-            ),
+            "spread": "median with Q1/Q3/IQR across simulations; no mean/SD",
             "quantiles": "numpy percentile with the default linear method",
+            "relative_error_pct": "100 * abs(estimate - truth) / abs(truth)",
+            "relative_error_floor_fraction": RELATIVE_ERROR_FLOOR_FRACTION,
+            "relative_error_floor": "undefined when abs(truth) <= floor_fraction * admissible parameter range",
             "rmse": "sqrt(mean((estimate - truth)^2)) across simulations",
-            "fv_residual": (
-                "physical RMS sigma_global*sqrt(2*fv_resid) at theta_hat under "
-                "the real FVSolver2D, and its ratio to the measurement noise std"
-            ),
-            "profile_interval": (
-                "Wilks interval on the lead estimand at the frozen "
-                "validation-calibrated sigma_eff; bound_limited_cases counts "
-                "intervals censored by the parameter range rather than closed "
-                "by a likelihood crossing"
-            ),
+            "profile_interval": "95% parameter profile at frozen calibrated variance; width statistics use only connected intervals with both likelihood crossings; counts report exclusions",
         },
         "by_sensor_count": by_sensor_count,
     }
-
     json_path = (out_dir / "inverse_sensor_sweep_summary.json").resolve()
     csv_path = (out_dir / "inverse_sensor_sweep_summary.csv").resolve()
     _write_json(json_path, summary)
-    flat_rows = [
-        _flat_paper_row(
-            benchmark=benchmark,
-            estimand=spec.lead_name,
-            unit=spec.lead_unit_text,
-            arm=arm,
-        )
-        for arm in by_sensor_count
-    ]
+    flat_rows = [_flat_paper_row(benchmark=benchmark, parameter=spec.parameter, arm=arm)
+                 for arm in by_sensor_count for spec in specs]
     with csv_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(_PAPER_SUMMARY_COLUMNS))
         writer.writeheader()
         writer.writerows(flat_rows)
-    return {
-        "status": "complete",
-        "json": str(json_path),
-        "csv": str(csv_path),
-        **summary,
-    }
+    return {"status": "complete", "json": str(json_path), "csv": str(csv_path), **summary}
 
 
 def _print_paper_summary(summary: dict) -> None:
-    print("\nPaper summary (median [Q1, Q3] across simulations):", flush=True)
+    def format_stats(stats):
+        if stats["n"] == 0:
+            return "unavailable (n=0)"
+        return f"{stats['median']:.6g} [{stats['q1']:.6g}, {stats['q3']:.6g}] (n={stats['n']})"
+
+    print("\nParameter summary (median [Q1, Q3] across simulations):", flush=True)
     for arm in summary["by_sensor_count"]:
-        absolute = arm["recovery"]["absolute_error"]
-        residual = arm["fv_verification"]["residual_K"]
-        width = arm["profile_interval"]["width"]
-        print(
-            f"  {arm['n_sensors']} sensors (n={arm['n_simulations']}):",
-            flush=True,
-        )
-        print(
-            f"    recovery error: {absolute['median']:.6g} "
-            f"[{absolute['q1']:.6g}, {absolute['q3']:.6g}], "
-            f"RMSE={arm['recovery']['rmse']:.6g}",
-            flush=True,
-        )
-        print(
-            f"    FV residual:    {residual['median']:.6g} K "
-            f"[{residual['q1']:.6g}, {residual['q3']:.6g}], "
-            f"{arm['fv_verification']['over_noise_median']:.3g}x noise std",
-            flush=True,
-        )
-        print(
-            f"    profile width:  {width['median']:.6g} "
-            f"[{width['q1']:.6g}, {width['q3']:.6g}], "
-            f"{arm['profile_interval']['bound_limited_cases']}"
-            f"/{arm['n_simulations']} bound-limited",
-            flush=True,
-        )
+        print(f"  {arm['n_sensors']} sensors (n={arm['n_simulations']}):", flush=True)
+        for name, metrics in arm["parameters"].items():
+            recovery, profile = metrics["recovery"], metrics["profile_interval"]
+            print(f"    {name}: absolute error {format_stats(recovery['absolute_error'])} {metrics['unit']}")
+            print(f"      relative error [%]: {format_stats(recovery['relative_error_pct'])}; "
+                  f"undefined={recovery['relative_error_undefined_cases']}")
+            print(f"      95% profile width: {format_stats(profile['width'])} {metrics['unit']}; "
+                  f"bound-limited={profile['bound_limited_cases']}, disconnected={profile['disconnected_cases']}")
+        fv = arm["fv_verification"]
+        print(f"    FV residual: {format_stats(fv['residual_K'])} K; {fv['over_noise_median']:.3g}x noise std", flush=True)
 
 
 def _validate_artifacts(artifact_dir: Path, sim_ids: list[int]) -> list[str]:
@@ -878,7 +758,7 @@ def run_sweep(
     previous_manifest = _load_json(manifest_path)
     checkpoint_fingerprint = _checkpoint_fingerprint(str(checkpoint))
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "status": "running",
         "started_utc": _utc_now(),
         "benchmark": benchmark,
@@ -904,8 +784,18 @@ def run_sweep(
             "noise_seed": NOISE_SEED,
             "fv_refine": True,
             "uq_level": UQ_LEVEL,
+            "parameter_reporting_version": 2,
+            "profile_parameters": [spec.parameter for spec in specs_for(benchmark)],
+            "profile_grid": PROFILE_GRID,
+            "profile_span": PROFILE_SPAN,
+            "profile_starts": PROFILE_STARTS,
+            "profile_root_rtol": PROFILE_ROOT_RTOL,
+            "profile_root_max_steps": PROFILE_ROOT_MAX_STEPS,
+            "profile_optimum_atol": PROFILE_OPTIMUM_ATOL,
+            "profile_optimum_max_rounds": PROFILE_OPTIMUM_MAX_ROUNDS,
+            "relative_error_floor_fraction": RELATIVE_ERROR_FLOOR_FRACTION,
             "reported_statistics": [
-                "recovery_error", "fv_verification", "profile_interval"
+                "parameter_recovery", "fv_verification", "parameter_profile_intervals"
             ],
             "pairing": (
                 "identical (benchmark, sim_id, noise_seed, init_seed) cases "

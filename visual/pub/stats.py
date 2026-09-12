@@ -536,38 +536,37 @@ class SensorSweepCurve:
 
 @dataclass(frozen=True)
 class InverseSensorSweepSummary:
-    """The three paired F18 quantities for one inverse benchmark."""
+    """Paired F18 quantities for one benchmark and recovered parameter."""
 
     benchmark: str
     estimand: str
     estimand_unit: str
     recovery_error: SensorSweepCurve
+    relative_error: SensorSweepCurve
     fv_residual: SensorSweepCurve
     noise_floor: SensorSweepCurve
     profile_width: SensorSweepCurve
     fv_over_noise_median: np.ndarray
     bound_limited_cases: np.ndarray
+    disconnected_cases: np.ndarray
 
 
 _INVERSE_SENSOR_METRICS = {
-    "forcing": {
-        "estimand": "R_c",
-        "unit": "m² K/W",
-        "truth": "R_c_true",
-        "estimate": "R_c_map",
-        "absolute_error": "R_c_abs_error",
-        "profile_low": "profile_R_c_ci_low",
-        "profile_high": "profile_R_c_ci_high",
-    },
-    "forcing_itr_sin": {
-        "estimand": "S_R",
-        "unit": "m³ K/W",
-        "truth": "excess_int_true",
-        "estimate": "excess_int_hat",
-        "absolute_error": "excess_int_abserr",
-        "profile_low": "profile_excess_ci_low",
-        "profile_high": "profile_excess_ci_high",
-    },
+    benchmark: tuple({
+        "estimand": name, "unit": "m² K/W",
+        "truth": f"{name}_true",
+        "estimate": f"{name}_map" if name == "R_c" else f"{name}_hat",
+        "absolute_error": f"{name}_abs_error" if name == "R_c" else f"{name}_abserr",
+        "relative_error": f"{name}_rel_error_pct",
+        "profile_low": f"profile_{name}_ci_low",
+        "profile_high": f"profile_{name}_ci_high",
+        "limited": f"profile_{name}_bound_limited",
+        "disconnected": f"profile_{name}_disconnected",
+    } for name in names)
+    for benchmark, names in {
+        "forcing": ("R_c",), "forcing_itr_sin": ("R_base", "A"),
+        "source_itr_sin": ("R_base", "A"),
+    }.items()
 }
 
 
@@ -579,6 +578,7 @@ def _sensor_sweep_curve(
     sensor_counts,
     case_keys,
     censored=None,
+    allow_missing=False,
 ) -> SensorSweepCurve:
     values = np.asarray(values, dtype=np.float64)
     counts = np.asarray(sensor_counts, dtype=np.int64)
@@ -587,22 +587,27 @@ def _sensor_sweep_curve(
             f"{metric} has shape {values.shape}; expected "
             f"({len(case_keys)}, {counts.size})"
         )
-    if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+    if np.any(np.isinf(values)) or (not allow_missing and np.any(np.isnan(values))) or np.any(values < 0.0):
         raise ValueError(f"{metric} must contain finite non-negative values")
     censored_values = None
     if censored is not None:
         censored_values = np.asarray(censored, dtype=bool)
         if censored_values.shape != values.shape:
             raise ValueError(f"{metric} censoring mask does not match its values")
+    quantiles = []
+    for j in range(counts.size):
+        keep = np.isfinite(values[:, j])
+        if censored_values is not None:
+            keep &= ~censored_values[:, j]
+        quantiles.append(np.percentile(values[keep, j], [25, 50, 75]) if keep.any() else [np.nan] * 3)
+    q25, median, q75 = np.asarray(quantiles).T
     return SensorSweepCurve(
         metric=metric,
         unit=unit,
         sensor_counts=counts,
         case_keys=tuple(case_keys),
         case_values=values,
-        median=np.median(values, axis=0),
-        q25=np.percentile(values, 25.0, axis=0),
-        q75=np.percentile(values, 75.0, axis=0),
+        median=median, q25=q25, q75=q75,
         censored=censored_values,
     )
 
@@ -611,122 +616,146 @@ def inverse_sensor_sweep_summaries(
     table: pd.DataFrame,
     *,
     sensor_counts: tuple[int, ...] = (8, 16, 32),
-) -> dict[str, InverseSensorSweepSummary]:
+) -> dict[tuple[str, str], InverseSensorSweepSummary]:
     """Reduce F18 at the paired inversion-case level.
 
     Lines connect identical ``(sim_id, noise_seed, init_seed)`` cases across the
     three discrete sensor counts. Medians and IQRs are descriptive across those
     cases; with eight cases no inferential confidence interval is estimated.
     """
+    from scripts.inverse_adapters import InverseAdapter, relative_error_percent
+
     pairing = ["sim_id", "noise_seed", "init_seed"]
-    output: dict[str, InverseSensorSweepSummary] = {}
+    output: dict[tuple[str, str], InverseSensorSweepSummary] = {}
     for benchmark in sorted(table["benchmark"].dropna().astype(str).unique()):
         try:
-            columns = _INVERSE_SENSOR_METRICS[benchmark]
+            parameter_columns = _INVERSE_SENSOR_METRICS[benchmark]
         except KeyError:
             raise ValueError(
                 f"unsupported inverse sensor sweep benchmark {benchmark!r}"
             ) from None
-        part = table.loc[table["benchmark"].astype(str) == benchmark].copy()
-        counts = tuple(sorted(part["n_sensors"].astype(int).unique()))
-        if counts != tuple(sensor_counts):
-            raise ValueError(
-                f"{benchmark} sensor counts {counts} do not match {sensor_counts}"
-            )
-        if part.duplicated(["n_sensors", *pairing]).any():
-            raise ValueError(f"{benchmark} has duplicate paired sensor-sweep rows")
+        adapter = InverseAdapter.from_config({"benchmark": {"name": benchmark}})
+        for parameter_index, columns in enumerate(parameter_columns):
+            part = table.loc[table["benchmark"].astype(str) == benchmark].copy()
+            counts = tuple(sorted(part["n_sensors"].astype(int).unique()))
+            if counts != tuple(sensor_counts):
+                raise ValueError(
+                    f"{benchmark} sensor counts {counts} do not match {sensor_counts}"
+                )
+            if part.duplicated(["n_sensors", *pairing]).any():
+                raise ValueError(f"{benchmark} has duplicate paired sensor-sweep rows")
 
-        case_keys = tuple(sorted({
-            tuple(int(value) for value in row)
-            for row in part[pairing].itertuples(index=False, name=None)
-        }))
-        matrices: dict[str, np.ndarray] = {}
-        numeric_columns = (
-            columns["truth"], columns["estimate"], columns["absolute_error"],
-            "fv_resid_rms_K", "fv_resid_over_noise", "noise_std_K",
-            columns["profile_low"], columns["profile_high"],
-        )
-        for column in numeric_columns:
-            columns_by_count = []
+            case_keys = tuple(sorted({
+                tuple(int(value) for value in row)
+                for row in part[pairing].itertuples(index=False, name=None)
+            }))
+            matrices: dict[str, np.ndarray] = {}
+            numeric_columns = (
+                columns["truth"], columns["estimate"], columns["absolute_error"], columns["relative_error"],
+                "fv_resid_rms_K", "fv_resid_over_noise", "noise_std_K",
+                columns["profile_low"], columns["profile_high"],
+            )
+            for column in numeric_columns:
+                columns_by_count = []
+                for count in counts:
+                    arm = part.loc[part["n_sensors"].astype(int) == count].copy()
+                    arm["_pair"] = [
+                        tuple(int(value) for value in row)
+                        for row in arm[pairing].itertuples(index=False, name=None)
+                    ]
+                    values = arm.set_index("_pair")[column].reindex(case_keys)
+                    if values.isna().any() and column != columns["relative_error"]:
+                        raise ValueError(
+                            f"{benchmark} {column} is not paired across sensor counts"
+                        )
+                    columns_by_count.append(values.to_numpy(dtype=np.float64))
+                matrices[column] = np.column_stack(columns_by_count)
+
+            censored_columns = []
+            limited_columns = []
+            disconnected_columns = []
             for count in counts:
                 arm = part.loc[part["n_sensors"].astype(int) == count].copy()
                 arm["_pair"] = [
                     tuple(int(value) for value in row)
                     for row in arm[pairing].itertuples(index=False, name=None)
                 ]
-                values = arm.set_index("_pair")[column].reindex(case_keys)
-                if values.isna().any():
+                flags = arm.set_index("_pair")[columns["limited"]].reindex(case_keys)
+                if flags.isna().any():
                     raise ValueError(
-                        f"{benchmark} {column} is not paired across sensor counts"
+                        f"{benchmark} profile censoring is not paired across counts"
                     )
-                columns_by_count.append(values.to_numpy(dtype=np.float64))
-            matrices[column] = np.column_stack(columns_by_count)
+                disconnected = arm.set_index("_pair")[columns["disconnected"]].reindex(case_keys)
+                if disconnected.isna().any():
+                    raise ValueError(f"{benchmark} disconnected flags are not paired across counts")
+                limited_columns.append(flags.astype(bool).to_numpy())
+                disconnected_columns.append(disconnected.astype(bool).to_numpy())
+                censored_columns.append((flags.astype(bool) | disconnected.astype(bool)).to_numpy())
+            censored = np.column_stack(censored_columns)
 
-        censored_columns = []
-        for count in counts:
-            arm = part.loc[part["n_sensors"].astype(int) == count].copy()
-            arm["_pair"] = [
-                tuple(int(value) for value in row)
-                for row in arm[pairing].itertuples(index=False, name=None)
-            ]
-            flags = arm.set_index("_pair")["profile_bound_limited"].reindex(case_keys)
-            if flags.isna().any():
-                raise ValueError(
-                    f"{benchmark} profile censoring is not paired across counts"
-                )
-            censored_columns.append(flags.astype(bool).to_numpy())
-        censored = np.column_stack(censored_columns)
+            truth = matrices[columns["truth"]]
+            estimate = matrices[columns["estimate"]]
+            absolute_error = matrices[columns["absolute_error"]]
+            if not np.allclose(truth, truth[:, :1], rtol=1e-9, atol=1e-12):
+                raise ValueError(f"{benchmark} changes the true estimand across sensor counts")
+            if not np.allclose(
+                absolute_error, np.abs(estimate - truth), rtol=1e-6, atol=1e-12
+            ):
+                raise ValueError(f"{benchmark} absolute recovery error is inconsistent")
 
-        truth = matrices[columns["truth"]]
-        estimate = matrices[columns["estimate"]]
-        absolute_error = matrices[columns["absolute_error"]]
-        if not np.allclose(truth, truth[:, :1], rtol=1e-9, atol=1e-12):
-            raise ValueError(f"{benchmark} changes the true estimand across sensor counts")
-        if not np.allclose(
-            absolute_error, np.abs(estimate - truth), rtol=1e-6, atol=1e-12
-        ):
-            raise ValueError(f"{benchmark} absolute recovery error is inconsistent")
+            expected_relative = np.asarray([
+                relative_error_percent(hat, true, adapter.param_scales[parameter_index])
+                for hat, true in zip(estimate.ravel(), truth.ravel())
+            ]).reshape(truth.shape)
+            if not np.allclose(matrices[columns["relative_error"]], expected_relative,
+                               rtol=1e-6, atol=1e-12, equal_nan=True):
+                raise ValueError(f"{benchmark} relative recovery error is inconsistent")
 
-        fv = matrices["fv_resid_rms_K"]
-        noise = matrices["noise_std_K"]
-        over_noise = matrices["fv_resid_over_noise"]
-        if np.any(noise <= 0.0):
-            raise ValueError(f"{benchmark} noise_std_K must be positive")
-        if not np.allclose(fv / noise, over_noise, rtol=1e-5, atol=1e-8):
-            raise ValueError(f"{benchmark} FV/noise ratio is inconsistent")
+            fv = matrices["fv_resid_rms_K"]
+            noise = matrices["noise_std_K"]
+            over_noise = matrices["fv_resid_over_noise"]
+            if np.any(noise <= 0.0):
+                raise ValueError(f"{benchmark} noise_std_K must be positive")
+            if not np.allclose(fv / noise, over_noise, rtol=1e-5, atol=1e-8):
+                raise ValueError(f"{benchmark} FV/noise ratio is inconsistent")
 
-        profile_width = (
-            matrices[columns["profile_high"]]
-            - matrices[columns["profile_low"]]
-        )
-        recovery_curve = _sensor_sweep_curve(
-            absolute_error, metric="absolute recovery error",
-            unit=columns["unit"], sensor_counts=counts, case_keys=case_keys,
-        )
-        fv_curve = _sensor_sweep_curve(
-            fv, metric="FV residual at recovered parameter", unit="K",
-            sensor_counts=counts, case_keys=case_keys,
-        )
-        noise_curve = _sensor_sweep_curve(
-            noise, metric="measurement noise standard deviation", unit="K",
-            sensor_counts=counts, case_keys=case_keys,
-        )
-        width_curve = _sensor_sweep_curve(
-            profile_width, metric="profile interval width",
-            unit=columns["unit"], sensor_counts=counts, case_keys=case_keys,
-            censored=censored,
-        )
-        output[benchmark] = InverseSensorSweepSummary(
-            benchmark=benchmark,
-            estimand=columns["estimand"],
-            estimand_unit=columns["unit"],
-            recovery_error=recovery_curve,
-            fv_residual=fv_curve,
-            noise_floor=noise_curve,
-            profile_width=width_curve,
-            fv_over_noise_median=np.median(over_noise, axis=0),
-            bound_limited_cases=np.count_nonzero(censored, axis=0),
-        )
+            profile_width = (
+                matrices[columns["profile_high"]]
+                - matrices[columns["profile_low"]]
+            )
+            recovery_curve = _sensor_sweep_curve(
+                absolute_error, metric="absolute recovery error",
+                unit=columns["unit"], sensor_counts=counts, case_keys=case_keys,
+            )
+            relative_curve = _sensor_sweep_curve(
+                matrices[columns["relative_error"]], metric="relative recovery error",
+                unit="%", sensor_counts=counts, case_keys=case_keys, allow_missing=True,
+            )
+            fv_curve = _sensor_sweep_curve(
+                fv, metric="FV residual at recovered parameter", unit="K",
+                sensor_counts=counts, case_keys=case_keys,
+            )
+            noise_curve = _sensor_sweep_curve(
+                noise, metric="measurement noise standard deviation", unit="K",
+                sensor_counts=counts, case_keys=case_keys,
+            )
+            width_curve = _sensor_sweep_curve(
+                profile_width, metric="profile interval width",
+                unit=columns["unit"], sensor_counts=counts, case_keys=case_keys,
+                censored=censored,
+            )
+            output[(benchmark, columns["estimand"])] = InverseSensorSweepSummary(
+                benchmark=benchmark,
+                estimand=columns["estimand"],
+                estimand_unit=columns["unit"],
+                recovery_error=recovery_curve, relative_error=relative_curve,
+                fv_residual=fv_curve,
+                noise_floor=noise_curve,
+                profile_width=width_curve,
+                fv_over_noise_median=np.median(over_noise, axis=0),
+                bound_limited_cases=np.count_nonzero(np.column_stack(limited_columns), axis=0),
+                disconnected_cases=np.count_nonzero(np.column_stack(disconnected_columns), axis=0),
+            )
     return output
 
 

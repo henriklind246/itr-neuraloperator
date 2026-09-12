@@ -500,7 +500,7 @@ class TestValidate:
             "y_h",
             "R_c_A",
             "R_c_A",
-            "S_R",
+            "R_c_base",
         }
         assert {int(row["epoch"]) for row in rows} == {7}
         # The fixture is a forcing-style dataset, so only forcing's extra

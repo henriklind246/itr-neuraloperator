@@ -16,13 +16,20 @@ from src.physics.internal_source import (
     RC_SIN_RANGES,
     R_PEAK_MAX,
     equivalent_scalar_resistance,
-    integrated_excess_resistance,
-    interface_control_volume_weights,
     make_rc_sin_profile,
 )
 
 
 SIN_PARAM_NAMES = ("R_base", "A")
+RELATIVE_ERROR_FLOOR_FRACTION = 1e-6
+
+
+def relative_error_percent(estimate: float, truth: float, parameter_range: float) -> float:
+    """Percentage error, undefined within 1e-6 of the admissible range of zero."""
+    if abs(truth) <= RELATIVE_ERROR_FLOOR_FRACTION * parameter_range:
+        return float("nan")
+    return 100.0 * abs(estimate - truth) / abs(truth)
+
 
 _GEN_DOMAIN = dict(a=0.0, b=1.0, c=0.0, d=1.0)
 _GEN_LAM_TARGET = 0.8
@@ -106,13 +113,6 @@ class InverseAdapter(ABC):
             f"{sorted(adapters)}."
         )
 
-    @property
-    def default_profile_index(self) -> int:
-        return 0
-
-    @property
-    def reports_spatial_severity(self) -> bool:
-        return False
 
     @property
     def supports_equivalent_scalar(self) -> bool:
@@ -267,34 +267,6 @@ class InverseAdapter(ABC):
     ) -> torch.Tensor:
         ...
 
-    @abstractmethod
-    def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
-        ...
-
-    def theta_profile_severity(
-        self, u: torch.Tensor, fixed_severity: float, y_grid: torch.Tensor
-    ) -> torch.Tensor:
-        """Pin the integrated severity ``S_R`` and leave the rest free.
-
-        Returns a differentiable ``theta`` for which ``uq_quantity(theta) ==
-        fixed_severity`` (up to the amplitude ceiling), so a Gaussian-NLL refit
-        over ``u`` profiles the severity estimand itself rather than a coordinate
-        that only co-varies with it. Only severity-reporting adapters implement
-        this.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not profile integrated severity."
-        )
-
-    def max_feasible_severity(self, y_grid: torch.Tensor) -> float:
-        """Upper bound on ``S_R`` reachable inside the physical parameter box.
-
-        Used to clamp the severity-profile grid so pinned values stay in the
-        FNO's training distribution.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not profile integrated severity."
-        )
 
     @abstractmethod
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
@@ -311,8 +283,6 @@ class InverseAdapter(ABC):
     @abstractmethod
     def laplace_summary(self, spec: dict) -> dict:
         ...
-
-
 
 
 class ForcingAdapter(InverseAdapter):
@@ -414,14 +384,15 @@ class ForcingAdapter(InverseAdapter):
             raise ValueError("forcing profile fixed_index must be 0 for R_c")
         return torch.as_tensor([fixed_value], dtype=u.dtype, device=u.device)
 
-    def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
-        return float(theta[0])
 
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
         out = {"loss": result.loss, "R_c_map": float(result.theta_hat[0])}
         if result.theta_true is not None:
             out["R_c_true"] = float(result.theta_true[0])
             out["R_c_abs_error"] = abs(out["R_c_map"] - out["R_c_true"])
+            out["R_c_rel_error_pct"] = relative_error_percent(
+                out["R_c_map"], out["R_c_true"], self.param_scales[0]
+            )
         return out
 
     def sensitivity_summary(self, report: dict) -> dict:
@@ -461,8 +432,6 @@ class ForcingAdapter(InverseAdapter):
         }
 
 
-
-
 class SourceItrSinAdapter(InverseAdapter):
     """Inverse adapter for theta=(R_base, A) with a dependent amplitude bound.
 
@@ -473,9 +442,6 @@ class SourceItrSinAdapter(InverseAdapter):
     theta_dim = 2
     param_names = SIN_PARAM_NAMES
 
-    @property
-    def default_profile_index(self) -> int:
-        return 1
 
     def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
         base_lo, base_hi = RC_SIN_RANGES["R_base"]
@@ -587,47 +553,12 @@ class SourceItrSinAdapter(InverseAdapter):
             A = s[..., 1] * (R_PEAK_MAX - R_base)
         return torch.stack([R_base, A], dim=-1)
 
-    def uq_quantity(self, theta: torch.Tensor, y_grid: torch.Tensor) -> float:
-        R_base, A = theta[0].item(), theta[1].item()
-        y = y_grid.detach().cpu().numpy().astype(np.float64)
-        profile = make_rc_sin_profile(y, R_base, A)
-        return integrated_excess_resistance(
-            y, profile, R_base,
-            bounds=(_GEN_DOMAIN["c"], _GEN_DOMAIN["d"]),
-        )
-
-    def _severity_sin_coeff(self, y_grid: torch.Tensor, dtype) -> torch.Tensor:
-        y = y_grid.to(dtype=dtype)
-        w = self._severity_weights(y_grid).to(dtype=dtype)
-        # S_R = A * sum_k w_k sin(pi y_k); coefficient is param-independent.
-        return torch.sum(w * torch.sin(np.pi * y)).clamp_min(_dtype_eps(dtype))
-
-    def theta_profile_severity(
-        self, u: torch.Tensor, fixed_severity: float, y_grid: torch.Tensor
-    ) -> torch.Tensor:
-        base_lo, base_hi = RC_SIN_RANGES["R_base"]
-        s = torch.sigmoid(u)
-        coeff = self._severity_sin_coeff(y_grid, u.dtype)
-        S = torch.as_tensor(fixed_severity, dtype=u.dtype, device=u.device)
-        amp_ceiling = torch.as_tensor(
-            R_PEAK_MAX - base_lo, dtype=u.dtype, device=u.device
-        )
-        A = torch.minimum((S / coeff).clamp_min(0.0), amp_ceiling)
-        base_ceiling = torch.clamp(R_PEAK_MAX - A, min=base_lo, max=base_hi)
-        R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
-        return torch.stack([R_base, A], dim=-1)
-
-    def max_feasible_severity(self, y_grid: torch.Tensor) -> float:
-        base_lo, _ = RC_SIN_RANGES["R_base"]
-        coeff = self._severity_sin_coeff(y_grid, torch.float64)
-        return float((R_PEAK_MAX - base_lo) * float(coeff))
 
     def summarize_result(self, result, y_grid: torch.Tensor) -> dict:
         out = {
             "loss": result.loss,
             "R_base_hat": float(result.theta_hat[0]),
             "A_hat": float(result.theta_hat[1]),
-            "excess_int_hat": self.uq_quantity(result.theta_hat, y_grid),
         }
         if result.theta_true is not None:
             t = result.theta_true
@@ -635,20 +566,15 @@ class SourceItrSinAdapter(InverseAdapter):
                 {
                     "R_base_true": float(t[0]),
                     "A_true": float(t[1]),
-                    "excess_int_true": self.uq_quantity(t, y_grid),
                     "R_base_abserr": abs(float(result.theta_hat[0]) - float(t[0])),
                     "A_abserr": abs(float(result.theta_hat[1]) - float(t[1])),
                 }
             )
-            out["excess_int_abserr"] = abs(
-                out["excess_int_hat"] - out["excess_int_true"]
-            )
+            for i, name in enumerate(self.param_names):
+                out[f"{name}_rel_error_pct"] = relative_error_percent(
+                    out[f"{name}_hat"], out[f"{name}_true"], self.param_scales[i]
+                )
         return out
-
-
-    @property
-    def reports_spatial_severity(self) -> bool:
-        return True
 
 
     def spatial_channel_index(self) -> Optional[int]:
@@ -671,14 +597,6 @@ class SourceItrSinAdapter(InverseAdapter):
             dt=float(ds.dt), tukey_alpha=_GEN_TUKEY_ALPHA,
             y_grid=y_grid,
         )
-
-
-    def _severity_weights(self, y_grid: torch.Tensor) -> torch.Tensor:
-        y = y_grid.detach().cpu().numpy().astype(np.float64)
-        w = interface_control_volume_weights(
-            y, (_GEN_DOMAIN["c"], _GEN_DOMAIN["d"])
-        )
-        return torch.as_tensor(w, dtype=y_grid.dtype, device=y_grid.device)
 
 
     def sensitivity_summary(self, report: dict) -> dict:
@@ -707,14 +625,10 @@ class SourceItrSinAdapter(InverseAdapter):
             out["fv_polish_evals"] = res.fv_polish_evals
             for i, name in enumerate(self.param_names):
                 out[f"{name}_fvpolish"] = float(tp[i])
-            out["excess_int_fvpolish"] = self.uq_quantity(tp, y_grid)
             if obs.theta_true is not None:
                 t = obs.theta_true
                 for i, name in enumerate(self.param_names):
                     out[f"{name}_fvpolish_abserr"] = abs(float(tp[i]) - float(t[i]))
-                out["excess_int_fvpolish_abserr"] = abs(
-                    out["excess_int_fvpolish"] - self.uq_quantity(t, y_grid)
-                )
         return out
 
 
@@ -729,7 +643,6 @@ class SourceItrSinAdapter(InverseAdapter):
         for i, nm in enumerate(self.param_names):
             out[f"laplace_least_dir_{nm}"] = float(least[i])
         return out
-
 
 
 class ForcingItrSinAdapter(SourceItrSinAdapter):

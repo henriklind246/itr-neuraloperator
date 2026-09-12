@@ -89,11 +89,6 @@ def build_cond_vector_sin(
     )
 
 
-def _sin_severity(A: float) -> float:
-    """Analytic integrated excess resistance int_0^1 (R_c - R_base) dy = A*(2/pi)."""
-    return float(A) * 2.0 / np.pi
-
-
 class SourceItrSinProblem(SourceProblem):
     """Source benchmark with R_c(y) = R_base + A sin(pi y)."""
 
@@ -353,7 +348,6 @@ class SourceItrSinProblem(SourceProblem):
             "requested": float(value),
             "R_c_base": float(R_base),
             "R_c_A": float(A),
-            "realized_severity": _sin_severity(A),
         }
         return params
 

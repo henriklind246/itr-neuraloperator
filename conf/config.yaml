@@ -49,19 +49,19 @@ model:
 
 training:
   device: "auto"
-  batch_size: 1024
+  batch_size: 512
   n_snapshots: 20
   n_snapshots_test: 40
   curriculum_warmup: 25
-  epochs: 101
-  learning_rate: 0.002
+  epochs: 41
+  learning_rate: 0.0028
   weight_decay: 3.0e-5
   noise_std: 0.0
   grad_clip: 1.0
   scheduler:
     type: "RIGNOThreePhase"
-    warmup_fraction: 0.02
-    cosine_fraction: 0.88
+    warmup_fraction: 0.05
+    cosine_fraction: 0.85
     exp_fraction: 0.10
     init_lr_ratio: 0.05
     cosine_floor_lr_ratio: 0.05
@@ -89,7 +89,7 @@ training:
   # per_sample_interface_x} are owned by the active `benchmark` config group
   # (per-benchmark loss region). per_sample_interface_x defaults to false in code
   # (loss_cfg.get(...)) and is set true only for the interfaces benchmark.
-  validate_every: 10
+  validate_every: 5
   # Cap on the number of per-pair diagnostic rows written to val_pairs.csv per
   # validation pass. A fixed, seeded subset of pairs is written (same subset
   # every pass, so per-pair error stays trackable across epochs). Does NOT affect
