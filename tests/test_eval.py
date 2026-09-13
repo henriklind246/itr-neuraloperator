@@ -56,6 +56,7 @@ def eval_setup():
 
 
 EXPECTED_METRIC_KEYS = {
+    "peak_jump_error_mean_K", "peak_jump_error_p95_K",
     "rel_l2_norm", "rel_l2_phys",
     "iface_rel_l2_norm", "iface_rel_l2_phys",
     "boundary_rel_l2_norm", "boundary_rel_l2_phys",
@@ -774,6 +775,15 @@ def test_combined_evaluation_reuses_predictions_and_preserves_outputs(records_ru
             assert actual == expected, key
     rows = _read_records(seed_dir / 'test_records.csv')
     assert len(rows) == n_test_sims * (1 if options.get('long_lead_only') else 6)
+    import pandas as pd
+    from visual.pub.tables import _peak_frame
+    peaks = _peak_frame(pd.read_csv(seed_dir / 'test_records.csv'))
+    assert combined[0]['test_peak_jump_error_mean_K'] == pytest.approx(
+        peaks.peak_jump_error_K.mean(), abs=1e-7
+    )
+    assert combined[0]['test_peak_jump_error_p95_K'] == pytest.approx(
+        peaks.peak_jump_error_K.quantile(0.95), abs=1e-7
+    )
     provenance = json.loads((seed_dir / 'test_records.provenance.json').read_text())
     assert provenance['n_pairs'] == len(rows)
     assert provenance['rollout_enabled'] == (options.get('rollout_num_substeps', 1) > 1)
@@ -810,3 +820,69 @@ def test_run_eval_combined_cli_writes_report_and_all_seed_records(records_run, m
     for seed in (seed_dir, other_seed):
         assert _read_records(seed / 'custom.csv')
         assert (seed / 'custom.provenance.json').exists()
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 5])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_peak_jump_errors_use_separate_initial_state_maxima(batch_size, dynamic):
+    from data.dataset import T_EPS
+    from src.operators.train import validate
+
+    pairs = [(10, 0, 1), (20, 0, 1), (10, 1, 2), (10, 0, 2), (20, 0, 2)]
+    predicted = [5., 1., 999., 2., 3.]
+    truth = [1., 7., 0., 4., 2.]
+    x_grid = torch.linspace(0, 1, 5)
+    items = []
+    for i, (pred, true) in enumerate(zip(predicted, truth)):
+        interface = 0.625 if dynamic and pairs[i][0] == 20 else 0.375
+        right = 3 if interface == 0.625 else 2
+        spatial = torch.zeros(5, 2, 1)
+        target = torch.zeros_like(spatial)
+        spatial[right, :, 0] = -pred / (2.0 + T_EPS)
+        target[right, :, 0] = -true / (2.0 + T_EPS)
+        items.append(dict(spatial=spatial, Y=target, cond_static=torch.zeros(1),
+                          forcing_seq=torch.empty(0, 0),
+                          T_stats=torch.tensor([300., 2., interface])))
+    class Pairs(list):
+        _pairs = pairs
+    dataset = Pairs(items)
+    loader = DataLoader(dataset, batch_size=batch_size)
+    model = _MetricPrediction()
+    metrics = evaluate(model, loader, "cpu", x_grid=x_grid,
+                       interface_x=0.375, use_per_sample_interface=dynamic)
+    validation = validate(model, loader, "cpu", x_grid_t=x_grid,
+                          interface_x=0.375, use_per_sample_interface=dynamic,
+                          sigma_global=2.0)
+    for result in (metrics, validation):
+        assert result["peak_jump_error_mean_K"] == pytest.approx(2.5)
+        assert result["peak_jump_error_p95_K"] == pytest.approx(3.85)
+
+
+@pytest.mark.parametrize("missing_geometry", [False, True])
+def test_peak_jump_unavailable_without_initial_state_pairs(missing_geometry):
+    class LaterPairs(list):
+        @property
+        def _pairs(self):
+            return [(i, 1, 2) for i in range(len(self))]
+    dataset = LaterPairs(_heterogeneous_metric_pairs())
+    loader = DataLoader(dataset, batch_size=2)
+    result = evaluate(_MetricPrediction(), loader, "cpu",
+                      x_grid=None if missing_geometry else torch.linspace(0, 1, 4))
+    assert math.isnan(result["peak_jump_error_mean_K"])
+    assert math.isnan(result["peak_jump_error_p95_K"])
+
+
+def test_seed_report_aggregates_peak_errors_and_persists_them(tmp_path):
+    import json
+    from src.operators.eval import save_report
+
+    rows = [_seed_result(i, 1., 1., 1., 1., 1.) for i in (1, 2)]
+    for row, mean, p95 in zip(rows, [1., 3.], [2., 6.]):
+        row.update(test_peak_jump_error_mean_K=mean, test_peak_jump_error_p95_K=p95)
+    summary = print_seed_report(rows)
+    save_report(tmp_path, rows, summary)
+    report = json.loads((tmp_path / "seed_report.json").read_text())
+    assert report["summary"]["test_peak_jump_error_mean_K_mean"] == 2.
+    assert report["summary"]["test_peak_jump_error_p95_K_mean"] == 4.
+    assert report["summary"]["test_peak_jump_error_mean_K_std"] == pytest.approx(2**0.5)
+    assert report["per_seed"] == rows

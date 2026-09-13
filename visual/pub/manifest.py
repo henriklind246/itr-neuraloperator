@@ -462,6 +462,61 @@ class Manifest:
         return cls(sources=sources, requirements=FigureRequirements.load())
 
     @classmethod
+    def for_run(cls, run_root: str | Path, *,
+                records_name: str = "test_records.csv") -> tuple[Manifest, str]:
+        """Manifest for the one benchmark an evaluated config directory holds.
+
+        ``discover_global_field`` answers a different question -- which four
+        experiments back the cross-benchmark figures -- and so insists on all
+        four being present. This one exists for the figures a single evaluation
+        can produce unaided: it is given the config directory that evaluation
+        was pointed at, and reads the benchmark off the runs rather than being
+        told, so an eval anywhere on disk can render its own figures without
+        ``manifest.yaml`` being edited first.
+
+        Returns the manifest and the benchmark name.
+        """
+        root = Path(run_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ProvenanceError(f"Run directory does not exist: {root}")
+
+        records_entries: list[dict] = []
+        run_entries: list[dict] = []
+        benchmarks: set[str] = set()
+        for seed_dir in sorted(root.glob("seed*")):
+            if not (seed_dir / records_name).is_file():
+                continue
+            config_path = seed_dir / "config_used.yaml"
+            if not config_path.is_file():
+                raise ProvenanceError(f"Missing run configuration: {config_path}")
+            config = _read_yaml(config_path)
+            benchmark = config.get("benchmark") if isinstance(config, dict) else None
+            if isinstance(benchmark, dict):
+                benchmark = benchmark.get("name")
+            if not benchmark:
+                raise ProvenanceError(f"Run does not name its benchmark: {config_path}")
+            benchmarks.add(str(benchmark))
+            entry = {"run": str(seed_dir)}
+            if seed_dir.name[4:].isdigit():
+                entry["seed"] = int(seed_dir.name[4:])
+            run_entries.append(entry)
+            records_entries.append({**entry, "artifact": records_name})
+
+        if not records_entries:
+            raise ProvenanceError(f"No seed*/{records_name} under {root}")
+        if len(benchmarks) != 1:
+            raise ProvenanceError(
+                f"Expected one benchmark under {root}; found {sorted(benchmarks)}"
+            )
+
+        benchmark = benchmarks.pop()
+        sources = {
+            f"{benchmark}_records": records_entries,
+            f"{benchmark}_checkpoint": run_entries,
+        }
+        return cls(sources=sources, requirements=FigureRequirements.load()), benchmark
+
+    @classmethod
     def load(cls, path: str | Path | None = None, *,
              figures_yaml: str | Path = FIGURES_YAML,
              root: Path = PROJECT_ROOT) -> Manifest:

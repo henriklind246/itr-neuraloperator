@@ -81,7 +81,7 @@ def schematic_arrow(ax, start: tuple[float, float], end: tuple[float, float],
 def field_map(ax, field: np.ndarray, limits: style.ColorLimits, *,
               extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
               interface_x: float | None = None, title: str = "",
-              xlabel: str = "", ylabel: str = ""):
+              xlabel: str = "", ylabel: str = "", tick_bins: int = 4):
     """Render an ``(Nx, Ny)`` field with x horizontal and y vertical.
 
     Trajectory arrays are indexed ``[x, y]``, so the array is transposed once,
@@ -91,6 +91,12 @@ def field_map(ax, field: np.ndarray, limits: style.ColorLimits, *,
     and an anisotropic stretch is not a neutral choice: it changes the apparent
     shape of a heating patch and the apparent angle at which a front meets the
     interface, which are the things these panels exist to show.
+
+    ``tick_bins`` is the tick density, and it has to fall as the panel does.
+    Tick labels are at a fixed point size, so a "0.00" is the same 0.21 in wide
+    whatever the map measures; four of them are comfortable across 1.4 in and
+    touching across 1.0 in. Lower it rather than shrinking the type, which is
+    the thing a small panel most needs to keep.
     """
     arr = np.asarray(field, dtype=float)
     if arr.ndim != 2:
@@ -102,7 +108,8 @@ def field_map(ax, field: np.ndarray, limits: style.ColorLimits, *,
     # label of one panel lands on the first label of its neighbour and reads as
     # "1.000.00". Pruning costs one tick and removes the collision outright.
     for axis in (ax.xaxis, ax.yaxis):
-        axis.set_major_locator(mpl.ticker.MaxNLocator(nbins=4, prune="upper"))
+        axis.set_major_locator(mpl.ticker.MaxNLocator(nbins=tick_bins,
+                                                      prune="upper"))
     if interface_x is not None:
         ax.axvline(interface_x, color="w", linewidth=0.8, alpha=0.85)
         ax.axvline(interface_x, color="k", linewidth=0.4, alpha=0.6)
@@ -188,6 +195,7 @@ def map_grid(width_in: float, n_rows: int, *, n_maps: int = 3,
              left_in: float = _LEFT_IN, right_in: float = 0.10,
              top_in: float = _TOP_IN,
              bottom_in: float = _BOTTOM_IN,
+             row_gap_in: float = _ROW_GAP_IN,
              cbar_label_in: float = _CBAR_LABEL_IN) -> MapGrid:
     """Lay out ``n_rows x n_maps`` square field maps with dedicated colorbars.
 
@@ -228,6 +236,12 @@ def map_grid(width_in: float, n_rows: int, *, n_maps: int = 3,
     tick labels and its rotated label. The default suits a bar reading two or
     three significant figures; a grid whose bars carry six-character ticks
     (``300.20``) needs more, or the label lands on the next map.
+
+    ``top_in``, ``bottom_in`` and ``row_gap_in`` are the whole of the grid's
+    height budget besides the maps themselves, and they set how tall the figure
+    is relative to its width. The defaults reserve room for a suptitle and a
+    provenance footer; a grid that carries neither is paying for both, and on a
+    three-row grid that is close to half an inch of height it does not use.
     """
     cbars = tuple(sorted(set(colorbar_after)))
     unknown = set(colorbar_span) - set(cbars)
@@ -279,9 +293,9 @@ def map_grid(width_in: float, n_rows: int, *, n_maps: int = 3,
     tail = 0.0
     if extra_rows:
         tail = (_EXTRA_ROW_GAP_IN + extra_rows * size * extra_row_height
-                + (extra_rows - 1) * _ROW_GAP_IN)
+                + (extra_rows - 1) * row_gap_in)
     height_in = (top_in + bottom_in + n_rows * size
-                 + (n_rows - 1) * _ROW_GAP_IN + tail)
+                 + (n_rows - 1) * row_gap_in + tail)
     fig = plt.figure(figsize=(width_in, height_in))
 
     def rect(x_in, y_in, w_in, h_in):
@@ -290,7 +304,7 @@ def map_grid(width_in: float, n_rows: int, *, n_maps: int = 3,
 
     def row_bottom(row: int) -> float:
         # Rows run top-down; matplotlib measures from the bottom.
-        return height_in - top_in - (row + 1) * size - row * _ROW_GAP_IN
+        return height_in - top_in - (row + 1) * size - row * row_gap_in
 
     # x offsets are the same on every row, so walk the plan once.
     x = left_in
@@ -323,7 +337,7 @@ def map_grid(width_in: float, n_rows: int, *, n_maps: int = 3,
     inset = min(max(extra_row_inset_in, 0.0), 0.5 * size)
     for r in range(extra_rows):
         h = size * extra_row_height
-        y = base - (r + 1) * h - r * _ROW_GAP_IN
+        y = base - (r + 1) * h - r * row_gap_in
         rows.append([fig.add_axes(rect(mx + inset, y, size - inset, h))
                      for mx in map_x])
 

@@ -616,6 +616,7 @@ class TestValidate:
                 loader,
                 torch.device("cpu"),
                 iface_mask=iface_mask,
+                x_grid_t=torch.as_tensor(x_grid),
                 dataset=dataset,
                 pair_csv_path=tmp_path / name,
                 val_pairs_max_rows=cap,
@@ -1497,3 +1498,24 @@ def test_metrics_summary_preserves_sigma_definition(tmp_path, legacy):
         assert summary[key]["val_sigma_nrmse_pct_p99"] == 9.0
         assert summary[key]["val_node_jump_gnrmse_pct"] == 6.0
         assert "val_gnrmse_pct" not in summary[key]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_final_metrics_preserve_best_and_final_peak_errors(tmp_path, legacy):
+    import json
+    from src.operators.train import _write_final_metrics
+
+    rows = [dict(epoch=0, is_best=1), dict(epoch=1, is_best=0)]
+    if not legacy:
+        rows[0].update(val_peak_jump_error_mean_K=0.2, val_peak_jump_error_p95_K=0.5)
+        rows[1].update(val_peak_jump_error_mean_K=0.3, val_peak_jump_error_p95_K=0.7)
+    with (tmp_path / "train_metrics.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    _write_final_metrics(tmp_path, seed=42, config={}, wall_time_s=1., status="completed")
+    report = json.loads((tmp_path / "final_metrics.json").read_text())
+    assert report["best"]["val_peak_jump_error_mean_K"] == (None if legacy else 0.2)
+    assert report["best"]["val_peak_jump_error_p95_K"] == (None if legacy else 0.5)
+    assert report["final"]["val_peak_jump_error_mean_K"] == (None if legacy else 0.3)
+    assert report["final"]["val_peak_jump_error_p95_K"] == (None if legacy else 0.7)

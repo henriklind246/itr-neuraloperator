@@ -24,6 +24,17 @@ def main() -> int:
         help="CSV filename per seed when --write-test-records is enabled (default: test_records.csv).",
     )
     parser.add_argument(
+        "--no-figures", action="store_true",
+        help=(
+            "Skip the benchmark case figure that --write-test-records otherwise "
+            "renders into run_root/figures/."
+        ),
+    )
+    parser.add_argument(
+        "--figures-dir", default=None,
+        help="Where to write the case figure (default: run_root/figures).",
+    )
+    parser.add_argument(
         "--device", choices=("cpu", "cuda", "mps", "auto"), default=None,
         help="Override the checkpoint's evaluation device.",
     )
@@ -168,7 +179,35 @@ def main() -> int:
 
     summary = print_seed_report(results)
     save_report(run_root=str(run_root), results=results, summary=summary, report_name=args.report_name)
+
+    if args.write_test_records and not args.no_figures:
+        render_case_figure(run_root, args.records_name, args.figures_dir)
     return 0
+
+
+def render_case_figure(run_root: Path, records_name: str, out_dir: str | None) -> None:
+    """Draw the benchmark's case figure from the records this eval just wrote.
+
+    Deliberately non-fatal. The evaluation's own output is already on disk by
+    this point, and a plotting problem -- a stale checkpoint format, a dataset
+    the figure cannot reach, no matplotlib in the environment -- is not a reason
+    to fail a job whose numbers are fine.
+    """
+    try:
+        from visual.pub.autorender import render_run
+    except ImportError as exc:
+        print(f"warning: skipping case figure, plotting unavailable: {exc}", file=sys.stderr)
+        return
+    try:
+        paths = render_run(run_root, records_name=records_name, out_dir=out_dir)
+    except Exception as exc:
+        print(f"warning: could not render case figure: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return
+    if not paths:
+        print("No case figure is defined for this benchmark.")
+    for path in paths:
+        print(f"Saved figure -> {path}")
 
 
 if __name__ == "__main__":

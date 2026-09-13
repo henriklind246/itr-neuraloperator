@@ -25,10 +25,12 @@ from src.operators.losses import (
     get_batch_interface_x,
     interface_flanking_nodes,
     interface_flanking_nodes_per_sample,
+    peak_jump_error_stats,
     per_sample_node_jump_errors,
     per_sample_nrmse,
     per_sample_sq_rms,
     tail_stats,
+    update_peak_jump_maxima,
 )
 from src.operators.rollout import (
     RolloutOptions,
@@ -228,6 +230,10 @@ def evaluate(
                             * 100; the scale is sqrt(sigma_train**2 +
                             (mu_train - temperature_reference_K)**2).
         gnrmse_pct_p99:     p99 of pair RMSE_K / the same rise scale * 100.
+        peak_jump_error_mean_K / peak_jump_error_p95_K: absolute difference
+                            of predicted/truth peak node-jump magnitudes over
+                            evaluated s=0, j>0 targets, reduced across sims.
+                            NaN without pair identity or initial-state predictions.
         node_jump_gnrmse_pct: mean pair jump RMSE / training sigma * 100
                             (the legacy jump diagnostic, identical in train/val).
 
@@ -248,6 +254,7 @@ def evaluate(
             interface_half_width=interface_half_width,
             use_per_sample_interface=use_per_sample_interface,
             prediction_batches=prediction_batches,
+            interface_x=interface_x,
         )
 
     x_grid_t = None
@@ -282,6 +289,13 @@ def evaluate(
         node_jump_nrmse_all: list[torch.Tensor] = []
         node_jump_gnrmse_all: list[torch.Tensor] = []
         max_err_K = 0.0
+        peak_jumps = {}
+        pair_cursor = 0
+        pairs = getattr(test_loader.dataset, "_pairs", None)
+        if prediction_batches is None and not isinstance(
+            test_loader.sampler, torch.utils.data.SequentialSampler
+        ):
+            pairs = None
 
         batches = prediction_batches if prediction_batches is not None else (
             (batch, None) for batch in test_loader
@@ -332,11 +346,18 @@ def evaluate(
                 err_rms_i, true_jump_rms_i = per_sample_node_jump_errors(
                     y_pred, y_batch, left, right
                 )
+                if pairs is not None:
+                    update_peak_jump_maxima(
+                        peak_jumps, pairs[pair_cursor:pair_cursor + len(y_batch)],
+                        y_pred, y_batch, left, right, sigma_s + T_EPS,
+                    )
                 node_jump_rmse_K_all.append((err_rms_i * sig).cpu())
                 node_jump_gnrmse_all.append(err_rms_i.cpu())
                 node_jump_nrmse_all.append(
                     (err_rms_i / true_jump_rms_i.clamp_min(EPS_JUMP)).cpu()
                 )
+
+            pair_cursor += len(y_batch)
 
             if iface_x is not None and x_grid_t is not None:
                 band = build_interface_band(x_grid_t, iface_x, interface_half_width)
@@ -390,6 +411,7 @@ def evaluate(
         node_jump_gnrmse_stats = tail_stats(torch.empty(0))
 
     return {
+        **peak_jump_error_stats(peak_jumps),
         "rel_l2_norm": rel_l2_norm,
         "rel_l2_phys": rel_l2_phys,
         "iface_rel_l2_norm": iface_rel_l2_norm,
@@ -436,14 +458,21 @@ def _evaluate_rollout(
     interface_half_width: float = 0.05,
     use_per_sample_interface: bool = False,
     prediction_batches=None,
+    interface_x: float = 0.5,
 ):
     dataset = test_loader.dataset
     if not hasattr(dataset, "_pairs"):
         raise ValueError("rollout evaluation requires a SnapshotPairDataset with _pairs")
 
     x_grid_t = None
-    if use_per_sample_interface and x_grid is not None:
+    if x_grid is not None:
         x_grid_t = torch.as_tensor(x_grid, dtype=torch.float32, device=device)
+
+    fixed_left = fixed_right = None
+    if x_grid is not None and not use_per_sample_interface:
+        fixed_left, fixed_right = interface_flanking_nodes(x_grid, interface_x)
+    peak_jumps = {}
+    pair_cursor = 0
 
     with torch.no_grad():
         model.eval()
@@ -489,6 +518,16 @@ def _evaluate_rollout(
             iface_x = get_batch_interface_x(
                 item_batch, device, use_per_sample_interface=use_per_sample_interface
             )
+            left, right = fixed_left, fixed_right
+            if use_per_sample_interface and iface_x is not None and x_grid_t is not None:
+                left, right = interface_flanking_nodes_per_sample(x_grid_t, iface_x)
+            if left is not None and right is not None:
+                update_peak_jump_maxima(
+                    peak_jumps, dataset._pairs[pair_cursor:pair_cursor + len(y_batch)],
+                    y_pred, y_batch, left, right, sigma_s + T_EPS,
+                )
+            pair_cursor += len(y_batch)
+
             if iface_x is not None and x_grid_t is not None:
                 band = build_interface_band(x_grid_t, iface_x, interface_half_width)
                 bf = band.to(y_batch.dtype).reshape(band.shape[0], band.shape[1], 1, 1)
@@ -510,6 +549,7 @@ def _evaluate_rollout(
         boundary_rel_l2_phys = math.sqrt(boundary_sums_phys[0] / max(boundary_sums_phys[1], 1e-12)) * 100.0
 
     return {
+        **peak_jump_error_stats(peak_jumps),
         "rel_l2_norm": rel_l2_norm,
         "rel_l2_phys": rel_l2_phys,
         "iface_rel_l2_norm": iface_rel_l2_norm,
@@ -686,6 +726,8 @@ def eval_all_seeds(
                 "test_gnrmse_pct_p99": float(metrics.get("gnrmse_pct_p99", float("nan"))),
                 "temperature_rise_scale_K": float(metrics.get("temperature_rise_scale_K", float("nan"))),
                 "test_max_err_K": float(metrics.get("max_err_K", float("nan"))),
+                "test_peak_jump_error_mean_K": float(metrics["peak_jump_error_mean_K"]),
+                "test_peak_jump_error_p95_K": float(metrics["peak_jump_error_p95_K"]),
                 "test_node_jump_rmse_K": float(metrics.get("node_jump_rmse_K", float("nan"))),
                 "test_node_jump_rmse_K_p95": float(metrics.get("node_jump_rmse_K_p95", float("nan"))),
                 "test_node_jump_nrmse": float(metrics.get("node_jump_nrmse", float("nan"))),
@@ -769,6 +811,12 @@ def print_seed_report(results: list[dict]) -> dict:
     jump_gnrmse_pct_mu, jump_gnrmse_pct_std = _seed_stat("test_node_jump_gnrmse_pct")
     jump_gnrmse_pct_p99_mu, _ = _seed_stat("test_node_jump_gnrmse_pct_p99")
 
+    peak_summary = {}
+    for key in ("test_peak_jump_error_mean_K", "test_peak_jump_error_p95_K"):
+        mu, std = mean_std([r.get(key, float("nan")) for r in results])
+        peak_summary[key + "_mean"] = mu
+        peak_summary[key + "_std"] = std
+
     print("\n===== Seed Report =====")
     print(f"Number of seeds: {len(results)}")
     print(f"best_val_loss            mean, std: ({val_mu}, {val_std})")
@@ -789,6 +837,10 @@ def print_seed_report(results: list[dict]) -> dict:
     print(f"test_node_jump_gnrmse(%) mean, p99: ({jump_gnrmse_pct_mu}, {jump_gnrmse_pct_p99_mu})")
     print(f"test_node_jump_nrmse (%) mean, std: ({jump_nrmse_mu}, {jump_nrmse_std})   <- offset-free interface")
 
+    for key in ("test_peak_jump_error_mean_K", "test_peak_jump_error_p95_K"):
+        print(f"{key} across seeds mean, std: "
+              f"({peak_summary[key + '_mean']}, {peak_summary[key + '_std']})")
+
     # Seed selection must never look at the test set: picking the seed that
     # minimizes test error and then quoting that seed's test error reports a
     # minimum over seeds as if it were a draw, which is optimistically biased.
@@ -804,6 +856,7 @@ def print_seed_report(results: list[dict]) -> dict:
     )
 
     return {
+        **peak_summary,
         "num_seeds": len(results),
         "best_val_loss_mean": val_mu,
         "best_val_loss_std": val_std,

@@ -121,7 +121,7 @@ _SPECS: tuple[FigureSpec, ...] = (
     _spec("F14_interfaces_difficulty", "Interfaces: what makes a case hard",
           "visual.pub.fig_benchmark", "difficulty", 1, "two_col",
           benchmark="interfaces"),
-    _spec("F15_interfaces_profiles", "Interfaces: temperature and jump profiles",
+    _spec("F15_interfaces_profiles", "Interfaces: representative interface positions",
           "visual.pub.fig_benchmark", "cases", 1, "two_col",
           benchmark="interfaces"),
     _spec("F21_tail_reliability", "Tail reliability across benchmarks",

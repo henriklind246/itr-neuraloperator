@@ -349,6 +349,50 @@ def per_sample_node_jump_errors(
     return err_rms, true_jump_rms
 
 
+def update_peak_jump_maxima(
+    peaks: dict[int, tuple[float, float]],
+    pairs: list[tuple[int, int, int]],
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    left,
+    right,
+    scale_K: float | torch.Tensor,
+) -> None:
+    """Accumulate separate predicted/truth spatial-time maxima for s=0 per sim.
+
+    Only evaluated positive target times contribute, matching publication tables.
+    ``scale_K`` is the inverse-normalization scale (sigma + T_EPS).
+    """
+    selected = [i for i, (_, s, j) in enumerate(pairs) if s == 0 and j > 0]
+    if not selected:
+        return
+    idx = torch.tensor(selected, device=y_pred.device)
+    left = left[idx] if torch.is_tensor(left) else left
+    right = right[idx] if torch.is_tensor(right) else right
+    scale = scale_K[idx] if torch.is_tensor(scale_K) and scale_K.ndim else scale_K
+    maxima = []
+    for field in (y_pred, y_true):
+        jump = _gather_x_node(field[idx], right) - _gather_x_node(field[idx], left)
+        maxima.append(jump.abs().flatten(1).amax(dim=1) * scale)
+    values = torch.stack(maxima, dim=1).detach().cpu().tolist()
+    for i, (pred, true) in zip(selected, values):
+        sid = int(pairs[i][0])
+        old_pred, old_true = peaks.get(sid, (0.0, 0.0))
+        peaks[sid] = (max(old_pred, pred), max(old_true, true))
+
+
+def peak_jump_error_stats(peaks: dict[int, tuple[float, float]]) -> dict[str, float]:
+    """Mean/P95 absolute peak-magnitude error across simulations, in Kelvin."""
+    errors = np.asarray([abs(pred - true) for pred, true in peaks.values()])
+    return {
+        "peak_jump_error_mean_K": float(errors.mean()) if errors.size else float("nan"),
+        "peak_jump_error_p95_K": (
+            float(np.quantile(errors, 0.95, method="linear"))
+            if errors.size else float("nan")
+        ),
+    }
+
+
 def per_sample_contact_jump_rmse(
     y_pred: torch.Tensor,
     y_true: torch.Tensor,

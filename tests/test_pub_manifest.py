@@ -799,3 +799,106 @@ class TestRealArtifact:
         assert {"SCHEMA_BELOW_REQUIRED", "TOO_FEW_SEEDS"} <= codes
         assert source.n_seeds == 1
         assert source.artifacts[0].benchmarks == ("source_itr_sin",)
+
+
+# ---------------------------------------------------------------------------
+# per-run discovery and auto-render
+# ---------------------------------------------------------------------------
+
+
+class TestForRun:
+    """``Manifest.for_run`` -- the manifest an evaluation builds for itself.
+
+    An evaluation is pointed at a config directory anywhere on disk, so the
+    figure it produces cannot go through ``manifest.yaml``; these assert that
+    the directory alone carries enough to resolve the benchmark's case figure.
+    """
+
+    def test_collects_every_seed_and_names_the_benchmark(self, tmp_path):
+        for seed in ("42", "7"):
+            run = make_run(tmp_path, seed=seed)
+        mf, benchmark = Manifest.for_run(run.parent)
+        assert benchmark == "source_itr_sin"
+        assert sorted(e["seed"] for e in mf.sources["source_itr_sin_records"]) == [7, 42]
+        # The checkpoint set names the run but no artifact, so the same seed
+        # directories satisfy both halves of a case figure's requirements.
+        assert all("artifact" not in e for e in mf.sources["source_itr_sin_checkpoint"])
+        source = mf.resolve("F13_source_itr_sin_cases", strict=False)
+        assert source.benchmarks == ("source_itr_sin",)
+        assert source.n_seeds == 2
+
+    def test_honours_a_renamed_records_file(self, tmp_path):
+        run = make_run(tmp_path)
+        (run / "test_records.csv").rename(run / "records_r200.csv")
+        mf, _ = Manifest.for_run(run.parent, records_name="records_r200.csv")
+        assert mf.sources["source_itr_sin_records"][0]["artifact"] == "records_r200.csv"
+        with pytest.raises(ProvenanceError, match="No seed"):
+            Manifest.for_run(run.parent)
+
+    def test_rejects_unusable_directories(self, tmp_path):
+        with pytest.raises(ProvenanceError, match="does not exist"):
+            Manifest.for_run(tmp_path / "absent")
+        with pytest.raises(ProvenanceError, match="No seed"):
+            Manifest.for_run(tmp_path)
+        run = make_run(tmp_path)
+        (run / "config_used.yaml").unlink()
+        with pytest.raises(ProvenanceError, match="Missing run configuration"):
+            Manifest.for_run(run.parent)
+
+    def test_rejects_a_directory_mixing_benchmarks(self, tmp_path):
+        run = make_run(tmp_path)
+        other = run.parent / "seed7"
+        other.mkdir()
+        (other / "config_used.yaml").write_text(yaml.safe_dump({"benchmark": "forcing"}))
+        write_records(other / "test_records.csv", version=2, benchmark="forcing")
+        with pytest.raises(ProvenanceError, match="Expected one benchmark"):
+            Manifest.for_run(run.parent)
+
+
+class TestAutoRender:
+    def test_routes_each_benchmark_to_its_case_figure(self, tmp_path, monkeypatch):
+        from visual.pub import autorender
+
+        calls = []
+        monkeypatch.setattr(registry, "render", lambda key, **kw: (
+            calls.append((key, kw)) or SimpleNamespace(paths=[tmp_path / "f.pdf"])))
+        run = make_run(tmp_path, benchmark="forcing", name="pub_forcing")
+        assert autorender.render_run(run.parent) == [tmp_path / "f.pdf"]
+        key, kwargs = calls[0]
+        assert key == "F09_forcing_cases"
+        assert kwargs["out_dir"] == run.parent / "figures"
+        # Non-strict so a one-seed evaluation still renders, into degraded/;
+        # forced because the eval that just ran is the newer source of truth.
+        assert not kwargs["strict"] and kwargs["force"]
+        assert autorender.render_run(run.parent, out_dir=tmp_path / "out")
+        assert calls[1][1]["out_dir"] == tmp_path / "out"
+
+    def test_benchmark_without_a_case_figure_renders_nothing(self, tmp_path, monkeypatch):
+        from visual.pub import autorender
+
+        monkeypatch.setattr(registry, "render", lambda *a, **k: pytest.fail("rendered"))
+        run = make_run(tmp_path, benchmark="forcing_itr", name="pub_forcing_itr")
+        assert autorender.render_run(run.parent) == []
+
+    def test_every_case_figure_is_registered(self):
+        from visual.pub import autorender
+
+        assert set(autorender.CASE_FIGURES.values()) <= set(registry.FIGURES)
+
+
+class TestEvalHook:
+    """A plotting failure must not fail an evaluation whose numbers are fine."""
+
+    def test_reports_failure_without_raising(self, tmp_path, capsys):
+        import scripts.run_eval as run_eval
+
+        run_eval.render_case_figure(tmp_path, "test_records.csv", None)
+        assert "could not render case figure" in capsys.readouterr().err
+
+    def test_announces_a_benchmark_with_no_case_figure(self, tmp_path, monkeypatch, capsys):
+        import scripts.run_eval as run_eval
+        from visual.pub import autorender
+
+        monkeypatch.setattr(autorender, "render_run", lambda *a, **k: [])
+        run_eval.render_case_figure(tmp_path, "test_records.csv", None)
+        assert "No case figure" in capsys.readouterr().out

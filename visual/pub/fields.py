@@ -403,15 +403,25 @@ def _transverse_grid(run_dir_str: str) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def transverse_fraction(bundle_: RunBundle, sim_ids, targets) -> np.ndarray:
-    """Transverse variance fraction of the truth field at each ``(sim_id, j)``."""
-    grid = _transverse_grid(str(bundle_.run_dir))
+def _lookup(grid: np.ndarray, sim_ids, targets) -> np.ndarray:
+    """Read a ``(n_sims, n_times)`` grid at ``(sim_id, j)``, zero off the edge.
+
+    Records can name a ``(sim_id, j)`` the loaded trajectories do not carry --
+    a records file written against a larger dataset than the one the manifest
+    resolves to. Those score zero and are dropped by every threshold rather
+    than raising, which is the same outcome as being genuinely featureless.
+    """
     sim = np.asarray(sim_ids, dtype=np.int64)
     tgt = np.asarray(targets, dtype=np.int64)
     inside = (sim >= 0) & (sim < grid.shape[0]) & (tgt >= 0) & (tgt < grid.shape[1])
     out = np.zeros(sim.shape, dtype=np.float64)
     out[inside] = grid[sim[inside], tgt[inside]]
     return out
+
+
+def transverse_fraction(bundle_: RunBundle, sim_ids, targets) -> np.ndarray:
+    """Transverse variance fraction of the truth field at each ``(sim_id, j)``."""
+    return _lookup(_transverse_grid(str(bundle_.run_dir)), sim_ids, targets)
 
 
 def transverse_pairs(bundle_: RunBundle, pair_df, *,
@@ -433,7 +443,8 @@ def transverse_pairs(bundle_: RunBundle, pair_df, *,
 def select_transverse_case(bundle_: RunBundle, sims, pair_df, *,
                            minimum: float = MIN_TRANSVERSE_FRACTION,
                            min_leads: int = 1,
-                           min_jump_contrast_K: float | None = None, **kwargs):
+                           min_jump_contrast_K: float | None = None,
+                           min_field_contrast_K: float | None = None, **kwargs):
     """:func:`select.select_case`, restricted to cases that vary along ``y``.
 
     The restriction is applied to the two frames *before* selection rather than
@@ -447,6 +458,11 @@ def select_transverse_case(bundle_: RunBundle, sims, pair_df, *,
     times needs one -- transverse structure decays, so the restriction strips
     the long leads and leaves a quarter of the simulations with a single lead,
     whose columns would then all be the same snapshot.
+
+    ``min_field_contrast_K`` narrows to cases whose truth field spans that many
+    Kelvin. The transverse fraction is scale-free and so clears on fields that
+    are structured but almost isothermal; under a figure-wide shared colour
+    scale those draw as a flat 300 K block.
 
     ``min_jump_contrast_K`` narrows further to cases whose *contact jump* spans
     that many Kelvin along y. A figure with a jump row needs it: the transverse
@@ -466,6 +482,8 @@ def select_transverse_case(bundle_: RunBundle, sims, pair_df, *,
     sim_df = getattr(sims, "df", sims)
     pair_df = getattr(pair_df, "df", pair_df)
     kept = transverse_pairs(bundle_, pair_df, minimum=minimum)
+    if min_field_contrast_K is not None:
+        kept = field_contrast_pairs(bundle_, kept, minimum=min_field_contrast_K)
     if min_jump_contrast_K is not None:
         kept = jump_contrast_pairs(bundle_, kept, minimum=min_jump_contrast_K)
     if kept is not pair_df:
@@ -524,13 +542,7 @@ def _jump_contrast_grid(run_dir_str: str) -> np.ndarray:
 
 def jump_contrast(bundle_: RunBundle, sim_ids, targets) -> np.ndarray:
     """Peak-to-peak truth contact jump at each ``(sim_id, j)``, in Kelvin."""
-    grid = _jump_contrast_grid(str(bundle_.run_dir))
-    sim = np.asarray(sim_ids, dtype=np.int64)
-    tgt = np.asarray(targets, dtype=np.int64)
-    inside = (sim >= 0) & (sim < grid.shape[0]) & (tgt >= 0) & (tgt < grid.shape[1])
-    out = np.zeros(sim.shape, dtype=np.float64)
-    out[inside] = grid[sim[inside], tgt[inside]]
-    return out
+    return _lookup(_jump_contrast_grid(str(bundle_.run_dir)), sim_ids, targets)
 
 
 def jump_contrast_pairs(bundle_: RunBundle, pair_df, *,
@@ -556,6 +568,68 @@ def jump_contrast_note(minimum: float = MIN_JUMP_CONTRAST_K) -> str:
             f"{minimum:g} K along y, so the jump panel shows transverse "
             f"structure rather than a flat line; strata with no such case fall "
             f"back to the unrestricted pool")
+
+
+# ------------------------------------------------------------ field contrast
+
+# Peak-to-peak span of the truth temperature field, in Kelvin.
+#
+# The transverse fraction above is scale-free: a field varying by 0.01 K across
+# y scores exactly as well as one varying by 50 K. Under the figure-wide shared
+# colour scale that every cases figure uses, a low-amplitude case is drawn in a
+# single flat colour and reads as a blank 300 K panel however high its
+# transverse fraction is. Structure and amplitude are independent, and a
+# qualitative panel needs both.
+#
+# Flat cases are a large, systematic part of two benchmarks rather than a rare
+# edge. A quarter of `forcing` target fields are *exactly* uniform, the target
+# preceding any appreciable forcing; a quarter of `source` targets span under
+# 0.25 K, the patch having barely switched on.
+#
+# 2 K is a presentation threshold, recorded in the sidecar like the other two.
+# It clears the blank regime while leaving at least 30% of every benchmark's
+# pair pool, so the median rule inside the restriction still ranks a population
+# rather than choosing among a handful of survivors. It is also inert on
+# `interfaces` -- 99% of that benchmark's fields already span more than 2 K --
+# so it costs nothing on the one benchmark that does not need it.
+MIN_FIELD_CONTRAST_K = 2.0
+
+
+@lru_cache(maxsize=8)
+def _field_contrast_grid(run_dir_str: str) -> np.ndarray:
+    """``(n_sims, n_times)`` peak-to-peak truth temperature, in Kelvin."""
+    traj = np.asarray(_load(run_dir_str).trajectories, dtype=np.float64)
+    return np.ptp(traj, axis=(2, 3))
+
+
+def field_contrast(bundle_: RunBundle, sim_ids, targets) -> np.ndarray:
+    """Peak-to-peak truth temperature at each ``(sim_id, j)``, in Kelvin."""
+    return _lookup(_field_contrast_grid(str(bundle_.run_dir)), sim_ids, targets)
+
+
+def field_contrast_pairs(bundle_: RunBundle, pair_df, *,
+                         minimum: float = MIN_FIELD_CONTRAST_K):
+    """The subset of ``pair_df`` whose truth field spans a visible temperature range.
+
+    Returns the frame unchanged when the restriction would empty it, matching
+    :func:`transverse_pairs` and :func:`jump_contrast_pairs` so the three chain
+    and the caller can still tell by identity whether anything was removed.
+    """
+    pair_df = getattr(pair_df, "df", pair_df)
+    if not {"sim_id", "j"} <= set(pair_df.columns):
+        return pair_df
+    ptp = field_contrast(bundle_, pair_df["sim_id"].to_numpy(),
+                         pair_df["j"].to_numpy())
+    kept = pair_df[ptp >= float(minimum)]
+    return pair_df if kept.empty else kept
+
+
+def field_contrast_note(minimum: float = MIN_FIELD_CONTRAST_K) -> str:
+    """One sidecar-ready sentence describing the field-contrast restriction."""
+    return (f"restricted to cases whose truth field spans at least {minimum:g} K, "
+            f"so no panel is a flat 300 K block under the figure-wide shared "
+            f"colour scale; strata with no such case fall back to the "
+            f"unrestricted pool")
 
 
 def transverse_note(restricted: bool, minimum: float = MIN_TRANSVERSE_FRACTION) -> str:
@@ -600,6 +674,7 @@ def case_metrics(case: CaseFields) -> list[dict]:
 __all__ = [
     "CONTACT_JUMP_COHORT_SEED",
     "CONTACT_JUMP_COHORT_SIZE",
+    "MIN_FIELD_CONTRAST_K",
     "MIN_JUMP_CONTRAST_K",
     "MIN_TRANSVERSE_FRACTION",
     "CaseFields",
@@ -611,6 +686,9 @@ __all__ = [
     "checkpoint_path",
     "evaluate_case",
     "evaluate_contact_jump_cohort",
+    "field_contrast",
+    "field_contrast_note",
+    "field_contrast_pairs",
     "interface_location",
     "jump_contrast",
     "jump_contrast_note",

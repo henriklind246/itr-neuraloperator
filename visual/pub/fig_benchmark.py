@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import matplotlib.patheffects as patheffects
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 from matplotlib.patches import Rectangle
 
@@ -67,30 +66,38 @@ INTERACTIONS = {
 }
 
 # The stratum each case figure contrasts, and which of its levels to show. A
-# ``None`` level list means the extremes of the stratum's declared order, which
-# is the right contrast for an ordinal stratum; a categorical one names the
-# levels explicitly so the set is a stated editorial choice, not whichever
-# families happened to be sampled.
+# categorical stratum names its levels explicitly so the set is a stated
+# editorial choice, not whichever families happened to be sampled; an ordinal
+# one gives a column count instead, because its level labels are generated from
+# bin edges and hardcoding them would break on a reformat.
+#
+# The counts are not uniform, and deliberately so: each figure shows as many
+# columns as its benchmark's variation needs. `forcing` and `source` each carry
+# a three-way contrast that is part of the argument, `interfaces` needs three
+# interface positions to show the model is not memorising one discontinuity,
+# and `source_itr_sin` varies one scalar, for which the two extremes suffice.
 CASE_CONTRAST = {
-    "forcing": ("temporal_family", ("sin", "exp", "pulse_train", "exp_train")),
+    "forcing": ("temporal_family", ("sin", "exp", "pulse_train")),
     "source": ("regime", ("left", "near", "right")),
-    "source_itr_sin": ("itr_amplitude", None),
-    "interfaces": ("interface_x_bin", None),
+    "source_itr_sin": ("itr_amplitude", 2),
+    "interfaces": ("interface_x_bin", 3),
 }
 
 # A second stratum pinned to one distinct level per contrast column. `forcing`
 # crosses four temporal families with four spatial profiles, and selecting on
 # the temporal family alone leaves the profile to whichever simulation happens
 # to be that family's median -- which drew `gaussian` twice and `triangle`
-# twice, so the figure showed half the spatial factor and repeated itself. The
-# pairing is by declared order in ``stats.STRATUM_SPECS``, so one column per
-# profile as well as per family.
+# twice, so the figure showed half the spatial factor and repeated itself.
+#
+# Three columns cannot cover a 4x4 product, so the pairing is chosen for
+# contrast rather than for coverage: broad and smooth (`sin` / `uniform`),
+# localized (`exp` / `gaussian`), and pulsed with transverse structure
+# (`pulse_train` / `triangle`).
 CASE_COVER = {
     "forcing": ("spatial_family", {
         "sin": "uniform",
-        "exp": "patch",
-        "pulse_train": "gaussian",
-        "exp_train": "triangle",
+        "exp": "gaussian",
+        "pulse_train": "triangle",
     }),
 }
 
@@ -241,15 +248,22 @@ def _itr_panel(ax, source, frame):
 def _contrast_levels(df, stratum: str, wanted) -> list[str]:
     """The stratum levels a case figure shows, in display order.
 
-    ``wanted`` names them explicitly for a categorical stratum; ``None`` means
-    take the two extremes of the declared order, which is the informative
-    contrast for an ordinal one (a middle row would only interpolate).
+    ``wanted`` names them explicitly for a categorical stratum. An integer asks
+    for that many levels spread evenly over the declared order: two gives the
+    extremes, three the extremes plus a middle. An ordinal stratum is specified
+    this way rather than by name because its levels are labelled from bin
+    edges, which are a property of the sampled data and not stable enough to
+    hardcode.
     """
     if stratum not in df.columns:
         return []
     order = stats.stratum_order(df, stratum)
-    if wanted is None:
-        return [order[0], order[-1]] if len(order) > 1 else list(order)
+    if isinstance(wanted, int):
+        n = min(wanted, len(order))
+        if n < 1:
+            return []
+        idx = np.unique(np.linspace(0, len(order) - 1, n).round().astype(int))
+        return [order[i] for i in idx]
     return [level for level in order if level in wanted]
 
 
@@ -387,10 +401,13 @@ def difficulty(*, benchmark: str, source=None, spec=None, requirement=None):
 def cases(*, benchmark: str, source=None, spec=None, requirement=None):
     """F09 / F11 / F13 / F15 -- representative cases, per benchmark.
 
-    Design, once the artifacts exist:
+    Design:
 
-    * One column per contrast level, titled with the level; rows are FV truth,
-      FNO prediction, residual, and the contact-jump profile.
+    * One column per contrast level, titled with the level; three rows, being FV
+      truth, FNO prediction, and residual. There is no contact-jump row: the
+      jump evidence is consolidated into its own cross-benchmark figure, where
+      four curves can be compared directly instead of being spread one per
+      column across four figures on four different y scales.
     * Cases come from ``select.select_case`` at the **stratum** median, one per
       contrasting stratum value, so the figure shows a declared median case in
       each regime rather than whichever case looks most dramatic. The chosen
@@ -398,31 +415,33 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
       the sidecar.
     * Truth and prediction share one sequential scale across the whole figure
       via ``style.shared_color_limits(mode="sequential")``; residuals share one
-      symmetric diverging scale. The jump row does **not**: it is read for shape
-      rather than amplitude, and a shared axis flattens the small-amplitude
-      columns into a line.
-    * Selection is additionally restricted to cases whose truth contact jump
-      spans at least ``fields.MIN_JUMP_CONTRAST_K`` along ``y``, so the jump row
-      shows transverse structure. The median rule is unchanged inside that pool.
-    * The contrast per benchmark:
+      symmetric diverging scale. Per-column scales would rescale each column
+      against itself and hide the amplitude difference between the levels.
+    * Selection is restricted twice before the median rule runs, and the rule is
+      unchanged inside the restricted pool. ``fields.MIN_TRANSVERSE_FRACTION``
+      keeps cases whose truth field varies along ``y``, so the maps are not
+      effectively 1-D; ``fields.MIN_FIELD_CONTRAST_K`` keeps cases that span a
+      visible temperature range, so no column is a flat 300 K block under the
+      figure-wide shared scale. The two are independent -- a field can be
+      strongly transverse and almost isothermal -- and a qualitative panel needs
+      both. The transverse filter pulls toward earlier targets, where the
+      benchmarks still have structure, and the contrast filter pulls away from
+      the earliest, where nothing has happened yet.
+    * The contrast per benchmark, sized to what that benchmark varies rather
+      than to a uniform column count:
 
-      - ``forcing``: all four temporal families, smooth (``sin``, ``exp``)
-        against pulse-like (``pulse_train``, ``exp_train``), each pinned to a
-        different spatial profile via ``CASE_COVER`` so the four columns cover
-        both factors of the forcing product rather than repeating a profile.
+      - ``forcing``: three temporal families pinned to three different spatial
+        profiles via ``CASE_COVER``, chosen for contrast: broad and smooth,
+        localized, and pulsed with transverse structure.
       - ``source``: ``regime`` left / near-interface / right, with the patch
-        outline drawn on every panel so the reader can see where the heat went
-        in.
-      - ``source_itr_sin``: field plus contact jump, with the localized jump error
-        around the resistance profile made visible as a zoom or difference strip -- the resistance profile
-        is the point of the benchmark and it is small.
-      - ``interfaces``: temperature and contact-jump **profiles** rather than a
-        field grid, since the interesting variation is along ``y`` at the
-        interface and across ``x_I``.
-
-    * Every jump curve is the physical ``R_c(y) q_n(y, t)`` from
-      ``visual.pub.jump``, never the adjacent-node difference the training loss
-      uses.
+        outline drawn on every panel, so the reader sees the model handle the
+        source on both sides of the discontinuity and on top of it.
+      - ``interfaces``: three interface positions, low / middle / high, which is
+        the demonstration that the model is not memorising a fixed
+        discontinuity.
+      - ``source_itr_sin``: the two extremes of the resistance amplitude. This
+        benchmark varies one scalar on top of ``source``'s geometry, so it needs
+        fewer columns than the benchmarks whose variation is the argument.
     """
     key = _CASE_KEYS.get(benchmark, f"cases[{benchmark}]")
     frames = records.records_by_benchmark(source)
@@ -434,7 +453,7 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                 "evaluated rather than read.",
                 key=key)
 
-    stratum, wanted = CASE_CONTRAST.get(benchmark, ("lead_bin", None))
+    stratum, wanted = CASE_CONTRAST.get(benchmark, ("lead_bin", 3))
     cover_stratum, cover_map = CASE_COVER.get(benchmark, (None, {}))
     strata = (stratum,) + ((cover_stratum,) if cover_stratum else ())
     sims = stats.per_sim(frame, strata=strata,
@@ -456,22 +475,15 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
         if level in cover_map:
             strata_filter[cover_stratum] = cover_map[level]
         filters.append(strata_filter)
-        # The jump row is a quarter of this figure, and the transverse filter
-        # does not protect it: it scores the field, and a field can be strongly
-        # two-dimensional while its interface jump is flat. Narrowing on the
-        # jump's own spread makes the row show the transverse structure it
-        # exists to show.
         pick, is_2d = fields.select_transverse_case(
             bundle, sims.df, pair_df, quantile=0.5, metric="rmse_K",
-            strata_filter=strata_filter,
-            min_jump_contrast_K=fields.MIN_JUMP_CONTRAST_K)
+            min_field_contrast_K=fields.MIN_FIELD_CONTRAST_K,
+            strata_filter=strata_filter)
         picks.append(pick)
         restricted.append(is_2d)
         case = fields.evaluate_case(bundle, pick.sim_id, pick.s, (pick.j,))
         cases_.append(case)
-        stat.append(fields.case_metrics(case)[0]
-                    | {"contact_jump_ptp_K": float(fields.jump_contrast(
-                        bundle, [pick.sim_id], [pick.j])[0])})
+        stat.append(fields.case_metrics(case)[0])
 
     # One sequential temperature scale and one symmetric residual scale across
     # the whole figure. Per-case scales would rescale each column against
@@ -484,22 +496,36 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
         *[c.residual[0] for c in cases_], mode="diverging")
 
     width = getattr(spec, "width", "full_page")
-    # Columns are the contrast levels and rows are the three fields plus a
-    # trailing row of contact-jump curves, so a level reads top to bottom.
+    # Columns are the contrast levels and rows are the three fields, so a level
+    # reads top to bottom.
+    #
     # cbar_label_in above the default: a field spanning 300.00-300.20 puts
     # six-character ticks on the bar, which the default 0.50 in cannot hold.
-    # max_map_in bounds the two-level benchmarks, where dividing the full width
-    # by two columns would otherwise give page-tall maps.
+    #
+    # Everything else here is the height budget. These figures span both columns
+    # of the page, so what a reader feels as "too big" is height at a fixed
+    # width, i.e. the aspect ratio, and the aspect ratio of a grid of *square*
+    # maps is close to its column:row count. At three of each it is close to
+    # square no matter what, and the only slack is the non-map furniture:
+    # `cases` draws no suptitle and ships no footer, so the default top and
+    # bottom margins reserve about half an inch of height for things that are
+    # not there. Reclaiming it, and closing the row gaps that carry no tick
+    # labels (only the last row is labelled), is the whole of the available
+    # gain; it does not stretch a single panel.
+    #
+    # max_map_in then sets absolute size. Every column count here hits the
+    # bound, so it is what actually fixes the panel size, and it sits well below
+    # the width the page allows on purpose: the annotations, tick labels and row
+    # labels are at fixed point sizes, so shrinking the maps raises the type
+    # *relative to* the panels. Scaled back up to the text width it is the only
+    # way a three-row grid of maps reads at this size.
     last = len(levels) - 1
     grid = panels.map_grid(style.WIDTHS_IN[width], 3, n_maps=len(levels),
                            colorbar_after=(last,),
                            colorbar_rows={last: ((0, 1), (2,))},
-                           extra_rows=1, extra_row_height=0.78,
-                           extra_row_inset_in=0.24,
-                           max_map_in=1.65, cbar_label_in=0.60)
+                           max_map_in=1.05, cbar_label_in=0.60,
+                           top_in=0.24, bottom_in=0.38, row_gap_in=0.08)
     fig, axes = grid.fig, grid.maps
-    y_grid = np.asarray(bundle.y_grid, dtype=float)
-    color = style.benchmark_color(benchmark)
 
     for col, (level, case, pick) in enumerate(zip(levels, cases_, picks)):
         # A pinned second stratum has to be on the panel; otherwise the column
@@ -519,7 +545,10 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                 ax, field, limits, interface_x=case.interface_x,
                 title=title if row == 0 else "",
                 xlabel="$x$" if row == 2 else "",
-                ylabel=f"{name}\n$y$" if col == 0 else "")
+                ylabel=f"{name}\n$y$" if col == 0 else "",
+                # Four ticks per axis need about 1.4 in to clear each other at
+                # 7 pt; these maps are narrower than that by design.
+                tick_bins=3)
             # tick_params, not set_xticklabels: these axes keep an automatic
             # locator, which regenerates labels over any fixed list at draw
             # time.
@@ -536,25 +565,17 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                 panels.attach_colorbar(fig, im, ax, "$T_{FNO}-T_{FV}$ [K]",
                                        cax=grid.colorbars[last][1])
 
-        j_true, j_pred = case.contact_jumps()
-        ax_j = grid.rows[0][col]
-        ax_j.plot(y_grid, j_true[0], color="0.15", linewidth=1.0, label="FV")
-        ax_j.plot(y_grid, j_pred[0], color=color, linewidth=1.0,
-                  linestyle="--", label="FNO")
-        ax_j.set_xlabel("$y$")
-        ax_j.tick_params(axis="y", labelsize=5.5)
-        if col == 0:
-            ax_j.set_ylabel(f"${jump.rc_symbol(benchmark)}\\,q_n$ [K]",
-                            fontsize=7)
-            ax_j.legend(fontsize=5.5, loc="best", handletextpad=0.3,
-                        borderpad=0.2, labelspacing=0.2)
-
+        # Three short lines rather than two long ones: the second line of the
+        # two-line form is as wide as the panel itself at this map size, and a
+        # label that spans its own panel edge to edge reads as an overlay
+        # rather than as an annotation.
         axes[0][col].text(
             0.02, 0.02,
             f"sim {pick.sim_id} ({pick.rank_in_sims}/{pick.n_sims})\n"
-            f"$t_s$={case.t_source:.3g}  $\\bar t$={stat[col]['lead_time']:.3g}",
+            f"$t_s$={case.t_source:.3g}\n"
+            f"$\\bar t$={stat[col]['lead_time']:.3g}",
             transform=axes[0][col].transAxes, fontsize=5.0, color="w",
-            ha="left", va="bottom",
+            ha="left", va="bottom", linespacing=1.2,
             bbox=dict(facecolor="0.15", alpha=0.55, pad=1.0, edgecolor="none"))
         axes[2][col].text(
             0.97, 0.03,
@@ -567,27 +588,6 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
             bbox=dict(facecolor="w", alpha=0.75, edgecolor="none",
                       boxstyle="square,pad=0.15"))
 
-    # The jump row gets per-column y limits, unlike the maps. The columns differ
-    # by an order of magnitude in jump amplitude, and on a shared axis the small
-    # ones collapse onto a line that reads as "no transverse structure" when the
-    # profile in fact varies by a third of its own mean. The maps can afford a
-    # shared scale because amplitude is part of what they compare; the jump row
-    # is there to show *shape*, and shape is what a shared axis destroys. Every
-    # panel therefore carries its own tick labels -- the scales differ, so an
-    # unlabelled axis would be read off its neighbour and misread.
-    for ax_j in grid.rows[0]:
-        lo, hi = ax_j.get_ylim()
-        if lo <= 0.0 <= hi or min(abs(lo), abs(hi)) < 0.25 * max(hi - lo, 1e-12):
-            lo, hi = min(lo, 0.0), max(hi, 0.0)
-            ax_j.axhline(0.0, color="0.6", linewidth=0.5, zorder=0)
-        # A `uniform` forcing profile has a rigorously constant jump, so the
-        # autoscaled range is degenerate and matplotlib falls back to a decade
-        # of ticks around it.
-        if hi - lo < 1e-9:
-            mid = 0.5 * (lo + hi)
-            lo, hi = mid - 0.5, mid + 0.5
-        ax_j.set_ylim(lo, hi)
-        ax_j.yaxis.set_major_locator(mticker.MaxNLocator(nbins=4, prune="upper"))
     # The axes are placed at absolute offsets by `map_grid`; tight_layout would
     # undo that and reintroduce the ragged spacing it is there to prevent.
 
@@ -605,12 +605,8 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                         "per column" if cover_stratum else ""),
         "transverse_restriction": fields.transverse_note(all(restricted)),
         "transverse_minimum": fields.MIN_TRANSVERSE_FRACTION,
-        "jump": jump.JUMP_DEFINITION,
-        "jump_contrast_restriction": fields.jump_contrast_note(),
-        "jump_contrast_minimum_K": fields.MIN_JUMP_CONTRAST_K,
-        "jump_axis_scales": "one y scale per column, so each column's jump "
-                            "shape is legible at its own amplitude; the maps "
-                            "above still share one scale",
+        "field_contrast_restriction": fields.field_contrast_note(),
+        "field_contrast_minimum_K": fields.MIN_FIELD_CONTRAST_K,
         "color_scales": "one sequential temperature scale and one symmetric "
                         "diverging residual scale, each shared across every "
                         "panel in the figure",
