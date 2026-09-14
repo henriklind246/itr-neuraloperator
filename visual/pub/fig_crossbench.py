@@ -814,7 +814,11 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
             "parameters vary concurrently. "
         )
     else:
-        caption += "All evaluated positive leads are retained without smoothing or extrapolation. "
+        caption += (
+            "On uniform snapshot grids, equal source-target index lags are pooled "
+            "at a common lead time to avoid floating-point splitting. All evaluated "
+            "positive leads are retained without smoothing or extrapolation. "
+        )
     caption += f"The RMSE axis is {summary['yscale']}; resistance and lead axes are linear."
     representations = {
         b: sorted({m["representation"] for m in metadata.get(b, {}).values()

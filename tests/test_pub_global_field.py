@@ -20,8 +20,8 @@ from src.physics.internal_source import make_rc_sin_profile
 KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
 
 
-def field_records(n_sims=25, seed_counts=None):
-    grid = np.array([0.0, 0.04, 0.10, 0.16])
+def field_records(n_sims=25, seed_counts=None, grid=None):
+    grid = np.asarray([0.0, 0.04, 0.10, 0.16] if grid is None else grid, dtype=float)
     frames = {}
     seed_counts = seed_counts or {}
     for bidx, benchmark in enumerate(stats.GLOBAL_FIELD_BENCHMARKS):
@@ -141,6 +141,41 @@ def test_grid_resolves_float_duplicates_and_rejects_protocol_mismatch():
     frames["source"] = frames["source"].loc[frames["source"].s == 0]
     with pytest.raises(ProvenanceError, match="protocols"):
         summarize(frames, metadata=metadata)
+
+
+@pytest.mark.parametrize("with_grid_metadata", [False, True])
+def test_float32_uniform_leads_pool_all_start_times(with_grid_metadata):
+    grid = np.linspace(0, .3, 31, dtype=np.float32)
+    frames = field_records(n_sims=3, seed_counts={"forcing": 2}, grid=grid)
+    for frame in frames.values():
+        # Start-dependent errors expose accidental pooling of only a subset of
+        # source times at each nominal lead, even when every sim is present.
+        frame["sse_K2"] = (1 + frame.s) ** 2 * frame.num_error_cells
+    metadata = ({b: {seed: {"t_grid": grid.tolist()} for seed in f.seed.unique()}
+                 for b, f in frames.items()} if with_grid_metadata else None)
+    result = summarize(frames, metadata=metadata)
+    for benchmark, frame in frames.items():
+        rows = [r for r in result["lead"] if r["benchmark"] == benchmark]
+        assert len(rows) == 30
+        assert [r["lead_time"] for r in rows] == pytest.approx(np.arange(1, 31) * .01)
+        for lag, row in enumerate(rows, start=1):
+            pairs = frame[(frame.seed == "0") & (frame.sim_id == 0)
+                          & (frame.j - frame.s == lag)]
+            expected = np.sqrt(pairs.sse_K2.sum() / pairs.num_error_cells.sum())
+            assert row["median_rmse_K"] == pytest.approx(expected)
+            assert row["eligible_pairs_by_seed"] == {
+                seed: 3 * (31 - lag) for seed in frame.seed.unique()}
+    assert sum(r["eligible_pair_rows_total"] for r in result["lead"]) == sum(
+        len(frame) for frame in frames.values())
+
+
+def test_nonuniform_grid_preserves_distinct_leads_with_equal_index_lags():
+    grid = np.array([0, .01, .021, .04], dtype=np.float32)
+    frames = field_records(n_sims=3, grid=grid)
+    result = summarize(frames)
+    rows = [r for r in result["lead"] if r["benchmark"] == "forcing"]
+    assert len(rows) == 6
+    assert [r["lead_time"] for r in rows] == pytest.approx([.01, .011, .019, .021, .03, .04])
 
 
 @pytest.mark.parametrize("bounds,amp", [((0, 1), 0), ((0, 1), 2), ((-.2, .8), 1)])

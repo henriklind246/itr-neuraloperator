@@ -1578,6 +1578,13 @@ def _resolved_field_leads(frame, grid=None):
         valid = actual.notna()
         if not np.allclose(actual[valid], lead[valid], rtol=1e-7, atol=1e-9):
             raise ProvenanceError("lead_time_actual disagrees with the snapshot grid")
+    snapshot_indices = times.index.to_numpy(dtype=np.int64)
+    spacing = (times.iloc[-1] - times.iloc[0]) / (snapshot_indices[-1] - snapshot_indices[0])
+    uniform_times = times.iloc[0] + (snapshot_indices - snapshot_indices[0]) * spacing
+    # Float32 snapshot roundoff is set by absolute time, not the much smaller
+    # lead. Equal index lags must pool together on a verified uniform grid.
+    if np.allclose(times, uniform_times, rtol=1e-7, atol=1e-9):
+        return (frame["j"] - frame["s"]).to_numpy(dtype=np.int64) * spacing, times
     # Subtraction at different start indices introduces roundoff even on an
     # exact regular grid. Resolve only differences below the grid's precision.
     unique = np.sort(np.unique(lead))
