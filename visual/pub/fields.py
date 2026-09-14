@@ -103,10 +103,45 @@ class CaseFields:
         return (jump_mod.contact_flux_map(self.truth, *args),
                 jump_mod.contact_flux_map(self.pred, *args))
 
+    def node_jumps(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(truth, prediction)`` adjacent-node jump, each ``(n_targets, Ny)``.
+
+        ``T(x_right, y) - T(x_left, y)`` across the two nodes flanking the
+        interface -- the quantity ``test_records.csv`` reports as
+        ``node_jump_rmse_K``, in the sign convention of ``eval.py`` (right minus
+        left, the opposite way round from :meth:`contact_jumps`).
+
+        This is not the physical contact jump: it carries both half-cell bulk
+        drops as well as the contact discontinuity. Use it where the claim is
+        about the shipped metric, and :meth:`contact_jumps` where the claim is
+        about the interface physics.
+        """
+        left, right = jump_mod.flanking_nodes(self.x_grid, self.interface_x)
+        return (self.truth[:, right, :] - self.truth[:, left, :],
+                self.pred[:, right, :] - self.pred[:, left, :])
+
 
 @dataclass(frozen=True)
 class ContactJumpCohort:
     """Physical contact jumps for a fixed simulation cohort and lead grid."""
+
+    benchmark: str
+    sim_ids: tuple[int, ...]
+    source_index: int
+    target_indices: tuple[int, ...]
+    lead_times: np.ndarray
+    truth: np.ndarray          # (n_sims, n_targets, Ny) Kelvin
+    pred: np.ndarray           # (n_sims, n_targets, Ny) Kelvin
+
+
+@dataclass(frozen=True)
+class NodeJumpCohort:
+    """Adjacent-node jumps for a fixed simulation cohort and lead grid.
+
+    Same shape as :class:`ContactJumpCohort` and a different quantity. Kept as a
+    separate type rather than a flag because the two are in different physical
+    spaces, and a figure handed the wrong one would draw without complaint.
+    """
 
     benchmark: str
     sim_ids: tuple[int, ...]
@@ -303,23 +338,19 @@ def evaluate_case(bundle_: RunBundle, sim_id: int, s: int,
     )
 
 
-def evaluate_contact_jump_cohort(
-    bundle_: RunBundle,
-    records_,
-    *,
-    n_sims: int = CONTACT_JUMP_COHORT_SIZE,
-    source_index: int = 0,
-    rng_seed: int = CONTACT_JUMP_COHORT_SEED,
-) -> ContactJumpCohort:
-    """Evaluate a reproducible simulation cohort on every future saved time.
+def _evaluate_jump_cohort(bundle_: RunBundle, records_, *, extract: str, kind: str,
+                          n_sims: int, source_index: int, rng_seed: int):
+    """Shared cohort walk for the contact-jump and node-jump evaluators.
 
-    The cohort is sampled without replacement from simulation IDs present in
-    the records and valid for the resolved run. No field or simulation-level
-    reduction happens here; :mod:`visual.pub.stats` owns those operations.
+    ``extract`` names the accessor that turns a case into a ``(truth, pred)`` pair
+    of ``(n_targets, Ny)`` profiles. It is looked up on the instance rather than
+    bound off :class:`CaseFields`, so a caller that supplies a stand-in case still
+    works. Returns the ingredients of a cohort dataclass, which the caller wraps
+    in the right type.
     """
     frame = getattr(records_, "df", records_)
     if "sim_id" not in frame.columns:
-        raise KeyError("contact-jump cohort selection requires sim_id")
+        raise KeyError(f"{kind} cohort selection requires sim_id")
     if n_sims <= 0:
         raise ValueError("n_sims must be positive")
 
@@ -346,15 +377,15 @@ def evaluate_contact_jump_cohort(
     lead_times = None
     for sim_id in sim_ids:
         case = evaluate_case(bundle_, int(sim_id), s, targets)
-        truth_jump, pred_jump = case.contact_jumps()
+        truth_jump, pred_jump = getattr(case, extract)()
         truth.append(truth_jump)
         pred.append(pred_jump)
         if lead_times is None:
             lead_times = case.lead_times
         elif not np.allclose(lead_times, case.lead_times):
-            raise ValueError("contact-jump cohort cases do not share a lead grid")
+            raise ValueError(f"{kind} cohort cases do not share a lead grid")
 
-    return ContactJumpCohort(
+    return dict(
         benchmark=bundle_.benchmark,
         sim_ids=tuple(int(v) for v in sim_ids),
         source_index=s,
@@ -363,6 +394,47 @@ def evaluate_contact_jump_cohort(
         truth=np.stack(truth),
         pred=np.stack(pred),
     )
+
+
+def evaluate_contact_jump_cohort(
+    bundle_: RunBundle,
+    records_,
+    *,
+    n_sims: int = CONTACT_JUMP_COHORT_SIZE,
+    source_index: int = 0,
+    rng_seed: int = CONTACT_JUMP_COHORT_SEED,
+) -> ContactJumpCohort:
+    """Evaluate a reproducible simulation cohort on every future saved time.
+
+    The cohort is sampled without replacement from simulation IDs present in
+    the records and valid for the resolved run. No field or simulation-level
+    reduction happens here; :mod:`visual.pub.stats` owns those operations.
+    """
+    return ContactJumpCohort(**_evaluate_jump_cohort(
+        bundle_, records_, extract="contact_jumps",
+        kind="contact-jump", n_sims=n_sims, source_index=source_index,
+        rng_seed=rng_seed,
+    ))
+
+
+def evaluate_node_jump_cohort(
+    bundle_: RunBundle,
+    records_,
+    *,
+    n_sims: int = CONTACT_JUMP_COHORT_SIZE,
+    source_index: int = 0,
+    rng_seed: int = CONTACT_JUMP_COHORT_SEED,
+) -> NodeJumpCohort:
+    """:func:`evaluate_contact_jump_cohort` for the adjacent-node jump.
+
+    Shares the cohort seed so the two figures describe the same simulations, and
+    a reader comparing them is seeing one population under two definitions.
+    """
+    return NodeJumpCohort(**_evaluate_jump_cohort(
+        bundle_, records_, extract="node_jumps",
+        kind="node-jump", n_sims=n_sims, source_index=source_index,
+        rng_seed=rng_seed,
+    ))
 
 
 # ------------------------------------------------------- transverse structure
@@ -444,6 +516,7 @@ def select_transverse_case(bundle_: RunBundle, sims, pair_df, *,
                            minimum: float = MIN_TRANSVERSE_FRACTION,
                            min_leads: int = 1,
                            min_jump_contrast_K: float | None = None,
+                           min_node_jump_contrast_K: float | None = None,
                            min_field_contrast_K: float | None = None, **kwargs):
     """:func:`select.select_case`, restricted to cases that vary along ``y``.
 
@@ -471,6 +544,11 @@ def select_transverse_case(bundle_: RunBundle, sims, pair_df, *,
     stratum with transverse cases but no contrasting jump keeps the transverse
     pool rather than dropping all the way back.
 
+    ``min_node_jump_contrast_K`` is the same restriction in the *adjacent-node*
+    jump, the quantity ``test_records.csv`` reports. The two are not
+    interchangeable -- see :data:`MIN_NODE_JUMP_CONTRAST_K` -- so a figure
+    filters in whichever space it plots.
+
     Falls back to the unrestricted pool when nothing in the requested stratum
     survives. Some strata have no such case to find -- ``forcing`` with a
     ``uniform`` spatial profile has a rigorously constant jump -- and refusing
@@ -486,14 +564,19 @@ def select_transverse_case(bundle_: RunBundle, sims, pair_df, *,
         kept = field_contrast_pairs(bundle_, kept, minimum=min_field_contrast_K)
     if min_jump_contrast_K is not None:
         kept = jump_contrast_pairs(bundle_, kept, minimum=min_jump_contrast_K)
+    if min_node_jump_contrast_K is not None:
+        kept = node_jump_contrast_pairs(bundle_, kept,
+                                        minimum=min_node_jump_contrast_K)
     if kept is not pair_df:
         eligible = set(kept["sim_id"])
         if min_leads > 1 and "t_bar" in kept.columns:
             counts = kept.groupby("sim_id")["t_bar"].nunique()
-            spanning = set(counts[counts >= min_leads].index)
-            if spanning:
-                eligible = spanning
-                kept = kept[kept["sim_id"].isin(spanning)]
+            # No simulation spans the requested leads inside the restriction, so
+            # the restriction cannot serve this figure at all. Returning a pick
+            # from it anyway reports ``True`` for a pool the caller would then
+            # draw columns from and find too thin.
+            eligible = set(counts[counts >= min_leads].index)
+            kept = kept[kept["sim_id"].isin(eligible)]
         keep_sims = sim_df[sim_df["sim_id"].isin(eligible)]
         if not keep_sims.empty:
             try:
@@ -632,6 +715,65 @@ def field_contrast_note(minimum: float = MIN_FIELD_CONTRAST_K) -> str:
             f"unrestricted pool")
 
 
+# -------------------------------------------------------- node-jump contrast
+
+# Peak-to-peak spread of the truth *adjacent-node* jump along y, in Kelvin.
+#
+# Not a rescaling of MIN_JUMP_CONTRAST_K. The two quantities are related by
+# contact = R_c/(R_c + h_L/k_L + h_R/k_R) * node, a prefactor that runs from
+# roughly 0.4 to 0.9 across the suite's R_c and conductivity ranges, and that
+# varies along y on source_itr_sin, where R_c is itself a function of y. A
+# threshold in one space is therefore not a threshold in the other, and the
+# figure that reports node_jump_rmse_K has to be filtered in the space it plots.
+#
+# 1.0 K rather than 0.5 K because the node jump carries both half-cell bulk
+# drops on top of the contact discontinuity and is correspondingly larger.
+MIN_NODE_JUMP_CONTRAST_K = 1.0
+
+
+@lru_cache(maxsize=8)
+def _node_jump_contrast_grid(run_dir_str: str) -> np.ndarray:
+    """``(n_sims, n_times)`` peak-to-peak truth adjacent-node jump, in Kelvin."""
+    b = _load(run_dir_str)
+    traj = np.asarray(b.trajectories, dtype=np.float64)
+    x_grid = np.asarray(b.x_grid, dtype=np.float64)
+    out = np.zeros(traj.shape[:2], dtype=np.float64)
+    for i in range(traj.shape[0]):
+        left, right = jump_mod.flanking_nodes(x_grid, interface_location(b, i))
+        out[i] = np.ptp(traj[i][:, right, :] - traj[i][:, left, :], axis=1)
+    return out
+
+
+def node_jump_contrast(bundle_: RunBundle, sim_ids, targets) -> np.ndarray:
+    """Peak-to-peak truth node jump at each ``(sim_id, j)``, in Kelvin."""
+    return _lookup(_node_jump_contrast_grid(str(bundle_.run_dir)), sim_ids, targets)
+
+
+def node_jump_contrast_pairs(bundle_: RunBundle, pair_df, *,
+                             minimum: float = MIN_NODE_JUMP_CONTRAST_K):
+    """The subset of ``pair_df`` whose truth node jump varies along ``y``.
+
+    Returns the frame unchanged when the restriction would empty it, matching
+    the other contrast filters so all four chain and the caller can still tell
+    by identity whether anything was removed.
+    """
+    pair_df = getattr(pair_df, "df", pair_df)
+    if not {"sim_id", "j"} <= set(pair_df.columns):
+        return pair_df
+    ptp = node_jump_contrast(bundle_, pair_df["sim_id"].to_numpy(),
+                             pair_df["j"].to_numpy())
+    kept = pair_df[ptp >= float(minimum)]
+    return pair_df if kept.empty else kept
+
+
+def node_jump_contrast_note(minimum: float = MIN_NODE_JUMP_CONTRAST_K) -> str:
+    """One sidecar-ready sentence describing the node-jump-contrast restriction."""
+    return (f"restricted to cases whose truth adjacent-node jump spans at least "
+            f"{minimum:g} K along y, so the jump profile shows transverse "
+            f"structure rather than a flat line; strata with no such case fall "
+            f"back to the unrestricted pool")
+
+
 def transverse_note(restricted: bool, minimum: float = MIN_TRANSVERSE_FRACTION) -> str:
     """One sidecar-ready sentence describing which pool a case was drawn from."""
     if restricted:
@@ -650,6 +792,7 @@ def case_metrics(case: CaseFields) -> list[dict]:
     comes from ``stats.py`` over ``test_records.csv``.
     """
     truth_jump, pred_jump = case.contact_jumps()
+    truth_node, pred_node = case.node_jumps()
     out: list[dict] = []
     for i in range(case.truth.shape[0]):
         err = case.pred[i] - case.truth[i]
@@ -657,6 +800,7 @@ def case_metrics(case: CaseFields) -> list[dict]:
         n = int(err.size)
         denom = float(np.sum((case.truth[i] - case.mu_global) ** 2))
         djump = pred_jump[i] - truth_jump[i]
+        dnode = pred_node[i] - truth_node[i]
         out.append({
             "j": case.targets[i],
             "t_target": float(case.t_targets[i]),
@@ -667,6 +811,10 @@ def case_metrics(case: CaseFields) -> list[dict]:
                 np.sqrt(float(np.sum(djump ** 2)) / max(djump.size, 1))),
             "contact_jump_rms_K": float(
                 np.sqrt(float(np.sum(truth_jump[i] ** 2)) / max(truth_jump[i].size, 1))),
+            "node_jump_rmse_K": float(
+                np.sqrt(float(np.sum(dnode ** 2)) / max(dnode.size, 1))),
+            "node_jump_rms_K": float(
+                np.sqrt(float(np.sum(truth_node[i] ** 2)) / max(truth_node[i].size, 1))),
         })
     return out
 
@@ -676,9 +824,11 @@ __all__ = [
     "CONTACT_JUMP_COHORT_SIZE",
     "MIN_FIELD_CONTRAST_K",
     "MIN_JUMP_CONTRAST_K",
+    "MIN_NODE_JUMP_CONTRAST_K",
     "MIN_TRANSVERSE_FRACTION",
     "CaseFields",
     "ContactJumpCohort",
+    "NodeJumpCohort",
     "RunBundle",
     "bundle",
     "bundles",
@@ -686,6 +836,7 @@ __all__ = [
     "checkpoint_path",
     "evaluate_case",
     "evaluate_contact_jump_cohort",
+    "evaluate_node_jump_cohort",
     "field_contrast",
     "field_contrast_note",
     "field_contrast_pairs",
@@ -694,6 +845,9 @@ __all__ = [
     "jump_contrast_note",
     "jump_contrast_pairs",
     "layer_conductivities",
+    "node_jump_contrast",
+    "node_jump_contrast_note",
+    "node_jump_contrast_pairs",
     "resistance",
     "run_dirs",
     "select_transverse_case",

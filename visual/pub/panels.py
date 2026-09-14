@@ -947,6 +947,115 @@ def recovery_scatter(ax, truth, estimate, *, polish=None, failed=None,
     ax.set_aspect("equal", adjustable="box")
 
 
+def jump_profile_family(ax, y, truth, pred, *, lead_times, color: str,
+                        xlabel: str = "$y$", ylabel: str = "",
+                        title: str = "", legend: bool = False) -> None:
+    """A family of truth/prediction interface-jump profiles, one pair per lead.
+
+    Truth is a wide translucent band, prediction a narrow crisp dash drawn on
+    top, both in the same tint so a pair reads as one comparison; the tint
+    darkens with lead time so error growth is visible inside the panel.
+    Deliberately not one colour per series: with three leads that would be six
+    colours and the eye would group by lead rather than by
+    truth-versus-prediction, which is the comparison being made.
+
+    The width asymmetry is what keeps both readable. Two lines of equal weight
+    coincide wherever the model is right, which is most of the domain, and the
+    one drawn second erases the other; a thin dash riding inside a wide band
+    stays legible whether they agree or not.
+    """
+    y = np.asarray(y, dtype=float)
+    truth = np.atleast_2d(np.asarray(truth, dtype=float))
+    pred = np.atleast_2d(np.asarray(pred, dtype=float))
+    lead_times = np.asarray(lead_times, dtype=float).ravel()
+    if truth.shape != pred.shape:
+        raise ValueError(
+            f"truth {truth.shape} and pred {pred.shape} must share one shape")
+    if truth.shape[0] != lead_times.size:
+        raise ValueError(
+            f"lead_times has {lead_times.size} entries for {truth.shape[0]} profiles")
+    if truth.shape[1] != y.size:
+        raise ValueError(
+            f"profiles have {truth.shape[1]} nodes for {y.size} y values")
+
+    base = np.asarray(mpl.colors.to_rgb(color))
+    n = truth.shape[0]
+    for i in range(n):
+        # The ramp runs past the base colour into a shaded version of it rather
+        # than stopping there, because three steps between white and the base
+        # alone put the middle lead too close to both of its neighbours to
+        # separate at print size. 0.62 is as near white as the lightest can go
+        # before it stops holding against the axes background.
+        mix = 0.62 - 0.92 * (i / max(n - 1, 1))
+        tint = tuple(base + (1.0 - base) * mix if mix >= 0.0
+                     else base * (1.0 + mix))
+        # Only the truth line is labelled. Labelling both doubles the legend to
+        # say the same thing twice; the solid/dashed key belongs once per figure.
+        ax.plot(y, truth[i], color=tint, linewidth=2.8, linestyle="-", zorder=3,
+                alpha=0.40, solid_capstyle="round",
+                label=f"$\\bar t$={lead_times[i]:.2f}")
+        ax.plot(y, pred[i], color=tint, linewidth=1.0, zorder=4,
+                linestyle=(0, (3.0, 1.4)),
+                label="_nolegend_")
+    ax.set_xlim(float(y.min()), float(y.max()))
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    if legend:
+        ax.legend(fontsize=7.0, loc="best", handlelength=1.6, borderpad=0.3,
+                  labelspacing=0.2, handletextpad=0.5, framealpha=0.75,
+                  ncol=1)
+
+
+def parity_scatter(ax, truth, pred, *, fit=None, color_by=None,
+                   norm=None, cmap: str = style.CMAP_SEQ_ORDINAL,
+                   color: str = "#0072B2", xlabel: str = "", ylabel: str = "",
+                   title: str = ""):
+    """Predicted against true values with the identity line, coloured by lead.
+
+    Returns the mappable so a caller can hang one shared colourbar off a row of
+    these; the colour scale has to be shared for the panels to be comparable.
+
+    Limits are square and symmetric about the identity line: an unequal aspect
+    turns a systematic slope error into something that looks like scatter.
+    """
+    truth = np.asarray(truth, dtype=float).ravel()
+    pred = np.asarray(pred, dtype=float).ravel()
+    ok = np.isfinite(truth) & np.isfinite(pred)
+    if color_by is None:
+        mappable = ax.scatter(truth[ok], pred[ok], s=1.5, color=color,
+                              linewidth=0.0, alpha=0.45, zorder=3)
+    else:
+        c = np.asarray(color_by, dtype=float).ravel()[ok]
+        mappable = ax.scatter(truth[ok], pred[ok], s=1.5, c=c, cmap=cmap,
+                              norm=norm, linewidth=0.0, alpha=0.55, zorder=3)
+
+    if ok.any():
+        lo = float(min(truth[ok].min(), pred[ok].min()))
+        hi = float(max(truth[ok].max(), pred[ok].max()))
+        pad = 0.06 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.06
+        span = (lo - pad, hi + pad)
+        ax.plot(span, span, color="0.4", linewidth=0.7, linestyle="--", zorder=1)
+        ax.set_xlim(*span)
+        ax.set_ylim(*span)
+    if fit is not None:
+        ax.text(0.04, 0.96,
+                f"slope {fit.slope:.3f}\nRMSE {fit.rmse:.3g} K",
+                transform=ax.transAxes, ha="left", va="top", fontsize=7.0,
+                color="0.2")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title, fontsize=7)
+    ax.grid(True, alpha=0.25)
+    ax.set_aspect("equal", adjustable="box")
+    return mappable
+
+
 def _spans_a_decade(values: np.ndarray) -> bool:
     """Whether the positive values cover more than one order of magnitude."""
     v = values[np.isfinite(values) & (values > 0)]
@@ -1093,9 +1202,11 @@ __all__ = [
     "ecdf_curves",
     "field_map",
     "joint_nll_contour_panel",
+    "jump_profile_family",
     "order_estimates",
     "pairwise_orders",
     "paired_sensor_sweep_panel",
+    "parity_scatter",
     "profile_likelihood_panel",
     "rate_bars",
     "rc_profile_recovery_panel",

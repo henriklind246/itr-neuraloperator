@@ -793,3 +793,60 @@ class TestMetricSpace:
         families = set(stats.POOLED_METRICS) | set(stats.RATIO_METRICS) \
             | set(stats.MEAN_METRICS)
         assert families == set(stats.METRICS)
+
+
+class TestParityFit:
+    def test_a_perfect_prediction_has_unit_slope_and_no_error(self):
+        truth = np.linspace(-4.0, 9.0, 50)
+        fit = stats.parity_fit(truth, truth, n_sims=6)
+        assert fit.slope == pytest.approx(1.0)
+        assert fit.rmse == pytest.approx(0.0)
+        assert fit.relative_pct == pytest.approx(0.0)
+        assert fit.n_points == 50
+        assert fit.n_sims == 6
+
+    def test_a_shrunk_prediction_reports_a_slope_below_one(self):
+        """The failure mode the parity panel exists to expose.
+
+        A model that under-predicts the jump magnitude everywhere has a small
+        RMSE when the jumps are small, so RMSE alone hides it; the slope does not.
+        """
+        truth = np.linspace(1.0, 10.0, 40)
+        fit = stats.parity_fit(truth, 0.8 * truth, n_sims=4)
+        assert fit.slope == pytest.approx(0.8)
+        assert fit.rmse > 0.0
+
+    def test_the_slope_is_through_the_origin(self):
+        """An intercept would fit a zero jump to a non-zero prediction.
+
+        With a constant offset added, a free-intercept fit would still report a
+        slope of 1 and hide the bias; the through-origin slope must not.
+        """
+        truth = np.linspace(1.0, 5.0, 40)
+        fit = stats.parity_fit(truth, truth + 2.0, n_sims=4)
+        assert fit.slope > 1.0
+
+    def test_span_covers_both_clouds(self):
+        fit = stats.parity_fit([0.0, 1.0], [-3.0, 7.0], n_sims=1)
+        assert fit.span == (-3.0, 7.0)
+
+    def test_mismatched_lengths_raise(self):
+        with pytest.raises(ValueError, match="same number of samples"):
+            stats.parity_fit(np.zeros(5), np.zeros(4), n_sims=1)
+
+    def test_empty_input_raises(self):
+        with pytest.raises(ValueError, match="at least one sample"):
+            stats.parity_fit(np.array([]), np.array([]), n_sims=1)
+
+    def test_non_finite_input_raises(self):
+        with pytest.raises(ValueError, match="finite"):
+            stats.parity_fit([1.0, np.nan], [1.0, 1.0], n_sims=1)
+
+    def test_shape_is_irrelevant_because_samples_are_pooled(self):
+        rng = np.random.default_rng(0)
+        truth = rng.standard_normal((4, 3, 5))
+        pred = truth * 0.9
+        flat = stats.parity_fit(truth.ravel(), pred.ravel(), n_sims=4)
+        block = stats.parity_fit(truth, pred, n_sims=4)
+        assert block.slope == pytest.approx(flat.slope)
+        assert block.n_points == 60

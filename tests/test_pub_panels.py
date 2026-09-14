@@ -187,3 +187,78 @@ class TestJointNllContourPanel:
                 ax, region, theta_hat=[0.45, 1.05], theta_true=[0.40, 1.20],
                 labels=("$R$", "$A$"),
             )
+
+
+class TestJumpProfileFamily:
+    def test_each_lead_draws_a_truth_and_a_prediction_line(self, ax):
+        y = np.linspace(0.0, 1.0, 20)
+        truth = np.stack([np.sin(np.pi * y), 2.0 * np.sin(np.pi * y)])
+        panels.jump_profile_family(ax, y, truth, truth + 0.1,
+                                   lead_times=[0.2, 0.8], color=COLOR)
+        assert len(ax.lines) == 4
+
+    def test_truth_and_prediction_are_separated_by_dash_pattern_not_colour(self, ax):
+        """Greyscale reproduction has to preserve the comparison being made."""
+        y = np.linspace(0.0, 1.0, 20)
+        truth = np.sin(np.pi * y)[None, :]
+        panels.jump_profile_family(ax, y, truth, truth + 0.1,
+                                   lead_times=[0.5], color=COLOR)
+        truth_line, pred_line = ax.lines
+        assert truth_line.get_linestyle() != pred_line.get_linestyle()
+        assert truth_line.get_color() == pred_line.get_color()
+
+    def test_the_tint_darkens_with_lead_time(self, ax):
+        y = np.linspace(0.0, 1.0, 8)
+        truth = np.zeros((3, 8))
+        panels.jump_profile_family(ax, y, truth, truth, lead_times=[0.1, 0.5, 0.9],
+                                   color=COLOR)
+        brightness = [sum(matplotlib.colors.to_rgb(line.get_color()))
+                      for line in ax.lines[::2]]
+        assert brightness[0] > brightness[1] > brightness[2]
+
+    def test_mismatched_shapes_raise_rather_than_broadcast(self, ax):
+        with pytest.raises(ValueError, match="must share one shape"):
+            panels.jump_profile_family(ax, np.linspace(0, 1, 8), np.zeros((2, 8)),
+                                       np.zeros((2, 7)), lead_times=[0.1, 0.2],
+                                       color=COLOR)
+
+    def test_a_lead_without_a_profile_raises(self, ax):
+        with pytest.raises(ValueError, match="lead_times has"):
+            panels.jump_profile_family(ax, np.linspace(0, 1, 8), np.zeros((2, 8)),
+                                       np.zeros((2, 8)), lead_times=[0.1, 0.2, 0.3],
+                                       color=COLOR)
+
+    def test_a_profile_must_match_the_y_grid(self, ax):
+        with pytest.raises(ValueError, match="y values"):
+            panels.jump_profile_family(ax, np.linspace(0, 1, 7), np.zeros((1, 8)),
+                                       np.zeros((1, 8)), lead_times=[0.1],
+                                       color=COLOR)
+
+
+class TestParityScatter:
+    def test_the_identity_line_is_drawn_and_the_axes_are_square(self, ax):
+        """An unequal aspect turns a slope bias into what looks like scatter."""
+        rng = np.random.default_rng(0)
+        truth = rng.standard_normal(200)
+        panels.parity_scatter(ax, truth, 0.8 * truth)
+        assert len(ax.lines) == 1
+        assert ax.get_xlim() == ax.get_ylim()
+        assert ax.get_aspect() == 1.0
+
+    def test_it_returns_a_mappable_so_one_colourbar_can_be_shared(self, ax):
+        truth = np.linspace(0.0, 1.0, 30)
+        mappable = panels.parity_scatter(ax, truth, truth, color_by=truth)
+        assert mappable.get_array() is not None
+
+    def test_non_finite_samples_are_dropped_rather_than_ruining_the_limits(self, ax):
+        truth = np.array([0.0, 1.0, np.nan])
+        pred = np.array([0.0, 1.0, 5.0])
+        panels.parity_scatter(ax, truth, pred)
+        low, high = ax.get_xlim()
+        assert high < 2.0
+
+    def test_the_fit_is_annotated_when_supplied(self, ax):
+        truth = np.linspace(1.0, 5.0, 20)
+        fit = stats.parity_fit(truth, 0.9 * truth, n_sims=3)
+        panels.parity_scatter(ax, truth, 0.9 * truth, fit=fit)
+        assert any("slope" in t.get_text() for t in ax.texts)

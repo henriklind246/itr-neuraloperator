@@ -382,3 +382,17 @@ figures:
     # mixed: the parameter axes are physical, the vertical axis is a
     # dimensionless log-likelihood difference against a chi-squared threshold.
     metric_space: mixed
+
+  # Same requirements as F26: both rows evaluate the network, so records alone
+  # are not enough.
+  F31_node_jump_fidelity:
+    requires:
+      - forcing_records
+      - source_records
+      - source_itr_sin_records
+      - interfaces_records
+      - forcing_checkpoint
+      - source_checkpoint
+      - source_itr_sin_checkpoint
+      - interfaces_checkpoint
+    metric_space: kelvin

@@ -502,6 +502,19 @@ class ContactJumpCurve:
 
 
 @dataclass(frozen=True)
+class ParityFit:
+    """Agreement between a predicted and a true quantity on a parity plot."""
+
+    slope: float
+    rmse: float
+    truth_rms: float
+    relative_pct: float
+    span: tuple[float, float]
+    n_points: int
+    n_sims: int
+
+
+@dataclass(frozen=True)
 class RolloutDeltaCurve:
     """Paired autoregressive-minus-direct error at exact lead times."""
 
@@ -1003,6 +1016,43 @@ def contact_jump_curve(lead_times, truth, pred) -> ContactJumpCurve:
         relative_q25_pct=_percentile(relative, 25),
         relative_q75_pct=_percentile(relative, 75),
         n_sims=int(truth.shape[0]),
+    )
+
+
+def parity_fit(truth, pred, *, n_sims: int) -> ParityFit:
+    """Summarize a truth-versus-prediction cloud for a parity panel.
+
+    The slope is least-squares **through the origin**: a zero jump has to predict
+    a zero jump, so an intercept would be fitting a physical impossibility and
+    would let a biased model report a slope of 1. Below 1 is systematic
+    under-prediction of the jump magnitude, which is the failure mode the panel
+    exists to expose.
+
+    Every ``(simulation, lead, y)`` sample is pooled, so ``rmse`` here is a
+    point-wise dispersion and not a simulation-level estimate; ``n_sims`` is
+    carried through so a caller cannot quote it as one. Use
+    :func:`contact_jump_curve` where the claim needs replication units.
+    """
+    truth = np.asarray(truth, dtype=np.float64).ravel()
+    pred = np.asarray(pred, dtype=np.float64).ravel()
+    if truth.shape != pred.shape:
+        raise ValueError("truth and pred must have the same number of samples")
+    if truth.size == 0:
+        raise ValueError("parity_fit requires at least one sample")
+    if not np.all(np.isfinite(truth)) or not np.all(np.isfinite(pred)):
+        raise ValueError("parity arrays must be finite")
+
+    truth_energy = float(np.sum(truth ** 2))
+    slope = float(np.sum(truth * pred) / truth_energy) if truth_energy > 1e-12 \
+        else float("nan")
+    rmse = float(np.sqrt(np.mean((pred - truth) ** 2)))
+    truth_rms = float(np.sqrt(truth_energy / truth.size))
+    relative = 100.0 * rmse / truth_rms if truth_rms > 1e-12 else float("nan")
+    lo = float(min(truth.min(), pred.min()))
+    hi = float(max(truth.max(), pred.max()))
+    return ParityFit(
+        slope=slope, rmse=rmse, truth_rms=truth_rms, relative_pct=relative,
+        span=(lo, hi), n_points=int(truth.size), n_sims=int(n_sims),
     )
 
 
@@ -1723,6 +1773,7 @@ __all__ = [
     "MetricSpec",
     "POOLED_METRICS",
     "PairedDelta",
+    "ParityFit",
     "RATIO_METRICS",
     "RankCorrelation",
     "RateCI",
@@ -1748,6 +1799,7 @@ __all__ = [
     "metric_spec",
     "representative_inverse_case",
     "paired_seed_delta",
+    "parity_fit",
     "per_sim",
     "pooled_rel_l2_pct",
     "pooled_rmse",

@@ -68,9 +68,11 @@ def signature(*, source=None, spec=None, requirement=None):
     # quantiles put the late columns exactly where there is nothing left to see
     # -- and the earliest one before the field has developed at all, which under
     # the shared temperature scale renders as a flat dark panel.
-    columns = select.select_lead_columns(
-        fields.transverse_pairs(bundle, frame.df), pick,
-        lead_quantiles=LEAD_QUANTILES)
+    # -- when the restriction held. When it did not, the pick was ranked in the
+    # full frame and is only guaranteed to span the leads there.
+    pool = fields.transverse_pairs(bundle, frame.df) if restricted else frame.df
+    columns = select.select_lead_columns(pool, pick,
+                                         lead_quantiles=LEAD_QUANTILES)
 
     cases = [fields.evaluate_case(bundle, pick.sim_id, s, (j,))
              for s, j in columns]

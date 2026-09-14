@@ -1,4 +1,4 @@
-"""Cross-benchmark figures: F04, F05, F07, F21 and F26-F28.
+"""Cross-benchmark figures: F04, F05, F07, F21, F26-F28 and F31.
 
 These are the figures the statistical redesign is *for*. Every reduction below
 comes from ``visual.pub.stats``: the defect being corrected is that the current
@@ -531,6 +531,192 @@ def physical_contact_jump_vs_lead(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
+NODE_JUMP_LEAD_QUANTILES = (0.1, 0.5, 0.9)
+
+# y nodes kept per profile when drawing the parity cloud. The cohort is 24
+# simulations x ~30 leads x ~100 y nodes, and 72k markers per panel is an
+# unreadable slab in the raster and a multi-megabyte path in the PDF. The fit
+# below is computed on the *full* cohort regardless, so the decimation changes
+# what is drawn and not what is reported; the factor is recorded in the sidecar.
+PARITY_Y_SAMPLES = 8
+
+
+def node_jump_fidelity(*, source=None, spec=None, requirement=None):
+    """F31 -- adjacent-node interface-jump fidelity across benchmarks.
+
+    Two rows over the same four benchmarks. The top row is one representative
+    case per benchmark, truth solid and prediction dashed at three lead times,
+    which shows whether the *shape* of the jump along y is recovered. The bottom
+    row is the whole seeded cohort as a parity cloud, which shows whether the
+    *magnitude* is, and whether the error is a slope bias or symmetric scatter --
+    a distinction the RMSE in F07 cannot make.
+
+    The quantity is the adjacent-node jump ``T(x_R, y) - T(x_L, y)``, which is
+    what ``test_records.csv`` reports as ``node_jump_rmse_K``. It is not the
+    physical contact jump; F26 shows that one.
+    """
+    frames = records.records_by_benchmark(source)
+    if not frames:
+        blocked(requirement, _RECORDS_NEEDED, key="F31_node_jump_fidelity")
+    order = [b for b in benchmark_order(frames) if fields.run_dirs(source, b)]
+    if not order:
+        blocked(requirement, _CHECKPOINT_NEEDED, key="F31_node_jump_fidelity")
+
+    cases, cohorts, fits, picks, restrictions, columns_by_bench = {}, {}, {}, {}, {}, {}
+    for bench in order:
+        frame = frames[bench]
+        bundle = fields.bundle(source, bench)
+        sims = stats.per_sim(frame, metrics=("rmse_K", "rel_l2_pct"))
+        pick, restricted = fields.select_transverse_case(
+            bundle, sims, frame.df, quantile=0.5, metric="rmse_K",
+            min_leads=len(NODE_JUMP_LEAD_QUANTILES),
+            min_node_jump_contrast_K=fields.MIN_NODE_JUMP_CONTRAST_K)
+        # The lead columns have to come from the pool the case was ranked in.
+        # When the restriction was dropped, the pick is only guaranteed to span
+        # the leads of the unrestricted frame.
+        pool = frame.df
+        if restricted:
+            pool = fields.node_jump_contrast_pairs(
+                bundle, fields.transverse_pairs(bundle, frame.df))
+        cols = select.select_lead_columns(
+            pool, pick, lead_quantiles=NODE_JUMP_LEAD_QUANTILES)
+        cases[bench] = [fields.evaluate_case(bundle, pick.sim_id, s, (j,))
+                        for s, j in cols]
+        cohort = fields.evaluate_node_jump_cohort(bundle, frame)
+        cohorts[bench] = cohort
+        fits[bench] = stats.parity_fit(cohort.truth, cohort.pred,
+                                       n_sims=len(cohort.sim_ids))
+        picks[bench] = pick
+        restrictions[bench] = restricted
+        columns_by_bench[bench] = cols
+
+    # One lead-time scale across every panel. Per-panel normalization would make
+    # the darkest marker mean a different lead in each column, and the row would
+    # stop being comparable across benchmarks.
+    lead_lo = min(float(c.lead_times.min()) for c in cohorts.values())
+    lead_hi = max(float(c.lead_times.max()) for c in cohorts.values())
+    norm = plt.Normalize(vmin=lead_lo, vmax=lead_hi)
+
+    width = spec.width if spec is not None else "two_col"
+    n_cols = len(order)
+    fig, axes = plt.subplots(
+        2, n_cols, squeeze=False,
+        figsize=style.figsize(width, rows=2, row_height="short", extra_in=0.5))
+    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.175, top=0.91,
+                        wspace=0.34, hspace=0.38)
+
+    mappable = None
+    for col, bench in enumerate(order):
+        color = style.benchmark_color(bench)
+        case_list = cases[bench]
+        y_grid = np.asarray(case_list[0].y_grid, dtype=float)
+        truth_profiles = np.stack([c.node_jumps()[0][0] for c in case_list])
+        pred_profiles = np.stack([c.node_jumps()[1][0] for c in case_list])
+        leads = np.asarray([float(c.lead_times[0]) for c in case_list])
+
+        ax_top = axes[0][col]
+        panels.jump_profile_family(
+            ax_top, y_grid, truth_profiles, pred_profiles, lead_times=leads,
+            color=color, xlabel="$y$", title=bench, legend=True)
+        ax_top.axhline(0.0, color="0.6", linewidth=0.5, zorder=0)
+        ax_top.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax_top.text(0.97, 0.03, f"sim {picks[bench].sim_id}",
+                    transform=ax_top.transAxes, ha="right", va="bottom",
+                    fontsize=5.0, color="0.35")
+
+        cohort = cohorts[bench]
+        lead_field = np.broadcast_to(
+            cohort.lead_times[None, :, None], cohort.truth.shape)
+        step = max(1, cohort.truth.shape[2] // PARITY_Y_SAMPLES)
+        mappable = panels.parity_scatter(
+            axes[1][col], cohort.truth[:, :, ::step], cohort.pred[:, :, ::step],
+            fit=fits[bench], color_by=lead_field[:, :, ::step], norm=norm,
+            xlabel="FV truth [K]",
+            ylabel="FNO prediction [K]" if col == 0 else "")
+        axes[1][col].xaxis.set_major_locator(MaxNLocator(nbins=4))
+        axes[1][col].yaxis.set_major_locator(MaxNLocator(nbins=4))
+
+    axes[0][0].set_ylabel(r"$\Delta T_{\rm node}$ [K]", fontsize=7)
+
+    # The tint in row A already carries lead time per panel, so the solid/dashed
+    # key is the only thing that has to be said once for the whole row.
+    fig.legend(handles=[Line2D([], [], color=style.GREY, linestyle="-",
+                               linewidth=2.8, alpha=0.40, label="FV truth"),
+                        Line2D([], [], color=style.GREY, linewidth=1.0,
+                               linestyle=(0, (3.0, 1.4)),
+                               label="FNO prediction")],
+               loc="lower left", bbox_to_anchor=(0.015, 0.0), ncol=1,
+               fontsize=8, frameon=False, handlelength=2.4,
+               labelspacing=0.4, handletextpad=0.6, borderaxespad=0.2)
+
+    cax = fig.add_axes([0.52, 0.055, 0.30, 0.022])
+    fig.colorbar(mappable, cax=cax, orientation="horizontal")
+    cax.set_xlabel(r"lead time $\bar t$", fontsize=7, labelpad=1.0)
+    cax.tick_params(labelsize=6)
+    style.panel_letters(axes)
+
+    metric_definition = {
+        "space": "kelvin",
+        "physical_quantity": "adjacent-node interface jump T(x_R, y) - T(x_L, y)",
+        "relation_to_contact_jump":
+            "not the physical contact jump; this quantity carries both half-cell "
+            "bulk drops as well as the contact discontinuity, and is reported "
+            "because it is the definition test_records.csv scores as "
+            "node_jump_rmse_K. See F26 for the physical jump.",
+        "sign_convention": "right minus left, matching src/operators/eval.py",
+        "row_a": {
+            "content": "one representative case per benchmark at lead-time "
+                       f"quantiles {NODE_JUMP_LEAD_QUANTILES} of that "
+                       "simulation's own t_bar",
+            "selection": "median simulation by pooled rmse_K within the "
+                         "restricted pool",
+            "node_jump_contrast_restriction":
+                fields.node_jump_contrast_note(),
+            "node_jump_contrast_minimum_K": fields.MIN_NODE_JUMP_CONTRAST_K,
+            "cases": {
+                b: {
+                    "sim_id": int(picks[b].sim_id),
+                    "restricted_pool": bool(restrictions[b]),
+                    "columns": [{"s": int(s), "j": int(j)}
+                                for s, j in columns_by_bench[b]],
+                }
+                for b in order
+            },
+        },
+        "row_b": {
+            "content": "every (simulation, lead, y) sample of the seeded cohort",
+            "protocol": "source snapshot s=0; every subsequent saved target time",
+            "cohort_selection": "sample without replacement from record sim_id values",
+            "cohort_rng_seed": fields.CONTACT_JUMP_COHORT_SEED,
+            "requested_simulations_per_benchmark": fields.CONTACT_JUMP_COHORT_SIZE,
+            "slope": "least squares through the origin",
+            "drawn_y_subsample": PARITY_Y_SAMPLES,
+            "subsampling_note": "markers are decimated along y for legibility; "
+                                "slope and RMSE are computed on the full cohort",
+            "pooling_note": "RMSE here is a point-wise dispersion over pooled "
+                            "samples, not a simulation-level estimate; F07 and "
+                            "F26 carry the replicated versions",
+            "fits": {
+                b: {
+                    "slope": fits[b].slope,
+                    "rmse_K": fits[b].rmse,
+                    "truth_rms_K": fits[b].truth_rms,
+                    "relative_pct": fits[b].relative_pct,
+                    "n_points": fits[b].n_points,
+                    "n_simulations": fits[b].n_sims,
+                    "sim_ids": list(cohorts[b].sim_ids),
+                    "source_index": cohorts[b].source_index,
+                    "lead_times": cohorts[b].lead_times.tolist(),
+                }
+                for b in order
+            },
+        },
+        "lead_color_limits": [lead_lo, lead_hi],
+        "benchmarks": order,
+    }
+    return fig, None, metric_definition
+
+
 _FIELD_MARKERS = {"forcing": "o", "source": "s", "source_itr_sin": "^", "interfaces": "D"}
 _FIELD_LINES = {"forcing": "-", "source": "--", "source_itr_sin": "-.", "interfaces": ":"}
 
@@ -683,6 +869,7 @@ __all__ = [
     "benchmark_order",
     "headline_accuracy",
     "jump_vs_lead",
+    "node_jump_fidelity",
     "physical_contact_jump_vs_lead",
     "tail_reliability",
     "truth_pred_residual",

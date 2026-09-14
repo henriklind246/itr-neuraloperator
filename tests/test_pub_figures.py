@@ -798,7 +798,7 @@ class TestBlocked:
     def test_the_blocked_set_is_the_whole_registry_minus_three(self):
         """If this changes, a figure was built or a key was added; both are news."""
         assert len(BLOCKED) == len(registry.FIGURES) - 3
-        assert len(registry.FIGURES) == 30
+        assert len(registry.FIGURES) == 31
 
     def test_every_renderable_key_is_tier_two(self):
         for key in RENDERABLE:
@@ -970,3 +970,168 @@ class TestCliAudit:
         code, out, _ = run_cli("--audit", str(tmp_path))
         assert code == cli.EXIT_OK
         assert "No rendered figures" in out
+
+
+# ---------------------------------------------------------------------------
+# F31: adjacent-node jump fidelity
+# ---------------------------------------------------------------------------
+
+
+def make_case_fields(truth, pred, *, x_grid=None, interface_x=0.5):
+    """A CaseFields carrying only what the jump accessors read."""
+    truth = np.asarray(truth, dtype=float)
+    x_grid = np.linspace(0.0, 1.0, truth.shape[1]) if x_grid is None else x_grid
+    return fields.CaseFields(
+        benchmark="forcing", sim_id=0, s=0, targets=(1,),
+        truth=truth, pred=np.asarray(pred, dtype=float), mu_global=300.0,
+        x_grid=np.asarray(x_grid, dtype=float),
+        y_grid=np.linspace(0.0, 1.0, truth.shape[2]),
+        t_source=0.0, t_targets=np.array([1.0]), lead_times=np.array([1.0]),
+        interface_x=interface_x, R_c=0.05, k_left=2.0, k_right=1.0, params=None,
+    )
+
+
+def test_node_jump_is_right_minus_left_matching_eval():
+    """The sign is the one ``src/operators/eval.py`` scores, not the physical one.
+
+    ``contact_jumps`` runs the other way round, so a figure that silently swapped
+    the two would draw a mirrored cloud with no error.
+    """
+    truth = np.zeros((1, 4, 3))
+    truth[0, 2, :] = 7.0          # the node right of x = 0.5
+    case = make_case_fields(truth, truth)
+    node_truth, node_pred = case.node_jumps()
+    assert node_truth.shape == (1, 3)
+    assert np.allclose(node_truth, 7.0)
+    assert np.allclose(node_pred, node_truth)
+
+    contact_truth, _ = case.contact_jumps()
+    assert np.sign(contact_truth).sum() == -np.sign(node_truth).sum()
+
+
+def test_node_jump_metrics_land_in_case_metrics():
+    truth = np.zeros((1, 4, 3))
+    truth[0, 2, :] = 4.0
+    pred = truth.copy()
+    pred[0, 2, :] = 5.0
+    row = fields.case_metrics(make_case_fields(truth, pred))[0]
+    assert row["node_jump_rmse_K"] == pytest.approx(1.0)
+    assert row["node_jump_rms_K"] == pytest.approx(4.0)
+
+
+def test_node_jump_cohort_shares_its_population_with_the_contact_cohort(monkeypatch):
+    """One seed, so the two jump figures describe the same simulations."""
+    bundle = SimpleNamespace(benchmark="forcing", n_sims=40, n_times=4)
+    frame = pd.DataFrame({"sim_id": np.repeat(np.arange(30), 2)})
+
+    class Case:
+        lead_times = np.array([0.1, 0.2, 0.3])
+
+        def __init__(self, sim_id):
+            self.sim_id = sim_id
+
+        def contact_jumps(self):
+            truth = np.full((3, 5), float(self.sim_id))
+            return truth, truth + 1.0
+
+        def node_jumps(self):
+            truth = np.full((3, 5), -2.0 * float(self.sim_id))
+            return truth, truth - 1.0
+
+    monkeypatch.setattr(
+        fields, "evaluate_case",
+        lambda _bundle, sim_id, _source, targets: Case(sim_id),
+    )
+    node = fields.evaluate_node_jump_cohort(bundle, frame, n_sims=8)
+    contact = fields.evaluate_contact_jump_cohort(bundle, frame, n_sims=8)
+
+    assert node.sim_ids == contact.sim_ids
+    assert node.target_indices == (1, 2, 3)
+    assert node.truth.shape == node.pred.shape == (8, 3, 5)
+    assert np.allclose(node.pred - node.truth, -1.0)
+
+
+def test_node_jump_cohort_is_its_own_type():
+    """A flag would let a figure be handed the wrong physical space silently."""
+    assert fields.NodeJumpCohort is not fields.ContactJumpCohort
+
+
+def test_node_jump_contrast_threshold_is_not_the_contact_threshold():
+    """The two live in different spaces; see MIN_NODE_JUMP_CONTRAST_K."""
+    assert fields.MIN_NODE_JUMP_CONTRAST_K != fields.MIN_JUMP_CONTRAST_K
+
+
+def test_node_jump_contrast_filter_returns_the_frame_when_it_would_empty(monkeypatch):
+    """Chaining contract: callers detect removal by identity, not by emptiness."""
+    frame = pd.DataFrame({"sim_id": [0, 1], "j": [1, 2]})
+    monkeypatch.setattr(fields, "node_jump_contrast",
+                        lambda _b, _s, _t: np.zeros(2))
+    kept = fields.node_jump_contrast_pairs(object(), frame, minimum=1.0)
+    assert kept is frame
+
+
+def test_node_jump_contrast_filter_keeps_the_contrasting_rows(monkeypatch):
+    frame = pd.DataFrame({"sim_id": [0, 1, 2], "j": [1, 2, 3]})
+    monkeypatch.setattr(fields, "node_jump_contrast",
+                        lambda _b, _s, _t: np.array([0.1, 5.0, 9.0]))
+    kept = fields.node_jump_contrast_pairs(object(), frame, minimum=1.0)
+    assert kept is not frame
+    assert list(kept["sim_id"]) == [1, 2]
+
+
+def test_node_jump_figure_draws_both_rows_and_records_the_decimation(monkeypatch):
+    frames = {b: SimpleNamespace(df=pd.DataFrame({"sim_id": [0, 1, 2]}))
+              for b in fig_crossbench.BENCH_ORDER}
+    monkeypatch.setattr(fig_crossbench.records, "records_by_benchmark",
+                        lambda _source: frames)
+    monkeypatch.setattr(fields, "run_dirs", lambda _source, _benchmark: [Path("run")])
+    monkeypatch.setattr(fields, "bundle", lambda _source, benchmark: benchmark)
+    monkeypatch.setattr(fig_crossbench.stats, "per_sim",
+                        lambda frame, metrics: frame)
+    monkeypatch.setattr(
+        fields, "select_transverse_case",
+        lambda *a, **k: (SimpleNamespace(sim_id=1), True))
+    monkeypatch.setattr(fields, "transverse_pairs", lambda _b, frame: frame)
+    monkeypatch.setattr(fields, "node_jump_contrast_pairs",
+                        lambda _b, frame, **k: frame)
+    monkeypatch.setattr(fig_crossbench.select, "select_lead_columns",
+                        lambda *a, **k: [(0, 1), (0, 2), (0, 3)])
+
+    y = np.linspace(0.0, 1.0, 40)
+
+    def case(_bundle, _sim, _s, targets):
+        j = targets[0]
+        profile = float(j) * np.sin(np.pi * y)[None, :]
+        return SimpleNamespace(
+            y_grid=y, lead_times=np.array([0.1 * j]),
+            node_jumps=lambda p=profile: (p, p + 0.05),
+        )
+
+    monkeypatch.setattr(fields, "evaluate_case", case)
+
+    def cohort(benchmark, _records):
+        truth = np.linspace(-3.0, 3.0, 3 * 2 * 40).reshape(3, 2, 40)
+        return fields.NodeJumpCohort(
+            benchmark=benchmark, sim_ids=(0, 1, 2), source_index=0,
+            target_indices=(1, 2), lead_times=np.array([0.1, 0.2]),
+            truth=truth, pred=0.9 * truth,
+        )
+
+    monkeypatch.setattr(fields, "evaluate_node_jump_cohort", cohort)
+
+    fig, selection, definition = fig_crossbench.node_jump_fidelity(
+        source=object(), spec=SimpleNamespace(width="two_col"), requirement=None,
+    )
+
+    assert selection is None
+    # 2 x 4 panels plus the shared lead-time colourbar.
+    assert len(fig.axes) == 9
+    assert definition["space"] == "kelvin"
+    assert "right minus left" in definition["sign_convention"]
+    assert set(definition["row_a"]["cases"]) == set(fig_crossbench.BENCH_ORDER)
+    # The fit is reported on the full cohort even though the cloud is thinned.
+    for bench in fig_crossbench.BENCH_ORDER:
+        fit = definition["row_b"]["fits"][bench]
+        assert fit["n_points"] == 3 * 2 * 40
+        assert fit["slope"] == pytest.approx(0.9)
+    plt.close(fig)

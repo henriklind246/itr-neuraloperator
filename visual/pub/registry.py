@@ -136,6 +136,11 @@ _SPECS: tuple[FigureSpec, ...] = (
     _spec("F28_global_field_error_vs_itr", "Global field RMSE stratified by interface-mean resistance",
           "visual.pub.fig_crossbench", "global_field_error_vs_itr", 1, "one_col",
           formats=("png", "pdf", "svg"), preserve_size=True),
+    # The adjacent-node companion to F26. Same four benchmarks, the other jump
+    # definition -- this is the one test_records.csv scores.
+    _spec("F31_node_jump_fidelity",
+          "Adjacent-node interface-jump fidelity across benchmarks",
+          "visual.pub.fig_crossbench", "node_jump_fidelity", 1, "two_col"),
 
     # ------------------------------- tier 3: blocked on experiments not yet run
     _spec("F16_inverse_forcing_recovery", "Parameter recovery: forcing",
