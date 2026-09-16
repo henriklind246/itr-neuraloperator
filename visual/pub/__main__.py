@@ -180,8 +180,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.global_field and any((args.figure, args.all, args.table, args.do_list, args.verify, args.audit)):
         parser.error("--global-field cannot be combined with other figure/table/inspection selectors")
-    if (args.runs_root or args.run) and not (args.global_field or args.table):
-        parser.error("--runs-root and --run require --global-field or --table")
+    if (args.runs_root or args.run) and not (args.global_field or args.table or args.verify):
+        parser.error("--runs-root and --run require --global-field, --table, or --verify")
     if args.run and not args.runs_root:
         parser.error("--run requires --runs-root")
     if args.runs_root and args.manifest != DEFAULT_MANIFEST:

@@ -656,6 +656,17 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
             cli.main(invalid)
 
 
+def test_verify_reports_satisfiability_of_discovered_runs(tmp_path, capsys):
+    # The preflight for a cluster: ask what the records already on disk can
+    # support, and what each gap needs, before spending a job rendering them.
+    from visual.pub import __main__ as cli
+    write_field_manifest(tmp_path / 'runs', n_sims=3)
+    assert cli.main(['--runs-root', str(tmp_path / 'runs'), '--verify']) == 2
+    out = capsys.readouterr().out
+    assert 'BLOCK F32_global_field_error_fixed_source' in out
+    assert 'figures satisfiable.' in out
+
+
 def test_discovered_runs_can_back_the_primary_table(tmp_path, monkeypatch, capsys):
     # T01 draws on the same four benchmarks discovery finds, so a cluster with
     # records but no manifest.yaml can write the table as well as the figures.

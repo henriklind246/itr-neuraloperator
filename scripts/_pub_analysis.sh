@@ -23,8 +23,28 @@ cd "$(dirname "$0")/.."
 
 ROOT="${1:-runs}"
 [ $# -gt 0 ] && shift
-PY="${PUB_PYTHON:-.venv/bin/python}"
 OUT="${PUB_OUT:-figures/pub}"
+
+# A cluster usually has no .venv; there the interpreter is whatever the loaded
+# module or conda environment provides. Resolve it once and say so, rather than
+# letting all three steps fail with a bare 127.
+if [ -n "${PUB_PYTHON:-}" ]; then
+  PY="$PUB_PYTHON"
+elif [ -x .venv/bin/python ]; then
+  PY=.venv/bin/python
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "No interpreter: set PUB_PYTHON=/path/to/python" >&2
+  exit 127
+fi
+if ! "$PY" -c 'import pandas, matplotlib' 2>/dev/null; then
+  echo "$PY cannot import pandas and matplotlib; set PUB_PYTHON to an environment that can" >&2
+  exit 127
+fi
+echo "python: $("$PY" -c 'import sys; print(sys.executable)')"
+echo "runs:   $ROOT"
+echo
 
 echo "=== source-time sweep: is F32's plotted t_s* representative? ==="
 "$PY" -u scripts/inspect_source_time_sweep.py --runs-root "$ROOT" "$@"
