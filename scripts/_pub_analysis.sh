@@ -10,9 +10,14 @@
 #   scripts/_pub_analysis.sh /scratch/$USER/runs
 #   scripts/_pub_analysis.sh /scratch/$USER/runs --run forcing=/scratch/$USER/runs/pub_forcing/config0
 #   PUB_PYTHON=python3 scripts/_pub_analysis.sh /scratch/$USER/runs
+#   PUB_OUT=/scratch/$USER/pub_out scripts/_pub_analysis.sh /scratch/$USER/runs
 #
 # Arguments after the root are forwarded to every step, which is how you
 # disambiguate a benchmark that has more than one evaluated experiment.
+#
+# Needs numpy, pandas, matplotlib, pyyaml and scipy, and nothing else: every
+# step reads test_records.csv and no step loads a model, so torch is not
+# required even though these are training artifacts.
 #
 # Steps report their exit code rather than aborting the run: the sweep returns 2
 # when the plotted source time is atypical and the figure and table steps return
@@ -38,12 +43,27 @@ else
   echo "No interpreter: set PUB_PYTHON=/path/to/python" >&2
   exit 127
 fi
-if ! "$PY" -c 'import pandas, matplotlib' 2>/dev/null; then
-  echo "$PY cannot import pandas and matplotlib; set PUB_PYTHON to an environment that can" >&2
+# Name every missing module at once. Checking a subset is worse than not
+# checking at all: it green-lights the interpreter and the steps fail anyway,
+# which is what a pandas-and-matplotlib-only check did on a cluster with no
+# scipy. torch is deliberately not on this list; nothing here loads a model.
+MISSING=$("$PY" - <<'EOF'
+from importlib.util import find_spec
+print(" ".join(pkg for pkg, mod in (("numpy", "numpy"), ("pandas", "pandas"),
+                                    ("matplotlib", "matplotlib"),
+                                    ("pyyaml", "yaml"), ("scipy", "scipy"))
+               if find_spec(mod) is None))
+EOF
+)
+if [ -n "$MISSING" ]; then
+  echo "$PY is missing:$(printf ' %s' $MISSING)" >&2
+  echo "Install them, or point PUB_PYTHON at an environment that has them:" >&2
+  echo "  pip install --user$(printf ' %s' $MISSING)" >&2
   exit 127
 fi
 echo "python: $("$PY" -c 'import sys; print(sys.executable)')"
 echo "runs:   $ROOT"
+echo "out:    $OUT   (figures and table; copy this off the cluster)"
 echo
 
 echo "=== source-time sweep: is F32's plotted t_s* representative? ==="
@@ -52,7 +72,7 @@ echo "exit=$?"
 
 echo
 echo "=== global-field figures: F27, F28, F32 ==="
-"$PY" -u -m visual.pub --global-field --runs-root "$ROOT" "$@"
+"$PY" -u -m visual.pub --global-field --runs-root "$ROOT" --out "$OUT" "$@"
 echo "exit=$?"
 
 echo

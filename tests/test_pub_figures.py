@@ -885,6 +885,23 @@ class TestCliList:
         assert proc.returncode == 0, proc.stderr
         assert proc.stderr.strip().endswith("NOTORCH")
 
+    def test_record_driven_figures_do_not_import_torch(self):
+        """A cluster that has the test records but no training stack must still plot.
+
+        Both of these reached torch through a module-level import that only ever
+        wanted something small: ``records`` wanted the CSV column names, and
+        ``fig_crossbench`` wanted three numpy interface helpers. The cost was that
+        ``python -m visual.pub`` could not run anywhere the solver stack was absent.
+        """
+        script = (
+            "import visual.pub.records, visual.pub.fig_crossbench, visual.pub.tables; "
+            "import sys; sys.stderr.write('TORCH' if 'torch' in sys.modules else 'NOTORCH')"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], cwd=REPO_ROOT,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stderr.strip().endswith("NOTORCH")
+
 
 class TestCliVerify:
     def test_verify_reports_the_repo_as_mostly_unsatisfiable(self, tmp_path):

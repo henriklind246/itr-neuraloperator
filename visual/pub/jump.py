@@ -23,11 +23,25 @@ from __future__ import annotations
 
 import numpy as np
 
-from visual.dataset_plots import (
-    _interface_conductance_G as interface_conductance,
-    _interface_contact_jump_map as contact_jump_map,
-    _interface_flanking_nodes_from_grid as flanking_nodes,
-)
+# These three are pure interface geometry, but they live in a module that
+# imports the dataset and therefore torch. Binding them lazily keeps the
+# record-driven figures importable on a machine that has the test records and
+# pandas but no training stack.
+_BORROWED = {
+    "interface_conductance": "_interface_conductance_G",
+    "contact_jump_map": "_interface_contact_jump_map",
+    "flanking_nodes": "_interface_flanking_nodes_from_grid",
+}
+
+
+def __getattr__(name: str):
+    if name in _BORROWED:
+        import visual.dataset_plots as dataset_plots
+
+        value = getattr(dataset_plots, _BORROWED[name])
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 JUMP_DEFINITION = {
     "quantity": "contact jump at the imperfect interface",
@@ -61,6 +75,11 @@ def contact_flux_map(fields: np.ndarray, x_grid: np.ndarray, interface_x: float,
     the same sign convention as :func:`contact_jump_map`, of which this is the
     ``R_c``-free factor.
     """
+    from visual.dataset_plots import (
+        _interface_conductance_G as interface_conductance,
+        _interface_flanking_nodes_from_grid as flanking_nodes,
+    )
+
     left_node, right_node = flanking_nodes(x_grid, interface_x)
     G = interface_conductance(x_grid, interface_x, R_c, k_left, k_right)
     flux = np.asarray(G) * (fields[:, left_node, :] - fields[:, right_node, :])
@@ -70,6 +89,8 @@ def contact_flux_map(fields: np.ndarray, x_grid: np.ndarray, interface_x: float,
 def contact_jump_profile(field: np.ndarray, x_grid: np.ndarray, interface_x: float,
                          R_c, k_left: float, k_right: float) -> np.ndarray:
     """Contact jump ``dT_contact(y)`` for a single ``(Nx, Ny)`` snapshot."""
+    from visual.dataset_plots import _interface_contact_jump_map as contact_jump_map
+
     return contact_jump_map(np.asarray(field)[None, ...], x_grid, interface_x,
                             R_c, k_left, k_right)[0]
 

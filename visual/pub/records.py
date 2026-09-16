@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.operators.eval import TEST_RECORD_FIELDS
+from src.operators.record_schema import TEST_RECORD_FIELDS
 from visual.pub.manifest import Degradation
 
 # The 26 columns actually present in the surviving v1 artifact
