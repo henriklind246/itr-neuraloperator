@@ -1597,12 +1597,14 @@ def _resolved_field_leads(frame, grid=None):
     return canonical[indices], times
 
 
-def global_field_error_summary(frames, *, metadata=None,
-                               n_boot=DEFAULT_N_BOOT, rng_seed=DEFAULT_RNG_SEED):
-    """F27/F28 reductions: pooled simulation RMSE, seed mean, cohort median.
+def _prepare_global_field_frames(frames, metadata):
+    """Validate F27/F28/F32 records and attach resolved snapshot times.
 
-    Both strata are reduced together so their exported axes share the same
-    range, including when only one figure is requested through the CLI.
+    Returns ``(prepared, seeds, resistance_info, protocol_info,
+    reference_protocol)``. Every downstream reduction reads ``lead_time`` and
+    ``source_time`` from here rather than from the raw ``t_bar``/``t_s``
+    columns, so the whole family shares one snapshot-grid resolution and one
+    cross-benchmark protocol check.
     """
     metadata = metadata or {}
     missing = set(GLOBAL_FIELD_BENCHMARKS) - set(frames)
@@ -1699,6 +1701,18 @@ def global_field_error_summary(frames, *, metadata=None,
         if identity_fields and (combined.groupby("sim_id")[identity_fields].nunique(dropna=False) > 1).to_numpy().any():
             raise ProvenanceError(f"{benchmark}: recorded simulation parameters differ across pairs or seeds")
         prepared[benchmark] = combined
+    return prepared, seeds, resistance_info, protocol_info, reference_protocol
+
+
+def global_field_error_summary(frames, *, metadata=None,
+                               n_boot=DEFAULT_N_BOOT, rng_seed=DEFAULT_RNG_SEED):
+    """F27/F28 reductions: pooled simulation RMSE, seed mean, cohort median.
+
+    Both strata are reduced together so their exported axes share the same
+    range, including when only one figure is requested through the CLI.
+    """
+    prepared, seeds, resistance_info, protocol_info, _ = _prepare_global_field_frames(
+        frames, metadata)
 
     resistance_values = np.concatenate([
         frame.drop_duplicates("sim_id")["R_c_mean"].to_numpy()
@@ -1762,8 +1776,425 @@ def global_field_error_summary(frames, *, metadata=None,
             "n_boot": n_boot, "rng_seed": rng_seed}
 
 
+# The source time is chosen as a fraction of the evaluated horizon rather than
+# as an absolute time so the choice survives a change of t_final. 0.2 is early
+# enough to keep most of the lead range while staying clear of the initial
+# condition, which is a uniform 300 K equilibrium in three of the four
+# benchmarks and would otherwise turn the figure into a question about
+# forecasting from that one special state.
+DEFAULT_SOURCE_FRACTION = 0.2
+SOURCE_FRACTION_SWEEP = (0.1, 0.2, 0.4, 0.6)
+
+
+def _select_source_index(protocol, fraction):
+    """Snapshot index whose time is nearest ``fraction * horizon``.
+
+    ``protocol`` is the validated ``(s, j, source_time, lead_time)`` array, so
+    the horizon is the last evaluated target time and every candidate index is
+    guaranteed to carry at least one positive lead. Ties resolve to the earlier
+    index, which retains more lead times.
+    """
+    horizon = float(np.max(protocol[:, 2] + protocol[:, 3]))
+    candidates = pd.DataFrame(protocol[:, [0, 2]], columns=["s", "source_time"])
+    candidates = candidates.drop_duplicates().sort_values("source_time")
+    times = candidates["source_time"].to_numpy(dtype=float)
+    pick = int(np.argmin(np.abs(times - fraction * horizon)))
+    return int(candidates["s"].to_numpy()[pick]), float(times[pick]), horizon
+
+
+def fixed_source_lead_summary(frames, *, metadata=None,
+                              source_fraction=DEFAULT_SOURCE_FRACTION,
+                              fraction_sweep=SOURCE_FRACTION_SWEEP,
+                              n_boot=DEFAULT_N_BOOT, rng_seed=DEFAULT_RNG_SEED):
+    """F32 reduction: lead-time curves at a single fixed source snapshot.
+
+    Unlike :func:`global_field_error_summary`, which pools every source time at
+    a given lead, this conditions on one source index. Each lead then draws on
+    the same simulation cohort, so the curve varies only the prediction horizon
+    and the sample size no longer shrinks as the lead grows.
+
+    The primary ``source_fraction`` is the one a figure should plot. Every
+    fraction in ``fraction_sweep`` is reduced as well and returned in the same
+    row list, flagged by ``is_primary``, so the robustness check over the choice
+    of source time is exported without a second render.
+    """
+    prepared, seeds, _, protocol_info, protocol = _prepare_global_field_frames(
+        frames, metadata)
+
+    fractions, seen = [], set()
+    for fraction in (source_fraction, *fraction_sweep):
+        value = float(fraction)
+        if not 0.0 <= value < 1.0:
+            raise ProvenanceError(f"source fraction must lie in [0, 1), got {value}")
+        if value not in seen:
+            seen.add(value)
+            fractions.append(value)
+
+    has_target = all("target_sse_K2" in frame for frame in prepared.values())
+    rows, selections = [], {}
+    for fraction in fractions:
+        index, source_time, horizon = _select_source_index(protocol, fraction)
+        primary = fraction == float(source_fraction)
+        leads = np.sort(protocol[protocol[:, 0] == index][:, 3])
+        selections[f"{fraction:g}"] = {
+            "source_index": index, "source_time": source_time,
+            "requested_time": fraction * horizon, "horizon": horizon,
+            "n_lead_times": int(len(leads)),
+            "max_lead_time": float(leads[-1]), "is_primary": primary,
+        }
+        for benchmark, frame in prepared.items():
+            part = frame.loc[frame["s"] == index]
+            if part.empty:
+                raise ProvenanceError(
+                    f"{benchmark}: no pairs at source snapshot {index}")
+            pooled = part.groupby(["lead_time", "sim_id", "seed"], sort=True).agg(
+                sse=("sse_K2", "sum"), cells=("num_error_cells", "sum"),
+                target=("target_sse_K2", "sum") if has_target else ("sse_K2", "size"))
+            pooled["rmse_K"] = pooled_rmse(pooled["sse"], pooled["cells"])
+            pooled["target_rms_K"] = (pooled_rmse(pooled["target"], pooled["cells"])
+                                      if has_target else np.nan)
+            simulations = pooled.groupby(["lead_time", "sim_id"]).agg(
+                rmse_K=("rmse_K", "mean"), target_rms_K=("target_rms_K", "mean"))
+            for lead in leads:
+                present = lead in simulations.index.get_level_values("lead_time")
+                sample = (simulations.xs(lead, level="lead_time") if present
+                          else simulations.iloc[:0])
+                values = sample["rmse_K"].to_numpy(dtype=float)
+                amplitude = sample["target_rms_K"].to_numpy(dtype=float)
+                lo, hi, method = bootstrap_ci(values, n_boot=n_boot, rng_seed=rng_seed)
+                at_lead = part.loc[np.isclose(part["lead_time"], lead)]
+                rows.append({
+                    "benchmark": benchmark, "source_fraction": float(fraction),
+                    "is_primary": primary, "source_index": index,
+                    "source_time": source_time, "lead_time": float(lead),
+                    "target_time": source_time + float(lead),
+                    "n_simulations": int(len(values)),
+                    "n_seeds": len(seeds[benchmark]), "seed_ids": seeds[benchmark],
+                    "eligible_pairs_by_seed": {
+                        seed: int((at_lead["seed"] == seed).sum())
+                        for seed in seeds[benchmark]},
+                    "eligible_pair_rows_total": int(len(at_lead)),
+                    "unique_simulation_pairs": int(
+                        len(at_lead.drop_duplicates(["sim_id", "s", "j"]))),
+                    "median_rmse_K": float(np.median(values)) if len(values) else None,
+                    "ci_lower_K": float(lo) if np.isfinite(lo) else None,
+                    "ci_upper_K": float(hi) if np.isfinite(hi) else None,
+                    "interval_method": method,
+                    "median_target_rms_K": (float(np.median(amplitude))
+                                            if has_target and len(amplitude) else None),
+                })
+
+    plotted = [row for row in rows if row["is_primary"]]
+    values = [row[name] for row in plotted
+              for name in ("median_rmse_K", "ci_lower_K", "ci_upper_K")
+              if row[name] is not None]
+    if not values:
+        raise ProvenanceError("no plottable statistics at the selected source time")
+    lower, upper = min(values), max(values)
+    if lower > 0:
+        padding = max((np.log10(upper) - np.log10(lower)) * 0.08, 0.06)
+        yscale = "log"
+        ylim = [10 ** (np.log10(lower) - padding), 10 ** (np.log10(upper) + padding)]
+    else:
+        yscale, ylim = "linear", [0.0, upper * 1.08 if upper > 0 else 1.0]
+    counts = {b: len(s) for b, s in seeds.items()}
+    return {"rows": rows, "primary": selections[f"{float(source_fraction):g}"],
+            "selections": selections, "seeds": seeds, "seed_counts": counts,
+            "unequal_seed_counts": len(set(counts.values())) > 1,
+            "field_amplitude_available": has_target,
+            "protocols": protocol_info, "yscale": yscale, "ylim": ylim,
+            "n_boot": n_boot, "rng_seed": rng_seed}
+
+
+# A curve's shape can only be compared against another curve over leads both of
+# them reach, and a source index s reaches lag K only when s + K is still on the
+# grid. Every window is therefore a trade: a long window compares few curves
+# over many leads, a short one compares many curves over few. The defaults are
+# fractions of the longest lag rather than absolute lags so the same three
+# points on that trade survive a change of snapshot count.
+DEFAULT_SHAPE_WINDOW_FRACTIONS = (0.8, 0.35, 0.15)
+DEFAULT_SHAPE_N_BOOT = 1_000
+MIN_CURVES_FOR_SHAPE = 3
+_SHAPE_BOOT_CHUNK = 100
+# Ceiling on one gathered resample block, in float64 elements (~160 MB).
+_SHAPE_BOOT_MAX_ELEMENTS = 20_000_000
+
+
+def _lead_by_lag(protocol):
+    """Lead time as a function of snapshot lag ``j - s``.
+
+    Comparing curves across source times presumes lag ``K`` means the same
+    prediction horizon wherever it is measured. On a non-uniform snapshot grid
+    it does not, and the comparison has no meaning, so that case is refused
+    rather than silently reduced.
+    """
+    lag = np.rint(protocol[:, 1] - protocol[:, 0]).astype(np.int64)
+    leads = pd.DataFrame({"lag": lag, "lead": protocol[:, 3]}).groupby("lag")["lead"]
+    if not np.allclose((leads.max() - leads.min()).to_numpy(), 0.0, atol=1e-9):
+        raise ProvenanceError(
+            "lead time is not a function of snapshot lag; comparing error-vs-lead "
+            "shape across source times is undefined on a non-uniform snapshot grid")
+    return leads.min()
+
+
+def _shape_lags_by_source(protocol):
+    lags = {}
+    for s, j, _, _ in protocol:
+        lags.setdefault(int(s), set()).add(int(round(j - s)))
+    return lags
+
+
+def _complete_shape_cohort(frame, n_pairs):
+    """Simulations contributing every evaluated pair under every seed.
+
+    A curve that gains and loses simulations as the lag grows changes cohort
+    along its own length, and that shows up as shape. Restricting to the
+    complete cohort is what makes the residual below attributable to the model
+    rather than to who was measured.
+    """
+    counts = frame.groupby(["sim_id", "seed"]).size().unstack("seed")
+    complete = (counts == n_pairs).all(axis=1).to_numpy()
+    ids = counts.index.to_numpy()
+    return ids[complete], ids[~complete]
+
+
+def _additive_interaction(matrix):
+    """Residual of the two-way additive fit ``mu + alpha_s + beta_k``.
+
+    The input is ``log10`` error, so additive means multiplicative in kelvin:
+    the model asserts that every source time traces one common lead-time shape
+    ``beta`` and differs from the others only by a constant factor ``alpha``.
+    Whatever the fit cannot reach is exactly the disagreement in shape.
+
+    Axes beyond the first two broadcast, so a stack of bootstrap replicates
+    reduces in a single call.
+    """
+    grand = matrix.mean(axis=(0, 1))
+    alpha = matrix.mean(axis=1) - grand
+    beta = matrix.mean(axis=0) - grand
+    return matrix - (grand + alpha[:, None] + beta[None, :]), alpha, beta
+
+
+def _shape_decomposition(log_matrix):
+    """Interaction size, common-shape fraction, and per-source residual RMS."""
+    resid, alpha, beta = _additive_interaction(log_matrix)
+    n_cells = resid.shape[0] * resid.shape[1]
+    ss_beta = (beta ** 2).sum(axis=0) * resid.shape[0]
+    ss_resid = (resid ** 2).sum(axis=(0, 1))
+    return {
+        "interaction_rms_log10": np.sqrt(ss_resid / n_cells),
+        "common_shape_fraction": np.where(ss_beta + ss_resid > 0,
+                                          ss_beta / np.where(ss_beta + ss_resid > 0,
+                                                             ss_beta + ss_resid, 1.0), 1.0),
+        "level_spread_log10": alpha.max(axis=0) - alpha.min(axis=0),
+        "per_source_rms": np.sqrt((resid ** 2).mean(axis=1)),
+    }
+
+
+def _shape_bootstrap(log_values, shape, n_boot, rng_seed):
+    """Paired simulation resample of an ``(n_cells, n_sims)`` log value table.
+
+    Every source time's curve is measured on the same simulations, so the
+    replicate has to redraw the simulations once and recompute all of the
+    curves on that draw. Resampling each cell on its own would break the
+    pairing that the whole comparison rests on.
+
+    Replicates run in chunks because the gather is ``(n_cells, chunk, n_sims)``
+    before the median reduces it. A published cohort is thousands of
+    simulations wide, where a fixed chunk would reserve gigabytes, so the chunk
+    is sized to the table instead.
+    """
+    rng = np.random.default_rng(rng_seed)
+    n_sims = log_values.shape[1]
+    chunk = max(1, min(_SHAPE_BOOT_CHUNK,
+                       _SHAPE_BOOT_MAX_ELEMENTS // max(1, log_values.size)))
+    draws = []
+    for start in range(0, n_boot, chunk):
+        size = min(chunk, n_boot - start)
+        idx = rng.integers(0, n_sims, size=(size, n_sims))
+        block = np.median(log_values[:, idx], axis=2)
+        draws.append(block.reshape(*shape, size))
+    return np.concatenate(draws, axis=-1)
+
+
+def source_time_shape_typicality(frames, *, metadata=None,
+                                 source_fraction=DEFAULT_SOURCE_FRACTION,
+                                 window_fractions=DEFAULT_SHAPE_WINDOW_FRACTIONS,
+                                 n_boot=DEFAULT_SHAPE_N_BOOT,
+                                 rng_seed=DEFAULT_RNG_SEED):
+    """Is the published source time's error-vs-lead curve shaped like the rest?
+
+    F32 plots one source snapshot. This asks whether that snapshot's lead-time
+    degradation is representative by fitting ``log10 RMSE(s, k) = mu + alpha_s
+    + beta_k`` over every source time that spans a common lead window. If the
+    fit is tight, all source times share one shape and differ only in level, so
+    no choice of source time could have been unrepresentative. Only when the
+    interaction is material does the published curve's standing among the
+    others carry information, and it is then reported as a rank with a paired
+    bootstrap interval.
+
+    Note this describes a direct time-conditioned operator: each pair is
+    predicted independently from its source snapshot, so a rising curve is
+    lead-time-dependent degradation, not error accumulated over a rollout.
+    """
+    prepared, seeds, _, protocol_info, protocol = _prepare_global_field_frames(
+        frames, metadata)
+
+    lead_by_lag = _lead_by_lag(protocol)
+    lags_by_source = _shape_lags_by_source(protocol)
+    max_lag = int(max(lead_by_lag.index))
+    published_index, published_time, horizon = _select_source_index(
+        protocol, float(source_fraction))
+
+    windows, seen = [], set()
+    for fraction in window_fractions:
+        window = max(2, int(round(float(fraction) * max_lag)))
+        if window <= max_lag and window not in seen:
+            seen.add(window)
+            windows.append(window)
+    if not windows:
+        raise ProvenanceError("no usable lead window for a shape comparison")
+
+    n_pairs = len(protocol)
+    cohort, degradations = {}, []
+    tables = {}
+    for benchmark, frame in prepared.items():
+        keep, dropped = _complete_shape_cohort(frame, n_pairs)
+        if len(keep) < MIN_CURVES_FOR_SHAPE:
+            raise ProvenanceError(
+                f"{benchmark}: {len(keep)} simulations evaluate the full pair "
+                f"protocol; a shape comparison needs at least {MIN_CURVES_FOR_SHAPE}")
+        if len(dropped):
+            degradations.append(Degradation(
+                "incomplete_pair_cohort",
+                f"{benchmark}: {len(dropped)} of {len(keep) + len(dropped)} simulations "
+                "miss at least one evaluated pair and are excluded so every curve is "
+                "measured on one cohort"))
+        part = frame.loc[frame["sim_id"].isin(set(keep.tolist()))].copy()
+        part["lag"] = part["j"] - part["s"]
+        pooled = part.groupby(["s", "lag", "sim_id", "seed"], sort=True).agg(
+            sse=("sse_K2", "sum"), cells=("num_error_cells", "sum"))
+        pooled["rmse_K"] = pooled_rmse(pooled["sse"], pooled["cells"])
+        table = pooled.groupby(["s", "lag", "sim_id"])["rmse_K"].mean().unstack("sim_id")
+        if not np.all(np.isfinite(table.to_numpy()) & (table.to_numpy() > 0)):
+            raise ProvenanceError(
+                f"{benchmark}: nonpositive or missing pooled RMSE; the log-space "
+                "decomposition is undefined")
+        tables[benchmark] = table
+        cohort[benchmark] = {"n_simulations": int(len(keep)),
+                             "n_dropped": int(len(dropped)),
+                             "dropped_sim_ids": sorted(int(i) for i in dropped)}
+
+    rows, source_rows = [], []
+    for window in windows:
+        needed = set(range(1, window + 1))
+        retained = sorted(s for s, lags in lags_by_source.items() if needed <= lags)
+        if len(retained) < MIN_CURVES_FOR_SHAPE:
+            continue
+        covers_published = published_index in retained
+        cells = [(s, k) for s in retained for k in range(1, window + 1)]
+        shape = (len(retained), window)
+        published_row = retained.index(published_index) if covers_published else None
+
+        for benchmark, table in tables.items():
+            # log10 first: the median is order-preserving, so the cohort median
+            # of the logs is the log of the cohort median, and the null table
+            # below is then a plain subtraction.
+            log_values = np.log10(table.loc[cells].to_numpy(dtype=float))
+            observed = np.median(log_values, axis=1).reshape(shape)
+            stats = _shape_decomposition(observed)
+            per_source = stats["per_source_rms"]
+            order = np.argsort(per_source)
+            # Competition rank, the same count the bootstrap below takes, so
+            # curves that agree to floating-point dust all rank first instead of
+            # being ordered by argsort's arbitrary tie-breaking -- which would
+            # otherwise hand the published curve a last place it did not earn,
+            # and put it outside its own interval.
+            rank = (1 + int((per_source < per_source[published_row]).sum())
+                    if covers_published else None)
+
+            # The rank, not the interaction size, carries the verdict. A
+            # resampled median is noisier than the median it is drawn from, so
+            # every replicate overstates the interaction and an interval around
+            # it would be biased outward. Rank is a comparison made inside one
+            # replicate, where that inflation applies to all curves at once and
+            # cancels: under curves that genuinely share a shape the interval
+            # widens to the whole set, which is the answer being sought.
+            n_sims = log_values.shape[1]
+            interval = {"rank_ci_lower": None, "rank_ci_upper": None,
+                        "rank_span_fraction": None, "interval_method": "none"}
+            if covers_published and n_sims >= MIN_SIMS_FOR_CI and n_boot > 0:
+                boot = _shape_decomposition(
+                    _shape_bootstrap(log_values, shape, n_boot, rng_seed))
+                ranks = 1 + (boot["per_source_rms"]
+                             < boot["per_source_rms"][published_row]).sum(axis=0)
+                lo, hi = (int(v) for v in np.percentile(ranks, [2.5, 97.5]))
+                interval.update(
+                    rank_ci_lower=lo, rank_ci_upper=hi,
+                    rank_span_fraction=float((hi - lo + 1) / len(retained)),
+                    interval_method="paired simulation bootstrap (percentile)")
+
+            interaction = float(stats["interaction_rms_log10"])
+            rows.append({
+                "benchmark": benchmark, "window_lags": int(window),
+                "window_lead_time": float(lead_by_lag.loc[window]),
+                "n_curves": len(retained), "source_indices": retained,
+                "n_simulations": n_sims,
+                "n_seeds": len(seeds[benchmark]), "seed_ids": seeds[benchmark],
+                "covers_published": covers_published,
+                "interaction_rms_log10": interaction,
+                "interaction_pct": float(100.0 * (10.0 ** interaction - 1.0)),
+                "common_shape_fraction": float(stats["common_shape_fraction"]),
+                "n_boot": int(n_boot),
+                "level_spread_pct": float(
+                    100.0 * (10.0 ** float(stats["level_spread_log10"]) - 1.0)),
+                "published_rank": rank,
+                "published_rms_log10": (float(per_source[published_row])
+                                        if covers_published else None),
+                "most_typical_index": int(retained[int(order[0])]),
+                "least_typical_index": int(retained[int(order[-1])]),
+                **interval,
+            })
+            for position, index in enumerate(retained):
+                source_rows.append({
+                    "benchmark": benchmark, "window_lags": int(window),
+                    "source_index": int(index),
+                    "source_time": float(protocol[protocol[:, 0] == index][0, 2]),
+                    "is_published": index == published_index,
+                    "residual_rms_log10": float(per_source[position]),
+                    "residual_pct": float(100.0 * (10.0 ** float(per_source[position]) - 1.0)),
+                    "rank": int(np.where(order == position)[0][0]) + 1,
+                })
+
+    if not rows:
+        raise ProvenanceError(
+            f"no lead window retains {MIN_CURVES_FOR_SHAPE} source times; the "
+            "snapshot grid is too short for a shape comparison")
+
+    counts = {b: len(s) for b, s in seeds.items()}
+    return {
+        "rows": rows, "sources": source_rows,
+        "published": {"source_index": published_index, "source_time": published_time,
+                      "source_fraction": float(source_fraction),
+                      "horizon": horizon, "max_lead_lag": max_lag - published_index},
+        "windows": windows, "max_lag": max_lag,
+        "lead_by_lag": {int(k): float(v) for k, v in lead_by_lag.items()},
+        "cohort": cohort, "degradations": degradations,
+        "seeds": seeds, "seed_counts": counts,
+        "unequal_seed_counts": len(set(counts.values())) > 1,
+        "protocols": protocol_info, "n_boot": n_boot, "rng_seed": rng_seed,
+    }
+
+
 __all__ = [
+    "DEFAULT_SHAPE_N_BOOT",
+    "DEFAULT_SHAPE_WINDOW_FRACTIONS",
+    "MIN_CURVES_FOR_SHAPE",
+    "source_time_shape_typicality",
+    "DEFAULT_SOURCE_FRACTION",
     "GLOBAL_FIELD_BENCHMARKS",
+    "SOURCE_FRACTION_SWEEP",
+    "fixed_source_lead_summary",
     "global_field_error_summary",
     "interface_mean_resistance",
     "ContactJumpCurve",

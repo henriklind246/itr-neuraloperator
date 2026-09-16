@@ -940,6 +940,45 @@ def time_order_test_2d_off_center_interface(dt_list: list, x_I: float = 0.4734) 
     return float(np.mean(_pairwise_orders(dt_list, results)))
 
 
+def run_interface_alignment_study(dt: float = 0.0001) -> dict:
+    """Compare fixed-geometry spatial refinement with and without alignment control."""
+    # These interval counts differ by multiples of 40, preserving the fractional
+    # position of each rational interface without moving the physical interface.
+    controlled_grids = (33, 73, 153)
+    studies = (
+        ("uncontrolled", 0.4734, (50, 100, 200), False),
+        ("controlled_left", 0.275, controlled_grids, True),
+        ("controlled_middle", 0.475, controlled_grids, True),
+        ("controlled_right", 0.675, controlled_grids, True),
+    )
+    cases = []
+    for name, x_I, grids, controlled in studies:
+        records = []
+        for N in grids:
+            h, dt_used, max_error, rms_error = run_mms_2d_interface(N, dt=dt, x_I=x_I)
+            records.append({
+                "N": N, "h": h, "dt": dt_used, "interface_x": x_I,
+                "interface_fraction": float((x_I / h) % 1.0),
+                "rms_error_K": rms_error, "max_error_K": max_error,
+                "error_over_h_squared": rms_error / h ** 2,
+            })
+        orders = _pairwise_orders(
+            [row["h"] for row in records],
+            [row["rms_error_K"] for row in records],
+        )
+        for row, order in zip(records, [None, *orders]):
+            row["order_from_previous"] = None if order is None else float(order)
+        cases.append({
+            "name": name, "alignment_controlled": controlled, "records": records,
+        })
+    return {
+        "t_final": 0.37,
+        "error_definition": "sqrt(mean((T_FV - T_exact)**2)) at t_final, in Kelvin",
+        "order_definition": "log(E_coarse/E_fine) / log(h_coarse/h_fine)",
+        "cases": cases,
+    }
+
+
 def near_node_interface_x_I(N: int, eps: float = 0.01) -> float:
     """Interface eps*hx to the right of a near-center grid node, so the smaller
     node gap is exactly eps*hx (default 1% of the cell). Recompute per N to hold
@@ -993,6 +1032,55 @@ def time_order_test_2d_patch_source(dt_list: list) -> float:
 # ==============================================================
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MMS verification of the 2D finite-volume solver.")
+    parser.add_argument(
+        "--interface-alignment-study", metavar="OUTPUT_DIR",
+        help="Save the off-center alignment study as CSV, JSON, PDF, and PNG.",
+    )
+    parser.add_argument("--study-dt", type=float, default=0.0001)
+    args = parser.parse_args()
+    if args.interface_alignment_study is not None:
+        import csv
+        import hashlib
+        import json
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        output = Path(args.interface_alignment_study)
+        output.mkdir(parents=True, exist_ok=True)
+        root = Path(__file__).resolve().parents[2]
+        sources = ("src/physics/mms_2d.py", "src/physics/fv_solver_2d.py",
+                   "src/physics/fv_solver_1d.py")
+        source_hashes = {
+            path: hashlib.sha256((root / path).read_bytes()).hexdigest()
+            for path in sources
+        }
+        study = run_interface_alignment_study(dt=args.study_dt)
+        study["created_utc"] = datetime.now(timezone.utc).isoformat()
+        study["source_sha256"] = source_hashes
+        (output / "interface_alignment.json").write_text(json.dumps(study, indent=2) + "\n")
+        rows = [
+            {"case": case["name"], "alignment_controlled": case["alignment_controlled"], **row}
+            for case in study["cases"] for row in case["records"]
+        ]
+        with (output / "interface_alignment.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        import matplotlib
+        matplotlib.use("Agg")
+        from visual.mms_plots import plot_interface_alignment_study
+
+        for extension in ("pdf", "png"):
+            plot_interface_alignment_study(study, output / f"interface_alignment.{extension}")
+        for case in study["cases"]:
+            orders = [row["order_from_previous"] for row in case["records"][1:]]
+            print(f"{case['name']}: pairwise orders " + ", ".join(f"{p:.4f}" for p in orders))
+        raise SystemExit(0)
+
     print("=== y-independent MMS (2D grid) ===")
     h, dt, me, l2 = run_mms_y_independent(N=101)
     print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")

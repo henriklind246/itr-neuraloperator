@@ -1,4 +1,4 @@
-"""Statistical and publication-export contracts for F27/F28."""
+"""Statistical and publication-export contracts for F27/F28/F32."""
 
 import json
 import re
@@ -18,6 +18,7 @@ from src.physics.internal_source import make_rc_sin_profile
 
 
 KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
+FIXED_SOURCE_KEY = "F32_global_field_error_fixed_source"
 
 
 def field_records(n_sims=25, seed_counts=None, grid=None):
@@ -212,6 +213,184 @@ def test_shared_rmse_scale_falls_back_to_linear_without_clipping_zero():
     assert result["ylim"][0] == 0
 
 
+def test_fixed_source_conditions_on_one_snapshot_and_keeps_the_cohort_constant():
+    frames = field_records(n_sims=25)
+    for frame in frames.values():
+        # Error depends only on the source snapshot, so pooling s=1 with s=2 at
+        # lead .06 -- which F27 does -- cannot reproduce the conditioned value.
+        frame["sse_K2"] = (1.0 + frame.s) ** 2 * frame.num_error_cells
+    result = stats.fixed_source_lead_summary(frames, n_boot=250)
+    assert result["primary"]["source_index"] == 1
+    assert result["primary"]["source_time"] == pytest.approx(.04)
+    assert result["primary"]["requested_time"] == pytest.approx(.032)
+    rows = [r for r in result["rows"] if r["is_primary"] and r["benchmark"] == "forcing"]
+    assert [r["lead_time"] for r in rows] == pytest.approx([.06, .12])
+    assert all(r["n_simulations"] == 25 for r in rows)
+    assert all(r["unique_simulation_pairs"] == 25 for r in rows)
+    assert all(r["median_rmse_K"] == pytest.approx(2.0) for r in rows)
+    pooled = next(r for r in summarize(frames)["lead"]
+                  if r["benchmark"] == "forcing" and np.isclose(r["lead_time"], .06))
+    assert pooled["median_rmse_K"] != pytest.approx(2.0)
+
+
+def test_fixed_source_sweep_exports_every_fraction_with_a_single_primary():
+    frames = field_records(n_sims=3)
+    result = stats.fixed_source_lead_summary(frames, source_fraction=.6, n_boot=50)
+    assert result["primary"]["source_index"] == 2
+    assert sorted(result["selections"]) == ["0.1", "0.2", "0.4", "0.6"]
+    assert [k for k, v in result["selections"].items() if v["is_primary"]] == ["0.6"]
+    assert {r["source_fraction"] for r in result["rows"]} == set(stats.SOURCE_FRACTION_SWEEP)
+    assert {r["source_fraction"] for r in result["rows"] if r["is_primary"]} == {.6}
+    # The sweep still reaches the initial condition the default deliberately avoids.
+    assert result["selections"]["0.1"]["source_index"] == 0
+    with pytest.raises(ProvenanceError, match="source fraction"):
+        stats.fixed_source_lead_summary(frames, source_fraction=1.5)
+
+
+def shape_records(*, n_sims=30, n_snap=12, dt=.02, log_level=None, log_shape=None,
+                  noise=0.0, rng_seed=0):
+    """Records whose log10 error is ``log_level(s) + log_shape(s, k)`` per simulation.
+
+    The shape reduction needs a grid long enough to hold several lead windows,
+    which the four-snapshot ``field_records`` grid is not. Writing the error in
+    log space lets a test plant a pure level change or a pure shape change and
+    assert the decomposition separates them.
+    """
+    log_level = log_level or (lambda s: 0.0)
+    log_shape = log_shape or (lambda s, k: .5 * np.log10(k))
+    rng = np.random.default_rng(rng_seed)
+    frames = {}
+    for benchmark in stats.GLOBAL_FIELD_BENCHMARKS:
+        offsets = rng.normal(0, .08, n_sims)
+        rows = []
+        for s in range(n_snap - 1):
+            for j in range(s + 1, n_snap):
+                k, cells = j - s, 16
+                error = 10.0 ** (np.log10(.05) + log_level(s) + log_shape(s, k) + offsets
+                                 + noise * rng.normal(0, 1, n_sims))
+                for sim in range(n_sims):
+                    row = {name: np.nan for name in records.SCHEMA_V1_COLUMNS}
+                    row.update({"seed": "0", "benchmark": benchmark, "sim_id": sim,
+                                "s": s, "j": j, "t_s": s * dt, "t_bar": k * dt,
+                                "R_c": .05 + .95 * sim / max(n_sims - 1, 1),
+                                "R_c_A": .8 if benchmark == "source_itr_sin" else np.nan,
+                                "rmse_K": error[sim], "sse_K2": error[sim] ** 2 * cells,
+                                "num_error_cells": cells, "target_sse_K2": 100.0,
+                                "interface_sse_K2": error[sim] ** 2,
+                                "num_interface_cells": 1, "interface_target_sse_K2": 100.0})
+                    rows.append(row)
+        frames[benchmark] = pd.DataFrame(rows)
+    return frames
+
+
+def typicality(frames, **kwargs):
+    kwargs.setdefault("n_boot", 200)
+    return stats.source_time_shape_typicality(frames, **kwargs)
+
+
+def forcing_rows(result):
+    return [r for r in result["rows"] if r["benchmark"] == "forcing"]
+
+
+def test_shape_windows_share_support_and_shrink_as_the_window_grows():
+    result = typicality(shape_records())
+    assert result["max_lag"] == 11
+    assert result["windows"] == [9, 4, 2]
+    assert result["published"]["source_index"] == 2
+    rows = forcing_rows(result)
+    assert [r["n_curves"] for r in rows] == [3, 8, 10]
+    for row in rows:
+        # Every retained curve must reach every lead in the window, or the
+        # comparison would read window length as shape.
+        assert row["source_indices"] == list(range(result["max_lag"] - row["window_lags"] + 1))
+        assert row["window_lead_time"] == pytest.approx(row["window_lags"] * .02)
+    # All four benchmarks are compared over the same source times per window.
+    for window in result["windows"]:
+        supports = {tuple(r["source_indices"]) for r in result["rows"]
+                    if r["window_lags"] == window}
+        assert len(supports) == 1
+
+
+def test_identical_shapes_leave_no_interaction_whatever_the_level():
+    # One source time's curve is lifted bodily by a constant factor. In log
+    # space that is alpha, not interaction, so the shape verdict must ignore it.
+    result = typicality(shape_records(log_level=lambda s: .3 * (s == 2)))
+    for row in forcing_rows(result):
+        assert row["interaction_pct"] == pytest.approx(0.0, abs=1e-9)
+        assert row["common_shape_fraction"] == pytest.approx(1.0)
+        assert row["level_spread_pct"] > 90
+
+
+def test_planted_bend_is_detected_and_attributed_to_its_source_time():
+    bent = 3
+    result = typicality(shape_records(
+        log_shape=lambda s, k: .5 * np.log10(k) + .4 * np.log10(k) * (s == bent)))
+    rows = [r for r in forcing_rows(result) if bent in r["source_indices"]]
+    assert rows
+    for row in rows:
+        assert row["interaction_pct"] > 1.0
+        assert row["least_typical_index"] == bent
+        assert row["common_shape_fraction"] < 1.0
+    worst = max((r for r in result["sources"] if r["benchmark"] == "forcing"
+                 and r["window_lags"] == rows[0]["window_lags"]),
+                key=lambda r: r["residual_rms_log10"])
+    assert worst["source_index"] == bent
+
+
+def test_noise_alone_neither_inflates_with_window_nor_singles_out_a_curve():
+    # The failure this guards against: a per-curve statistic measured over a
+    # window whose length is a function of the source index will rank the
+    # curves even when they are identical.
+    result = typicality(shape_records(noise=.02, rng_seed=5))
+    rows = forcing_rows(result)
+    interactions = [r["interaction_pct"] for r in rows]
+    assert max(interactions) < 2 * min(interactions)
+    covering = [r for r in rows if r["covers_published"]]
+    assert covering
+    for row in covering:
+        assert row["rank_span_fraction"] > .8
+        assert row["rank_ci_lower"] <= row["published_rank"] <= row["rank_ci_upper"]
+
+
+def test_tied_curves_all_rank_first_rather_than_being_ordered_by_dust():
+    # Noiseless identical curves separate only by floating-point residue.
+    # Ranking on that names a least-typical source time that does not exist and
+    # strands the published rank outside its own interval.
+    for row in forcing_rows(typicality(shape_records(n_sims=25))):
+        assert row["interaction_pct"] == pytest.approx(0.0, abs=1e-6)
+        assert row["published_rank"] == 1
+        assert row["rank_ci_lower"] <= row["published_rank"] <= row["rank_ci_upper"]
+
+
+def test_incomplete_pair_cohort_is_excluded_and_disclosed():
+    frames = shape_records(n_sims=25)
+    f = frames["forcing"]
+    frames["forcing"] = f.drop(f.index[(f.sim_id == 7) & (f.s == 1) & (f.j == 5)])
+    result = typicality(frames)
+    assert result["cohort"]["forcing"] == {"n_simulations": 24, "n_dropped": 1,
+                                           "dropped_sim_ids": [7]}
+    assert result["cohort"]["source"]["n_dropped"] == 0
+    assert [d.code for d in result["degradations"]] == ["incomplete_pair_cohort"]
+    assert all(r["n_simulations"] == 24 for r in forcing_rows(result))
+
+
+def test_bootstrap_rank_interval_is_reproducible_and_seed_dependent():
+    frames = shape_records(noise=.02, rng_seed=3)
+    span = lambda r: [(x["rank_ci_lower"], x["rank_ci_upper"]) for x in forcing_rows(r)]
+    assert span(typicality(frames)) == span(typicality(frames))
+    assert span(typicality(frames, rng_seed=stats.DEFAULT_RNG_SEED + 1)) != []
+
+
+def test_shape_comparison_refuses_short_and_nonuniform_grids():
+    short = field_records(n_sims=25, grid=np.arange(4) * .02)
+    with pytest.raises(ProvenanceError, match="too short"):
+        stats.source_time_shape_typicality(short, n_boot=0)
+    grid = np.array([0, .01, .021, .04, .07, .11, .16, .22], dtype=float)
+    frames = field_records(n_sims=25, grid=grid)
+    with pytest.raises(ProvenanceError, match="non-uniform snapshot grid"):
+        stats.source_time_shape_typicality(frames, n_boot=0)
+
+
 def write_field_manifest(root, n_sims=25):
     sources = {}
     for benchmark, f in field_records(n_sims=n_sims).items():
@@ -292,6 +471,41 @@ def test_render_exports_vectors_dimensions_statistics_and_provenance(tmp_path):
         assert payload["degradations"]
     assert all(row["status"] == "OK" for row in audit(tmp_path / "out"))
     assert {"F08_forcing_difficulty", "F10_source_difficulty", "F12_source_itr_sin_resistance", "F14_interfaces_difficulty"} <= set(registry.FIGURES)
+
+
+def test_fixed_source_figure_draws_only_the_primary_fraction(monkeypatch):
+    frames = field_records()
+    reduced = stats.fixed_source_lead_summary(frames)
+    monkeypatch.setattr(records, "load_global_field_records", lambda source: (frames, {}))
+    fig, _, definition = registry.get_figure(FIXED_SOURCE_KEY).load()(
+        source=FigureSource(FIXED_SOURCE_KEY))
+    ax = fig.axes[0]
+    assert fig.get_size_inches() == pytest.approx([3.42, 2.6])
+    assert len(fig.legends[0].get_texts()) == 4
+    assert len(ax.lines) == 4 and len(ax.collections) == 4
+    primary = [r for r in reduced["rows"] if r["is_primary"] and r["benchmark"] == "forcing"]
+    assert ax.lines[0].get_xdata() == pytest.approx([r["lead_time"] for r in primary])
+    assert len(definition["statistics"]) == len(reduced["rows"])
+    assert sorted(definition["source_fraction_sweep"]) == ["0.1", "0.2", "0.4", "0.6"]
+    assert definition["prediction_mode"].startswith("direct_pair")
+    assert "not error accumulation" in definition["caption"]
+    plt.close(fig)
+
+
+def test_fixed_source_render_exports_the_whole_sweep(tmp_path):
+    manifest = write_field_manifest(tmp_path)
+    result = registry.render(FIXED_SOURCE_KEY, manifest=manifest,
+                             out_dir=tmp_path / "out", strict=False)
+    assert [p.suffix for p in result.paths] == [".png", ".pdf", ".svg", ".csv"]
+    with Image.open(result.paths[0]) as image:
+        assert image.size == (1026, 780)
+    plotted = pd.read_csv(result.paths[3])
+    assert set(plotted.source_fraction) == set(stats.SOURCE_FRACTION_SWEEP)
+    drawn = plotted.loc[plotted.is_primary]
+    assert drawn.source_time.nunique() == 1
+    assert drawn.n_simulations.nunique() == 1
+    definition = json.loads(result.sidecar.read_text())["metric_definition"]
+    assert definition["source_time_selection"]["source_index"] == 1
 
 
 def test_loader_rejects_legacy_rollout_and_reads_grid_metadata(tmp_path):
@@ -431,7 +645,7 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
     monkeypatch.setattr(cli, 'render', fake_render)
     command = ['--global-field', '--runs-root', str(tmp_path / 'runs')]
     assert cli.main(command) == 2
-    assert [key for key, _ in calls] == list(KEYS)
+    assert [key for key, _ in calls] == [*KEYS, FIXED_SOURCE_KEY]
     assert all(not kw['strict'] and str(kw['out_dir']) == 'figures/global_field' for _, kw in calls)
     assert 'Selected forcing_records' in capsys.readouterr().out
     calls.clear()
@@ -440,6 +654,26 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
     for invalid in (['--runs-root', str(tmp_path)], command + ['--all'], command + ['--manifest', 'custom.yaml']):
         with pytest.raises(SystemExit):
             cli.main(invalid)
+
+
+def test_discovered_runs_can_back_the_primary_table(tmp_path, monkeypatch, capsys):
+    # T01 draws on the same four benchmarks discovery finds, so a cluster with
+    # records but no manifest.yaml can write the table as well as the figures.
+    from visual.pub import __main__ as cli
+    from visual.pub import tables
+    write_field_manifest(tmp_path / 'runs', n_sims=3)
+    seen = {}
+    def fake_write(source, out_dir):
+        seen.update(degraded=source.is_degraded, out=out_dir)
+        return [out_dir / 'T01.tex']
+    monkeypatch.setattr(tables, 'write_descriptive_results', fake_write)
+    command = ['--runs-root', str(tmp_path / 'runs'), '--out', str(tmp_path / 'out')]
+    assert cli.main([*command, '--table', 'T01_primary_results_descriptive']) == 2
+    assert seen == {'degraded': True, 'out': tmp_path / 'out'}
+    assert 'Selected forcing_records' in capsys.readouterr().out
+    # The strict table still refuses a single-seed cohort rather than shipping it.
+    assert cli.main([*command, '--table', 'T01_primary_results']) == 1
+    assert 'FAILED T01_primary_results' in capsys.readouterr().err
 
 
 def test_sinusoidal_records_accept_legacy_empty_gaussian_columns(tmp_path):

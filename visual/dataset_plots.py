@@ -176,6 +176,15 @@ def _contact_jump_reductions(jump_map: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def _shared_thumbnail_grid(n_panels: int) -> tuple[int, int]:
+    """Return a near-square (nrows, ncols) layout for thumbnail-style figures."""
+    if n_panels <= 0:
+        return 1, 1
+    ncols = int(np.ceil(np.sqrt(n_panels)))
+    nrows = int(np.ceil(n_panels / ncols))
+    return nrows, ncols
+
+
 def _plot_field_2d(
     ax,
     x_grid: np.ndarray,
@@ -945,6 +954,46 @@ def plot_lead_time_coverage(
         ax_frac.legend(loc="upper right")
         ax_frac.grid(True)
         _save_figure(fig, save_path, "data", "lead_time_coverage", layout="constrained")
+
+
+def plot_initial_conditions(
+    trajectories: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    n_samples: int = 20,
+    seed: int = 42,
+    save_path: str | Path | None = None,
+):
+    """Plot sampled 2D initial-condition fields.
+
+    Shows only the IC draw itself, so no interface geometry is overlaid.
+    """
+    rng = np.random.default_rng(seed)
+    num_sims = trajectories.shape[0]
+    selected = sorted(rng.choice(num_sims, size=min(n_samples, num_sims), replace=False))
+    nrows, ncols = _shared_thumbnail_grid(len(selected))
+    fields = trajectories[selected, 0]
+    vmin = float(np.min(fields))
+    vmax = float(np.max(fields))
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(4.4 * ncols, 3.8 * nrows),
+            squeeze=False, constrained_layout=True,
+        )
+        axes_flat = axes.ravel()
+        pcm = None
+        for ax, sim_id, field in zip(axes_flat, selected, fields):
+            pcm = _plot_field_2d(ax, x_grid, y_grid, field, vmin=vmin, vmax=vmax)
+            ax.set_title(f"Sim {sim_id}")
+
+        for ax in axes_flat[len(selected):]:
+            ax.set_axis_off()
+
+        fig.colorbar(pcm, ax=axes.ravel().tolist(), label="Temperature", shrink=0.9)
+        fig.suptitle(f"Initial Conditions T(x, y, t=0) — {len(selected)} simulations")
+        _save_figure(fig, save_path, "data", "initial_conditions", layout="constrained")
 
 
 # ============================================================

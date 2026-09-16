@@ -24,6 +24,7 @@ PLOT_REGISTRY: dict[str, str] = {
     "prediction_vs_truth":       "data",
     "interface_error":           "data",
     "lead_time_coverage":        "data",
+    "initial_conditions":        "data",
     # group: forcing
     "forcing_temporal_families":            "forcing",
     "forcing_spatial_profiles":             "forcing",
@@ -48,6 +49,7 @@ PLOT_RERUN_TRIGGERS: dict[str, str] = {
     "prediction_vs_truth": "new checkpoint or changed field-evaluation path",
     "interface_error": "new checkpoint on an interface-bearing benchmark",
     "lead_time_coverage": "snapshot pairing, split, or curriculum change",
+    "initial_conditions": "IC family, sampler, or regenerated dataset",
     "forcing_temporal_families": "temporal forcing builder or sampler change",
     "forcing_spatial_profiles": "spatial forcing builder or sampler change",
     "forcing_separable_assembly": "separable forcing assembly change",

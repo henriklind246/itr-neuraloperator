@@ -865,9 +865,145 @@ def global_field_error_vs_itr(*, source=None, spec=None, requirement=None):
     return _global_field_error_figure(axis="itr", source=source, spec=spec, requirement=requirement)
 
 
+def global_field_error_fixed_source(*, source=None, spec=None, requirement=None,
+                                    source_fraction=stats.DEFAULT_SOURCE_FRACTION):
+    """F32: lead-time curves conditioned on one fixed source snapshot.
+
+    F27 pools every source time at a given lead, so its long leads are drawn
+    from a smaller and systematically earlier set of source times than its short
+    leads. Fixing the source snapshot removes that confound: the cohort is the
+    same at every point on the x axis and only the prediction horizon moves.
+    """
+    try:
+        frames, metadata = records.load_global_field_records(source)
+    except (records.SchemaError, FileNotFoundError) as exc:
+        raise ProvenanceError(str(exc)) from exc
+    if not frames:
+        blocked(requirement, _RECORDS_NEEDED, key="F32_global_field_error_fixed_source")
+    summary = stats.fixed_source_lead_summary(
+        frames, metadata=metadata, source_fraction=source_fraction)
+    primary = summary["primary"]
+    rows = [row for row in summary["rows"] if row["is_primary"]]
+
+    fig, ax = plt.subplots(figsize=style.figsize("one_col", row_height="std"))
+    fig.subplots_adjust(left=0.19, right=0.97, bottom=0.21, top=0.78)
+    handles = []
+    for benchmark in BENCH_ORDER:
+        points = [row for row in rows if row["benchmark"] == benchmark]
+        x = np.asarray([row["lead_time"] for row in points], dtype=float)
+        y = np.asarray([row["median_rmse_K"] for row in points], dtype=float)
+        lo = np.asarray([row["ci_lower_K"] for row in points], dtype=float)
+        hi = np.asarray([row["ci_upper_K"] for row in points], dtype=float)
+        color = style.benchmark_color(benchmark)
+        marker, linestyle = _FIELD_MARKERS[benchmark], _FIELD_LINES[benchmark]
+        ax.fill_between(x, lo, hi, color=color, alpha=0.10, linewidth=0)
+        ax.plot(x, y, color=color, linestyle=linestyle, linewidth=1.2,
+                marker=marker, markersize=3.2, markevery=max(1, len(x) // 7),
+                markerfacecolor="white", markeredgewidth=0.8)
+        handles.append(Line2D([], [], color=color, linestyle=linestyle, marker=marker,
+                              markersize=3.5, markerfacecolor="white", linewidth=1.2,
+                              label=tables.BENCH_LABEL[benchmark]))
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.54, 0.99),
+               ncol=2, fontsize=7, frameon=False, handlelength=2.2,
+               columnspacing=1.2, handletextpad=0.5, labelspacing=0.45)
+    ax.set_xlabel(r"Lead time $\Delta t=t_j-t_s^\ast$", fontsize=8)
+    ax.set_ylabel("Median global RMSE [K]", fontsize=8)
+    ax.set_xscale("linear")
+    ax.set_yscale(summary["yscale"])
+    ax.set_ylim(summary["ylim"])
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+    if summary["yscale"] == "log":
+        ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5), numticks=8))
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    else:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.tick_params(labelsize=7, width=0.6)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, axis="y", which="major", color="0.7", alpha=0.35,
+            linewidth=0.5, linestyle="-")
+    ax.set_axisbelow(True)
+    ax.margins(x=0.06)
+    ax.annotate(rf"$t_s^\ast={primary['source_time']:.3g}$", xy=(0.97, 0.04),
+                xycoords="axes fraction", ha="right", va="bottom", fontsize=7)
+
+    title = "Global field RMSE against lead time at a fixed source time"
+    seed_note = "; ".join(f"{tables.BENCH_LABEL[b]}: K={summary['seed_counts'][b]}"
+                          for b in BENCH_ORDER)
+    caption = (
+        f"{title}. Every prediction starts from the same snapshot "
+        f"$t_s^\\ast={primary['source_time']:.3g}$, the evaluated snapshot nearest "
+        f"{source_fraction:g} of the {primary['horizon']:.3g} horizon, so each point "
+        "varies only the prediction horizon and every lead is measured on the same "
+        "simulation cohort. Points are the cohort median of simulation-level global "
+        "field RMSE; with one source snapshot each simulation contributes exactly one "
+        "pair per lead, which is averaged across fixed model seeds before the median. "
+        "Shaded regions are pointwise 95% BCa bootstrap intervals resampling "
+        "simulations; they are not simultaneous confidence bands and quantify "
+        "test-cohort uncertainty conditional on the trained models, not training-seed "
+        "variability. Averaging errors across seeds does not evaluate an "
+        "ensemble-averaged prediction. The operator predicts each pair directly, so "
+        "any rise with lead time is lead-time-dependent difficulty, not error "
+        f"accumulation through a rollout. Evaluated model seeds: {seed_note}. "
+    )
+    if summary["unequal_seed_counts"]:
+        caption += "Seed counts differ by benchmark; the amount of training-seed averaging is unequal. "
+    if any(row["interval_method"] == "none" and row["n_simulations"] for row in rows):
+        caption += f"Intervals are omitted for leads with fewer than {stats.MIN_SIMS_FOR_CI} simulations. "
+    if any(row["interval_method"] == "percentile" for row in rows):
+        caption += "Degenerate BCa cases use percentile intervals, identified in the statistics. "
+    if summary["field_amplitude_available"]:
+        caption += (
+            "RMSE is absolute, so vertical offsets between benchmarks partly reflect "
+            "differing temperature amplitudes; median_target_rms_K in the statistics "
+            "gives each benchmark's field scale for that comparison. "
+        )
+    caption += (
+        f"The RMSE axis is {summary['yscale']}; the lead axis is linear. The "
+        "statistics also carry the same reduction at source fractions "
+        + ", ".join(f"{f:g}" for f in stats.SOURCE_FRACTION_SWEEP)
+        + " so the choice of source time can be checked without re-rendering."
+    )
+    representations = {
+        b: sorted({m["representation"] for m in metadata.get(b, {}).values()
+                   if m.get("representation")}) for b in BENCH_ORDER
+    }
+    if any(reps != ["temporal_encoder"] for reps in representations.values() if reps):
+        caption += " Evaluated representations: " + "; ".join(
+            f"{tables.BENCH_LABEL[b]}: {', '.join(reps).replace('_', ' ')}"
+            for b, reps in representations.items() if reps) + "."
+    if source.degradations:
+        caption += " This descriptive comparison has publication-cohort limitations detailed in the provenance sidecar."
+    definition = {
+        "space": "kelvin", "metric": "rmse_K", "title": title, "caption": caption,
+        "source_time_selection": primary,
+        "source_fraction_sweep": summary["selections"],
+        "conditioning": "single fixed source snapshot; the simulation cohort is constant across leads",
+        "aggregation": "cells -> pair sufficient statistics -> simulation RMSE at one (t_s*, lead) -> seed mean -> cohort median",
+        "simulation_rmse": "sqrt(sum_pair(sse_K2) / sum_pair(num_error_cells)) over the single eligible pair",
+        "replication_unit": "sim_id within benchmark; equal simulation weights",
+        "prediction_mode": "direct_pair; increases with lead are horizon difficulty, not rollout error accumulation",
+        "interval": "pointwise 95% BCa simulation bootstrap; not a simultaneous band",
+        "interval_interpretation": "test-cohort uncertainty conditional on fixed trained models; not training-seed variability",
+        "field_amplitude": ("median simulation RMS of the true field about the training mean, "
+                            "in kelvin" if summary["field_amplitude_available"] else None),
+        "minimum_simulations_for_ci": stats.MIN_SIMS_FOR_CI,
+        "n_boot": summary["n_boot"], "rng_seed": summary["rng_seed"],
+        "seed_counts": summary["seed_counts"], "seed_ids": summary["seeds"],
+        "unequal_seed_counts": summary["unequal_seed_counts"],
+        "seed_averaging": "mean of simulation errors; not an ensemble-averaged prediction",
+        "protocols": summary["protocols"], "record_metadata": metadata,
+        "yscale": summary["yscale"], "ylim": summary["ylim"],
+        "statistics": summary["rows"],
+        "degradations": [str(d) for d in source.degradations],
+    }
+    return fig, None, definition
+
+
 __all__ = [
     "global_field_error_vs_lead",
     "global_field_error_vs_itr",
+    "global_field_error_fixed_source",
     "BENCH_ORDER",
     "TARGET_REL_L2_PCT",
     "benchmark_order",

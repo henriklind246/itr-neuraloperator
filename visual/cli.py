@@ -128,6 +128,7 @@ def main():
         "prediction_vs_truth",
         "interface_error",
         "lead_time_coverage",
+        "initial_conditions",
         "energy_budget",
         "patch_region_error_map",
         "source_interface_zone_error",
@@ -213,6 +214,13 @@ def main():
 
     data_dir = out_dir / "data"
     if trajectories is not None:
+        if requested("initial_conditions"):
+            dataset_plots.plot_initial_conditions(
+                trajectories,
+                x_grid,
+                y_grid,
+                save_path=data_dir / "initial_conditions.png",
+            )
         if requested("lead_time_coverage"):
             dataset_plots.plot_lead_time_coverage(
                 trajectories,

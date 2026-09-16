@@ -70,6 +70,7 @@ class TestPlotRegistry:
             "prediction_vs_truth": "data",
             "interface_error": "data",
             "lead_time_coverage": "data",
+            "initial_conditions": "data",
             "forcing_temporal_families": "forcing",
             "forcing_spatial_profiles": "forcing",
             "forcing_separable_assembly": "forcing",
@@ -89,7 +90,7 @@ class TestPlotRegistry:
             "final_temperature", "layer_geometry", "face_conductance",
             "multilayer_evolution", "heat_flux_profile", "trajectory_heatmap",
             "trajectory_deviation_heatmap", "spatial_family_breakdown",
-            "initial_conditions", "ic_uniform_progression",
+            "ic_uniform_progression",
             "ic_random_sinusoid_progression", "ic_grf_progression",
             "ic_hot_spot_progression", "snapshot_pair_samples",
             "lead_time_error", "parameter_error_slices", "dataset_summary",
@@ -264,6 +265,25 @@ class TestLeadTimeCoverage:
             synthetic_sim_params,
             plot_config,
             save_path=out_path,
+        )
+        assert out_path.exists()
+
+
+class TestInitialConditions:
+    def test_smoke_writes_png(self, tmp_path, synthetic_trajectories):
+        trajectories, x_grid, y_grid, _t_grid = synthetic_trajectories
+        out_path = tmp_path / "initial_conditions.png"
+        dataset_plots.plot_initial_conditions(
+            trajectories, x_grid, y_grid, n_samples=6, save_path=out_path
+        )
+        assert out_path.exists()
+
+    def test_sample_count_caps_to_available_sims(self, tmp_path, synthetic_trajectories):
+        trajectories, x_grid, y_grid, _t_grid = synthetic_trajectories
+        out_path = tmp_path / "initial_conditions.png"
+        dataset_plots.plot_initial_conditions(
+            trajectories, x_grid, y_grid,
+            n_samples=trajectories.shape[0] + 5, save_path=out_path,
         )
         assert out_path.exists()
 

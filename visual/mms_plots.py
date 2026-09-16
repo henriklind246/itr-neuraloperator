@@ -8,6 +8,58 @@ import numpy as np
 from visual._common import PLOT_STYLE, _save_figure
 
 
+def plot_interface_alignment_study(study: dict, save_path: str | Path):
+    """Plot raw spatial errors and every refinement-pair order from a saved study."""
+    styles = {
+        "uncontrolled": ("0.35", "X", "--"),
+        "controlled_left": ("#0072B2", "o", "-"),
+        "controlled_middle": ("#D55E00", "s", "-."),
+        "controlled_right": ("#A34B79", "^", ":"),
+    }
+    style = {**PLOT_STYLE, "font.family": "serif", "mathtext.fontset": "dejavuserif",
+             "font.size": 9, "axes.titlesize": 10, "axes.labelsize": 9,
+             "xtick.labelsize": 8, "ytick.labelsize": 8, "pdf.fonttype": 42}
+    with plt.rc_context(style):
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.9))
+        fig.subplots_adjust(left=0.10, right=0.98, bottom=0.32, top=0.86, wspace=0.30)
+        handles = []
+        for case in study["cases"]:
+            rows = case["records"]
+            h = np.array([row["h"] for row in rows])
+            error = np.array([row["rms_error_K"] for row in rows])
+            orders = [row["order_from_previous"] for row in rows[1:]]
+            x_I = rows[0]["interface_x"]
+            fraction = rows[0]["interface_fraction"]
+            label = (rf"$x_I={x_I:g}$, fixed fraction {fraction:.1f}"
+                     if case["alignment_controlled"] else rf"$x_I={x_I:g}$, varying fraction")
+            color, marker, linestyle = styles[case["name"]]
+            kwargs = dict(color=color, marker=marker, linestyle=linestyle,
+                          linewidth=1.3, markersize=4, markerfacecolor="white")
+            line, = axes[0].loglog(h, error, label=label, **kwargs)
+            axes[1].semilogx(np.sqrt(h[:-1] * h[1:]), orders, **kwargs)
+            handles.append(line)
+        axes[0].set(title="(a) Spatial error", xlabel=r"Grid spacing, $h$",
+                    ylabel="RMS temperature error (K)")
+        axes[1].set(title="(b) Pairwise convergence order", xlabel=r"Grid-spacing midpoint, $h$",
+                    ylabel=r"Observed order, $p$")
+        axes[0].set_xticks([0.005, 0.01, 0.02], labels=["0.005", "0.010", "0.020"])
+        axes[1].set_xticks([0.007, 0.01, 0.02], labels=["0.007", "0.010", "0.020"])
+        axes[1].axhline(2, color="0.55", linestyle="--", linewidth=1, zorder=0)
+        for ax in axes:
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.xaxis.set_minor_formatter(plt.NullFormatter())
+            ax.grid(which="major", color="0.88", linewidth=0.6)
+            ax.set_axisbelow(True)
+        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.10),
+                   ncol=2, frameon=False, fontsize=8)
+        dt = study["cases"][0]["records"][0]["dt"]
+        fig.text(0.5, 0.025,
+                 rf"Fixed physical interface within each sequence; $\Delta t={dt:g}$, "
+                 rf"$t={study['t_final']:g}$. Gray horizontal line: $p=2$.",
+                 ha="center", fontsize=7.5)
+        _save_figure(fig, save_path, "mms", "interface_alignment", layout="none")
+
+
 def plot_mms_convergence(save_path: str | Path | None = None):
     """MMS convergence for the 2D solver in log-log space, by direction.
 

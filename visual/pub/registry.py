@@ -136,6 +136,13 @@ _SPECS: tuple[FigureSpec, ...] = (
     _spec("F28_global_field_error_vs_itr", "Global field RMSE stratified by interface-mean resistance",
           "visual.pub.fig_crossbench", "global_field_error_vs_itr", 1, "one_col",
           formats=("png", "pdf", "svg"), preserve_size=True),
+    # F27 pools every source time at a given lead, so its long leads come from a
+    # smaller and systematically earlier cohort. This one conditions on a single
+    # source snapshot, holding the cohort fixed along the whole lead axis.
+    _spec("F32_global_field_error_fixed_source",
+          "Global field RMSE against lead time at a fixed source time",
+          "visual.pub.fig_crossbench", "global_field_error_fixed_source", 1, "one_col",
+          formats=("png", "pdf", "svg"), preserve_size=True, source_fraction=0.2),
     # The adjacent-node companion to F26. Same four benchmarks, the other jump
     # definition -- this is the one test_records.csv scores.
     _spec("F31_node_jump_fidelity",

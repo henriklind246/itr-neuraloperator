@@ -164,7 +164,8 @@ def cmd_audit(out_dir: Path, fmt: str) -> int:
 
 def _selected_keys(args) -> list[str]:
     if args.global_field:
-        return ["F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr"]
+        return ["F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr",
+                "F32_global_field_error_fixed_source"]
     if args.figure:
         for key in args.figure:
             get_figure(key)
@@ -179,8 +180,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.global_field and any((args.figure, args.all, args.table, args.do_list, args.verify, args.audit)):
         parser.error("--global-field cannot be combined with other figure/table/inspection selectors")
-    if (args.runs_root or args.run) and not args.global_field:
-        parser.error("--runs-root and --run require --global-field")
+    if (args.runs_root or args.run) and not (args.global_field or args.table):
+        parser.error("--runs-root and --run require --global-field or --table")
     if args.run and not args.runs_root:
         parser.error("--run requires --runs-root")
     if args.runs_root and args.manifest != DEFAULT_MANIFEST:

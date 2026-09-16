@@ -4,6 +4,7 @@ import pytest
 
 from src.physics.mms_2d import (
     run_interface_trace_reconstruction_mms,
+    run_interface_alignment_study,
     near_node_interface_x_I,
     patch_source_neumann_residual,
     run_mms_2d_interface,
@@ -37,6 +38,27 @@ pytestmark = pytest.mark.slow
 
 MMS_DT_LIST = [0.0185, 0.00925, 0.004625]
 MMS_PATCH_DT_LIST = [0.037, 0.0185, 0.00925]
+
+
+@pytest.fixture(scope="module")
+def interface_alignment_study():
+    return run_interface_alignment_study()
+
+
+@pytest.mark.parametrize("name, fraction", [
+    ("controlled_left", 0.8),
+    ("controlled_middle", 0.2),
+    ("controlled_right", 0.6),
+])
+def test_controlled_interface_alignment_converges_pairwise(interface_alignment_study, name, fraction):
+    case = next(case for case in interface_alignment_study["cases"] if case["name"] == name)
+    records = case["records"]
+    assert len({row["interface_x"] for row in records}) == 1
+    for row in records:
+        assert row["interface_fraction"] == pytest.approx(fraction, abs=1e-12)
+    for coarse, fine in zip(records, records[1:]):
+        assert fine["rms_error_K"] < coarse["rms_error_K"]
+        assert 1.8 < fine["order_from_previous"] < 2.2
 
 
 class TestOffCenterInterfaceMMS:

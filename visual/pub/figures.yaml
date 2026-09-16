@@ -396,3 +396,8 @@ figures:
       - source_itr_sin_checkpoint
       - interfaces_checkpoint
     metric_space: kelvin
+
+  # Same records as F27; the reduction conditions on one source snapshot.
+  F32_global_field_error_fixed_source:
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
+    metric_space: kelvin
