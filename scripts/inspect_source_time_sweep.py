@@ -159,16 +159,35 @@ def report(result):
             continue
         outlying = [r for r in located
                     if r["published_rank"] > 0.75 * r["n_curves"]]
+        # Quote only the windows that met the criterion. Listing every located
+        # window after the word ATYPICAL reads as if all of them agreed, when a
+        # rank like 4/21 sits at the typical end and argues the other way.
         verdict = "ATYPICAL" if outlying else "typical"
+        cited = outlying or located
         ranks = ", ".join(f"K={r['window_lags']} rank {r['published_rank']}/{r['n_curves']}"
-                          for r in located)
+                          for r in cited)
         print(f"  {benchmark:<16} {verdict}: {ranks}")
+        if outlying and len(outlying) < len(located):
+            others = ", ".join(
+                f"K={r['window_lags']} rank {r['published_rank']}/{r['n_curves']}"
+                for r in located if r not in outlying)
+            print(f"  {'':<16} but not at {others}")
         atypical.extend(outlying)
 
     if atypical:
         print("\n  The plotted source time ranks among the least typical curves for "
               f"{sorted({r['benchmark'] for r in atypical})}.")
         print("  Report the sweep, or pick a source time nearer the centre of the set.")
+        # A window K admits only source times that reach lag K, so when K equals
+        # the published curve's own longest lag it is the latest source time in
+        # the set. If shape drifts steadily with source time, an endpoint ranks
+        # last whether or not it is anomalous, and the rank alone cannot separate
+        # the two. Windows shorter than this admit later source times and do.
+        edge = sorted({r["window_lags"] for r in atypical
+                       if r["window_lags"] == published["max_lead_lag"]})
+        if edge:
+            print(f"  Note K={', '.join(str(k) for k in edge)} admits no source time "
+                  f"later than the published one, so its rank is an endpoint rank.")
     else:
         print("\n  Nothing contradicts F32's choice of source time.")
     for degradation in result["degradations"]:

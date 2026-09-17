@@ -45,6 +45,36 @@ def test_bend_at_the_published_source_time_is_flagged(tmp_path, capsys):
     assert "'forcing'" in out
 
 
+def test_verdict_cites_only_the_windows_that_met_the_criterion(tmp_path, capsys):
+    """A window where the published curve ranks near the typical end is not evidence.
+
+    The verdict used to list every window it could place the curve in, so a
+    rank like 4/21 -- which argues the curve is ordinary -- was printed directly
+    after the word ATYPICAL as though it supported it.
+    """
+    # Each source time gets its own mild shape wiggle so the ranks separate and
+    # the bootstrap places every window; the published one is extra-bad only at
+    # long lags, which is what makes the short window disagree with the long.
+    frames = shape_records(
+        n_sims=60, n_snap=31, noise=.004,
+        log_shape=lambda s, k: (.5 * np.log10(k) + .06 * np.sin(.7 * s) * np.log10(k)
+                                + .5 * (s == 6 and k > 14)))
+    result = sweep.stats.source_time_shape_typicality(frames, metadata=None, n_boot=300)
+    assert sweep.report(result) == 2
+    verdict = capsys.readouterr().out.split("=== 5. Verdict ===")[1]
+
+    rows = [r for r in result["rows"] if r["benchmark"] == "forcing"]
+    outlying = {r["window_lags"] for r in rows
+                if r["published_rank"] > .75 * r["n_curves"]}
+    ordinary = {r["window_lags"] for r in rows} - outlying
+    assert outlying and ordinary, "fixture must produce both kinds of window"
+
+    line = next(l for l in verdict.splitlines() if "forcing" in l)
+    cited = {int(k.split()[0]) for k in line.split("K=")[1:]}
+    assert cited == outlying
+    assert f"but not at K={min(ordinary)}" in verdict
+
+
 def test_bend_elsewhere_leaves_the_published_curve_alone(tmp_path, capsys):
     root = write_runs(tmp_path, n_sims=25,
                       log_shape=lambda s, k: .5 * np.log10(k) + .5 * np.log10(k) * (s == 8))

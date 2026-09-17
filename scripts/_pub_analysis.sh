@@ -7,10 +7,13 @@
 # <experiment>/seed*/test_records.csv; it defaults to runs/.
 #
 #   scripts/_pub_analysis.sh
-#   scripts/_pub_analysis.sh /scratch/$USER/runs
-#   scripts/_pub_analysis.sh /scratch/$USER/runs --run forcing=/scratch/$USER/runs/pub_forcing/config0
-#   PUB_PYTHON=python3 scripts/_pub_analysis.sh /scratch/$USER/runs
-#   PUB_OUT=/scratch/$USER/pub_out scripts/_pub_analysis.sh /scratch/$USER/runs
+#   scripts/_pub_analysis.sh ~/runs
+#   scripts/_pub_analysis.sh ~/runs --run forcing=~/runs/pub_forcing/config0
+#   PUB_PYTHON=python3 scripts/_pub_analysis.sh ~/runs
+#   PUB_OUT=~/pub_out scripts/_pub_analysis.sh ~/runs
+#
+# PUB_OUT must be somewhere you can write. Cluster scratch is a common choice
+# but is not universally writable by users, so pick a path you own if unsure.
 #
 # Arguments after the root are forwarded to every step, which is how you
 # disambiguate a benchmark that has more than one evaluated experiment.
@@ -61,6 +64,16 @@ if [ -n "$MISSING" ]; then
   echo "  pip install --user$(printf ' %s' $MISSING)" >&2
   exit 127
 fi
+# Check the destination before any step runs. The figures resolve provenance,
+# read every record and do the whole bootstrap before they save, so an
+# unwritable --out costs all of that and then raises PermissionError from
+# mkdir. Fail in the first second instead.
+if ! mkdir -p "$OUT" 2>/dev/null || [ ! -w "$OUT" ]; then
+  echo "PUB_OUT is not writable: $OUT" >&2
+  echo "Set PUB_OUT to a directory you own, e.g. PUB_OUT=\$HOME/pub_out" >&2
+  exit 1
+fi
+
 echo "python: $("$PY" -c 'import sys; print(sys.executable)')"
 echo "runs:   $ROOT"
 echo "out:    $OUT   (figures and table; copy this off the cluster)"
