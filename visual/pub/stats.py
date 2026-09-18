@@ -2186,10 +2186,167 @@ def source_time_shape_typicality(frames, *, metadata=None,
     }
 
 
+SURFACE_BENCHMARKS = ("interfaces", "source_itr_sin")
+
+
+def _additive_fit_incomplete(values, rows, cols, n_rows, n_cols):
+    """Least-squares ``mu + alpha_row + beta_col`` over an arbitrary cell set.
+
+    :func:`_additive_interaction` takes row and column means, which is the
+    least-squares fit only when every cell is observed. The evaluated ``(s, k)``
+    domain is triangular -- a late source time reaches no long lag -- so the
+    fit has to be solved rather than averaged. On a complete grid this returns
+    the same answer.
+
+    The design is rank deficient by two, one redundancy per factor, and
+    ``lstsq`` resolves that with its minimum-norm solution; the coefficients are
+    then recentered so ``alpha`` and ``beta`` read as offsets. Fitted values are
+    invariant to both choices. What is *not* automatic is identifiability: if
+    the observed cells split into groups sharing no row and no column, the level
+    difference between those groups is unmeasurable and the rank falls short.
+    """
+    rows, cols = np.asarray(rows), np.asarray(cols)
+    design = np.zeros((len(values), 1 + n_rows + n_cols))
+    design[:, 0] = 1.0
+    design[np.arange(len(rows)), 1 + rows] = 1.0
+    design[np.arange(len(cols)), 1 + n_rows + cols] = 1.0
+    if np.linalg.matrix_rank(design) != n_rows + n_cols - 1:
+        raise ProvenanceError(
+            "the evaluated source/lead cells are disconnected; a shared "
+            "lead-time shape is not identifiable across them")
+    coef = np.linalg.lstsq(design, values, rcond=None)[0]
+    alpha, beta = coef[1:1 + n_rows], coef[1 + n_rows:]
+    return (float(coef[0] + alpha.mean() + beta.mean()),
+            alpha - alpha.mean(), beta - beta.mean())
+
+
+def source_lead_error_surface(frames, *, metadata=None,
+                              benchmarks=SURFACE_BENCHMARKS,
+                              source_fraction=DEFAULT_SOURCE_FRACTION):
+    """The whole ``log10 RMSE(source time, lead time)`` surface per benchmark.
+
+    F32 draws one column of this surface and
+    :func:`source_time_shape_typicality` tests whether that column is
+    representative. Both answer the question indirectly. This returns the
+    surface itself, together with the additive fit ``mu + alpha_s + beta_k`` and
+    its residual, so the two ways a single source time can mislead are separable
+    by eye: ``alpha`` is how much the level moves with source time, and the
+    residual is how much the *shape* does.
+
+    The domain is triangular, not rectangular, so unlike the windowed
+    comparison this is an unbalanced design -- long leads are observed at fewer
+    source times than short ones. The fit accounts for that, but the summary
+    scalars are weighted by cell coverage and are therefore not comparable to
+    the balanced-window values that carry the verdict there. Nothing here is a
+    hypothesis test; it is the data the test is run on.
+    """
+    unknown = [b for b in benchmarks if b not in GLOBAL_FIELD_BENCHMARKS]
+    if unknown:
+        raise ProvenanceError(f"unknown global-field benchmarks: {sorted(unknown)}")
+
+    prepared, seeds, _, protocol_info, protocol = _prepare_global_field_frames(
+        frames, metadata)
+    lead_by_lag = _lead_by_lag(protocol)
+    lags_by_source = _shape_lags_by_source(protocol)
+    max_lag = int(max(lead_by_lag.index))
+    published_index, published_time, horizon = _select_source_index(
+        protocol, float(source_fraction))
+
+    sources = sorted(lags_by_source)
+    lags = list(range(1, max_lag + 1))
+    row_of = {s: i for i, s in enumerate(sources)}
+    source_time = {int(s): float(t) for s, _, t, _ in protocol}
+    cells = [(s, k) for s in sources for k in sorted(lags_by_source[s])]
+    cell_rows = [row_of[s] for s, _ in cells]
+    cell_cols = [k - 1 for _, k in cells]
+
+    n_pairs = len(protocol)
+    out, degradations = {}, []
+    for benchmark in benchmarks:
+        frame = prepared[benchmark]
+        keep, dropped = _complete_shape_cohort(frame, n_pairs)
+        if len(keep) < MIN_CURVES_FOR_SHAPE:
+            raise ProvenanceError(
+                f"{benchmark}: {len(keep)} simulations evaluate the full pair "
+                f"protocol; the surface needs at least {MIN_CURVES_FOR_SHAPE}")
+        if len(dropped):
+            degradations.append(Degradation(
+                "incomplete_pair_cohort",
+                f"{benchmark}: {len(dropped)} of {len(keep) + len(dropped)} simulations "
+                "miss at least one evaluated pair and are excluded so every cell of the "
+                "surface is measured on one cohort"))
+        part = frame.loc[frame["sim_id"].isin(set(keep.tolist()))].copy()
+        part["lag"] = part["j"] - part["s"]
+        pooled = part.groupby(["s", "lag", "sim_id", "seed"], sort=True).agg(
+            sse=("sse_K2", "sum"), cells=("num_error_cells", "sum"))
+        pooled["rmse_K"] = pooled_rmse(pooled["sse"], pooled["cells"])
+        table = pooled.groupby(["s", "lag", "sim_id"])["rmse_K"].mean().unstack("sim_id")
+        values = table.loc[cells].to_numpy(dtype=float)
+        if not np.all(np.isfinite(values) & (values > 0)):
+            raise ProvenanceError(
+                f"{benchmark}: nonpositive or missing pooled RMSE; the log-space "
+                "surface is undefined")
+        observed = np.median(np.log10(values), axis=1)
+
+        grand, alpha, beta = _additive_fit_incomplete(
+            observed, cell_rows, cell_cols, len(sources), len(lags))
+        fitted = grand + alpha[cell_rows] + beta[cell_cols]
+        residual = observed - fitted
+
+        blank = np.full((len(sources), len(lags)), np.nan)
+        surface, fit_surface, residual_surface = (blank.copy() for _ in range(3))
+        surface[cell_rows, cell_cols] = observed
+        fit_surface[cell_rows, cell_cols] = fitted
+        residual_surface[cell_rows, cell_cols] = residual
+
+        ss_resid = float((residual ** 2).sum())
+        ss_beta = float((beta[cell_cols] ** 2).sum())
+        interaction = float(np.sqrt(ss_resid / len(cells)))
+        level = float(alpha.max() - alpha.min())
+        out[benchmark] = {
+            "surface_log10": surface,
+            "additive_fit_log10": fit_surface,
+            "residual_log10": residual_surface,
+            "level_log10": alpha,
+            "shape_log10": beta,
+            "grand_log10": grand,
+            "interaction_rms_log10": interaction,
+            "interaction_pct": float(100.0 * (10.0 ** interaction - 1.0)),
+            "level_spread_pct": float(100.0 * (10.0 ** level - 1.0)),
+            "common_shape_fraction": (ss_beta / (ss_beta + ss_resid)
+                                      if ss_beta + ss_resid > 0 else 1.0),
+            "n_simulations": int(len(keep)),
+            "n_dropped": int(len(dropped)),
+            "n_cells": len(cells),
+            "n_seeds": len(seeds[benchmark]),
+            "seed_ids": seeds[benchmark],
+        }
+
+    counts = {b: out[b]["n_seeds"] for b in benchmarks}
+    return {
+        "benchmarks": list(benchmarks), "surfaces": out,
+        "source_indices": sources,
+        "source_times": [source_time[s] for s in sources],
+        "lags": lags,
+        "lead_times": [float(lead_by_lag.loc[k]) for k in lags],
+        "published": {"source_index": published_index, "source_time": published_time,
+                      "source_fraction": float(source_fraction), "horizon": horizon,
+                      "max_lead_lag": max_lag - published_index},
+        "max_lag": max_lag, "degradations": degradations,
+        "seeds": {b: seeds[b] for b in benchmarks}, "seed_counts": counts,
+        "unequal_seed_counts": len(set(counts.values())) > 1,
+        "protocols": {b: protocol_info[b] for b in benchmarks},
+        "domain": "triangular; cell (s, k) exists iff the target snapshot s + k is evaluated",
+        "fit": "least squares mu + alpha_s + beta_k over observed cells; unbalanced design",
+    }
+
+
 __all__ = [
     "DEFAULT_SHAPE_N_BOOT",
     "DEFAULT_SHAPE_WINDOW_FRACTIONS",
     "MIN_CURVES_FOR_SHAPE",
+    "SURFACE_BENCHMARKS",
+    "source_lead_error_surface",
     "source_time_shape_typicality",
     "DEFAULT_SOURCE_FRACTION",
     "GLOBAL_FIELD_BENCHMARKS",

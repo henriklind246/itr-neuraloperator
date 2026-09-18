@@ -12,7 +12,13 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.ticker import LogLocator, MaxNLocator, NullFormatter, StrMethodFormatter
+from matplotlib.ticker import (
+    FuncFormatter,
+    LogLocator,
+    MaxNLocator,
+    NullFormatter,
+    StrMethodFormatter,
+)
 
 from visual.pub import fields, panels, records, select, stats, style, tables
 from visual.pub._blocked import blocked
@@ -1000,10 +1006,232 @@ def global_field_error_fixed_source(*, source=None, spec=None, requirement=None,
     return fig, None, definition
 
 
+def _cell_edges(centers):
+    """Edges bracketing a monotone sequence of cell centers.
+
+    ``pcolormesh`` wants edges. Midpoints place every center inside its own
+    cell, so a tick reading a source time falls in the column it names rather
+    than on the boundary between two of them.
+    """
+    centers = np.asarray(centers, dtype=float)
+    inner = 0.5 * (centers[:-1] + centers[1:])
+    return np.concatenate([[2 * centers[0] - inner[0]], inner,
+                           [2 * centers[-1] - inner[-1]]])
+
+
+def _kelvin_ticks(vmin, vmax):
+    """Ticks at round kelvin values, on a bar that is linear in log10 kelvin.
+
+    Choosing the ticks in log space puts them at round exponents, whose kelvin
+    values read as noise (0.0631, 0.158, 0.251). Choosing them in kelvin and
+    mapping back gives a scale the reader can price against a temperature.
+    """
+    decades = np.arange(np.floor(vmin), np.ceil(vmax) + 1)
+    for subs in ((1., 2., 5.), (1., 2., 3., 5., 7.), np.arange(1., 10.)):
+        ticks = np.log10(np.concatenate([10.0 ** d * np.asarray(subs) for d in decades]))
+        ticks = ticks[(ticks >= vmin) & (ticks <= vmax)]
+        if len(ticks) >= 3:
+            break
+    return ticks
+
+
+# The shared labels are set for tables and for figures that put several
+# benchmarks in a legend, where brevity wins. Here each name has a panel to
+# itself, so the one that reads as a bare noun is spelled out.
+_SURFACE_TITLES = {"interfaces": "Varying interface"}
+
+
+def _surface_title(benchmark):
+    return _SURFACE_TITLES.get(benchmark, tables.BENCH_LABEL[benchmark])
+
+
+def source_lead_error_surface(*, source=None, spec=None, requirement=None,
+                              benchmarks=stats.SURFACE_BENCHMARKS,
+                              source_fraction=stats.DEFAULT_SOURCE_FRACTION):
+    """F33: the whole error surface over source time and lead time.
+
+    F32 fixes one source time and draws error against lead. Whether that column
+    stands for the others is a question the figure cannot answer about itself,
+    and ``scripts/inspect_source_time_sweep.py`` answers it only as a rank. Here
+    the surface is drawn whole, one heatmap per benchmark, so the column F32
+    draws can be read against its neighbours directly.
+
+    The additive fit and its residual are not drawn. They stay in the exported
+    statistics and in the caption's scalars, where they quantify what the
+    heatmap shows without costing it two thirds of its width.
+    """
+    try:
+        frames, metadata = records.load_global_field_records(source)
+    except (records.SchemaError, FileNotFoundError) as exc:
+        raise ProvenanceError(str(exc)) from exc
+    if not frames:
+        blocked(requirement, _RECORDS_NEEDED, key="F33_source_lead_error_surface")
+    surface = stats.source_lead_error_surface(
+        frames, metadata=metadata, benchmarks=benchmarks,
+        source_fraction=source_fraction)
+    order = surface["benchmarks"]
+    published = surface["published"]
+
+    x_edges = _cell_edges(surface["source_times"])
+    y_edges = _cell_edges(surface["lead_times"])
+    sequential = plt.get_cmap(style.CMAP_TEMPERATURE).copy()
+    # Most of the (s, k) rectangle is never evaluated. Left to the default those
+    # cells take the colormap's lowest color, which reads as a real and very
+    # small error rather than as an absence of data.
+    sequential.set_bad("0.90")
+
+    fig = plt.figure(figsize=style.figsize("two_col", rows=1, row_height="tall"))
+    # A uniform wspace would set the panel-to-bar gap and the bar-to-next-panel
+    # gap to the same width, and the second of those has to hold a tick column
+    # and an axis label while the first holds nothing. Explicit spacer columns
+    # at wspace=0 let the bar sit against its panel.
+    ratios, panel_cols, bar_cols = [], [], []
+    for index in range(len(order)):
+        if index:
+            ratios.append(.30)
+        panel_cols.append(len(ratios))
+        ratios += [1., .03]
+        bar_cols.append(len(ratios))
+        ratios.append(.045)
+    grid = fig.add_gridspec(1, len(ratios), width_ratios=ratios, wspace=0,
+                            left=.105, right=.895, bottom=.155, top=.905)
+    for column, benchmark in enumerate(order):
+        data = surface["surfaces"][benchmark]
+        vmin = float(np.nanmin(data["surface_log10"]))
+        vmax = float(np.nanmax(data["surface_log10"]))
+        ax = fig.add_subplot(grid[0, panel_cols[column]])
+        mesh = ax.pcolormesh(x_edges, y_edges,
+                             np.ma.masked_invalid(data["surface_log10"]).T,
+                             cmap=sequential, vmin=vmin, vmax=vmax,
+                             shading="flat", rasterized=True)
+        ax.set_xlim(x_edges[0], x_edges[-1])
+        ax.set_ylim(y_edges[0], y_edges[-1])
+        ax.tick_params(labelsize=9, width=.8, labelleft=column == 0)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(.8)
+        ax.set_title(_surface_title(benchmark), fontsize=12, pad=6)
+        ax.set_xlabel(r"Source time $t_s$", fontsize=11)
+        if column == 0:
+            ax.set_ylabel(r"Lead time $\Delta t = t_j - t_s$", fontsize=11)
+
+        # Per panel, not shared: the two benchmarks need not span the same
+        # kelvin range, and a shared scale would flatten whichever one is
+        # smaller. The comparison the figure invites is of shape across columns
+        # within a panel, which a per-panel scale serves.
+        bar = fig.colorbar(mesh, cax=fig.add_subplot(grid[0, bar_cols[column]]))
+        bar.set_label("Median RMSE [K]", fontsize=10, labelpad=4)
+        bar.ax.tick_params(labelsize=9, width=.7, pad=2)
+        bar.ax.yaxis.set_ticks(_kelvin_ticks(vmin, vmax))
+        bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{10.0 ** v:g}"))
+        bar.outline.set_linewidth(.8)
+
+    title = "Global field RMSE over source time and lead time"
+
+    labels = ", ".join(_surface_title(b) for b in order)
+    seed_note = "; ".join(f"{_surface_title(b)}: K={surface['seed_counts'][b]}"
+                          for b in order)
+    numbers = "; ".join(
+        f"{_surface_title(b)} {surface['surfaces'][b]['level_spread_pct']:.0f}% level "
+        f"spread, {surface['surfaces'][b]['interaction_pct']:.1f}% residual, "
+        f"{surface['surfaces'][b]['common_shape_fraction']:.2f} shared-shape fraction"
+        for b in order)
+    caption = (
+        f"{title}. Each cell is the cohort median over held-out test simulations of the "
+        "simulation-level global field RMSE at one evaluated (source snapshot, lead) pair, "
+        f"for {labels}. SSE and evaluated cell counts are pooled within a simulation and "
+        "averaged across fixed model seeds before the cohort median. Grey cells are not "
+        "evaluated: a source snapshot admits only the leads that stay inside the horizon, so "
+        "the domain is triangular rather than rectangular. Reading a panel column by column is "
+        "reading error against lead at one source time; the scalars below come from the "
+        "least-squares fit of log10 RMSE = mu + alpha(source) + beta(lead) over the evaluated "
+        "cells, which is the model in which every column traces one shape and differs from the "
+        "others only by a constant factor. Its residual, not drawn here but exported alongside "
+        "this figure, is the disagreement in shape itself; additive in log space is "
+        "multiplicative in kelvin, so that residual is a percentage of the fitted value. F32 "
+        f"draws the single source time $t_s={published['source_time']:.3g}$, the evaluated "
+        f"snapshot nearest {source_fraction:g} of the {published['horizon']:.3g} horizon: that "
+        f"figure is one column of this surface. Over the evaluated cells: {numbers}. Because the domain is "
+        "triangular the fit is an unbalanced design and these scalars are weighted by cell "
+        "coverage, so they describe this surface and are not the balanced-window quantities "
+        "reported by scripts/inspect_source_time_sweep.py, which is where the typicality of "
+        "the marked column is tested. No interval is drawn; a per-cell median carries "
+        "sampling error that this rendering does not show. The operator predicts each pair "
+        "directly from its source snapshot, so variation along the vertical axis is "
+        "lead-time-dependent difficulty, not error accumulated through a rollout. Evaluated "
+        f"model seeds: {seed_note}. "
+    )
+    if surface["unequal_seed_counts"]:
+        caption += "Seed counts differ by benchmark; the amount of training-seed averaging is unequal. "
+    if any(surface["seed_counts"][b] < stats.MIN_SEEDS_FOR_SPREAD for b in order):
+        caption += (
+            f"Fewer than {stats.MIN_SEEDS_FOR_SPREAD} model seeds are averaged, so the surface "
+            "carries the idiosyncrasies of the particular trained models alongside the "
+            "behaviour of the operator. ")
+    caption += ("Each panel carries its own color scale, so colors are comparable within a "
+                "benchmark and not across the two. The scales are linear in log10 RMSE; both "
+                "time axes are linear.")
+    if source.degradations:
+        caption += (" This descriptive comparison has publication-cohort limitations detailed "
+                    "in the provenance sidecar.")
+
+    rows = []
+    for benchmark in order:
+        data = surface["surfaces"][benchmark]
+        for i, (index, t_s) in enumerate(zip(surface["source_indices"],
+                                             surface["source_times"])):
+            for j, (lag, lead) in enumerate(zip(surface["lags"], surface["lead_times"])):
+                if not np.isfinite(data["surface_log10"][i, j]):
+                    continue
+                rows.append({
+                    "benchmark": benchmark, "source_index": int(index),
+                    "source_time": float(t_s), "lag": int(lag), "lead_time": float(lead),
+                    "is_published_source": index == published["source_index"],
+                    "median_rmse_K": float(10.0 ** data["surface_log10"][i, j]),
+                    "additive_fit_rmse_K": float(10.0 ** data["additive_fit_log10"][i, j]),
+                    "residual_pct": float(100.0 * (10.0 ** data["residual_log10"][i, j] - 1.0)),
+                    "n_simulations": data["n_simulations"], "n_seeds": data["n_seeds"],
+                })
+    definition = {
+        "space": "kelvin", "metric": "rmse_K", "title": title, "caption": caption,
+        "benchmarks": order,
+        "benchmark_selection": (
+            "one benchmark whose error level moves strongly with source time and one whose "
+            "error shape does; the two ways a single source time can fail to stand for the rest"),
+        "source_time_marked": published,
+        "domain": surface["domain"], "fit": surface["fit"],
+        "aggregation": "cells -> pair sufficient statistics -> simulation RMSE at one (s, lag) "
+                       "-> seed mean -> cohort median -> log10",
+        "replication_unit": "sim_id within benchmark; equal simulation weights",
+        "prediction_mode": "direct_pair; increases with lead are horizon difficulty, "
+                           "not rollout error accumulation",
+        "interval": None,
+        "interval_omitted_because": "a per-cell median has sampling error a heatmap cannot "
+                                    "display; intervals for the marked column are in F32 and "
+                                    "the rank interval for its typicality is in the sweep",
+        "summary": {b: {k: surface["surfaces"][b][k] for k in
+                        ("interaction_pct", "level_spread_pct", "common_shape_fraction",
+                         "n_simulations", "n_dropped", "n_cells")} for b in order},
+        "summary_comparability": "weighted by cell coverage over a triangular domain; not the "
+                                 "balanced-window values in scripts/inspect_source_time_sweep.py",
+        "seed_counts": surface["seed_counts"], "seed_ids": surface["seeds"],
+        "unequal_seed_counts": surface["unequal_seed_counts"],
+        "seed_averaging": "mean of simulation errors; not an ensemble-averaged prediction",
+        "protocols": surface["protocols"], "record_metadata": metadata,
+        "statistics": rows,
+        "degradations": [str(d) for d in source.degradations]
+                        + [str(d) for d in surface["degradations"]],
+    }
+    return fig, None, definition
+
+
 __all__ = [
     "global_field_error_vs_lead",
     "global_field_error_vs_itr",
     "global_field_error_fixed_source",
+    "source_lead_error_surface",
     "BENCH_ORDER",
     "TARGET_REL_L2_PCT",
     "benchmark_order",

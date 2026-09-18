@@ -84,7 +84,7 @@ echo "=== source-time sweep: is F32's plotted t_s* representative? ==="
 echo "exit=$?"
 
 echo
-echo "=== global-field figures: F27, F28, F32 ==="
+echo "=== global-field figures: F27, F28, F32, F33 ==="
 "$PY" -u -m visual.pub --global-field --runs-root "$ROOT" --out "$OUT" "$@"
 echo "exit=$?"
 

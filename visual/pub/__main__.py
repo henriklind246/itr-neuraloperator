@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--figure", nargs="+", metavar="KEY",
                    help="figure keys to render")
     p.add_argument("--global-field", action="store_true",
-                   help="render F27 and F28; defaults to descriptive rendering with disclosures")
+                   help="render F27, F28, F32 and F33; defaults to descriptive rendering with disclosures")
     p.add_argument("--runs-root", type=Path,
                    help="discover global-field records recursively under this directory")
     p.add_argument("--run", action="append", default=[], metavar="BENCHMARK=CONFIG_DIR",
@@ -165,7 +165,8 @@ def cmd_audit(out_dir: Path, fmt: str) -> int:
 def _selected_keys(args) -> list[str]:
     if args.global_field:
         return ["F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr",
-                "F32_global_field_error_fixed_source"]
+                "F32_global_field_error_fixed_source",
+                "F33_source_lead_error_surface"]
     if args.figure:
         for key in args.figure:
             get_figure(key)

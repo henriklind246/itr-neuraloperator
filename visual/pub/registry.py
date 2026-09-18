@@ -143,6 +143,13 @@ _SPECS: tuple[FigureSpec, ...] = (
           "Global field RMSE against lead time at a fixed source time",
           "visual.pub.fig_crossbench", "global_field_error_fixed_source", 1, "one_col",
           formats=("png", "pdf", "svg"), preserve_size=True, source_fraction=0.2),
+    # F32 draws one column of a surface. This draws the surface, so whether that
+    # column stands for the rest is something the reader can see rather than
+    # something a separate diagnostic has to assert.
+    _spec("F33_source_lead_error_surface",
+          "Global field RMSE over source time and lead time",
+          "visual.pub.fig_crossbench", "source_lead_error_surface", 1, "two_col",
+          formats=("png", "pdf", "svg"), preserve_size=True, source_fraction=0.2),
     # The adjacent-node companion to F26. Same four benchmarks, the other jump
     # definition -- this is the one test_records.csv scores.
     _spec("F31_node_jump_fidelity",

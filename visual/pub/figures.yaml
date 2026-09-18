@@ -401,3 +401,10 @@ figures:
   F32_global_field_error_fixed_source:
     requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     metric_space: kelvin
+
+  # Draws only interfaces and source_itr_sin, but all four records are still
+  # required: the shared loader validates one cross-benchmark snapshot protocol,
+  # and the two drawn panels inherit the source-time grid from that check.
+  F33_source_lead_error_surface:
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
+    metric_space: kelvin

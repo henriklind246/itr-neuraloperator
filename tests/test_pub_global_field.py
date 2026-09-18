@@ -12,13 +12,14 @@ import yaml
 from PIL import Image
 from scipy.integrate import quad
 
-from visual.pub import records, registry, stats, style
+from visual.pub import records, registry, stats, style, tables
 from visual.pub.manifest import FigureSource, Manifest, ProvenanceError, audit
 from src.physics.internal_source import make_rc_sin_profile
 
 
 KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
 FIXED_SOURCE_KEY = "F32_global_field_error_fixed_source"
+SURFACE_KEY = "F33_source_lead_error_surface"
 
 
 def field_records(n_sims=25, seed_counts=None, grid=None):
@@ -391,9 +392,9 @@ def test_shape_comparison_refuses_short_and_nonuniform_grids():
         stats.source_time_shape_typicality(frames, n_boot=0)
 
 
-def write_field_manifest(root, n_sims=25):
+def write_field_manifest(root, n_sims=25, frames=None):
     sources = {}
-    for benchmark, f in field_records(n_sims=n_sims).items():
+    for benchmark, f in (field_records(n_sims=n_sims) if frames is None else frames).items():
         run = root / benchmark / "seed0"
         run.mkdir(parents=True)
         f.to_csv(run / "test_records.csv", index=False)
@@ -506,6 +507,150 @@ def test_fixed_source_render_exports_the_whole_sweep(tmp_path):
     assert drawn.n_simulations.nunique() == 1
     definition = json.loads(result.sidecar.read_text())["metric_definition"]
     assert definition["source_time_selection"]["source_index"] == 1
+
+
+def surface(frames=None, **kwargs):
+    return stats.source_lead_error_surface(
+        shape_records(**kwargs) if frames is None else frames)
+
+
+def test_incomplete_fit_reduces_to_row_and_column_means_on_a_full_grid():
+    """The whole reason the surface solves rather than averages.
+
+    Row and column means are the least-squares additive fit only when every
+    cell is observed, which is the windowed comparison's balanced design but
+    never the surface's triangular one. If the two disagree on a full grid the
+    solver is wrong, not merely different.
+    """
+    rng = np.random.default_rng(0)
+    matrix = rng.normal(size=(5, 7))
+    rows, cols = np.divmod(np.arange(matrix.size), 7)
+    grand, alpha, beta = stats._additive_fit_incomplete(matrix.ravel(), rows, cols, 5, 7)
+    _, expected_alpha, expected_beta = stats._additive_interaction(matrix)
+    assert grand == pytest.approx(matrix.mean())
+    assert alpha == pytest.approx(expected_alpha)
+    assert beta == pytest.approx(expected_beta)
+
+
+def test_disconnected_cells_are_refused_rather_than_fitted():
+    # Two blocks sharing no row and no column: the level difference between them
+    # is unmeasurable, and lstsq would silently return one anyway.
+    values = np.arange(4.0)
+    rows, cols = [0, 0, 1, 1], [0, 1, 2, 3]
+    with pytest.raises(ProvenanceError, match="disconnected"):
+        stats._additive_fit_incomplete(values, rows, cols, 2, 4)
+
+
+def test_surface_separates_a_level_shift_from_a_shape_change():
+    # n_snap=10 leaves source indices 0..8, so the planted level spans .2 * 8.
+    level = surface(n_snap=10, log_level=lambda s: .2 * s)["surfaces"]["interfaces"]
+    assert level["level_spread_pct"] == pytest.approx(100 * (10 ** 1.6 - 1), rel=1e-6)
+    assert level["interaction_pct"] == pytest.approx(0, abs=1e-6)
+    assert level["common_shape_fraction"] == pytest.approx(1.0)
+
+    # A bend that only the late source times have cannot be absorbed by a
+    # per-source constant, so it lands in the residual and nowhere else.
+    bent = surface(n_snap=10,
+                   log_shape=lambda s, k: .5 * np.log10(k) + .4 * (s >= 5) * np.log10(k),
+                   )["surfaces"]["interfaces"]
+    assert bent["interaction_pct"] > 5
+    assert bent["common_shape_fraction"] < level["common_shape_fraction"]
+    assert bent["level_spread_pct"] < level["level_spread_pct"]
+
+
+def test_surface_is_triangular_and_its_fit_reproduces_the_observed_cells():
+    result = surface(n_snap=10)
+    data = result["surfaces"]["source_itr_sin"]
+    observed = data["surface_log10"]
+    assert observed.shape == (len(result["source_indices"]), len(result["lags"]))
+    evaluated = np.argwhere(np.isfinite(observed))
+    # Cell (s, k) exists exactly when the target snapshot s + k is on the grid.
+    assert {(int(s), int(k) + 1) for s, k in evaluated} == {
+        (s, k) for s in result["source_indices"]
+        for k in result["lags"] if s + k <= result["max_lag"]}
+    assert data["n_cells"] == len(evaluated)
+    assert np.isnan(data["additive_fit_log10"][~np.isfinite(observed)]).all()
+    residual = observed - data["additive_fit_log10"]
+    assert np.nanmax(np.abs(residual - data["residual_log10"])) == pytest.approx(0, abs=1e-12)
+    # Recentered offsets, so the fit reads as a grand level plus two deviations.
+    assert data["level_log10"].mean() == pytest.approx(0, abs=1e-12)
+    assert data["shape_log10"].mean() == pytest.approx(0, abs=1e-12)
+
+
+def test_surface_refuses_an_unknown_benchmark_and_a_thin_cohort():
+    with pytest.raises(ProvenanceError, match="unknown global-field"):
+        stats.source_lead_error_surface(shape_records(), benchmarks=("typo",))
+    with pytest.raises(ProvenanceError, match="at least"):
+        stats.source_lead_error_surface(shape_records(n_sims=2))
+
+
+def test_surface_discloses_an_incomplete_cohort_without_dropping_a_cell():
+    frames = shape_records(n_sims=20, n_snap=8)
+    f = frames["interfaces"]
+    frames["interfaces"] = f.loc[~((f.sim_id == 3) & (f.s == 1) & (f.j == 4))]
+    result = stats.source_lead_error_surface(frames)
+    assert result["surfaces"]["interfaces"]["n_simulations"] == 19
+    assert result["surfaces"]["interfaces"]["n_dropped"] == 1
+    # The other benchmark keeps its full cohort; the exclusion is not global.
+    assert result["surfaces"]["source_itr_sin"]["n_simulations"] == 20
+    assert any(d.code == "incomplete_pair_cohort" for d in result["degradations"])
+
+
+def test_surface_figure_titles_each_panel_and_masks_the_unevaluated_cells(monkeypatch):
+    frames = shape_records(n_sims=20, n_snap=10)
+    reduced = stats.source_lead_error_surface(frames)
+    monkeypatch.setattr(records, "load_global_field_records", lambda source: (frames, {}))
+    fig, _, definition = registry.get_figure(SURFACE_KEY).load()(
+        source=FigureSource(SURFACE_KEY))
+    # One heatmap per benchmark and one colorbar each. Colorbar axes carry a
+    # collection too, so the title is what distinguishes a panel.
+    panels = [ax for ax in fig.axes if ax.get_title()]
+    assert len(panels) == len(stats.SURFACE_BENCHMARKS)
+    assert len(fig.axes) == 2 * len(stats.SURFACE_BENCHMARKS)
+    assert fig.get_size_inches() == pytest.approx([7.0, 3.6])
+    assert not fig.texts, "the panel titles carry the naming; no figure-level title"
+    # The panel title overrides the shared table label for interfaces only.
+    assert [ax.get_title() for ax in panels] == [
+        "Varying interface", tables.BENCH_LABEL["source_itr_sin"]]
+    assert not any(ax.lines for ax in panels), "no source-time marker is drawn"
+
+    # Each panel is scaled to its own benchmark, not to the pair.
+    for ax, benchmark in zip(panels, stats.SURFACE_BENCHMARKS):
+        values = reduced["surfaces"][benchmark]["surface_log10"]
+        assert ax.collections[0].get_clim() == pytest.approx(
+            (np.nanmin(values), np.nanmax(values)))
+    grey = panels[0].collections[0].get_cmap()(np.ma.masked_invalid([np.nan]))[0]
+    assert grey[:3] == pytest.approx((.90, .90, .90), abs=.01)
+
+    total = sum(s["n_cells"] for s in reduced["surfaces"].values())
+    assert len(definition["statistics"]) == total
+    assert sum(r["is_published_source"] for r in definition["statistics"]) > 0
+    assert definition["benchmarks"] == list(stats.SURFACE_BENCHMARKS)
+    assert definition["interval"] is None
+    assert "not error accumulated through a rollout" in definition["caption"]
+    assert "accumulat" not in definition["caption"].replace(
+        "not error accumulated through a rollout", "")
+    plt.close(fig)
+
+
+def test_surface_render_exports_one_row_per_evaluated_cell(tmp_path):
+    # The default field_records grid is non-uniform, which the surface refuses:
+    # lead time has to be a function of snapshot lag for a column to mean
+    # anything. shape_records is evenly spaced.
+    manifest = write_field_manifest(
+        tmp_path, frames=shape_records(n_sims=20, n_snap=10))
+    result = registry.render(SURFACE_KEY, manifest=manifest,
+                             out_dir=tmp_path / "out", strict=False)
+    assert [p.suffix for p in result.paths] == [".png", ".pdf", ".svg", ".csv"]
+    plotted = pd.read_csv(result.paths[3])
+    assert set(plotted.benchmark) == set(stats.SURFACE_BENCHMARKS)
+    assert (plotted.source_index + plotted.lag <= plotted.lag.max() + 1).all()
+    assert plotted.loc[plotted.is_published_source].source_time.nunique() == 1
+    # The residual is a percentage of the fit, which is what the colorbar claims.
+    assert (100 * (plotted.median_rmse_K / plotted.additive_fit_rmse_K - 1)
+            ).to_numpy() == pytest.approx(plotted.residual_pct.to_numpy(), abs=1e-6)
+    definition = json.loads(result.sidecar.read_text())["metric_definition"]
+    assert "triangular domain" in definition["summary_comparability"]
 
 
 def test_loader_rejects_legacy_rollout_and_reads_grid_metadata(tmp_path):
@@ -645,7 +790,7 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
     monkeypatch.setattr(cli, 'render', fake_render)
     command = ['--global-field', '--runs-root', str(tmp_path / 'runs')]
     assert cli.main(command) == 2
-    assert [key for key, _ in calls] == [*KEYS, FIXED_SOURCE_KEY]
+    assert [key for key, _ in calls] == [*KEYS, FIXED_SOURCE_KEY, SURFACE_KEY]
     assert all(not kw['strict'] and str(kw['out_dir']) == 'figures/global_field' for _, kw in calls)
     assert 'Selected forcing_records' in capsys.readouterr().out
     calls.clear()
