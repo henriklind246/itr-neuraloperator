@@ -602,23 +602,29 @@ def test_surface_figure_titles_each_panel_and_masks_the_unevaluated_cells(monkey
     monkeypatch.setattr(records, "load_global_field_records", lambda source: (frames, {}))
     fig, _, definition = registry.get_figure(SURFACE_KEY).load()(
         source=FigureSource(SURFACE_KEY))
-    # One heatmap per benchmark and one colorbar each. Colorbar axes carry a
-    # collection too, so the title is what distinguishes a panel.
+    # Colorbar axes carry a collection too, so the title distinguishes a panel.
     panels = [ax for ax in fig.axes if ax.get_title()]
     assert len(panels) == len(stats.SURFACE_BENCHMARKS)
-    assert len(fig.axes) == 2 * len(stats.SURFACE_BENCHMARKS)
-    assert fig.get_size_inches() == pytest.approx([7.0, 3.6])
+    assert len(fig.axes) == len(stats.SURFACE_BENCHMARKS) + 1
+    assert fig.get_size_inches() == pytest.approx([8.4, 4.32])
     assert not fig.texts, "the panel titles carry the naming; no figure-level title"
     # The panel title overrides the shared table label for interfaces only.
     assert [ax.get_title() for ax in panels] == [
         "Varying interface", tables.BENCH_LABEL["source_itr_sin"]]
     assert not any(ax.lines for ax in panels), "no source-time marker is drawn"
 
-    # Each panel is scaled to its own benchmark, not to the pair.
+    all_values = np.concatenate([
+        reduced["surfaces"][b]["surface_log10"].ravel()
+        for b in stats.SURFACE_BENCHMARKS])
+    shared_limits = (np.nanmin(all_values), np.nanmax(all_values))
     for ax, benchmark in zip(panels, stats.SURFACE_BENCHMARKS):
         values = reduced["surfaces"][benchmark]["surface_log10"]
-        assert ax.collections[0].get_clim() == pytest.approx(
-            (np.nanmin(values), np.nanmax(values)))
+        mesh = ax.collections[0]
+        assert mesh.get_clim() == pytest.approx(shared_limits)
+        assert mesh.norm is panels[0].collections[0].norm
+        assert mesh.get_array().compressed() == pytest.approx(values.T[np.isfinite(values.T)])
+    assert fig.axes[-1].get_ylabel() == "Median RMSE [K]"
+    assert "Both panels share one color scale" in definition["caption"]
     grey = panels[0].collections[0].get_cmap()(np.ma.masked_invalid([np.nan]))[0]
     assert grey[:3] == pytest.approx((.90, .90, .90), abs=.01)
 

@@ -250,6 +250,10 @@ def bundles(source) -> dict[str, RunBundle]:
 # ------------------------------------------------------------------ evaluation
 
 def layer_conductivities(bundle_: RunBundle) -> tuple[float, float]:
+    params = bundle_.sim_params[0]
+    if "material_properties" in _param_names(params):
+        material = params["material_properties"]
+        return float(material["k_left"]), float(material["k_right"])
     if bundle_.benchmark in ("source", "source_itr_sin"):
         return _K_LEFT_SOURCE, _K_RIGHT_SOURCE
     layers = bundle_.config.get("physics", {}).get("layers")

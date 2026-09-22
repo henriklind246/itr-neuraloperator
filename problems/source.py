@@ -32,6 +32,19 @@ RC_RANGE = (0.05, 1.0)
 INTERFACE_X = 0.5
 T_OFF_FRAC = 0.75
 
+# Millimetres, seconds, kg, and K: representative Ti-6Al-4V / cartridge brass.
+# k = 6.97 / 112 W/(m K), rho = 4440 / 8530 kg/m^3, cp = 523 / 377 J/(kg K).
+K_LEFT, K_RIGHT = 0.00697, 0.112
+RHO_LEFT, RHO_RIGHT = 4.44e-6, 8.53e-6
+CP_LEFT, CP_RIGHT = 523.0, 377.0
+PROBLEM_VERSION = "source_ti_brass_mm_v1"
+MATERIAL_PROPERTIES = {
+    "k_left": K_LEFT, "k_right": K_RIGHT,
+    "rho_left": RHO_LEFT, "rho_right": RHO_RIGHT,
+    "cp_left": CP_LEFT, "cp_right": CP_RIGHT,
+    "length_unit": "mm", "time_unit": "s", "mass_unit": "kg",
+}
+
 COND_STATIC_DIM = 6  # [lead, R_c] + [x_h, y_h, w_h, h_h]; no source amplitude leak
 
 # Spatial-descriptor conditioning ablation slice (single source of truth for the
@@ -236,6 +249,7 @@ class SourceProblem(ProblemSpec):
     """
 
     name = "source"
+    problem_version = PROBLEM_VERSION
 
     spatial_descriptor_cond_slice = SOURCE_SPATIAL_DESCRIPTOR_SLICE
 
@@ -301,6 +315,7 @@ class SourceProblem(ProblemSpec):
             T0 = np.full(X.shape, 300.0, dtype=np.float32)
 
             sim_params.append({
+                "material_properties": dict(MATERIAL_PROPERTIES),
                 "R_c": R_c,
                 "interface_x": interface_x,
                 "x_h": x_h,
@@ -323,8 +338,8 @@ class SourceProblem(ProblemSpec):
         a = float(base_kwargs["a"])
         b = float(base_kwargs["b"])
         layers = [
-            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=3.0),
-            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=35.0),
+            Layer2D(x_left=a, x_right=x_I, rho=RHO_LEFT, cp=CP_LEFT, k=K_LEFT),
+            Layer2D(x_left=x_I, x_right=b, rho=RHO_RIGHT, cp=CP_RIGHT, k=K_RIGHT),
         ]
         # Zero-flux left boundary in vector form so the solver's flux detection
         # uses the vector branch.
@@ -618,6 +633,7 @@ class SourceProblem(ProblemSpec):
         regime = _classify_regime(x_h, interface_x, w_h)
 
         params = {
+            "material_properties": dict(MATERIAL_PROPERTIES),
             "R_c": R_c,
             "interface_x": interface_x,
             "x_h": x_h,

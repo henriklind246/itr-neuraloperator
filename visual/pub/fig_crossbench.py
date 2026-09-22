@@ -1080,53 +1080,49 @@ def source_lead_error_surface(*, source=None, spec=None, requirement=None,
     # small error rather than as an absence of data.
     sequential.set_bad("0.90")
 
-    fig = plt.figure(figsize=style.figsize("two_col", rows=1, row_height="tall"))
-    # A uniform wspace would set the panel-to-bar gap and the bar-to-next-panel
-    # gap to the same width, and the second of those has to hold a tick column
-    # and an axis label while the first holds nothing. Explicit spacer columns
-    # at wspace=0 let the bar sit against its panel.
-    ratios, panel_cols, bar_cols = [], [], []
+    vmin = min(float(np.nanmin(surface["surfaces"][b]["surface_log10"]))
+               for b in order)
+    vmax = max(float(np.nanmax(surface["surfaces"][b]["surface_log10"]))
+               for b in order)
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+
+    base_size = style.figsize("two_col", rows=1, row_height="tall")
+    fig = plt.figure(figsize=tuple(1.2 * length for length in base_size))
+    ratios, panel_cols = [], []
     for index in range(len(order)):
         if index:
-            ratios.append(.30)
+            ratios.append(.12)
         panel_cols.append(len(ratios))
-        ratios += [1., .03]
-        bar_cols.append(len(ratios))
-        ratios.append(.045)
+        ratios.append(1.)
+    ratios += [.04, .045]
     grid = fig.add_gridspec(1, len(ratios), width_ratios=ratios, wspace=0,
                             left=.105, right=.895, bottom=.155, top=.905)
     for column, benchmark in enumerate(order):
         data = surface["surfaces"][benchmark]
-        vmin = float(np.nanmin(data["surface_log10"]))
-        vmax = float(np.nanmax(data["surface_log10"]))
         ax = fig.add_subplot(grid[0, panel_cols[column]])
         mesh = ax.pcolormesh(x_edges, y_edges,
                              np.ma.masked_invalid(data["surface_log10"]).T,
-                             cmap=sequential, vmin=vmin, vmax=vmax,
+                             cmap=sequential, norm=norm,
                              shading="flat", rasterized=True)
         ax.set_xlim(x_edges[0], x_edges[-1])
         ax.set_ylim(y_edges[0], y_edges[-1])
-        ax.tick_params(labelsize=9, width=.8, labelleft=column == 0)
+        ax.tick_params(labelsize=11, width=.8, labelleft=column == 0)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
         for spine in ax.spines.values():
             spine.set_visible(True)
             spine.set_linewidth(.8)
-        ax.set_title(_surface_title(benchmark), fontsize=12, pad=6)
-        ax.set_xlabel(r"Source time $t_s$", fontsize=11)
+        ax.set_title(_surface_title(benchmark), fontsize=14, pad=7)
+        ax.set_xlabel(r"Source time $t_s$", fontsize=14)
         if column == 0:
-            ax.set_ylabel(r"Lead time $\Delta t = t_j - t_s$", fontsize=11)
+            ax.set_ylabel(r"Lead time $\Delta t = t_j - t_s$", fontsize=14)
 
-        # Per panel, not shared: the two benchmarks need not span the same
-        # kelvin range, and a shared scale would flatten whichever one is
-        # smaller. The comparison the figure invites is of shape across columns
-        # within a panel, which a per-panel scale serves.
-        bar = fig.colorbar(mesh, cax=fig.add_subplot(grid[0, bar_cols[column]]))
-        bar.set_label("Median RMSE [K]", fontsize=10, labelpad=4)
-        bar.ax.tick_params(labelsize=9, width=.7, pad=2)
-        bar.ax.yaxis.set_ticks(_kelvin_ticks(vmin, vmax))
-        bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{10.0 ** v:g}"))
-        bar.outline.set_linewidth(.8)
+    bar = fig.colorbar(mesh, cax=fig.add_subplot(grid[0, -1]))
+    bar.set_label("Median RMSE [K]", fontsize=13, labelpad=5)
+    bar.ax.tick_params(labelsize=11, width=.7, pad=3)
+    bar.ax.yaxis.set_ticks(_kelvin_ticks(vmin, vmax))
+    bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{10.0 ** v:g}"))
+    bar.outline.set_linewidth(.8)
 
     title = "Global field RMSE over source time and lead time"
 
@@ -1170,9 +1166,9 @@ def source_lead_error_surface(*, source=None, spec=None, requirement=None,
             f"Fewer than {stats.MIN_SEEDS_FOR_SPREAD} model seeds are averaged, so the surface "
             "carries the idiosyncrasies of the particular trained models alongside the "
             "behaviour of the operator. ")
-    caption += ("Each panel carries its own color scale, so colors are comparable within a "
-                "benchmark and not across the two. The scales are linear in log10 RMSE; both "
-                "time axes are linear.")
+    caption += ("Both panels share one color scale spanning the full RMSE range across "
+                "benchmarks, so the same color represents the same error in kelvin. "
+                "The shared scale is linear in log10 RMSE; both time axes are linear.")
     if source.degradations:
         caption += (" This descriptive comparison has publication-cohort limitations detailed "
                     "in the provenance sidecar.")

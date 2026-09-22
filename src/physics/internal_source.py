@@ -11,13 +11,12 @@ between t=0 and t=t_off:
     a(t)       = A * sin^2(pi * t / t_off)   for 0 <= t <= t_off, else 0
     S_h(x, y)  = indicator of the rectangular patch.
 
-PATCH_A_RANGE is the (A_MIN, A_MAX) tuple consumed by downstream LHS sampling
-and normalization, so there is a single source of truth. The range is chosen
-so that peak temperature rises land inside the 5-150 K window used by
-`scripts/calibrate_patch_amplitude.py`: a 4-point sweep at (A=300, A=3000)
-across both interface regimes gave ~1 K and ~10 K peak rises, so linear
-extrapolation places A_min at ~1500 (5 K floor) and A_max at ~15000
-(~50 K rise, well below the 150 K ceiling).
+PATCH_A_RANGE is in W/mm^3 for the Ti-6Al-4V / brass source benchmarks.
+The shared 10:1 amplitude range is calibrated with
+`scripts/calibrate_patch_amplitude.py` at 100x100, dt=0.005 s, t_final=0.3 s.
+The 174-case screen gives peak rises of approximately 0.13-145 K over both
+amplitude endpoints. A universal 5 K floor is incompatible with a 150 K
+ceiling: patches next to the cold right wall heat much less than left patches.
 """
 
 PATCH_W = 0.1
@@ -39,7 +38,7 @@ def patch_center_range(lo: float, hi: float, length: float) -> tuple[float, floa
 
 PATCH_X_RANGE = patch_center_range(*DOMAIN_X, PATCH_W)
 PATCH_Y_RANGE = patch_center_range(*DOMAIN_Y, PATCH_H)
-PATCH_A_RANGE: tuple[float, float] = (1500.0, 15000.0)
+PATCH_A_RANGE: tuple[float, float] = (8.0, 80.0)
 
 
 def make_patch_indicator(

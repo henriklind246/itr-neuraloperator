@@ -668,6 +668,66 @@ class TestSourceSolver:
         assert solver.interface_R == [params["R_c"]]
 
 
+@pytest.mark.parametrize("name", ["source", "source_itr_sin"])
+def test_source_material_capacity_and_cross_interface_heating(name):
+    from types import SimpleNamespace
+
+    from data.generate_dataset import build_base_setup
+    from visual.pub.fields import layer_conductivities
+
+    setup = build_base_setup(num_sims=2, save_stride=1, nx=20, ny=20, dt=0.005)
+    spec = get_problem(name, "temporal_encoder")
+    params = spec.sample_sim_params(
+        np.random.default_rng(0), np.random.default_rng(1),
+        setup["grids"], setup["time_cfg"],
+    )[0]
+    bundle = SimpleNamespace(benchmark=name, sim_params=[params], config={})
+    assert layer_conductivities(bundle) == (0.00697, 0.112)
+    legacy = dict(params)
+    legacy.pop("material_properties")
+    assert layer_conductivities(SimpleNamespace(
+        benchmark=name, sim_params=[legacy], config={},
+    )) == (3.0, 35.0)
+    for axis in spec.ood_axes().values():
+        latents = spec.draw_latents(
+            np.random.default_rng(0), np.random.default_rng(1),
+            setup["grids"], setup["time_cfg"], axis,
+        )
+        ood_params = spec.apply_ood_value(latents, axis, axis.ood_values[0])
+        assert ood_params["material_properties"] == params["material_properties"]
+    params.update(x_h=0.5, y_h=0.5, w_h=0.4, h_h=0.4, A=1.0)
+    solver = spec.configure_solver(params, setup["base_kwargs"])
+    np.testing.assert_allclose(solver.k_nodes[[8, 11], 9], [0.00697, 0.112])
+    np.testing.assert_allclose(solver.rho_nodes[[8, 11], 9], [4.44e-6, 8.53e-6])
+    np.testing.assert_allclose(solver.cp_nodes[[8, 11], 9], [523.0, 377.0])
+
+    # At an initially uniform temperature, the instantaneous heating rate is
+    # Q/(rho cp). A tiny first step isolates this from subsequent diffusion.
+    setup["base_kwargs"].update(dt=1e-8, t_final=1e-8)
+    solver = spec.configure_solver(params, setup["base_kwargs"])
+    tn = params["t_off"] / 2
+    initial = np.full((20, 20), 300.0)
+    expected = solver.dt / np.array([4.44e-6 * 523.0, 8.53e-6 * 377.0])
+    for step in (solver.cn_step, solver.cn_step_loop):
+        actual = step(initial, tn) - initial
+        np.testing.assert_allclose(actual[[8, 11], 9], expected, rtol=1e-4, atol=1e-10)
+
+
+@pytest.mark.parametrize("name", ["source", "source_itr_sin"])
+def test_source_material_version_rejects_old_datasets(name, tmp_path):
+    from data.dataset import assert_dataset_problem_version
+
+    spec = get_problem(name)
+    path = tmp_path / "t_grid.npy"
+    with pytest.raises(ValueError, match="regenerate"):
+        assert_dataset_problem_version(spec, path)
+    np.save(tmp_path / "meta.npy", {"problem_version": "unit_capacity"})
+    with pytest.raises(ValueError, match="stale"):
+        assert_dataset_problem_version(spec, path)
+    np.save(tmp_path / "meta.npy", {"problem_version": spec.problem_version})
+    assert assert_dataset_problem_version(spec, path)["problem_version"] == "source_ti_brass_mm_v1"
+
+
 class TestSourceSampleParity:
     def test_regimes_and_ranges(self, source_dataset):
         ds = source_dataset

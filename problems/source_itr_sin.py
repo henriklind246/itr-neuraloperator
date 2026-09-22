@@ -10,6 +10,13 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM, T_EPS, _forcing_seq_3tok_from_samples, _sample_a
 from problems.source import (
+    CP_LEFT,
+    CP_RIGHT,
+    K_LEFT,
+    K_RIGHT,
+    MATERIAL_PROPERTIES,
+    RHO_LEFT,
+    RHO_RIGHT,
     SourceProblem,
     _classify_regime,
     _lhs_unit,
@@ -329,6 +336,7 @@ class SourceItrSinProblem(SourceProblem):
         regime = _classify_regime(x_h, interface_x, w_h)
 
         params = {
+            "material_properties": dict(MATERIAL_PROPERTIES),
             "R_c": float(R_base),
             "interface_x": interface_x,
             "x_h": x_h,
@@ -361,8 +369,8 @@ class SourceItrSinProblem(SourceProblem):
         a = float(base_kwargs["a"])
         b = float(base_kwargs["b"])
         layers = [
-            Layer2D(x_left=a, x_right=x_I, rho=1.0, cp=1.0, k=3.0),
-            Layer2D(x_left=x_I, x_right=b, rho=1.0, cp=1.0, k=35.0),
+            Layer2D(x_left=a, x_right=x_I, rho=RHO_LEFT, cp=CP_LEFT, k=K_LEFT),
+            Layer2D(x_left=x_I, x_right=b, rho=RHO_RIGHT, cp=CP_RIGHT, k=K_RIGHT),
         ]
         q_left_fn = lambda t: np.zeros_like(y_grid)
         # Build the source via the parent's patch builder by delegating the
