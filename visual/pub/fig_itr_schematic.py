@@ -5,17 +5,9 @@ interfacial thermal resistance of the *_itr_sin benchmarks and the classical
 spatially uniform scalar-ITR formulation. This is a representative schematic,
 not a result plot.
 
-The representative profile uses the center of the actual benchmark sampling
-ranges (src/physics/internal_source.py RC_SIN_RANGES, R_PEAK_MAX and
-problems/source_itr_sin.py sample_sim_params):
-
-    R_c(y) = R_base + A sin(pi y),
-    R_base = mid([0.05, 1.0]) = 0.525,
-    A      = E[u_A] * (R_PEAK_MAX - R_base) = 0.5 * (3.0 - 0.525) = 1.2375.
-
-The scalar panel uses the center of the uniform benchmarks' own sampling range
-(problems/source.py / problems/forcing.py RC_RANGE = (0.05, 1.0)), i.e.
-R_c = 0.525.
+The representative profile uses the midpoint baseline and mean conditional
+amplitude from problems/source_itr_sin.py. The scalar panel uses the midpoint
+of problems/source.py RC_RANGE. Both panels describe the source benchmarks.
 
 Run:  python -m visual.pub.fig_itr_schematic
 """
@@ -28,7 +20,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from problems.source import RC_RANGE
-from src.physics.internal_source import RC_SIN_RANGES, R_PEAK_MAX, make_rc_sin_profile
+from problems.source_itr_sin import RC_SIN_RANGES, R_PEAK_MAX
+from src.physics.internal_source import make_rc_sin_profile
 from visual.pub import style
 
 OUT_DIR = Path("visual/pub_out")
@@ -57,8 +50,8 @@ def build() -> "plt.Figure":
         constrained_layout=True,
     )
 
-    xlim = (0.0, 2.0)
-    xlabel = "$R_c$ [m$^2$K/W]"
+    xlim = (0.0, 1.15 * (R_base + A))
+    xlabel = "$R_c$ [mm$^2$K/W]"
 
     # ---- (a) spatially varying sinusoidal profile ----
     ax_var.plot(rc, y, color=COLOR_VARYING, linewidth=1.6, solid_capstyle="round")
@@ -77,14 +70,14 @@ def build() -> "plt.Figure":
     rc_scalar = 0.5 * (RC_RANGE[0] + RC_RANGE[1])
     ax_uni.plot([rc_scalar, rc_scalar], [0.0, 1.0], color=COLOR_SCALAR,
                 linewidth=1.6, solid_capstyle="round")
-    ax_uni.text(rc_scalar + 0.06, 0.5, rf"$R_c = {rc_scalar:.3g}$",
+    ax_uni.text(rc_scalar + 0.06 * RC_RANGE[1], 0.5, rf"$R_c = {rc_scalar:.3g}$",
                 ha="left", va="center", rotation=90, fontsize=6, color="0.45")
     ax_uni.set_title("Spatially uniform ITR")
 
     ax_var.set_xlim(*xlim)
-    ax_var.set_xticks([0.0, 0.5, 1.0, 1.5, 2.0])
-    ax_uni.set_xlim(0.0, 1.0)
-    ax_uni.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    ax_var.set_xticks(np.linspace(*xlim, 5))
+    ax_uni.set_xlim(0.0, RC_RANGE[1])
+    ax_uni.set_xticks(np.linspace(0.0, RC_RANGE[1], 5))
     for ax in (ax_var, ax_uni):
         ax.set_ylim(0.0, 1.0)
         ax.set_xlabel(xlabel)

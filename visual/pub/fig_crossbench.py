@@ -537,7 +537,7 @@ def physical_contact_jump_vs_lead(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
-NODE_JUMP_LEAD_QUANTILES = (0.1, 0.5, 0.9)
+NODE_JUMP_TARGET_FRACTIONS = (0.2, 0.5, 1.0)
 
 # y nodes kept per profile when drawing the parity cloud. The cohort is 24
 # simulations x ~30 leads x ~100 y nodes, and 72k markers per panel is an
@@ -551,7 +551,8 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
     """F31 -- adjacent-node interface-jump fidelity across benchmarks.
 
     Two rows over the same four benchmarks. The top row is one representative
-    case per benchmark, truth solid and prediction dashed at three lead times,
+    case per benchmark, truth solid and prediction dashed from t_s=0 at three
+    fixed fractions of the saved time horizon,
     which shows whether the *shape* of the jump along y is recovered. The bottom
     row is the whole seeded cohort as a parity cloud, which shows whether the
     *magnitude* is, and whether the error is a slope bias or symmetric scatter --
@@ -568,33 +569,34 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
     if not order:
         blocked(requirement, _CHECKPOINT_NEEDED, key="F31_node_jump_fidelity")
 
-    cases, cohorts, fits, picks, restrictions, columns_by_bench = {}, {}, {}, {}, {}, {}
+    cases, cohorts, fits, picks, restrictions = {}, {}, {}, {}, {}
     for bench in order:
         frame = frames[bench]
         bundle = fields.bundle(source, bench)
         sims = stats.per_sim(frame, metrics=("rmse_K", "rel_l2_pct"))
         pick, restricted = fields.select_transverse_case(
             bundle, sims, frame.df, quantile=0.5, metric="rmse_K",
-            min_leads=len(NODE_JUMP_LEAD_QUANTILES),
             min_node_jump_contrast_K=fields.MIN_NODE_JUMP_CONTRAST_K)
-        # The lead columns have to come from the pool the case was ranked in.
-        # When the restriction was dropped, the pick is only guaranteed to span
-        # the leads of the unrestricted frame.
-        pool = frame.df
-        if restricted:
-            pool = fields.node_jump_contrast_pairs(
-                bundle, fields.transverse_pairs(bundle, frame.df))
-        cols = select.select_lead_columns(
-            pool, pick, lead_quantiles=NODE_JUMP_LEAD_QUANTILES)
-        cases[bench] = [fields.evaluate_case(bundle, pick.sim_id, s, (j,))
-                        for s, j in cols]
+        t_grid = np.asarray(bundle.t_grid, dtype=float)
+        if len(t_grid) <= len(NODE_JUMP_TARGET_FRACTIONS) or not np.isclose(t_grid[0], 0.0):
+            raise ProvenanceError(
+                f"{bench}: F31 needs t_s=0 and at least three saved future snapshots")
+        targets = []
+        # Contrast selects the simulation, never its displayed times: filtering
+        # targets would suppress cooling and could repeat the same truth field.
+        for index, fraction in enumerate(NODE_JUMP_TARGET_FRACTIONS):
+            nearest = int(np.argmin(np.abs(t_grid - fraction * t_grid[-1])))
+            lower = targets[-1] + 1 if targets else 1
+            upper = len(t_grid) - (len(NODE_JUMP_TARGET_FRACTIONS) - index)
+            targets.append(int(np.clip(nearest, lower, upper)))
+        cases[bench] = [fields.evaluate_case(bundle, pick.sim_id, 0, (j,))
+                        for j in targets]
         cohort = fields.evaluate_node_jump_cohort(bundle, frame)
         cohorts[bench] = cohort
         fits[bench] = stats.parity_fit(cohort.truth, cohort.pred,
                                        n_sims=len(cohort.sim_ids))
         picks[bench] = pick
         restrictions[bench] = restricted
-        columns_by_bench[bench] = cols
 
     # One lead-time scale across every panel. Per-panel normalization would make
     # the darkest marker mean a different lead in each column, and the row would
@@ -626,7 +628,7 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
             color=color, xlabel="$y$", title=bench, legend=True)
         ax_top.axhline(0.0, color="0.6", linewidth=0.5, zorder=0)
         ax_top.yaxis.set_major_locator(MaxNLocator(nbins=4))
-        ax_top.text(0.97, 0.03, f"sim {picks[bench].sim_id}",
+        ax_top.text(0.97, 0.03, f"sim {picks[bench].sim_id}, $t_s=0$",
                     transform=ax_top.transAxes, ha="right", va="bottom",
                     fontsize=5.0, color="0.35")
 
@@ -671,11 +673,16 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
             "node_jump_rmse_K. See F26 for the physical jump.",
         "sign_convention": "right minus left, matching src/operators/eval.py",
         "row_a": {
-            "content": "one representative case per benchmark at lead-time "
-                       f"quantiles {NODE_JUMP_LEAD_QUANTILES} of that "
-                       "simulation's own t_bar",
+            "content": "one representative simulation per benchmark, predicted "
+                       "from t_s=0 at fixed fractions of the saved time horizon",
+            "protocol_version": 2,
+            "source_time": 0.0,
+            "target_time_fractions": list(NODE_JUMP_TARGET_FRACTIONS),
+            "target_selection": "nearest saved times, constrained to distinct "
+                                "increasing future indices; no target contrast filter",
             "selection": "median simulation by pooled rmse_K within the "
-                         "restricted pool",
+                         "restricted pool; contrast restrictions apply only "
+                         "to simulation selection",
             "node_jump_contrast_restriction":
                 fields.node_jump_contrast_note(),
             "node_jump_contrast_minimum_K": fields.MIN_NODE_JUMP_CONTRAST_K,
@@ -683,8 +690,11 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
                 b: {
                     "sim_id": int(picks[b].sim_id),
                     "restricted_pool": bool(restrictions[b]),
-                    "columns": [{"s": int(s), "j": int(j)}
-                                for s, j in columns_by_bench[b]],
+                    "columns": [{"s": int(c.s), "j": int(c.targets[0]),
+                                 "t_s": float(c.t_source),
+                                 "t_j": float(c.t_targets[0]),
+                                 "t_bar": float(c.lead_times[0])}
+                                for c in cases[b]],
                 }
                 for b in order
             },

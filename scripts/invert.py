@@ -37,7 +37,6 @@ from scripts.inverse_adapters import (  # noqa: E402
     SIN_PARAM_NAMES,
 )
 from src.operators.fno2d import FNO2d  # noqa: E402
-from src.physics.internal_source import R_PEAK_MAX  # noqa: E402
 
 _SOURCE_ITR_SIN_ADAPTER = SourceItrSinAdapter()
 PAPER_OBSERVATION_TIMES = (0.07, 0.15, 0.30)
@@ -1604,7 +1603,7 @@ def joint_nll_grid(
     with torch.no_grad():
         for i, r_base in enumerate(axes[0]):
             for j, amp in enumerate(axes[1]):
-                if amp > R_PEAK_MAX - r_base:
+                if amp > adapter.rc_peak_max - r_base:
                     continue
                 theta = torch.tensor([r_base, amp], dtype=theta_mle.dtype)
                 nll[i, j] = float(neg_log_likelihood(

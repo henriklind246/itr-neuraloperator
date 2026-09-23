@@ -14,9 +14,9 @@ between t=0 and t=t_off:
 PATCH_A_RANGE is in W/mm^3 for the Ti-6Al-4V / brass source benchmarks.
 The shared 10:1 amplitude range is calibrated with
 `scripts/calibrate_patch_amplitude.py` at 100x100, dt=0.005 s, t_final=0.3 s.
-The 174-case screen gives peak rises of approximately 0.13-145 K over both
-amplitude endpoints. A universal 5 K floor is incompatible with a 150 K
-ceiling: patches next to the cold right wall heat much less than left patches.
+The amplitude and source-specific resistance ranges jointly target historical
+temperature-rise and interface-jump scales while retaining distinct material
+heat capacities. Patches next to the cold right wall heat less than left patches.
 """
 
 PATCH_W = 0.1
@@ -38,7 +38,7 @@ def patch_center_range(lo: float, hi: float, length: float) -> tuple[float, floa
 
 PATCH_X_RANGE = patch_center_range(*DOMAIN_X, PATCH_W)
 PATCH_Y_RANGE = patch_center_range(*DOMAIN_Y, PATCH_H)
-PATCH_A_RANGE: tuple[float, float] = (8.0, 80.0)
+PATCH_A_RANGE: tuple[float, float] = (4.0, 40.0)
 
 
 def make_patch_indicator(
@@ -194,15 +194,16 @@ def equivalent_scalar_resistance(
     return float(np.sum(weights) / np.sum(weights / Rc))
 
 
-def rc_log_norm(Rc_y: np.ndarray) -> np.ndarray:
+def rc_log_norm(
+    Rc_y: np.ndarray, *, rc_min: float = RC_MIN, rc_max: float = R_PEAK_MAX,
+) -> np.ndarray:
     """Log-normalize a physical R_c(y) profile to roughly [-1, 1].
 
-    Linear normalization over the 60x span [RC_MIN, R_PEAK_MAX] = [0.05, 3.0]
-    wastes most of the range because realistic R_base clusters in [0.05, 1.0];
-    log-spacing spends resolution where the samples are. R_c(y) >= R_base >=
-    RC_MIN, so the log argument is always positive.
+    Log-spacing resolves the small-resistance end of the sampled range.
+    Source benchmarks supply their physical bounds; defaults retain the
+    forcing benchmark normalization.
     """
-    log_min = np.log(RC_MIN)
-    log_max = np.log(R_PEAK_MAX)
+    log_min = np.log(rc_min)
+    log_max = np.log(rc_max)
     Rc = np.asarray(Rc_y, dtype=np.float64)
     return (2.0 * (np.log(Rc) - log_min) / (log_max - log_min) - 1.0).astype(np.float32)

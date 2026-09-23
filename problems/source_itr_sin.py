@@ -15,6 +15,7 @@ from problems.source import (
     K_LEFT,
     K_RIGHT,
     MATERIAL_PROPERTIES,
+    RC_RANGE,
     RHO_LEFT,
     RHO_RIGHT,
     SourceProblem,
@@ -24,14 +25,15 @@ from problems.source import (
     _validate_patch_bounds,
 )
 from src.physics.internal_source import (
-    RC_MIN,
-    RC_SIN_RANGES,
-    R_PEAK_MAX,
     make_rc_sin_profile,
     integrate_sin2_pulse,
     make_sin2_pulse,
     rc_log_norm,
 )
+
+RC_MIN = RC_RANGE[0]
+R_PEAK_MAX = 1050.0
+RC_SIN_RANGES = {"R_base": RC_RANGE, "A": (0.0, R_PEAK_MAX - RC_MIN)}
 
 SPATIAL_CHANNELS_TEMPORAL = 5
 S_Y_CHANNEL = 3
@@ -244,8 +246,8 @@ class SourceItrSinProblem(SourceProblem):
             "rc_base": OODAxis(
                 name="rc_base",
                 kind="simulation_parameter",
-                id_reference=(0.5,),
-                ood_values=(0.1, 1.25, 1.5, 2.0),
+                id_reference=(175.0,),
+                ood_values=(35.0, 437.5, 525.0, 700.0),
                 field="R_c_base",
                 trained_range=(base_lo, base_hi),
                 notes="sinusoid floor R_base; reject < RC_MIN (log-normalized "
@@ -256,7 +258,7 @@ class SourceItrSinProblem(SourceProblem):
                 name="rc_A",
                 kind="simulation_parameter",
                 id_reference=(0.5 * (A_lo + A_hi),),
-                ood_values=(0.0, 3.5, 4.0),
+                ood_values=(0.0, 1225.0, 1400.0),
                 field="R_c_A",
                 trained_range=(A_lo, A_hi),
                 notes="sinusoid depth A; R_base held at background. A=0 is the "
@@ -403,7 +405,7 @@ class SourceItrSinProblem(SourceProblem):
     def _rc_channel(self, ds, params: dict) -> np.ndarray:
         """Build the (Nx, Ny) normalized R_c(y) input channel for one sim."""
         Rc_y = self._canonical_profile(params, ds.y_grid)
-        Rc_y_norm = rc_log_norm(Rc_y)  # (Ny,)
+        Rc_y_norm = rc_log_norm(Rc_y, rc_min=RC_MIN, rc_max=R_PEAK_MAX)  # (Ny,)
         if self.rc_channel_mode == "broadcast":
             channel = np.broadcast_to(Rc_y_norm[None, :], (ds.Nx, ds.Ny))
         elif self.rc_channel_mode == "localized":

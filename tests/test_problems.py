@@ -681,6 +681,10 @@ def test_source_material_capacity_and_cross_interface_heating(name):
         np.random.default_rng(0), np.random.default_rng(1),
         setup["grids"], setup["time_cfg"],
     )[0]
+    assert 4.0 <= params["A"] <= 40.0
+    assert 17.5 <= params["R_c"] <= 350.0
+    if name == "source_itr_sin":
+        assert 0.0 <= params["R_c_A"] <= 1050.0 - params["R_c_base"]
     bundle = SimpleNamespace(benchmark=name, sim_params=[params], config={})
     assert layer_conductivities(bundle) == (0.00697, 0.112)
     legacy = dict(params)
@@ -724,8 +728,11 @@ def test_source_material_version_rejects_old_datasets(name, tmp_path):
     np.save(tmp_path / "meta.npy", {"problem_version": "unit_capacity"})
     with pytest.raises(ValueError, match="stale"):
         assert_dataset_problem_version(spec, path)
+    np.save(tmp_path / "meta.npy", {"problem_version": "source_ti_brass_mm_v1"})
+    with pytest.raises(ValueError, match="stale"):
+        assert_dataset_problem_version(spec, path)
     np.save(tmp_path / "meta.npy", {"problem_version": spec.problem_version})
-    assert assert_dataset_problem_version(spec, path)["problem_version"] == "source_ti_brass_mm_v1"
+    assert assert_dataset_problem_version(spec, path)["problem_version"] == "source_ti_brass_mm_v2"
 
 
 class TestSourceSampleParity:
@@ -733,9 +740,9 @@ class TestSourceSampleParity:
         ds = source_dataset
         regimes = set()
         for p in ds.sim_params:
-            assert 0.05 <= p["R_c"] <= 1.0
+            assert 17.5 <= p["R_c"] <= 350.0
             assert p["interface_x"] == 0.5
-            assert p["A"] > 0.0
+            assert 4.0 <= p["A"] <= 40.0
             regimes.add(p["regime"])
         # stratified x_h sampling should populate more than one regime
         assert regimes <= {"left", "near", "right"}
@@ -794,7 +801,7 @@ class TestSourceItrSinItem:
         )
 
     def test_rc_channel_matches_sin_log_norm_profile(self, source_itr_sin_dataset):
-        from problems.source_itr_sin import rc_log_norm
+        from problems.source_itr_sin import RC_MIN, R_PEAK_MAX, rc_log_norm
         from src.physics.internal_source import make_rc_sin_profile
 
         ds = source_itr_sin_dataset
@@ -805,7 +812,7 @@ class TestSourceItrSinItem:
         expected = rc_log_norm(
             make_rc_sin_profile(
                 ds.y_grid, R_base=float(p["R_c_base"]), A=float(p["R_c_A"]),
-            )
+            ), rc_min=RC_MIN, rc_max=R_PEAK_MAX
         )
         np.testing.assert_allclose(item["spatial"][0, :, 4], expected, rtol=0, atol=0)
 
@@ -839,7 +846,7 @@ class TestSourceItrSinSchema:
 
 class TestSourceItrSinSampleParity:
     def test_sin_params_present_and_bounded(self, source_itr_sin_dataset):
-        from src.physics.internal_source import RC_SIN_RANGES, R_PEAK_MAX
+        from problems.source_itr_sin import RC_SIN_RANGES, R_PEAK_MAX
         ds = source_itr_sin_dataset
         b_lo, b_hi = RC_SIN_RANGES["R_base"]
         for p in ds.sim_params:

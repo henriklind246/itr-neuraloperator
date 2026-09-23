@@ -16,6 +16,7 @@ from data.dataset import (
     split_sim_ids,
 )
 from src.physics.boundary_forcing import FORCING_TEMPORAL_SAMPLES
+from problems import source_itr_sin
 from problems.source import INTERFACE_X
 from src.physics.internal_source import rc_log_norm
 from src.physics.internal_source import (
@@ -1194,7 +1195,9 @@ def plot_source_itr_sin_resistance_profiles(
         G_y = _interface_conductance_profile(
             y, Rc_y, x_grid=x_grid, interface_x=float(p.get("interface_x", INTERFACE_X))
         )
-        profile_rows.append((int(sid), p, Rc_y, rc_log_norm(Rc_y), G_y))
+        profile_rows.append((int(sid), p, Rc_y, rc_log_norm(
+            Rc_y, rc_min=source_itr_sin.RC_MIN, rc_max=source_itr_sin.R_PEAK_MAX,
+        ), G_y))
 
     colors = plt.cm.viridis(np.linspace(0.15, 0.85, max(len(profile_rows), 1)))
     active = severity["is_itr_active"]

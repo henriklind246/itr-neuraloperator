@@ -147,7 +147,7 @@ class TestItrTemperatureJumpSweep:
         result = physics_plots.plot_itr_temperature_jump_sweep(
             benchmarks=("source_itr_sin",),
             Nx=20, Ny=20, t_final=0.1,
-            rc_peak_values=(0.05, 1.00),
+            rc_peak_values=(17.5, 350.0),
             requested_times=(0.05, 0.10),
             save_path=tmp_path / "itr_temperature_jump_sweep.png",
         )
@@ -156,12 +156,12 @@ class TestItrTemperatureJumpSweep:
         for row in records:
             assert np.isfinite(row["mean_abs_jump_K"])
             assert row["itr_kind"] == "Rc_peak"
-            assert row["R_c_base"] == 0.05
+            assert row["R_c_base"] == 17.5
             assert row["R_c_peak"] == row["itr_value"]
-            assert row["R_c_A"] == pytest.approx(row["R_c_peak"] - 0.05)
+            assert row["R_c_A"] == pytest.approx(row["R_c_peak"] - 17.5)
 
-        # The R_c_peak == 0.05 endpoint is the "no void excess" baseline.
-        base_rows = [r for r in records if r["itr_value"] == 0.05]
+        # The R_c_peak == 17.5 endpoint is the "no void excess" baseline.
+        base_rows = [r for r in records if r["itr_value"] == 17.5]
         assert base_rows
         for row in base_rows:
             assert row["R_c_A"] == pytest.approx(0.0)

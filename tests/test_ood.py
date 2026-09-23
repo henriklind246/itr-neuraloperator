@@ -33,7 +33,7 @@ from data.generate_ood_dataset import (
 from problems.registry import get_problem
 from scripts.inspect_ood import BUCKET_KEYS, reduce_pairs_to_sims
 from src.operators.eval import TEST_RECORD_FIELDS, write_test_records
-from src.physics.internal_source import RC_MIN
+from problems.source_itr_sin import RC_MIN
 
 # Small solver scaffolding shared by the generation-side tests. The grid must be
 # wide enough for the interfaces `interface_x` extremes to clear the
@@ -100,14 +100,15 @@ def test_ood_hooks_schema_valid_and_solvable(benchmark):
 # ---------------------------------------------------------------------------
 # (b) CRN invariance on ordinary axes: only the swept field changes.
 # ---------------------------------------------------------------------------
-# forcing, source, and interfaces all expose the identical scalar `rc` sweep.
+# Scalar resistance sweeps preserve their relative distance from training bounds.
 @pytest.mark.parametrize("benchmark", ("forcing", "source", "interfaces"))
 def test_crn_invariance_scalar_rc(benchmark):
     spec = get_problem(benchmark, "temporal_encoder")
     setup = _tiny_setup(num_sims=2)
     axis = spec.ood_axes()["rc"]
     assert axis.field == "R_c"
-    assert axis.ood_values == (0.0, 0.01, 0.025, 1.25, 1.5, 2.0)
+    scale = 350.0 if benchmark == "source" else 1.0
+    assert axis.ood_values == tuple(scale * v for v in (0.0, 0.01, 0.025, 1.25, 1.5, 2.0))
     latents = spec.draw_latents(
         np.random.default_rng(7), np.random.default_rng(8),
         setup["grids"], setup["time_cfg"], axis,

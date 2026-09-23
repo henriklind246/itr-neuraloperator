@@ -20,14 +20,14 @@ import torch
 from problems.forcing import FORCING_TEMPORAL_TOKEN_DIM
 from problems.source import _patch_center_ranges
 from problems.source_itr_sin import (
+    RC_MIN,
+    RC_SIN_RANGES,
+    R_PEAK_MAX,
     RC_Y_CHANNEL,
     build_cond_vector_sin,
     rc_log_norm,
 )
 from src.physics.internal_source import (
-    RC_MIN,
-    RC_SIN_RANGES,
-    R_PEAK_MAX,
     make_rc_sin_profile,
 )
 from scripts import invert as inv
@@ -97,6 +97,7 @@ THETAS = [
     (0.50, 0.00),   # no-void floor
     (0.75, 1.20),
 ]
+THETAS = [tuple(350.0 * value for value in theta) for theta in THETAS]
 
 
 @pytest.mark.parametrize("theta", THETAS)
@@ -128,7 +129,7 @@ def test_rc_channel_matches_reference(theta):
     y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float32)
 
     Rc_y = make_rc_sin_profile(y_grid, R_base=R_base, A=R_amp)
-    ref_channel = np.broadcast_to(rc_log_norm(Rc_y)[None, :], (Nx, Ny))
+    ref_channel = np.broadcast_to(rc_log_norm(Rc_y, rc_min=RC_MIN, rc_max=R_PEAK_MAX)[None, :], (Nx, Ny))
 
     theta_t = torch.tensor(theta, dtype=torch.float64)
     y_t = torch.from_numpy(y_grid).to(torch.float64)
@@ -196,7 +197,7 @@ def _fake_observation_set(Nx=16, Ny=16, N=3, M=128):
         sid=0, time_indices=list(range(N)),
         spatial=spatial, cond=cond, forcing_seq=forcing_seq,
         targets=targets, y_grid=y_grid, Nx=Nx,
-        theta_true=torch.tensor([0.3, 1.0]),
+        theta_true=torch.tensor([105.0, 350.0]),
     )
 
 
@@ -223,8 +224,8 @@ def test_predict_fullfield_injects_both_points_and_is_differentiable():
 def test_predict_fullfield_changes_with_theta():
     model = _tiny_source_itr_sin_model().eval()
     obs = _fake_observation_set()
-    theta_a = torch.tensor([0.2, 0.1])
-    theta_b = torch.tensor([0.8, 2.0])
+    theta_a = torch.tensor([70.0, 35.0])
+    theta_b = torch.tensor([280.0, 700.0])
     with torch.no_grad():
         pa = inv.predict_fullfield(model, obs, theta_a)
         pb = inv.predict_fullfield(model, obs, theta_b)
@@ -245,7 +246,7 @@ def test_invert_sim_recovers_theta_against_self_generated_target(optimizer):
         p.requires_grad_(False)
     obs = _fake_observation_set()
 
-    theta_star = torch.tensor([0.4, 1.5])
+    theta_star = torch.tensor([140.0, 525.0])
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
 
@@ -255,7 +256,7 @@ def test_invert_sim_recovers_theta_against_self_generated_target(optimizer):
     assert result.loss < 1e-4
     # Landed theta is inside the physical box.
     th = result.theta_hat
-    assert 0.05 - 1e-6 <= th[0] <= 1.0 + 1e-6
+    assert 17.5 - 1e-6 <= th[0] <= 350.0 + 1e-6
     assert th[1] >= -1e-6 and (th[0] + th[1]) <= R_PEAK_MAX + 1e-4
 
 
@@ -349,7 +350,7 @@ def test_invert_sim_recovers_theta_with_sparse_sensors():
     )
     assert int(obs.mask.sum()) < Nx * Ny  # genuinely sparse
 
-    theta_star = torch.tensor([0.4, 1.5])
+    theta_star = torch.tensor([140.0, 525.0])
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
 
@@ -358,7 +359,7 @@ def test_invert_sim_recovers_theta_with_sparse_sensors():
     result = inv.invert_sim(model, obs, cfg)
     assert result.loss < 1e-4
     th = result.theta_hat
-    assert 0.05 - 1e-6 <= th[0] <= 1.0 + 1e-6
+    assert 17.5 - 1e-6 <= th[0] <= 350.0 + 1e-6
     assert th[1] >= -1e-6 and (th[0] + th[1]) <= R_PEAK_MAX + 1e-4
 
 
@@ -384,7 +385,7 @@ def test_lhs_starts_map_into_theta_box():
     u = torch.from_numpy(inv.lhs_starts_u(16, rng))
     theta = inv.theta_from_unconstrained(u)
     R_base, R_amp = (theta[:, i] for i in range(2))
-    assert torch.all(R_base >= 0.05 - 1e-6) and torch.all(R_base <= 1.0 + 1e-6)
+    assert torch.all(R_base >= 17.5 - 1e-6) and torch.all(R_base <= 350.0 + 1e-6)
     assert torch.all(R_amp >= -1e-6)
     assert torch.all(R_base + R_amp <= R_PEAK_MAX + 1e-4)  # dependent ceiling
 
@@ -395,7 +396,7 @@ def test_invert_sim_lhs_and_normal_both_recover():
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set()
-    theta_star = torch.tensor([0.4, 1.5])
+    theta_star = torch.tensor([140.0, 525.0])
     with torch.no_grad():
         obs.targets = inv.predict_fullfield(model, obs, theta_star).detach()
     for sampling in ("lhs", "normal"):
@@ -410,7 +411,7 @@ def test_observation_jacobian_shape_finite_nonzero():
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set(Nx=8, Ny=8, N=2)
-    theta = torch.tensor([0.4, 1.2])
+    theta = torch.tensor([140.0, 420.0])
 
     # Full-field: m = N * Nx * Ny * C.
     J = inv.observation_jacobian(model, obs, theta)
@@ -445,7 +446,7 @@ def test_sensitivity_report_orthonormal_and_summary_columns():
     for p in model.parameters():
         p.requires_grad_(False)
     obs = _fake_observation_set(Nx=8, Ny=8, N=2)
-    theta = torch.tensor([0.4, 1.2])
+    theta = torch.tensor([140.0, 420.0])
     rep = inv.sensitivity_report(model, obs, theta)
 
     S = rep["singular_values"]
@@ -759,8 +760,8 @@ def test_fv_polish_holds_or_improves_from_perturbed_start(tiny_fv_dataset):
     theta_true = obs.theta_true
     # Perturb within the box (keep the dependent amp ceiling satisfied).
     theta_start = torch.tensor([
-        float(theta_true[0]) + 0.05,
-        max(0.0, float(theta_true[1]) - 0.1),
+        float(theta_true[0]) + 17.5,
+        max(0.0, float(theta_true[1]) - 35.0),
     ], dtype=torch.float32)
 
     mask_cpu = obs.mask.cpu()
@@ -778,7 +779,7 @@ def test_fv_polish_holds_or_improves_from_perturbed_start(tiny_fv_dataset):
     assert res.fv_polish_resid is not None
     assert res.fv_polish_resid <= start_resid + 1e-9    # never worse than start
     tp = res.theta_fv_polish
-    assert 0.05 - 1e-6 <= float(tp[0]) <= 1.0 + 1e-6
+    assert 17.5 - 1e-6 <= float(tp[0]) <= 350.0 + 1e-6
     assert float(tp[1]) >= -1e-6 and (float(tp[0]) + float(tp[1])) <= R_PEAK_MAX + 1e-4
 
     flat = inv.fv_refine_summary(res, obs, obs.y_grid)
@@ -902,7 +903,7 @@ def test_neg_log_likelihood_zero_at_fit_and_scales_inverse_variance():
 
     # Now perturb theta so residuals are nonzero, and check 1/sigma_eff2 scaling.
     theta2 = theta.clone()
-    theta2[1] = theta2[1] + 0.3
+    theta2[1] = theta2[1] + 105.0
     nll_a = float(inv.neg_log_likelihood(model, obs, theta2, 0.02))
     nll_b = float(inv.neg_log_likelihood(model, obs, theta2, 0.08))
     assert nll_a > 0 and nll_b > 0
@@ -913,25 +914,25 @@ def test_neg_log_likelihood_zero_at_fit_and_scales_inverse_variance():
 def test_theta_profile_pins_coord_and_respects_amp_ceiling(fixed_index):
     torch.manual_seed(0)
     u = torch.randn(4, dtype=torch.float64)
-    pinned = {0: 0.4, 1: 0.7, 2: 0.6, 3: 0.12}[fixed_index]
+    pinned = {0: 140.0, 1: 245.0}[fixed_index]
     theta = inv._theta_profile(u, fixed_index, pinned)
     assert float(theta[fixed_index]) == pytest.approx(pinned)
     # Free coords stay in the physical box; the dependent amp ceiling holds.
     R_base, R_amp = float(theta[0]), float(theta[1])
-    assert 0.05 - 1e-6 <= R_base <= 1.0 + 1e-6
+    assert 17.5 - 1e-6 <= R_base <= 350.0 + 1e-6
     assert R_amp >= -1e-6 and (R_base + R_amp) <= R_PEAK_MAX + 1e-4
 
 
 def test_theta_profile_high_pinned_amp_caps_free_base():
     # Pinning R_amp near its ceiling must shrink the free R_base box so the peak
     # R_base + R_amp never exceeds R_PEAK_MAX. A large positive u0 (sigmoid -> 1)
-    # would map R_base to base_hi=1.0 without the cap, giving 1.0 + 2.8 = 3.8.
-    pinned_amp = 2.8
+    # would map R_base to base_hi=350 without the cap, giving 350 + 980 = 1330.
+    pinned_amp = 980.0
     u = torch.tensor([20.0, 0.0], dtype=torch.float64)
     theta = inv._theta_profile(u, fixed_index=1, fixed_value=pinned_amp)
     R_base, R_amp = float(theta[0]), float(theta[1])
     assert R_amp == pytest.approx(pinned_amp)
-    base_ceiling = R_PEAK_MAX - pinned_amp  # 0.2
+    base_ceiling = R_PEAK_MAX - pinned_amp  # 70.0
     assert R_base == pytest.approx(base_ceiling, abs=1e-6)
     assert (R_base + R_amp) <= R_PEAK_MAX + 1e-9
     # Lower edge of the shrunk box still reaches base_lo at u0 -> -inf.
@@ -1449,6 +1450,28 @@ THETAS_SIN = [
     (0.50, 0.00),   # no-hump floor (A = 0)
     (0.75, 1.20),
 ]
+THETAS_SIN = [tuple(350.0 * value for value in theta) for theta in THETAS_SIN]
+
+
+def test_source_and_forcing_sin_adapters_use_distinct_physical_ranges():
+    source, forcing = SourceItrSinAdapter(), ForcingItrSinAdapter()
+    u = torch.tensor([[-2.0, -1.0], [0.0, 0.0], [2.0, 1.0]], dtype=torch.float64)
+    source_theta = source.theta_from_unconstrained(u)
+    forcing_theta = forcing.theta_from_unconstrained(u)
+    assert source.profile_bounds(0) == (17.5, 350.0)
+    assert source.profile_bounds(1) == (0.0, 1032.5)
+    assert forcing.profile_bounds(0) == (0.05, 1.0)
+    assert forcing.profile_bounds(1) == (0.0, 2.95)
+    torch.testing.assert_close(source_theta, 350.0 * forcing_theta)
+    torch.testing.assert_close(
+        source.cond_slice_from_theta(source_theta),
+        forcing.cond_slice_from_theta(forcing_theta),
+    )
+    y = torch.linspace(0.0, 1.0, 21, dtype=torch.float64)
+    torch.testing.assert_close(
+        source.spatial_channel_from_theta(source_theta, y, 4),
+        forcing.spatial_channel_from_theta(forcing_theta, y, 4),
+    )
 
 
 @pytest.mark.parametrize("theta", THETAS_SIN)
@@ -1487,7 +1510,7 @@ def test_sin_adapter_rc_channel_matches_numpy_profile(theta):
     y_grid = np.linspace(0.0, 1.0, Ny).astype(np.float64)
 
     Rc_y = make_rc_sin_profile(y_grid, R_base=R_base, A=A)
-    ref_channel = np.broadcast_to(rc_log_norm(Rc_y)[None, :], (Nx, Ny))
+    ref_channel = np.broadcast_to(rc_log_norm(Rc_y, rc_min=RC_MIN, rc_max=R_PEAK_MAX)[None, :], (Nx, Ny))
 
     adapter = SourceItrSinAdapter()
     y_t = torch.from_numpy(y_grid)
@@ -1595,7 +1618,7 @@ def test_parameter_profile_matches_correlated_gaussian(monkeypatch, param_index)
     monkeypatch.setattr(inv, "neg_log_likelihood", nll)
     obs = SimpleNamespace(spatial=torch.empty(0))
     res = inv.profile_likelihood(
-        None, obs, mean, 1.0, param_index=param_index,
+        None, obs, mean, 1.0, param_index=param_index, adapter=ForcingItrSinAdapter(),
     )
     half = np.sqrt(chi2.ppf(0.95, 1)) * float(scales[param_index])
     assert res.ci_low == pytest.approx(float(mean[param_index]) - half, abs=4e-4)
@@ -1612,7 +1635,7 @@ def test_parameter_profile_marks_physical_bounds(monkeypatch):
     monkeypatch.setattr(inv, "neg_log_likelihood", lambda model, obs, theta, sigma, adapter: (theta ** 2).sum() * 0)
     res = inv.profile_likelihood(
         None, SimpleNamespace(spatial=torch.empty(0)), torch.tensor([0.4, 0.8]),
-        1.0, param_index=0,
+        1.0, param_index=0, adapter=ForcingItrSinAdapter(),
     )
     assert (res.ci_low, res.ci_high) == (0.05, 1.0)
     assert not res.lower_closed and not res.upper_closed
@@ -1621,7 +1644,7 @@ def test_parameter_profile_marks_physical_bounds(monkeypatch):
 
 def test_parameter_errors_are_separate_and_zero_amplitude_is_undefined():
     from types import SimpleNamespace
-    adapter = SourceItrSinAdapter()
+    adapter = ForcingItrSinAdapter()
     result = SimpleNamespace(
         theta_hat=torch.tensor([0.55, 0.3], dtype=torch.float64),
         theta_true=torch.tensor([0.5, 0.2], dtype=torch.float64), loss=0.0,
@@ -1647,7 +1670,7 @@ def test_profiles_share_checked_optimum_and_persist_both_parameters(monkeypatch,
         return 0.5 * (z**2).sum()
     monkeypatch.setattr(inv, "neg_log_likelihood", nll)
     obs = _fake_observation_set()
-    adapter = SourceItrSinAdapter()
+    adapter = ForcingItrSinAdapter()
     theta, profiles = inv.profile_parameters(
         None, obs, torch.tensor([0.2, 1.2], dtype=torch.float64), 1.0,
         adapter=adapter, adam_steps=200, lbfgs_steps=40,
@@ -1702,16 +1725,17 @@ def _profile_pair(adapter, grids):
     ) for i, grid in enumerate(grids)]
 
 
-def test_joint_nll_grid_spans_profiles_clips_bounds_and_masks_the_ceiling(monkeypatch):
+@pytest.mark.parametrize("adapter_type,scale", [(SourceItrSinAdapter, 350.0), (ForcingItrSinAdapter, 1.0)])
+def test_joint_nll_grid_spans_profiles_clips_bounds_and_masks_the_ceiling(monkeypatch, adapter_type, scale):
     from scipy.stats import chi2
 
-    monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
-    adapter = SourceItrSinAdapter()
+    monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll(mean=(0.5 * scale, scale), scale=(0.08 * scale, 0.15 * scale)))
+    adapter = adapter_type()
     obs = _fake_observation_set()
-    theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64)
+    theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64) * scale
     # R_base narrower than its bounds (span follows the profile); A wider
     # (span is clipped back to the adapter bounds).
-    profiles = _profile_pair(adapter, ([0.3, 0.5, 0.7], [-1.0, 1.0, 5.0]))
+    profiles = _profile_pair(adapter, (np.array([0.3, 0.5, 0.7]) * scale, np.array([-1.0, 1.0, 5.0]) * scale))
 
     joint = inv.joint_nll_grid(
         None, obs, 1.0, adapter=adapter, profiles=profiles,
@@ -1720,12 +1744,12 @@ def test_joint_nll_grid_spans_profiles_clips_bounds_and_masks_the_ceiling(monkey
 
     base_axis = joint["joint_nll_grid_R_base"]
     amp_axis = joint["joint_nll_grid_A"]
-    np.testing.assert_allclose(base_axis, np.linspace(0.3, 0.7, 5))
+    np.testing.assert_allclose(base_axis, np.linspace(0.3, 0.7, 5) * scale)
     np.testing.assert_allclose(amp_axis, np.linspace(*adapter.profile_bounds(1), 5))
 
     nll = joint["joint_nll"]
     assert nll.shape == (5, 5)
-    inadmissible = amp_axis[None, :] > (R_PEAK_MAX - base_axis[:, None])
+    inadmissible = amp_axis[None, :] > (adapter.rc_peak_max - base_axis[:, None])
     assert inadmissible.any(), "test grid must straddle the dependent ceiling"
     np.testing.assert_array_equal(np.isnan(nll), inadmissible)
 
@@ -1740,7 +1764,7 @@ def test_joint_nll_grid_spans_profiles_clips_bounds_and_masks_the_ceiling(monkey
 
 def test_joint_nll_grid_rejects_unusable_requests(monkeypatch):
     monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
-    adapter = SourceItrSinAdapter()
+    adapter = ForcingItrSinAdapter()
     obs = _fake_observation_set()
     theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64)
     grids = ([0.3, 0.5, 0.7], [0.5, 1.0, 1.5])
@@ -1766,7 +1790,7 @@ def test_joint_grid_round_trips_through_the_artifact_at_schema_4(monkeypatch, tm
     from types import SimpleNamespace
 
     monkeypatch.setattr(inv, "neg_log_likelihood", _quadratic_nll())
-    adapter = SourceItrSinAdapter()
+    adapter = ForcingItrSinAdapter()
     obs = _fake_observation_set()
     theta_hat = torch.tensor([0.5, 1.0], dtype=torch.float64)
     profiles = _profile_pair(adapter, ([0.3, 0.5, 0.7], [0.5, 1.0, 1.5]))
@@ -1796,20 +1820,20 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
     import csv
     from types import SimpleNamespace
 
-    adapter = SourceItrSinAdapter()
+    adapter = ForcingItrSinAdapter()
     obs = _fake_observation_set()
     ds = SimpleNamespace(
         t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
         y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
     )
     loaded = SimpleNamespace(
-        config={"benchmark": {"name": "source_itr_sin", "representation": "temporal_encoder"}},
+        config={"benchmark": {"name": "forcing_itr_sin", "representation": "temporal_encoder"}},
         mu_global=0.0, sigma_global=1.0, model=None,
     )
     monkeypatch.setattr(inv, "load_checkpoint", lambda *a, **k: loaded)
-    monkeypatch.setattr(SourceItrSinAdapter, "validate_model", lambda *a: None)
-    monkeypatch.setattr(SourceItrSinAdapter, "validate_dataset", lambda *a: None)
-    monkeypatch.setattr(SourceItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
+    monkeypatch.setattr(ForcingItrSinAdapter, "validate_model", lambda *a: None)
+    monkeypatch.setattr(ForcingItrSinAdapter, "validate_dataset", lambda *a: None)
+    monkeypatch.setattr(ForcingItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
     monkeypatch.setattr(inv, "build_dataset_from_dir", lambda *a, **k: ds)
     monkeypatch.setattr(inv, "build_observation_set", lambda *a, **k: obs)
     monkeypatch.setattr(inv, "_checkpoint_fingerprint", lambda *a: "test")
@@ -1857,20 +1881,20 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
 def test_cli_joint_nll_grid_writes_the_block_and_guards_bad_invocations(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
-    adapter = SourceItrSinAdapter()
+    adapter = ForcingItrSinAdapter()
     obs = _fake_observation_set()
     ds = SimpleNamespace(
         t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
         y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
     )
     loaded = SimpleNamespace(
-        config={"benchmark": {"name": "source_itr_sin", "representation": "temporal_encoder"}},
+        config={"benchmark": {"name": "forcing_itr_sin", "representation": "temporal_encoder"}},
         mu_global=0.0, sigma_global=1.0, model=None,
     )
     monkeypatch.setattr(inv, "load_checkpoint", lambda *a, **k: loaded)
-    monkeypatch.setattr(SourceItrSinAdapter, "validate_model", lambda *a: None)
-    monkeypatch.setattr(SourceItrSinAdapter, "validate_dataset", lambda *a: None)
-    monkeypatch.setattr(SourceItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
+    monkeypatch.setattr(ForcingItrSinAdapter, "validate_model", lambda *a: None)
+    monkeypatch.setattr(ForcingItrSinAdapter, "validate_dataset", lambda *a: None)
+    monkeypatch.setattr(ForcingItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
     monkeypatch.setattr(inv, "build_dataset_from_dir", lambda *a, **k: ds)
     monkeypatch.setattr(inv, "build_observation_set", lambda *a, **k: obs)
     monkeypatch.setattr(inv, "_checkpoint_fingerprint", lambda *a: "test")
@@ -1931,7 +1955,7 @@ def test_profile_returns_a_better_optimum_found_while_bracketing(monkeypatch):
     monkeypatch.setattr(inv, "neg_log_likelihood", nll)
     res = inv.profile_likelihood(
         None, SimpleNamespace(spatial=torch.empty(0)),
-        torch.tensor([0.2, 0.9], dtype=torch.float64), 1.0, param_index=0,
+        torch.tensor([0.2, 0.9], dtype=torch.float64), 1.0, param_index=0, adapter=ForcingItrSinAdapter(),
     )
     assert res.theta_mle is not None
     assert float(res.theta_mle[0]) == pytest.approx(0.7, abs=0.05)

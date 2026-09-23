@@ -107,7 +107,7 @@ def synthetic_source_sim_params(synthetic_trajectories):
     Mirrors problems/source.py: rectangular patch params, fixed interface at
     x = 0.5, no temporal/spatial forcing keys, plus a T0 IC field for plotting.
     """
-    from problems.source import INTERFACE_X, _classify_regime
+    from problems.source import RC_RANGE, INTERFACE_X, _classify_regime
     from src.physics.internal_source import (
         PATCH_A_RANGE,
         PATCH_H,
@@ -130,7 +130,7 @@ def synthetic_source_sim_params(synthetic_trajectories):
         y_h = float(rng.uniform(*PATCH_Y_RANGE))
         A = float(np.exp(rng.uniform(np.log(A_min), np.log(A_max))))
         params.append({
-            "R_c": float(rng.uniform(0.05, 1.0)),
+            "R_c": float(rng.uniform(*RC_RANGE)),
             "interface_x": INTERFACE_X,
             "x_h": x_h,
             "y_h": y_h,
@@ -153,7 +153,7 @@ def synthetic_source_itr_sin_sim_params(synthetic_source_sim_params):
     The R_amp bound is dependent on R_base (as in sample_sim_params) so the
     profile peak stays under R_PEAK_MAX without clipping.
     """
-    from src.physics.internal_source import RC_SIN_RANGES, R_PEAK_MAX
+    from problems.source_itr_sin import RC_SIN_RANGES, R_PEAK_MAX
 
     base_lo, base_hi = RC_SIN_RANGES["R_base"]
 

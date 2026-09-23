@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.generate_dataset import build_base_setup
 from problems.registry import get_problem
-from problems.source import CP_LEFT, CP_RIGHT, K_LEFT, K_RIGHT, RHO_LEFT, RHO_RIGHT
+from problems.source import CP_LEFT, CP_RIGHT, K_LEFT, K_RIGHT, RC_RANGE, RHO_LEFT, RHO_RIGHT
+from problems.source_itr_sin import R_PEAK_MAX
 from src.physics.internal_source import PATCH_A_RANGE
 
 
@@ -41,9 +42,9 @@ def main() -> None:
             setup["grids"], setup["time_cfg"],
         )
         cases = [(f"sample_{i}", p) for i, p in enumerate(params)]
-        resistance_cases = [(0.05, 0.0), (1.0, 0.0)]
+        resistance_cases = [(rc, 0.0) for rc in RC_RANGE]
         if name == "source_itr_sin":
-            resistance_cases += [(0.05, 2.95), (1.0, 2.0)]
+            resistance_cases += [(rc, R_PEAK_MAX - rc) for rc in RC_RANGE]
         for x_h in (0.05, 0.25, 0.45, 0.5, 0.55, 0.75, 0.95):
             for y_h in (0.05, 0.5, 0.95):
                 for rc, rc_amp in resistance_cases:
@@ -114,6 +115,8 @@ def main() -> None:
         feasible_common_range=proposed[0] <= proposed[1],
         ceiling_limited_decade_range=[decade_max / 10, decade_max],
         configured_amplitude_range=list(PATCH_A_RANGE),
+        configured_scalar_resistance_range=list(RC_RANGE),
+        configured_sinusoidal_peak_cap=R_PEAK_MAX,
         configured_peak_rise_envelope_K=[min(gains) * PATCH_A_RANGE[0],
                                         max(gains) * PATCH_A_RANGE[1]],
         minimum_temperature_K=300.0 + min(r["minimum_rise_per_unit_A"] for r in rows) * PATCH_A_RANGE[1],

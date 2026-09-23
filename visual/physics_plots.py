@@ -6,6 +6,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from problems.source_itr_sin import RC_MIN as _ITR_RC_MIN, R_PEAK_MAX as _ITR_R_PEAK_MAX
+from src.physics.internal_source import PATCH_A_RANGE
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 from visual._common import (
@@ -130,9 +132,6 @@ def plot_bc_verification(
 # benchmark's ProblemSpec.configure_solver so geometry, conductivities, forcing,
 # and the (scalar or (Ny,)) interface_R are always correct per benchmark.
 
-# Cap mirrors src/physics/internal_source.py:R_PEAK_MAX so source_itr_sin sinusoidal profile peaks
-# stay inside the sampled R_c(y) range.
-_ITR_R_PEAK_MAX = 3.0
 
 # Canonical sin temporal driver shared by the forcing/interfaces panels. Keys
 # match temporal_sin(A, f, t_on, t_off, phase, tukey_alpha, rectified).
@@ -176,15 +175,17 @@ def _itr_canonical_params(benchmark: str, itr_value: float,
         params = {
             "interface_x": 0.5,
             "x_h": 0.45, "y_h": 0.5, "w_h": 0.1, "h_h": 0.1,
-            "A": 8000.0, "t_off": t_off,
+            "A": float(np.sqrt(PATCH_A_RANGE[0] * PATCH_A_RANGE[1])), "t_off": t_off,
             "T0": np.full(X.shape, T_right, dtype=np.float32),
         }
         if benchmark == "source":
             params["R_c"] = float(itr_value)
             meta = {"itr_kind": "scalar_Rc", "itr_value": float(itr_value), "R_c": float(itr_value)}
             return params, meta
-        R_c_base = 0.05
+        R_c_base = _ITR_RC_MIN
         R_c_peak = min(float(itr_value), _ITR_R_PEAK_MAX)
+        if R_c_peak < R_c_base:
+            raise ValueError(f"Source ITR peak must be at least {R_c_base} mm² K/W.")
         if benchmark == "source_itr_sin":
             # source_itr_sin: itr_value is the sinusoid peak R_c,peak = R_base + A
             # (capped), so the amplitude is the excess over the base. Universal
@@ -254,14 +255,16 @@ def plot_itr_temperature_jump_sweep(
     t_final: float = 0.3,
     requested_times: tuple[float, ...] = (0.10, 0.20, 0.30),
     scalar_rc_values: tuple[float, ...] = (0.05, 0.15, 0.35, 0.70, 1.00),
-    rc_peak_values: tuple[float, ...] = (0.05, 0.15, 0.35, 0.70, 1.00, 2.00, 3.00),
+    source_rc_values: tuple[float, ...] = (17.5, 52.5, 122.5, 245.0, 350.0),
+    rc_peak_values: tuple[float, ...] = (17.5, 52.5, 122.5, 245.0, 350.0, 700.0, 1050.0),
     save_path: str | Path | None = None,
 ) -> dict:
     """Solver-truth sweep of contact temperature-jump magnitude vs ITR.
 
     For each benchmark, the thermal driver is held fixed while interface thermal
     resistance is swept (scalar ``R_c`` for forcing/source/interfaces; sinusoidal profile peak
-    ``R_c,peak`` for source_itr_sin). Every solve is wired through the production
+    ``R_c,peak`` for source_itr_sin). Source resistance values use mm² K/W
+    and are supplied separately through ``source_rc_values``. Every solve is wired through the production
     ``ProblemSpec.configure_solver`` so per-benchmark physics is never re-derived
     here. Returns ``{"png", "csv", "records"}``; ``records`` is one dict per
     (benchmark, itr_value, requested_time).
@@ -308,7 +311,8 @@ def plot_itr_temperature_jump_sweep(
         spec = get_problem(benchmark)
         sweep_values = (
             rc_peak_values
-            if benchmark in ("source_itr_sin")
+            if benchmark == "source_itr_sin"
+            else source_rc_values if benchmark == "source"
             else scalar_rc_values
         )
         panel_data[benchmark] = {t_req: {"x": [], "y": []} for t_req in requested_times}

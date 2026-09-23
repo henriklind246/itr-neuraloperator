@@ -9,6 +9,7 @@ import torch
 from problems.forcing import RC_RANGE
 from problems.forcing import ForcingProblem
 from problems.registry import get_problem
+from problems import source_itr_sin
 from problems.source_itr_sin import RC_Y_CHANNEL
 from src.physics.fv_solver_2d import Layer2D
 from src.physics.internal_source import (
@@ -439,23 +440,26 @@ class SourceItrSinAdapter(InverseAdapter):
     """
 
     benchmark = "source_itr_sin"
+    rc_min = source_itr_sin.RC_MIN
+    rc_peak_max = source_itr_sin.R_PEAK_MAX
+    rc_sin_ranges = source_itr_sin.RC_SIN_RANGES
     theta_dim = 2
     param_names = SIN_PARAM_NAMES
 
 
     def theta_from_unconstrained(self, u: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        base_lo, base_hi = self.rc_sin_ranges["R_base"]
         s = torch.sigmoid(u)
         R_base = base_lo + (base_hi - base_lo) * s[..., 0]
-        A = s[..., 1] * (R_PEAK_MAX - R_base)
+        A = s[..., 1] * (self.rc_peak_max - R_base)
         return torch.stack([R_base, A], dim=-1)
 
     def unconstrained_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        base_lo, base_hi = self.rc_sin_ranges["R_base"]
         R_base = theta[..., 0]
         A = theta[..., 1]
         p_base = (R_base - base_lo) / (base_hi - base_lo)
-        ceil = (R_PEAK_MAX - R_base).clamp_min(_dtype_eps(theta.dtype))
+        ceil = (self.rc_peak_max - R_base).clamp_min(_dtype_eps(theta.dtype))
         p_A = A / ceil
         return torch.stack([_logit(p_base), _logit(p_A)], dim=-1)
 
@@ -472,8 +476,8 @@ class SourceItrSinAdapter(InverseAdapter):
         return (1, 3)
 
     def cond_slice_from_theta(self, theta: torch.Tensor) -> torch.Tensor:
-        base_lo, base_hi = RC_SIN_RANGES["R_base"]
-        A_lo, A_hi = RC_SIN_RANGES["A"]
+        base_lo, base_hi = self.rc_sin_ranges["R_base"]
+        A_lo, A_hi = self.rc_sin_ranges["A"]
         R_base = theta[..., 0]
         A = theta[..., 1]
         R_base_norm = (R_base - base_lo) / (base_hi - base_lo)
@@ -488,8 +492,8 @@ class SourceItrSinAdapter(InverseAdapter):
         y = y_grid.to(dtype=theta.dtype, device=theta.device)
         Rc_y = R_base + A * torch.sin(np.pi * y)
 
-        log_min = float(np.log(RC_MIN))
-        log_max = float(np.log(R_PEAK_MAX))
+        log_min = float(np.log(self.rc_min))
+        log_max = float(np.log(self.rc_peak_max))
         Rc_y_norm = 2.0 * (torch.log(Rc_y) - log_min) / (log_max - log_min) - 1.0
         return Rc_y_norm.unsqueeze(-2).expand(*Rc_y_norm.shape[:-1], Nx, y.shape[0])
 
@@ -530,19 +534,19 @@ class SourceItrSinAdapter(InverseAdapter):
 
     def profile_bounds(self, param_index: int) -> tuple[float, float]:
         if param_index == 0:
-            return tuple(RC_SIN_RANGES["R_base"])
+            return tuple(self.rc_sin_ranges["R_base"])
         if param_index == 1:
-            return (0.0, R_PEAK_MAX - RC_MIN)
+            return (0.0, self.rc_peak_max - self.rc_min)
         raise ValueError(f"profile param_index {param_index} out of range")
 
     def theta_profile(
         self, u: torch.Tensor, fixed_index: int, fixed_value: float
     ) -> torch.Tensor:
-        base_lo, base_hi = RC_SIN_RANGES["R_base"]
+        base_lo, base_hi = self.rc_sin_ranges["R_base"]
         s = torch.sigmoid(u)
         if fixed_index == 1:
             A = torch.as_tensor(fixed_value, dtype=u.dtype, device=u.device)
-            base_ceiling = min(base_hi, R_PEAK_MAX - float(fixed_value))
+            base_ceiling = min(base_hi, self.rc_peak_max - float(fixed_value))
             R_base = base_lo + (base_ceiling - base_lo) * s[..., 0]
         else:
             R_base = (
@@ -550,7 +554,7 @@ class SourceItrSinAdapter(InverseAdapter):
                 if fixed_index == 0
                 else base_lo + (base_hi - base_lo) * s[..., 0]
             )
-            A = s[..., 1] * (R_PEAK_MAX - R_base)
+            A = s[..., 1] * (self.rc_peak_max - R_base)
         return torch.stack([R_base, A], dim=-1)
 
 
@@ -655,6 +659,9 @@ class ForcingItrSinAdapter(SourceItrSinAdapter):
     """
 
     benchmark = "forcing_itr_sin"
+    rc_min = RC_MIN
+    rc_peak_max = R_PEAK_MAX
+    rc_sin_ranges = RC_SIN_RANGES
 
     @property
     def supports_equivalent_scalar(self) -> bool:

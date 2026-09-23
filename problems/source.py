@@ -28,7 +28,7 @@ from src.physics.fv_solver_2d import FVSolver2D, Layer2D
 
 # ----- representation constants (canonical home for the source benchmark) ------
 
-RC_RANGE = (0.05, 1.0)
+RC_RANGE = (17.5, 350.0)
 INTERFACE_X = 0.5
 T_OFF_FRAC = 0.75
 
@@ -37,7 +37,7 @@ T_OFF_FRAC = 0.75
 K_LEFT, K_RIGHT = 0.00697, 0.112
 RHO_LEFT, RHO_RIGHT = 4.44e-6, 8.53e-6
 CP_LEFT, CP_RIGHT = 523.0, 377.0
-PROBLEM_VERSION = "source_ti_brass_mm_v1"
+PROBLEM_VERSION = "source_ti_brass_mm_v2"
 MATERIAL_PROPERTIES = {
     "k_left": K_LEFT, "k_right": K_RIGHT,
     "rho_left": RHO_LEFT, "rho_right": RHO_RIGHT,
@@ -111,7 +111,7 @@ def build_cond_vector(
 def _build_lhs_param_ranges() -> dict:
     A_min, A_max = _patch_a_range()
     return {
-        "R_c": (0.05, 1.0),
+        "R_c": RC_RANGE,
         "y_h": PATCH_Y_RANGE,
         "log_A": (float(np.log(A_min)), float(np.log(A_max))),
     }
@@ -511,11 +511,11 @@ class SourceProblem(ProblemSpec):
         return {
             "rc": OODAxis(
                 name="rc", kind="simulation_parameter", field="R_c",
-                id_reference=(0.5,), ood_values=(0.0, 0.01, 0.025, 1.25, 1.5, 2.0),
+                id_reference=(175.0,), ood_values=(0.0, 3.5, 8.75, 437.5, 525.0, 700.0),
                 trained_range=RC_RANGE, resolution_kind="none",
-                notes="scalar interface resistance; same sweep as the forcing "
-                "benchmark. 0.0 is the limiting (perfect-contact) case; values "
-                "above RC_RANGE[1]=1.0 are out-of-distribution.",
+                notes="scalar interface resistance in mm² K/W. "
+                "0.0 is the limiting (perfect-contact) case; values "
+                "above RC_RANGE[1]=350.0 are out-of-distribution.",
             ),
             "patch_size": OODAxis(
                 name="patch_size",
