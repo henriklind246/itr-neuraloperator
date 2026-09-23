@@ -46,6 +46,7 @@ def _option(command: list[str], name: str) -> str:
 
 def _write_mock_forcing_results(command: list[str]) -> None:
     count = int(_option(command, "--sensor-n-y"))
+    noise_std_K = float(_option(command, "--noise-std")) * 25.0
     out_csv = Path(_option(command, "--out-csv"))
     artifact_dir = Path(_option(command, "--artifact-dir"))
     sim_start = command.index("--sim-ids") + 1
@@ -62,12 +63,12 @@ def _write_mock_forcing_results(command: list[str]) -> None:
                 "sim_id": sid,
                 "n_sensors": count,
                 "noise_seed": sid,
-                "noise_std_K": 0.25,
+                "noise_std_K": noise_std_K,
                 "R_c_true": true_value,
                 "R_c_map": map_value,
                 "R_c_abs_error": abs(signed_error),
                 "fv_resid_rms_K": 0.18 + 0.001 * sid,
-                "fv_resid_over_noise": (0.18 + 0.001 * sid) / 0.25,
+                "fv_resid_over_noise": (0.18 + 0.001 * sid) / noise_std_K if noise_std_K else float("nan"),
                 "profile_R_c_ci_low": 0.2,
                 "profile_R_c_ci_high": 0.8,
                 "profile_R_c_bound_limited": False,
@@ -503,6 +504,72 @@ def test_sweep_runner_has_no_legacy_plot_dependency():
     source = Path(sweep.__file__).read_text()
     assert "generate_sweep_plots" not in source
     assert "PlotGenerationError" not in source
+
+
+@pytest.mark.parametrize("existing_data", [False, True])
+def test_main_runs_noisy_then_noise_free_on_the_same_dataset(
+    tmp_path, monkeypatch, capsys, existing_data
+):
+    checkpoint = _checkpoint(tmp_path / "model.pt")
+    data_dir = _data_dir(tmp_path / "data")
+    out_dir = tmp_path / "out"
+    commands = []
+    generations = []
+
+    def fake_prepare(**kwargs):
+        generations.append(kwargs)
+        return {
+            "data_dir": str(data_dir),
+            "invert_ids": list(range(sweep.N_CASES)),
+            "calibration_ids": list(range(sweep.N_CASES, sweep.N_CASES + sweep.CALIBRATION_FLOOR)),
+        }
+
+    def fake_run(command):
+        commands.append(command)
+        if "--calibration-out" in command:
+            _write_mock_calibration(
+                Path(_option(command, "--calibration-out")),
+                gate_pass=float(_option(command, "--noise-std")) > 0.0,
+            )
+        else:
+            _write_mock_forcing_results(command)
+
+    monkeypatch.setattr(sweep, "prepare_inversion_dataset", fake_prepare)
+    monkeypatch.setattr(sweep, "_run_command", fake_run)
+    monkeypatch.setattr(sweep, "_checkpoint_fingerprint", lambda _: "mock-checkpoint")
+    argv = [
+        "--benchmark", "forcing", "--checkpoint", str(checkpoint),
+        "--out-dir", str(out_dir), "--device", "cpu", "--no-figures",
+    ]
+    if existing_data:
+        argv += ["--data-dir", str(data_dir)]
+    assert sweep.main(argv) == 0
+    assert len(generations) == (0 if existing_data else 1)
+    assert len(commands) == 12
+    assert [float(_option(cmd, "--noise-std")) for cmd in commands] == [0.01] * 6 + [0.0] * 6
+    for noisy, clean in zip(commands[:6], commands[6:]):
+        for option in ("--checkpoint", "--data-dir", "--seed", "--noise-seed", "--sensor-n-y", "--device"):
+            assert _option(noisy, option) == _option(clean, option)
+        if "--out-csv" in clean:
+            assert "--allow-surrogate-limited" in clean
+            assert "--allow-surrogate-limited" not in noisy
+            assert Path(_option(clean, "--out-csv")).is_relative_to(out_dir / "no_noise")
+
+    manifest = json.loads((out_dir / "no_noise" / "sweep_manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["fixed_protocol"]["noise_std_norm"] == 0.0
+    assert manifest["data_dir"] == str(data_dir)
+    assert all(not arm["calibration"]["local_gate_pass"] for arm in manifest["arms"].values())
+    assert all(arm["fv_verification"]["over_noise_median"] is None
+               for arm in manifest["paper_summary"]["by_sensor_count"])
+    final_output = capsys.readouterr().out.split("Results for both sensor-noise settings:")[1]
+    assert "With sensor noise:" in final_output
+    assert "No sensor noise:" in final_output
+    assert "noise ratio unavailable (no sensor noise)" in final_output
+
+    commands.clear()
+    assert sweep.main(argv) == 0
+    assert commands == []
 
 
 def test_run_sweep_preserves_results_when_summary_generation_fails(

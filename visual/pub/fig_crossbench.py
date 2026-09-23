@@ -723,6 +723,9 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
+# F28 is narrower than the one-column width F27 keeps: its x axis is a handful
+# of resistance strata rather than a dense lead axis.
+_ITR_WIDTH_IN = 3.05
 _FIELD_MARKERS = {"forcing": "o", "source": "s", "source_itr_sin": "^", "interfaces": "D"}
 _FIELD_LINES = {"forcing": "-", "source": "--", "source_itr_sin": "-.", "interfaces": ":"}
 
@@ -737,8 +740,13 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
         blocked(requirement, _RECORDS_NEEDED, key=key)
     summary = stats.global_field_error_summary(frames, metadata=metadata)
     rows = summary[axis]
-    fig, ax = plt.subplots(figsize=style.figsize("one_col", row_height="std"))
-    fig.subplots_adjust(left=0.19, right=0.97, bottom=0.21, top=0.78)
+    width_in, height_in = style.figsize("one_col", row_height="std")
+    if axis == "itr":
+        width_in = _ITR_WIDTH_IN
+    fig, ax = plt.subplots(figsize=(width_in, height_in))
+    # Margins in inches, so the narrower F28 keeps F27's room for its labels.
+    fig.subplots_adjust(left=0.65 / width_in, right=1 - 0.10 / width_in,
+                        bottom=0.21, top=0.78)
     handles = []
     for benchmark in BENCH_ORDER:
         points = [row for row in rows if row["benchmark"] == benchmark]
@@ -755,18 +763,20 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
                     marker=marker, markersize=3.2, markevery=max(1, len(x) // 7),
                     markerfacecolor="white", markeredgewidth=0.8)
         else:
-            ax.plot(x, y, color=color, linestyle=linestyle, linewidth=0.6, alpha=0.45)
+            ax.plot(x, y, color=color, linestyle=linestyle, linewidth=1.1, alpha=0.45)
             # Draw interval endpoints directly: a BCa interval need not contain
             # its sample median, unlike Matplotlib's nonnegative yerr contract.
             valid = np.isfinite(lo) & np.isfinite(hi)
-            ax.vlines(x[valid], lo[valid], hi[valid], color=color, linewidth=0.8, zorder=3)
-            ax.plot(x[valid], lo[valid], "_", color=color, markersize=4, markeredgewidth=0.8)
-            ax.plot(x[valid], hi[valid], "_", color=color, markersize=4, markeredgewidth=0.8)
-            ax.plot(x, y, linestyle="none", marker=marker, markersize=4,
-                    color=color, markerfacecolor="white", markeredgewidth=1.0, zorder=4)
+            ax.vlines(x[valid], lo[valid], hi[valid], color=color, linewidth=1.2, zorder=3)
+            ax.plot(x[valid], lo[valid], "_", color=color, markersize=6, markeredgewidth=1.2)
+            ax.plot(x[valid], hi[valid], "_", color=color, markersize=6, markeredgewidth=1.2)
+            ax.plot(x, y, linestyle="none", marker=marker, markersize=6,
+                    color=color, markerfacecolor="white", markeredgewidth=1.4, zorder=4)
         handles.append(Line2D([], [], color=color, linestyle=linestyle, marker=marker,
-                              markersize=3.5, markerfacecolor="white", linewidth=1.2,
-                              label=tables.BENCH_LABEL[benchmark]))
+                              markersize=3.5 if axis == "lead" else 5.0,
+                              markerfacecolor="white",
+                              markeredgewidth=None if axis == "lead" else 1.2,
+                              linewidth=1.2, label=tables.BENCH_LABEL[benchmark]))
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.54, 0.99),
                ncol=2, fontsize=7, frameon=False, handlelength=2.2,
                columnspacing=1.2, handletextpad=0.5, labelspacing=0.45)
@@ -1096,7 +1106,7 @@ def source_lead_error_surface(*, source=None, spec=None, requirement=None,
         ratios.append(1.)
     ratios += [.04, .045]
     grid = fig.add_gridspec(1, len(ratios), width_ratios=ratios, wspace=0,
-                            left=.105, right=.895, bottom=.155, top=.905)
+                            left=.13, right=.88, bottom=.16, top=.905)
     for column, benchmark in enumerate(order):
         data = surface["surfaces"][benchmark]
         ax = fig.add_subplot(grid[0, panel_cols[column]])
@@ -1106,23 +1116,26 @@ def source_lead_error_surface(*, source=None, spec=None, requirement=None,
                              shading="flat", rasterized=True)
         ax.set_xlim(x_edges[0], x_edges[-1])
         ax.set_ylim(y_edges[0], y_edges[-1])
-        ax.tick_params(labelsize=11, width=.8, labelleft=column == 0)
+        ax.tick_params(width=1., length=4, labelleft=column == 0)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
         for spine in ax.spines.values():
             spine.set_visible(True)
-            spine.set_linewidth(.8)
-        ax.set_title(_surface_title(benchmark), fontsize=14, pad=7)
-        ax.set_xlabel(r"Source time $t_s$", fontsize=14)
+            spine.set_linewidth(1.)
+        ax.set_title(_surface_title(benchmark), pad=7)
+        ax.set_xlabel(r"Source time $\boldsymbol{t}_{\boldsymbol{s}}$")
         if column == 0:
-            ax.set_ylabel(r"Lead time $\Delta t = t_j - t_s$", fontsize=14)
+            ax.set_ylabel(r"Lead time $\boldsymbol{\Delta t}=\boldsymbol{t}_{\boldsymbol{j}}"
+                          r"-\boldsymbol{t}_{\boldsymbol{s}}$")
+        style.bold_axis_text(ax, label_size=16, tick_size=13, title_size=16)
 
     bar = fig.colorbar(mesh, cax=fig.add_subplot(grid[0, -1]))
-    bar.set_label("Median RMSE [K]", fontsize=13, labelpad=5)
-    bar.ax.tick_params(labelsize=11, width=.7, pad=3)
+    bar.set_label("Median RMSE [K]", labelpad=6)
+    bar.ax.tick_params(width=.9, length=4, pad=3)
     bar.ax.yaxis.set_ticks(_kelvin_ticks(vmin, vmax))
     bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{10.0 ** v:g}"))
-    bar.outline.set_linewidth(.8)
+    bar.outline.set_linewidth(1.)
+    style.bold_axis_text(bar.ax, label_size=15, tick_size=13)
 
     title = "Global field RMSE over source time and lead time"
 

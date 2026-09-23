@@ -1151,4 +1151,6 @@ def test_node_jump_figure_draws_both_rows_and_records_the_decimation(monkeypatch
         fit = definition["row_b"]["fits"][bench]
         assert fit["n_points"] == 3 * 2 * 40
         assert fit["slope"] == pytest.approx(0.9)
+    parity_text = [t.get_text() for ax in fig.axes[4:8] for t in ax.texts]
+    assert parity_text and not any("slope" in t for t in parity_text)
     plt.close(fig)

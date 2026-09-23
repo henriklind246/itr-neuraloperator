@@ -18,6 +18,8 @@ from src.physics.internal_source import make_rc_sin_profile
 
 
 KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
+# F28 is drawn narrower than F27; both keep the one-column height.
+SIZES_IN = {KEYS[0]: (3.42, 2.6), KEYS[1]: (3.05, 2.6)}
 FIXED_SOURCE_KEY = "F32_global_field_error_fixed_source"
 SURFACE_KEY = "F33_source_lead_error_surface"
 
@@ -418,7 +420,7 @@ def test_builders_share_scale_and_keep_itr_markers_dominant(monkeypatch):
         fig, _, definition = registry.get_figure(key).load()(source=FigureSource(key))
         figures.append(fig)
         assert len(fig.axes) == 1
-        assert fig.get_size_inches() == pytest.approx([3.42, 2.6])
+        assert fig.get_size_inches() == pytest.approx(SIZES_IN[key])
         assert len(fig.legends[0].get_texts()) == 4
         assert definition["statistics"]
         assert "pointwise" in definition["interval"]
@@ -428,7 +430,7 @@ def test_builders_share_scale_and_keep_itr_markers_dominant(monkeypatch):
     assert itr.get_xscale() == "linear"
     connectors = [line for line in itr.lines if line.get_alpha() == .45]
     assert len(connectors) == 4
-    assert all(line.get_linewidth() == .6 for line in connectors)
+    assert all(line.get_linewidth() == 1.1 for line in connectors)
     assert any(np.isnan(line.get_xdata()).any() for line in connectors)
     for fig in figures:
         fig.canvas.draw()
@@ -455,12 +457,14 @@ def test_render_exports_vectors_dimensions_statistics_and_provenance(tmp_path):
         assert result.degraded
         assert [p.suffix for p in result.paths] == [".png", ".pdf", ".svg", ".csv"]
         png, pdf, svg, table = result.paths
+        width_in, height_in = SIZES_IN[key]
         with Image.open(png) as image:
-            assert image.size == (1026, 780)
+            assert image.size == (round(300 * width_in), round(300 * height_in))
         assert b"/FontFile2" in pdf.read_bytes()
         assert b"/Subtype /Type3" not in pdf.read_bytes()
         box = re.search(rb"/MediaBox\s*\[([^\]]+)\]", pdf.read_bytes())
-        assert list(map(float, box[1].split())) == pytest.approx([0, 0, 246.24, 187.2])
+        assert list(map(float, box[1].split())) == pytest.approx(
+            [0, 0, 72 * width_in, 72 * height_in])
         assert "<text" in svg.read_text()
         payload = json.loads(result.sidecar.read_text())
         definition = payload["metric_definition"]
@@ -624,6 +628,11 @@ def test_surface_figure_titles_each_panel_and_masks_the_unevaluated_cells(monkey
         assert mesh.norm is panels[0].collections[0].norm
         assert mesh.get_array().compressed() == pytest.approx(values.T[np.isfinite(values.T)])
     assert fig.axes[-1].get_ylabel() == "Median RMSE [K]"
+    for ax in fig.axes:
+        labelled = [t for t in (ax.xaxis.label, ax.yaxis.label, ax.title,
+                                *ax.get_xticklabels(), *ax.get_yticklabels())
+                    if t.get_text()]
+        assert labelled and all(t.get_fontweight() == "bold" for t in labelled)
     assert "Both panels share one color scale" in definition["caption"]
     grey = panels[0].collections[0].get_cmap()(np.ma.masked_invalid([np.nan]))[0]
     assert grey[:3] == pytest.approx((.90, .90, .90), abs=.01)

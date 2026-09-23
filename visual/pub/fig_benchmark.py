@@ -101,6 +101,12 @@ CASE_COVER = {
     }),
 }
 
+# The type around the case maps. The in-panel annotations stay at their own,
+# smaller size: they sit on the maps and would cover them if scaled with these.
+CASE_LABEL_PT = 9.5
+CASE_TICK_PT = 8.5
+_RESIDUAL_LABEL = r"$\boldsymbol{T}_{\mathbf{FNO}}-\boldsymbol{T}_{\mathbf{FV}}$"
+
 
 def _available_strata(frame, benchmark: str) -> list[str]:
     """The declared strata whose source column actually varies in this frame."""
@@ -523,8 +529,10 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
     grid = panels.map_grid(style.WIDTHS_IN[width], 3, n_maps=len(levels),
                            colorbar_after=(last,),
                            colorbar_rows={last: ((0, 1), (2,))},
-                           max_map_in=1.05, cbar_label_in=0.60,
-                           top_in=0.24, bottom_in=0.38, row_gap_in=0.08)
+                           max_map_in=1.05, cbar_label_in=0.80,
+                           left_in=0.95,
+                           top_in=0.46 if cover_map else 0.30, bottom_in=0.50,
+                           row_gap_in=0.08)
     fig, axes = grid.fig, grid.maps
 
     for col, (level, case, pick) in enumerate(zip(levels, cases_, picks)):
@@ -533,19 +541,20 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
         # uniform profile", and the two are not the same claim.
         title = level
         if level in cover_map:
-            title = f"{level} / {cover_map[level]}"
+            # Two lines: at the case label size "pulse_train / triangle" is
+            # wider than its map and runs into the neighbouring title.
+            title = f"{level} /\n{cover_map[level]}"
         patch = fields.source_patch(case.params)
         for row, (field, limits, name) in enumerate((
                 (case.truth[0], temp_limits, "FV truth"),
                 (case.pred[0], temp_limits, "FNO prediction"),
-                (case.residual[0], residual_limits,
-                 "$T_{\\rm FNO}-T_{\\rm FV}$"))):
+                (case.residual[0], residual_limits, _RESIDUAL_LABEL))):
             ax = axes[row][col]
             im = panels.field_map(
                 ax, field, limits, interface_x=case.interface_x,
                 title=title if row == 0 else "",
-                xlabel="$x$" if row == 2 else "",
-                ylabel=f"{name}\n$y$" if col == 0 else "",
+                xlabel=r"$\boldsymbol{x}$" if row == 2 else "",
+                ylabel=f"{name}\n$\\boldsymbol{{y}}$" if col == 0 else "",
                 # Four ticks per axis need about 1.4 in to clear each other at
                 # 7 pt; these maps are narrower than that by design.
                 tick_bins=3)
@@ -556,14 +565,20 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
                 ax.tick_params(labelleft=False)
             if row != 2:
                 ax.tick_params(labelbottom=False)
+            style.bold_axis_text(ax, label_size=CASE_LABEL_PT,
+                                 tick_size=CASE_TICK_PT, title_size=CASE_LABEL_PT)
             if patch is not None:
                 _draw_patch(ax, patch)
+            bar = None
             if col == last and row == 0:
-                panels.attach_colorbar(fig, im, ax, "$T$ [K]",
-                                       cax=grid.colorbars[last][0])
+                bar = panels.attach_colorbar(fig, im, ax, r"$\boldsymbol{T}$ [K]",
+                                             cax=grid.colorbars[last][0])
             elif col == last and row == 2:
-                panels.attach_colorbar(fig, im, ax, "$T_{FNO}-T_{FV}$ [K]",
-                                       cax=grid.colorbars[last][1])
+                bar = panels.attach_colorbar(fig, im, ax, f"{_RESIDUAL_LABEL} [K]",
+                                             cax=grid.colorbars[last][1])
+            if bar is not None:
+                style.bold_axis_text(bar.ax, label_size=CASE_LABEL_PT,
+                                     tick_size=CASE_TICK_PT)
 
         # Three short lines rather than two long ones: the second line of the
         # two-line form is as wide as the panel itself at this map size, and a

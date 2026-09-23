@@ -2,7 +2,8 @@
 
 The scientific protocol is intentionally fixed. Reviewers select the inverse
 benchmark and attach its trained checkpoint; the runner calibrates and evaluates
-the same eight cases at 8, 16, and 32 interface-band sensors.
+the same eight cases at 8, 16, and 32 interface-band sensors, first with
+sensor noise and then without it.
 """
 
 from __future__ import annotations
@@ -236,6 +237,7 @@ def build_calibration_command(
     device: str,
     sensor_count: int,
     calibration_path: Path,
+    noise_std: float = NOISE_STD,
 ) -> list[str]:
     return [
         sys.executable,
@@ -255,7 +257,7 @@ def build_calibration_command(
         "--sensor-n-y",
         str(sensor_count),
         "--noise-std",
-        str(NOISE_STD),
+        str(noise_std),
         "--noise-seed",
         str(NOISE_SEED),
         "--seed",
@@ -278,6 +280,7 @@ def build_inversion_command(
     result_path: Path,
     artifact_dir: Path,
     sim_ids: list[int],
+    noise_std: float = NOISE_STD,
 ) -> list[str]:
     joint = (
         ["--joint-nll-grid", str(JOINT_NLL_GRID)]
@@ -304,7 +307,7 @@ def build_inversion_command(
         "--sensor-n-y",
         str(sensor_count),
         "--noise-std",
-        str(NOISE_STD),
+        str(noise_std),
         "--noise-seed",
         str(NOISE_SEED),
         "--n-starts",
@@ -324,6 +327,7 @@ def build_inversion_command(
         "--uq-level",
         str(UQ_LEVEL),
         *joint,
+        *(["--allow-surrogate-limited"] if noise_std == 0.0 else []),
         "--calibration-artifact",
         str(calibration_path),
         "--out-csv",
@@ -363,6 +367,7 @@ def _validate_calibration(
     benchmark: str,
     checkpoint_fingerprint: str,
     calibration_count: int,
+    noise_std: float = NOISE_STD,
 ) -> None:
     if calibration["benchmark"] != benchmark:
         raise ValueError(
@@ -378,7 +383,8 @@ def _validate_calibration(
             f"surrogate calibration used {calibration['simulation_count']} simulations; "
             f"expected all {calibration_count} validation simulations."
         )
-    if not calibration["local_gate_pass"]:
+    # The measurement-noise gate is undefined for the noise-free diagnostic.
+    if noise_std != 0.0 and not calibration["local_gate_pass"]:
         raise CalibrationGateError(
             "frozen surrogate calibration gate failed: "
             f"median={calibration['sensor_rms_median_K']:.6g} K, "
@@ -459,6 +465,12 @@ def validate_and_annotate_rows(
                 raise ValueError(f"{result_path} is missing populated column {column!r}.")
             if column.endswith("_bound_limited"):
                 _summary_bool(row, column)
+            elif (
+                column == "fv_resid_over_noise"
+                and float(row.get("noise_std_K", "nan")) == 0.0
+                and math.isnan(float(value))
+            ):
+                continue
             elif not math.isfinite(float(value)):
                 raise ValueError(f"{result_path} has non-finite {column}={value!r}.")
         for spec in specs_for(benchmark):
@@ -634,7 +646,10 @@ def generate_paper_summary(
     for count in counts:
         arm_rows = [row_by_key[(count, sim_id)] for sim_id in sim_ids]
         fv = np.asarray([_summary_float(row, "fv_resid_rms_K") for row in arm_rows])
-        ratios = np.asarray([_summary_float(row, "fv_resid_over_noise") for row in arm_rows])
+        ratios = np.asarray([
+            _summary_float(row, "fv_resid_over_noise") for row in arm_rows
+            if float(row.get("noise_std_K", "nan")) != 0.0
+        ])
         if np.any(fv < 0) or np.any(ratios < 0):
             raise ValueError("negative FV residual")
         parameters = {}
@@ -671,7 +686,10 @@ def generate_paper_summary(
         by_sensor_count.append({
             "n_sensors": count, "n_simulations": len(sim_ids),
             "simulation_ids": list(sim_ids), "parameters": parameters,
-            "fv_verification": {"residual_K": _robust_summary(fv), "over_noise_median": float(np.median(ratios))},
+            "fv_verification": {
+                "residual_K": _robust_summary(fv),
+                "over_noise_median": float(np.median(ratios)) if ratios.size else None,
+            },
         })
     summary = {
         "schema_version": 2, "benchmark": benchmark,
@@ -721,7 +739,12 @@ def _print_paper_summary(summary: dict) -> None:
             print(f"      95% profile width: {format_stats(profile['width'])} {metrics['unit']}; "
                   f"bound-limited={profile['bound_limited_cases']}")
         fv = arm["fv_verification"]
-        print(f"    FV residual: {format_stats(fv['residual_K'])} K; {fv['over_noise_median']:.3g}x noise std", flush=True)
+        ratio = fv["over_noise_median"]
+        ratio_text = (
+            "noise ratio unavailable (no sensor noise)"
+            if ratio is None else f"{ratio:.3g}x noise std"
+        )
+        print(f"    FV residual: {format_stats(fv['residual_K'])} K; {ratio_text}", flush=True)
 
 
 # Publication figures this sweep can draw entirely from its own outputs, keyed
@@ -838,6 +861,7 @@ def run_sweep(
     out_dir: Path,
     device: str,
     figures: bool = True,
+    noise_std: float = NOISE_STD,
 ) -> Path:
     checkpoint = checkpoint.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
@@ -878,7 +902,7 @@ def run_sweep(
             "sensor_counts": list(SENSOR_COUNTS),
             "sensor_layout": "interface_band",
             "sensor_x_halfwidth": SENSOR_X_HALFWIDTH,
-            "noise_std_norm": NOISE_STD,
+            "noise_std_norm": noise_std,
             "n_starts": N_STARTS,
             "optimizer": OPTIMIZER,
             "nm_maxiter": NM_MAXITER,
@@ -929,6 +953,7 @@ def run_sweep(
                 device=device,
                 sensor_count=sensor_count,
                 calibration_path=calibration_path,
+                noise_std=noise_std,
             )
             inversion_command = build_inversion_command(
                 benchmark=benchmark,
@@ -940,6 +965,7 @@ def run_sweep(
                 result_path=result_path,
                 artifact_dir=artifact_dir,
                 sim_ids=sim_ids,
+                noise_std=noise_std,
             )
             arm = {
                 "status": "calibrating",
@@ -981,6 +1007,7 @@ def run_sweep(
                         benchmark=benchmark,
                         checkpoint_fingerprint=checkpoint_fingerprint,
                         calibration_count=len(calibration_ids),
+                        noise_std=noise_std,
                     )
                     arm["calibration"] = calibration
                     arm["artifacts"] = _validate_artifacts(artifact_dir, sim_ids)
@@ -1018,6 +1045,7 @@ def run_sweep(
                     benchmark=benchmark,
                     checkpoint_fingerprint=checkpoint_fingerprint,
                     calibration_count=len(calibration_ids),
+                    noise_std=noise_std,
                 )
             except CalibrationGateError as exc:
                 arm["status"] = "calibration_gate_failed"
@@ -1224,6 +1252,24 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             figures=args.figures,
         )
+        noisy_manifest = _load_json(out_dir / "sweep_manifest.json")
+        no_noise_dir = out_dir / "no_noise"
+        print("\nStarting sweep without sensor noise (surrogate-limited diagnostic).", flush=True)
+        run_sweep(
+            benchmark=args.benchmark,
+            checkpoint=checkpoint,
+            data_dir=Path(noisy_manifest["data_dir"]),
+            out_dir=no_noise_dir,
+            device=device,
+            figures=args.figures,
+            noise_std=0.0,
+        )
+        print("\nResults for both sensor-noise settings:", flush=True)
+        for label, result_dir in (("With sensor noise", out_dir), ("No sensor noise", no_noise_dir)):
+            manifest = _load_json(result_dir / "sweep_manifest.json")
+            print(f"\n{label}: {manifest['canonical_csv']}", flush=True)
+            _print_paper_summary(manifest["paper_summary"])
+            print(f"Summary CSV: {manifest['paper_summary']['csv']}", flush=True)
     except CalibrationGateError as exc:
         print(f"calibration gate failure: {exc}", file=sys.stderr)
         return 2

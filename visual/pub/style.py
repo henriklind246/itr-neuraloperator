@@ -262,6 +262,29 @@ def panel_letters(axes, *, start: int = 0, loc: tuple[float, float] = (-0.14, 1.
                 va="bottom", ha="right")
 
 
+def bold_axis_text(ax, *, label_size: float, tick_size: float,
+                   title_size: float | None = None) -> None:
+    """Set the axis labels, title and tick labels of ``ax`` in bold.
+
+    ``fontweight`` does not reach mathtext: a ``$...$`` label has to spell its
+    symbols as ``\\boldsymbol``/``\\mathbf`` itself, one symbol and one
+    subscript at a time, since ``\\boldsymbol`` does not carry into a subscript.
+
+    Tick labels are set on the ticks that exist now. Ticks a locator adds at draw
+    time copy their label properties from the first existing tick, so the weight
+    carries over to them.
+    """
+    for text in (ax.xaxis.label, ax.yaxis.label):
+        text.set_fontsize(label_size)
+        text.set_fontweight("bold")
+    if title_size is not None:
+        ax.title.set_fontsize(title_size)
+        ax.title.set_fontweight("bold")
+    ax.tick_params(labelsize=tick_size)
+    for text in (*ax.get_xticklabels(), *ax.get_yticklabels()):
+        text.set_fontweight("bold")
+
+
 def add_reference_line(ax, value: float = 1.0, label: str = "1% target",
                        axis: str = "y") -> None:
     """Draw a dashed reference line (default: the 1% relative-error target)."""

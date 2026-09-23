@@ -1043,8 +1043,7 @@ def parity_scatter(ax, truth, pred, *, fit=None, color_by=None,
         ax.set_xlim(*span)
         ax.set_ylim(*span)
     if fit is not None:
-        ax.text(0.04, 0.96,
-                f"slope {fit.slope:.3f}\nRMSE {fit.rmse:.3g} K",
+        ax.text(0.04, 0.96, f"RMSE {fit.rmse:.3g} K",
                 transform=ax.transAxes, ha="left", va="top", fontsize=7.0,
                 color="0.2")
     ax.set_xlabel(xlabel)

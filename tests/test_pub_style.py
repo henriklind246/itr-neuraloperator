@@ -301,6 +301,21 @@ class TestAnnotation:
         plt.close(fig)
 
 
+    def test_bold_axis_text_reaches_ticks_the_locator_adds_at_draw_time(self):
+        fig, ax = plt.subplots()
+        ax.set_xlabel("x")
+        ax.set_title("t")
+        style.bold_axis_text(ax, label_size=9.5, tick_size=8.5, title_size=10)
+        ax.set_xlim(0, 100)
+        fig.canvas.draw()
+        ticks = [*ax.get_xticklabels(), *ax.get_yticklabels()]
+        assert all(t.get_fontweight() == "bold" for t in ticks)
+        assert all(t.get_fontsize() == pytest.approx(8.5) for t in ticks)
+        assert ax.xaxis.label.get_fontweight() == "bold"
+        assert ax.xaxis.label.get_fontsize() == pytest.approx(9.5)
+        assert ax.title.get_fontsize() == pytest.approx(10)
+        plt.close(fig)
+
     def test_reference_line_sits_at_the_requested_value(self):
         fig, ax = plt.subplots()
         style.add_reference_line(ax, value=1.0)

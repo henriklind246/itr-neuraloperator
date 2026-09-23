@@ -261,4 +261,6 @@ class TestParityScatter:
         truth = np.linspace(1.0, 5.0, 20)
         fit = stats.parity_fit(truth, 0.9 * truth, n_sims=3)
         panels.parity_scatter(ax, truth, 0.9 * truth, fit=fit)
-        assert any("slope" in t.get_text() for t in ax.texts)
+        assert any("RMSE" in t.get_text() for t in ax.texts)
+        # The slope stays in the fit and the F31 sidecar, not on the panel.
+        assert not any("slope" in t.get_text() for t in ax.texts)
