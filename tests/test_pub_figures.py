@@ -1096,45 +1096,40 @@ def test_node_jump_contrast_filter_keeps_the_contrasting_rows(monkeypatch):
     assert list(kept["sim_id"]) == [1, 2]
 
 
-@pytest.mark.parametrize("t_grid, expected_targets", [
-    (np.linspace(0.0, 0.3, 31), [6, 15, 30]),
-    (np.array([0.0, 0.01, 0.29, 0.3]), [1, 2, 3]),
-])
-def test_node_jump_figure_draws_both_rows_and_records_the_decimation(
-        monkeypatch, t_grid, expected_targets):
+def test_node_jump_figure_draws_both_rows_and_records_the_decimation(monkeypatch):
     frames = {b: SimpleNamespace(df=pd.DataFrame({"sim_id": [0, 1, 2]}))
               for b in fig_crossbench.BENCH_ORDER}
     monkeypatch.setattr(fig_crossbench.records, "records_by_benchmark",
                         lambda _source: frames)
     monkeypatch.setattr(fields, "run_dirs", lambda _source, _benchmark: [Path("run")])
-    monkeypatch.setattr(fields, "bundle", lambda _source, benchmark:
-                        SimpleNamespace(benchmark=benchmark, t_grid=t_grid))
+    monkeypatch.setattr(fields, "bundle", lambda _source, benchmark: benchmark)
     monkeypatch.setattr(fig_crossbench.stats, "per_sim",
                         lambda frame, metrics: frame)
     monkeypatch.setattr(
         fields, "select_transverse_case",
         lambda *a, **k: (SimpleNamespace(sim_id=1), True))
-    y = np.linspace(0.0, 1.0, 40)
-    calls = []
+    monkeypatch.setattr(fields, "transverse_pairs", lambda _b, frame: frame)
+    monkeypatch.setattr(fields, "node_jump_contrast_pairs",
+                        lambda _b, frame, **k: frame)
+    monkeypatch.setattr(fig_crossbench.select, "select_lead_columns",
+                        lambda *a, **k: [(0, 1), (0, 2), (0, 3)])
 
-    def case(bundle, sim, s, targets):
+    y = np.linspace(0.0, 1.0, 40)
+
+    def case(_bundle, _sim, _s, targets):
         j = targets[0]
-        calls.append((bundle.benchmark, sim, s, j))
-        amplitude = 0.01 if j == len(t_grid) - 1 else float(j)
-        profile = amplitude * np.sin(np.pi * y)[None, :]
+        profile = float(j) * np.sin(np.pi * y)[None, :]
         return SimpleNamespace(
-            s=s, targets=targets, t_source=t_grid[s],
-            t_targets=t_grid[list(targets)],
-            y_grid=y, lead_times=np.array([t_grid[j] - t_grid[s]]),
+            y_grid=y, lead_times=np.array([0.1 * j]),
             node_jumps=lambda p=profile: (p, p + 0.05),
         )
 
     monkeypatch.setattr(fields, "evaluate_case", case)
 
-    def cohort(bundle, _records):
+    def cohort(benchmark, _records):
         truth = np.linspace(-3.0, 3.0, 3 * 2 * 40).reshape(3, 2, 40)
         return fields.NodeJumpCohort(
-            benchmark=bundle.benchmark, sim_ids=(0, 1, 2), source_index=0,
+            benchmark=benchmark, sim_ids=(0, 1, 2), source_index=0,
             target_indices=(1, 2), lead_times=np.array([0.1, 0.2]),
             truth=truth, pred=0.9 * truth,
         )
@@ -1151,17 +1146,6 @@ def test_node_jump_figure_draws_both_rows_and_records_the_decimation(
     assert definition["space"] == "kelvin"
     assert "right minus left" in definition["sign_convention"]
     assert set(definition["row_a"]["cases"]) == set(fig_crossbench.BENCH_ORDER)
-    assert calls == [(b, 1, 0, j) for b in fig_crossbench.BENCH_ORDER
-                     for j in expected_targets]
-    assert definition["row_a"]["target_time_fractions"] == [0.2, 0.5, 1.0]
-    for col, bench in enumerate(fig_crossbench.BENCH_ORDER):
-        columns = definition["row_a"]["cases"][bench]["columns"]
-        assert [c["j"] for c in columns] == expected_targets
-        assert all(c["s"] == 0 and c["t_s"] == 0.0 for c in columns)
-        assert [c["t_j"] for c in columns] == pytest.approx(t_grid[expected_targets])
-        assert [c["t_bar"] for c in columns] == pytest.approx(t_grid[expected_targets])
-        # Cooling remains visible even when its jump is below the selection threshold.
-        assert np.allclose(fig.axes[col].lines[4].get_ydata(), 0.01 * np.sin(np.pi * y))
     # The fit is reported on the full cohort even though the cloud is thinned.
     for bench in fig_crossbench.BENCH_ORDER:
         fit = definition["row_b"]["fits"][bench]

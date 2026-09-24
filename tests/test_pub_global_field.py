@@ -18,8 +18,8 @@ from src.physics.internal_source import make_rc_sin_profile
 
 
 KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
-# F28 is drawn narrower than F27; both keep the one-column height.
-SIZES_IN = {KEYS[0]: (3.42, 2.6), KEYS[1]: (3.05, 2.6)}
+# F28 is drawn narrower than F27 and taller by its second resistance axis.
+SIZES_IN = {KEYS[0]: (3.42, 2.6), KEYS[1]: (3.05, 2.86)}
 FIXED_SOURCE_KEY = "F32_global_field_error_fixed_source"
 SURFACE_KEY = "F33_source_lead_error_surface"
 
@@ -204,8 +204,28 @@ def test_bins_are_common_seed_invariant_and_preserve_fixed_zero_resistance():
         f["R_c"] = 0.0
         f["R_c_A"] = 0.0
     result = summarize(frames)
-    assert result["resistance_bin_edges"] == [0.0, 0.0]
+    assert result["resistance_bin_edges"] == {
+        "nondimensional": [0.0, 0.0], "source_mm2K_per_W": [0.0, 0.0]}
     assert len(result["itr"]) == 4
+
+
+def test_resistance_bins_are_computed_per_scale():
+    frames = field_records(n_sims=25)
+    for benchmark in ("source", "source_itr_sin"):
+        frames[benchmark]["R_c"] = 17.5 + 332.5 * frames[benchmark]["sim_id"] / 24
+    result = summarize(frames)
+    edges = result["resistance_bin_edges"]
+    assert set(edges) == {"nondimensional", "source_mm2K_per_W"}
+    assert edges["nondimensional"][0] == pytest.approx(0.05)
+    assert edges["nondimensional"][-1] == pytest.approx(1.0)
+    assert edges["source_mm2K_per_W"][0] == pytest.approx(17.5)
+    # Every benchmark fills every bin of its own scale instead of the one or two
+    # bins its range would straddle in a pooled quantile split.
+    for benchmark in stats.GLOBAL_FIELD_BENCHMARKS:
+        rows = [r for r in result["itr"] if r["benchmark"] == benchmark]
+        assert len(rows) == 5
+        assert all(r["n_simulations"] == 5 for r in rows)
+        assert {r["resistance_scale"] for r in rows} == {stats.resistance_scale(benchmark)}
 
 
 def test_shared_rmse_scale_falls_back_to_linear_without_clipping_zero():
@@ -419,34 +439,46 @@ def test_builders_share_scale_and_keep_itr_markers_dominant(monkeypatch):
     for key in KEYS:
         fig, _, definition = registry.get_figure(key).load()(source=FigureSource(key))
         figures.append(fig)
-        assert len(fig.axes) == 1
+        assert len(fig.axes) == (2 if key == KEYS[1] else 1)
         assert fig.get_size_inches() == pytest.approx(SIZES_IN[key])
         assert len(fig.legends[0].get_texts()) == 4
         assert definition["statistics"]
         assert "pointwise" in definition["interval"]
         assert "not training-seed variability" in definition["interval_interpretation"]
     assert figures[0].axes[0].get_ylim() == figures[1].axes[0].get_ylim()
-    itr = figures[1].axes[0]
+    itr, itr_top = figures[1].axes
     assert itr.get_xscale() == "linear"
-    connectors = [line for line in itr.lines if line.get_alpha() == .45]
+    assert itr_top.get_xticks()[0] == pytest.approx(0.05)
+    assert itr_top.get_xticks()[-1] == pytest.approx(1.0)
+    assert itr_top.get_xlim()[0] < 0.05 and itr_top.get_xlim()[1] > 1.0
+    assert "Forcing" in itr_top.get_xlabel() and "Interfaces" in itr_top.get_xlabel()
+    assert "Source" in itr.get_xlabel() and "Forcing" not in itr.get_xlabel()
+    connectors = [line for ax in (itr, itr_top) for line in ax.lines
+                  if line.get_alpha() == .45]
     assert len(connectors) == 4
     assert all(line.get_linewidth() == 1.1 for line in connectors)
     assert any(np.isnan(line.get_xdata()).any() for line in connectors)
     for fig in figures:
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
-        for text in [*fig.axes[0].get_xticklabels(), *fig.axes[0].get_yticklabels(),
-                     fig.axes[0].xaxis.label, fig.axes[0].yaxis.label, *fig.legends[0].get_texts()]:
+        legend = [*fig.legends[0].get_texts()]
+        legend_boxes = [t.get_window_extent(renderer) for t in legend]
+        texts = [(None, t) for t in legend]
+        for ax in fig.axes:
+            # Locators may instantiate invisible, out-of-range tick labels.
+            texts += [(ax, t) for t in ax.get_xticklabels()
+                      if ax.get_xlim()[0] <= t.get_position()[0] <= ax.get_xlim()[1]]
+            texts += [(ax, t) for t in ax.get_yticklabels()
+                      if ax.get_ylim()[0] <= t.get_position()[1] <= ax.get_ylim()[1]]
+            texts += [(ax, ax.xaxis.label), (ax, ax.yaxis.label)]
+        for ax, text in texts:
             if not text.get_visible() or not text.get_text():
                 continue
             bbox = text.get_window_extent(renderer)
-            # Locators may instantiate invisible, out-of-range tick labels.
-            if text in fig.axes[0].get_yticklabels() and not fig.axes[0].get_ylim()[0] <= text.get_position()[1] <= fig.axes[0].get_ylim()[1]:
-                continue
-            if text in fig.axes[0].get_xticklabels() and not fig.axes[0].get_xlim()[0] <= text.get_position()[0] <= fig.axes[0].get_xlim()[1]:
-                continue
             assert bbox.x0 >= 0 and bbox.y0 >= 0
             assert bbox.x1 <= fig.bbox.width and bbox.y1 <= fig.bbox.height
+            if ax is not None:
+                assert not any(bbox.overlaps(box) for box in legend_boxes)
         plt.close(fig)
 
 

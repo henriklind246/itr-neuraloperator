@@ -101,6 +101,16 @@ CASE_COVER = {
     }),
 }
 
+# Benchmarks whose case columns carry no title. The source_itr_sin levels are
+# numeric amplitude-bin intervals, which read as clutter above the maps; the
+# level of every column is still recorded in the sidecar.
+CASE_UNTITLED = frozenset({"source_itr_sin"})
+
+# Benchmarks whose truth maps carry no sim / t_s / lead-time box. On the source
+# benchmarks the box sits over the heated region and hides the field; the same
+# values are in the sidecar's `cases` entries.
+CASE_UNANNOTATED = frozenset({"source", "source_itr_sin"})
+
 # The type around the case maps. The in-panel annotations stay at their own,
 # smaller size: they sit on the maps and would cover them if scaled with these.
 CASE_LABEL_PT = 9.5
@@ -526,12 +536,14 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
     # *relative to* the panels. Scaled back up to the text width it is the only
     # way a three-row grid of maps reads at this size.
     last = len(levels) - 1
+    titled = benchmark not in CASE_UNTITLED
+    top_in = (0.46 if cover_map else 0.30) if titled else 0.08
     grid = panels.map_grid(style.WIDTHS_IN[width], 3, n_maps=len(levels),
                            colorbar_after=(last,),
                            colorbar_rows={last: ((0, 1), (2,))},
                            max_map_in=1.05, cbar_label_in=0.80,
                            left_in=0.95,
-                           top_in=0.46 if cover_map else 0.30, bottom_in=0.50,
+                           top_in=top_in, bottom_in=0.50,
                            row_gap_in=0.08)
     fig, axes = grid.fig, grid.maps
 
@@ -552,7 +564,7 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
             ax = axes[row][col]
             im = panels.field_map(
                 ax, field, limits, interface_x=case.interface_x,
-                title=title if row == 0 else "",
+                title=title if row == 0 and titled else "",
                 xlabel=r"$\boldsymbol{x}$" if row == 2 else "",
                 ylabel=f"{name}\n$\\boldsymbol{{y}}$" if col == 0 else "",
                 # Four ticks per axis need about 1.4 in to clear each other at
@@ -584,14 +596,15 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
         # two-line form is as wide as the panel itself at this map size, and a
         # label that spans its own panel edge to edge reads as an overlay
         # rather than as an annotation.
-        axes[0][col].text(
-            0.02, 0.02,
-            f"sim {pick.sim_id} ({pick.rank_in_sims}/{pick.n_sims})\n"
-            f"$t_s$={case.t_source:.3g}\n"
-            f"$\\bar t$={stat[col]['lead_time']:.3g}",
-            transform=axes[0][col].transAxes, fontsize=5.0, color="w",
-            ha="left", va="bottom", linespacing=1.2,
-            bbox=dict(facecolor="0.15", alpha=0.55, pad=1.0, edgecolor="none"))
+        if benchmark not in CASE_UNANNOTATED:
+            axes[0][col].text(
+                0.02, 0.02,
+                f"sim {pick.sim_id} ({pick.rank_in_sims}/{pick.n_sims})\n"
+                f"$t_s$={case.t_source:.3g}\n"
+                f"$\\bar t$={stat[col]['lead_time']:.3g}",
+                transform=axes[0][col].transAxes, fontsize=5.0, color="w",
+                ha="left", va="bottom", linespacing=1.2,
+                bbox=dict(facecolor="0.15", alpha=0.55, pad=1.0, edgecolor="none"))
         axes[2][col].text(
             0.97, 0.03,
             f"rel. $L_2$={stat[col]['rel_l2_pct']:.2f}%\n"

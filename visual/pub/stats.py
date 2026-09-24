@@ -1530,6 +1530,21 @@ def paired_seed_delta(sims_a: SimFrame, sims_b: SimFrame, metric: str, *,
 
 GLOBAL_FIELD_BENCHMARKS = ("forcing", "source", "source_itr_sin", "interfaces")
 
+# Forcing and interfaces sample a nondimensional R_c in [0.05, 1]; the source
+# benchmarks are dimensional (mm^2 K/W, from 17.5 upward). Quantile bins pooled
+# over both scales would give each family only the bins its own range happens to
+# straddle, so F28 bins each scale separately and draws it on its own x axis.
+RESISTANCE_SCALES = {
+    "forcing": "nondimensional",
+    "interfaces": "nondimensional",
+    "source": "source_mm2K_per_W",
+    "source_itr_sin": "source_mm2K_per_W",
+}
+
+
+def resistance_scale(benchmark: str) -> str:
+    return RESISTANCE_SCALES.get(benchmark, benchmark)
+
 
 def interface_mean_resistance(frame: pd.DataFrame, benchmark: str,
                               bounds=(0.0, 1.0)) -> np.ndarray:
@@ -1714,14 +1729,19 @@ def global_field_error_summary(frames, *, metadata=None,
     prepared, seeds, resistance_info, protocol_info, _ = _prepare_global_field_frames(
         frames, metadata)
 
-    resistance_values = np.concatenate([
-        frame.drop_duplicates("sim_id")["R_c_mean"].to_numpy()
-        for frame in prepared.values()])
-    edges = np.unique(np.quantile(resistance_values, np.linspace(0, 1, 6)))
-    if len(edges) == 1:
-        edges = np.repeat(edges, 2)
+    edges_by_scale = {}
+    for scale in dict.fromkeys(resistance_scale(b) for b in prepared):
+        values = np.concatenate([
+            frame.drop_duplicates("sim_id")["R_c_mean"].to_numpy()
+            for b, frame in prepared.items() if resistance_scale(b) == scale])
+        scale_edges = np.unique(np.quantile(values, np.linspace(0, 1, 6)))
+        if len(scale_edges) == 1:
+            scale_edges = np.repeat(scale_edges, 2)
+        edges_by_scale[scale] = scale_edges
     lead_rows, itr_rows = [], []
     for benchmark, frame in prepared.items():
+        scale = resistance_scale(benchmark)
+        edges = edges_by_scale[scale]
         frame["resistance_bin"] = np.clip(
             np.searchsorted(edges, frame["R_c_mean"], side="right") - 1,
             0, len(edges) - 2)
@@ -1755,7 +1775,8 @@ def global_field_error_summary(frames, *, metadata=None,
                 if stratum == "lead_time":
                     row["lead_time"] = float(level)
                 else:
-                    row.update({"bin_index": int(level), "bin_lower": float(edges[level]),
+                    row.update({"resistance_scale": scale,
+                                "bin_index": int(level), "bin_lower": float(edges[level]),
                                 "bin_upper": float(edges[level + 1]),
                                 "median_resistance": float(sample["resistance"].median()) if len(values) else None})
                 rows.append(row)
@@ -1771,7 +1792,8 @@ def global_field_error_summary(frames, *, metadata=None,
     counts = {b: len(s) for b, s in seeds.items()}
     return {"lead": lead_rows, "itr": itr_rows, "seeds": seeds,
             "seed_counts": counts, "unequal_seed_counts": len(set(counts.values())) > 1,
-            "resistance_bin_edges": edges.tolist(), "resistance_definitions": resistance_info,
+            "resistance_bin_edges": {k: v.tolist() for k, v in edges_by_scale.items()},
+            "resistance_definitions": resistance_info,
             "protocols": protocol_info, "yscale": yscale, "ylim": ylim,
             "n_boot": n_boot, "rng_seed": rng_seed}
 

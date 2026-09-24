@@ -20,6 +20,7 @@ from matplotlib.ticker import (
     StrMethodFormatter,
 )
 
+from problems.forcing import RC_RANGE as NONDIM_RC_RANGE
 from visual.pub import fields, panels, records, select, stats, style, tables
 from visual.pub._blocked import blocked
 from visual.pub.manifest import ProvenanceError
@@ -537,7 +538,7 @@ def physical_contact_jump_vs_lead(*, source=None, spec=None, requirement=None):
     return fig, None, metric_definition
 
 
-NODE_JUMP_TARGET_FRACTIONS = (0.2, 0.5, 1.0)
+NODE_JUMP_LEAD_QUANTILES = (0.1, 0.5, 0.9)
 
 # y nodes kept per profile when drawing the parity cloud. The cohort is 24
 # simulations x ~30 leads x ~100 y nodes, and 72k markers per panel is an
@@ -551,8 +552,7 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
     """F31 -- adjacent-node interface-jump fidelity across benchmarks.
 
     Two rows over the same four benchmarks. The top row is one representative
-    case per benchmark, truth solid and prediction dashed from t_s=0 at three
-    fixed fractions of the saved time horizon,
+    case per benchmark, truth solid and prediction dashed at three lead times,
     which shows whether the *shape* of the jump along y is recovered. The bottom
     row is the whole seeded cohort as a parity cloud, which shows whether the
     *magnitude* is, and whether the error is a slope bias or symmetric scatter --
@@ -569,34 +569,33 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
     if not order:
         blocked(requirement, _CHECKPOINT_NEEDED, key="F31_node_jump_fidelity")
 
-    cases, cohorts, fits, picks, restrictions = {}, {}, {}, {}, {}
+    cases, cohorts, fits, picks, restrictions, columns_by_bench = {}, {}, {}, {}, {}, {}
     for bench in order:
         frame = frames[bench]
         bundle = fields.bundle(source, bench)
         sims = stats.per_sim(frame, metrics=("rmse_K", "rel_l2_pct"))
         pick, restricted = fields.select_transverse_case(
             bundle, sims, frame.df, quantile=0.5, metric="rmse_K",
+            min_leads=len(NODE_JUMP_LEAD_QUANTILES),
             min_node_jump_contrast_K=fields.MIN_NODE_JUMP_CONTRAST_K)
-        t_grid = np.asarray(bundle.t_grid, dtype=float)
-        if len(t_grid) <= len(NODE_JUMP_TARGET_FRACTIONS) or not np.isclose(t_grid[0], 0.0):
-            raise ProvenanceError(
-                f"{bench}: F31 needs t_s=0 and at least three saved future snapshots")
-        targets = []
-        # Contrast selects the simulation, never its displayed times: filtering
-        # targets would suppress cooling and could repeat the same truth field.
-        for index, fraction in enumerate(NODE_JUMP_TARGET_FRACTIONS):
-            nearest = int(np.argmin(np.abs(t_grid - fraction * t_grid[-1])))
-            lower = targets[-1] + 1 if targets else 1
-            upper = len(t_grid) - (len(NODE_JUMP_TARGET_FRACTIONS) - index)
-            targets.append(int(np.clip(nearest, lower, upper)))
-        cases[bench] = [fields.evaluate_case(bundle, pick.sim_id, 0, (j,))
-                        for j in targets]
+        # The lead columns have to come from the pool the case was ranked in.
+        # When the restriction was dropped, the pick is only guaranteed to span
+        # the leads of the unrestricted frame.
+        pool = frame.df
+        if restricted:
+            pool = fields.node_jump_contrast_pairs(
+                bundle, fields.transverse_pairs(bundle, frame.df))
+        cols = select.select_lead_columns(
+            pool, pick, lead_quantiles=NODE_JUMP_LEAD_QUANTILES)
+        cases[bench] = [fields.evaluate_case(bundle, pick.sim_id, s, (j,))
+                        for s, j in cols]
         cohort = fields.evaluate_node_jump_cohort(bundle, frame)
         cohorts[bench] = cohort
         fits[bench] = stats.parity_fit(cohort.truth, cohort.pred,
                                        n_sims=len(cohort.sim_ids))
         picks[bench] = pick
         restrictions[bench] = restricted
+        columns_by_bench[bench] = cols
 
     # One lead-time scale across every panel. Per-panel normalization would make
     # the darkest marker mean a different lead in each column, and the row would
@@ -628,7 +627,7 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
             color=color, xlabel="$y$", title=bench, legend=True)
         ax_top.axhline(0.0, color="0.6", linewidth=0.5, zorder=0)
         ax_top.yaxis.set_major_locator(MaxNLocator(nbins=4))
-        ax_top.text(0.97, 0.03, f"sim {picks[bench].sim_id}, $t_s=0$",
+        ax_top.text(0.97, 0.03, f"sim {picks[bench].sim_id}",
                     transform=ax_top.transAxes, ha="right", va="bottom",
                     fontsize=5.0, color="0.35")
 
@@ -673,16 +672,11 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
             "node_jump_rmse_K. See F26 for the physical jump.",
         "sign_convention": "right minus left, matching src/operators/eval.py",
         "row_a": {
-            "content": "one representative simulation per benchmark, predicted "
-                       "from t_s=0 at fixed fractions of the saved time horizon",
-            "protocol_version": 2,
-            "source_time": 0.0,
-            "target_time_fractions": list(NODE_JUMP_TARGET_FRACTIONS),
-            "target_selection": "nearest saved times, constrained to distinct "
-                                "increasing future indices; no target contrast filter",
+            "content": "one representative case per benchmark at lead-time "
+                       f"quantiles {NODE_JUMP_LEAD_QUANTILES} of that "
+                       "simulation's own t_bar",
             "selection": "median simulation by pooled rmse_K within the "
-                         "restricted pool; contrast restrictions apply only "
-                         "to simulation selection",
+                         "restricted pool",
             "node_jump_contrast_restriction":
                 fields.node_jump_contrast_note(),
             "node_jump_contrast_minimum_K": fields.MIN_NODE_JUMP_CONTRAST_K,
@@ -690,11 +684,8 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
                 b: {
                     "sim_id": int(picks[b].sim_id),
                     "restricted_pool": bool(restrictions[b]),
-                    "columns": [{"s": int(c.s), "j": int(c.targets[0]),
-                                 "t_s": float(c.t_source),
-                                 "t_j": float(c.t_targets[0]),
-                                 "t_bar": float(c.lead_times[0])}
-                                for c in cases[b]],
+                    "columns": [{"s": int(s), "j": int(j)}
+                                for s, j in columns_by_bench[b]],
                 }
                 for b in order
             },
@@ -736,6 +727,10 @@ def node_jump_fidelity(*, source=None, spec=None, requirement=None):
 # F28 is narrower than the one-column width F27 keeps: its x axis is a handful
 # of resistance strata rather than a dense lead axis.
 _ITR_WIDTH_IN = 3.05
+# F28 carries a second x axis on top for the nondimensional resistance of
+# forcing and interfaces; this is the height added for its ticks and label.
+_ITR_TOP_AXIS_IN = 0.26
+_NONDIM_RC_TICKS = (0.05, 0.25, 0.5, 0.75, 1.0)
 _FIELD_MARKERS = {"forcing": "o", "source": "s", "source_itr_sin": "^", "interfaces": "D"}
 _FIELD_LINES = {"forcing": "-", "source": "--", "source_itr_sin": "-.", "interfaces": ":"}
 
@@ -751,14 +746,24 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
     summary = stats.global_field_error_summary(frames, metadata=metadata)
     rows = summary[axis]
     width_in, height_in = style.figsize("one_col", row_height="std")
+    top_in, bottom_in = 0.22 * height_in, 0.21 * height_in
     if axis == "itr":
         width_in = _ITR_WIDTH_IN
+        height_in += _ITR_TOP_AXIS_IN
+        top_in += _ITR_TOP_AXIS_IN
     fig, ax = plt.subplots(figsize=(width_in, height_in))
     # Margins in inches, so the narrower F28 keeps F27's room for its labels.
     fig.subplots_adjust(left=0.65 / width_in, right=1 - 0.10 / width_in,
-                        bottom=0.21, top=0.78)
+                        bottom=bottom_in / height_in, top=1 - top_in / height_in)
+    axis_of = {b: ax for b in BENCH_ORDER}
+    top_ax = None
+    if axis == "itr":
+        top_ax = ax.twiny()
+        axis_of.update({b: top_ax for b in BENCH_ORDER
+                        if stats.resistance_scale(b) == "nondimensional"})
     handles = []
     for benchmark in BENCH_ORDER:
+        ax_b = axis_of[benchmark]
         points = [row for row in rows if row["benchmark"] == benchmark]
         xname = "lead_time" if axis == "lead" else "median_resistance"
         x = np.asarray([row[xname] for row in points], dtype=float)
@@ -773,15 +778,15 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
                     marker=marker, markersize=3.2, markevery=max(1, len(x) // 7),
                     markerfacecolor="white", markeredgewidth=0.8)
         else:
-            ax.plot(x, y, color=color, linestyle=linestyle, linewidth=1.1, alpha=0.45)
+            ax_b.plot(x, y, color=color, linestyle=linestyle, linewidth=1.1, alpha=0.45)
             # Draw interval endpoints directly: a BCa interval need not contain
             # its sample median, unlike Matplotlib's nonnegative yerr contract.
             valid = np.isfinite(lo) & np.isfinite(hi)
-            ax.vlines(x[valid], lo[valid], hi[valid], color=color, linewidth=1.2, zorder=3)
-            ax.plot(x[valid], lo[valid], "_", color=color, markersize=6, markeredgewidth=1.2)
-            ax.plot(x[valid], hi[valid], "_", color=color, markersize=6, markeredgewidth=1.2)
-            ax.plot(x, y, linestyle="none", marker=marker, markersize=6,
-                    color=color, markerfacecolor="white", markeredgewidth=1.4, zorder=4)
+            ax_b.vlines(x[valid], lo[valid], hi[valid], color=color, linewidth=1.2, zorder=3)
+            ax_b.plot(x[valid], lo[valid], "_", color=color, markersize=6, markeredgewidth=1.2)
+            ax_b.plot(x[valid], hi[valid], "_", color=color, markersize=6, markeredgewidth=1.2)
+            ax_b.plot(x, y, linestyle="none", marker=marker, markersize=6,
+                      color=color, markerfacecolor="white", markeredgewidth=1.4, zorder=4)
         handles.append(Line2D([], [], color=color, linestyle=linestyle, marker=marker,
                               markersize=3.5 if axis == "lead" else 5.0,
                               markerfacecolor="white",
@@ -790,8 +795,15 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.54, 0.99),
                ncol=2, fontsize=7, frameon=False, handlelength=2.2,
                columnspacing=1.2, handletextpad=0.5, labelspacing=0.45)
-    ax.set_xlabel(r"Lead time $\Delta t=t_j-t_s$" if axis == "lead" else
-                  r"Interface-mean $\overline{R_c}$ [m$^2$ K/W]", fontsize=8)
+    if axis == "lead":
+        ax.set_xlabel(r"Lead time $\Delta t=t_j-t_s$", fontsize=8)
+    else:
+        bottom_names = [tables.BENCH_LABEL[b] for b in BENCH_ORDER if axis_of[b] is ax]
+        top_names = [tables.BENCH_LABEL[b] for b in BENCH_ORDER if axis_of[b] is top_ax]
+        ax.set_xlabel(", ".join(bottom_names)
+                      + r": $\overline{R_c}$ [mm$^2$ K/W]", fontsize=8)
+        top_ax.set_xlabel(", ".join(top_names) + r": $R_c$ [nondim.]",
+                          fontsize=8, labelpad=3.0)
     ax.set_ylabel("Median global RMSE [K]", fontsize=8)
     ax.set_xscale("linear")
     ax.set_yscale(summary["yscale"])
@@ -809,6 +821,19 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
             linewidth=0.5, linestyle="-")
     ax.set_axisbelow(True)
     ax.margins(x=0.06)
+    if top_ax is not None:
+        # Fixed to the sampled range rather than autoscaled, so the top axis
+        # always reads 0.05 to 1 whatever strata happen to be populated.
+        drawn = [value for line in top_ax.lines for value in line.get_xdata()
+                 if np.isfinite(value)]
+        lo_x = min([NONDIM_RC_RANGE[0], *drawn])
+        hi_x = max([NONDIM_RC_RANGE[1], *drawn])
+        pad = 0.06 * (hi_x - lo_x)
+        top_ax.set_xlim(lo_x - pad, hi_x + pad)
+        top_ax.set_xticks(_NONDIM_RC_TICKS)
+        top_ax.xaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+        top_ax.tick_params(labelsize=7, width=0.6)
+        top_ax.spines[["right", "left", "bottom"]].set_visible(False)
 
     title = ("Global field RMSE versus lead time" if axis == "lead" else
              "Global field RMSE stratified by interface-mean resistance")
@@ -832,7 +857,10 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
         caption += "Degenerate BCa cases use percentile intervals, identified in the statistics. "
     if axis == "itr":
         caption += (
-            "Common quantile bins count each simulation once; points sit at each benchmark's "
+            "Forcing and Interfaces sample a nondimensional R_c and are read on the top axis; "
+            "Source and Source + ITR use a dimensional R_c in mm^2 K/W and are read on the "
+            "bottom axis. Quantile bins are computed separately on each scale and count each "
+            "simulation once; points sit at each benchmark's "
             "median resistance within its bin. Scalar R_c is used for uniform interfaces; "
             "Source + ITR uses the finite-domain mean of R_c(y), not an effective resistance. "
             "Points represent marginal error stratifications over interface resistance and should "
@@ -872,6 +900,7 @@ def _global_field_error_figure(*, axis, source, spec, requirement):
         "resistance_definition": "R_c for scalar interfaces; (d-c)^-1 integral_c^d [R_c + R_c_A sin(pi y)] dy for source_itr_sin",
         "resistance_definitions_by_seed": summary["resistance_definitions"],
         "resistance_bin_edges": summary["resistance_bin_edges"],
+        "resistance_axes": {b: stats.resistance_scale(b) for b in BENCH_ORDER},
         "bin_closure": "left closed, right open; final upper endpoint included; constant values occupy one bin",
         "protocols": summary["protocols"], "record_metadata": metadata,
         "yscale": summary["yscale"], "ylim": summary["ylim"],
