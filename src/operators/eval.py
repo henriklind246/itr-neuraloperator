@@ -577,6 +577,8 @@ def eval_all_seeds(
     write_records: bool = False,
     records_name: str = "test_records.csv",
     device: str | None = None,
+    n_snapshots_test: int | None = None,
+    batch_size: int | None = None,
 ):
     run_root = Path(run_root)
     results = []
@@ -604,6 +606,12 @@ def eval_all_seeds(
         )
         if padding_reference_resolution is not None:
             config["model"]["parameters"]["padding_reference_resolution"] = int(padding_reference_resolution)
+        # The training batch size can exhaust accelerator memory once a
+        # cross-resolution eval scales the grid; pooled metrics do not depend on it.
+        if batch_size is not None:
+            if int(batch_size) < 1:
+                raise ValueError("batch_size must be positive")
+            config["training"]["batch_size"] = int(batch_size)
 
         # Cross-resolution eval: point the trained checkpoint at a different
         # dataset (e.g. a finer grid). Only the test split is consumed, and the
@@ -626,6 +634,7 @@ def eval_all_seeds(
             time_norm_horizon=time_norm_horizon,
             target_times=target_times,
             protocols=protocols,
+            n_snapshots_test=n_snapshots_test,
         )
 
         loss_cfg = config.get("training", {}).get("loss", {})

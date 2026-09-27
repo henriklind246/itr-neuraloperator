@@ -154,53 +154,55 @@ def direct_vs_autoregressive(*, source=None, spec=None, requirement=None):
 
 
 def resolution_invariance(*, source=None, spec=None, requirement=None):
-    """F24 -- E32/E33 resolution transfer against metric-matched FV drift."""
-    studies = records.load_resolution_studies(source)
+    """F24 -- field and node-jump GNRMSE of one fixed checkpoint per grid."""
+    study = records.load_resolution_study(source)
     width = spec.width if spec is not None else "two_col"
     fig, axes = plt.subplots(
-        1, 3, figsize=style.figsize(width, row_height="std"), squeeze=False,
+        1, 2, figsize=style.figsize(width, row_height="std"), squeeze=False,
     )
+    color = style.benchmark_color(study.benchmark)
     panel_specs = (
-        ("global_rel_l2_pct", "global field"),
-        ("interface_rel_l2_pct", "interface band"),
-        ("boundary_rel_l2_pct", "boundary band"),
+        ("field_gnrmse_pct", "Field GNRMSE [%]", "field"),
+        ("node_jump_gnrmse_pct", "Node-jump GNRMSE [%]", "interface node jump"),
     )
-    for index, (value_attr, title) in enumerate(panel_specs):
+    for index, (value_attr, ylabel, title) in enumerate(panel_specs):
         panels.resolution_curve_panel(
-            axes[0, index], studies, studies.fv_drift,
-            value_attr=value_attr, title=title,
-            ylabel=("Relative $L_2$ [%]" if index == 0 else ""),
-            legend=index == 0,
+            axes[0, index], study, value_attr=value_attr, color=color,
+            title=title, ylabel=ylabel,
         )
     fig.suptitle(
-        f"Forcing benchmark · fixed seed {studies.original.seed} · "
-        f"{studies.original.n_simulations} fresh simulations per grid",
+        f"{study.benchmark.capitalize()} benchmark · fixed seed {study.seed} · "
+        f"{study.n_simulations} fresh simulations per grid",
         fontsize=8, y=0.995,
     )
     style.panel_letters(axes.ravel())
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
 
     metric_definition = {
-        "quantity": "global, interface-band, and boundary-band relative L2 error",
-        "space": "checkpoint-normalized temperature",
+        "quantity": "field GNRMSE and interface node-jump GNRMSE",
+        "field_gnrmse_pct": (
+            "100 * pooled physical RMSE / sqrt(sigma_train^2 + "
+            "(mu_train - 300 K)^2)"
+        ),
+        "node_jump_gnrmse_pct": (
+            "100 * mean over pairs of node-jump RMSE / sigma_train"
+        ),
         "unit": "%",
-        "comparison": [studies.original.label, studies.material_side.label],
-        "model_seed": studies.original.seed,
-        "n_simulations_per_resolution": studies.original.n_simulations,
-        "snapshot_pairs_per_simulation": studies.original.pairs_per_simulation,
-        "resolutions": list(studies.original.resolutions),
+        "benchmark": study.benchmark,
+        "material_side": study.material_side,
+        "model_seed": study.seed,
+        "checkpoint_epoch_zero_based": study.checkpoint_epoch,
+        "checkpoint_sha256": study.checkpoint_sha256,
+        "n_simulations_per_resolution": study.n_simulations,
+        "snapshot_pairs_per_simulation": study.pairs_per_simulation,
+        "resolutions": list(study.resolutions),
         "uncertainty": (
-            "none; each curve is a point estimate for one fixed checkpoint"
+            "none; each point is a pooled estimate for one fixed checkpoint"
         ),
-        "fv_reference": (
-            "metric-matched finite-volume discretization drift to "
-            f"N={studies.fv_drift.reference_resolution}"
+        "node_jump_caveat": (
+            "the node jump spans the two nodes adjacent to the interface, so "
+            "its target changes with grid spacing"
         ),
-        "comparison_caveat": studies.material_side.comparison_caveat,
-        "checkpoint_best_epochs_zero_based": {
-            studies.original.label: studies.original.checkpoint_epoch,
-            studies.material_side.label: studies.material_side.checkpoint_epoch,
-        },
     }
     return fig, None, metric_definition
 

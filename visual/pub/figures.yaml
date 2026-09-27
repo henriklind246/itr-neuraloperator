@@ -218,11 +218,9 @@ requirement_sets:
     min_seeds: 1
     schema_min: 0
     note: >-
-      E32 original and E33 material-side seed_report_r*.json ladders, their
-      study manifests, and the checkpoint-normalized FV drift baseline.
-    regenerate: >-
-      python scripts/fv_convergence_baseline.py ... and the per-resolution
-      evaluation reports
+      one fixed checkpoint's field GNRMSE and node-jump GNRMSE at each
+      evaluation grid, written as resolution_study.json.
+    regenerate: python scripts/run_resolution_study.py <checkpoint> --out-dir ...
 
 figures:
 

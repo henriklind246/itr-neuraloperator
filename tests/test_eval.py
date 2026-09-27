@@ -603,6 +603,66 @@ class TestTestRecordSufficientStatistics:
             )
 
 
+class TestEvalAllSeedsProtocolOverrides:
+    """A cross-resolution study fixes the pair count and shrinks the batch.
+
+    Both used to require editing a copy of the checkpoint's ``conf``; the
+    overrides must reach the loader without touching the saved checkpoint.
+    """
+
+    @pytest.fixture
+    def scored_run(self, records_run, monkeypatch):
+        import src.operators.eval as eval_mod
+
+        run_root, seed_dir, n_test_sims = records_run
+        ckpt_path = seed_dir / "fno2d_best.pt"
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt["epoch"] = 3
+        torch.save(ckpt, ckpt_path)
+
+        loaders = []
+        original = eval_mod.build_test_loader
+
+        def spy(*args, **kwargs):
+            out = original(*args, **kwargs)
+            loaders.append(out[0])
+            return out
+
+        monkeypatch.setattr(eval_mod, "build_test_loader", spy)
+        return run_root, ckpt_path, n_test_sims, loaders
+
+    def test_config_values_are_used_when_overrides_are_absent(self, scored_run):
+        from src.operators.eval import eval_all_seeds
+
+        run_root, _ckpt_path, n_test_sims, loaders = scored_run
+        eval_all_seeds(str(run_root), device="cpu")
+        # config n_snapshots_test=4 -> 6 pairs per sim; config batch_size=4.
+        assert len(loaders[0].dataset) == n_test_sims * 6
+        assert loaders[0].batch_size == 4
+
+    def test_overrides_reach_the_loader(self, scored_run):
+        from src.operators.eval import eval_all_seeds
+
+        run_root, ckpt_path, n_test_sims, loaders = scored_run
+        results = eval_all_seeds(
+            str(run_root), device="cpu", n_snapshots_test=6, batch_size=1,
+        )
+        assert len(loaders[0].dataset) == n_test_sims * 15
+        assert loaders[0].batch_size == 1
+        assert math.isfinite(results[0]["test_gnrmse_pct"])
+        assert math.isfinite(results[0]["test_node_jump_gnrmse_pct"])
+        saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        assert saved["conf"]["training"]["n_snapshots_test"] == 4
+        assert saved["conf"]["training"]["batch_size"] == 4
+
+    def test_nonpositive_batch_size_is_rejected(self, scored_run):
+        from src.operators.eval import eval_all_seeds
+
+        run_root, _ckpt_path, _n, _loaders = scored_run
+        with pytest.raises(ValueError, match="batch_size"):
+            eval_all_seeds(str(run_root), device="cpu", batch_size=0)
+
+
 class _MetricPairs(list):
     @property
     def _pairs(self):

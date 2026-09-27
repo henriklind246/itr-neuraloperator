@@ -78,26 +78,5 @@ sources:
       seed: 32
 
   resinv_reports:
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/study_manifest.json
-      seed: 32
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/validation.json
-      seed: 32
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r100.json
-      seed: 32
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r150.json
-      seed: 32
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r200.json
-      seed: 32
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/run/seed_report_r256.json
-      seed: 32
-    - table: resolution_studies/forcing_E32_checkpoint_20260830/data/normalized_fv_baseline/fv_drift_baseline.json
-    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/study_manifest.json
-      seed: 32
-    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r100.json
-      seed: 32
-    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r150.json
-      seed: 32
-    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r200.json
-      seed: 32
-    - table: resolution_studies/forcing_E33_material_side_checkpoint_20260831/run/seed_report_r256.json
+    - table: resolution_studies/forcing_E33_material_side_gnrmse_20260925/resolution_study.json
       seed: 32

@@ -19,7 +19,6 @@ Schema versions of ``test_records.csv``:
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -135,40 +134,18 @@ class RolloutArmRecords:
 
 @dataclass(frozen=True)
 class ResolutionStudy:
-    """Reported fixed-checkpoint errors over one resolution ladder."""
+    """Field and node-jump GNRMSE of one fixed checkpoint per evaluation grid."""
 
-    label: str
     benchmark: str
     material_side: bool
     seed: str
     checkpoint_epoch: int
     resolutions: tuple[int, ...]
-    global_rel_l2_pct: tuple[float, ...]
-    interface_rel_l2_pct: tuple[float, ...]
-    boundary_rel_l2_pct: tuple[float, ...]
+    field_gnrmse_pct: tuple[float, ...]
+    node_jump_gnrmse_pct: tuple[float, ...]
     n_simulations: int
     pairs_per_simulation: int
-    comparison_caveat: str
-
-
-@dataclass(frozen=True)
-class ResolutionDrift:
-    """Metric-matched FV discretization drift to the finest grid."""
-
-    resolutions: tuple[int, ...]
-    global_rel_l2_pct: tuple[float, ...]
-    interface_rel_l2_pct: tuple[float, ...]
-    boundary_rel_l2_pct: tuple[float, ...]
-    reference_resolution: int
-
-
-@dataclass(frozen=True)
-class ResolutionStudies:
-    """The original/material-side checkpoint comparison and FV reference."""
-
-    original: ResolutionStudy
-    material_side: ResolutionStudy
-    fv_drift: ResolutionDrift
+    checkpoint_sha256: str
 
 
 def seed_from_path(csv_path: Path) -> str:
@@ -907,7 +884,8 @@ def load_rollout_arms(source, *, require_version: int = 4
     return dict(sorted(by_benchmark.items()))
 
 
-_RESOLUTION_REPORT_RE = re.compile(r"seed_report_r(?P<resolution>\d+)\.json$")
+RESOLUTION_STUDY_FILENAME = "resolution_study.json"
+RESOLUTION_STUDY_METRICS = ("field_gnrmse_pct", "node_jump_gnrmse_pct")
 
 
 def _json_payload(path: Path) -> dict:
@@ -920,142 +898,51 @@ def _json_payload(path: Path) -> dict:
     return payload
 
 
-def _under(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
-
-
-def load_resolution_studies(source) -> ResolutionStudies:
-    """Load E32, E33 material-side, and the normalized FV drift ladder."""
-    paths = artifact_paths(source, "json_report")
-    manifest_paths = [p for p in paths if p.name == "study_manifest.json"]
-    drift_paths = [p for p in paths if p.name == "fv_drift_baseline.json"]
-    if len(manifest_paths) != 2:
-        raise SchemaError(
-            f"resolution source needs two study manifests, found {len(manifest_paths)}"
-        )
-    if len(drift_paths) != 1:
-        raise SchemaError(
-            f"resolution source needs one metric-matched FV drift report, "
-            f"found {len(drift_paths)}"
-        )
-
-    studies: list[ResolutionStudy] = []
-    for manifest_path in manifest_paths:
-        study_root = manifest_path.parent
-        manifest = _json_payload(manifest_path)
-        expected_resolutions = tuple(int(v) for v in manifest.get("resolutions", ()))
-        reports: dict[int, dict] = {}
-        for path in paths:
-            match = _RESOLUTION_REPORT_RE.match(path.name)
-            if match and _under(path, study_root):
-                reports[int(match.group("resolution"))] = _json_payload(path)
-        if tuple(sorted(reports)) != expected_resolutions:
-            raise SchemaError(
-                f"{manifest_path} declares {expected_resolutions}, but its report "
-                f"set is {tuple(sorted(reports))}"
-            )
-
-        per_resolution: list[dict] = []
-        for resolution in expected_resolutions:
-            per_seed = reports[resolution].get("per_seed") or []
-            if len(per_seed) != 1:
-                raise SchemaError(
-                    f"{study_root} r{resolution} must report exactly one fixed seed"
-                )
-            per_resolution.append(per_seed[0])
-
-        seeds = {str(row.get("seed")) for row in per_resolution}
-        epochs = {int(row.get("best_epoch")) for row in per_resolution}
-        sim_counts = {int(row.get("num_sims")) for row in per_resolution}
-        if len(seeds) != 1 or len(epochs) != 1 or len(sim_counts) != 1:
-            raise SchemaError(
-                f"{study_root} changes seed, checkpoint epoch, or simulation "
-                "count across resolutions"
-            )
-        benchmark = str(manifest.get("benchmark", ""))
-        if benchmark != "forcing":
-            raise SchemaError(
-                f"{manifest_path} is benchmark {benchmark!r}; expected 'forcing'"
-            )
-
-        material_side = bool(manifest.get("material_side", False))
-        pairs_per_sim = int(manifest.get("pairs_per_sim", 0))
-        if not pairs_per_sim:
-            validations = [
-                _json_payload(p) for p in paths
-                if p.name == "validation.json" and _under(p, study_root)
-            ]
-            if len(validations) == 1:
-                pairs_per_sim = int(validations[0].get("pairs_per_sim", 0))
-        if pairs_per_sim <= 0:
-            raise SchemaError(f"{study_root} does not report pairs_per_sim")
-
-        studies.append(ResolutionStudy(
-            label="E33 material-side" if material_side else "E32 original",
-            benchmark=benchmark,
-            material_side=material_side,
-            seed=next(iter(seeds)),
-            checkpoint_epoch=next(iter(epochs)),
-            resolutions=expected_resolutions,
-            global_rel_l2_pct=tuple(
-                float(row["test_rel_l2_norm"]) for row in per_resolution
-            ),
-            interface_rel_l2_pct=tuple(
-                float(row["test_iface_rel_l2_norm"]) for row in per_resolution
-            ),
-            boundary_rel_l2_pct=tuple(
-                float(row["test_boundary_rel_l2_norm"]) for row in per_resolution
-            ),
-            n_simulations=next(iter(sim_counts)),
-            pairs_per_simulation=pairs_per_sim,
-            comparison_caveat=str(manifest.get("comparison_caveat", "")),
-        ))
-
-    originals = [study for study in studies if not study.material_side]
-    variants = [study for study in studies if study.material_side]
-    if len(originals) != 1 or len(variants) != 1:
-        raise SchemaError(
-            "resolution comparison needs one original and one material-side study"
-        )
-    original, material_side = originals[0], variants[0]
-    if original.resolutions != material_side.resolutions:
-        raise SchemaError("resolution studies use different evaluation grids")
-    if original.n_simulations != material_side.n_simulations:
-        raise SchemaError("resolution studies use different simulation counts")
-    if original.pairs_per_simulation != material_side.pairs_per_simulation:
-        raise SchemaError("resolution studies use different pair counts")
-    if original.seed != material_side.seed:
-        raise SchemaError("resolution studies use different model seeds")
-
-    drift_payload = _json_payload(drift_paths[0])
-    drift_rows = drift_payload.get("per_resolution") or []
-    drift_resolutions = tuple(int(row["resolution"]) for row in drift_rows)
-    if drift_resolutions != original.resolutions:
-        raise SchemaError(
-            f"FV drift grids {drift_resolutions} do not match model grids "
-            f"{original.resolutions}"
-        )
-    references = [
-        int(row["resolution"]) for row in drift_rows if row.get("is_reference")
+def load_resolution_study(source) -> ResolutionStudy:
+    """Load the one ``scripts/run_resolution_study.py`` report of a source."""
+    paths = [
+        p for p in artifact_paths(source, "json_report")
+        if p.name == RESOLUTION_STUDY_FILENAME
     ]
-    if len(references) != 1:
-        raise SchemaError("FV drift report must identify exactly one reference grid")
-    drift = ResolutionDrift(
-        resolutions=drift_resolutions,
-        global_rel_l2_pct=tuple(float(row["global_rel_l2_pct"])
-                                for row in drift_rows),
-        interface_rel_l2_pct=tuple(float(row["interface_rel_l2_pct"])
-                                   for row in drift_rows),
-        boundary_rel_l2_pct=tuple(float(row["boundary_rel_l2_pct"])
-                                  for row in drift_rows),
-        reference_resolution=references[0],
+    if len(paths) != 1:
+        raise SchemaError(
+            f"resolution source needs one {RESOLUTION_STUDY_FILENAME}, "
+            f"found {len(paths)}"
+        )
+    payload = _json_payload(paths[0])
+    rows = payload.get("per_resolution") or []
+    if not rows:
+        raise SchemaError(f"{paths[0]} reports no resolutions")
+    resolutions = tuple(int(row["resolution"]) for row in rows)
+    if list(resolutions) != sorted(set(resolutions)):
+        raise SchemaError(
+            f"{paths[0]} resolutions must be unique and ascending: {resolutions}"
+        )
+    values: dict[str, tuple[float, ...]] = {}
+    for metric in RESOLUTION_STUDY_METRICS:
+        try:
+            values[metric] = tuple(float(row[metric]) for row in rows)
+        except KeyError as exc:
+            raise SchemaError(f"{paths[0]} is missing {metric}") from exc
+        if not all(np.isfinite(values[metric])):
+            raise SchemaError(f"{paths[0]} has non-finite {metric}")
+
+    pairs_per_sim = int(payload.get("pairs_per_sim", 0))
+    n_simulations = int(payload.get("num_sims", 0))
+    if pairs_per_sim <= 0 or n_simulations <= 0:
+        raise SchemaError(f"{paths[0]} does not report its simulation/pair counts")
+    return ResolutionStudy(
+        benchmark=str(payload.get("benchmark", "")),
+        material_side=bool(payload.get("material_side", False)),
+        seed=str(payload.get("checkpoint_seed", "")),
+        checkpoint_epoch=int(payload["checkpoint_epoch"]),
+        resolutions=resolutions,
+        field_gnrmse_pct=values["field_gnrmse_pct"],
+        node_jump_gnrmse_pct=values["node_jump_gnrmse_pct"],
+        n_simulations=n_simulations,
+        pairs_per_simulation=pairs_per_sim,
+        checkpoint_sha256=str(payload.get("checkpoint_sha256", "")),
     )
-    return ResolutionStudies(original=original, material_side=material_side,
-                             fv_drift=drift)
 
 
 __all__ = [
@@ -1068,8 +955,8 @@ __all__ = [
     "SCHEMA_V4_REQUIRED",
     "SchemaError",
     "RecordFrame",
-    "ResolutionDrift",
-    "ResolutionStudies",
+    "RESOLUTION_STUDY_FILENAME",
+    "RESOLUTION_STUDY_METRICS",
     "ResolutionStudy",
     "RolloutArmRecords",
     "artifact_paths",
@@ -1082,7 +969,7 @@ __all__ = [
     "load_train_metrics",
     "load_csv_table",
     "load_inverse_sensor_sweep",
-    "load_resolution_studies",
+    "load_resolution_study",
     "load_rollout_arms",
     "count_simulations",
     "available_strata",

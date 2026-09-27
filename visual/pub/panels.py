@@ -476,36 +476,28 @@ def rollout_delta_panel(ax, curves, *, title: str = "", ylabel: str = "",
                   title_fontsize=5.5)
 
 
-def resolution_curve_panel(ax, studies, drift, *, value_attr: str,
-                           title: str = "", ylabel: str = "",
-                           legend: bool = False) -> None:
-    """Two fixed-checkpoint resolution curves and metric-matched FV drift."""
-    series = (
-        (studies.original, "#0072B2", "-", "o"),
-        (studies.material_side, "#E69F00", "--", "s"),
-    )
-    for study, color, linestyle, marker in series:
-        ax.plot(
-            study.resolutions, getattr(study, value_attr),
-            color=color, linestyle=linestyle, marker=marker,
-            markersize=3.4, markerfacecolor="white", markeredgewidth=0.8,
-            linewidth=1.1, label=study.label, zorder=3,
-        )
+def resolution_curve_panel(ax, study, *, value_attr: str, color: str,
+                           title: str = "", ylabel: str = "") -> None:
+    """One fixed-checkpoint metric at each evaluation grid, values annotated."""
+    values = getattr(study, value_attr)
     ax.plot(
-        drift.resolutions, getattr(drift, value_attr),
-        color="0.35", linestyle=":", marker="^", markersize=3.2,
-        markerfacecolor="white", markeredgewidth=0.8, linewidth=1.0,
-        label=f"FV drift to N={drift.reference_resolution}", zorder=2,
+        study.resolutions, values,
+        color=color, linestyle="-", marker="o",
+        markersize=3.4, markerfacecolor="white", markeredgewidth=0.8,
+        linewidth=1.1, zorder=3,
     )
-    ax.set_xticks(studies.original.resolutions)
+    for resolution, value in zip(study.resolutions, values):
+        ax.annotate(
+            f"{value:.3f}", (resolution, value), textcoords="offset points",
+            xytext=(0, 4), ha="center", va="bottom", fontsize=5.3,
+        )
+    ax.set_xticks(study.resolutions)
     ax.set_xlabel(r"Evaluation grid $N \times N$")
     ax.set_ylabel(ylabel)
-    ax.set_ylim(bottom=0.0)
+    ax.set_ylim(bottom=0.0, top=1.2 * max(values))
     if title:
         ax.set_title(title, fontsize=7)
     ax.grid(True, alpha=0.25)
-    if legend:
-        ax.legend(fontsize=5.3, loc="best")
 
 
 # ============================================================
