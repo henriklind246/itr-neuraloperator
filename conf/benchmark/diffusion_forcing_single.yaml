@@ -1,0 +1,19 @@
+benchmark:
+  name: diffusion_forcing_single
+  representation: temporal_encoder
+
+training:
+  learning_rate: 0.0005
+  optimizer: Adam
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler:
+    type: PICViTExponential
+    decay_every: 500
+    decay_rate: 0.95
+    min_lr: 0.00001
+  loss:
+    interface_weight: 1.0
+    interface_x: 0.5
+    interface_half_width: 0.05
+    per_sample_interface_x: false

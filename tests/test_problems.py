@@ -26,6 +26,9 @@ _SYNTH_SIGMA = 1.0
 # Target (benchmark x representation) tensor contract. Single source of truth for
 # the dims/shape tests below. `temporal_encoder` is the only representation.
 CONTRACTS = {
+    ("diffusion_forcing_single", "temporal_encoder"): dict(
+        in_ch=4, cond=1, token=3, t_stats=2, s_y=3, aug=True,
+    ),
     ("forcing", "temporal_encoder"): dict(
         in_ch=4, cond=10, token=3, t_stats=2, s_y=3, aug=True,
     ),
@@ -1126,6 +1129,11 @@ class TestRepresentationContracts:
         name, representation = key
         c = CONTRACTS[key]
         trajectories, x_grid, y_grid, t_grid = synthetic_trajectories
+        if name == "diffusion_forcing_single":
+            with pytest.raises(ValueError, match="homogeneous"):
+                problem_from_config({"benchmark": {"name": name, "representation": representation,
+                                                    "spatial_input": {"material_side": True}}})
+            return
         spec = problem_from_config({
             "benchmark": {
                 "name": name,

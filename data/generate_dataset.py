@@ -357,6 +357,10 @@ def generate_sim_data(
             "rng_seed": int(rng_seed),
             "seed_streams": seeds,
         }
+        for key in ("online_sampler_version", "ic_builder_version"):
+            value = getattr(spec, key, None)
+            if value is not None:
+                meta[key] = value
 
     save_path = Path(save_dir) if save_dir is not None else DATA_DIR
     save_dataset(

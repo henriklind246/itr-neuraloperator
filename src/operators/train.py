@@ -819,6 +819,107 @@ class RIGNOThreePhaseScheduler:
         self._set_lr(self._lr_for_epoch(self.next_epoch_index))
 
 
+class PICViTExponentialScheduler:
+    step_unit = "update"
+    STATE_VERSION = 1
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        peak_lr: float,
+        decay_every: int,
+        decay_rate: float,
+        min_lr: float,
+    ):
+        self.optimizer = optimizer
+        self.peak_lr = float(peak_lr)
+        self.decay_every = int(decay_every)
+        self.decay_rate = float(decay_rate)
+        self.min_lr = float(min_lr)
+
+        if self.peak_lr <= 0:
+            raise ValueError("PICViTExponential requires a positive peak_lr.")
+        if self.decay_every <= 0:
+            raise ValueError("PICViTExponential requires decay_every > 0.")
+        if not 0.0 < self.decay_rate < 1.0:
+            raise ValueError("PICViTExponential requires 0 < decay_rate < 1.")
+        if self.min_lr <= 0 or self.min_lr > self.peak_lr:
+            raise ValueError("PICViTExponential requires 0 < min_lr <= peak_lr.")
+
+        for group_idx, param_group in enumerate(self.optimizer.param_groups):
+            group_lr = float(param_group["lr"])
+            if not math.isclose(group_lr, self.peak_lr, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "PICViTExponential requires every optimizer parameter group "
+                    f"to start at training.learning_rate={self.peak_lr}; group "
+                    f"{group_idx} has lr={group_lr}."
+                )
+
+        self.next_update = 0
+        self._set_lr(self.lr_for_update(self.next_update))
+
+    def lr_for_update(self, update_idx: int) -> float:
+        if update_idx < 0:
+            raise ValueError(f"update_idx must be >= 0, got {update_idx}")
+        lr = self.peak_lr * self.decay_rate ** (update_idx / self.decay_every)
+        return max(self.min_lr, lr)
+
+    def _set_lr(self, lr: float) -> None:
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+    def step(self) -> None:
+        self.next_update += 1
+        self._set_lr(self.lr_for_update(self.next_update))
+
+    def state_dict(self) -> dict[str, int | float]:
+        return {
+            "version": self.STATE_VERSION,
+            "next_update": self.next_update,
+            "peak_lr": self.peak_lr,
+            "decay_every": self.decay_every,
+            "decay_rate": self.decay_rate,
+            "min_lr": self.min_lr,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        version = int(state_dict.get("version", -1))
+        if version != self.STATE_VERSION:
+            raise ValueError(
+                f"Unsupported PICViTExponential state version {version}; "
+                f"expected {self.STATE_VERSION}."
+            )
+
+        expected = {
+            "peak_lr": self.peak_lr,
+            "decay_every": self.decay_every,
+            "decay_rate": self.decay_rate,
+            "min_lr": self.min_lr,
+        }
+        for key, current_value in expected.items():
+            if key not in state_dict:
+                raise ValueError(f"PICViTExponential state is missing {key}.")
+            saved_value = state_dict[key]
+            matches = (
+                int(saved_value) == int(current_value)
+                if key == "decay_every"
+                else math.isclose(
+                    float(saved_value), float(current_value), rel_tol=0.0, abs_tol=1e-12
+                )
+            )
+            if not matches:
+                raise ValueError(
+                    f"PICViTExponential resume mismatch for {key}: "
+                    f"checkpoint={saved_value}, current={current_value}."
+                )
+
+        next_update = int(state_dict.get("next_update", -1))
+        if next_update < 0:
+            raise ValueError("PICViTExponential state requires next_update >= 0.")
+        self.next_update = next_update
+        self._set_lr(self.lr_for_update(self.next_update))
+
+
 def _set_scheduler_step_unit(scheduler, step_unit: str):
     scheduler.step_unit = step_unit
     return scheduler
@@ -845,6 +946,13 @@ def build_scheduler(config: dict, optimizer: torch.optim.Optimizer):
     training_cfg = config["training"]
     sched_cfg = training_cfg.get("scheduler", {})
     sched_type = sched_cfg.get("type", "StepLR")
+
+    if sched_type == "PICViTExponential":
+        return PICViTExponentialScheduler(
+            optimizer, peak_lr=training_cfg["learning_rate"],
+            decay_every=sched_cfg["decay_every"],
+            decay_rate=sched_cfg["decay_rate"], min_lr=sched_cfg["min_lr"],
+        )
 
     if sched_type == "CosineWarmRestarts":
         return _set_scheduler_step_unit(

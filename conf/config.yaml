@@ -1,5 +1,82 @@
 config_id: 0
 
+physics_test:
+  mg:
+    solver:
+      pre_smooth: 2
+      post_smooth: 2
+      omega: 0.6666666666666666
+      coarse_max_unknowns: 64
+    max_probe_relative_error: 0.1
+    fixed_max_exact_error_ratio: 2.0
+  model_type: cvit
+  phase0:
+    grid_sizes: [20, 40, 100]
+    updates: 1000
+    learning_rate: 0.01
+    seed: 1701
+    mu_global: 295.0
+    sigma_global: 10.0
+    dt: 0.005
+    t_final: 0.3
+    later_time: 0.075
+    flux_amplitude: 150.0
+    flux_frequency: 5.0
+    ramp_seconds: 0.01
+    perturbation_rms: 0.2
+    relative_error_tolerance: 0.01
+    min_step_speedup: 2.0
+    min_final_error_ratio: 5.0
+    log_every: 25
+
+  cvit:
+    emb_dim: 256
+    dec_emb_dim: null
+    depth_enc: 4
+    depth_dec: 2
+    num_heads: 8
+    mlp_ratio: 2.0
+    ic_patch_size: 10
+    forcing_patch_size: 8
+    forcing_grid_size: [96, 128]
+    fourier_freq: 1.0
+    fourier_freq_t: null
+    activation: gelu
+    film_hidden_layers: 2
+    film_activation: silu
+    head_hidden_layers: 1
+    head_activation: gelu
+    hard_right_dirichlet: true
+  pino:
+    residual_mode: one_step
+    prefix_steps: 5
+    controls: [raw, exact]
+    checkpoint_keep_all: true
+    fixed_updates: 1000
+    fixed_validate_every: 100
+    online_updates: 4000
+    online_validate_every: 250
+    online_sampling: precomputed
+    validation_cases: null
+    validation_seed: 1042
+    validation_rollout_steps: null
+    full_validate_every: 1000
+    validation_batch_size: 1
+    compact_metrics: false
+    startup_profile_updates: [50, 100]
+    allocation_seconds: 21600
+    seed: 42
+    batch_size: 1
+    query_chunk_size: 2048
+    ic_weight: 1.0
+    forcing_a_ref: 300.0
+    log_every: 25
+    causal_warmup_updates: 0
+    evaluation_times: [0.0, 0.005, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3]
+    gate_error_ratio: 1.5
+    fixed_max_sigma_error_percent: 5.0
+    fixed_max_first_step_sigma_error_percent: 5.0
+
 experiment:
   name: experiment0
 

@@ -33,6 +33,13 @@ STRUCTURE_PNG = {
 }
 
 
+def test_regime_plot_handles_a_sparse_five_step_rollout(tmp_path):
+    latest = pd.DataFrame({"t_bar": np.arange(6) * .005,
+                           "rel_l2": [0, .8, 1.1, 1.5, 1.2, 1.0]})
+    ivp.plot_regime_stratification(latest, ["t_bar"], tmp_path)
+    assert (tmp_path / "02_regime_stratification.png").is_file()
+
+
 def _write_csv(path, benchmark, *, include_benchmark_col=True):
     """Write a synthetic val_pairs.csv with the production superset header.
 
@@ -175,3 +182,22 @@ class TestMainDispatch:
         assert int(tail.loc[tail["stratum"] == "overall", "n_sims"].iloc[0]) == 6
         # The report header must name the detected benchmark.
         assert f"Benchmark: {benchmark}" in capsys.readouterr().out
+
+
+def test_homogeneous_cvit_stratification_without_interface_columns(tmp_path,capsys):
+    rows=[]
+    for sid,family in enumerate(('uniform_2d','grf_2d')):
+        for time in (0.005,0.05,0.1,0.15,0.2,0.3):
+            rows.append(dict(epoch=100,sim_id=sid,benchmark='diffusion_forcing_single',
+                             t_s=0,t_bar=time,absolute_time=time,ic_family=family,
+                             amplitude=100+sid*100,frequency=2+sid*5,
+                             rel_l2=10+time,rmse_K=1+time,sigma_nrmse_pct=5+time))
+    df=pd.DataFrame(rows)
+    columns=ivp._cond_cols(df,'diffusion_forcing_single')
+    assert {'amplitude','frequency','absolute_time'} <= set(columns)
+    ivp.report_structure(df,'diffusion_forcing_single')
+    assert 'grf_2d' in capsys.readouterr().out
+    ivp.plot_structure(df,'diffusion_forcing_single',tmp_path)
+    ivp.plot_interface_ratio(df,tmp_path)
+    assert (tmp_path/'05_ic_family_errors.png').exists()
+    assert not (tmp_path/'04_interface_vs_bulk.png').exists()

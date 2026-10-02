@@ -634,6 +634,44 @@ def _cn_laplacian_full(T: torch.Tensor, geom: FVGeom) -> torch.Tensor:
             + geom.r_s * (Ts - T) + geom.r_n * (Tn - T))
 
 
+def implicit_cn_action(deviation: torch.Tensor, geom: FVGeom) -> torch.Tensor:
+    """Apply the capacity-divided CN matrix on free nodes; right deviation is zero."""
+    return (deviation - _cn_laplacian_full(deviation, geom))[..., :-1, :]
+
+
+def _cn_left_increment(geom: FVGeom, bc: FullBCData) -> torch.Tensor:
+    denom = geom.rho_cp[..., 0, :] * geom.hx * geom.sigma_global
+    if bc.qL_int is not None:
+        return 2.0 * bc.qL_int / denom
+    return geom.dt * (bc.qL_n + bc.qL_np1) / denom
+
+
+def explicit_cn_rhs(
+    deviation: torch.Tensor, geom: FVGeom, bc: FullBCData,
+    *, detach_previous: bool = True,
+) -> torch.Tensor:
+    """CN right-hand side; retain the source graph for coupled trajectory losses."""
+    state = deviation.detach() if detach_previous else deviation
+    rhs = (state + _cn_laplacian_full(state, geom))[..., :-1, :]
+    rhs = rhs.clone()
+    rhs[..., 0, :] = rhs[..., 0, :] + _cn_left_increment(geom, bc)
+    return rhs
+
+
+def cn_step_residual(
+    T_n: torch.Tensor, T_np1: torch.Tensor, geom: FVGeom, bc: FullBCData,
+    *, detach_previous: bool = True,
+) -> torch.Tensor:
+    """Complete normalized CN residual on (B,Nx-1,Ny), with fixed right Dirichlet."""
+    right = torch.as_tensor(bc.T_right_tilde, device=T_np1.device, dtype=T_np1.dtype)
+    if right.ndim:
+        right = right.unsqueeze(-2)
+    return (
+        implicit_cn_action(T_np1 - right, geom)
+        - explicit_cn_rhs(T_n - right, geom, bc, detach_previous=detach_previous)
+    )
+
+
 def _interface_face_indices(geom: FVGeom, batch_size: int) -> torch.Tensor:
     face_idx = geom.face_idx
     if face_idx is None:
@@ -1154,13 +1192,7 @@ def full_bc_cn_residual(T_n: torch.Tensor, T_np1: torch.Tensor,
     # the solver's RHS injection (`fv_solver_2d.py` left-Neumann block). When the
     # exact step integral is supplied use `2*qL_int` (the solver's exact path);
     # otherwise fall back to the CN trapezoid `dt*(qL_n+qL_np1)`.
-    rho_cp_left = geom.rho_cp[0, :]                          # (Ny,)
-    denom = rho_cp_left[None, :] * geom.hx * geom.sigma_global
-    if bc.qL_int is not None:
-        f_norm = 2.0 * bc.qL_int / denom                    # (B,Ny) after bcast
-    else:
-        flux = bc.qL_n + bc.qL_np1                          # (B,Ny) after bcast
-        f_norm = geom.dt * flux / denom
+    f_norm = _cn_left_increment(geom, bc)
     left_res = bal[:, 0, :] - f_norm                        # (B, Ny)
 
     # Right Dirichlet column i=Nx-1 (algebraic).

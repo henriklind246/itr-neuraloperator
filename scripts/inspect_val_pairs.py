@@ -34,6 +34,7 @@ LEAD_BINS = 12
 # all benchmarks; benchmark extras are appended when present and varying.
 BASE_COND_COLS = ["t_s", "t_bar", "R_c"]
 BENCHMARK_COND_COLS = {
+    "diffusion_forcing_single": ["amplitude", "frequency", "absolute_time"],
     "forcing": [],
     "forcing_itr_sin": ["R_c_base", "R_c_A"],
     "interfaces": ["interface_x"],
@@ -50,6 +51,7 @@ BENCHMARK_COND_COLS = {
 STRAT_METRICS = ["rel_l2", "rmse_K", "sigma_nrmse_pct", "nrmse"]
 
 TAIL_CATEGORICAL_COLS = {
+    "diffusion_forcing_single": ("ic_family",),
     "forcing": ("temporal_family", "spatial_family"),
     "forcing_itr_sin": ("temporal_family", "spatial_family"),
     "source": ("regime",),
@@ -216,6 +218,9 @@ def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
             ["mean", "median", "count"]
         )
         print(agg.sort_values("mean").to_string(float_format=lambda x: f"{x:.4f}"))
+    elif benchmark == "diffusion_forcing_single" and "ic_family" in latest:
+        metrics = _present_strat_metrics(latest)
+        print(latest.groupby("ic_family")[metrics].mean().to_string(float_format=lambda x: f"{x:.4f}"))
     elif benchmark == "interfaces" and _is_varying_numeric(latest, "interface_x"):
         bins = pd.qcut(latest["interface_x"], 5, duplicates="drop")
         agg = latest.groupby(bins, observed=True)["rel_l2"].agg(["mean", "median", _quantile(0.99)])
@@ -503,8 +508,9 @@ def plot_regime_stratification(latest: pd.DataFrame, cond_cols: list[str], out: 
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), sharey=True, squeeze=False)
     for ax, col in zip(axes[0], cond_cols):
         bins = pd.qcut(latest[col], 8, duplicates="drop")
-        grouped = [g["rel_l2"].values for _, g in latest.groupby(bins, observed=True)]
-        labels = [f"{i.left:.2f}-{i.right:.2f}" for i in bins.cat.categories]
+        observed_groups = list(latest.groupby(bins, observed=True))
+        grouped = [g["rel_l2"].values for _, g in observed_groups]
+        labels = [f"{i.left:.2f}-{i.right:.2f}" for i, _ in observed_groups]
         ax.boxplot(grouped, tick_labels=labels, showfliers=False)
         ax.set_xlabel(col)
         ax.tick_params(axis="x", rotation=45)
@@ -568,6 +574,17 @@ def plot_structure(latest: pd.DataFrame, benchmark: str, out: Path) -> None:
     """Benchmark-specific final plot (the 5th figure)."""
     if benchmark in ("forcing", "forcing_itr_sin"):
         _plot_ic_family_heatmap(latest, out)
+    elif benchmark == "diffusion_forcing_single":
+        metrics = _present_strat_metrics(latest)
+        grouped = latest.groupby("ic_family")[metrics].mean()
+        fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4), squeeze=False)
+        for ax, metric in zip(axes[0], metrics):
+            grouped[metric].plot.bar(ax=ax)
+            ax.set_ylabel(metric)
+            ax.set_xlabel("IC family")
+        fig.tight_layout()
+        fig.savefig(out / "05_ic_family_errors.png", dpi=130)
+        plt.close(fig)
     elif benchmark == "interfaces":
         _plot_error_vs_interface_x(latest, out)
     elif benchmark in ("source", "source_itr_sin"):

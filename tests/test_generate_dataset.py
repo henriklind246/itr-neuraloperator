@@ -348,3 +348,21 @@ class TestSeedProvenance:
     def test_default_family_writes_no_meta_for_an_unversioned_spec(self, tmp_path):
         _, out = _generate(tmp_path, "base", num_sims=2, rng_seed=0)
         assert not (out / "meta.npy").exists()
+
+
+def test_homogeneous_generation_preserves_varying_ic_versions_and_balancing(tmp_path):
+    from src.physics.init_conditions import IC_BUILDER_SCHEMA_VERSION, ONLINE_IC_SAMPLER_VERSION
+    generate_sim_data(num_sims=8,save_stride=2,save_dir=tmp_path,
+                      benchmark='diffusion_forcing_single',nx=4,ny=4)
+    meta=np.load(tmp_path/'meta.npy',allow_pickle=True).item()
+    assert meta['problem_version'] == 'forcing_single_varying_ic_v2'
+    assert meta['ic_mode'] == 'varying'
+    assert meta['online_sampler_version'] == ONLINE_IC_SAMPLER_VERSION
+    assert meta['ic_builder_version'] == IC_BUILDER_SCHEMA_VERSION
+    params=np.load(tmp_path/'sim_params.npy',allow_pickle=True)
+    families,counts=np.unique([p['ic_family'] for p in params],return_counts=True)
+    assert len(families) == 4
+    assert np.all(counts == 2)
+    assert all('R_c' not in p and 'interface_x' not in p for p in params)
+    assert all(p['temporal_family'] == 'sin' and p['spatial_family'] == 'uniform' for p in params)
+    assert np.load(tmp_path/'trajectories.npy').shape == (8,31,4,4)
