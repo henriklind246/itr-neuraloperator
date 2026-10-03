@@ -13,8 +13,9 @@ import yaml
 
 import src.operators.train_pino as pino
 from scripts.run_train_pino import result_exit_code
-from scripts.run_train_fixed import _parse_override_value
+from scripts.run_train_fixed import _apply_override, _parse_override_value
 from src.operators.cvit import ForcingICCViT
+from src.operators.soap import SOAP
 from src.physics.fv_preconditioner import MGOneCycleInverse
 from src.physics.init_conditions import IC_FAMILIES
 from tests.test_cvit_pino import config, prescribed_inputs, save_inputs
@@ -320,7 +321,7 @@ def test_launcher_resources_overrides_and_resume(tmp_path):
     script = Path('slurm/train_pcvit_mg_msi.sbatch').resolve()
     subprocess.run(['bash', '-n', script], check=True)
     text = script.read_text()
-    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=10:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
+    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=18:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
         assert directive in text
     project = tmp_path / 'project with spaces'
     project.mkdir()
@@ -341,13 +342,27 @@ exec bash "$LAUNCHER"
     assert args[:3] == ['python', '-u', 'scripts/run_train_pino.py']
     assert args[args.index('--data-dir') + 1] == str(project / 'data/physics_test_single_development_20261001')
     overrides = dict(arg.split('=', 1) for arg in args if '=' in arg)
-    assert overrides['physics_test.pino.online_updates'] == '20000'
+    assert overrides['physics_test.pino.online_updates'] == '10000'
     assert overrides['physics_test.pino.validation_cases'] == '128'
     assert overrides['physics_test.pino.validation_batch_size'] == '8'
     assert overrides['physics_test.pino.prefix_steps'] == '20'
-    assert overrides['physics_test.pino.allocation_seconds'] == '36000'
+    assert overrides['physics_test.pino.allocation_seconds'] == '64800'
     assert overrides['physics_test.cvit.fourier_freq'] == '20'
     assert _parse_override_value(overrides['physics_test.pino.controls']) == ['mg']
+    cfg = online_config()
+    for key, value in overrides.items():
+        _apply_override(cfg, key, _parse_override_value(value))
+    model = pino.build_cvit(cfg, prescribed_inputs()[0], torch.device('cpu'))
+    optimizer = pino.build_optimizer(cfg, model.parameters())
+    assert isinstance(optimizer, SOAP)
+    assert optimizer.param_groups[0]['betas'] == (0.95, 0.95)
+    assert optimizer.param_groups[0]['shampoo_beta'] == 0.95
+    assert optimizer.param_groups[0]['precondition_frequency'] == 10
+    assert max(max(p.shape) for p in model.parameters()) <= optimizer.param_groups[0]['max_precond_dim']
+    scheduler = pino.build_scheduler(cfg, optimizer)
+    assert scheduler.lr_for_update(0) == pytest.approx(1e-3)
+    assert scheduler.lr_for_update(5000) == pytest.approx(1e-3 * 0.9 ** 20)
+    assert scheduler.lr_for_update(10000) == pytest.approx(1e-3 * 0.9 ** 40)
     env['RESUME_RUN_DIR'] = str(tmp_path / 'resume with spaces')
     subprocess.run(['bash', '-c', prologue], env=env, check=True, capture_output=True)
     args = capture.read_bytes().decode().strip('\0').split('\0')

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=pcvit_mg_online
+#SBATCH --job-name=pcvit_mg_soap
 #SBATCH --partition=msigpu
 #SBATCH --gres=gpu:a100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=18:00:00
+#SBATCH --time=09:00:00
 #SBATCH --signal=USR1@120
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
@@ -22,7 +22,7 @@ PHASE4_DIR="${PHASE4_DIR:-$PROJECT_DIR/runs/physics_test_phase4_direct_state_mg_
 FIXED_MG_DIR="${FIXED_MG_DIR:-$PROJECT_DIR/runs/physics_test_phase4_cvit_autoregressive_mg_prefix5_adam_seed42_20261002}"
 NORMALIZATION_PATH="${NORMALIZATION_PATH:-$FIXED_MG_DIR/normalization.json}"
 PERSISTENT_RUNS="${PERSISTENT_RUNS:-$HOME/fno_runs}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-pcvit_mg_phase3_prefix20_20k}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-pcvit_mg_phase3_soap_prefix20_10k}"
 RUN_DIR="${RUN_DIR:-$PERSISTENT_RUNS/${EXPERIMENT_NAME}_${SLURM_JOB_ID:?}}"
 export BENCHMARK=diffusion_forcing_single
 export REPRESENTATION=temporal_encoder
@@ -51,19 +51,23 @@ else
         --stage online --data-dir "$DATA_DIR" --output-dir "$RUN_DIR" \
         --phase0-dir "$PHASE4_DIR" --fixed-screen-dir "$FIXED_MG_DIR" \
         --normalization "$NORMALIZATION_PATH" \
-        training.device=cuda training.optimizer=Adam training.learning_rate=0.0005 \
+        training.device=cuda training.optimizer=SOAP training.learning_rate=0.001 \
         training.weight_decay=0.0 training.grad_clip=1.0 training.batch_size=8 \
-        training.scheduler.type=PICViTExponential training.scheduler.decay_every=500 \
-        training.scheduler.decay_rate=0.95 training.scheduler.min_lr=0.00001 \
+        'training.soap.betas=[0.95,0.95]' training.soap.shampoo_beta=0.95 \
+        training.soap.eps=1e-8 training.soap.precondition_frequency=10 \
+        training.soap.max_precond_dim=2048 training.soap.merge_dims=false \
+        training.soap.precondition_1d=false \
+        training.scheduler.type=PICViTExponential training.scheduler.decay_every=250 \
+        training.scheduler.decay_rate=0.90 training.scheduler.min_lr=0.00001 \
         physics_test.model_type=cvit physics_test.cvit.fourier_freq=20 \
         physics_test.pino.residual_mode=autoregressive 'physics_test.pino.controls=["mg"]' \
         physics_test.pino.prefix_steps=20 physics_test.pino.batch_size=8 \
-        physics_test.pino.online_updates=20000 physics_test.pino.online_sampling=per_update \
+        physics_test.pino.online_updates=10000 physics_test.pino.online_sampling=per_update \
         physics_test.pino.online_validate_every=500 physics_test.pino.full_validate_every=1000 \
         physics_test.pino.validation_cases=128 physics_test.pino.validation_seed=1042 \
         physics_test.pino.validation_rollout_steps=60 physics_test.pino.validation_batch_size=8 \
         physics_test.pino.compact_metrics=true physics_test.pino.log_every=50 \
         physics_test.pino.seed=42 physics_test.pino.ic_weight=0.0 \
         physics_test.pino.checkpoint_keep_all=false physics_test.pino.query_chunk_size=2048 \
-        'physics_test.pino.startup_profile_updates=[50,100]' physics_test.pino.allocation_seconds=36000
+        'physics_test.pino.startup_profile_updates=[50,100]' physics_test.pino.allocation_seconds=64800
 fi
