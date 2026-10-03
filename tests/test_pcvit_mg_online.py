@@ -320,7 +320,7 @@ def test_launcher_resources_overrides_and_resume(tmp_path):
     script = Path('slurm/train_pcvit_mg_msi.sbatch').resolve()
     subprocess.run(['bash', '-n', script], check=True)
     text = script.read_text()
-    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=06:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
+    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=10:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
         assert directive in text
     project = tmp_path / 'project with spaces'
     project.mkdir()
@@ -341,10 +341,11 @@ exec bash "$LAUNCHER"
     assert args[:3] == ['python', '-u', 'scripts/run_train_pino.py']
     assert args[args.index('--data-dir') + 1] == str(project / 'data/physics_test_single_development_20261001')
     overrides = dict(arg.split('=', 1) for arg in args if '=' in arg)
-    assert overrides['physics_test.pino.online_updates'] == '10000'
+    assert overrides['physics_test.pino.online_updates'] == '20000'
     assert overrides['physics_test.pino.validation_cases'] == '128'
     assert overrides['physics_test.pino.validation_batch_size'] == '8'
-    assert overrides['physics_test.pino.prefix_steps'] == '10'
+    assert overrides['physics_test.pino.prefix_steps'] == '20'
+    assert overrides['physics_test.pino.allocation_seconds'] == '36000'
     assert overrides['physics_test.cvit.fourier_freq'] == '20'
     assert _parse_override_value(overrides['physics_test.pino.controls']) == ['mg']
     env['RESUME_RUN_DIR'] = str(tmp_path / 'resume with spaces')
