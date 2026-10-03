@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 import numpy as np
+import torch
 from problems.base import ProblemDims, ProblemSpec
 from problems.forcing import (A_AMP_REF, FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM, T_EPS, _sample_a, _forcing_seq_3tok_from_samples)
@@ -147,6 +148,20 @@ class DiffusionForcingSingleProblem(ProblemSpec):
             )
             profiles[int(sim_id)] = np.asarray(s_vec, dtype=np.float32)
         ds.s_y_profiles = profiles
+
+    def build_step_inputs(self, state, coords, average_flux, dt, horizon):
+        """Encode the solver's interval-average forcing at the fixed step size."""
+        batch, nx, ny = state.shape
+        xy = coords.reshape(1, nx, ny, 2).expand(batch, -1, -1, -1)
+        spatial = torch.cat((state[..., None], xy, torch.ones_like(state[..., None])), dim=-1)
+        r = torch.linspace(0, 1, FORCING_TEMPORAL_SAMPLES,
+                           device=state.device, dtype=state.dtype).expand(batch, -1)
+        # The benchmark is uniform in y; repeating its exact mean avoids giving
+        # the FNO waveform information that the CN step and CViT never consume.
+        a = average_flux[:, :1].expand_as(r)
+        return dict(spatial=spatial,
+                    cond_static=state.new_full((batch, self.dims.cond_static_dim), dt / horizon),
+                    forcing_seq=torch.stack((r, a, a), dim=-1))
 
     def build_item(self, ds, sid: int, s: int, j: int) -> dict[str, np.ndarray]:
         sid = int(sid)

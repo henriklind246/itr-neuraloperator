@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 from data.dataset import SnapshotPairDataset, problem_from_config
 from problems.registry import get_problem
@@ -45,6 +46,31 @@ CONTRACTS = {
         in_ch=6, cond=3, token=3, t_stats=3, s_y=5, aug=True,
     ),
 }
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
+def test_homogeneous_step_encoding_preserves_state_and_exact_mean_flux(dtype):
+    spec = get_problem('diffusion_forcing_single')
+    contract = CONTRACTS[(spec.name, 'temporal_encoder')]
+    state = torch.randn(2, 4, 6, dtype=dtype, requires_grad=True)
+    x, y = torch.meshgrid(torch.linspace(0, 1, 4, dtype=dtype),
+                          torch.linspace(0, 1, 6, dtype=dtype), indexing='ij')
+    coords = torch.stack((x, y), -1).reshape(1, -1, 2)
+    average = torch.tensor([0.25, -0.5], dtype=dtype)[:, None].expand(-1, 6)
+    fields = spec.build_step_inputs(state, coords, average, .005, .3)
+    assert fields['spatial'].shape == (2, 4, 6, contract['in_ch'])
+    assert fields['cond_static'].shape == (2, contract['cond'])
+    assert fields['forcing_seq'].shape == (2, 128, contract['token'])
+    assert all(v.dtype == dtype and v.device == state.device for v in fields.values())
+    torch.testing.assert_close(fields['spatial'][..., 0], state)
+    torch.testing.assert_close(fields['spatial'][..., 1:3], coords.reshape(1, 4, 6, 2).expand(2, -1, -1, -1))
+    torch.testing.assert_close(fields['spatial'][..., contract['s_y']], torch.ones_like(state))
+    torch.testing.assert_close(fields['cond_static'], torch.full((2, 1), .005 / .3, dtype=dtype))
+    for channel in (1, 2):
+        torch.testing.assert_close(fields['forcing_seq'][..., channel], average[:, :1].expand(-1, 128))
+    torch.testing.assert_close(fields['forcing_seq'][..., 0], torch.linspace(0, 1, 128, dtype=dtype).expand(2, -1))
+    fields['spatial'][..., 0].sum().backward()
+    torch.testing.assert_close(state.grad, torch.ones_like(state))
 
 
 def _make_dataset(trajectories, x_grid, y_grid, t_grid, sim_params, spec):

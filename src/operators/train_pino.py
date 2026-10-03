@@ -127,6 +127,8 @@ def build_screen_model(config, inputs, device):
                    use_forcing_time_aug=dims.use_forcing_time_aug,
                    forcing_extender_rc_cond_index=dims.forcing_extender_rc_cond_index,
                    t_right_norm=(300 - inputs["mu_global"]) / inputs["sigma_global"])
+    if config["physics_test"]["pino"].get("residual_mode") == "autoregressive" and not options.get("hard_right_dirichlet"):
+        raise ValueError("Autoregressive FNO requires model.parameters.hard_right_dirichlet=true: the CN loss uses free nodes only")
     return FNO2d(**options).to(device)
 
 
@@ -207,6 +209,18 @@ def step_forcing_image(params, intervals, config, inputs, device, dtype):
     boundary = make_boundary(params, intervals, dict(inputs, y=np.linspace(0, 1, height)), device, dtype)
     average = boundary.qL_int / (inputs["dt"] * config["physics_test"]["pino"]["forcing_a_ref"])
     return average[:, None, :, None].expand(-1, 1, -1, width).contiguous()
+
+
+def autoregressive_step(model, state, params, intervals, config, inputs, coords):
+    if isinstance(model, FNO2d):
+        boundary = make_boundary(params, intervals, inputs, state.device, state.dtype)
+        average = boundary.qL_int / (inputs["dt"] * config["physics_test"]["pino"]["forcing_a_ref"])
+        fields = inputs["spec"].build_step_inputs(state, coords, average, inputs["dt"], inputs["t_final"])
+        return model(**fields)[..., 0]
+    forcing = step_forcing_image(params, intervals, config, inputs, state.device, state.dtype)
+    latent = model.encode(forcing, state[:, None])
+    return decode_grid(model, latent, coords, None, *state.shape[-2:],
+                       config["physics_test"]["pino"]["query_chunk_size"])
 
 
 def model_inputs(params, config, inputs, device):
@@ -312,14 +326,11 @@ def draw_online_batch(inputs, generators, count, families=None):
 def autoregressive_backward(model, params, config, inputs, coords, geom, inverse, objective):
     pino = config["physics_test"]["pino"]
     _, state = model_inputs(params, config, inputs, coords.device)
-    nx, ny = state.shape[-2:]
     losses, residuals, corrections = [], [], []
     for n in range(pino["prefix_steps"]):
         previous = state.detach()
         intervals = np.full(len(params), n)
-        forcing = step_forcing_image(params, intervals, config, inputs, coords.device, state.dtype)
-        latent = model.encode(forcing, previous[:, None])
-        state = decode_grid(model, latent, coords, None, nx, ny, pino["query_chunk_size"])
+        state = autoregressive_step(model, previous, params, intervals, config, inputs, coords)
         bc = make_boundary(params, intervals, inputs, coords.device, state.dtype)
         step_loss, residual, correction = cn_objective(previous, state, geom, bc, inverse, objective)
         # Step graphs are independent because both uses of the current state detach.
@@ -365,9 +376,7 @@ def evaluate_development(model, config, inputs, params, references, coords, geom
         if autoregressive:
             states = [ic]
             for n in range(pino["prefix_steps"]):
-                forcing = step_forcing_image([p], [n], config, inputs, device, ic.dtype)
-                latent = model.encode(forcing, states[-1][:, None])
-                states.append(decode_grid(model, latent, coords, None, nx, ny, pino["query_chunk_size"]))
+                states.append(autoregressive_step(model, states[-1], [p], [n], config, inputs, coords))
         else:
             latent = forcing if isinstance(model, FNO2d) else model.encode(forcing, ic[:, None])
         for tid, t in enumerate(times):
@@ -470,11 +479,8 @@ def evaluate_online_mg(model, config, inputs, params, references, coords, steps,
                 synchronize(coords.device)
                 step_start = time.perf_counter()
                 if n:
-                    forcing = step_forcing_image(batch, np.full(len(batch), n - 1), config,
-                                                  inputs, coords.device, state.dtype)
-                    latent = model.encode(forcing, state[:, None])
-                    state = decode_grid(model, latent, coords, None, len(inputs["x"]),
-                                        len(inputs["y"]), pino["query_chunk_size"])
+                    state = autoregressive_step(model, state, batch, np.full(len(batch), n - 1),
+                                                config, inputs, coords)
                     physical = state.cpu().double().numpy() * inputs["sigma_global"] + inputs["mu_global"]
                 else:
                     physical = np.stack([p["T0"] for p in batch]).astype(np.float64)
@@ -903,10 +909,12 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     single_autoregressive = mode == "autoregressive" and controls in (["exact"], ["mg"])
     if mode not in {"one_step", "space_time", "autoregressive"} or (not single_autoregressive and not {"raw", "exact"} <= set(controls) <= allowed) or len(set(controls)) != len(controls):
         raise ValueError("Use unique raw/exact controls, or an exact-only/MG-only autoregressive screen")
-    if mode == "autoregressive" and (model_type != "cvit" or (stage != "fixed" and not online_mg)):
-        raise ValueError("The autoregressive diagnostic supports the fixed CViT screen")
+    if mode == "autoregressive" and stage != "fixed" and not online_mg:
+        raise ValueError("Autoregressive screens require fixed cases or online MG")
     if pino.get("online_sampling", "precomputed") == "per_update" and not online_mg:
-        raise ValueError("Per-update sampling currently requires online autoregressive MG CViT")
+        raise ValueError("Per-update sampling requires online autoregressive MG")
+    if pino["forcing_a_ref"] <= 0:
+        raise ValueError("forcing_a_ref must be positive")
     if online_mg:
         if pino.get("online_sampling") != "per_update" or not pino.get("compact_metrics"):
             raise ValueError("Online MG requires per_update sampling and compact_metrics")
@@ -924,13 +932,13 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     mg_only = controls == ["mg"]
     prerequisites = [require_gate(phase0_dir, "phase4_direct_state_mg" if online_mg or (mg_only and not smoke) else "phase0_direct_state")]
     historical = None
-    if mg_only and not smoke and not online_mg:
+    if mg_only and not smoke and not online_mg and (model_type == "cvit" or exact_screen_dir is not None):
         if exact_screen_dir is None:
             raise ValueError("The MG preservation screen requires the completed exact prefix screen")
-        prerequisites.append(require_gate(exact_screen_dir, "phase2_fixed_cvit_autoregressive_prefix"))
+        prerequisites.append(require_gate(exact_screen_dir, f"phase2_fixed_{model_type}_autoregressive_prefix"))
         historical = json.loads((Path(exact_screen_dir) / "final_metrics.json").read_text())["controls"]["exact"]
     if stage == "online":
-        prerequisites.append(require_gate(fixed_screen_dir, "phase4_fixed_cvit_autoregressive_prefix_mg" if online_mg else f"phase2_fixed_{model_type}"))
+        prerequisites.append(require_gate(fixed_screen_dir, f"phase4_fixed_{model_type}_autoregressive_prefix_mg" if online_mg else f"phase2_fixed_{model_type}"))
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     config = copy.deepcopy(config)
@@ -943,9 +951,13 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     if online_mg and not smoke:
         baseline_path = Path(fixed_screen_dir) / "config_used.yaml"
         baseline = yaml.safe_load(baseline_path.read_text())
-        # The time Fourier scale is unused by the spatial-only decoder.
-        current_options = {k: v for k, v in config["physics_test"]["cvit"].items() if k != "fourier_freq_t"}
-        baseline_options = {k: v for k, v in baseline["physics_test"]["cvit"].items() if k != "fourier_freq_t"}
+        if model_type == "cvit":
+            # The time Fourier scale is unused by the spatial-only decoder.
+            current_options = {k: v for k, v in config["physics_test"]["cvit"].items() if k != "fourier_freq_t"}
+            baseline_options = {k: v for k, v in baseline["physics_test"]["cvit"].items() if k != "fourier_freq_t"}
+        else:
+            current_options = config["model"]["parameters"]
+            baseline_options = baseline["model"]["parameters"]
         if current_options != baseline_options or config["physics_test"]["mg"]["solver"] != baseline["physics_test"]["mg"]["solver"]:
             raise ValueError("Online MG must reuse the passing fixed-case architecture and MG settings")
         baseline_protocol = baseline["physics_test"]["protocol"]
@@ -1010,7 +1022,7 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         prefix_horizon=pino["prefix_steps"] * inputs["dt"] if mode in {"space_time", "autoregressive"} else None,
         total_solver_steps=int(round(inputs["t_final"] / inputs["dt"])),
         temporal_gradient_policy="detached_current_state_input_and_residual; mean_step_loss_gradients" if mode == "autoregressive" else "full_prefix_graph; spatial_exact alone detaches previous states" if mode == "space_time" else "detached_previous_state",
-        input_encoding="current_state_and_exact_interval_average_flux_xy_decoder" if mode == "autoregressive" else "full_horizon_forcing_tokens_and_IC_query_time_cond" if model_type == "fno" else "full_horizon_forcing_image_and_IC_coordinate_time_decoder",
+        input_encoding=("current_state_and_exact_interval_average_flux_FNO_tokens" if model_type == "fno" else "current_state_and_exact_interval_average_flux_xy_decoder") if mode == "autoregressive" else "full_horizon_forcing_tokens_and_IC_query_time_cond" if model_type == "fno" else "full_horizon_forcing_image_and_IC_coordinate_time_decoder",
         preconditioner="one_Torch_geometric_MG_V_cycle" if mg_only else "cached_exact_spatial_CN_inverse" if mode == "autoregressive" else "exact_CN_inverse",
         mg_settings=config["physics_test"].get("mg") if mg_only else None,
         historical_exact_metrics=historical,
@@ -1037,7 +1049,7 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         baseline_protocol = baseline_config["physics_test"]["protocol"]
         protocol = config["physics_test"]["protocol"]
         for key in ("normalization", "prescribed_input_sha256", "grid", "dt", "horizon", "ramp_seconds",
-                    "validation_ids", "resolved_cvit_kwargs", "prefix_steps", "stream_sha256"):
+                    "validation_ids", "resolved_cvit_kwargs", "resolved_fno_dims", "prefix_steps", "stream_sha256"):
             if protocol[key] != baseline_protocol[key]:
                 raise ValueError(f"MG/exact comparison requires identical {key}")
         for name in source_paths:
@@ -1101,10 +1113,12 @@ def write_development_pairs(output, config, histories):
 
 def finish_screen(config, metrics, histories, output, protocol_sha):
     pino = config["physics_test"]["pino"]
+    model_type = config["physics_test"].get("model_type", "cvit")
     if config["physics_test"]["stage"] == "online" and pino.get("online_sampling") == "per_update":
         progress = metrics["mg"]
         completed = progress["successful_updates"] == pino["online_updates"] and not progress["pending_validation"]
-        summary = dict(stage="phase1_smoke" if config["physics_test"]["smoke"] else "phase3_online_cvit_autoregressive_mg",
+        summary = dict(stage="phase1_smoke" if config["physics_test"]["smoke"] else f"phase3_online_{model_type}_autoregressive_mg",
+                       model_type=model_type,
                        status="complete" if completed else "interrupted", protocol_sha256=protocol_sha,
                        successful_updates=progress["successful_updates"], registered_updates=pino["online_updates"],
                        accuracy_gate_applied=False, scientific_evidence=not config["physics_test"]["smoke"],
@@ -1143,7 +1157,7 @@ def finish_screen(config, metrics, histories, output, protocol_sha):
     if prefix_only:
         stage_name += "_autoregressive_prefix" if autoregressive else "_prefix"
     if candidate == "mg":
-        stage_name = "phase4_fixed_cvit_autoregressive_prefix_mg"
+        stage_name = f"phase4_fixed_{model_type}_autoregressive_prefix_mg"
     summary = dict(stage="phase1_smoke" if config["physics_test"]["smoke"] else stage_name,
                    model_type=model_type,
                    residual_mode=pino.get("residual_mode", "one_step"),

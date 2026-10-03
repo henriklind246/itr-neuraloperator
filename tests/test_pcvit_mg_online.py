@@ -16,13 +16,14 @@ from scripts.run_train_pino import result_exit_code
 from scripts.run_train_fixed import _apply_override, _parse_override_value
 from src.operators.cvit import ForcingICCViT
 from src.operators.soap import SOAP
+from src.operators.train import load_config
 from src.physics.fv_preconditioner import MGOneCycleInverse
 from src.physics.init_conditions import IC_FAMILIES
 from tests.test_cvit_pino import config, prescribed_inputs, save_inputs
 
 
-def online_config(updates=4):
-    cfg = config(residual_mode='mg')
+def online_config(updates=4, model_type="cvit"):
+    cfg = config(model_type, residual_mode='mg')
     cfg['physics_test']['cvit']['fourier_freq'] = 20
     cfg['physics_test']['pino'].update(online_sampling='per_update', compact_metrics=True,
         online_updates=updates, online_validate_every=2, full_validate_every=4,
@@ -206,14 +207,18 @@ def test_validation_cadence_and_independent_rmse(online_inputs, tmp_path, monkey
 
 
 @pytest.mark.parametrize('interruption', ['training', 'validation', 'prefix_validation', 'validation_batch_boundary'])
-def test_signal_resume_matches_uninterrupted_and_reuses_reference_cache(interruption, online_inputs, tmp_path, monkeypatch):
-    cfg = online_config(4)
+@pytest.mark.parametrize('model_type,optimizer_name', [('cvit', 'Adam'), ('fno', 'SOAP')])
+def test_signal_resume_matches_uninterrupted_and_reuses_reference_cache(interruption, model_type, optimizer_name, online_inputs, tmp_path, monkeypatch):
+    cfg = online_config(4, model_type)
+    cfg['training']['optimizer'] = optimizer_name
+    (online_inputs[3][1] / 'final_metrics.json').write_text(json.dumps(dict(
+        stage=f'phase4_fixed_{model_type}_autoregressive_prefix_mg', passed=True)))
     if interruption == 'validation_batch_boundary':
         cfg['physics_test']['pino']['validation_batch_size'] = 2
     baseline, restarted = tmp_path / 'baseline', tmp_path / 'restarted'
     run_online(cfg, online_inputs, baseline)
     triggered, validation_calls = [], []
-    original = pino.autoregressive_backward if interruption == 'training' else pino.decode_grid
+    original = pino.autoregressive_backward if interruption == 'training' else pino.autoregressive_step
     def interrupt(*args):
         result = original(*args)
         if not torch.is_grad_enabled():
@@ -223,7 +228,7 @@ def test_signal_resume_matches_uninterrupted_and_reuses_reference_cache(interrup
             triggered.append(True)
             os.kill(os.getpid(), signal.SIGUSR1)
         return result
-    name = 'autoregressive_backward' if interruption == 'training' else 'decode_grid'
+    name = 'autoregressive_backward' if interruption == 'training' else 'autoregressive_step'
     prior_handler = signal.getsignal(signal.SIGUSR1)
     monkeypatch.setattr(pino, name, interrupt)
     result = run_online(cfg, online_inputs, restarted)
@@ -285,6 +290,27 @@ def test_prerequisites_and_checkpoint_before_each_validation(online_inputs, tmp_
     assert not (tmp_path / 'blocked').exists()
 
 
+def test_fno_online_requires_matching_fno_fixed_gate(online_inputs, tmp_path):
+    inputs, data, normalization, gates = online_inputs
+    cfg = online_config(model_type='fno')
+    with pytest.raises(ValueError, match='phase4_fixed_fno'):
+        run_online(cfg, online_inputs, tmp_path / 'wrong_model')
+    assert not (tmp_path / 'wrong_model').exists()
+    (gates[1] / 'final_metrics.json').write_text(json.dumps(
+        dict(stage='phase4_fixed_fno_autoregressive_prefix_mg', passed=True)))
+    baseline = copy.deepcopy(cfg)
+    baseline['model']['parameters']['width'] *= 2
+    (gates[1] / 'config_used.yaml').write_text(yaml.safe_dump(baseline))
+    with pytest.raises(ValueError, match='architecture and MG settings'):
+        pino.run_screen(cfg, data, tmp_path / 'wrong_architecture', gates[0],
+                        'online', gates[1], normalization, smoke=False)
+    fixed = copy.deepcopy(cfg)
+    fixed['physics_test']['pino']['online_sampling'] = 'precomputed'
+    with pytest.raises(ValueError, match='100x100 grid'):
+        pino.run_screen(fixed, data, tmp_path / 'fixed_fno', gates[0],
+                        normalization_path=normalization, smoke=False)
+
+
 def test_throughput_windows_and_remaining_validation_cost():
     cfg = online_config(10000)['physics_test']['pino']
     cfg.update(online_validate_every=500, full_validate_every=1000)
@@ -317,11 +343,11 @@ def test_runtime_diagnostics_saved_at_50_and_100(online_inputs, tmp_path, monkey
     assert all(r['validation_wall_seconds']['full'] > r['validation_wall_seconds']['prefix'] > 0 for r in reports)
 
 
-def test_launcher_resources_overrides_and_resume(tmp_path):
+def test_launcher_resources_overrides_and_resume(tmp_path, monkeypatch):
     script = Path('slurm/train_pcvit_mg_msi.sbatch').resolve()
     subprocess.run(['bash', '-n', script], check=True)
     text = script.read_text()
-    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=18:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
+    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=09:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
         assert directive in text
     project = tmp_path / 'project with spaces'
     project.mkdir()
@@ -329,7 +355,15 @@ def test_launcher_resources_overrides_and_resume(tmp_path):
     prologue = '''module() { :; }
 conda() { :; }
 nvidia-smi() { :; }
-srun() { printf '%s\\0' "$@" > "$CAPTURE"; }
+srun() {
+    for arg in "$@"; do
+        if [[ "$arg" == fixed ]]; then
+            printf '%s\\0' "$@" > "$CAPTURE.fixed"
+            return "${FIXED_EXIT_CODE:-0}"
+        fi
+    done
+    printf '%s\\0' "$@" > "$CAPTURE"
+}
 export -f module conda nvidia-smi srun
 exec bash "$LAUNCHER"
 '''
@@ -339,20 +373,32 @@ exec bash "$LAUNCHER"
     env.pop('RESUME_RUN_DIR', None)
     subprocess.run(['bash', '-c', prologue], env=env, check=True, capture_output=True)
     args = capture.read_bytes().decode().strip('\0').split('\0')
+    fixed_args = Path(str(capture) + '.fixed').read_bytes().decode().strip('\0').split('\0')
+    fixed_overrides = dict(arg.split('=', 1) for arg in fixed_args if '=' in arg)
+    assert fixed_overrides['physics_test.pino.fixed_updates'] == '1000'
+    assert fixed_overrides['physics_test.pino.online_sampling'] == 'precomputed'
+    assert fixed_args[fixed_args.index('--output-dir') + 1] == args[args.index('--fixed-screen-dir') + 1]
     assert args[:3] == ['python', '-u', 'scripts/run_train_pino.py']
     assert args[args.index('--data-dir') + 1] == str(project / 'data/physics_test_single_development_20261001')
     overrides = dict(arg.split('=', 1) for arg in args if '=' in arg)
+    for key in ('physics_test.model_type', 'physics_test.pino.prefix_steps', 'training.optimizer',
+                'model.parameters.forcing_spatial_mode', 'model.parameters.forcing_cond_mode'):
+        assert fixed_overrides[key] == overrides[key]
     assert overrides['physics_test.pino.online_updates'] == '10000'
     assert overrides['physics_test.pino.validation_cases'] == '128'
     assert overrides['physics_test.pino.validation_batch_size'] == '8'
     assert overrides['physics_test.pino.prefix_steps'] == '20'
-    assert overrides['physics_test.pino.allocation_seconds'] == '64800'
-    assert overrides['physics_test.cvit.fourier_freq'] == '20'
+    assert overrides['physics_test.pino.allocation_seconds'] == '32400'
+    assert overrides['physics_test.model_type'] == 'fno'
+    assert overrides['model.parameters.forcing_spatial_mode'] == 'boundary_extender'
+    assert overrides['model.parameters.forcing_cond_mode'] == 'spatial_only'
     assert _parse_override_value(overrides['physics_test.pino.controls']) == ['mg']
-    cfg = online_config()
+    monkeypatch.setenv('BENCHMARK', 'diffusion_forcing_single')
+    monkeypatch.setenv('REPRESENTATION', 'temporal_encoder')
+    cfg = load_config()
     for key, value in overrides.items():
         _apply_override(cfg, key, _parse_override_value(value))
-    model = pino.build_cvit(cfg, prescribed_inputs()[0], torch.device('cpu'))
+    model = pino.build_screen_model(cfg, prescribed_inputs()[0], torch.device('cpu'))
     optimizer = pino.build_optimizer(cfg, model.parameters())
     assert isinstance(optimizer, SOAP)
     assert optimizer.param_groups[0]['betas'] == (0.95, 0.95)
@@ -363,6 +409,10 @@ exec bash "$LAUNCHER"
     assert scheduler.lr_for_update(0) == pytest.approx(1e-3)
     assert scheduler.lr_for_update(5000) == pytest.approx(1e-3 * 0.9 ** 20)
     assert scheduler.lr_for_update(10000) == pytest.approx(1e-3 * 0.9 ** 40)
+    capture.unlink()
+    failed = subprocess.run(['bash', '-c', prologue], env=dict(env, FIXED_EXIT_CODE='2'), capture_output=True)
+    assert failed.returncode == 2
+    assert not capture.exists()
     env['RESUME_RUN_DIR'] = str(tmp_path / 'resume with spaces')
     subprocess.run(['bash', '-c', prologue], env=env, check=True, capture_output=True)
     args = capture.read_bytes().decode().strip('\0').split('\0')

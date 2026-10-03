@@ -18,7 +18,7 @@ from src.operators.train_pino import (
     decode_grid, freeze_development_normalization, load_pino_inputs,
     make_boundary, matched_stream, require_gate, run_screen, anchored_previous,
     prefix_cn_objective, development_references,
-    step_forcing_image, evaluation_query_times,
+    step_forcing_image, evaluation_query_times, autoregressive_step,
 )
 from src.physics.boundary_forcing import reconstruct_qL
 from src.physics.fv_preconditioner import ExactCNInverse
@@ -53,6 +53,9 @@ def config(model_type='cvit', residual_mode='one_step'):
                     cond_hidden=16, temporal_hidden=8, forcing_embed_dim=8,
                     forcing_spatial_dim=2, padding_mode='replicate',
                     cin_exclude_padding=True, hard_right_dirichlet=True)
+        if residual_mode in {"autoregressive", "mg"}:
+            cfg["model"]["parameters"].update(forcing_spatial_mode="boundary_extender",
+                forcing_cond_mode="spatial_only", forcing_extender_heads=2, forcing_extender_grid_size=4)
     return cfg
 
 
@@ -250,7 +253,7 @@ def test_development_normalization_excludes_validation_and_test(tmp_path):
 
 
 @pytest.mark.parametrize('model_type,residual_mode', [('cvit','one_step'),('fno','one_step'),
-    ('cvit','space_time'),('fno','space_time'),('cvit','autoregressive'),('cvit','mg')])
+    ('cvit','space_time'),('fno','space_time'),('cvit','autoregressive'),('cvit','mg'),('fno','autoregressive'),('fno','mg')])
 def test_two_update_end_to_end_smoke_cannot_open_a_later_gate(tmp_path, model_type, residual_mode):
     inputs,_ = prescribed_inputs()
     data = tmp_path/'data'
@@ -269,7 +272,9 @@ def test_two_update_end_to_end_smoke_cannot_open_a_later_gate(tmp_path, model_ty
         assert frozen['physics_test']['protocol']['resolved_cvit_kwargs']['ic_grid_size'] == [4,4]
     else:
         assert frozen['physics_test']['protocol']['resolved_fno_dims']['in_channels'] == 4
-        assert frozen['physics_test']['protocol']['input_encoding'] == 'full_horizon_forcing_tokens_and_IC_query_time_cond'
+        assert frozen['physics_test']['protocol']['input_encoding'] == (
+            'current_state_and_exact_interval_average_flux_FNO_tokens' if residual_mode in {'autoregressive', 'mg'}
+            else 'full_horizon_forcing_tokens_and_IC_query_time_cond')
     assert result['stage'] == 'phase1_smoke'
     assert not result['passed']
     for objective in config(model_type,residual_mode)['physics_test']['pino']['controls']:
@@ -285,13 +290,14 @@ def test_two_update_end_to_end_smoke_cannot_open_a_later_gate(tmp_path, model_ty
         assert not (output/'raw').exists()
         assert not result['raw_comparison_performed']
         assert result['full_horizon_gate'] is None
-        assert not frozen['physics_test']['protocol']['resolved_cvit_kwargs']['use_time_query']
+        if model_type == 'cvit':
+            assert not frozen['physics_test']['protocol']['resolved_cvit_kwargs']['use_time_query']
     with pytest.raises(ValueError,match='did not pass'):
         require_gate(output,'phase2_fixed_cvit')
 
 
 @pytest.mark.parametrize('model_type,residual_mode', [('cvit','one_step'),('fno','one_step'),
-    ('cvit','space_time'),('fno','space_time'),('cvit','autoregressive'),('cvit','mg')])
+    ('cvit','space_time'),('fno','space_time'),('cvit','autoregressive'),('cvit','mg'),('fno','autoregressive'),('fno','mg')])
 def test_interrupted_screen_resume_replays_identical_updates(tmp_path,monkeypatch, model_type, residual_mode):
     import src.operators.train_pino as pino
     inputs,_ = prescribed_inputs()
@@ -429,11 +435,12 @@ def test_step_forcing_image_is_the_exact_local_cn_integral(interval):
     assert evaluation_query_times(cfg,inputs)==[0,.005,.01]
 
 
-def test_time_step_loss_and_parameter_gradients_match_cn_targets_for_each_current_state():
-    cfg=config(residual_mode='autoregressive')
+@pytest.mark.parametrize('model_type', ['cvit', 'fno'])
+def test_time_step_loss_and_parameter_gradients_match_cn_targets_for_each_current_state(model_type):
+    cfg=config(model_type, residual_mode='autoregressive')
     inputs,setup=prescribed_inputs()
     params=inputs['params'][:1].tolist()
-    model=build_cvit(cfg,inputs,torch.device('cpu')).double()
+    model=build_screen_model(cfg,inputs,torch.device('cpu')).double()
     _,state=model_inputs(params,cfg,inputs,torch.device('cpu'))
     state=state.double()
     X,Y=np.meshgrid(inputs['x'],inputs['y'],indexing='ij')
@@ -444,8 +451,7 @@ def test_time_step_loss_and_parameter_gradients_match_cn_targets_for_each_curren
     losses,direct=[],[]
     for n in range(2):
         previous=state.detach()
-        forcing=step_forcing_image(params,[n],cfg,inputs,torch.device('cpu'),torch.float64)
-        state=decode_grid(model,model.encode(forcing,previous[:,None]),coords,None,4,4,5)
+        state=autoregressive_step(model,previous,params,[n],cfg,inputs,coords)
         bc=make_boundary(params,[n],inputs,torch.device('cpu'),torch.float64)
         loss,_,_=cn_objective(previous,state,geom,bc,inverse,'exact')
         target=solver.cn_step(previous[0].numpy()*10+295,n*.005)
@@ -461,9 +467,10 @@ def test_time_step_loss_and_parameter_gradients_match_cn_targets_for_each_curren
         torch.testing.assert_close(a,b,rtol=1e-10,atol=1e-11)
 
 
-def test_autoregressive_training_reencodes_detached_model_predictions(tmp_path,monkeypatch):
+@pytest.mark.parametrize('model_type', ['cvit', 'fno'])
+def test_autoregressive_training_reencodes_detached_model_predictions(tmp_path,monkeypatch,model_type):
     import src.operators.train_pino as pino
-    cfg=config(residual_mode='autoregressive')
+    cfg=config(model_type, residual_mode='autoregressive')
     inputs,_=prescribed_inputs()
     data=tmp_path/'data'
     data.mkdir()
@@ -472,21 +479,16 @@ def test_autoregressive_training_reencodes_detached_model_predictions(tmp_path,m
     phase0.mkdir()
     (phase0/'final_metrics.json').write_text(json.dumps(dict(stage='phase0_direct_state',passed=True)))
     encoded,decoded=[],[]
-    original_encode=ForcingICCViT.encode
-    original_decode=pino.decode_grid
-    def capture_encode(self,forcing,state):
+    original_step=pino.autoregressive_step
+    def capture_step(model,state,*args):
         if torch.is_grad_enabled():
             assert not state.requires_grad
-            encoded.append(state[:,0].clone())
-        return original_encode(self,forcing,state)
-    def capture_decode(model,latent,coords,times,*args):
-        result=original_decode(model,latent,coords,times,*args)
+            encoded.append(state.clone())
+        result=original_step(model,state,*args)
         if torch.is_grad_enabled():
-            assert times is None
             decoded.append(result.detach().clone())
         return result
-    monkeypatch.setattr(ForcingICCViT,'encode',capture_encode)
-    monkeypatch.setattr(pino,'decode_grid',capture_decode)
+    monkeypatch.setattr(pino,'autoregressive_step',capture_step)
     output=tmp_path/'screen'
     run_screen(cfg,data,output,phase0,normalization_path=normalization,smoke=True)
     assert len(encoded)==len(decoded)==4
@@ -494,6 +496,28 @@ def test_autoregressive_training_reencodes_detached_model_predictions(tmp_path,m
     torch.testing.assert_close(encoded[3],decoded[2],rtol=0,atol=0)
     torch.testing.assert_close(encoded[0],encoded[2],rtol=0,atol=0)
     assert not (output/'raw').exists()
+
+
+def test_fno_step_uses_boundary_extension_and_preserves_hard_wall():
+    torch.manual_seed(42)
+    cfg = config('fno', residual_mode='mg')
+    inputs, _ = prescribed_inputs()
+    params = inputs['params'][:1].tolist()
+    model = build_screen_model(cfg, inputs, torch.device('cpu'))
+    _, state = model_inputs(params, cfg, inputs, torch.device('cpu'))
+    x, y = np.meshgrid(inputs['x'], inputs['y'], indexing='ij')
+    coords = torch.tensor(np.stack([x, y], axis=-1).reshape(1, -1, 2), dtype=state.dtype)
+    predicted = autoregressive_step(model, state, params, [0], cfg, inputs, coords)
+    torch.testing.assert_close(predicted[:, -1], torch.full_like(predicted[:, -1], .5), rtol=0, atol=0)
+    assert not model._forcing_to_cond
+    predicted[:, :-1].square().mean().backward()
+    for branch in (model.temporal_encoder, model.boundary_extender, model.spectral_layers):
+        grads = [p.grad for p in branch.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+        assert sum(g.abs().sum().item() for g in grads) > 0
+    cfg['model']['parameters']['hard_right_dirichlet'] = False
+    with pytest.raises(ValueError, match='hard_right_dirichlet=true'):
+        build_screen_model(cfg, inputs, torch.device('cpu'))
 
 
 def test_exact_only_gate_checks_prefix_and_first_step_without_a_raw_comparison():
