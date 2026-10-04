@@ -203,12 +203,11 @@ def make_boundary(params, intervals, inputs, device, dtype):
         qL_n=qn, qL_np1=qnext, qL_int=integral)
 
 
-def step_forcing_image(params, intervals, config, inputs, device, dtype):
+def step_forcing_profile(params, intervals, config, inputs, device, dtype):
     """Exact interval-average flux; fixed-dt CN needs no other time descriptor."""
-    height, width = config["physics_test"]["cvit"]["forcing_grid_size"]
-    boundary = make_boundary(params, intervals, dict(inputs, y=np.linspace(0, 1, height)), device, dtype)
+    boundary = make_boundary(params, intervals, inputs, device, dtype)
     average = boundary.qL_int / (inputs["dt"] * config["physics_test"]["pino"]["forcing_a_ref"])
-    return average[:, None, :, None].expand(-1, 1, -1, width).contiguous()
+    return average
 
 
 def autoregressive_step(model, state, params, intervals, config, inputs, coords):
@@ -217,7 +216,7 @@ def autoregressive_step(model, state, params, intervals, config, inputs, coords)
         average = boundary.qL_int / (inputs["dt"] * config["physics_test"]["pino"]["forcing_a_ref"])
         fields = inputs["spec"].build_step_inputs(state, coords, average, inputs["dt"], inputs["t_final"])
         return model(**fields)[..., 0]
-    forcing = step_forcing_image(params, intervals, config, inputs, state.device, state.dtype)
+    forcing = step_forcing_profile(params, intervals, config, inputs, state.device, state.dtype)
     latent = model.encode(forcing, state[:, None])
     return decode_grid(model, latent, coords, None, *state.shape[-2:],
                        config["physics_test"]["pino"]["query_chunk_size"])
@@ -1022,7 +1021,7 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         prefix_horizon=pino["prefix_steps"] * inputs["dt"] if mode in {"space_time", "autoregressive"} else None,
         total_solver_steps=int(round(inputs["t_final"] / inputs["dt"])),
         temporal_gradient_policy="detached_current_state_input_and_residual; mean_step_loss_gradients" if mode == "autoregressive" else "full_prefix_graph; spatial_exact alone detaches previous states" if mode == "space_time" else "detached_previous_state",
-        input_encoding=("current_state_and_exact_interval_average_flux_FNO_tokens" if model_type == "fno" else "current_state_and_exact_interval_average_flux_xy_decoder") if mode == "autoregressive" else "full_horizon_forcing_tokens_and_IC_query_time_cond" if model_type == "fno" else "full_horizon_forcing_image_and_IC_coordinate_time_decoder",
+        input_encoding=("current_state_and_exact_interval_average_flux_FNO_tokens" if model_type == "fno" else "current_state_and_exact_interval_average_flux_MLP_tokens_xy_decoder") if mode == "autoregressive" else "full_horizon_forcing_tokens_and_IC_query_time_cond" if model_type == "fno" else "full_horizon_forcing_image_and_IC_coordinate_time_decoder",
         preconditioner="one_Torch_geometric_MG_V_cycle" if mg_only else "cached_exact_spatial_CN_inverse" if mode == "autoregressive" else "exact_CN_inverse",
         mg_settings=config["physics_test"].get("mg") if mg_only else None,
         historical_exact_metrics=historical,

@@ -39,6 +39,7 @@ physics_test:
     ic_patch_size: 10
     forcing_patch_size: 8
     forcing_grid_size: [96, 128]
+    forcing_num_tokens: 4
     fourier_freq: 1.0
     fourier_freq_t: null
     activation: gelu

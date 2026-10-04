@@ -18,7 +18,7 @@ from src.operators.train_pino import (
     decode_grid, freeze_development_normalization, load_pino_inputs,
     make_boundary, matched_stream, require_gate, run_screen, anchored_previous,
     prefix_cn_objective, development_references,
-    step_forcing_image, evaluation_query_times, autoregressive_step,
+    step_forcing_profile, evaluation_query_times, autoregressive_step,
 )
 from src.physics.boundary_forcing import reconstruct_qL
 from src.physics.fv_preconditioner import ExactCNInverse
@@ -407,10 +407,11 @@ def test_time_step_decoder_uses_current_state_and_spatial_queries_only():
     model=build_cvit(cfg,inputs,torch.device('cpu'))
     forcing,ic=model_inputs(params,cfg,inputs,torch.device('cpu'))
     assert forcing is None
-    forcing=step_forcing_image(params,[0],cfg,inputs,torch.device('cpu'),ic.dtype)
+    forcing=step_forcing_profile(params,[0],cfg,inputs,torch.device('cpu'),ic.dtype)
     coords=torch.rand(1,16,2)
     coords[:,-4:,0]=1
     latent=model.encode(forcing,ic[:,None])
+    assert latent.shape == (1, model.num_ic_tokens + 4, 16)
     full=decode_grid(model,latent,coords,None,4,4,16)
     chunked=decode_grid(model,latent,coords,None,4,4,3)
     torch.testing.assert_close(full,chunked)
@@ -419,20 +420,106 @@ def test_time_step_decoder_uses_current_state_and_spatial_queries_only():
     assert not torch.allclose(full,decode_grid(model,other,coords,None,4,4,16))
     assert not any('time_film' in n or 'fourier_t' in n for n,_ in model.named_parameters())
     full.square().mean().backward()
-    assert model.forcing_encoder.patch_embed.proj.weight.grad.abs().sum()>0
+    assert model.forcing_encoder.net[0].weight.grad.abs().sum()>0
     assert model.ic_encoder.patch_embed.proj.weight.grad.abs().sum()>0
 
 
 @pytest.mark.parametrize('interval',[0,1,3,39,40,50])
-def test_step_forcing_image_is_the_exact_local_cn_integral(interval):
+def test_step_forcing_profile_is_the_exact_local_cn_integral(interval):
     cfg=config(residual_mode='autoregressive')
     inputs,_=prescribed_inputs()
     params=inputs['params'][:2].tolist()
-    image=step_forcing_image(params,[interval]*2,cfg,inputs,torch.device('cpu'),torch.float64)
+    profile=step_forcing_profile(params,[interval]*2,cfg,inputs,torch.device('cpu'),torch.float64)
     bc=make_boundary(params,[interval]*2,inputs,torch.device('cpu'),torch.float64)
     expected=bc.qL_int/(300*inputs['dt'])
-    torch.testing.assert_close(image[:,0],expected[:,:,None].expand(-1,-1,8),rtol=1e-12,atol=1e-12)
+    assert profile.shape == (2, len(inputs['y']))
+    torch.testing.assert_close(profile,expected,rtol=1e-12,atol=1e-12)
     assert evaluation_query_times(cfg,inputs)==[0,.005,.01]
+
+
+@pytest.mark.parametrize('num_tokens', [1, 4, 8])
+def test_step_forcing_tokens_preserve_amplitude_sign_and_spatial_location(num_tokens):
+    torch.manual_seed(42)
+    cfg = config(residual_mode='autoregressive')
+    cfg['physics_test']['cvit']['forcing_num_tokens'] = num_tokens
+    inputs, _ = prescribed_inputs()
+    model = build_cvit(cfg, inputs, torch.device('cpu')).double()
+    profiles = torch.tensor([[0., 0., 0., 0.], [.5, .5, .5, .5],
+                             [1., 1., 1., 1.], [-1., -1., -1., -1.],
+                             [1., 0., 0., 0.], [0., 0., 0., 1.]],
+                            dtype=torch.float64, requires_grad=True)
+    state = torch.zeros(6, 1, 4, 4, dtype=torch.float64)
+    coords = torch.tensor([[[0., 0.], [0., 1.], [.5, .5], [1., .5]]], dtype=torch.float64)
+    latent = model.encode(profiles, state)
+    assert latent.shape == (6, model.num_ic_tokens + num_tokens, 16)
+    prediction = model.decode(latent, coords)
+    for a, b in ((0, 1), (1, 2), (2, 3), (4, 5)):
+        assert not torch.allclose(latent[a, :num_tokens], latent[b, :num_tokens])
+        assert not torch.allclose(prediction[a, :-1], prediction[b, :-1])
+    torch.testing.assert_close(prediction[:, -1], torch.full((6, 1), .5, dtype=torch.float64))
+    prediction[:, :-1].square().sum().backward()
+    assert torch.isfinite(profiles.grad).all()
+    assert (profiles.grad.abs() > 1e-10).all()
+    for parameter in model.forcing_encoder.parameters():
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
+
+
+def test_step_forcing_profile_keeps_all_solver_nodes_and_signed_spatial_flux():
+    cfg = config(residual_mode='autoregressive')
+    inputs, _ = prescribed_inputs(n=10)
+    params = copy.deepcopy(inputs['params'][:2].tolist())
+    for p, center, amplitude in zip(params, [.2, .8], [200., -200.]):
+        p.update(spatial_family='gaussian', spatial_params=dict(y_c=center, sigma_y=.1),
+                 temporal_family='pulse_train',
+                 temporal_params=dict(A_list=[amplitude], t_list=[0.], dt_list=[.1]))
+    profile = step_forcing_profile(params, [3, 3], cfg, inputs, torch.device('cpu'), torch.float64)
+    boundary = make_boundary(params, [3, 3], inputs, torch.device('cpu'), torch.float64)
+    assert profile.shape == (2, 10)
+    torch.testing.assert_close(profile, boundary.qL_int / (300 * inputs['dt']), rtol=1e-12, atol=1e-12)
+    assert profile[0].max() > 0 and profile[1].min() < 0
+    assert profile[0].argmax() == 2 and profile[1].argmin() == 7
+
+
+def test_step_forcing_token_count_must_be_positive():
+    with pytest.raises(ValueError, match='forcing_num_tokens'):
+        ForcingICCViT(use_time_query=False, forcing_num_tokens=0)
+
+
+def test_mlp_forcing_learns_cn_response_at_unseen_amplitudes():
+    torch.manual_seed(42)
+    cfg = config(residual_mode='autoregressive')
+    inputs, setup = prescribed_inputs()
+    model = build_cvit(cfg, inputs, torch.device('cpu'))
+    xy = np.stack(np.meshgrid(inputs['x'], inputs['y'], indexing='ij'), axis=-1)
+    coords = torch.tensor(xy.reshape(1, -1, 2), dtype=torch.float32)
+    params = copy.deepcopy(inputs['params'][0])
+    params.update(T0=np.full((4, 4), 300.), spatial_family='uniform', spatial_params={},
+                  temporal_family='pulse_train',
+                  temporal_params=dict(A_list=[300.], t_list=[0.], dt_list=[.1]))
+    solver = inputs['spec'].configure_solver(params, setup['base_kwargs'])
+    response = torch.tensor((solver.cn_step(params['T0'], .015) - 300) / 10,
+                            dtype=torch.float32).reshape(1, -1, 1)
+    amplitudes = torch.tensor([-1., -.5, 0., .5, 1.])
+    profiles = amplitudes[:, None].expand(-1, 4)
+    state = torch.full((5, 1, 4, 4), .5)
+    targets = .5 + amplitudes[:, None, None] * response
+    optimizer = torch.optim.Adam(model.parameters(), lr=.003)
+    for _ in range(200):
+        loss = (model(profiles, state, coords) - targets).square().mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    with torch.no_grad():
+        held_out = torch.tensor([-.75, -.25, .25, .75])
+        prediction = model(held_out[:, None].expand(-1, 4), state[:4], coords)
+        expected = .5 + held_out[:, None, None] * response
+        # Scale by the forcing-induced temperature change, not the 300 K baseline.
+        relative_error = (prediction - expected).norm() / (expected - .5).norm()
+        response_error = ((prediction[-1] - prediction[0]) -
+                          (expected[-1] - expected[0])).norm() / (expected[-1] - expected[0]).norm()
+    assert relative_error < .08
+    assert response_error < .08
 
 
 @pytest.mark.parametrize('model_type', ['cvit', 'fno'])

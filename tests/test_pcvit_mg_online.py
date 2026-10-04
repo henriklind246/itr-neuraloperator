@@ -347,7 +347,7 @@ def test_launcher_resources_overrides_and_resume(tmp_path, monkeypatch):
     script = Path('slurm/train_pcvit_mg_msi.sbatch').resolve()
     subprocess.run(['bash', '-n', script], check=True)
     text = script.read_text()
-    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=09:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
+    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=03:00:00', '--cpus-per-task=4', '--mem=32G', '--signal=USR1@120']:
         assert directive in text
     project = tmp_path / 'project with spaces'
     project.mkdir()
@@ -382,23 +382,26 @@ exec bash "$LAUNCHER"
     assert args[args.index('--data-dir') + 1] == str(project / 'data/physics_test_single_development_20261001')
     overrides = dict(arg.split('=', 1) for arg in args if '=' in arg)
     for key in ('physics_test.model_type', 'physics_test.pino.prefix_steps', 'training.optimizer',
-                'model.parameters.forcing_spatial_mode', 'model.parameters.forcing_cond_mode'):
+                'physics_test.cvit.forcing_num_tokens', 'physics_test.cvit.hard_right_dirichlet'):
         assert fixed_overrides[key] == overrides[key]
-    assert overrides['physics_test.pino.online_updates'] == '10000'
+    assert overrides['physics_test.pino.online_updates'] == '5000'
     assert overrides['physics_test.pino.validation_cases'] == '128'
     assert overrides['physics_test.pino.validation_batch_size'] == '8'
     assert overrides['physics_test.pino.prefix_steps'] == '20'
-    assert overrides['physics_test.pino.allocation_seconds'] == '32400'
-    assert overrides['physics_test.model_type'] == 'fno'
-    assert overrides['model.parameters.forcing_spatial_mode'] == 'boundary_extender'
-    assert overrides['model.parameters.forcing_cond_mode'] == 'spatial_only'
+    assert overrides['physics_test.pino.allocation_seconds'] == '10800'
+    assert overrides['physics_test.model_type'] == 'cvit'
+    assert overrides['physics_test.cvit.forcing_num_tokens'] == '4'
+    assert 'pcvit_mlp4_mg_soap_prefix20_5k' in args[args.index('--output-dir') + 1]
     assert _parse_override_value(overrides['physics_test.pino.controls']) == ['mg']
     monkeypatch.setenv('BENCHMARK', 'diffusion_forcing_single')
     monkeypatch.setenv('REPRESENTATION', 'temporal_encoder')
     cfg = load_config()
     for key, value in overrides.items():
         _apply_override(cfg, key, _parse_override_value(value))
-    model = pino.build_screen_model(cfg, prescribed_inputs()[0], torch.device('cpu'))
+    model = pino.build_screen_model(cfg, prescribed_inputs(n=20)[0], torch.device('cpu'))
+    assert isinstance(model, ForcingICCViT)
+    assert model.num_forcing_tokens == 4
+    assert model.forcing_encoder.net[0].in_features == 20
     optimizer = pino.build_optimizer(cfg, model.parameters())
     assert isinstance(optimizer, SOAP)
     assert optimizer.param_groups[0]['betas'] == (0.95, 0.95)

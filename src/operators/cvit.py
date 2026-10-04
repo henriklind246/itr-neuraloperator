@@ -362,8 +362,9 @@ class ForcingICCViT(nn.Module):
     not normalize — callers pass ``T0_tilde`` already scaled.
 
     With ``use_time_query=False``, the second branch receives the current state
-    and the forcing image carries one interval's average flux. The decoder then
-    uses only (x,y) to predict the fixed-dt next field.
+    and an MLP maps the interval-average flux profile at all solver y-nodes to
+    ``forcing_num_tokens`` latent tokens. The decoder then uses only (x,y) to
+    predict the fixed-dt next field.
     """
 
     def __init__(
@@ -392,10 +393,12 @@ class ForcingICCViT(nn.Module):
         t_right_tilde: float = 0.0,
         t_final: float = 1.0,
         use_time_query: bool = True,
+        forcing_num_tokens: int = 4,
     ):
         super().__init__()
         dec_emb_dim = int(dec_emb_dim) if dec_emb_dim is not None else int(emb_dim)
         self.hard_right_dirichlet = bool(hard_right_dirichlet)
+        self.use_time_query = bool(use_time_query)
         if int(forcing_in_ch) != 1:
             raise ValueError(
                 "ForcingICCViT requires exactly one forcing-image channel "
@@ -403,15 +406,15 @@ class ForcingICCViT(nn.Module):
             )
         forcing_grid_size = tuple(int(v) for v in forcing_grid_size)
         forcing_patch_size = int(forcing_patch_size)
-        if len(forcing_grid_size) != 2 or forcing_patch_size <= 0 or any(
+        if use_time_query and (len(forcing_grid_size) != 2 or forcing_patch_size <= 0 or any(
             v <= 0 for v in forcing_grid_size
-        ):
+        )):
             raise ValueError(
                 "forcing_grid_size must contain two positive dimensions and "
                 f"forcing_patch_size must be positive; got {forcing_grid_size} "
                 f"and {forcing_patch_size}."
             )
-        if any(v % forcing_patch_size != 0 for v in forcing_grid_size):
+        if use_time_query and any(v % forcing_patch_size != 0 for v in forcing_grid_size):
             raise ValueError(
                 "forcing_grid_size dimensions must be divisible by "
                 f"forcing_patch_size; got {forcing_grid_size} and {forcing_patch_size}."
@@ -439,9 +442,11 @@ class ForcingICCViT(nn.Module):
         self.forcing_patch_size = forcing_patch_size
         self.ic_grid_size = ic_grid_size
         self.ic_patch_size = ic_patch_size
+        if not use_time_query and (not isinstance(forcing_num_tokens, int) or forcing_num_tokens <= 0):
+            raise ValueError("forcing_num_tokens must be a positive integer")
         self.num_forcing_tokens = (
             forcing_grid_size[0] // forcing_patch_size
-        ) * (forcing_grid_size[1] // forcing_patch_size)
+        ) * (forcing_grid_size[1] // forcing_patch_size) if use_time_query else forcing_num_tokens
         self.num_ic_tokens = (
             ic_grid_size[0] // ic_patch_size
         ) * (ic_grid_size[1] // ic_patch_size)
@@ -453,6 +458,12 @@ class ForcingICCViT(nn.Module):
             depth=depth_enc,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
+            activation=activation,
+        ) if use_time_query else MLP(
+            in_dim=ic_grid_size[1],
+            hidden_dim=emb_dim,
+            out_dim=forcing_num_tokens * emb_dim,
+            num_layers=2,
             activation=activation,
         )
         self.ic_encoder = CViTEncoder(
@@ -498,14 +509,15 @@ class ForcingICCViT(nn.Module):
     ) -> torch.Tensor:
         """Build the cached latent token set; ``(B, N_f + N_ic, emb_dim)``.
 
-        u_forcing:(B, 1, Ny_img, Nt_img) boundary space-time image;
+        u_forcing:(B, 1, Ny_img, Nt_img) boundary space-time image, or
+        (B, Ny) normalized interval-average flux for the fixed-dt model;
         u_ic:(B, 1, Nx, Ny) normalized initial field ``T0_tilde``.
         Query-independent, so run once per sim and reuse for every decode.
         """
-        if tuple(u_forcing.shape[1:]) != (1, *self.forcing_grid_size):
+        forcing_shape = (1, *self.forcing_grid_size) if self.use_time_query else (self.ic_grid_size[1],)
+        if tuple(u_forcing.shape[1:]) != forcing_shape:
             raise ValueError(
-                "u_forcing must have shape (B, 1, Ny_img, Nt_img) with "
-                f"(Ny_img, Nt_img)={self.forcing_grid_size}; got "
+                f"u_forcing must have shape (B, {', '.join(map(str, forcing_shape))}); got "
                 f"{tuple(u_forcing.shape)}."
             )
         if tuple(u_ic.shape[1:]) != (1, *self.ic_grid_size):
@@ -513,11 +525,8 @@ class ForcingICCViT(nn.Module):
                 "u_ic must have shape (B, 1, Nx, Ny) with "
                 f"(Nx, Ny)={self.ic_grid_size}; got {tuple(u_ic.shape)}."
             )
-        z_f = self.forcing_encoder(u_forcing) + self.modality[0]
-        if z_f.shape[1] != self.num_forcing_tokens:
-            raise RuntimeError(
-                f"Expected {self.num_forcing_tokens} forcing tokens, got {z_f.shape[1]}."
-            )
+        z_f = self.forcing_encoder(u_forcing).reshape(u_forcing.shape[0], self.num_forcing_tokens, -1)
+        z_f = z_f + self.modality[0]
         z_ic = self.ic_encoder(u_ic) + self.modality[1]
         if z_ic.shape[1] != self.num_ic_tokens:
             raise RuntimeError(
