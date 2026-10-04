@@ -18,12 +18,14 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:?Submit from the project directory or set PROJECT_DIR}}"
 export PROJECT_ROOT="$PROJECT_DIR"
 export DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/physics_test_single_development_20261001}"
+PHASE0_DIR="${PHASE0_DIR:-$PROJECT_DIR/runs/physics_test_phase0_raw_exact_20261001}"
 PHASE4_DIR="${PHASE4_DIR:-$PROJECT_DIR/runs/physics_test_phase4_direct_state_mg_20261002}"
 NORMALIZATION_PATH="${NORMALIZATION_PATH:-$PROJECT_DIR/runs/physics_test_phase4_cvit_autoregressive_mg_prefix5_adam_seed42_20261002/normalization.json}"
 PERSISTENT_RUNS="${PERSISTENT_RUNS:-$HOME/fno_runs}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-pcvit_mlp4_mg_soap_prefix20_5k}"
 RUN_DIR="${RUN_DIR:-$PERSISTENT_RUNS/${EXPERIMENT_NAME}_${SLURM_JOB_ID:?}}"
 FIXED_MG_DIR="${FIXED_MG_DIR:-${RUN_DIR}_fixed}"
+EXACT_SCREEN_DIR="${EXACT_SCREEN_DIR:-${RUN_DIR}_exact_fixed}"
 export BENCHMARK=diffusion_forcing_single
 export REPRESENTATION=temporal_encoder
 export PYTHONUNBUFFERED=1
@@ -39,7 +41,8 @@ cd "$PROJECT_DIR"
 mkdir -p "$PERSISTENT_RUNS"
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_DIR=$PROJECT_DIR DATA_DIR=$DATA_DIR"
-echo "PHASE4_DIR=$PHASE4_DIR FIXED_MG_DIR=$FIXED_MG_DIR NORMALIZATION_PATH=$NORMALIZATION_PATH"
+echo "PHASE0_DIR=$PHASE0_DIR PHASE4_DIR=$PHASE4_DIR"
+echo "EXACT_SCREEN_DIR=$EXACT_SCREEN_DIR FIXED_MG_DIR=$FIXED_MG_DIR NORMALIZATION_PATH=$NORMALIZATION_PATH"
 nvidia-smi
 
 if [[ -n "${RESUME_RUN_DIR:-}" ]]; then
@@ -69,10 +72,20 @@ else
         'physics_test.pino.startup_profile_updates=[50,100]' physics_test.pino.allocation_seconds=10800
     )
     if [[ ! -f "$FIXED_MG_DIR/final_metrics.json" ]]; then
+        if [[ ! -f "$EXACT_SCREEN_DIR/final_metrics.json" ]]; then
+            echo "Running the matching 1000-update PCViT exact-prefix baseline in $EXACT_SCREEN_DIR"
+            srun python -u scripts/run_train_pino.py \
+                --stage fixed --data-dir "$DATA_DIR" --output-dir "$EXACT_SCREEN_DIR" \
+                --phase0-dir "$PHASE0_DIR" --normalization "$NORMALIZATION_PATH" \
+                "${overrides[@]}" physics_test.pino.online_sampling=precomputed \
+                'physics_test.pino.controls=["exact"]' \
+                physics_test.pino.fixed_updates=1000 physics_test.pino.fixed_validate_every=100
+        fi
         echo "Running the 1000-update PCViT MLP-forcing fixed-case gate in $FIXED_MG_DIR"
         srun python -u scripts/run_train_pino.py \
             --stage fixed --data-dir "$DATA_DIR" --output-dir "$FIXED_MG_DIR" \
             --phase0-dir "$PHASE4_DIR" --normalization "$NORMALIZATION_PATH" \
+            --exact-screen-dir "$EXACT_SCREEN_DIR" \
             "${overrides[@]}" physics_test.pino.online_sampling=precomputed \
             physics_test.pino.fixed_updates=1000 physics_test.pino.fixed_validate_every=100
     fi

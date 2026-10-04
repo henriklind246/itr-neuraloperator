@@ -357,6 +357,12 @@ conda() { :; }
 nvidia-smi() { :; }
 srun() {
     for arg in "$@"; do
+        if [[ "$arg" == 'physics_test.pino.controls=["exact"]' ]]; then
+            printf '%s\\0' "$@" > "$CAPTURE.exact"
+            return "${EXACT_EXIT_CODE:-0}"
+        fi
+    done
+    for arg in "$@"; do
         if [[ "$arg" == fixed ]]; then
             printf '%s\\0' "$@" > "$CAPTURE.fixed"
             return "${FIXED_EXIT_CODE:-0}"
@@ -371,10 +377,24 @@ exec bash "$LAUNCHER"
                PERSISTENT_RUNS=str(tmp_path / 'persistent'), CAPTURE=str(capture), LAUNCHER=str(script))
     env.pop('PROJECT_DIR', None)
     env.pop('RESUME_RUN_DIR', None)
+    env.pop('EXACT_SCREEN_DIR', None)
+    env.pop('PHASE0_DIR', None)
+    env.pop('FIXED_MG_DIR', None)
     subprocess.run(['bash', '-c', prologue], env=env, check=True, capture_output=True)
     args = capture.read_bytes().decode().strip('\0').split('\0')
     fixed_args = Path(str(capture) + '.fixed').read_bytes().decode().strip('\0').split('\0')
+    exact_args = Path(str(capture) + '.exact').read_bytes().decode().strip('\0').split('\0')
+    exact_overrides = dict(arg.split('=', 1) for arg in exact_args if '=' in arg)
     fixed_overrides = dict(arg.split('=', 1) for arg in fixed_args if '=' in arg)
+    assert _parse_override_value(exact_overrides['physics_test.pino.controls']) == ['exact']
+    assert exact_overrides['physics_test.pino.fixed_updates'] == '1000'
+    assert exact_overrides['physics_test.pino.online_sampling'] == 'precomputed'
+    assert exact_args[exact_args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase0_raw_exact_20261001')
+    assert fixed_args[fixed_args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase4_direct_state_mg_20261002')
+    assert exact_args[exact_args.index('--output-dir') + 1] == fixed_args[fixed_args.index('--exact-screen-dir') + 1]
+    assert exact_args[exact_args.index('--normalization') + 1] == fixed_args[fixed_args.index('--normalization') + 1]
+    assert {key: value for key, value in exact_overrides.items() if key != 'physics_test.pino.controls'} == {
+        key: value for key, value in fixed_overrides.items() if key != 'physics_test.pino.controls'}
     assert fixed_overrides['physics_test.pino.fixed_updates'] == '1000'
     assert fixed_overrides['physics_test.pino.online_sampling'] == 'precomputed'
     assert fixed_args[fixed_args.index('--output-dir') + 1] == args[args.index('--fixed-screen-dir') + 1]
@@ -413,6 +433,11 @@ exec bash "$LAUNCHER"
     assert scheduler.lr_for_update(5000) == pytest.approx(1e-3 * 0.9 ** 20)
     assert scheduler.lr_for_update(10000) == pytest.approx(1e-3 * 0.9 ** 40)
     capture.unlink()
+    Path(str(capture) + '.fixed').unlink()
+    failed_exact = subprocess.run(['bash', '-c', prologue], env=dict(env, EXACT_EXIT_CODE='2'), capture_output=True)
+    assert failed_exact.returncode == 2
+    assert not capture.exists()
+    assert not Path(str(capture) + '.fixed').exists()
     failed = subprocess.run(['bash', '-c', prologue], env=dict(env, FIXED_EXIT_CODE='2'), capture_output=True)
     assert failed.returncode == 2
     assert not capture.exists()
