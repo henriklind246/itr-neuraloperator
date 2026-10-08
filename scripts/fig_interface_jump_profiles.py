@@ -10,11 +10,14 @@ Evaluated mode reads each run's ``test_records.csv`` (written by
 ``scripts/run_eval.py <config_dir> --write-test-records``), whose
 ``node_jump_abs_max_true_K`` column is exactly that peak jump per test pair. The
 quantile is taken over those rows, and only the selected (sim_id, s, j) pair is
-re-run through the checkpoint to recover the full truth and prediction fields:
+re-run through the checkpoint to recover the full truth and prediction fields.
 
-    python scripts/fig_interface_jump_profiles.py \
-        --run forcing=<config_dir> --run interfaces=<config_dir> \
-        --run source=<config_dir> --run source_itr_sin=<config_dir>
+The four runs are discovered under ``--runs-root`` (default ``~/fno_runs``, where
+the MSI training jobs copy their runs) by the same rule as
+``python -m visual.pub --runs-root``: exactly one evaluated experiment per
+benchmark, with ``--run BENCHMARK=<config_dir>`` choosing when there are several.
+
+    python scripts/fig_interface_jump_profiles.py
 
 ``--synthetic`` instead draws a watermarked layout preview from
 `synthetic_test_set`; no checkpoint or dataset is read.
@@ -112,6 +115,9 @@ def select_quantile_example(truth, x_grid, y_grid, interface_x, quantile) -> Sel
 # ----------------------------------------------------- evaluated test sets
 
 RECORD_JUMP = "node_jump_abs_max_true_K"
+# The name scripts/run_eval.py --write-test-records uses, and the one
+# Manifest.discover_global_field searches for.
+RECORDS_NAME = "test_records.csv"
 
 
 def resolve_seed_dir(run: Path, model_seed: int | None) -> Path:
@@ -158,8 +164,11 @@ def evaluated_panel(benchmark: str, run_dir: Path, records_name: str, quantile: 
     bundle = fields._load(str(run_dir))
     if bundle.benchmark != benchmark:
         raise SystemExit(f"--run {benchmark}=... points at a {bundle.benchmark!r} run: {run_dir}")
-    assert_dataset_problem_version(problem_from_config(bundle.config),
-                                   bundle.config["data"]["t_grid_path"])
+    try:
+        assert_dataset_problem_version(problem_from_config(bundle.config),
+                                       bundle.config["data"]["t_grid_path"])
+    except ValueError as exc:
+        raise SystemExit(f"{benchmark}: {exc} ({run_dir})") from None
     sim_id, s, j = int(row["sim_id"]), int(row["s"]), int(row["j"])
     case = fields.evaluate_case(bundle, sim_id, s, (j,))
     truth, pred = case.truth[0], case.pred[0]
@@ -494,26 +503,34 @@ def render(panels: dict, out_dir: Path, key: str, synthetic: bool) -> list[Path]
         return style.save(fig, out_dir, key)
 
 
-def _parse_runs(items: list[str]) -> dict[str, Path]:
-    runs = {}
-    for item in items:
+def discover_runs(runs_root: Path, selections: list[str], model_seed: int | None) -> dict[str, Path]:
+    """One evaluated seed directory per benchmark, found under ``runs_root``."""
+    from visual.pub.manifest import Manifest, ProvenanceError
+
+    chosen = {}
+    for item in selections:
         bench, sep, path = item.partition("=")
-        if not sep or bench not in BENCHMARKS:
-            raise SystemExit(f"--run expects BENCHMARK=PATH with BENCHMARK in {BENCHMARKS}; got {item!r}")
-        runs[bench] = Path(path)
-    missing = [b for b in BENCHMARKS if b not in runs]
-    if missing:
-        raise SystemExit(f"the 2x2 figure needs all four benchmarks; missing --run for {missing}")
-    return runs
+        if not sep or bench not in BENCHMARKS or bench in chosen:
+            raise SystemExit(f"--run expects a unique BENCHMARK=CONFIG_DIR with BENCHMARK in "
+                             f"{BENCHMARKS}; got {item!r}")
+        chosen[bench] = path
+    try:
+        manifest = Manifest.discover_global_field(runs_root, selections=chosen)
+    except ProvenanceError as exc:
+        raise SystemExit(f"run discovery under {runs_root} failed: {exc}") from None
+    return {bench: resolve_seed_dir(Path(manifest.sources[f"{bench}_records"][0]["run"]).parent,
+                                    model_seed)
+            for bench in BENCHMARKS}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--run", action="append", default=[], metavar="BENCHMARK=PATH",
-                        help="evaluated config dir (holding seed*/) or seed dir; once per benchmark")
+    parser.add_argument("--runs-root", type=Path, default=Path("~/fno_runs"),
+                        help="directory searched for evaluated runs (default ~/fno_runs)")
+    parser.add_argument("--run", action="append", default=[], metavar="BENCHMARK=CONFIG_DIR",
+                        help="choose an experiment when a benchmark has several evaluated ones")
     parser.add_argument("--model-seed", type=int, default=None,
                         help="which seed*/ to use when a config dir holds several")
-    parser.add_argument("--records-name", default="test_records.csv")
     parser.add_argument("--synthetic", action="store_true",
                         help="draw the watermarked synthetic layout preview instead")
     parser.add_argument("--out", type=Path, default=None,
@@ -522,8 +539,8 @@ def main(argv=None):
     parser.add_argument("--n-examples", type=int, default=240, help="synthetic only")
     parser.add_argument("--seed", type=int, default=20261007, help="synthetic only")
     args = parser.parse_args(argv)
-    if args.synthetic == bool(args.run):
-        parser.error("pass either --synthetic or one --run per benchmark")
+    if args.synthetic and args.run:
+        parser.error("--run selects evaluated runs; it does not apply to --synthetic")
 
     sidecar = {"synthetic": args.synthetic, "quantile": args.quantile,
                "jump_definition": "peak over y of |T(x_L,y) - T(x_R,y)| across the two "
@@ -538,9 +555,9 @@ def main(argv=None):
             sel = select_quantile_example(truth, x, y, interface_x, args.quantile)
             panels[bench] = (x, truth[sel.index, :, sel.y_index], pred[sel.index, :, sel.y_index], sel)
     else:
-        for bench, run in _parse_runs(args.run).items():
-            panels[bench] = evaluated_panel(bench, resolve_seed_dir(run, args.model_seed),
-                                            args.records_name, args.quantile)
+        for bench, run_dir in discover_runs(args.runs_root, args.run, args.model_seed).items():
+            print(f"{bench:15s} {run_dir}")
+            panels[bench] = evaluated_panel(bench, run_dir, RECORDS_NAME, args.quantile)
     for bench in BENCHMARKS:
         sidecar["benchmarks"][bench] = asdict(panels[bench][3])
 
