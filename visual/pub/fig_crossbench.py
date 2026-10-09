@@ -1,4 +1,4 @@
-"""Cross-benchmark figures: F04, F05, F07, F21, F26-F28 and F31.
+"""Cross-benchmark figures: F04, F05, F07, F21, F26-F28 and F31-F34.
 
 These are the figures the statistical redesign is *for*. Every reduction below
 comes from ``visual.pub.stats``: the defect being corrected is that the current
@@ -12,6 +12,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from matplotlib.ticker import (
     FuncFormatter,
     LogLocator,
@@ -1055,6 +1056,135 @@ def global_field_error_fixed_source(*, source=None, spec=None, requirement=None,
     return fig, None, definition
 
 
+# Benchmark numbering in the manuscript: boundary-driven B1/B2 on the top row,
+# internally heated B3/B4 on the bottom.
+_LEAD_PANEL_ORDER = ("forcing", "interfaces", "source", "source_itr_sin")
+_BAND_ALPHA = 0.22
+
+
+def global_field_error_lead_panels(*, source=None, spec=None, requirement=None,
+                                   source_time=stats.LEAD_SPREAD_SOURCE_TIME):
+    """F34: one panel per benchmark, error against lead from the initial condition.
+
+    Replaces F33's surface with the single question a reader brings to it:
+    whether, and by how much, error grows with the prediction horizon. Every
+    panel starts from the same source time, so each curve follows one fixed
+    cohort along the lead axis. The band is the between-simulation interquartile
+    range, deliberately not a confidence interval for the median.
+    """
+    try:
+        frames, metadata = records.load_global_field_records(source)
+    except (records.SchemaError, FileNotFoundError) as exc:
+        raise ProvenanceError(str(exc)) from exc
+    if not frames:
+        blocked(requirement, _RECORDS_NEEDED, key="F34_global_field_error_lead_panels")
+    summary = stats.lead_error_spread(frames, metadata=metadata, source_time=source_time)
+    rows, growth = summary["rows"], summary["growth"]
+
+    width_in, height_in = style.figsize("one_col", rows=2, row_height="grid_row",
+                                        extra_in=0.45)
+    fig, axes = plt.subplots(2, 2, sharex=True, sharey=True, figsize=(width_in, height_in))
+    # Margins in inches: at one column each panel is only ~1.4 in wide, so the
+    # room for tick labels, the two-line panel headers and the legend is fixed
+    # rather than scaled with the figure.
+    fig.subplots_adjust(left=0.50 / width_in, right=1 - 0.06 / width_in,
+                        bottom=0.38 / height_in, top=1 - 0.52 / height_in,
+                        hspace=0.36, wspace=0.10)
+    for number, (ax, benchmark, letter) in enumerate(
+            zip(axes.flat, _LEAD_PANEL_ORDER, "abcd"), start=1):
+        points = [row for row in rows if row["benchmark"] == benchmark]
+        x = np.asarray([row["lead_time"] for row in points], dtype=float)
+        median = np.asarray([row["median_rmse_K"] for row in points], dtype=float)
+        lower = np.asarray([row["q25_rmse_K"] for row in points], dtype=float)
+        upper = np.asarray([row["q75_rmse_K"] for row in points], dtype=float)
+        color = style.benchmark_color(benchmark)
+        ax.fill_between(x, lower, upper, color=color, alpha=_BAND_ALPHA, linewidth=0)
+        ax.plot(x, median, color=color, linewidth=1.2)
+        ax.set_title(f"({letter}) B{number}: {_surface_title(benchmark)}", loc="left",
+                     fontsize=7, fontweight="bold", pad=10)
+        g = growth[benchmark]
+        # '#' keeps trailing zeros, so 0.060 is not printed as 0.06 beside 0.018.
+        change = (f"{g['first_median_rmse_K']:#.2g} → {g['last_median_rmse_K']:#.2g} K"
+                  + (f" (×{g['ratio_last_to_first']:.1f})"
+                     if g["ratio_last_to_first"] is not None else ""))
+        ax.text(0.0, 1.02, change, transform=ax.transAxes, ha="left", va="bottom",
+                fontsize=6, color="0.30")
+        ax.grid(True, axis="y", color="0.7", alpha=0.35, linewidth=0.5, linestyle="-")
+        ax.set_axisbelow(True)
+        ax.tick_params(labelsize=6.5, width=0.6, length=2.5, pad=2)
+    fig.supxlabel(r"Lead time $\Delta t=t_j-t_s$  ($t_s=%g$)" % source_time,
+                  fontsize=7.5, x=0.5 * (1 + 0.44 / width_in), y=0.01, va="bottom")
+    fig.supylabel("Field RMSE [K]", fontsize=7.5, x=0.01, ha="left",
+                  y=0.5 * (0.38 / height_in + 1 - 0.52 / height_in))
+    lead_hi = summary["lead_times"][-1]
+    axes[0, 0].set_xlim(0.0, lead_hi * 1.03)
+    axes[0, 0].set_ylim(summary["ylim"])
+    axes[0, 0].xaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))
+    axes[0, 0].xaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+    axes[0, 0].yaxis.set_major_locator(MaxNLocator(nbins=4))
+    axes[0, 0].yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+
+    neutral = "0.30"
+    handles = [Line2D([], [], color=neutral, linewidth=1.2, label="Median"),
+               Patch(facecolor=neutral, alpha=_BAND_ALPHA, linewidth=0,
+                     label="25th–75th percentile")]
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.0),
+               ncol=2, fontsize=6.5, frameon=False, handlelength=1.8,
+               columnspacing=1.6, borderaxespad=0.2)
+
+    title = "Global field RMSE against lead time from the initial condition"
+    sims_note = "; ".join(f"{_surface_title(b)}: {growth[b]['n_simulations']}"
+                          for b in _LEAD_PANEL_ORDER)
+    seed_note = "; ".join(f"{_surface_title(b)}: K={summary['seed_counts'][b]}"
+                          for b in _LEAD_PANEL_ORDER)
+    caption = (
+        f"{title}. Each panel uses the trained model for its benchmark and predicts every "
+        f"evaluated target snapshot directly from the source snapshot $t_s={source_time:g}$, so "
+        "the lead time equals the target time and each simulation contributes one prediction "
+        "per lead. Lines are the median simulation-level global field RMSE across held-out test "
+        "simulations; shaded bands span the 25th to 75th percentiles of that RMSE across "
+        "simulations. The bands describe case-to-case variation in prediction error, not "
+        "uncertainty in the estimated median. Panel headers give the median RMSE at the shortest "
+        "and longest evaluated leads and their ratio. All panels share linear axes, so heights "
+        "compare directly in kelvin. The operator predicts each pair directly, so any rise with "
+        "lead time is lead-time-dependent difficulty, not error accumulation through a rollout. "
+        f"Test simulations: {sims_note}. Evaluated model seeds: {seed_note}. "
+    )
+    if any(summary["seed_counts"][b] > 1 for b in _LEAD_PANEL_ORDER):
+        caption += ("Simulation RMSE is averaged across model seeds before the percentiles are "
+                    "taken; this is not an ensemble-averaged prediction. ")
+    if not all(g["constant_cohort"] for g in growth.values()):
+        caption += "The simulation cohort is not identical at every lead; counts are in the statistics. "
+    if source.degradations:
+        caption += ("This descriptive comparison has publication-cohort limitations detailed "
+                    "in the provenance sidecar.")
+    definition = {
+        "space": "kelvin", "metric": "rmse_K", "title": title, "caption": caption.strip(),
+        "benchmarks": list(_LEAD_PANEL_ORDER),
+        "source_time": summary["source_time"], "source_index": summary["source_index"],
+        "conditioning": "single fixed source snapshot at t_s = 0 for every benchmark",
+        "aggregation": "cells -> pair sufficient statistics -> simulation RMSE at (t_s, lead) "
+                       "-> seed mean -> cohort quartiles",
+        "simulation_rmse": "sqrt(sse_K2 / num_error_cells) of the single pair at (t_s, lead)",
+        "replication_unit": "sim_id within benchmark; equal simulation weights",
+        "prediction_mode": "direct_pair; increases with lead are horizon difficulty, "
+                           "not rollout error accumulation",
+        "band": "25th-75th percentile of simulation RMSE across the test cohort",
+        "interval": None,
+        "interval_omitted_because": "the band shows between-simulation variation by request; "
+                                    "a confidence interval for the median is in F32",
+        "quantile_method": "numpy linear interpolation",
+        "growth": growth,
+        "seed_counts": summary["seed_counts"], "seed_ids": summary["seeds"],
+        "unequal_seed_counts": summary["unequal_seed_counts"],
+        "protocols": summary["protocols"], "record_metadata": metadata,
+        "ylim": summary["ylim"],
+        "statistics": rows,
+        "degradations": [str(d) for d in source.degradations],
+    }
+    return fig, None, definition
+
+
 def _cell_edges(centers):
     """Edges bracketing a monotone sequence of cell centers.
 
@@ -1279,6 +1409,7 @@ __all__ = [
     "global_field_error_vs_lead",
     "global_field_error_vs_itr",
     "global_field_error_fixed_source",
+    "global_field_error_lead_panels",
     "source_lead_error_surface",
     "BENCH_ORDER",
     "TARGET_REL_L2_PCT",

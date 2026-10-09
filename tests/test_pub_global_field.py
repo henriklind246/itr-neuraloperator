@@ -1,4 +1,4 @@
-"""Statistical and publication-export contracts for F27/F28/F32."""
+"""Statistical and publication-export contracts for F27/F28/F32-F34."""
 
 import json
 import re
@@ -22,6 +22,7 @@ KEYS = ("F27_global_field_error_vs_lead", "F28_global_field_error_vs_itr")
 SIZES_IN = {KEYS[0]: (3.42, 2.6), KEYS[1]: (3.05, 2.86)}
 FIXED_SOURCE_KEY = "F32_global_field_error_fixed_source"
 SURFACE_KEY = "F33_source_lead_error_surface"
+LEAD_PANELS_KEY = "F34_global_field_error_lead_panels"
 
 
 def field_records(n_sims=25, seed_counts=None, grid=None):
@@ -700,6 +701,129 @@ def test_surface_render_exports_one_row_per_evaluated_cell(tmp_path):
     assert "triangular domain" in definition["summary_comparability"]
 
 
+def test_lead_spread_takes_quartiles_of_seed_averaged_simulations_at_t0():
+    frames = field_records(n_sims=9, seed_counts={"forcing": 2})
+    f = frames["forcing"]
+    f["sse_K2"] = ((f.sim_id + 1) * (f.seed.astype(int) + 1)) ** 2 * f.num_error_cells
+    result = stats.lead_error_spread(frames)
+    assert result["source_index"] == 0 and result["source_time"] == 0.0
+    rows = [r for r in result["rows"] if r["benchmark"] == "forcing"]
+    assert [r["lead_time"] for r in rows] == pytest.approx([.04, .10, .16])
+    # Seeds 0 and 1 give k+1 and 2(k+1); the quartiles are of their mean.
+    expected = np.quantile(1.5 * np.arange(1, 10), [.25, .5, .75])
+    for r in rows:
+        assert r["n_simulations"] == 9 and r["n_seeds"] == 2
+        assert [r["q25_rmse_K"], r["median_rmse_K"], r["q75_rmse_K"]] == pytest.approx(expected)
+    assert result["growth"]["forcing"]["constant_cohort"] is True
+    assert result["ylim"] == pytest.approx(
+        [0.0, 1.08 * max(r["q75_rmse_K"] for r in result["rows"])])
+
+
+def test_lead_spread_conditions_on_the_initial_condition_only():
+    frames = field_records(n_sims=5)
+    for frame in frames.values():
+        # Error depends only on the source snapshot; any pooling across s shows.
+        frame["sse_K2"] = (1.0 + frame.s) ** 2 * frame.num_error_cells
+    result = stats.lead_error_spread(frames)
+    assert all(r["q25_rmse_K"] == pytest.approx(1.0) and r["q75_rmse_K"] == pytest.approx(1.0)
+               for r in result["rows"])
+    assert all(g["ratio_last_to_first"] == pytest.approx(1.0)
+               for g in result["growth"].values())
+
+
+def test_lead_spread_growth_summarizes_the_first_last_and_peak_lead():
+    frames = field_records(n_sims=5)
+    for frame in frames.values():
+        rmse = np.where(np.isclose(frame.t_bar, .10), 3.0, 1.0 + 10 * frame.t_bar)
+        frame["sse_K2"] = rmse ** 2 * frame.num_error_cells
+    growth = stats.lead_error_spread(frames)["growth"]["source"]
+    assert growth["first_median_rmse_K"] == pytest.approx(1.4)
+    assert growth["last_median_rmse_K"] == pytest.approx(2.6)
+    assert growth["ratio_last_to_first"] == pytest.approx(2.6 / 1.4)
+    assert growth["increase_K"] == pytest.approx(1.2)
+    assert (growth["peak_lead"], growth["peak_median_rmse_K"]) == pytest.approx((.10, 3.0))
+
+
+def test_lead_spread_refuses_records_without_an_initial_condition_snapshot():
+    frames = field_records(n_sims=3, grid=[.02, .06, .12, .18])
+    with pytest.raises(ProvenanceError, match="t_s=0"):
+        stats.lead_error_spread(frames)
+
+
+def test_lead_panel_figure_draws_one_benchmark_per_panel_on_shared_axes(monkeypatch):
+    frames = field_records()
+    reduced = stats.lead_error_spread(frames)
+    monkeypatch.setattr(records, "load_global_field_records", lambda source: (frames, {}))
+    fig, _, definition = registry.get_figure(LEAD_PANELS_KEY).load()(
+        source=FigureSource(LEAD_PANELS_KEY))
+    assert fig.get_size_inches() == pytest.approx([3.42, 3.55])
+    assert len(fig.axes) == 4
+    assert [ax.get_title(loc="left") for ax in fig.axes] == [
+        "(a) B1: Forcing", "(b) B2: Varying interface", "(c) B3: Source",
+        "(d) B4: Source + ITR"]
+    for ax, benchmark in zip(fig.axes, ("forcing", "interfaces", "source", "source_itr_sin")):
+        rows = [r for r in reduced["rows"] if r["benchmark"] == benchmark]
+        assert len(ax.lines) == 1 and len(ax.collections) == 1
+        assert ax.lines[0].get_xdata() == pytest.approx([r["lead_time"] for r in rows])
+        assert ax.lines[0].get_ydata() == pytest.approx([r["median_rmse_K"] for r in rows])
+        band = ax.collections[0].get_paths()[0].vertices[:, 1]
+        assert band.min() == pytest.approx(min(r["q25_rmse_K"] for r in rows))
+        assert band.max() == pytest.approx(max(r["q75_rmse_K"] for r in rows))
+        assert ax.get_ylim() == pytest.approx(reduced["ylim"])
+        assert len(ax.texts) == 1 and "→" in ax.texts[0].get_text()
+    assert len(fig.legends[0].get_texts()) == 2
+    assert definition["band"].startswith("25th-75th percentile")
+    assert definition["interval"] is None
+    assert "not uncertainty in the estimated median" in definition["caption"]
+    assert "not error accumulation" in definition["caption"]
+    assert len(definition["statistics"]) == len(reduced["rows"])
+    plt.close(fig)
+
+
+def test_lead_panel_text_fits_one_column_without_overlap(monkeypatch):
+    frames = field_records()
+    monkeypatch.setattr(records, "load_global_field_records", lambda source: (frames, {}))
+    fig, _, _ = registry.get_figure(LEAD_PANELS_KEY).load()(
+        source=FigureSource(LEAD_PANELS_KEY))
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    # fig.texts holds the shared axis labels.
+    texts = [*fig.legends[0].get_texts(), *fig.texts]
+    assert len(fig.texts) == 2
+    for ax in fig.axes:
+        texts += [ax.title, ax._left_title, *ax.texts]
+        # Locators may instantiate invisible, out-of-range tick labels.
+        texts += [t for t in ax.get_xticklabels()
+                  if ax.get_xlim()[0] <= t.get_position()[0] <= ax.get_xlim()[1]]
+        texts += [t for t in ax.get_yticklabels()
+                  if ax.get_ylim()[0] <= t.get_position()[1] <= ax.get_ylim()[1]]
+    boxes = [t.get_window_extent(renderer) for t in texts if t.get_visible() and t.get_text()]
+    for box in boxes:
+        assert box.x0 >= 0 and box.y0 >= 0
+        assert box.x1 <= fig.bbox.width and box.y1 <= fig.bbox.height
+    for i, first in enumerate(boxes):
+        assert not any(first.overlaps(other) for other in boxes[i + 1:])
+    plt.close(fig)
+
+
+def test_lead_panel_render_exports_one_row_per_benchmark_and_lead(tmp_path):
+    manifest = write_field_manifest(tmp_path)
+    result = registry.render(LEAD_PANELS_KEY, manifest=manifest,
+                             out_dir=tmp_path / "out", strict=False)
+    assert [p.suffix for p in result.paths] == [".png", ".pdf", ".svg", ".csv"]
+    with Image.open(result.paths[0]) as image:
+        assert image.size == (1026, 1065)
+    plotted = pd.read_csv(result.paths[3])
+    assert set(plotted.benchmark) == set(stats.GLOBAL_FIELD_BENCHMARKS)
+    assert len(plotted) == 4 * 3
+    assert (plotted.source_time == 0).all()
+    assert (plotted.q25_rmse_K <= plotted.median_rmse_K).all()
+    assert (plotted.median_rmse_K <= plotted.q75_rmse_K).all()
+    definition = json.loads(result.sidecar.read_text())["metric_definition"]
+    assert definition["source_index"] == 0
+    assert set(definition["growth"]) == set(stats.GLOBAL_FIELD_BENCHMARKS)
+
+
 def test_loader_rejects_legacy_rollout_and_reads_grid_metadata(tmp_path):
     manifest = write_field_manifest(tmp_path, n_sims=3)
     run = tmp_path / "forcing" / "seed0"
@@ -837,7 +961,7 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
     monkeypatch.setattr(cli, 'render', fake_render)
     command = ['--global-field', '--runs-root', str(tmp_path / 'runs')]
     assert cli.main(command) == 2
-    assert [key for key, _ in calls] == [*KEYS, FIXED_SOURCE_KEY, SURFACE_KEY]
+    assert [key for key, _ in calls] == [*KEYS, FIXED_SOURCE_KEY, SURFACE_KEY, LEAD_PANELS_KEY]
     assert all(not kw['strict'] and str(kw['out_dir']) == 'figures/global_field' for _, kw in calls)
     assert 'Selected forcing_records' in capsys.readouterr().out
     calls.clear()
@@ -846,6 +970,21 @@ def test_global_field_shortcut_routes_both_figures_and_preserves_strict(tmp_path
     for invalid in (['--runs-root', str(tmp_path)], command + ['--all'], command + ['--manifest', 'custom.yaml']):
         with pytest.raises(SystemExit):
             cli.main(invalid)
+
+
+def test_discovered_runs_can_render_a_single_global_field_figure(tmp_path, capsys):
+    from visual.pub import __main__ as cli
+    write_field_manifest(tmp_path / 'runs')
+    out = tmp_path / 'figures'
+    command = ['--figure', LEAD_PANELS_KEY, '--runs-root', str(tmp_path / 'runs'),
+               '--out', str(out)]
+    # One seed per benchmark falls short of the strict three-seed requirement.
+    assert cli.main(command) == 1
+    assert 'TOO_FEW_SEEDS' in capsys.readouterr().err
+    assert cli.main(command + ['--allow-missing']) == 2
+    rendered = sorted(p.name for p in (out / 'degraded').iterdir())
+    assert f'{LEAD_PANELS_KEY}.png' in rendered and f'{LEAD_PANELS_KEY}.pdf' in rendered
+    assert not any(name.startswith(('F27', 'F28', 'F32', 'F33')) for name in rendered)
 
 
 def test_verify_reports_satisfiability_of_discovered_runs(tmp_path, capsys):

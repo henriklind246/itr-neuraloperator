@@ -150,6 +150,13 @@ _SPECS: tuple[FigureSpec, ...] = (
           "Global field RMSE over source time and lead time",
           "visual.pub.fig_crossbench", "source_lead_error_surface", 1, "two_col",
           formats=("png", "pdf", "svg"), preserve_size=True, source_fraction=0.2),
+    # The 2x2 replacement for F33's heatmaps: one benchmark per panel, error
+    # against lead from the initial condition, with the between-simulation
+    # interquartile range rather than a confidence interval.
+    _spec("F34_global_field_error_lead_panels",
+          "Global field RMSE against lead time from the initial condition",
+          "visual.pub.fig_crossbench", "global_field_error_lead_panels", 1, "one_col",
+          formats=("png", "pdf", "svg"), preserve_size=True, source_time=0.0),
     # The adjacent-node companion to F26. Same four benchmarks, the other jump
     # definition -- this is the one test_records.csv scores.
     _spec("F31_node_jump_fidelity",

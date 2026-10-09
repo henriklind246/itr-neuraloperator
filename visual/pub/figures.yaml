@@ -406,3 +406,9 @@ figures:
   F33_source_lead_error_surface:
     requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
     metric_space: kelvin
+
+  # Same records as F32, with every panel fixed at t_s = 0 and the band the
+  # between-simulation interquartile range rather than a confidence interval.
+  F34_global_field_error_lead_panels:
+    requires: [forcing_records, source_records, source_itr_sin_records, interfaces_records]
+    metric_space: kelvin

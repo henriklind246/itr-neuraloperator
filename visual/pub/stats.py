@@ -1824,6 +1824,27 @@ def _select_source_index(protocol, fraction):
     return int(candidates["s"].to_numpy()[pick]), float(times[pick]), horizon
 
 
+def _has_target_sse(prepared):
+    return all("target_sse_K2" in frame for frame in prepared.values())
+
+
+def _seed_mean_rmse_by_lead(part, has_target):
+    """Simulation RMSE per ``(lead_time, sim_id)``, pooled within a seed first.
+
+    SSE and cell counts are summed before the square root, then the per-seed
+    RMSEs are averaged, so a simulation contributes one value per lead however
+    many seeds evaluated it.
+    """
+    pooled = part.groupby(["lead_time", "sim_id", "seed"], sort=True).agg(
+        sse=("sse_K2", "sum"), cells=("num_error_cells", "sum"),
+        target=("target_sse_K2", "sum") if has_target else ("sse_K2", "size"))
+    pooled["rmse_K"] = pooled_rmse(pooled["sse"], pooled["cells"])
+    pooled["target_rms_K"] = (pooled_rmse(pooled["target"], pooled["cells"])
+                              if has_target else np.nan)
+    return pooled.groupby(["lead_time", "sim_id"]).agg(
+        rmse_K=("rmse_K", "mean"), target_rms_K=("target_rms_K", "mean"))
+
+
 def fixed_source_lead_summary(frames, *, metadata=None,
                               source_fraction=DEFAULT_SOURCE_FRACTION,
                               fraction_sweep=SOURCE_FRACTION_SWEEP,
@@ -1852,7 +1873,7 @@ def fixed_source_lead_summary(frames, *, metadata=None,
             seen.add(value)
             fractions.append(value)
 
-    has_target = all("target_sse_K2" in frame for frame in prepared.values())
+    has_target = _has_target_sse(prepared)
     rows, selections = [], {}
     for fraction in fractions:
         index, source_time, horizon = _select_source_index(protocol, fraction)
@@ -1869,14 +1890,7 @@ def fixed_source_lead_summary(frames, *, metadata=None,
             if part.empty:
                 raise ProvenanceError(
                     f"{benchmark}: no pairs at source snapshot {index}")
-            pooled = part.groupby(["lead_time", "sim_id", "seed"], sort=True).agg(
-                sse=("sse_K2", "sum"), cells=("num_error_cells", "sum"),
-                target=("target_sse_K2", "sum") if has_target else ("sse_K2", "size"))
-            pooled["rmse_K"] = pooled_rmse(pooled["sse"], pooled["cells"])
-            pooled["target_rms_K"] = (pooled_rmse(pooled["target"], pooled["cells"])
-                                      if has_target else np.nan)
-            simulations = pooled.groupby(["lead_time", "sim_id"]).agg(
-                rmse_K=("rmse_K", "mean"), target_rms_K=("target_rms_K", "mean"))
+            simulations = _seed_mean_rmse_by_lead(part, has_target)
             for lead in leads:
                 present = lead in simulations.index.get_level_values("lead_time")
                 sample = (simulations.xs(lead, level="lead_time") if present
@@ -1926,6 +1940,84 @@ def fixed_source_lead_summary(frames, *, metadata=None,
             "field_amplitude_available": has_target,
             "protocols": protocol_info, "yscale": yscale, "ylim": ylim,
             "n_boot": n_boot, "rng_seed": rng_seed}
+
+
+# F34 conditions every panel on the initial condition. That is a fixed time, not
+# a fraction of the horizon, so records without an evaluated t_s = 0 snapshot
+# are refused rather than plotted from whichever snapshot happens to be nearest.
+LEAD_SPREAD_SOURCE_TIME = 0.0
+LEAD_SPREAD_QUANTILES = (0.25, 0.5, 0.75)
+
+
+def lead_error_spread(frames, *, metadata=None,
+                      source_time=LEAD_SPREAD_SOURCE_TIME):
+    """F34 reduction: per-lead quartiles of simulation RMSE from one source time.
+
+    The band this feeds is the spread of simulation-level error across the test
+    cohort, not an interval for the median: it shows how much accuracy varies
+    between cases at a lead, and it does not narrow as the cohort grows.
+    """
+    prepared, seeds, _, protocol_info, protocol = _prepare_global_field_frames(
+        frames, metadata)
+    at_source = protocol[np.isclose(protocol[:, 2], source_time, rtol=0.0, atol=1e-9)]
+    if not len(at_source):
+        earliest = ", ".join(f"{t:g}" for t in np.unique(protocol[:, 2])[:5])
+        raise ProvenanceError(
+            f"no evaluated source snapshot at t_s={source_time:g}; "
+            f"earliest evaluated source times: {earliest}")
+    index = int(at_source[0, 0])
+    leads = np.sort(at_source[:, 3])
+    has_target = _has_target_sse(prepared)
+
+    rows, growth = [], {}
+    for benchmark in GLOBAL_FIELD_BENCHMARKS:
+        simulations = _seed_mean_rmse_by_lead(
+            prepared[benchmark].loc[prepared[benchmark]["s"] == index], has_target)
+        present = set(simulations.index.get_level_values("lead_time"))
+        cohorts = set()
+        for lead in leads:
+            if lead not in present:
+                raise ProvenanceError(
+                    f"{benchmark}: no simulations at t_s={source_time:g}, lead {lead:g}")
+            sample = simulations.xs(lead, level="lead_time")
+            values = sample["rmse_K"].to_numpy(dtype=float)
+            q25, q50, q75 = np.quantile(values, LEAD_SPREAD_QUANTILES)
+            amplitude = sample["target_rms_K"].to_numpy(dtype=float)
+            cohorts.add(tuple(sample.index))
+            rows.append({
+                "benchmark": benchmark, "source_index": index,
+                "source_time": float(source_time), "lead_time": float(lead),
+                "n_simulations": int(len(values)),
+                "n_seeds": len(seeds[benchmark]), "seed_ids": seeds[benchmark],
+                "median_rmse_K": float(q50),
+                "q25_rmse_K": float(q25), "q75_rmse_K": float(q75),
+                "median_target_rms_K": float(np.median(amplitude)) if has_target else None,
+            })
+        curve = [row for row in rows if row["benchmark"] == benchmark]
+        first, last = curve[0], curve[-1]
+        peak = max(curve, key=lambda row: row["median_rmse_K"])
+        growth[benchmark] = {
+            "first_lead": first["lead_time"], "first_median_rmse_K": first["median_rmse_K"],
+            "last_lead": last["lead_time"], "last_median_rmse_K": last["median_rmse_K"],
+            "ratio_last_to_first": (last["median_rmse_K"] / first["median_rmse_K"]
+                                    if first["median_rmse_K"] > 0 else None),
+            "increase_K": last["median_rmse_K"] - first["median_rmse_K"],
+            "peak_lead": peak["lead_time"], "peak_median_rmse_K": peak["median_rmse_K"],
+            "n_simulations": max(row["n_simulations"] for row in curve),
+            "constant_cohort": len(cohorts) == 1,
+        }
+
+    upper = max(row["q75_rmse_K"] for row in rows)
+    counts = {b: len(s) for b, s in seeds.items()}
+    return {"rows": rows, "growth": growth,
+            "source_index": index, "source_time": float(source_time),
+            "lead_times": leads.tolist(),
+            "quantiles": list(LEAD_SPREAD_QUANTILES),
+            "seeds": seeds, "seed_counts": counts,
+            "unequal_seed_counts": len(set(counts.values())) > 1,
+            "field_amplitude_available": has_target,
+            "protocols": protocol_info,
+            "ylim": [0.0, upper * 1.08 if upper > 0 else 1.0]}
 
 
 # A curve's shape can only be compared against another curve over leads both of
@@ -2374,6 +2466,9 @@ __all__ = [
     "GLOBAL_FIELD_BENCHMARKS",
     "SOURCE_FRACTION_SWEEP",
     "fixed_source_lead_summary",
+    "LEAD_SPREAD_QUANTILES",
+    "LEAD_SPREAD_SOURCE_TIME",
+    "lead_error_spread",
     "global_field_error_summary",
     "interface_mean_resistance",
     "ContactJumpCurve",
