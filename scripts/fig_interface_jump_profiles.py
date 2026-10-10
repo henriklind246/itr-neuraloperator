@@ -329,10 +329,10 @@ FV_LW, FNO_LW, IFACE_LW = 2.6, 1.4, 1.3
 # Each layout pairs inset corners with the y headroom that frees them: upper
 # corners with spare room above the data, lower corners with spare room below.
 _INSET_LAYOUTS = (
-    ((-0.06, 0.42), {"upper right": (0.555, 0.46, 0.43, 0.48),
-                     "upper left": (0.03, 0.46, 0.43, 0.48)}),
-    ((-0.62, 0.06), {"lower right": (0.555, 0.15, 0.43, 0.42),
-                     "lower left": (0.03, 0.15, 0.43, 0.42)}),
+    ((-0.06, 0.42), {"upper right": (0.515, 0.44, 0.47, 0.51),
+                     "upper left": (0.03, 0.44, 0.47, 0.51)}),
+    ((-0.62, 0.06), {"lower right": (0.515, 0.13, 0.47, 0.45),
+                     "lower left": (0.03, 0.13, 0.47, 0.45)}),
 )
 
 
@@ -364,7 +364,7 @@ def _place_inset(ax, x, curves, interface_x):
     return best[2]
 
 
-def _fit_inside(text, ax, margin=0.03, min_size=5.4):
+def _fit_inside(text, ax, margin=0.03, min_size=7.0):
     """Shrink ``text`` until it ends inside ``ax`` with ``margin`` to spare.
 
     Real readouts vary in width ("-12.3%" vs "+1.4%"), so the size is fitted
@@ -387,9 +387,9 @@ def _jump_inset(ax, x, T_fv, T_fno, sel, color, jump_fv, jump_fno):
                solid_capstyle="round", zorder=2)
     axins.plot(x[window], T_fno[window], color=INK, linewidth=FNO_LW,
                linestyle=FNO_DASH, zorder=3)
-    axins.plot(x[nodes], T_fv[nodes], linestyle="none", marker="o", markersize=6.5,
+    axins.plot(x[nodes], T_fv[nodes], linestyle="none", marker="o", markersize=7.5,
                markerfacecolor=color, markeredgecolor="white", markeredgewidth=1.1, zorder=4)
-    axins.plot(x[nodes], T_fno[nodes], linestyle="none", marker="o", markersize=6.5,
+    axins.plot(x[nodes], T_fno[nodes], linestyle="none", marker="o", markersize=7.5,
                markerfacecolor="none", markeredgecolor=INK, markeredgewidth=1.3, zorder=5)
 
     # Bracket on the downstream side, where a drop leaves the space above the curve empty.
@@ -406,7 +406,7 @@ def _jump_inset(ax, x, T_fv, T_fno, sel, color, jump_fv, jump_fno):
     span = w_hi - w_lo
     up = jump_fv > 0
     axins.set_xlim(sel.interface_x - INSET_HALF_WIDTH, sel.interface_x + INSET_HALF_WIDTH)
-    y_lo, y_hi = w_lo - (0.1 if up else 0.62) * span, w_hi + (0.62 if up else 0.1) * span
+    y_lo, y_hi = w_lo - (0.1 if up else 0.95) * span, w_hi + (0.95 if up else 0.1) * span
     axins.set_ylim(y_lo, y_hi)
     # Stop the interface line short of the readout band so the text never crosses it.
     data_top, data_bot = (w_hi - y_lo) / (y_hi - y_lo), (w_lo - y_lo) / (y_hi - y_lo)
@@ -416,8 +416,8 @@ def _jump_inset(ax, x, T_fv, T_fno, sel, color, jump_fv, jump_fno):
     # goes to the readout, and the box can sit close to the interface line.
     axins.xaxis.set_major_locator(MaxNLocator(nbins=3))
     axins.set_yticks([])
-    axins.tick_params(axis="x", length=2.5, width=0.8, pad=1.5, colors=REF, labelcolor=INK)
-    style.bold_axis_text(axins, label_size=6.8, tick_size=6.8)
+    axins.tick_params(axis="x", length=3, width=0.8, pad=2, colors=REF, labelcolor=INK)
+    style.bold_axis_text(axins, label_size=8.5, tick_size=8.5)
     axins.set_facecolor("white")
     for spine in axins.spines.values():
         spine.set_visible(True)
@@ -428,14 +428,15 @@ def _jump_inset(ax, x, T_fv, T_fno, sel, color, jump_fv, jump_fno):
     label = "$\\mathbf{{\\Delta}}\\boldsymbol{{T}}_{{\\mathbf{{{}}}}}$"
     readout = axins.text(0.04, 0.95 if up else 0.05,
                          f"{label.format('FV')} = {jump_fv:.2f} K\n"
-                         f"{label.format('FNO')} = {jump_fno:.2f} K ({rel}%)",
+                         f"{label.format('FNO')} = {jump_fno:.2f} K\n"
+                         f"error {rel}%",
                          transform=axins.transAxes, ha="left", va="top" if up else "bottom",
-                         fontsize=6.6, fontweight="bold", color=INK, linespacing=1.4)
+                         fontsize=8.5, fontweight="bold", color=INK, linespacing=1.4)
     _fit_inside(readout, axins)
     ax.axvspan(*axins.get_xlim(), color=BAND, linewidth=0, zorder=0)
 
 
-def _panel(ax, benchmark, x, T_fv, T_fno, sel: Selection):
+def _panel(ax, benchmark, letter, x, T_fv, T_fno, sel: Selection):
     color = style.benchmark_color(benchmark)
     ax.grid(axis="y", color=GRID, linestyle="-", linewidth=0.5)
     ax.set_axisbelow(True)
@@ -444,13 +445,15 @@ def _panel(ax, benchmark, x, T_fv, T_fno, sel: Selection):
     ax.plot(x, T_fno, color=INK, linewidth=FNO_LW, linestyle=FNO_DASH, zorder=3)
     ax.set_xlim(0.0, 1.0)
     ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
-    ax.tick_params(colors=REF, labelcolor=INK, length=3, labelsize=7.5)
+    ax.tick_params(colors=REF, labelcolor=INK, length=3.5, labelsize=9.5)
     for spine in ("left", "bottom"):
         ax.spines[spine].set_color(REF)
-    ax.set_title(TITLES[benchmark], loc="left", fontsize=8.8, fontweight="bold",
-                 color=INK, pad=6)
-    ax.set_title(f"$\\boldsymbol{{y}}$ = {sel.y:.2f}", loc="right", fontsize=8.3,
-                 fontweight="bold", color=REF, pad=6)
+    # The y value takes a line of its own: beside a full benchmark name at a
+    # readable size it collides with the title.
+    ax.set_title(f"({letter}) {TITLES[benchmark]}", loc="left", fontsize=10.5,
+                 fontweight="bold", color=INK, pad=19)
+    ax.text(0.0, 1.025, f"$\\boldsymbol{{y}}$ = {sel.y:.2f}", transform=ax.transAxes,
+            ha="left", va="bottom", fontsize=10, fontweight="bold", color=REF)
 
     left, right = flanking_nodes(x, sel.interface_x)
     jump_fv = float(T_fv[left] - T_fv[right])
@@ -470,19 +473,16 @@ def _panel(ax, benchmark, x, T_fv, T_fno, sel: Selection):
 def render(panels: dict, out_dir: Path, key: str, synthetic: bool) -> list[Path]:
     with style.pub_style():
         fig, axes = plt.subplots(2, 2, figsize=style.figsize("two_col", rows=2, row_height="std",
-                                                             extra_in=0.3))
-        fig.subplots_adjust(left=0.08, right=0.985, bottom=0.085, top=0.88,
-                            wspace=0.18, hspace=0.38)
-        for ax, bench in zip(axes.ravel(), BENCHMARKS):
+                                                             extra_in=2.1))
+        fig.subplots_adjust(left=0.095, right=0.985, bottom=0.075, top=0.875,
+                            wspace=0.19, hspace=0.36)
+        for ax, bench, letter in zip(axes.ravel(), BENCHMARKS, "abcd"):
             x, T_fv, T_fno, sel = panels[bench]
-            panels[bench] = (*panels[bench], *_panel(ax, bench, x, T_fv, T_fno, sel))
+            panels[bench] = (*panels[bench], *_panel(ax, bench, letter, x, T_fv, T_fno, sel))
         for ax in axes[1]:
-            ax.set_xlabel("$\\boldsymbol{x}$", color=INK, fontsize=9)
+            ax.set_xlabel("$\\boldsymbol{x}$", color=INK, fontsize=11)
         for ax in axes[:, 0]:
-            ax.set_ylabel("$\\boldsymbol{T}$ [K]", color=INK, fontsize=9, fontweight="bold")
-        style.panel_letters(axes, loc=(-0.03, 1.035))
-        for ax in axes.ravel():
-            ax.texts[-1].set_fontsize(9.5)
+            ax.set_ylabel("$\\boldsymbol{T}$ [K]", color=INK, fontsize=11, fontweight="bold")
 
         fv_key = tuple(Line2D([], [], color=style.benchmark_color(b), linewidth=FV_LW)
                        for b in BENCHMARKS)
@@ -495,10 +495,10 @@ def render(panels: dict, out_dir: Path, key: str, synthetic: bool) -> list[Path]
                     "region shown in inset"],
             handler_map={tuple: HandlerTuple(ndivide=None, pad=0.0)},
             loc="upper center", bbox_to_anchor=(0.5, 0.995), ncol=4, frameon=False,
-            handlelength=3.0, columnspacing=1.8, prop={"size": 8, "weight": "bold"})
+            handlelength=2.0, columnspacing=1.0, prop={"size": 9, "weight": "bold"})
         if synthetic:
             fig.text(0.005, 0.002, "SYNTHETIC DATA: layout preview, not FV solver or "
-                     "FNO checkpoint output.", fontsize=5.5, color="#B22222",
+                     "FNO checkpoint output.", fontsize=7, color="#B22222",
                      ha="left", va="bottom")
         return style.save(fig, out_dir, key)
 

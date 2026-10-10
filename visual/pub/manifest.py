@@ -424,7 +424,18 @@ class Manifest:
         if unknown:
             raise ProvenanceError(f"Unknown benchmark selection: {sorted(unknown)}")
         candidates = {b: {} for b in benchmarks}
-        for record in sorted(root.rglob("test_records.csv")):
+        # A shared runs directory also holds old, partial and differently laid out
+        # runs, and any one of them would otherwise fail the whole discovery. Once
+        # every benchmark is named, only the named experiments are read.
+        search = [root]
+        if set(selections) == set(benchmarks):
+            search = [Path(path).expanduser().resolve() for path in selections.values()]
+            for path in search:
+                if not path.is_dir():
+                    raise ProvenanceError(f"Selected run directory does not exist: {path}")
+        records_found = sorted({record for base in search
+                                for record in base.rglob("test_records.csv")})
+        for record in records_found:
             run = record.parent.resolve()
             config_path = run / "config_used.yaml"
             if not config_path.is_file():

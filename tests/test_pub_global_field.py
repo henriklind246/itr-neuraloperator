@@ -715,8 +715,9 @@ def test_lead_spread_takes_quartiles_of_seed_averaged_simulations_at_t0():
         assert r["n_simulations"] == 9 and r["n_seeds"] == 2
         assert [r["q25_rmse_K"], r["median_rmse_K"], r["q75_rmse_K"]] == pytest.approx(expected)
     assert result["growth"]["forcing"]["constant_cohort"] is True
-    assert result["ylim"] == pytest.approx(
-        [0.0, 1.08 * max(r["q75_rmse_K"] for r in result["rows"])])
+    for benchmark, ylim in result["ylims"].items():
+        assert ylim == pytest.approx([0.0, 1.08 * max(
+            r["q75_rmse_K"] for r in result["rows"] if r["benchmark"] == benchmark)])
 
 
 def test_lead_spread_conditions_on_the_initial_condition_only():
@@ -769,7 +770,7 @@ def test_lead_panel_figure_draws_one_benchmark_per_panel_on_shared_axes(monkeypa
         band = ax.collections[0].get_paths()[0].vertices[:, 1]
         assert band.min() == pytest.approx(min(r["q25_rmse_K"] for r in rows))
         assert band.max() == pytest.approx(max(r["q75_rmse_K"] for r in rows))
-        assert ax.get_ylim() == pytest.approx(reduced["ylim"])
+        assert ax.get_ylim() == pytest.approx(reduced["ylims"][benchmark])
         assert len(ax.texts) == 1 and "→" in ax.texts[0].get_text()
     assert len(fig.legends[0].get_texts()) == 2
     assert definition["band"].startswith("25th-75th percentile")
@@ -938,6 +939,25 @@ def test_global_field_discovery_selects_all_seeds_and_rejects_ambiguity(tmp_path
         Manifest.discover_global_field(root, selections={'forcing': str(root / 'absent')})
     with pytest.raises(ProvenanceError, match='Unknown benchmark'):
         Manifest.discover_global_field(root, selections={'typo': str(root)})
+
+
+def test_full_selection_ignores_unrelated_runs_in_a_shared_root(tmp_path):
+    root = tmp_path / 'runs'
+    write_field_manifest(root, n_sims=3)
+    # An old run elsewhere under the root that discovery cannot interpret.
+    stray = root / 'old_experiment' / 'eval'
+    stray.mkdir(parents=True)
+    (stray / 'test_records.csv').write_text('sim_id\n1\n')
+    with pytest.raises(ProvenanceError, match='Missing run configuration'):
+        Manifest.discover_global_field(root)
+    selections = {b: str(root / b) for b in stats.GLOBAL_FIELD_BENCHMARKS}
+    discovered = Manifest.discover_global_field(root, selections=selections)
+    assert {name: [e['run'] for e in entries] for name, entries in discovered.sources.items()} == {
+        f'{b}_records': [str((root / b / 'seed0').resolve())]
+        for b in stats.GLOBAL_FIELD_BENCHMARKS}
+    with pytest.raises(ProvenanceError, match='Selected run directory does not exist'):
+        Manifest.discover_global_field(
+            root, selections={**selections, 'forcing': str(root / 'absent')})
 
 
 def test_global_field_discovery_missing_records_and_config(tmp_path):

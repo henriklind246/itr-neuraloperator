@@ -2007,7 +2007,12 @@ def lead_error_spread(frames, *, metadata=None,
             "constant_cohort": len(cohorts) == 1,
         }
 
-    upper = max(row["q75_rmse_K"] for row in rows)
+    # One RMSE range per benchmark: their error levels differ several-fold, and a
+    # shared range flattens the curves of the more accurate ones.
+    ylims = {}
+    for benchmark in GLOBAL_FIELD_BENCHMARKS:
+        upper = max(row["q75_rmse_K"] for row in rows if row["benchmark"] == benchmark)
+        ylims[benchmark] = [0.0, upper * 1.08 if upper > 0 else 1.0]
     counts = {b: len(s) for b, s in seeds.items()}
     return {"rows": rows, "growth": growth,
             "source_index": index, "source_time": float(source_time),
@@ -2016,8 +2021,7 @@ def lead_error_spread(frames, *, metadata=None,
             "seeds": seeds, "seed_counts": counts,
             "unequal_seed_counts": len(set(counts.values())) > 1,
             "field_amplitude_available": has_target,
-            "protocols": protocol_info,
-            "ylim": [0.0, upper * 1.08 if upper > 0 else 1.0]}
+            "protocols": protocol_info, "ylims": ylims}
 
 
 # A curve's shape can only be compared against another curve over leads both of

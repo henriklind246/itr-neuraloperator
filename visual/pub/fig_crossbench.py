@@ -1083,13 +1083,13 @@ def global_field_error_lead_panels(*, source=None, spec=None, requirement=None,
 
     width_in, height_in = style.figsize("one_col", rows=2, row_height="grid_row",
                                         extra_in=0.45)
-    fig, axes = plt.subplots(2, 2, sharex=True, sharey=True, figsize=(width_in, height_in))
+    fig, axes = plt.subplots(2, 2, sharex=True, figsize=(width_in, height_in))
     # Margins in inches: at one column each panel is only ~1.4 in wide, so the
     # room for tick labels, the two-line panel headers and the legend is fixed
     # rather than scaled with the figure.
-    fig.subplots_adjust(left=0.50 / width_in, right=1 - 0.06 / width_in,
+    fig.subplots_adjust(left=0.46 / width_in, right=1 - 0.04 / width_in,
                         bottom=0.38 / height_in, top=1 - 0.52 / height_in,
-                        hspace=0.36, wspace=0.10)
+                        hspace=0.36, wspace=0.30)
     for number, (ax, benchmark, letter) in enumerate(
             zip(axes.flat, _LEAD_PANEL_ORDER, "abcd"), start=1):
         points = [row for row in rows if row["benchmark"] == benchmark]
@@ -1101,7 +1101,7 @@ def global_field_error_lead_panels(*, source=None, spec=None, requirement=None,
         ax.fill_between(x, lower, upper, color=color, alpha=_BAND_ALPHA, linewidth=0)
         ax.plot(x, median, color=color, linewidth=1.2)
         ax.set_title(f"({letter}) B{number}: {_surface_title(benchmark)}", loc="left",
-                     fontsize=7, fontweight="bold", pad=10)
+                     fontsize=6.5, fontweight="bold", pad=10)
         g = growth[benchmark]
         # '#' keeps trailing zeros, so 0.060 is not printed as 0.06 beside 0.018.
         change = (f"{g['first_median_rmse_K']:#.2g} → {g['last_median_rmse_K']:#.2g} K"
@@ -1109,20 +1109,20 @@ def global_field_error_lead_panels(*, source=None, spec=None, requirement=None,
                      if g["ratio_last_to_first"] is not None else ""))
         ax.text(0.0, 1.02, change, transform=ax.transAxes, ha="left", va="bottom",
                 fontsize=6, color="0.30")
+        ax.set_ylim(summary["ylims"][benchmark])
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10], min_n_ticks=3))
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
         ax.grid(True, axis="y", color="0.7", alpha=0.35, linewidth=0.5, linestyle="-")
         ax.set_axisbelow(True)
         ax.tick_params(labelsize=6.5, width=0.6, length=2.5, pad=2)
     fig.supxlabel(r"Lead time $\Delta t=t_j-t_s$  ($t_s=%g$)" % source_time,
-                  fontsize=7.5, x=0.5 * (1 + 0.44 / width_in), y=0.01, va="bottom")
+                  fontsize=7.5, x=0.5 * (1 + 0.42 / width_in), y=0.01, va="bottom")
     fig.supylabel("Field RMSE [K]", fontsize=7.5, x=0.01, ha="left",
                   y=0.5 * (0.38 / height_in + 1 - 0.52 / height_in))
     lead_hi = summary["lead_times"][-1]
     axes[0, 0].set_xlim(0.0, lead_hi * 1.03)
-    axes[0, 0].set_ylim(summary["ylim"])
     axes[0, 0].xaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 5, 10]))
     axes[0, 0].xaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
-    axes[0, 0].yaxis.set_major_locator(MaxNLocator(nbins=4))
-    axes[0, 0].yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
 
     neutral = "0.30"
     handles = [Line2D([], [], color=neutral, linewidth=1.2, label="Median"),
@@ -1145,8 +1145,9 @@ def global_field_error_lead_panels(*, source=None, spec=None, requirement=None,
         "simulations; shaded bands span the 25th to 75th percentiles of that RMSE across "
         "simulations. The bands describe case-to-case variation in prediction error, not "
         "uncertainty in the estimated median. Panel headers give the median RMSE at the shortest "
-        "and longest evaluated leads and their ratio. All panels share linear axes, so heights "
-        "compare directly in kelvin. The operator predicts each pair directly, so any rise with "
+        "and longest evaluated leads and their ratio. Lead axes are shared; each panel has its "
+        "own linear RMSE axis starting at zero, so compare error levels across benchmarks by "
+        "axis values and the header numbers rather than by curve heights. The operator predicts each pair directly, so any rise with "
         "lead time is lead-time-dependent difficulty, not error accumulation through a rollout. "
         f"Test simulations: {sims_note}. Evaluated model seeds: {seed_note}. "
     )
@@ -1178,7 +1179,7 @@ def global_field_error_lead_panels(*, source=None, spec=None, requirement=None,
         "seed_counts": summary["seed_counts"], "seed_ids": summary["seeds"],
         "unequal_seed_counts": summary["unequal_seed_counts"],
         "protocols": summary["protocols"], "record_metadata": metadata,
-        "ylim": summary["ylim"],
+        "ylims": summary["ylims"],
         "statistics": rows,
         "degradations": [str(d) for d in source.degradations],
     }
