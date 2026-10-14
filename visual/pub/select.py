@@ -16,6 +16,11 @@ Two stages:
 The result is written to the figure sidecar and printed in the footer. Any
 behavioural change requires bumping :data:`PROTOCOL_VERSION`, which a golden
 test pins.
+
+:func:`select_peak_case` is a second, separately versioned rule for the
+per-benchmark case figures: a pair near a stated quantile of the truth field's
+peak temperature, and the most accurate prediction among its neighbours. See
+its docstring for why it ranks pairs rather than simulations.
 """
 
 from __future__ import annotations
@@ -30,6 +35,14 @@ PROTOCOL_VERSION = 1
 DEFAULT_TIE_BREAK_SEED = 20260728
 
 PAIR_RULES = ("median_within_sim", "longest_lead", "fixed_leads")
+
+PEAK_PROTOCOL_VERSION = 1
+PEAK_QUANTILE = 0.85
+# Half-width of the candidate band in quantile units: P80-P90 at the default.
+# Wide enough that a column drawn from a few dozen pairs still has several
+# candidates to choose the accurate one from, narrow enough that every
+# candidate is still a large-temperature case.
+PEAK_BAND = 0.05
 
 
 class SelectionError(ValueError):
@@ -67,6 +80,47 @@ class CaseSelection:
     def footer_field(self) -> str:
         """The selection field ``style.add_provenance_footer`` prints."""
         return f"{self.label} [sel v{self.protocol_version}]"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PeakCaseSelection:
+    """A case chosen for a large truth temperature and an accurate prediction.
+
+    ``peak_rank`` is the 1-based position of the chosen pair in ascending
+    ``peak_metric`` order among ``n_pairs`` pairs, and ``n_candidates`` is how
+    many pairs the quantile band held.
+    """
+
+    sim_id: int
+    s: int
+    j: int
+    quantile: float
+    band: float
+    peak_metric: str
+    target_peak: float
+    peak_value: float
+    peak_rank: int
+    n_pairs: int
+    n_candidates: int
+    accuracy_metric: str
+    accuracy_value: float
+    seed: str = ""
+    benchmark: str = ""
+    strata: dict[str, str] = field(default_factory=dict)
+    protocol_version: int = PEAK_PROTOCOL_VERSION
+
+    @property
+    def label(self) -> str:
+        """Footer text, e.g. ``sim 81, T_max_K rank 39/45 (p85, best rel_l2_pct of 5)``."""
+        return (f"sim {self.sim_id}, {self.peak_metric} rank "
+                f"{self.peak_rank}/{self.n_pairs} (p{100 * self.quantile:g}, "
+                f"best {self.accuracy_metric} of {self.n_candidates})")
+
+    def footer_field(self) -> str:
+        return f"{self.label} [peak sel v{self.protocol_version}]"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -148,6 +202,17 @@ def _select_pair(records: pd.DataFrame, sim_id: int, metric: str,
     return ordered.iloc[0]
 
 
+def _case_strata(pair: pd.Series, strata_filter: dict | None) -> dict[str, str]:
+    strata = {}
+    for col in ("temporal_family", "spatial_family", "regime", "protocol",
+                "distribution_class"):
+        if col in pair.index and str(pair[col]):
+            strata[col] = str(pair[col])
+    if strata_filter:
+        strata.update({k: str(v) for k, v in strata_filter.items()})
+    return strata
+
+
 def select_case(sims, records, *, quantile: float = 0.5, metric: str = "rmse_K",
                 strata_filter: dict | None = None,
                 pair_rule: str = "median_within_sim",
@@ -175,14 +240,7 @@ def select_case(sims, records, *, quantile: float = 0.5, metric: str = "rmse_K",
     if "seed" in records.columns and "seed" in row.index:
         pair_records = records[records["seed"].astype(str) == str(row["seed"])]
     pair = _select_pair(pair_records, sim_id, metric, pair_rule, strata_filter)
-
-    strata = {}
-    for col in ("temporal_family", "spatial_family", "regime", "protocol",
-                "distribution_class"):
-        if col in pair.index and str(pair[col]):
-            strata[col] = str(pair[col])
-    if strata_filter:
-        strata.update({k: str(v) for k, v in strata_filter.items()})
+    strata = _case_strata(pair, strata_filter)
 
     return CaseSelection(
         sim_id=sim_id,
@@ -207,6 +265,89 @@ def select_case_grid(sims, records, *, quantiles=(0.5, 0.9), **kwargs
                      ) -> list[CaseSelection]:
     """One selection per quantile, for figures that show a spread of cases."""
     return [select_case(sims, records, quantile=q, **kwargs) for q in quantiles]
+
+
+def select_peak_case(records, *, peak_metric: str, quantile: float = PEAK_QUANTILE,
+                     band: float = PEAK_BAND, accuracy_metric: str = "rel_l2_pct",
+                     strata_filter: dict | None = None,
+                     seed: str | None = None) -> PeakCaseSelection:
+    """The most accurate pair in a band around a quantile of ``peak_metric``.
+
+    Pairs are sorted by ``peak_metric`` (ties on ``sim_id``, ``s``, ``j``) and
+    the target is the pair at ``ceil(quantile * (n - 1))``, the same indexing as
+    :func:`select_case`. The band is every pair whose position lies within
+    ``band`` quantile units of it. Within the band the lowest
+    ``accuracy_metric`` wins, ties going to the pair nearer the target.
+
+    This ranks **pairs**, unlike :func:`select_case`. The peak temperature is a
+    property of the one target field a panel draws, and a simulation-level
+    aggregate of it would admit a simulation whose drawn snapshot is cold. The
+    pseudo-replication argument that governs ``select_case`` concerns
+    population statistics; nothing here estimates one.
+
+    The target is fixed on the full pool before accuracy is consulted, so the
+    accuracy preference can move the pick only within the band and never
+    redefines what the quantile is.
+    """
+    if not 0.0 <= quantile <= 1.0:
+        raise SelectionError(f"quantile must be in [0, 1], got {quantile}")
+    if band < 0.0:
+        raise SelectionError(f"band must be non-negative, got {band}")
+
+    df = getattr(records, "df", records)
+    for col in (peak_metric, accuracy_metric):
+        if col not in df.columns:
+            raise SelectionError(f"{col!r} is not a pair-level column")
+    df = _apply_filter(df, strata_filter)
+    if seed is not None and "seed" in df.columns:
+        df = df[df["seed"].astype(str) == str(seed)]
+        if df.empty:
+            raise SelectionError(f"no rows for seed {seed!r}")
+
+    peak = pd.to_numeric(df[peak_metric], errors="coerce").to_numpy(dtype=np.float64)
+    acc = pd.to_numeric(df[accuracy_metric], errors="coerce").to_numpy(dtype=np.float64)
+    ok = df[np.isfinite(peak) & np.isfinite(acc)].copy()
+    if ok.empty:
+        raise SelectionError(
+            f"no pair has finite {peak_metric} and {accuracy_metric}")
+    ok["_peak"] = pd.to_numeric(ok[peak_metric], errors="coerce")
+    ok["_acc"] = pd.to_numeric(ok[accuracy_metric], errors="coerce")
+    ok = ok.sort_values(["_peak", "sim_id", "s", "j"], kind="mergesort")
+    ok["_pos"] = np.arange(len(ok))
+
+    n = len(ok)
+    # Rounded before ceil/floor: 0.8 * 30 is 24.000000000000004 in binary, and
+    # an unrounded ceil would silently drop position 24 from the band.
+    def position(q):
+        return round(q * (n - 1), 9)
+
+    target = int(np.clip(np.ceil(position(quantile)), 0, n - 1))
+    lo = int(np.clip(np.ceil(position(quantile - band)), 0, target))
+    hi = int(np.clip(np.floor(position(quantile + band)), target, n - 1))
+    pool = ok.iloc[lo:hi + 1].copy()
+    pool["_dist"] = (pool["_pos"] - target).abs()
+    pick = pool.sort_values(["_acc", "_dist", "sim_id", "s", "j"],
+                            kind="mergesort").iloc[0]
+
+    return PeakCaseSelection(
+        sim_id=int(pick["sim_id"]),
+        s=int(pick["s"]),
+        j=int(pick["j"]),
+        quantile=float(quantile),
+        band=float(band),
+        peak_metric=peak_metric,
+        target_peak=float(ok["_peak"].iloc[target]),
+        peak_value=float(pick["_peak"]),
+        peak_rank=int(pick["_pos"]) + 1,
+        n_pairs=n,
+        n_candidates=len(pool),
+        accuracy_metric=accuracy_metric,
+        accuracy_value=float(pick["_acc"]),
+        seed=str(pick["seed"]) if "seed" in pick.index else "",
+        benchmark=str(pick["benchmark"]) if "benchmark" in pick.index else "",
+        strata=_case_strata(pick, strata_filter),
+        protocol_version=PEAK_PROTOCOL_VERSION,
+    )
 
 
 def select_lead_columns(records, selection: CaseSelection, *,
@@ -271,11 +412,16 @@ def selection_context(sims, metric: str, selection: CaseSelection) -> np.ndarray
 __all__ = [
     "DEFAULT_TIE_BREAK_SEED",
     "PAIR_RULES",
+    "PEAK_BAND",
+    "PEAK_PROTOCOL_VERSION",
+    "PEAK_QUANTILE",
     "PROTOCOL_VERSION",
     "CaseSelection",
+    "PeakCaseSelection",
     "SelectionError",
     "select_case",
     "select_case_grid",
+    "select_peak_case",
     "select_lead_columns",
     "selection_context",
 ]

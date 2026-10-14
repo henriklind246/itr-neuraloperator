@@ -15,12 +15,20 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-$HOME/repos/itr-neuraloperator}"
 export PROJECT_ROOT="$PROJECT_DIR"
 DATA_OUT_DIR="${DATA_OUT_DIR:-$PROJECT_DIR/data}"
-NUM_SIMS="${NUM_SIMS:-8000}"
 
 # Active benchmark adapter (forcing|interfaces|source). Selects sampling +
 # physics + item representation. generate_dataset.py reads $BENCHMARK as the
 # default for --benchmark, so exporting it here is sufficient.
 export BENCHMARK="${BENCHMARK:-forcing}"
+
+GENERATOR_ARGS=(--dt 0.005)
+if [[ "$BENCHMARK" == "interfaces" ]]; then
+    NUM_SIMS="${NUM_SIMS:-4000}"
+    # Preserve the physical snapshot cadence and ramp when refining solver time.
+    GENERATOR_ARGS=(--dt 0.0003125 --save-stride 32 --ramp-seconds 0.01)
+else
+    NUM_SIMS="${NUM_SIMS:-8000}"
+fi
 
 if [[ $# -gt 0 && "$1" != -* ]]; then
     DATA_OUT_DIR="$1"
@@ -46,6 +54,7 @@ echo "PROJECT_ROOT=$PROJECT_ROOT"
 echo "DATA_OUT_DIR=$DATA_OUT_DIR"
 echo "NUM_SIMS=$NUM_SIMS"
 echo "BENCHMARK=$BENCHMARK"
+echo "Generator defaults: ${GENERATOR_ARGS[*]}"
 echo "Extra generator args: $*"
 
 # ──── Run ────
@@ -55,6 +64,7 @@ python "$PROJECT_DIR/data/generate_dataset.py" \
     --num-sims "$NUM_SIMS" \
     --save-dir "$DATA_OUT_DIR" \
     --benchmark "$BENCHMARK" \
+    "${GENERATOR_ARGS[@]}" \
     "$@"
 
 echo "Job $SLURM_JOB_ID finished at $(date)"

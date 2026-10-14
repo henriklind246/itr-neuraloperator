@@ -294,6 +294,7 @@ def generate_sim_data(
     ic_families: list[str] | None = None,
     ramp_seconds: float | None = None,
     rng_seed: int = 0,
+    dt: float = 0.005,
 ) -> None:
     benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
     spec = get_problem(benchmark)
@@ -304,6 +305,7 @@ def generate_sim_data(
 
     setup = build_base_setup(
         num_sims=num_sims, save_stride=save_stride, nx=nx, ny=ny,
+        dt=dt,
         ramp_seconds=ramp_seconds, lhs_seed=seeds["lhs"], ic_families=ic_families,
         forcing_profile_seed=seeds["forcing_profile"],
     )
@@ -386,6 +388,10 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
     parser.add_argument("--nx", type=int, default=100, help="Number of x-direction grid nodes.")
     parser.add_argument("--ny", type=int, default=100, help="Number of y-direction grid nodes.")
     parser.add_argument(
+        "--dt", type=float, default=0.005,
+        help="Solver timestep in seconds. Saved snapshot spacing is dt * save-stride.",
+    )
+    parser.add_argument(
         "--save-stride",
         type=int,
         default=2,
@@ -449,6 +455,7 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         ic_families=ic_families,
         ramp_seconds=args.ramp_seconds,
         rng_seed=args.rng_seed,
+        dt=args.dt,
     )
     return 0
 

@@ -479,18 +479,20 @@ def _transverse_grid(run_dir_str: str) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def _lookup(grid: np.ndarray, sim_ids, targets) -> np.ndarray:
-    """Read a ``(n_sims, n_times)`` grid at ``(sim_id, j)``, zero off the edge.
+def _lookup(grid: np.ndarray, sim_ids, targets, fill: float = 0.0) -> np.ndarray:
+    """Read a ``(n_sims, n_times)`` grid at ``(sim_id, j)``, ``fill`` off the edge.
 
     Records can name a ``(sim_id, j)`` the loaded trajectories do not carry --
     a records file written against a larger dataset than the one the manifest
-    resolves to. Those score zero and are dropped by every threshold rather
-    than raising, which is the same outcome as being genuinely featureless.
+    resolves to. With the default zero those are dropped by every threshold
+    rather than raising, which is the same outcome as being genuinely
+    featureless. A quantity that is ranked rather than thresholded passes NaN
+    instead, so the missing pairs leave the pool rather than sit at its bottom.
     """
     sim = np.asarray(sim_ids, dtype=np.int64)
     tgt = np.asarray(targets, dtype=np.int64)
     inside = (sim >= 0) & (sim < grid.shape[0]) & (tgt >= 0) & (tgt < grid.shape[1])
-    out = np.zeros(sim.shape, dtype=np.float64)
+    out = np.full(sim.shape, fill, dtype=np.float64)
     out[inside] = grid[sim[inside], tgt[inside]]
     return out
 
@@ -719,6 +721,52 @@ def field_contrast_note(minimum: float = MIN_FIELD_CONTRAST_K) -> str:
             f"unrestricted pool")
 
 
+# ----------------------------------------------------------- peak temperature
+
+@lru_cache(maxsize=8)
+def _peak_temperature_grid(run_dir_str: str) -> np.ndarray:
+    """``(n_sims, n_times)`` maximum truth temperature, in Kelvin."""
+    traj = np.asarray(_load(run_dir_str).trajectories, dtype=np.float64)
+    return traj.max(axis=(2, 3))
+
+
+def peak_temperature(bundle_: RunBundle, sim_ids, targets) -> np.ndarray:
+    """Maximum truth temperature at each ``(sim_id, j)``; NaN where not loaded."""
+    return _lookup(_peak_temperature_grid(str(bundle_.run_dir)), sim_ids, targets,
+                   fill=np.nan)
+
+
+def select_peak_temperature_case(bundle_: RunBundle, pair_df, *,
+                                 strata_filter: dict | None = None, **kwargs):
+    """:func:`select.select_peak_case` on the target field's ``T_max_K``.
+
+    ``test_records.csv`` carries no field maximum, so it is read off the
+    bundle's trajectories at each pair's target index. When the records span
+    several seeds, only the bundle's own seed is ranked: the accuracy that
+    decides the pick has to be the accuracy of the checkpoint the figure then
+    evaluates.
+    """
+    from visual.pub import select
+
+    pair_df = getattr(pair_df, "df", pair_df)
+    frame = pair_df.assign(T_max_K=peak_temperature(
+        bundle_, pair_df["sim_id"].to_numpy(), pair_df["j"].to_numpy()))
+    seed = Path(bundle_.run_dir).name
+    seed = seed[len("seed"):] if seed.startswith("seed") else seed
+    if "seed" not in frame.columns or seed not in set(frame["seed"].astype(str)):
+        seed = None
+    return select.select_peak_case(frame, peak_metric="T_max_K",
+                                   strata_filter=strata_filter, seed=seed, **kwargs)
+
+
+def peak_selection_note(quantile: float, band: float, accuracy_metric: str) -> str:
+    """One sidecar-ready sentence describing the peak-temperature case rule."""
+    return (f"snapshot pairs ranked by the truth target field's maximum "
+            f"temperature within each column's pool; the target is the "
+            f"p{100 * quantile:g} pair, and the pair shown is the lowest "
+            f"{accuracy_metric} among pairs within +/-{band:g} quantile of it")
+
+
 # -------------------------------------------------------- node-jump contrast
 
 # Peak-to-peak spread of the truth *adjacent-node* jump along y, in Kelvin.
@@ -807,6 +855,7 @@ def case_metrics(case: CaseFields) -> list[dict]:
         dnode = pred_node[i] - truth_node[i]
         out.append({
             "j": case.targets[i],
+            "T_max_K": float(case.truth[i].max()),
             "t_target": float(case.t_targets[i]),
             "lead_time": float(case.lead_times[i]),
             "rmse_K": float(np.sqrt(sse / max(n, 1))),
@@ -852,8 +901,11 @@ __all__ = [
     "node_jump_contrast",
     "node_jump_contrast_note",
     "node_jump_contrast_pairs",
+    "peak_selection_note",
+    "peak_temperature",
     "resistance",
     "run_dirs",
+    "select_peak_temperature_case",
     "select_transverse_case",
     "source_patch",
     "transverse_fraction",

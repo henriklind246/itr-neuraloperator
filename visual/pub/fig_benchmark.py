@@ -83,11 +83,20 @@ CASE_CONTRAST = {
     "interfaces": ("interface_x_bin", 3),
 }
 
+# How each case column is chosen; see `cases`. The quantile is of the truth
+# target field's maximum temperature over that column's test pairs, so every
+# column shows a large excursion rather than a typical, often barely-heated,
+# snapshot. Accuracy then picks within the band, never outside it.
+CASE_PEAK_QUANTILE = select.PEAK_QUANTILE
+CASE_PEAK_BAND = select.PEAK_BAND
+CASE_ACCURACY_METRIC = "rel_l2_pct"
+
 # A second stratum pinned to one distinct level per contrast column. `forcing`
 # crosses four temporal families with four spatial profiles, and selecting on
 # the temporal family alone leaves the profile to whichever simulation happens
-# to be that family's median -- which drew `gaussian` twice and `triangle`
-# twice, so the figure showed half the spatial factor and repeated itself.
+# to be that family's selected case -- which drew `gaussian` twice and
+# `triangle` twice, so the figure showed half the spatial factor and repeated
+# itself.
 #
 # Three columns cannot cover a 4x4 product, so the pairing is chosen for
 # contrast rather than for coverage: broad and smooth (`sin` / `uniform`),
@@ -424,25 +433,18 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
       jump evidence is consolidated into its own cross-benchmark figure, where
       four curves can be compared directly instead of being spread one per
       column across four figures on four different y scales.
-    * Cases come from ``select.select_case`` at the **stratum** median, one per
-      contrasting stratum value, so the figure shows a declared median case in
-      each regime rather than whichever case looks most dramatic. The chosen
-      ``(sim_id, s, j)``, ``t_s``, ``t_j`` and lead time go on the panel and into
-      the sidecar.
+    * Cases come from ``fields.select_peak_temperature_case``, one per
+      contrasting stratum value: within that column's test pairs, ranked by the
+      truth target field's maximum temperature, the most accurate (lowest
+      ``CASE_ACCURACY_METRIC``) pair within ``CASE_PEAK_BAND`` quantile of the
+      ``CASE_PEAK_QUANTILE`` pair. Every column therefore shows a large
+      temperature excursion for its level, predicted well. The chosen
+      ``(sim_id, s, j)``, ``T_max``, ``t_s``, ``t_j`` and lead time go into the
+      sidecar.
     * Truth and prediction share one sequential scale across the whole figure
       via ``style.shared_color_limits(mode="sequential")``; residuals share one
       symmetric diverging scale. Per-column scales would rescale each column
       against itself and hide the amplitude difference between the levels.
-    * Selection is restricted twice before the median rule runs, and the rule is
-      unchanged inside the restricted pool. ``fields.MIN_TRANSVERSE_FRACTION``
-      keeps cases whose truth field varies along ``y``, so the maps are not
-      effectively 1-D; ``fields.MIN_FIELD_CONTRAST_K`` keeps cases that span a
-      visible temperature range, so no column is a flat 300 K block under the
-      figure-wide shared scale. The two are independent -- a field can be
-      strongly transverse and almost isothermal -- and a qualitative panel needs
-      both. The transverse filter pulls toward earlier targets, where the
-      benchmarks still have structure, and the contrast filter pulls away from
-      the earliest, where nothing has happened yet.
     * The contrast per benchmark, sized to what that benchmark varies rather
       than to a uniform column count:
 
@@ -472,31 +474,24 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
     stratum, wanted = CASE_CONTRAST.get(benchmark, ("lead_bin", 3))
     cover_stratum, cover_map = CASE_COVER.get(benchmark, (None, {}))
     strata = (stratum,) + ((cover_stratum,) if cover_stratum else ())
-    sims = stats.per_sim(frame, strata=strata,
-                         metrics=("rmse_K", "rel_l2_pct"))
-    # The pair frame needs the same stratum columns, since case selection filters
-    # at both levels; assigning it here rather than reaching into per_sim keeps
-    # the two calls on one deterministic set of bin edges.
     pair_df = stats.assign_strata(frame.df, strata)
-    levels = _contrast_levels(sims.df, stratum, wanted)
+    levels = _contrast_levels(pair_df, stratum, wanted)
     if not levels:
         blocked(requirement,
                 f"{benchmark} records carry no usable {stratum} contrast",
                 key=key)
 
     bundle = fields.bundle(source, benchmark)
-    picks, cases_, stat, restricted, filters = [], [], [], [], []
+    picks, cases_, stat, filters = [], [], [], []
     for level in levels:
         strata_filter = {stratum: level}
         if level in cover_map:
             strata_filter[cover_stratum] = cover_map[level]
         filters.append(strata_filter)
-        pick, is_2d = fields.select_transverse_case(
-            bundle, sims.df, pair_df, quantile=0.5, metric="rmse_K",
-            min_field_contrast_K=fields.MIN_FIELD_CONTRAST_K,
-            strata_filter=strata_filter)
+        pick = fields.select_peak_temperature_case(
+            bundle, pair_df, quantile=CASE_PEAK_QUANTILE, band=CASE_PEAK_BAND,
+            accuracy_metric=CASE_ACCURACY_METRIC, strata_filter=strata_filter)
         picks.append(pick)
-        restricted.append(is_2d)
         case = fields.evaluate_case(bundle, pick.sim_id, pick.s, (pick.j,))
         cases_.append(case)
         stat.append(fields.case_metrics(case)[0])
@@ -599,7 +594,7 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
         if benchmark not in CASE_UNANNOTATED:
             axes[0][col].text(
                 0.02, 0.02,
-                f"sim {pick.sim_id} ({pick.rank_in_sims}/{pick.n_sims})\n"
+                f"sim {pick.sim_id}\n"
                 f"$t_s$={case.t_source:.3g}\n"
                 f"$\\bar t$={stat[col]['lead_time']:.3g}",
                 transform=axes[0][col].transAxes, fontsize=5.0, color="w",
@@ -627,22 +622,21 @@ def cases(*, benchmark: str, source=None, spec=None, requirement=None):
         "pinned_stratum": cover_stratum,
         "pinned_levels": {lev: f[cover_stratum] for lev, f in zip(levels, filters)
                           if cover_stratum in f},
-        "selection": f"median simulation by pooled rmse_K within each {stratum} "
-                     "level, median pair within that simulation"
+        "selection": fields.peak_selection_note(
+            CASE_PEAK_QUANTILE, CASE_PEAK_BAND, CASE_ACCURACY_METRIC)
+                     + f"; one column per {stratum} level"
                      + (f", with {cover_stratum} pinned to one distinct level "
                         "per column" if cover_stratum else ""),
-        "transverse_restriction": fields.transverse_note(all(restricted)),
-        "transverse_minimum": fields.MIN_TRANSVERSE_FRACTION,
-        "field_contrast_restriction": fields.field_contrast_note(),
-        "field_contrast_minimum_K": fields.MIN_FIELD_CONTRAST_K,
+        "peak_quantile": CASE_PEAK_QUANTILE,
+        "peak_band": CASE_PEAK_BAND,
+        "accuracy_metric": CASE_ACCURACY_METRIC,
         "color_scales": "one sequential temperature scale and one symmetric "
                         "diverging residual scale, each shared across every "
                         "panel in the figure",
         "temperature_limits": [temp_limits.vmin, temp_limits.vmax],
         "residual_limits": [residual_limits.vmin, residual_limits.vmax],
-        "cases": [{"level": lev, "transverse_restricted": bool(r),
-                   **p.to_dict(), **m}
-                  for lev, p, m, r in zip(levels, picks, stat, restricted)],
+        "cases": [{"level": lev, **p.to_dict(), **m}
+                  for lev, p, m in zip(levels, picks, stat)],
     }
     return fig, picks[0], metric_definition
 

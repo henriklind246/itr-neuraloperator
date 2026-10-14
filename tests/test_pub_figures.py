@@ -1154,3 +1154,37 @@ def test_node_jump_figure_draws_both_rows_and_records_the_decimation(monkeypatch
     parity_text = [t.get_text() for ax in fig.axes[4:8] for t in ax.texts]
     assert parity_text and not any("slope" in t for t in parity_text)
     plt.close(fig)
+
+
+def test_peak_temperature_case_ranks_truth_maxima_of_the_bundle_seed(monkeypatch):
+    """T_max comes from the trajectories, off-grid pairs leave the pool, and
+    only the evaluated checkpoint's seed decides accuracy."""
+    grid = 300.0 + np.arange(40, dtype=float).reshape(20, 2)
+    monkeypatch.setattr(fields, "_peak_temperature_grid", lambda _run: grid)
+    bundle = SimpleNamespace(run_dir=Path("runs/x/config0/seed42"))
+
+    own = pd.DataFrame({"sim_id": np.repeat(np.arange(20), 2),
+                        "s": 0, "j": np.tile([0, 1], 20), "seed": "42",
+                        "rel_l2_pct": 1.0})
+    other = own.assign(seed="43", rel_l2_pct=0.0)
+    off_grid = pd.DataFrame({"sim_id": [500], "s": [0], "j": [0], "seed": ["42"],
+                             "rel_l2_pct": [0.0]})
+    sel = fields.select_peak_temperature_case(
+        bundle, pd.concat([own, other, off_grid], ignore_index=True))
+
+    assert sel.seed == "42"
+    assert sel.n_pairs == 40
+    assert sel.peak_value == sel.target_peak == 300.0 + 34.0
+    assert np.isnan(fields.peak_temperature(bundle, [500], [0])[0])
+
+
+def test_case_metrics_report_the_truth_peak():
+    case = SimpleNamespace(
+        truth=np.full((1, 4, 3), 300.0), pred=np.full((1, 4, 3), 300.5),
+        mu_global=300.0, targets=(5,), t_targets=np.array([0.2]),
+        lead_times=np.array([0.1]),
+        contact_jumps=lambda: (np.zeros((1, 3)), np.zeros((1, 3))),
+        node_jumps=lambda: (np.zeros((1, 3)), np.zeros((1, 3))),
+    )
+    case.truth[0, 2, 1] = 317.0
+    assert fields.case_metrics(case)[0]["T_max_K"] == 317.0

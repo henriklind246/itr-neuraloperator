@@ -2,6 +2,7 @@ import numpy as np
 
 from data.generate_dataset import (
     IC_ASSIGN_SEED,
+    build_base_setup,
     build_sim_params,
     generate_sim_data,
     generate_lhs_samples,
@@ -191,13 +192,37 @@ class TestGenerateSimData:
 
         save_dir = tmp_path / "custom_data"
         exit_code = generate_main(
-            ["--num-sims", "17", "--save-dir", str(save_dir)],
+            ["--num-sims", "17", "--save-dir", str(save_dir),
+             "--dt", "0.0003125", "--save-stride", "32", "--ramp-seconds", "0.01"],
             generate_fn=fake_generate,
         )
 
         assert exit_code == 0
         assert calls["num_sims"] == 17
         assert calls["save_dir"] == save_dir
+        assert calls["dt"] == 0.0003125
+        assert calls["save_stride"] == 32
+        assert calls["ramp_seconds"] == 0.01
+
+    def test_refined_interfaces_keeps_snapshot_cadence_and_physical_ramp(self, tmp_path):
+        from problems.registry import get_problem
+
+        generate_main([
+            "--benchmark", "interfaces", "--num-sims", "1",
+            "--nx", "12", "--ny", "12", "--save-dir", str(tmp_path),
+            "--dt", "0.0003125", "--save-stride", "32", "--ramp-seconds", "0.01",
+        ])
+        trajectory = np.load(tmp_path / "trajectories.npy")
+        assert trajectory.shape == (1, 31, 12, 12)
+        np.testing.assert_allclose(np.load(tmp_path / "t_grid.npy"), np.linspace(0, T_FINAL, 31))
+        assert float(np.load(tmp_path / "dt.npy")) == 0.0003125
+        assert float(np.load(tmp_path / "ramp_seconds.npy")) == 0.01
+
+        params = np.load(tmp_path / "sim_params.npy", allow_pickle=True)[0]
+        setup = build_base_setup(1, 32, nx=12, ny=12, dt=0.0003125, ramp_seconds=0.01)
+        solver = get_problem("interfaces").configure_solver(params, setup["base_kwargs"])
+        _, _, _, expected = solver.solve(params["T0"], store_trajectory=True)
+        np.testing.assert_array_equal(trajectory[0], expected[::32].astype(np.float32))
 
     def test_generate_sim_data_smoke_writes_outputs_to_data_dir_with_ic_metadata(
         self, tmp_path, monkeypatch, capsys,

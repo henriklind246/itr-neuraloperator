@@ -409,3 +409,151 @@ class TestGolden:
         assert sel.rank_in_sims == 51
         assert sel.n_sims == 101
         assert sel.protocol_version == 1
+
+
+# ---------------------------------------------------------------------------
+# peak-temperature rule (the per-benchmark case figures)
+# ---------------------------------------------------------------------------
+
+
+def make_peak_pairs(peaks, errors, *, seed: str = "42", strata=None) -> pd.DataFrame:
+    """Pair ``k`` has ``T_max_K = peaks[k]`` and ``rel_l2_pct = errors[k]``."""
+    rows = []
+    for k, (peak, err) in enumerate(zip(peaks, errors)):
+        row = {"sim_id": k // 3, "s": 0, "j": k % 3 + 1, "seed": seed,
+               "benchmark": "forcing", "T_max_K": float(peak),
+               "rel_l2_pct": float(err)}
+        if strata is not None:
+            row.update(strata(k))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def peak_ladder(errors=None) -> pd.DataFrame:
+    """101 pairs with ``T_max_K`` 300 .. 400, so p85 is exactly 385 K."""
+    return make_peak_pairs(300.0 + np.arange(101),
+                           np.ones(101) if errors is None else errors)
+
+
+class TestPeakCase:
+    def test_equal_accuracy_falls_to_the_quantile_pair(self):
+        sel = select.select_peak_case(peak_ladder(), peak_metric="T_max_K")
+        assert sel.target_peak == sel.peak_value == 385.0
+        assert sel.peak_rank == 86
+        assert sel.n_pairs == 101
+        assert sel.n_candidates == 11
+
+    def test_most_accurate_pair_in_the_band_wins(self):
+        errors = np.ones(101)
+        errors[82], errors[88] = 0.2, 0.3
+        sel = select.select_peak_case(peak_ladder(errors), peak_metric="T_max_K")
+        assert sel.peak_value == 382.0
+        assert sel.accuracy_value == pytest.approx(0.2)
+
+    def test_accuracy_outside_the_band_is_never_chosen(self):
+        errors = np.ones(101)
+        errors[50] = errors[100] = 0.0
+        sel = select.select_peak_case(peak_ladder(errors), peak_metric="T_max_K")
+        assert 380.0 <= sel.peak_value <= 390.0
+
+    def test_target_is_fixed_before_accuracy_is_consulted(self):
+        sel = select.select_peak_case(peak_ladder(np.linspace(5.0, 0.1, 101)),
+                                      peak_metric="T_max_K")
+        assert sel.target_peak == 385.0
+        assert sel.peak_value == 390.0
+
+    def test_band_edges_survive_binary_rounding(self):
+        # 0.8 * 30 is 24.000000000000004; position 24 must stay in the band.
+        errors = np.ones(31)
+        errors[24] = 0.0
+        pairs = make_peak_pairs(300.0 + np.arange(31), errors)
+        sel = select.select_peak_case(pairs, peak_metric="T_max_K",
+                                      quantile=0.85, band=0.05)
+        assert sel.peak_value == 324.0
+
+    def test_zero_band_is_the_plain_quantile(self):
+        errors = np.ones(101)
+        errors[84] = 0.0
+        sel = select.select_peak_case(peak_ladder(errors), peak_metric="T_max_K",
+                                      band=0.0)
+        assert sel.peak_value == 385.0
+        assert sel.n_candidates == 1
+
+    def test_input_order_does_not_change_the_pick(self):
+        rng = np.random.default_rng(0)
+        pairs = make_peak_pairs(rng.uniform(300, 400, 60), rng.uniform(0.1, 3, 60))
+        shuffled = pairs.sample(frac=1.0, random_state=1)
+        a = select.select_peak_case(pairs, peak_metric="T_max_K")
+        b = select.select_peak_case(shuffled, peak_metric="T_max_K")
+        assert (a.sim_id, a.s, a.j) == (b.sim_id, b.s, b.j)
+
+    def test_quantile_is_taken_within_the_strata_filter(self):
+        # Even pairs run 300..400 K, odd pairs 1000 K hotter. Ranking the even
+        # column must not see the odd ones, or its p85 would be unreachable.
+        peaks = [300.0 + k // 2 if k % 2 == 0 else 1300.0 + k // 2
+                 for k in range(202)]
+        pairs = make_peak_pairs(peaks, np.ones(202),
+                                strata=lambda k: {"regime": "left" if k % 2 == 0
+                                                  else "right"})
+        sel = select.select_peak_case(pairs, peak_metric="T_max_K",
+                                      strata_filter={"regime": "left"})
+        assert sel.peak_value == 385.0
+        assert sel.n_pairs == 101
+        assert sel.strata["regime"] == "left"
+
+    def test_only_the_named_seed_is_ranked(self):
+        a = peak_ladder()
+        b = make_peak_pairs(300.0 + np.arange(101), np.ones(101), seed="43")
+        b.loc[90, "rel_l2_pct"] = 0.0
+        sel = select.select_peak_case(pd.concat([a, b]), peak_metric="T_max_K",
+                                      seed="42")
+        assert sel.seed == "42"
+        assert sel.peak_value == 385.0
+
+    def test_nonfinite_pairs_leave_the_pool(self):
+        pairs = peak_ladder()
+        extra = make_peak_pairs([np.nan] * 20, np.ones(20))
+        extra["sim_id"] += 1000
+        sel = select.select_peak_case(pd.concat([pairs, extra]),
+                                      peak_metric="T_max_K")
+        assert sel.n_pairs == 101
+        assert sel.peak_value == 385.0
+
+    def test_bad_arguments_raise(self):
+        pairs = peak_ladder()
+        with pytest.raises(select.SelectionError):
+            select.select_peak_case(pairs, peak_metric="T_max_K", quantile=1.5)
+        with pytest.raises(select.SelectionError):
+            select.select_peak_case(pairs, peak_metric="T_max_K", band=-0.1)
+        with pytest.raises(select.SelectionError):
+            select.select_peak_case(pairs, peak_metric="not_a_column")
+        with pytest.raises(select.SelectionError):
+            select.select_peak_case(pairs, peak_metric="T_max_K",
+                                    accuracy_metric="not_a_column")
+        with pytest.raises(select.SelectionError):
+            select.select_peak_case(pairs, peak_metric="T_max_K", seed="99")
+
+    def test_record_round_trips_and_names_the_rule(self):
+        sel = select.select_peak_case(peak_ladder(), peak_metric="T_max_K")
+        payload = sel.to_dict()
+        assert set(payload) == set(select.PeakCaseSelection.__dataclass_fields__)
+        assert select.PeakCaseSelection(**payload) == sel
+        assert sel.label == ("sim 28, T_max_K rank 86/101 "
+                             "(p85, best rel_l2_pct of 11)")
+        assert "peak sel v1" in sel.footer_field()
+
+
+class TestPeakGolden:
+    """Brittle on purpose, like :class:`TestGolden`: bump the version with it."""
+
+    def test_peak_protocol_is_pinned(self):
+        assert select.PEAK_PROTOCOL_VERSION == 1
+        assert select.PEAK_QUANTILE == 0.85
+        assert select.PEAK_BAND == 0.05
+
+    def test_golden_peak_case(self):
+        errors = 1.0 + 0.01 * ((np.arange(101) * 37) % 11)
+        sel = select.select_peak_case(peak_ladder(errors), peak_metric="T_max_K")
+        assert (sel.sim_id, sel.s, sel.j) == (29, 0, 2)
+        assert sel.peak_rank == 89
+        assert sel.protocol_version == 1
