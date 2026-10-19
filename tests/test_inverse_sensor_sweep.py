@@ -64,6 +64,12 @@ def _write_mock_forcing_results(command: list[str]) -> None:
                 "n_sensors": count,
                 "noise_seed": sid,
                 "noise_std_K": noise_std_K,
+                "sigma_sensor_K": 5.0, "S_sensor_K": 10.0,
+                "eta_noise_pct": 100 * noise_std_K / 5.0,
+                "eta_rise_pct": 100 * noise_std_K / 10.0,
+                "sensor_scale_observation_count": len(sim_ids) * count * 3,
+                "sensor_scale_simulation_count": len(sim_ids),
+                "R_c_profile_rel_l2_pct": 100 * abs(signed_error) / true_value,
                 "R_c_true": true_value,
                 "R_c_map": map_value,
                 "R_c_abs_error": abs(signed_error),
@@ -110,10 +116,15 @@ def _paper_summary_rows(benchmark: str) -> list[dict[str, object]]:
     rows = []
     for count in sweep.SENSOR_COUNTS:
         scale = 8.0 / count
-        for sim_id in range(1, 9):
+        for sim_id in range(1, sweep.N_CASES + 1):
             row = {
                 "benchmark": benchmark, "sim_id": sim_id, "n_sensors": count,
                 "noise_seed": sim_id, "init_seed": 0, "noise_std_K": 0.25,
+                "sigma_sensor_K": 5.0, "S_sensor_K": 10.0,
+                "eta_noise_pct": 5.0, "eta_rise_pct": 2.5,
+                "sensor_scale_observation_count": sweep.N_CASES * count * 3,
+                "sensor_scale_simulation_count": sweep.N_CASES,
+                "R_c_profile_rel_l2_pct": 2.0 * sim_id * scale,
                 "fv_resid_rms_K": (0.15 + 0.01 * sim_id) * scale,
                 "fv_resid_over_noise": (0.15 + 0.01 * sim_id) * scale / 0.25,
             }
@@ -142,25 +153,44 @@ def test_paper_summary_contains_all_table_statistics(tmp_path, benchmark):
     names = [spec.parameter for spec in sweep.specs_for(benchmark)]
     assert result["status"] == "complete"
     assert result["parameters"] == names
-    assert result["reported_statistics"] == ["parameter_recovery", "fv_verification", "parameter_profile_intervals"]
+    assert result["reported_statistics"] == ["parameter_recovery", "fv_verification", "parameter_profile_intervals", "itr_profile_recovery", "sensor_noise"]
     assert Path(result["json"]).is_file()
     arm8 = result["by_sensor_count"][0]
     for i, name in enumerate(names):
         metrics = arm8["parameters"][name]
-        expected_errors = (i + 1) * np.arange(1, 9) * 0.01
+        expected_errors = (i + 1) * np.arange(1, sweep.N_CASES + 1) * 0.01
         assert metrics["recovery"]["absolute_error"]["median"] == pytest.approx(np.median(expected_errors))
         assert metrics["recovery"]["relative_error_pct"]["median"] == pytest.approx(np.median(expected_errors) * 200)
         assert metrics["recovery"]["rmse"] == pytest.approx(np.sqrt(np.mean(expected_errors**2)))
         profile = metrics["profile_interval"]
-        assert profile["width"]["n"] == 5
-        assert profile["width"]["median"] == pytest.approx((i + 1) * np.median(0.10 + 0.01 * np.arange(4, 9)))
+        assert profile["width"]["n"] == sweep.N_CASES - 3
+        assert profile["width"]["median"] == pytest.approx((i + 1) * np.median(0.10 + 0.01 * np.arange(4, sweep.N_CASES + 1)))
         assert profile["bound_limited_cases"] == 3
-    assert arm8["fv_verification"]["residual_K"]["median"] == pytest.approx(0.195)
+    assert arm8["fv_verification"]["residual_K"]["median"] == pytest.approx(0.15 + 0.01 * (sweep.N_CASES + 1) / 2)
+    assert arm8["R_c_profile_rel_l2_pct"]["median"] == pytest.approx(sweep.N_CASES + 1)
+    assert arm8["R_c_profile_rel_l2_pct"]["n"] == sweep.N_CASES
+    assert arm8["sensor_noise"]["eta_noise_pct"] == 5.0
+    assert arm8["sensor_noise"]["eta_rise_pct"] == 2.5
     with Path(result["csv"]).open(newline="") as handle:
         flat = list(csv.DictReader(handle))
     assert len(flat) == 3 * len(names)
     assert set(flat[0]) == set(sweep._PAPER_SUMMARY_COLUMNS)
     assert {row["parameter"] for row in flat} == set(names)
+    assert float(flat[0]["R_c_profile_rel_l2_pct_median"]) == pytest.approx(sweep.N_CASES + 1)
+    assert float(flat[0]["sigma_sensor_K"]) == 5.0
+
+
+def test_summary_serializes_undefined_sensor_noise_ratios(tmp_path):
+    rows = _paper_summary_rows("forcing")
+    for row in rows:
+        row.update(sigma_sensor_K=0.0, S_sensor_K=0.0,
+                   eta_noise_pct=float("nan"), eta_rise_pct=float("nan"))
+    combined = tmp_path / "inverse_sensor_sweep.csv"
+    sweep._write_csv(combined, rows)
+    summary = sweep.generate_paper_summary(combined, benchmark="forcing", out_dir=tmp_path)
+    assert all(arm["sensor_noise"]["eta_noise_pct"] is None for arm in summary["by_sensor_count"])
+    assert all(arm["sensor_noise"]["eta_rise_pct"] is None for arm in summary["by_sensor_count"])
+    assert "NaN" not in Path(summary["json"]).read_text()
 
 
 def test_summary_handles_no_closed_intervals_and_near_zero_amplitude(tmp_path):
@@ -175,11 +205,11 @@ def test_summary_handles_no_closed_intervals_and_near_zero_amplitude(tmp_path):
     result = sweep.generate_paper_summary(combined, benchmark="forcing_itr_sin", out_dir=tmp_path)
     for arm in result["by_sensor_count"]:
         amp = arm["parameters"]["A"]
-        assert amp["recovery"]["relative_error_undefined_cases"] == 8
+        assert amp["recovery"]["relative_error_undefined_cases"] == sweep.N_CASES
         assert amp["recovery"]["relative_error_pct"]["n"] == 0
         assert amp["profile_interval"]["width"]["median"] is None
         assert amp["profile_interval"]["width"]["n"] == 0
-        assert arm["parameters"]["R_base"]["recovery"]["relative_error_pct"]["n"] == 8
+        assert arm["parameters"]["R_base"]["recovery"]["relative_error_pct"]["n"] == sweep.N_CASES
     assert "NaN" not in Path(result["json"]).read_text()
 
 
@@ -303,7 +333,7 @@ def test_command_builders_fix_the_reviewer_protocol(tmp_path):
         benchmark="forcing",
         result_path=tmp_path / "results.csv",
         artifact_dir=tmp_path / "artifacts",
-        sim_ids=list(range(8)),
+        sim_ids=list(range(sweep.N_CASES)),
     )
     for command in (calibration, inversion):
         assert _option(command, "--sensor-layout") == "interface_band"
@@ -348,7 +378,7 @@ def test_joint_nll_grid_is_requested_only_where_two_parameters_are_recovered(tmp
         "calibration_path": tmp_path / "calibration.npz",
         "result_path": tmp_path / "results.csv",
         "artifact_dir": tmp_path / "artifacts",
-        "sim_ids": list(range(8)),
+        "sim_ids": list(range(sweep.N_CASES)),
     }
     # The joint surface is only defined over a 2-d parameter space, and
     # scripts/invert.py rejects the flag outright for any other theta_dim, so
@@ -414,7 +444,7 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     assert sum("--out-csv" in command for command in commands) == 3
     with combined.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert len(rows) == 24
+    assert len(rows) == 3 * sweep.N_CASES
     assert {int(row["n_sensors"]) for row in rows} == {8, 16, 32}
     assert {int(row["init_seed"]) for row in rows} == {0}
     assert {int(row["noise_seed"]) for row in rows} == set(range(sweep.N_CASES))
@@ -437,14 +467,14 @@ def test_run_sweep_calibrates_three_arms_and_writes_paired_csv(
     # rather than staying silent, so a figure can tell "not requested" from
     # "requested and missing".
     assert manifest["fixed_protocol"]["joint_nll_grid"] == 0
-    assert manifest["combined_row_count"] == 24
+    assert manifest["combined_row_count"] == 3 * sweep.N_CASES
     assert Path(manifest["canonical_csv"]) == combined
     assert manifest["calibration_sim_ids"] == list(
         range(sweep.N_CASES, sweep.N_CASES + sweep.CALIBRATION_FLOOR)
     )
     assert manifest["evaluation_sim_ids"] == list(range(sweep.N_CASES))
     assert "plots" not in manifest
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert manifest["paper_summary"]["status"] == "complete"
     assert Path(manifest["paper_summary"]["json"]).is_file()
     assert Path(manifest["paper_summary"]["csv"]).is_file()
@@ -545,12 +575,16 @@ def test_main_runs_noisy_then_noise_free_on_the_same_dataset(
         argv += ["--data-dir", str(data_dir)]
     assert sweep.main(argv) == 0
     assert len(generations) == (0 if existing_data else 1)
+    assert sweep.N_CASES == 16
     assert len(commands) == 12
     assert [float(_option(cmd, "--noise-std")) for cmd in commands] == [0.01] * 6 + [0.0] * 6
     for noisy, clean in zip(commands[:6], commands[6:]):
         for option in ("--checkpoint", "--data-dir", "--seed", "--noise-seed", "--sensor-n-y", "--device"):
             assert _option(noisy, option) == _option(clean, option)
         if "--out-csv" in clean:
+            noisy_start, clean_start = noisy.index("--sim-ids") + 1, clean.index("--sim-ids") + 1
+            assert noisy[noisy_start:noisy.index("--sensor-layout")] == [str(i) for i in range(16)]
+            assert clean[clean_start:clean.index("--sensor-layout")] == [str(i) for i in range(16)]
             assert "--allow-surrogate-limited" in clean
             assert "--allow-surrogate-limited" not in noisy
             assert Path(_option(clean, "--out-csv")).is_relative_to(out_dir / "no_noise")
@@ -562,6 +596,13 @@ def test_main_runs_noisy_then_noise_free_on_the_same_dataset(
     assert all(not arm["calibration"]["local_gate_pass"] for arm in manifest["arms"].values())
     assert all(arm["fv_verification"]["over_noise_median"] is None
                for arm in manifest["paper_summary"]["by_sensor_count"])
+    for directory, expected_noise in ((out_dir, 0.25), (out_dir / "no_noise", 0.0)):
+        with (directory / "inverse_sensor_sweep.csv").open() as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 48
+        assert all(float(row["noise_std_K"]) == expected_noise for row in rows)
+        assert all(float(row["eta_noise_pct"]) == expected_noise * 20 for row in rows)
+        assert all(float(row["R_c_profile_rel_l2_pct"]) >= 0 for row in rows)
     final_output = capsys.readouterr().out.split("Results for both sensor-noise settings:")[1]
     assert "With sensor noise:" in final_output
     assert "No sensor noise:" in final_output

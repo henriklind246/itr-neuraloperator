@@ -876,6 +876,25 @@ def _default_time_indices(Nt: int) -> list[int]:
     return sorted(set([early, mid, late]))
 
 
+def sensor_noise_summary(clean_sensor_temperatures: list[np.ndarray], noise_std_K: float) -> dict:
+    """Physical noise scales pooled over clean FV sensors, times, and cases."""
+    temperatures = np.concatenate([
+        np.asarray(values, dtype=np.float64).ravel()
+        for values in clean_sensor_temperatures
+    ])
+    sigma_sensor = float(np.std(temperatures, ddof=0))
+    rise_rms = float(np.sqrt(np.mean((temperatures - 300.0) ** 2)))
+    return {
+        "noise_std_K": float(noise_std_K),
+        "sigma_sensor_K": sigma_sensor,
+        "S_sensor_K": rise_rms,
+        "eta_noise_pct": 100.0 * noise_std_K / sigma_sensor if sigma_sensor > 0 else float("nan"),
+        "eta_rise_pct": 100.0 * noise_std_K / rise_rms if rise_rms > 0 else float("nan"),
+        "sensor_scale_observation_count": int(temperatures.size),
+        "sensor_scale_simulation_count": len(clean_sensor_temperatures),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reported statistic 2: FV-verified sensor residual at theta_hat.
 #
@@ -2364,6 +2383,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     rows = []
+    clean_sensor_temperatures = []
     for sid in sim_ids:
         # None-init the per-sim stage locals so artifact writing never hits an
         # unbound local when a stage was skipped for this sim. `report` and `J`
@@ -2381,6 +2401,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             sensor_layout=args.sensor_layout,
             sensor_y=sensor_y,
             observation_times=observation_times,
+        )
+        clean_sensor_temperatures.append(
+            apply_sensor_mask(obs.targets, obs.mask).detach().cpu().numpy().astype(np.float64)
+            * (loaded.sigma_global + T_EPS) + loaded.mu_global
         )
         if args.self_consistency:
             with torch.no_grad():
@@ -2495,6 +2519,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"FV residual={summary['fv_resid_rms_K']:.6g} K "
             f"({summary['fv_resid_over_noise']:.3g}x noise std)"
         )
+        print(f"  Recovered ITR profile relative L2 error: {summary['R_c_profile_rel_l2_pct']:.6g}%")
         for i, name in enumerate(adapter.param_names):
             hat = float(result.theta_hat[i])
             true = float(result.theta_true[i]) if result.theta_true is not None else float("nan")
@@ -2510,6 +2535,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                     line += " (bound-limited)"
             print(line)
 
+    if rows:
+        noise_summary = sensor_noise_summary(
+            clean_sensor_temperatures, float(args.noise_std) * loaded.sigma_global
+        )
+        for row in rows:
+            row.update(noise_summary)
+        print(
+            f"Sensor noise: sigma_meas={noise_summary['noise_std_K']:.6g} K; "
+            f"sigma_sensor={noise_summary['sigma_sensor_K']:.6g} K; "
+            f"S_sensor={noise_summary['S_sensor_K']:.6g} K; "
+            f"eta_noise={noise_summary['eta_noise_pct']:.6g}%; "
+            f"eta_rise={noise_summary['eta_rise_pct']:.6g}%"
+        )
     if args.out_csv and rows:
         fieldnames = sorted({k for r in rows for k in r})
         with open(args.out_csv, "w", newline="") as f:

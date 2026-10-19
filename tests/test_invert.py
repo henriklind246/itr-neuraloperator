@@ -1661,6 +1661,47 @@ def test_parameter_errors_are_separate_and_zero_amplitude_is_undefined():
         assert np.isfinite(flat["A_abserr"])
 
 
+@pytest.mark.parametrize("adapter", [ForcingAdapter(), ForcingItrSinAdapter(), SourceItrSinAdapter()])
+@pytest.mark.parametrize("amplitude", [0.0, 0.2])
+def test_recovered_itr_profile_error_uses_full_interface(adapter, amplitude):
+    y = torch.linspace(0, 1, 101, dtype=torch.float64)
+    truth = torch.tensor([0.5, amplitude][:adapter.theta_dim], dtype=torch.float64)
+    estimate = torch.tensor([0.55, 0.3][:adapter.theta_dim], dtype=torch.float64)
+    result = inv.InversionResult(estimate, 0.0, truth)
+    if adapter.theta_dim == 1:
+        expected = 10.0
+    else:
+        true_profile = 0.5 + amplitude * np.sin(np.pi * y.numpy())
+        predicted_profile = 0.55 + 0.3 * np.sin(np.pi * y.numpy())
+        expected = 100 * np.linalg.norm(predicted_profile - true_profile) / np.linalg.norm(true_profile)
+    assert inv.summarize(result, y, adapter)["R_c_profile_rel_l2_pct"] == pytest.approx(expected)
+    result.theta_hat = truth.clone()
+    assert inv.summarize(result, y, adapter)["R_c_profile_rel_l2_pct"] == 0.0
+
+
+@pytest.mark.parametrize("noise_std_K", [0.0, 0.25])
+def test_sensor_noise_scales_pool_cases_times_and_sensors(noise_std_K):
+    cases = [np.array([[300., 302.], [304., 306.]]), np.array([[310., 312.], [314., 316.]])]
+    report = inv.sensor_noise_summary(cases, noise_std_K)
+    pooled = np.array([300., 302., 304., 306., 310., 312., 314., 316.])
+    sigma = np.std(pooled)
+    rise = np.sqrt(np.mean((pooled - 300.) ** 2))
+    assert report["sigma_sensor_K"] == pytest.approx(sigma)
+    assert report["sigma_sensor_K"] != pytest.approx(np.mean([np.std(case) for case in cases]))
+    assert report["S_sensor_K"] == pytest.approx(rise)
+    assert report["eta_noise_pct"] == pytest.approx(100 * noise_std_K / sigma)
+    assert report["eta_rise_pct"] == pytest.approx(100 * noise_std_K / rise)
+    assert report["sensor_scale_observation_count"] == 8
+    assert report["sensor_scale_simulation_count"] == 2
+
+
+def test_sensor_noise_zero_reference_scales_are_undefined():
+    report = inv.sensor_noise_summary([np.full((3, 8), 300.0)], 0.0)
+    assert report["sigma_sensor_K"] == report["S_sensor_K"] == 0.0
+    assert np.isnan(report["eta_noise_pct"])
+    assert np.isnan(report["eta_rise_pct"])
+
+
 def test_profiles_share_checked_optimum_and_persist_both_parameters(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
@@ -1822,6 +1863,11 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
 
     adapter = ForcingItrSinAdapter()
     obs = _fake_observation_set()
+    obs.targets.fill_(1000.0)
+    obs.targets[:, 0, :2, 0] = torch.tensor([[300., 302.], [304., 306.], [308., 310.]])
+    obs.mask = torch.zeros(obs.targets.shape[1:3], dtype=torch.bool)
+    obs.mask[0, :2] = True
+    clean = inv.apply_sensor_mask(obs.targets, obs.mask).numpy().astype(np.float64).copy()
     ds = SimpleNamespace(
         t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
         y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
@@ -1871,6 +1917,12 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
         assert float(row[f"{name}_abserr"]) == pytest.approx(abs(float(fitted[i]) - float(obs.theta_true[i])))
         assert f"{name}_rel_error_pct" in row
     assert "profile_R_base_ci_width" in row
+    assert float(row["sigma_sensor_K"]) == pytest.approx(np.std(clean * (1 + inv.T_EPS)))
+    assert float(row["S_sensor_K"]) == pytest.approx(np.sqrt(np.mean((clean * (1 + inv.T_EPS) - 300)**2)))
+    assert int(row["sensor_scale_observation_count"]) == clean.size
+    assert float(row["R_c_profile_rel_l2_pct"]) == pytest.approx(
+        inv.summarize(inv.InversionResult(fitted, 0.0, obs.theta_true), obs.y_grid, adapter)["R_c_profile_rel_l2_pct"]
+    )
     assert ("profile_A_ci_width" in row) == (profile_index is None)
     assert not any("excess" in key or "S_R" in key for key in row)
     stdout = capsys.readouterr().out

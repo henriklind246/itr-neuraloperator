@@ -2,7 +2,7 @@
 
 The scientific protocol is intentionally fixed. Reviewers select the inverse
 benchmark and attach its trained checkpoint; the runner calibrates and evaluates
-the same eight cases at 8, 16, and 32 interface-band sensors, first with
+the same 16 cases at 8, 16, and 32 interface-band sensors, first with
 sensor noise and then without it.
 """
 
@@ -55,10 +55,10 @@ UQ_LEVEL = 0.95
 JOINT_NLL_GRID = 25
 INIT_SEED = 0
 NOISE_SEED = 0
-# Fixed reviewer protocol: invert eight held-out cases, calibrate on a disjoint
+# Fixed reviewer protocol: invert 16 held-out cases, calibrate on a disjoint
 # floor of sims. Both slices come from one dataset generated disjoint from the
 # training corpus (see scripts/invert.prepare_inversion_dataset).
-N_CASES = 8
+N_CASES = 16
 
 BENCHMARKS = ("forcing", "forcing_itr_sin", "source_itr_sin")
 REQUIRED_DATA_FILES = (
@@ -411,8 +411,14 @@ def _resume_provenance_matches(previous: dict | None, current: dict) -> bool:
     return all(previous.get(key) == current.get(key) for key in keys)
 
 
+_NOISE_COLUMNS = (
+    "noise_std_K", "sigma_sensor_K", "S_sensor_K", "eta_noise_pct", "eta_rise_pct",
+    "sensor_scale_observation_count", "sensor_scale_simulation_count",
+)
+
+
 def _required_stage_columns(benchmark: str) -> tuple[str, ...]:
-    columns = ["fv_resid_rms_K", "fv_resid_over_noise"]
+    columns = ["fv_resid_rms_K", "fv_resid_over_noise", "R_c_profile_rel_l2_pct", *_NOISE_COLUMNS]
     for spec in specs_for(benchmark):
         columns.extend((spec.estimate_col, spec.truth_col, spec.absolute_error_col))
         columns.extend(f"profile_{spec.parameter}_{suffix}" for suffix in (
@@ -471,6 +477,12 @@ def validate_and_annotate_rows(
                 and math.isnan(float(value))
             ):
                 continue
+            elif (
+                column in {"eta_noise_pct", "eta_rise_pct"}
+                and float(row["sigma_sensor_K" if column == "eta_noise_pct" else "S_sensor_K"]) == 0.0
+                and math.isnan(float(value))
+            ):
+                continue
             elif not math.isfinite(float(value)):
                 raise ValueError(f"{result_path} has non-finite {column}={value!r}.")
         for spec in specs_for(benchmark):
@@ -495,10 +507,10 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
 _ROBUST_STATISTICS = ("n", "median", "q1", "q3", "iqr")
 _PAPER_SUMMARY_COLUMNS = (
     "benchmark", "parameter", "unit", "n_sensors", "n_simulations",
-    *(f"{prefix}_{stat}" for prefix in ("absolute_error", "relative_error_pct", "profile_width", "fv_resid_K")
+    *(f"{prefix}_{stat}" for prefix in ("absolute_error", "relative_error_pct", "profile_width", "fv_resid_K", "R_c_profile_rel_l2_pct")
       for stat in _ROBUST_STATISTICS),
     "relative_error_undefined_cases", "recovery_rmse", "fv_resid_over_noise_median",
-    "profile_bound_limited_cases",
+    "profile_bound_limited_cases", *_NOISE_COLUMNS,
 )
 
 
@@ -569,11 +581,13 @@ def _flat_paper_row(*, benchmark, parameter, arm):
         "fv_resid_over_noise_median": arm["fv_verification"]["over_noise_median"],
         "profile_bound_limited_cases": metrics["profile_interval"]["bound_limited_cases"],
     }
+    row.update(arm["sensor_noise"])
     for prefix, stats in (
         ("absolute_error", metrics["recovery"]["absolute_error"]),
         ("relative_error_pct", metrics["recovery"]["relative_error_pct"]),
         ("profile_width", metrics["profile_interval"]["width"]),
         ("fv_resid_K", arm["fv_verification"]["residual_K"]),
+        ("R_c_profile_rel_l2_pct", arm["R_c_profile_rel_l2_pct"]),
     ):
         row.update({f"{prefix}_{stat}": stats[stat] for stat in _ROBUST_STATISTICS})
     return row
@@ -683,26 +697,42 @@ def generate_paper_summary(
                     "bound_limited_cases": int(limited.sum()),
                 },
             }
+        profile_errors = np.asarray([
+            _summary_float(row, "R_c_profile_rel_l2_pct") for row in arm_rows
+        ])
+        if np.any(profile_errors < 0):
+            raise ValueError("negative ITR profile error")
+        sensor_noise = {}
+        for column in _NOISE_COLUMNS:
+            values = np.asarray([float(row[column]) for row in arm_rows])
+            if not np.allclose(values, values[0], equal_nan=True):
+                raise ValueError(f"pooled sensor noise column {column} changes within an arm")
+            sensor_noise[column] = float(values[0]) if np.isfinite(values[0]) else None
         by_sensor_count.append({
             "n_sensors": count, "n_simulations": len(sim_ids),
             "simulation_ids": list(sim_ids), "parameters": parameters,
+            "R_c_profile_rel_l2_pct": _robust_summary(profile_errors),
+            "sensor_noise": sensor_noise,
             "fv_verification": {
                 "residual_K": _robust_summary(fv),
                 "over_noise_median": float(np.median(ratios)) if ratios.size else None,
             },
         })
     summary = {
-        "schema_version": 2, "benchmark": benchmark,
+        "schema_version": 3, "benchmark": benchmark,
         "parameters": [spec.parameter for spec in specs], "confidence_level": UQ_LEVEL,
         "sensor_counts": list(counts), "n_paired_simulations": len(sim_ids),
         "simulation_ids": list(sim_ids),
         "pairing_fields": ["benchmark", "sim_id", "noise_seed", "init_seed"],
         "source_csv": str(combined_path.resolve()), "source_columns": list(required_columns),
-        "reported_statistics": ["parameter_recovery", "fv_verification", "parameter_profile_intervals"],
+        "reported_statistics": ["parameter_recovery", "fv_verification", "parameter_profile_intervals",
+                "itr_profile_recovery", "sensor_noise"],
         "statistics_conventions": {
             "spread": "median with Q1/Q3/IQR across simulations; no mean/SD",
             "quantiles": "numpy percentile with the default linear method",
             "relative_error_pct": "100 * abs(estimate - truth) / abs(truth)",
+            "R_c_profile_rel_l2_pct": "100 * norm(R_c_hat(y) - R_c_true(y)) / norm(R_c_true(y)), full interface y grid",
+            "sensor_noise": "clean FV temperatures pooled over all inverse cases, observation times and sensor locations separately per sensor configuration; population std (ddof=0); RMS rise above 300 K; percentages undefined for a zero reference scale",
             "relative_error_floor_fraction": RELATIVE_ERROR_FLOOR_FRACTION,
             "relative_error_floor": "undefined when abs(truth) <= floor_fraction * admissible parameter range",
             "rmse": "sqrt(mean((estimate - truth)^2)) across simulations",
@@ -738,6 +768,14 @@ def _print_paper_summary(summary: dict) -> None:
                   f"undefined={recovery['relative_error_undefined_cases']}")
             print(f"      95% profile width: {format_stats(profile['width'])} {metrics['unit']}; "
                   f"bound-limited={profile['bound_limited_cases']}")
+        print(f"    Recovered ITR profile relative L2 error [%]: {format_stats(arm['R_c_profile_rel_l2_pct'])}")
+        noise = arm["sensor_noise"]
+        def noise_value(key):
+            return "undefined" if noise[key] is None else f"{noise[key]:.6g}"
+        print(f"    Sensor noise: sigma_meas={noise_value('noise_std_K')} K; "
+              f"sigma_sensor={noise_value('sigma_sensor_K')} K; "
+              f"S_sensor={noise_value('S_sensor_K')} K; "
+              f"eta_noise={noise_value('eta_noise_pct')}%; eta_rise={noise_value('eta_rise_pct')}%")
         fv = arm["fv_verification"]
         ratio = fv["over_noise_median"]
         ratio_text = (
@@ -815,7 +853,7 @@ def generate_paper_figures(combined_path: Path, *, benchmark: str,
 def read_sidecar_selection(sidecar: Path) -> dict:
     """The case a figure chose, lifted into the sweep manifest.
 
-    Which of the eight simulations got drawn is the one thing about these
+    Which of the 16 simulations got drawn is the one thing about these
     figures a reader cannot recover from the sweep's own numeric outputs.
     """
     payload = _load_json(Path(sidecar))
@@ -886,7 +924,7 @@ def run_sweep(
     previous_manifest = _load_json(manifest_path)
     checkpoint_fingerprint = _checkpoint_fingerprint(str(checkpoint))
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": "running",
         "started_utc": _utc_now(),
         "benchmark": benchmark,
@@ -912,7 +950,8 @@ def run_sweep(
             "noise_seed": NOISE_SEED,
             "fv_refine": True,
             "uq_level": UQ_LEVEL,
-            "parameter_reporting_version": 2,
+            "parameter_reporting_version": 3,
+            "sensor_noise_reporting_version": 1,
             "profile_parameters": [spec.parameter for spec in specs_for(benchmark)],
             "profile_step_fraction": PROFILE_STEP_FRACTION,
             "profile_walk_max_steps": PROFILE_WALK_MAX_STEPS,
@@ -924,7 +963,8 @@ def run_sweep(
             "profile_optimum_atol": PROFILE_OPTIMUM_ATOL,
             "relative_error_floor_fraction": RELATIVE_ERROR_FLOOR_FRACTION,
             "reported_statistics": [
-                "parameter_recovery", "fv_verification", "parameter_profile_intervals"
+                "parameter_recovery", "fv_verification", "parameter_profile_intervals",
+                "itr_profile_recovery", "sensor_noise"
             ],
             "pairing": (
                 "identical (benchmark, sim_id, noise_seed, init_seed) cases "

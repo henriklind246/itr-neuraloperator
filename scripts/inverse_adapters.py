@@ -394,6 +394,9 @@ class ForcingAdapter(InverseAdapter):
             out["R_c_rel_error_pct"] = relative_error_percent(
                 out["R_c_map"], out["R_c_true"], self.param_scales[0]
             )
+            out["R_c_profile_rel_l2_pct"] = (
+                100.0 * out["R_c_abs_error"] / abs(out["R_c_true"])
+            )
         return out
 
     def sensitivity_summary(self, report: dict) -> dict:
@@ -578,6 +581,12 @@ class SourceItrSinAdapter(InverseAdapter):
                 out[f"{name}_rel_error_pct"] = relative_error_percent(
                     out[f"{name}_hat"], out[f"{name}_true"], self.param_scales[i]
                 )
+            y = y_grid.detach().cpu().numpy().astype(np.float64)
+            predicted = make_rc_sin_profile(y, out["R_base_hat"], out["A_hat"])
+            truth = make_rc_sin_profile(y, out["R_base_true"], out["A_true"])
+            out["R_c_profile_rel_l2_pct"] = float(
+                100.0 * np.linalg.norm(predicted - truth) / np.linalg.norm(truth)
+            )
         return out
 
 
