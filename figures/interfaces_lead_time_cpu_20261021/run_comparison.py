@@ -5,16 +5,17 @@ varying initial condition. For every lead time on the 0.01 s snapshot grid this
 measures, against the FV reference at the B2 training timestep:
 
 - the single-thread CPU cost of advancing the FV solver over the lead,
-- the single-thread CPU cost of one FNO prediction over the same interval,
-- their ratio, and
+- the cost of one FNO prediction over the same interval, on one CPU thread
+  and, when ``--device`` is a GPU, on that GPU at batch one,
+- the FV/FNO ratio for each FNO arm, and
 - the FNO field error over every (t_s, t_j) pair with that lead.
 
     python figures/interfaces_lead_time_cpu_20261021/run_comparison.py \
         --checkpoint <run>/config0/seed32/fno2d_best.pt
 
-The error sweep is batched on ``--device`` (CUDA when present); it runs after
-the CPU timing and does not affect it. ``--plot-only`` redraws the figure from
-the CSV already in ``--out``.
+GPU timing and the batched error sweep run on ``--device`` (CUDA when
+present), after the CPU timing so they do not disturb it. ``--plot-only``
+redraws the figure from the CSV already in ``--out``.
 """
 import os
 for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
@@ -43,7 +44,7 @@ from scripts.invert import load_checkpoint
 from src.operators.eval import evaluate
 
 OUT = Path(__file__).resolve().parent
-FIGURE_KEY = 'interfaces_lead_time_cpu'
+FIGURE_KEY = 'interfaces_lead_time_speedup'
 SEED = 20261021
 T_FINAL = 0.3
 SNAPSHOT_DT = 0.01
@@ -91,6 +92,13 @@ def pick_device(name):
     if torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
+
+
+def synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    elif device.type == 'mps':
+        torch.mps.synchronize()
 
 
 def cpu_name():
@@ -219,8 +227,11 @@ def measure(args):
     training_data = training_timestep(loaded.config, args.dt)
     trained = set(training_indices(loaded.config, n_snap).tolist())
     device = pick_device(args.device)
+    gpu = device.type in ('cuda', 'mps')
+    # Loaded outside inference_mode so its parameters stay ordinary tensors for evaluate().
+    eval_model = load_checkpoint(str(checkpoint), device=str(device)).model
     print(f'B2 checkpoint {checkpoint.name}: FV dt={args.dt} s, {n_steps} steps, {n_snap} snapshots; '
-          f'error sweep on {device}.', flush=True)
+          f'GPU timing {"on " + str(device) if gpu else "skipped"}; error sweep on {device}.', flush=True)
 
     params, setup = draw(spec, args.num_sims, args.seed, args.dt, stride)
     warm_params, warm_setup = draw(spec, 1, args.seed + 1, args.dt, stride)
@@ -239,6 +250,8 @@ def measure(args):
     fv_cum = np.empty((R, N, n_snap))
     fno_core = np.empty((R, N, L))
     fno_total = np.empty_like(fno_core)
+    gpu_core = np.full((R, N, L), np.nan)
+    gpu_total = np.full_like(gpu_core, np.nan)
 
     with threadpool_limits(limits=1), torch.inference_mode():
         warm = warm_params[0]
@@ -288,13 +301,40 @@ def measure(args):
                 if rep == 0 and (sid + 1) % 20 == 0:
                     print(f'  round 1: {sid + 1}/{N} sims, {time.perf_counter() - started:.0f} s', flush=True)
             print(f'Timing round {rep + 1}/{R}: FV full horizon {(fv_setup[rep] + fv_cum[rep, :, -1]).mean():.4f} s, '
-                  f'FNO {fno_total[rep].mean():.4f} s', flush=True)
+                  f'FNO CPU {fno_total[rep].mean():.4f} s', flush=True)
         pools = threadpool_info()
+
+        if gpu:
+            # Same pairs and protocol as the CPU arm. Input encoding stays on the one CPU thread;
+            # end to end adds the host-device copies.
+            names = ('spatial', 'cond_static', 'forcing_seq')
+            for _ in range(10):
+                eval_model(*[warm_batch[key].to(device) for key in names]).cpu()
+            for rep in range(R):
+                for sid, param in enumerate(params):
+                    for li, k in enumerate(leads):
+                        s = int(timed_s[sid, li])
+                        j = s + int(k)
+                        start = time.perf_counter_ns()
+                        ds = dataset([param], np.stack([truth[sid, s], truth[sid, s]])[None],
+                                     t_grid[[s, j]], setup, spec, loaded)
+                        batch = {key: v.unsqueeze(0) for key, v in ds[0].items()}
+                        inputs = [batch[key].to(device) for key in names]
+                        synchronize(device)
+                        core_start = time.perf_counter_ns()
+                        pred = eval_model(*inputs)
+                        synchronize(device)
+                        core_end = time.perf_counter_ns()
+                        pred_K = (pred * (sigma + T_EPS) + mu).cpu()
+                        end = time.perf_counter_ns()
+                        gpu_core[rep, sid, li] = (core_end - core_start) * 1e-9
+                        gpu_total[rep, sid, li] = (end - start) * 1e-9
+                        assert torch.isfinite(pred_K).all()
+                print(f'GPU timing round {rep + 1}/{R}: FNO {gpu_total[rep].mean():.5f} s', flush=True)
 
     print(f'Error sweep over all pairs on {device}.', flush=True)
     if device.type == 'cpu':
         torch.set_num_threads(os.cpu_count() or 1)
-    eval_model = load_checkpoint(str(checkpoint), device=str(device)).model
     full = dataset(params, truth, t_grid, setup, spec, loaded)
     pairs = np.array(full._pairs, dtype=np.int64)
     timed = {(sid, int(timed_s[sid, li]), int(timed_s[sid, li] + k)): li
@@ -352,15 +392,17 @@ def measure(args):
         counts = np.bincount(pairs[sel, 0], minlength=N)
         sim_gnrmse[:, li] = 100 * np.sqrt(np.bincount(pairs[sel, 0], weights=mse_K[sel], minlength=N) / counts) / rise
         p10, p25, p50, p75, p90 = np.percentile(sim_gnrmse[:, li], [10, 25, 50, 75, 90])
-        times = {name: arr[..., li] for name, arr in (('fv_core', fv_core_lead), ('fv_total', fv_total_lead),
-                                                     ('fno_core', fno_core), ('fno_total', fno_total))}
+        times = {name: arr[..., li] for name, arr in (
+            ('fv_core', fv_core_lead), ('fv_total', fv_total_lead), ('fno_cpu_core', fno_core),
+            ('fno_cpu_total', fno_total), ('fno_gpu_core', gpu_core), ('fno_gpu_total', gpu_total))}
         row = dict(lead_s=float(t_grid[k]), fv_steps=int(k * stride), n_pairs=int(sel.sum()))
         for name, arr in times.items():
             row[f'{name}_s'] = float(arr.mean())
             row[f'{name}_std_s'] = float(arr.mean(0).std())
+        for arm in ('cpu', 'gpu'):
+            for part in ('core', 'total'):
+                row[f'speedup_{arm}_{part}'] = row[f'fv_{part}_s'] / row[f'fno_{arm}_{part}_s']
         row.update(
-            speedup_core=row['fv_core_s'] / row['fno_core_s'],
-            speedup_total=row['fv_total_s'] / row['fno_total_s'],
             pooled_gnrmse_pct=float(100 * np.sqrt(mse_K[sel].mean()) / rise),
             gnrmse_p10_pct=p10, gnrmse_p25_pct=p25, gnrmse_median_pct=p50,
             gnrmse_p75_pct=p75, gnrmse_p90_pct=p90,
@@ -381,8 +423,13 @@ def measure(args):
             trained_snapshots=bool(s in trained and j in trained)))
     write_csv(out / 'per_pair.csv', pair_rows)
 
-    speedup_total = np.array([r['speedup_total'] for r in lead_rows])
-    above = np.flatnonzero(speedup_total >= 1.0)
+    def first_break_even(arm):
+        above = np.flatnonzero(np.array([r[f'speedup_{arm}_total'] for r in lead_rows]) >= 1.0)
+        return float(t_grid[leads[above[0]]]) if above.size else None
+
+    def mean_or_none(arr):
+        return float(arr.mean()) if gpu else None
+
     result = {
         'checkpoint': str(checkpoint), 'checkpoint_sha256': sha256(checkpoint),
         'checkpoint_epoch': ckpt.get('epoch'), 'checkpoint_training_seed': ckpt.get('seed'),
@@ -402,27 +449,32 @@ def measure(args):
         'warmup_seed': args.seed + 1, 'batch_size_timing': 1, 'torch_threads_timing': 1,
         'threadpools': pools, 'hardware': cpu_name(), 'platform': platform.platform(),
         'slurm_job_id': os.environ.get('SLURM_JOB_ID'), 'slurm_cpus_per_task': os.environ.get('SLURM_CPUS_PER_TASK'),
-        'sweep_device': str(device),
-        'sweep_device_name': torch.cuda.get_device_name(device) if device.type == 'cuda' else str(device),
+        'device': str(device), 'gpu_timed': gpu,
+        'device_name': torch.cuda.get_device_name(device) if device.type == 'cuda' else str(device),
         'torch': torch.__version__, 'numpy': np.__version__, 'scipy': scipy.__version__,
         'mu_train_K': mu, 'sigma_train_K': sigma, 'training_rise_rms_K': rise,
-        'mean_fno_forward_seconds': float(fno_core.mean()),
-        'mean_fno_setup_and_predict_seconds': float(fno_total.mean()),
+        'mean_fno_cpu_forward_seconds': float(fno_core.mean()),
+        'mean_fno_cpu_end_to_end_seconds': float(fno_total.mean()),
+        'mean_fno_gpu_forward_seconds': mean_or_none(gpu_core),
+        'mean_fno_gpu_end_to_end_seconds': mean_or_none(gpu_total),
         'mean_fv_setup_seconds': float(fv_setup.mean()),
         'mean_fv_step_seconds': float(fv_cum[..., -1].mean() / n_steps),
         'fv_full_horizon_solve_seconds': float(fv_cum[..., -1].mean()),
-        'speedup_total_at_max_lead': lead_rows[-1]['speedup_total'],
-        'speedup_core_at_max_lead': lead_rows[-1]['speedup_core'],
-        'first_lead_with_speedup_total_at_least_1_s': float(t_grid[leads[above[0]]]) if above.size else None,
+        **{f'speedup_{arm}_{part}_at_max_lead': lead_rows[-1][f'speedup_{arm}_{part}'] if arm == 'cpu' or gpu else None
+           for arm in ('cpu', 'gpu') for part in ('total', 'core')},
+        'first_lead_with_cpu_speedup_total_at_least_1_s': first_break_even('cpu'),
+        'first_lead_with_gpu_speedup_total_at_least_1_s': first_break_even('gpu') if gpu else None,
         'pooled_gnrmse_pct_all_pairs': float(100 * np.sqrt(mse_K.mean()) / rise),
         'metric_scope': 'Direct prediction (no rollout) for every (t_s, t_j) pair on the 31 saved snapshots; FV is '
                         'the reference; fixed training normalization. gnRMSE = 100 * RMSE_K / training rise RMS. '
                         'Bands are across simulations, each pooled over its pairs at that lead.',
         'timing_scope': 'CPU single thread, batch one, timing interleaved FV/FNO per simulation. FV time for a lead '
                         'is the measured cost of the steps between two snapshots, averaged over all source '
-                        'snapshots; core excludes solver assembly/factorization, total includes it. FNO core is one '
-                        'forward pass; total adds input encoding and denormalization. Excludes loading, warmup, '
-                        'sampling, disk I/O and metrics.',
+                        'snapshots; core excludes solver assembly/factorization, total includes it. FNO CPU core is '
+                        'one forward pass; total adds input encoding and denormalization. FNO GPU uses the same '
+                        'pairs at batch one after the CPU timing, synchronized around the forward pass (core); its '
+                        'total adds CPU input encoding on one thread, host-to-device and device-to-host copies and '
+                        'denormalization. Excludes loading, warmup, sampling, disk I/O and metrics.',
         'validation': 'Weights match checkpoint; timestamped FV loop equals FVSolver2D.solve; repeated FV and FNO '
                       'results bitwise deterministic; NumPy metrics agree with evaluate() on the check sims; device '
                       'sweep checked against the timed CPU predictions (cpu_vs_device).',
@@ -437,7 +489,8 @@ def measure(args):
         json.dumps([{k: v for k, v in p.items() if k != 'T0'} for p in params], indent=2, default=jsonable))
     np.savez_compressed(out / 'timings.npz', t_grid=t_grid, leads=leads, timed_source_index=timed_s,
                         fv_setup_seconds=fv_setup, fv_cumulative_seconds=fv_cum,
-                        fno_forward_seconds=fno_core, fno_total_seconds=fno_total,
+                        fno_cpu_forward_seconds=fno_core, fno_cpu_total_seconds=fno_total,
+                        fno_gpu_forward_seconds=gpu_core, fno_gpu_total_seconds=gpu_total,
                         sim_gnrmse_pct=sim_gnrmse)
     print(json.dumps({k: v for k, v in result.items() if k.startswith(('mean_', 'pooled_', 'speedup_', 'fv_full', 'first_'))},
                      indent=2), flush=True)
@@ -464,6 +517,10 @@ def plot(out):
     lead = col['lead_s']
     fno_color, fv_color, key_color = style.benchmark_color('interfaces'), '0.2', '0.45'
     marker = dict(marker='o', markersize=2.5)
+    arms = [('cpu', fno_color, 'FNO, CPU (1 thread)')]
+    if np.isfinite(col['fno_gpu_total_s']).all():
+        gpu_name = meta['device_name'] if meta['device'].startswith('cuda') else meta['device'].upper()
+        arms.append(('gpu', '#D55E00', f'FNO, GPU ({gpu_name})'))
 
     with style.pub_style():
         fig, axes = plt.subplots(1, 3, figsize=style.figsize('two_col', row_height='std'),
@@ -471,29 +528,32 @@ def plot(out):
         ax = axes[0]
         ax.plot(lead, col['fv_total_s'], color=fv_color, **marker)
         ax.plot(lead, col['fv_core_s'], color=fv_color, linestyle='--')
-        ax.plot(lead, col['fno_total_s'], color=fno_color, **marker)
-        ax.plot(lead, col['fno_core_s'], color=fno_color, linestyle='--')
+        for arm, color, _ in arms:
+            ax.plot(lead, col[f'fno_{arm}_total_s'], color=color, **marker)
+            ax.plot(lead, col[f'fno_{arm}_core_s'], color=color, linestyle='--')
         ax.set_yscale('log')
-        ax.set_ylabel('CPU time per prediction [s]')
+        ax.set_ylabel('Wall time per prediction [s]')
         top = ax.secondary_xaxis('top', functions=(lambda t: t / dt, lambda n: n * dt))
         top.set_xlabel(f'FV time steps ($\\Delta t$ = {dt:g} s)')
 
         ax = axes[1]
-        ax.plot(lead, col['speedup_total'], color=fno_color, **marker)
-        ax.plot(lead, col['speedup_core'], color=fno_color, linestyle='--')
+        for arm, color, _ in arms:
+            ax.plot(lead, col[f'speedup_{arm}_total'], color=color, **marker)
+            ax.plot(lead, col[f'speedup_{arm}_core'], color=color, linestyle='--')
+        # Log scale: the GPU arm sits orders of magnitude above the CPU arm.
+        ax.set_yscale('log')
         style.add_reference_line(ax, 1.0, label='Break even')
-        ax.set_ylim(bottom=0.0)
-        ax.set_ylabel('Speedup, FV / FNO [-]')
+        ax.set_ylabel('Speedup over FV [-]')
 
         # Below the panels, so its placement does not depend on where the curves fall.
-        handles = [
-            Line2D([], [], color=fv_color, **marker, label='FV solver'),
-            Line2D([], [], color=fno_color, **marker, label='FNO'),
+        handles = [Line2D([], [], color=fv_color, **marker, label='FV solver, CPU (1 thread)')]
+        handles += [Line2D([], [], color=color, **marker, label=label) for _, color, label in arms]
+        handles += [
             Line2D([], [], color=key_color, label='End to end'),
             Line2D([], [], color=key_color, linestyle='--',
                    label='Core (FV time stepping, FNO forward pass)'),
         ]
-        fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.0), ncol=4)
+        fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.0), ncol=3)
 
         ax = axes[2]
         ax.fill_between(lead, col['gnrmse_p10_pct'], col['gnrmse_p90_pct'], color=fno_color,
