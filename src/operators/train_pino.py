@@ -5,6 +5,7 @@ import copy
 import csv
 import hashlib
 import json
+import inspect
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +28,6 @@ from src.operators.utils import resolve_device
 from src.physics.boundary_forcing import build_interface_forcing, reconstruct_qL
 from src.physics.fv_preconditioner import ExactCNInverse, MGOneCycleInverse
 from src.physics.fv_residual import FullBCData, build_homogeneous_cn_geom, cn_step_residual
-from src.physics.init_conditions import IC_FAMILIES
 
 
 def file_sha256(path):
@@ -42,10 +42,12 @@ def require_gate(directory, stage):
     return {"path": str(path.resolve()), "sha256": file_sha256(path), "kind": "gate"}
 
 
-def load_pino_inputs(data_dir, normalization_path):
+def load_pino_inputs(data_dir, normalization_path, benchmark="diffusion_forcing_single", representation="temporal_encoder"):
     """Load prescribed inputs and frozen stats without accessing future labels."""
     root = Path(data_dir)
-    spec = get_problem("diffusion_forcing_single")
+    spec = get_problem(benchmark, representation)
+    if not getattr(spec, "supports_physics_only", False):
+        raise ValueError(f"Benchmark {benchmark!r} does not support the homogeneous physics-only trainer")
     meta = assert_dataset_problem_version(spec, root / "t_grid.npy")
     params = np.load(root / "sim_params.npy", allow_pickle=True)
     spec.validate_schema(params, np.arange(len(params)))
@@ -260,23 +262,18 @@ def matched_stream(config, inputs, stage):
     batch = pino["batch_size"]
     if stage == "online" and pino.get("online_sampling") == "per_update":
         count = pino["validation_cases"]
-        if not isinstance(count, int) or count < 4 or count % len(IC_FAMILIES):
-            raise ValueError("validation_cases must be a positive multiple of the IC family count")
         generators = online_generators(pino["validation_seed"])
-        families = list(np.repeat(list(IC_FAMILIES), count // len(IC_FAMILIES)))
-        generators["main"].shuffle(families)
-        validation = draw_online_batch(inputs, generators, count, families)
+        assignments = inputs["spec"].validation_assignments(count, generators["main"])
+        validation = draw_online_batch(inputs, generators, count, assignments)
         return dict(problems=[], ids=np.empty((0, batch), dtype=np.int64),
                     intervals=np.empty((0, batch), dtype=np.int64),
                     validation=validation, validation_ids=list(range(count)),
                     train_ids=train.tolist(), reserved_test_ids=test.tolist())
     if stage == "fixed":
-        structured = [int(i) for i in train if inputs["params"][i]["ic_family"] == "random_sinusoid_2d"]
-        sid = structured[0] if structured else int(train[0])
-        problems = [inputs["params"][sid]]
-        ids = np.zeros((updates, batch), dtype=np.int64)
-        validation = [inputs["params"][sid]]
-        validation_ids = [sid]
+        validation_ids = inputs["spec"].fixed_case_ids(inputs["params"], train)
+        problems = [inputs["params"][sid] for sid in validation_ids]
+        ids = np.arange(updates * batch, dtype=np.int64).reshape(updates, batch) % len(problems)
+        validation = problems
     else:
         grids = dict(X=np.broadcast_to(inputs["x"][:, None], (len(inputs["x"]), len(inputs["y"]))),
                      Y=np.broadcast_to(inputs["y"][None], (len(inputs["x"]), len(inputs["y"]))),
@@ -313,13 +310,13 @@ def online_generators(seed):
             (("main", 100), ("ic_family", 300), ("ic_params", 400), ("forcing_params", 500))}
 
 
-def draw_online_batch(inputs, generators, count, families=None):
+def draw_online_batch(inputs, generators, count, assignments=None):
     nx, ny = len(inputs["x"]), len(inputs["y"])
     grids = dict(X=np.broadcast_to(inputs["x"][:, None], (nx, ny)),
                  Y=np.broadcast_to(inputs["y"][None, :], (nx, ny)), y_grid=inputs["y"])
     return inputs["spec"].sample_online_params(generators["main"], count, grids,
                 dict(dt=inputs["dt"], t_final=inputs["t_final"]),
-                rng_streams=generators, ic_family_assignment=families)
+                rng_streams=generators, **(assignments or {}))
 
 
 def autoregressive_backward(model, params, config, inputs, coords, geom, inverse, objective):
@@ -384,7 +381,8 @@ def evaluate_development(model, config, inputs, params, references, coords, geom
             target = references[sid, tid]
             error = predicted - target
             row = dict(case=sid, ic_family=p["ic_family"], time=t,
-                       amplitude=p["temporal_params"]["A"], frequency=p["temporal_params"]["f"],
+                       temporal_family=p["temporal_family"], spatial_family=p["spatial_family"],
+                       amplitude=p["temporal_params"].get("A"), frequency=p["temporal_params"].get("f"),
                        rmse_K=float(np.sqrt(np.mean(error ** 2))),
                        sigma_error_percent=float(100 * np.sqrt(np.mean(error ** 2)) / inputs["sigma_global"]),
                        normalized_rel_l2_percent=float(100 * np.linalg.norm(error) / max(np.linalg.norm(target - inputs["mu_global"]), 1e-12)),
@@ -434,12 +432,13 @@ def cvit_gate(raw, exact, pino, stage):
     ratio = pino["gate_error_ratio"]
     improved = None if raw is None else all(exact[key] * ratio < raw[key] for key in
                    ("trajectory_rmse_K", "first_step_rmse_K"))
+    baseline_kinds = ("trajectory", "first_step") if pino.get("gate_compare_first_step_baselines", True) else ("trajectory",)
     beats_floors = all(exact[f"{kind}_rmse_K"] < exact[f"{baseline}_{kind}_rmse_K"]
-                      for kind in ("trajectory", "first_step") for baseline in ("copy", "equilibrium"))
+                      for kind in baseline_kinds for baseline in ("copy", "equilibrium"))
     fits = stage != "fixed" or exact["trajectory_sigma_error_percent"] <= pino["fixed_max_sigma_error_percent"]
     first_fits = raw is not None or stage != "fixed" or exact["first_step_sigma_error_percent"] <= pino["fixed_max_first_step_sigma_error_percent"]
     return dict(passed=bool((improved if raw is not None else first_fits) and beats_floors and fits), improves_both=improved,
-                beats_both_baselines=beats_floors, fixed_fit_tolerance_passed=fits,
+                beats_both_baselines=beats_floors, baseline_comparison_kinds=list(baseline_kinds), fixed_fit_tolerance_passed=fits,
                 first_step_fit_tolerance_passed=first_fits,
                 raw_comparison_performed=raw is not None,
                 trajectory_raw_over_exact=None if raw is None else raw["trajectory_rmse_K"] / max(exact["trajectory_rmse_K"], 1e-15),
@@ -488,8 +487,9 @@ def evaluate_online_mg(model, config, inputs, params, references, coords, steps,
                     error = physical[offset] - target
                     rmse = float(np.sqrt(np.mean(error ** 2)))
                     rows.append(dict(case=lo + offset, ic_family=p["ic_family"],
-                        time=round(n * inputs["dt"], 10), amplitude=p["temporal_params"]["A"],
-                        frequency=p["temporal_params"]["f"], rmse_K=rmse,
+                        time=round(n * inputs["dt"], 10),
+                        temporal_family=p["temporal_family"], spatial_family=p["spatial_family"],
+                        amplitude=p["temporal_params"].get("A"), frequency=p["temporal_params"].get("f"), rmse_K=rmse,
                         sigma_error_percent=100 * rmse / inputs["sigma_global"],
                         normalized_rel_l2_percent=float(100 * np.linalg.norm(error) / max(np.linalg.norm(target - inputs["mu_global"]), 1e-12)),
                         physical_rel_l2_percent=float(100 * np.linalg.norm(error) / np.linalg.norm(target)),
@@ -520,9 +520,18 @@ def evaluate_online_mg(model, config, inputs, params, references, coords, steps,
         summary = aggregate(rows)
         summary.update(validation_steps=steps, validation_cases=len(params),
                        validation_wall_seconds=progress["elapsed_seconds"] + time.perf_counter() - start,
-                       prefix_wall_seconds=prefix_seconds,
-                       ic_families={family: aggregate([r for r in rows if r["ic_family"] == family])
-                                    for family in IC_FAMILIES})
+                       prefix_wall_seconds=prefix_seconds)
+        for field, key in (("ic_family", "ic_families"), ("temporal_family", "temporal_families"),
+                           ("spatial_family", "spatial_families")):
+            summary[key] = {family: aggregate([r for r in rows if r[field] == family])
+                            for family in sorted({r[field] for r in rows})}
+        summary["forcing_combinations"] = {
+            f"{temporal}/{spatial}": aggregate([r for r in rows if
+                (r["temporal_family"], r["spatial_family"]) == (temporal, spatial)])
+            for temporal, spatial in sorted({(r["temporal_family"], r["spatial_family"]) for r in rows})}
+        summary["lead_times"] = {
+            str(t): dict(rmse_K=float(np.sqrt(np.mean([r["rmse_K"] ** 2 for r in rows if r["time"] == t]))))
+            for t in sorted({r["time"] for r in rows if r["time"] > 0})}
         return summary, rows, None
     finally:
         model.train()
@@ -941,15 +950,17 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     config = copy.deepcopy(config)
-    config["benchmark"].update(name="diffusion_forcing_single", representation="temporal_encoder")
     config["physics_test"]["stage"] = stage
     if normalization_path is None:
         normalization_path = output / "normalization.json"
         freeze_development_normalization(data_dir, normalization_path)
-    inputs = load_pino_inputs(data_dir, normalization_path)
+    inputs = load_pino_inputs(data_dir, normalization_path, config["benchmark"]["name"],
+                              config["benchmark"].get("representation", "temporal_encoder"))
     if online_mg and not smoke:
         baseline_path = Path(fixed_screen_dir) / "config_used.yaml"
         baseline = yaml.safe_load(baseline_path.read_text())
+        if baseline["benchmark"] != config["benchmark"]:
+            raise ValueError("Online MG must reuse a passing fixed-case benchmark")
         if model_type == "cvit":
             # The time Fourier scale is unused by the spatial-only decoder.
             current_options = {k: v for k, v in config["physics_test"]["cvit"].items() if k != "fourier_freq_t"}
@@ -996,10 +1007,12 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         references = np.load(output / "validation_references.npy", mmap_mode="r")
     repo = Path(__file__).resolve().parents[2]
     source_paths = ["src/operators/cvit.py", "src/operators/fno2d.py", "src/operators/train_pino.py", "src/operators/train.py",
-                    "problems/diffusion_forcing_single.py", "src/physics/fv_residual.py",
+                    "problems/diffusion_forcing_single.py", "problems/forcing.py", "problems/base.py", "src/physics/fv_residual.py",
                     "src/physics/fv_preconditioner.py", "src/physics/fv_solver_2d.py",
                     "src/physics/boundary_forcing.py", "src/physics/init_conditions.py",
                     "data/generate_dataset.py", "data/dataset.py", "scripts/run_train_pino.py"]
+    spec_source = str(Path(inspect.getfile(type(inputs["spec"]))).resolve().relative_to(repo))
+    source_paths = list(dict.fromkeys([*source_paths, spec_source, "problems/registry.py"]))
     if online_mg:
         source_paths.append("slurm/train_pcvit_mg_msi.sbatch")
     config["physics_test"]["protocol"] = dict(
@@ -1047,6 +1060,8 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         baseline_config = yaml.safe_load((Path(exact_screen_dir) / "config_used.yaml").read_text())
         baseline_protocol = baseline_config["physics_test"]["protocol"]
         protocol = config["physics_test"]["protocol"]
+        if baseline_config["benchmark"] != config["benchmark"]:
+            raise ValueError("MG/exact comparison requires identical benchmark")
         for key in ("normalization", "prescribed_input_sha256", "grid", "dt", "horizon", "ramp_seconds",
                     "validation_ids", "resolved_cvit_kwargs", "resolved_fno_dims", "prefix_steps", "stream_sha256"):
             if protocol[key] != baseline_protocol[key]:
@@ -1060,6 +1075,8 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         for key in ("seed", "fixed_updates", "fixed_validate_every", "batch_size", "query_chunk_size", "ic_weight"):
             if pino[key] != baseline_config["physics_test"]["pino"][key]:
                 raise ValueError(f"MG/exact comparison requires identical pino.{key}")
+        if pino.get("gate_compare_first_step_baselines", True) != baseline_config["physics_test"]["pino"].get("gate_compare_first_step_baselines", True):
+            raise ValueError("MG/exact comparison requires identical first-step baseline policy")
         for name in ("config_used.yaml", "initial_state.pt"):
             path = Path(exact_screen_dir) / name
             prerequisites.append(dict(path=str(path.resolve()), sha256=file_sha256(path), kind="file"))
@@ -1098,7 +1115,7 @@ def write_development_pairs(output, config, histories):
             path = output / objective / f"val_pairs_{update:06d}.json"
             for record in json.loads(path.read_text()):
                 row = dict(record, epoch=update, update=update,
-                           benchmark="diffusion_forcing_single", sim_id=sim_ids[record["case"]],
+                           benchmark=config["benchmark"]["name"], sim_id=sim_ids[record["case"]],
                            t_s=0.0, t_bar=record["time"], absolute_time=record["time"],
                            rel_l2=record["normalized_rel_l2_percent"],
                            sigma_nrmse_pct=record["sigma_error_percent"])
@@ -1197,7 +1214,8 @@ def resume_screen(output):
     for name, expected in protocol["prescribed_input_sha256"].items():
         if file_sha256(Path(protocol["data_dir"]) / name) != expected:
             raise ValueError(f"Prescribed input changed: {name}")
-    inputs = load_pino_inputs(protocol["data_dir"], output / "normalization.json")
+    inputs = load_pino_inputs(protocol["data_dir"], output / "normalization.json",
+                              config["benchmark"]["name"], config["benchmark"].get("representation", "temporal_encoder"))
     if inputs["normalization"] != protocol["normalization"]:
         raise ValueError("Frozen normalization changed")
     if config["physics_test"]["stage"] == "online" and config["physics_test"]["pino"].get("online_sampling") == "per_update":

@@ -36,6 +36,7 @@ BASE_COND_COLS = ["t_s", "t_bar", "R_c"]
 BENCHMARK_COND_COLS = {
     "diffusion_forcing_single": ["amplitude", "frequency", "absolute_time"],
     "forcing": [],
+    "forcing_homogeneous": ["absolute_time"],
     "forcing_itr_sin": ["R_c_base", "R_c_A"],
     "interfaces": ["interface_x"],
     "source": ["x_h", "y_h", "A"],
@@ -53,6 +54,7 @@ STRAT_METRICS = ["rel_l2", "rmse_K", "sigma_nrmse_pct", "nrmse"]
 TAIL_CATEGORICAL_COLS = {
     "diffusion_forcing_single": ("ic_family",),
     "forcing": ("temporal_family", "spatial_family"),
+    "forcing_homogeneous": ("temporal_family", "spatial_family"),
     "forcing_itr_sin": ("temporal_family", "spatial_family"),
     "source": ("regime",),
     "source_itr_sin": ("regime",),
@@ -211,7 +213,7 @@ def report_xh_deciles(latest: pd.DataFrame, benchmark: str) -> None:
 
 def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
     print(f"\n=== 4. Structure breakdown for benchmark={benchmark!r} (final epoch) ===")
-    if benchmark in ("forcing", "forcing_itr_sin") and {
+    if benchmark in ("forcing", "forcing_itr_sin", "forcing_homogeneous") and {
         "temporal_family", "spatial_family"
     } <= set(latest.columns):
         agg = latest.groupby(["temporal_family", "spatial_family"])["rel_l2"].agg(
@@ -572,7 +574,7 @@ def plot_interface_ratio(latest: pd.DataFrame, out: Path) -> None:
 
 def plot_structure(latest: pd.DataFrame, benchmark: str, out: Path) -> None:
     """Benchmark-specific final plot (the 5th figure)."""
-    if benchmark in ("forcing", "forcing_itr_sin"):
+    if benchmark in ("forcing", "forcing_itr_sin", "forcing_homogeneous"):
         _plot_ic_family_heatmap(latest, out)
     elif benchmark == "diffusion_forcing_single":
         metrics = _present_strat_metrics(latest)

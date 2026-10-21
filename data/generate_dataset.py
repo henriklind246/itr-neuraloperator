@@ -317,7 +317,7 @@ def generate_sim_data(
     # a separate seeded RNG (so IC balancing never perturbs the forcing draws).
     # The spec reads a scalar per sim; it never decides the balance itself. Other
     # benchmarks (no ic_mode attribute) are byte-unaffected: the key is absent.
-    allowed_ic_families = ic_families if ic_families is not None else list(IC_FAMILIES.keys())
+    allowed_ic_families = ic_families if ic_families is not None else list(getattr(spec, "ic_families", IC_FAMILIES))
     if getattr(spec, "ic_mode", None) == "varying":
         setup["time_cfg"]["ic_family_assignment"] = build_balanced_ic_families(
             num_sims=num_sims, allowed_families=allowed_ic_families, seed=seeds["ic_assign"],

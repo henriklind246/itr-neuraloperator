@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 import numpy as np
-import torch
 from problems.base import ProblemDims, ProblemSpec
 from problems.forcing import (A_AMP_REF, FORCING_TEMPORAL_SAMPLES,
     FORCING_TEMPORAL_TOKEN_DIM, T_EPS, _sample_a, _forcing_seq_3tok_from_samples)
@@ -33,6 +32,9 @@ class DiffusionForcingSingleProblem(ProblemSpec):
     ic_mode = IC_MODE
     online_sampler_version = ONLINE_IC_SAMPLER_VERSION
     ic_builder_version = IC_BUILDER_SCHEMA_VERSION
+    supports_physics_only = True
+    temporal_families = (FIXED_TEMPORAL_FAMILY,)
+    spatial_families = (FIXED_SPATIAL_FAMILY,)
     val_pair_fields = ("temporal_family", "spatial_family", "ic_family")
     def __init__(self, representation: str = "temporal_encoder"):
         self.representation = representation
@@ -151,6 +153,8 @@ class DiffusionForcingSingleProblem(ProblemSpec):
 
     def build_step_inputs(self, state, coords, average_flux, dt, horizon):
         """Encode the solver's interval-average forcing at the fixed step size."""
+        import torch
+
         batch, nx, ny = state.shape
         xy = coords.reshape(1, nx, ny, 2).expand(batch, -1, -1, -1)
         spatial = torch.cat((state[..., None], xy, torch.ones_like(state[..., None])), dim=-1)
@@ -364,6 +368,17 @@ class DiffusionForcingSingleProblem(ProblemSpec):
             })
         return records
 
+    def validation_assignments(self, count, rng):
+        if not isinstance(count, int) or count < len(IC_FAMILIES) or count % len(IC_FAMILIES):
+            raise ValueError("validation_cases must be a positive multiple of the IC family count")
+        families = list(np.repeat(list(IC_FAMILIES), count // len(IC_FAMILIES)))
+        rng.shuffle(families)
+        return {"ic_family_assignment": families}
+
+    def fixed_case_ids(self, params, train_ids):
+        structured = [int(i) for i in train_ids if params[int(i)]["ic_family"] == "random_sinusoid_2d"]
+        return [structured[0] if structured else int(train_ids[0])]
+
     def validate_schema(self, sim_params: np.ndarray, sim_ids: np.ndarray) -> None:
         required = ("T0", "ic_family", "ic_params", "temporal_family", "temporal_params",
                     "spatial_family", "spatial_params")
@@ -385,17 +400,17 @@ class DiffusionForcingSingleProblem(ProblemSpec):
                 )
         for sid in sim_ids:
             entry = sim_params[int(sid)]
-            if entry["temporal_family"] != FIXED_TEMPORAL_FAMILY:
+            if entry["temporal_family"] not in self.temporal_families:
                 raise ValueError(
                     f"sim_params[{int(sid)}] has temporal_family="
                     f"{entry['temporal_family']!r}; benchmark {self.name!r} admits "
-                    f"only {FIXED_TEMPORAL_FAMILY!r}."
+                    f"only {self.temporal_families!r}."
                 )
-            if entry["spatial_family"] != FIXED_SPATIAL_FAMILY:
+            if entry["spatial_family"] not in self.spatial_families:
                 raise ValueError(
                     f"sim_params[{int(sid)}] has spatial_family="
                     f"{entry['spatial_family']!r}; benchmark {self.name!r} admits "
-                    f"only {FIXED_SPATIAL_FAMILY!r}."
+                    f"only {self.spatial_families!r}."
                 )
             if entry["ic_family"] not in IC_FAMILIES:
                 raise ValueError(

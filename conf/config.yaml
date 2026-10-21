@@ -75,6 +75,7 @@ physics_test:
     causal_warmup_updates: 0
     evaluation_times: [0.0, 0.005, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3]
     gate_error_ratio: 1.5
+    gate_compare_first_step_baselines: true
     fixed_max_sigma_error_percent: 5.0
     fixed_max_first_step_sigma_error_percent: 5.0
 

@@ -35,6 +35,7 @@ def tiny_model():
 def config(model_type='cvit', residual_mode='one_step'):
     cfg = yaml.safe_load(Path('conf/config.yaml').read_text())
     cfg['paths'] = {}
+    cfg['benchmark']['name'] = 'diffusion_forcing_single'
     cfg['training'].update(device='cpu', optimizer='Adam', weight_decay=0.0, learning_rate=0.0005,
                            scheduler=dict(type='PICViTExponential', decay_every=500, decay_rate=0.95, min_lr=1e-5))
     cfg['physics_test']['cvit'].update(emb_dim=16, num_heads=2, depth_enc=1, depth_dec=1,

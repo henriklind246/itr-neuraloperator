@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.run_train_fixed import _apply_override, _parse_override_value
 from src.operators.train import load_config
+from data.dataset import problem_from_config
 from src.operators.train_pino import run_screen, resume_screen
 
 
@@ -39,8 +40,8 @@ def main():
     for raw in args.overrides:
         key, value = raw.split("=", 1)
         _apply_override(config, key, _parse_override_value(value))
-    if config["benchmark"]["name"] != "diffusion_forcing_single":
-        raise ValueError("Select the homogeneous benchmark with BENCHMARK=diffusion_forcing_single")
+    if not getattr(problem_from_config(config), "supports_physics_only", False):
+        raise ValueError("Select a homogeneous physics-only benchmark with BENCHMARK")
     try:
         result = run_screen(config, args.data_dir, args.output_dir, args.phase0_dir, args.stage,
                             args.fixed_screen_dir, args.normalization, args.smoke, args.exact_screen_dir)
