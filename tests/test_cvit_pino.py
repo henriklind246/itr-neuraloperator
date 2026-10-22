@@ -45,7 +45,8 @@ def config(model_type='cvit', residual_mode='one_step'):
     cfg['physics_test']['model_type'] = model_type
     cfg['physics_test']['pino'].update(residual_mode='autoregressive' if residual_mode == 'mg' else residual_mode,prefix_steps=2)
     if residual_mode == 'space_time':
-        cfg['physics_test']['pino'].update(controls=['raw','spatial_exact','exact','mg'],checkpoint_keep_all=False)
+        cfg['physics_test']['pino'].update(controls=['raw','spatial_exact','exact','spatial_mg','spatial_mg_detached','mg'],
+                                           checkpoint_keep_all=False)
         cfg['physics_test']['mg']['solver']['coarse_max_unknowns'] = 4
     elif residual_mode in {'autoregressive', 'mg'}:
         cfg['physics_test']['pino'].update(controls=['mg' if residual_mode == 'mg' else 'exact'],checkpoint_keep_all=False,ic_weight=0.0)
@@ -469,12 +470,67 @@ def test_space_time_mg_control_trains_through_the_mg_forward_substitution(tmp_pa
     result = run_screen(cfg,data,output,phase0,normalization_path=normalization,smoke=True)
     assert {(objective,kind) for objective,kind,_ in used} == {
         ('raw',ExactCNInverse),('spatial_exact',ExactCNInverse),('exact',ExactCNInverse),
-        ('mg',MGOneCycleInverse)}
+        ('spatial_mg',MGOneCycleInverse),('spatial_mg_detached',MGOneCycleInverse),('mg',MGOneCycleInverse)}
     assert all(requires_grad for *_,requires_grad in used)
     protocol = yaml.safe_load((output/'config_used.yaml').read_text())['physics_test']['protocol']
     assert protocol['mg_settings'] == cfg['physics_test']['mg']
-    assert 'forward_substitution' in protocol['preconditioner']
+    assert protocol['preconditioner'] == pino.PREFIX_PRECONDITIONERS
+    assert protocol['preconditioner']['mg'] == 'one_MG_V_cycle_per_interval_forward_substitution'
     assert result['controls']['mg']['update'] == 2
+
+
+def test_spatial_mg_controls_differ_only_in_previous_state_gradients():
+    inputs,_ = prescribed_inputs(n=8)
+    params = inputs['params'][:2].tolist()
+    geom = build_homogeneous_cn_geom(inputs['x'],inputs['y'],1,.005,sigma_global=10)
+    mg = MGOneCycleInverse(geom,coarse_max_unknowns=4)
+    boundaries = [make_boundary(params,np.full(2,n),inputs,torch.device('cpu'),torch.float64) for n in range(3)]
+    states = torch.randn(2,4,8,8,generator=torch.Generator().manual_seed(4),dtype=torch.float64,requires_grad=True)
+    full,residuals,transformed = prefix_cn_objective(states,geom,boundaries,mg,'spatial_mg')
+    detached,_,transformed_detached = prefix_cn_objective(states,geom,boundaries,mg,'spatial_mg_detached')
+    torch.testing.assert_close(transformed,mg(residuals),rtol=0,atol=0)
+    torch.testing.assert_close(transformed_detached,transformed,rtol=0,atol=0)
+    full_gradient = torch.autograd.grad(full,states)[0]
+    detached_gradient = torch.autograd.grad(detached,states)[0]
+    # The final state is never a previous state, and the first is only one.
+    torch.testing.assert_close(full_gradient[:,-1],detached_gradient[:,-1],rtol=1e-12,atol=1e-15)
+    assert detached_gradient[:,0].abs().max() == 0 < full_gradient[:,0].abs().max()
+    assert not torch.allclose(full_gradient[:,1:-1],detached_gradient[:,1:-1])
+
+
+@pytest.mark.parametrize('ic_weight', [0.0, 0.5])
+@pytest.mark.parametrize('objective', ['raw','spatial_exact','exact','spatial_mg','spatial_mg_detached','mg'])
+def test_two_pass_space_time_backward_equals_the_full_graph_gradient(objective,ic_weight,monkeypatch):
+    import src.operators.train_pino as pino
+    torch.manual_seed(3)
+    cfg = config('fno',residual_mode='space_time')
+    # Five intervals in chunks of two leave a remainder chunk.
+    cfg['physics_test']['pino'].update(prefix_steps=5,time_chunk_size=2,ic_weight=ic_weight)
+    inputs,_ = prescribed_inputs(n=8)
+    params = inputs['params'][:2].tolist()
+    model = build_screen_model(cfg,inputs,torch.device('cpu')).double()
+    (spatial,sequence,horizon),ic = model_inputs(params,cfg,inputs,torch.device('cpu'))
+    latent,ic = (spatial.double(),sequence.double(),horizon),ic.double()
+    monkeypatch.setattr(pino,'model_inputs',lambda *args: (latent,ic))
+    geom = build_homogeneous_cn_geom(inputs['x'],inputs['y'],1,.005,sigma_global=10)
+    inverse = MGOneCycleInverse(geom,coarse_max_unknowns=4) if objective in pino.MG_OBJECTIVES else ExactCNInverse(geom)
+    first = 0 if ic_weight else 1
+    times = np.arange(first,6)*.005
+    torch.testing.assert_close(pino.decode_times(model,latent,times[:3]),
+        torch.stack([decode_grid(model,latent,None,[t],8,8,1) for t in times[:3]],dim=1),rtol=0,atol=0)
+    fields = pino.decode_times(model,latent,times)
+    boundaries = [make_boundary(params,np.full(2,n),inputs,torch.device('cpu'),torch.float64) for n in range(5)]
+    physics = prefix_cn_objective(torch.cat((ic[:,None],fields[:,1-first:]),dim=1),geom,boundaries,inverse,objective)[0]
+    ic_loss = (fields[:,0]-ic).square().mean() if ic_weight else 0
+    expected = torch.autograd.grad(physics+ic_weight*ic_loss,tuple(model.parameters()),allow_unused=True)
+    expected = [torch.zeros_like(p) if e is None else e for p,e in zip(model.parameters(),expected)]
+    loss,_,_ = pino.space_time_backward(model,params,cfg,inputs,torch.empty(1,64,2),geom,inverse,objective)
+    torch.testing.assert_close(loss,physics.detach(),rtol=1e-12,atol=0)
+    # Compare against the overall gradient scale: some weights get only roundoff.
+    scale = max(float(e.abs().max()) for e in expected)
+    for parameter,e in zip(model.parameters(),expected):
+        actual = torch.zeros_like(parameter) if parameter.grad is None else parameter.grad
+        torch.testing.assert_close(actual,e,rtol=0,atol=1e-12*scale)
 
 
 def test_time_step_decoder_uses_current_state_and_spatial_queries_only():

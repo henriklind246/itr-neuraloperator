@@ -165,33 +165,48 @@ def cn_objective(previous, following, geom, bc, inverse, objective):
     return weighted.square().mean(), residual, weighted
 
 
-def prefix_cn_objective(states, geom, boundaries, inverse, objective):
-    """CN loss from an exact IC, with full temporal gradients for the block inverses.
+PREFIX_PRECONDITIONERS = dict(
+    raw="none",
+    spatial_exact="exact_spatial_CN_inverse_per_interval",
+    exact="exact_space_time_CN_inverse",
+    spatial_mg="one_MG_V_cycle_per_interval",
+    spatial_mg_detached="one_MG_V_cycle_per_interval",
+    mg="one_MG_V_cycle_per_interval_forward_substitution",
+)
+MG_OBJECTIVES = {"mg", "spatial_mg", "spatial_mg_detached"}
 
-    exact solves the anchored block system with ExactCNInverse; mg is its
-    inexact forward substitution with one MGOneCycleInverse V-cycle per interval.
+
+def prefix_cn_objective(states, geom, boundaries, inverse, objective):
+    """CN loss from an exact IC over every prefix interval.
+
+    exact and mg precondition the anchored block system, mg by inexact forward
+    substitution with one V-cycle per interval; spatial_* precondition each
+    interval alone. spatial_exact and spatial_mg_detached detach every
+    interval's previous state; the others keep the full temporal gradient.
     """
-    if objective not in {"raw", "spatial_exact", "exact", "mg"}:
+    if objective not in PREFIX_PRECONDITIONERS:
         raise ValueError(f"Unsupported prefix objective {objective!r}")
     residuals = torch.stack([
         cn_step_residual(states[:, n], states[:, n + 1], geom, bc,
-                         detach_previous=objective == "spatial_exact")
+                         detach_previous=objective in {"spatial_exact", "spatial_mg_detached"})
         for n, bc in enumerate(boundaries)
     ], dim=1)
-    transformed = (inverse.space_time(residuals) if objective in {"exact", "mg"}
-                   else inverse(residuals) if objective == "spatial_exact" else residuals)
+    transformed = (residuals if objective == "raw"
+                   else inverse.space_time(residuals) if objective in {"exact", "mg"}
+                   else inverse(residuals))
     return transformed.square().mean(), residuals, transformed
 
 
 def evaluation_query_times(config, inputs):
-    times = config["physics_test"]["pino"]["evaluation_times"]
-    mode = config["physics_test"]["pino"].get("residual_mode", "one_step")
+    pino = config["physics_test"]["pino"]
+    times = pino["evaluation_times"]
+    mode = pino.get("residual_mode", "one_step")
+    if config["physics_test"].get("stage") == "online" and pino.get("online_sampling") == "per_update":
+        # Online validation indexes references by solver step along the full rollout.
+        return [round(float(t), 10) for t in np.arange(pino["validation_rollout_steps"] + 1) * inputs["dt"]]
     if mode in {"space_time", "autoregressive"}:
-        prefix = np.arange(config["physics_test"]["pino"]["prefix_steps"] + 1) * inputs["dt"]
+        prefix = np.arange(pino["prefix_steps"] + 1) * inputs["dt"]
         if mode == "autoregressive":
-            pino = config["physics_test"]["pino"]
-            if config["physics_test"].get("stage") == "online" and pino.get("online_sampling") == "per_update":
-                prefix = np.arange(pino["validation_rollout_steps"] + 1) * inputs["dt"]
             return [round(float(t), 10) for t in prefix]
         return sorted(set(round(float(t), 10) for t in (*times, *prefix)))
     return times
@@ -341,6 +356,47 @@ def autoregressive_backward(model, params, config, inputs, coords, geom, inverse
     return torch.stack(losses).mean(), torch.stack(residuals), torch.stack(corrections)
 
 
+def decode_times(model, latent, times):
+    """Time-conditioned FNO fields (B, len(times), Nx, Ny) from one batched forward."""
+    spatial, sequence, horizon = latent
+    count, batch = len(times), spatial.shape[0]
+    query = torch.as_tensor(np.asarray(times), dtype=spatial.dtype, device=spatial.device)
+    cond = query.repeat_interleave(batch)[:, None] / horizon
+    fields = model(spatial.repeat(count, 1, 1, 1), cond, sequence.repeat(count, 1, 1))[..., 0]
+    return fields.reshape(count, batch, *fields.shape[1:]).transpose(0, 1)
+
+
+def space_time_backward(model, params, config, inputs, coords, geom, inverse, objective):
+    """Accumulate one update's parameter gradients for a time-conditioned FNO.
+
+    One FNO graph per interval does not fit at 100x100 with 60 intervals, so the
+    fields are predicted without a graph, the coupled loss is differentiated with
+    respect to them, and each time chunk is recomputed to pull its field
+    gradients back to the weights. Each field depends on the weights only
+    through its own forward pass, so this equals the full-graph gradient.
+    """
+    pino = config["physics_test"]["pino"]
+    latent, ic = model_inputs(params, config, inputs, coords.device)
+    first = 0 if pino["ic_weight"] else 1
+    times = np.arange(first, pino["prefix_steps"] + 1) * inputs["dt"]
+    size = pino["time_chunk_size"]
+    chunks = [times[lo:lo + size] for lo in range(0, len(times), size)]
+    with torch.no_grad():
+        fields = torch.cat([decode_times(model, latent, chunk) for chunk in chunks], dim=1)
+    fields.requires_grad_()
+    states = torch.cat((ic[:, None], fields[:, 1 - first:]), dim=1)
+    boundaries = [make_boundary(params, np.full(len(params), n), inputs, coords.device, ic.dtype)
+                  for n in range(pino["prefix_steps"])]
+    physics, residuals, _ = prefix_cn_objective(states, geom, boundaries, inverse, objective)
+    ic_loss = (fields[:, 0] - ic).square().mean() if first == 0 else torch.zeros_like(physics)
+    (physics + pino["ic_weight"] * ic_loss).backward()
+    start = 0
+    for chunk in chunks:
+        decode_times(model, latent, chunk).backward(fields.grad[:, start:start + len(chunk)])
+        start += len(chunk)
+    return physics.detach(), residuals.detach(), ic_loss.detach()
+
+
 def development_references(inputs, params, evaluation_times):
     """Only the development caller uses solver reference temperatures."""
     setup = build_base_setup(len(params), 1, nx=len(inputs["x"]), ny=len(inputs["y"]),
@@ -469,20 +525,23 @@ def evaluate_online_mg(model, config, inputs, params, references, coords, steps,
                                 elapsed_seconds=0.0, prefix_seconds=0.0)
     rows = list(progress["rows"])
     prefix_seconds = progress["prefix_seconds"]
+    time_conditioned = pino.get("residual_mode") == "space_time"
     start = time.perf_counter()
     model.eval()
     try:
         for lo in range(progress["case_start"], len(params), pino["validation_batch_size"]):
             batch = params[lo:lo + pino["validation_batch_size"]]
             first_step = progress["next_step"] if lo == progress["case_start"] else 0
-            state = (progress["state"].to(coords.device) if first_step else
-                     model_inputs(batch, config, inputs, coords.device)[1])
+            latent, ic = model_inputs(batch, config, inputs, coords.device)
+            state = progress["state"].to(coords.device) if first_step else ic
             for n in range(first_step, steps + 1):
                 synchronize(coords.device)
                 step_start = time.perf_counter()
                 if n:
-                    state = autoregressive_step(model, state, batch, np.full(len(batch), n - 1),
-                                                config, inputs, coords)
+                    state = (decode_grid(model, latent, coords, [n * inputs["dt"]], len(inputs["x"]),
+                                         len(inputs["y"]), pino["query_chunk_size"]) if time_conditioned
+                             else autoregressive_step(model, state, batch, np.full(len(batch), n - 1),
+                                                      config, inputs, coords))
                     physical = state.cpu().double().numpy() * inputs["sigma_global"] + inputs["mu_global"]
                 else:
                     physical = np.stack([p["T0"] for p in batch]).astype(np.float64)
@@ -567,7 +626,10 @@ def atomic_json(path, value):
 
 
 def run_online_mg(initial_state, config, inputs, stream, references, output, device, resume_checkpoint=None):
+    """Per-update online training: autoregressive MG, or one space_time control of a time-conditioned FNO."""
     pino = config["physics_test"]["pino"]
+    objective = pino["controls"][0]
+    time_conditioned = pino.get("residual_mode") == "space_time"
     model = build_screen_model(config, inputs, device)
     model.load_state_dict(initial_state)
     set_seed(pino["seed"])
@@ -576,7 +638,8 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
     X, Y = np.meshgrid(inputs["x"], inputs["y"], indexing="ij")
     coords = torch.as_tensor(np.stack([X, Y], -1).reshape(1, -1, 2), device=device, dtype=torch.float32)
     precise = build_homogeneous_cn_geom(inputs["x"], inputs["y"], 1.0, inputs["dt"], sigma_global=inputs["sigma_global"])
-    inverse = MGOneCycleInverse(precise, **config["physics_test"]["mg"]["solver"]).to(device=device, dtype=torch.float32)
+    inverse = (MGOneCycleInverse(precise, **config["physics_test"]["mg"]["solver"]).to(device=device, dtype=torch.float32)
+               if objective in MG_OBJECTIVES else ExactCNInverse(precise))
     geom = replace(precise, **{name: value.to(device=device, dtype=torch.float32 if value.is_floating_point() else value.dtype)
                     for name, value in vars(precise).items() if torch.is_tensor(value)})
     generators = online_generators(pino["seed"])
@@ -585,6 +648,8 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
                  pending_validation=True, validation_progress=None, evaluations=[],
                  manifest_position=0, metrics_position=0)
     fields = ("update", "physics_loss", "raw_residual_rms", "gradient_norm", "learning_rate", "seconds_per_update")
+    if time_conditioned:
+        fields += ("ic_loss",)
     output.mkdir(exist_ok=resume_checkpoint is not None)
     if resume_checkpoint is not None:
         checkpoint = torch.load(resume_checkpoint, map_location="cpu", weights_only=False)
@@ -594,7 +659,10 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         state = checkpoint["online_state"]
-        if scheduler.next_update != state["successful_updates"]:
+        # Every scheduler type steps once per optimizer update here, whatever its counter is called.
+        position = next(getattr(scheduler, name) for name in ("next_update", "next_epoch_index", "last_epoch")
+                        if hasattr(scheduler, name))
+        if position != state["successful_updates"]:
             raise ValueError("Checkpoint scheduler and successful update counts disagree")
         for name, rng in generators.items():
             rng.bit_generator.state = checkpoint["sampler_rng_states"][name]
@@ -659,7 +727,7 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
                     atomic_json(output / f"val_pairs_{update:06d}.json", rows)
                     atomic_json(output / "diagnostics.json", state["evaluations"])
                     atomic_json(output / f"validation_{update:06d}.json", summary)
-                    write_development_pairs(output.parent, config, {"mg": state["evaluations"]})
+                    write_development_pairs(output.parent, config, {output.name: state["evaluations"]})
                     text = f"validation update={update} first_step_rmse_K={summary['first_step_rmse_K']:.6g} first_step_sigma_percent={summary['first_step_sigma_error_percent']:.6g} prefix_rmse_K={summary['prefix_trajectory_rmse_K']:.6g} prefix_sigma_percent={summary['prefix_trajectory_sigma_error_percent']:.6g}"
                     if "full_trajectory_rmse_K" in summary:
                         text += f" full_rmse_K={summary['full_trajectory_rmse_K']:.6g} full_sigma_percent={summary['full_trajectory_sigma_error_percent']:.6g}"
@@ -679,10 +747,14 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
                                default=lambda value: value.tolist()) + "\n")
                 manifest.flush()
                 optimizer.zero_grad(set_to_none=True)
-                physics, residual, _ = autoregressive_backward(model, params, config, inputs, coords, geom, inverse, "mg")
+                if time_conditioned:
+                    physics, residual, ic_loss = space_time_backward(model, params, config, inputs, coords, geom,
+                                                                     inverse, objective)
+                else:
+                    physics, residual, _ = autoregressive_backward(model, params, config, inputs, coords, geom, inverse, "mg")
                 grad = torch.nn.utils.clip_grad_norm_(model.parameters(), config["training"]["grad_clip"])
                 if not torch.isfinite(physics) or not torch.isfinite(grad):
-                    raise FloatingPointError(f"Nonfinite MG loss/gradient at update {update + 1}")
+                    raise FloatingPointError(f"Nonfinite {objective} loss/gradient at update {update + 1}")
                 lr = optimizer.param_groups[0]["lr"]
                 optimizer.step()
                 scheduler.step()
@@ -690,7 +762,8 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
                 duration = time.perf_counter() - update_start
                 state["successful_updates"] = update + 1
                 state["window"].append(dict(physics_loss=float(physics), residual_square=float(residual.square().mean()),
-                                  gradient_norm=float(grad), learning_rate=lr, seconds_per_update=duration))
+                                  gradient_norm=float(grad), learning_rate=lr, seconds_per_update=duration,
+                                  **({"ic_loss": float(ic_loss)} if time_conditioned else {})))
                 if update + 1 <= 100:
                     state["profile_durations"].append((update + 1, duration))
                 if (update + 1) % pino["log_every"] == 0:
@@ -699,6 +772,8 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
                                   raw_residual_rms=float(np.sqrt(np.mean([r["residual_square"] for r in window]))),
                                   gradient_norm=float(np.mean([r["gradient_norm"] for r in window])),
                                   learning_rate=lr, seconds_per_update=float(np.mean([r["seconds_per_update"] for r in window])))
+                    if time_conditioned:
+                        record["ic_loss"] = float(np.mean([r["ic_loss"] for r in window]))
                     writer.writerow(record)
                     metrics.flush()
                     print("train " + " ".join(f"{k}={v:.6g}" for k, v in record.items()), flush=True)
@@ -735,7 +810,7 @@ def run_control(objective, initial_state, config, inputs, stream, references, ou
                                        sigma_global=inputs["sigma_global"])
     inverse = ExactCNInverse(precise)
     training_inverse = (MGOneCycleInverse(precise, **config["physics_test"]["mg"]["solver"])
-                        .to(device=device, dtype=torch.float32) if objective == "mg" else inverse)
+                        .to(device=device, dtype=torch.float32) if objective in MG_OBJECTIVES else inverse)
     geom = replace(precise, **{name: value.to(device=device, dtype=torch.float32 if value.is_floating_point() else value.dtype)
                     for name, value in vars(precise).items() if torch.is_tensor(value)})
     first_update = 0
@@ -916,23 +991,30 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     pino = config["physics_test"]["pino"]
     mode = pino.get("residual_mode", "one_step")
     controls = pino.get("controls", ["raw", "exact"])
+    per_update = stage == "online" and pino.get("online_sampling", "precomputed") == "per_update"
     online_mg = stage == "online" and mode == "autoregressive" and controls == ["mg"]
-    allowed = {"raw", "exact", "spatial_exact", "mg"} if mode == "space_time" else {"raw", "exact"}
+    # Ungated development runs: one control of a time-conditioned FNO trained on fresh problems each update.
+    online_space_time = (per_update and mode == "space_time" and model_type == "fno"
+                         and len(controls) == 1 and controls[0] in PREFIX_PRECONDITIONERS)
+    online = online_mg or online_space_time
+    allowed = set(PREFIX_PRECONDITIONERS) if mode == "space_time" else {"raw", "exact"}
     single_autoregressive = mode == "autoregressive" and controls in (["exact"], ["mg"])
-    if mode not in {"one_step", "space_time", "autoregressive"} or (not single_autoregressive and not {"raw", "exact"} <= set(controls) <= allowed) or len(set(controls)) != len(controls):
-        raise ValueError("Use unique raw/exact controls, or an exact-only/MG-only autoregressive screen")
+    if mode not in {"one_step", "space_time", "autoregressive"} or (not single_autoregressive and not online_space_time and not {"raw", "exact"} <= set(controls) <= allowed) or len(set(controls)) != len(controls):
+        raise ValueError("Use unique raw/exact controls, an exact-only/MG-only autoregressive screen, "
+                         "or one control of an online space_time FNO run")
     if mode == "autoregressive" and stage != "fixed" and not online_mg:
         raise ValueError("Autoregressive screens require fixed cases or online MG")
-    if pino.get("online_sampling", "precomputed") == "per_update" and not online_mg:
-        raise ValueError("Per-update sampling requires online autoregressive MG")
+    if pino.get("online_sampling", "precomputed") == "per_update" and not online:
+        raise ValueError("Per-update sampling requires online autoregressive MG or one control of an online space_time FNO run")
     if pino["forcing_a_ref"] <= 0:
         raise ValueError("forcing_a_ref must be positive")
-    if online_mg:
-        if pino.get("online_sampling") != "per_update" or not pino.get("compact_metrics"):
-            raise ValueError("Online MG requires per_update sampling and compact_metrics")
-        if normalization_path is None:
+    if online:
+        if not per_update or not pino.get("compact_metrics"):
+            raise ValueError("Online per-update training requires per_update sampling and compact_metrics")
+        if online_mg and normalization_path is None:
             raise ValueError("Online MG requires the already-frozen normalization file")
-        for key in ("online_updates", "online_validate_every", "full_validate_every", "batch_size", "validation_batch_size", "log_every"):
+        for key in ("online_updates", "online_validate_every", "full_validate_every", "batch_size", "validation_batch_size", "log_every",
+                    *(("time_chunk_size",) if online_space_time else ())):
             if not isinstance(pino[key], int) or pino[key] < 1:
                 raise ValueError(f"{key} must be a positive integer")
         if pino["full_validate_every"] % pino["online_validate_every"]:
@@ -941,20 +1023,29 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
             raise ValueError("Validation must use an independent seed")
         if not set(pino["startup_profile_updates"]) <= {50, 100}:
             raise ValueError("Startup profiling supports updates 50 and 100")
+    if online_space_time:
+        if not config["model"]["parameters"].get("hard_right_dirichlet"):
+            raise ValueError("Online space_time FNO requires model.parameters.hard_right_dirichlet=true: the CN loss uses free nodes only")
+        if config["model"]["parameters"].get("dropout", 0.0):
+            raise ValueError("Online space_time FNO recomputes its forward pass for the gradient; set model.parameters.dropout=0")
     mg_only = controls == ["mg"]
-    prerequisites = [require_gate(phase0_dir, "phase4_direct_state_mg" if online_mg or (mg_only and not smoke) else "phase0_direct_state")]
+    uses_mg_gate = online_mg or (mg_only and not smoke) or (online_space_time and controls[0] in MG_OBJECTIVES)
+    prerequisites = [require_gate(phase0_dir, "phase4_direct_state_mg" if uses_mg_gate else "phase0_direct_state")]
     historical = None
-    if mg_only and not smoke and not online_mg and (model_type == "cvit" or exact_screen_dir is not None):
+    if mg_only and not smoke and not online and (model_type == "cvit" or exact_screen_dir is not None):
         if exact_screen_dir is None:
             raise ValueError("The MG preservation screen requires the completed exact prefix screen")
         prerequisites.append(require_gate(exact_screen_dir, f"phase2_fixed_{model_type}_autoregressive_prefix"))
         historical = json.loads((Path(exact_screen_dir) / "final_metrics.json").read_text())["controls"]["exact"]
-    if stage == "online":
+    if stage == "online" and not online_space_time:
         prerequisites.append(require_gate(fixed_screen_dir, f"phase4_fixed_{model_type}_autoregressive_prefix_mg" if online_mg else f"phase2_fixed_{model_type}"))
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     config = copy.deepcopy(config)
     config["physics_test"]["stage"] = stage
+    if online:
+        # Online schedulers step once per optimizer update, so epoch-length schedules span the updates.
+        config["training"]["epochs"] = pino["online_updates"]
     if normalization_path is None:
         normalization_path = output / "normalization.json"
         freeze_development_normalization(data_dir, normalization_path)
@@ -981,10 +1072,12 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
                 inputs[key] != baseline_protocol[name] for key, name in (("dt", "dt"), ("t_final", "horizon"), ("ramp_seconds", "ramp_seconds"))):
             raise ValueError("Online MG must reuse the passing fixed-case grid and time discretization")
         prerequisites.append(dict(path=str(baseline_path.resolve()), sha256=file_sha256(baseline_path), kind="file"))
-    if online_mg and not (isinstance(pino["prefix_steps"], int) and isinstance(pino["validation_rollout_steps"], int)
+    if online and not (isinstance(pino["prefix_steps"], int) and isinstance(pino["validation_rollout_steps"], int)
               and 1 <= pino["prefix_steps"] <= pino["validation_rollout_steps"] <= round(inputs["t_final"] / inputs["dt"])):
         raise ValueError("Require 1 <= training prefix <= validation rollout <= solver horizon")
-    if not smoke and (len(inputs["x"]) != 100 or config["physics_test"]["pino"][f"{stage}_updates"] < (1000 if stage == "fixed" else 4000)):
+    # Ungated online space_time runs register any update budget; gated screens keep their minimum.
+    if not smoke and (len(inputs["x"]) != 100 or (not online_space_time and
+                      config["physics_test"]["pino"][f"{stage}_updates"] < (1000 if stage == "fixed" else 4000))):
         raise ValueError("A development gate needs the registered 100x100 grid and full update budget; use --smoke for wiring checks")
     config["physics_test"]["smoke"] = smoke
     if model_type == "cvit":
@@ -1001,11 +1094,11 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     config["training"]["device"] = str(device)
     (output / "normalization.json").write_text(json.dumps(inputs["normalization"], indent=2) + "\n")
     stream = matched_stream(config, inputs, stage)
-    if not online_mg:
+    if not online:
         np.save(output / "problem_stream.npy", np.array(stream["problems"], dtype=object), allow_pickle=True)
         np.savez(output / "interval_stream.npz", ids=stream["ids"], intervals=stream["intervals"])
     np.save(output / "validation_inputs.npy", np.array(stream["validation"], dtype=object), allow_pickle=True)
-    if online_mg:
+    if online:
         references = development_references(inputs, stream["validation"], evaluation_query_times(config, inputs))
         np.save(output / "validation_references.npy", references)
         references = np.load(output / "validation_references.npy", mmap_mode="r")
@@ -1019,6 +1112,8 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     source_paths = list(dict.fromkeys([*source_paths, spec_source, "problems/registry.py"]))
     if online_mg:
         source_paths.append("slurm/train_pcvit_mg_msi.sbatch")
+    if online_space_time:
+        source_paths.append("slurm/train_fno_space_time_msi.sbatch")
     config["physics_test"]["protocol"] = dict(
         role="development", selection="final_registered_update", references_accessed=True,
         normalization=inputs["normalization"], data_dir=str(Path(data_dir).resolve()),
@@ -1037,20 +1132,25 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         prefix_steps=pino.get("prefix_steps") if mode in {"space_time", "autoregressive"} else None,
         prefix_horizon=pino["prefix_steps"] * inputs["dt"] if mode in {"space_time", "autoregressive"} else None,
         total_solver_steps=int(round(inputs["t_final"] / inputs["dt"])),
-        temporal_gradient_policy="detached_current_state_input_and_residual; mean_step_loss_gradients" if mode == "autoregressive" else "full_prefix_graph; spatial_exact alone detaches previous states" if mode == "space_time" else "detached_previous_state",
+        temporal_gradient_policy=("detached_current_state_input_and_residual; mean_step_loss_gradients" if mode == "autoregressive"
+                                  else "full_prefix_graph; spatial_exact and spatial_mg_detached detach previous states"
+                                  + ("; FNO recomputed per time chunk for the full-graph gradient" if online_space_time else "")
+                                  if mode == "space_time" else "detached_previous_state"),
         input_encoding=("current_state_and_exact_interval_average_flux_FNO_tokens" if model_type == "fno" else "current_state_and_exact_interval_average_flux_MLP_tokens_xy_decoder") if mode == "autoregressive" else "full_horizon_forcing_tokens_and_IC_query_time_cond" if model_type == "fno" else "full_horizon_forcing_image_and_IC_coordinate_time_decoder",
-        preconditioner="one_Torch_geometric_MG_V_cycle" if mg_only else "cached_exact_spatial_CN_inverse" if mode == "autoregressive"
-                       else "exact_CN_inverse; mg: one_MG_V_cycle_per_interval_forward_substitution" if "mg" in controls else "exact_CN_inverse",
-        mg_settings=config["physics_test"].get("mg") if "mg" in controls else None,
+        preconditioner=({control: PREFIX_PRECONDITIONERS[control] for control in controls} if mode == "space_time"
+                        else "one_Torch_geometric_MG_V_cycle" if mg_only
+                        else "cached_exact_spatial_CN_inverse" if mode == "autoregressive" else "exact_CN_inverse"),
+        mg_settings=config["physics_test"].get("mg") if MG_OBJECTIVES & set(controls) else None,
         historical_exact_metrics=historical,
-        gate_policy="registered_final_update_evidence_no_accuracy_gate" if online_mg else "absolute_fit_and_within_registered_factor_of_historical_exact" if mg_only and historical is not None else "absolute_prefix_and_first_step_fit_only_no_raw_comparison" if single_autoregressive else "matched_raw_exact_improvement",
+        gate_policy="registered_final_update_evidence_no_accuracy_gate" if online else "absolute_fit_and_within_registered_factor_of_historical_exact" if mg_only and historical is not None else "absolute_prefix_and_first_step_fit_only_no_raw_comparison" if single_autoregressive else "matched_raw_exact_improvement",
         online_sampling=pino.get("online_sampling", "precomputed"),
-        validation_namespace="independent_seed_cases" if online_mg else "dataset_sim_ids",
-        reference_role="held_out_validation_only" if online_mg else "development_diagnostics_only",
-        setup_seconds=time.perf_counter() - setup_start if online_mg else None,
+        validation_namespace="independent_seed_cases" if online else "dataset_sim_ids",
+        reference_role="held_out_validation_only" if online else "development_diagnostics_only",
+        setup_seconds=time.perf_counter() - setup_start if online else None,
         learning_rate_schedule_note="Retained smooth exponential; differs from user-described cosine-to-LR/10 paper schedule" if online_mg else None,
         scheduled_final_learning_rate=max(config["training"]["scheduler"]["min_lr"], config["training"]["learning_rate"] *
-                  config["training"]["scheduler"]["decay_rate"] ** (pino["online_updates"] / config["training"]["scheduler"]["decay_every"])) if online_mg else None,
+                  config["training"]["scheduler"]["decay_rate"] ** (pino["online_updates"] / config["training"]["scheduler"]["decay_every"]))
+                  if online and config["training"]["scheduler"]["type"] == "PICViTExponential" else None,
         resolved_cvit_kwargs=dict(config["physics_test"]["cvit"], forcing_in_ch=1, ic_in_ch=1, out_dim=1,
                                   ic_grid_size=[len(inputs["x"]), len(inputs["y"])], t_final=inputs["t_final"],
                                   use_time_query=mode != "autoregressive",
@@ -1059,7 +1159,7 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         model_origin="repository_FNO_defaults" if model_type == "fno" else "partial_archive_source_defaults_not_historical_run", objective="mean_free_node_square",
         metric_aggregation="equal_case_equal_nonzero_query_time_RMS", dtype="float32",
         stream_sha256={name: file_sha256(output / name) for name in
-                       (("validation_inputs.npy", "validation_references.npy") if online_mg else
+                       (("validation_inputs.npy", "validation_references.npy") if online else
                         ("problem_stream.npy", "interval_stream.npz", "validation_inputs.npy"))})
     if historical is not None:
         baseline_config = yaml.safe_load((Path(exact_screen_dir) / "config_used.yaml").read_text())
@@ -1093,7 +1193,7 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     (output / "config_used.yaml").write_text(frozen)
     protocol_sha = hashlib.sha256(frozen.encode()).hexdigest()
     (output / "status.json").write_text(json.dumps(dict(status="running", protocol_sha256=protocol_sha)))
-    if not online_mg:
+    if not online:
         references = development_references(inputs, stream["validation"], evaluation_query_times(config, inputs))
     set_seed(config["physics_test"]["pino"]["seed"])
     initial_model = build_screen_model(config, inputs, torch.device("cpu"))
@@ -1136,14 +1236,15 @@ def finish_screen(config, metrics, histories, output, protocol_sha):
     pino = config["physics_test"]["pino"]
     model_type = config["physics_test"].get("model_type", "cvit")
     if config["physics_test"]["stage"] == "online" and pino.get("online_sampling") == "per_update":
-        progress = metrics["mg"]
+        control = pino["controls"][0]
+        progress = metrics[control]
         completed = progress["successful_updates"] == pino["online_updates"] and not progress["pending_validation"]
-        summary = dict(stage="phase1_smoke" if config["physics_test"]["smoke"] else f"phase3_online_{model_type}_autoregressive_mg",
+        summary = dict(stage="phase1_smoke" if config["physics_test"]["smoke"] else f"phase3_online_{model_type}_{pino['residual_mode']}_{control}",
                        model_type=model_type,
                        status="complete" if completed else "interrupted", protocol_sha256=protocol_sha,
                        successful_updates=progress["successful_updates"], registered_updates=pino["online_updates"],
                        accuracy_gate_applied=False, scientific_evidence=not config["physics_test"]["smoke"],
-                       controls={"mg": histories["mg"][-1] if histories["mg"] else None},
+                       controls={control: histories[control][-1] if histories[control] else None},
                        elapsed_seconds=progress["elapsed_seconds"], runtime_reports=progress["runtime_reports"])
         atomic_json(output / "status.json", summary)
         atomic_json(output / ("final_metrics.json" if completed else "interrupted_metrics.json"), summary)
@@ -1228,12 +1329,13 @@ def resume_screen(output):
         stream = dict(validation=np.load(output / "validation_inputs.npy", allow_pickle=True).tolist())
         references = np.load(output / "validation_references.npy", mmap_mode="r")
         initial = torch.load(output / "initial_state.pt", map_location="cpu", weights_only=True)
-        checkpoint = output / "mg/checkpoint_latest.pt"
+        control = config["physics_test"]["pino"]["controls"][0]
+        checkpoint = output / control / "checkpoint_latest.pt"
         if not checkpoint.exists():
-            checkpoint = output / "mg/checkpoint_000000.pt"
-        progress, histories = run_online_mg(initial, config, inputs, stream, references, output / "mg",
+            checkpoint = output / control / "checkpoint_000000.pt"
+        progress, histories = run_online_mg(initial, config, inputs, stream, references, output / control,
                                            resolve_device(config["training"]["device"]), checkpoint)
-        return finish_screen(config, {"mg": progress}, {"mg": histories}, output, protocol_sha)
+        return finish_screen(config, {control: progress}, {control: histories}, output, protocol_sha)
     replay = np.load(output / "interval_stream.npz")
     stream = dict(problems=np.load(output / "problem_stream.npy", allow_pickle=True).tolist(),
                   ids=replay["ids"], intervals=replay["intervals"],

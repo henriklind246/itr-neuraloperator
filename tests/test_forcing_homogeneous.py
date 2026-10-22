@@ -2,8 +2,10 @@ import copy
 import csv
 import json
 from itertools import product
+import os
 from pathlib import Path
 import signal
+import subprocess
 
 import numpy as np
 import pytest
@@ -12,7 +14,10 @@ import yaml
 
 from data.generate_dataset import build_base_setup, generate_sim_data
 from problems.registry import get_problem
+from scripts.run_train_fixed import _apply_override, _parse_override_value
 import src.operators.train_pino as pino
+from src.operators.fno2d import FNO2d
+from src.operators.soap import SOAP
 from src.operators.train import load_config
 from src.physics.fv_residual import build_homogeneous_cn_geom, cn_step_residual
 from tests.test_cvit_pino import config, save_inputs
@@ -242,3 +247,174 @@ def test_quiet_first_step_gate_keeps_absolute_accuracy_requirement():
     assert gate['passed'] and gate['baseline_comparison_kinds'] == ['trajectory']
     metrics['first_step_sigma_error_percent'] = settings['fixed_max_first_step_sigma_error_percent'] + 1
     assert not pino.cvit_gate(None, metrics, settings, 'fixed')['passed']
+
+
+def space_time_config(control='mg', optimizer='SOAP', scheduler=None, ic_weight=0.0):
+    cfg = config('fno', residual_mode='space_time')
+    cfg['benchmark']['name'] = 'forcing_homogeneous'
+    cfg['training']['optimizer'] = optimizer
+    if scheduler is not None:
+        cfg['training']['scheduler'] = scheduler
+    cfg['physics_test']['pino'].update(controls=[control], online_sampling='per_update', compact_metrics=True,
+        online_updates=4, online_validate_every=2, full_validate_every=4, prefix_steps=3,
+        validation_rollout_steps=4, batch_size=2, validation_cases=16, validation_batch_size=8,
+        log_every=1, startup_profile_updates=[], time_chunk_size=2, ic_weight=ic_weight)
+    return cfg
+
+
+RIGNO = dict(type='RIGNOThreePhase', warmup_fraction=.25, cosine_fraction=.5, exp_fraction=.25,
+             init_lr_ratio=.1, cosine_floor_lr_ratio=.1, final_lr_ratio=.05)
+
+
+@pytest.mark.parametrize('control,optimizer,scheduler,ic_weight', [
+    ('mg', 'SOAP', None, 0.0), ('spatial_mg_detached', 'Adam', RIGNO, 0.0), ('raw', 'AdamW', None, 0.5)])
+def test_online_space_time_fno_trains_validates_and_resumes(homogeneous_files, tmp_path, monkeypatch,
+                                                            control, optimizer, scheduler, ic_weight):
+    inputs, data, norm, gates = homogeneous_files
+    cfg = space_time_config(control, optimizer, scheduler, ic_weight)
+    gate = gates[1] if control in pino.MG_OBJECTIVES else gates[0]
+    baseline, restarted = tmp_path / 'baseline', tmp_path / 'restart'
+    def run(output):
+        # No fixed-case screen: online space_time runs are ungated development evidence.
+        return pino.run_screen(cfg, data, output, gate, 'online', None, norm, smoke=True)
+    original, calls = pino.space_time_backward, []
+    def record(*args):
+        calls.append(args[-1])
+        return original(*args)
+    monkeypatch.setattr(pino, 'space_time_backward', record)
+    result = run(baseline)
+    assert result['status'] == 'complete' and not result['accuracy_gate_applied']
+    assert set(result['controls']) == {control} and calls == [control] * 4
+    def interrupt(*args):
+        value = original(*args)
+        signal.raise_signal(signal.SIGUSR1)
+        return value
+    monkeypatch.setattr(pino, 'space_time_backward', interrupt)
+    assert run(restarted)['status'] == 'interrupted'
+    monkeypatch.setattr(pino, 'space_time_backward', original)
+    assert pino.resume_screen(restarted)['status'] == 'complete'
+    a, b = (torch.load(output / control / 'checkpoint_final.pt', weights_only=False) for output in (baseline, restarted))
+    for key in ('model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'sampler_rng_states'):
+        assert_same_state(a[key], b[key])
+    assert (baseline / control / 'training_manifest.jsonl').read_bytes() == (
+        restarted / control / 'training_manifest.jsonl').read_bytes()
+    frozen = yaml.safe_load((baseline / 'config_used.yaml').read_text())
+    protocol = frozen['physics_test']['protocol']
+    assert frozen['training']['epochs'] == 4
+    assert protocol['preconditioner'] == {control: pino.PREFIX_PRECONDITIONERS[control]}
+    assert protocol['gate_policy'] == 'registered_final_update_evidence_no_accuracy_gate'
+    assert 'recomputed per time chunk' in protocol['temporal_gradient_policy']
+    assert (protocol['mg_settings'] is not None) == (control in pino.MG_OBJECTIVES)
+    assert 'slurm/train_fno_space_time_msi.sbatch' in protocol['source_sha256']
+    assert [p['path'] for p in protocol['prerequisites']] == [str((gate / 'final_metrics.json').resolve())]
+    if scheduler is not None:
+        assert a['scheduler_state_dict'] == {'next_epoch_index': 4}
+    with (baseline / control / 'train_metrics.csv').open() as file:
+        reader = csv.DictReader(file)
+        assert reader.fieldnames[-1] == 'ic_loss'
+        rows = list(reader)
+    assert [int(r['update']) for r in rows] == [1, 2, 3, 4]
+    assert all(float(r['ic_loss']) > 0 for r in rows) == bool(ic_weight)
+    assert np.load(baseline / 'validation_references.npy').shape == (16, 5, 4, 4)
+    summary = json.loads((baseline / control / 'validation_000004.json').read_text())
+    assert np.isfinite(summary['full_trajectory_rmse_K']) and len(summary['lead_times']) == 4
+    assert len(summary['forcing_combinations']) == 16
+
+
+@pytest.mark.parametrize('mutate,gate_index,match', [
+    (lambda c: None, 0, 'phase4_direct_state_mg'),
+    (lambda c: c['physics_test'].update(model_type='cvit'), 1, 'one control of an online space_time FNO run'),
+    (lambda c: c['physics_test']['pino'].update(controls=['raw', 'mg']), 1, 'one control of an online space_time FNO run'),
+    (lambda c: c['model']['parameters'].update(hard_right_dirichlet=False), 1, 'hard_right_dirichlet'),
+    (lambda c: c['model']['parameters'].update(dropout=.1), 1, 'dropout'),
+    (lambda c: c['physics_test']['pino'].update(time_chunk_size=0), 1, 'time_chunk_size'),
+    (lambda c: c['physics_test']['pino'].update(validation_seed=42), 1, 'independent seed'),
+])
+def test_online_space_time_rejects_invalid_runs_before_creating_artifacts(homogeneous_files, tmp_path,
+                                                                         mutate, gate_index, match):
+    _, data, norm, gates = homogeneous_files
+    cfg = space_time_config()
+    mutate(cfg)
+    with pytest.raises(ValueError, match=match):
+        pino.run_screen(cfg, data, tmp_path / 'run', gates[gate_index], 'online', None, norm, smoke=True)
+    assert not (tmp_path / 'run').exists()
+
+
+def test_online_space_time_scientific_runs_need_the_benchmark_grid_not_a_minimum_budget(homogeneous_files, tmp_path):
+    _, data, norm, gates = homogeneous_files
+    with pytest.raises(ValueError, match='100x100 grid'):
+        pino.run_screen(space_time_config(), data, tmp_path / 'run', gates[1], 'online', None, norm, smoke=False)
+
+
+def test_space_time_launcher_defaults_overrides_and_resume(tmp_path, monkeypatch):
+    script = Path('slurm/train_fno_space_time_msi.sbatch').resolve()
+    subprocess.run(['bash', '-n', script], check=True)
+    text = script.read_text()
+    for directive in ['--partition=msigpu', '--gres=gpu:a100:1', '--time=08:00:00', '--signal=USR1@120']:
+        assert directive in text
+    project = tmp_path / 'project with spaces'
+    project.mkdir()
+    capture = tmp_path / 'arguments'
+    prologue = '''module() { :; }
+conda() { :; }
+nvidia-smi() { :; }
+srun() { printf '%s\\0' "$@" > "$CAPTURE"; }
+export -f module conda nvidia-smi srun
+exec bash "$LAUNCHER" "$@"
+'''
+    # A clean environment keeps the caller's DATA_DIR, CONTROL, ... out of the defaults.
+    base = dict(PATH=os.environ['PATH'], HOME=str(tmp_path), SLURM_JOB_ID='77', SLURM_SUBMIT_DIR=str(project),
+                PERSISTENT_RUNS=str(tmp_path / 'runs'), CAPTURE=str(capture), LAUNCHER=str(script))
+
+    def launch(*extra, **env):
+        subprocess.run(['bash', '-c', prologue, 'launcher', *extra], env=dict(base, **env), check=True,
+                       capture_output=True)
+        return capture.read_bytes().decode().strip('\0').split('\0')
+
+    def resolved(args):
+        cfg = load_config()
+        for raw in (arg for arg in args if '=' in arg):
+            key, value = raw.split('=', 1)
+            _apply_override(cfg, key, _parse_override_value(value))
+        return cfg
+
+    monkeypatch.setenv('BENCHMARK', 'forcing_homogeneous')
+    monkeypatch.setenv('REPRESENTATION', 'temporal_encoder')
+    args = launch()
+    assert args[:3] == ['python', '-u', 'scripts/run_train_pino.py']
+    assert args[args.index('--stage') + 1] == 'online'
+    assert args[args.index('--data-dir') + 1] == str(project / 'data/forcing_homogeneous')
+    assert args[args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase4_direct_state_mg_20261002')
+    assert args[args.index('--output-dir') + 1] == str(tmp_path / 'runs/fno_st_mg_SOAP_lr0.001_bs8_n60_u5000_s42_77')
+    assert '--normalization' not in args
+    cfg = resolved(args)
+    pino_cfg = cfg['physics_test']['pino']
+    assert cfg['physics_test']['model_type'] == 'fno'
+    assert (pino_cfg['residual_mode'], pino_cfg['controls'], pino_cfg['online_sampling']) == ('space_time', ['mg'], 'per_update')
+    assert (pino_cfg['prefix_steps'], pino_cfg['batch_size'], pino_cfg['online_updates']) == (60, 8, 5000)
+    assert (pino_cfg['time_chunk_size'], pino_cfg['validation_cases'], pino_cfg['ic_weight']) == (4, 128, 0.0)
+    assert cfg['model']['parameters']['hard_right_dirichlet'] and cfg['model']['parameters']['dropout'] == 0
+    model = pino.build_screen_model(cfg, prescribed_inputs(n=20)[0], torch.device('cpu'))
+    assert isinstance(model, FNO2d)
+    optimizer = pino.build_optimizer(cfg, model.parameters())
+    assert isinstance(optimizer, SOAP) and optimizer.param_groups[0]['lr'] == pytest.approx(1e-3)
+    scheduler = pino.build_scheduler(cfg, optimizer)
+    assert scheduler.lr_for_update(250) == pytest.approx(1e-3 * .9)
+
+    norm = tmp_path / 'normalization with spaces.json'
+    args = launch('model.parameters.width=32', 'training.soap.precondition_frequency=5',
+                  CONTROL='raw', OPTIMIZER='Adam', LEARNING_RATE='3e-4', SCHEDULER='RIGNOThreePhase',
+                  BATCH_SIZE='4', NORMALIZATION_PATH=str(norm))
+    assert args[args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase0_raw_exact_20261001')
+    assert args[args.index('--normalization') + 1] == str(norm)
+    assert args[-2:] == ['model.parameters.width=32', 'training.soap.precondition_frequency=5']
+    cfg = resolved(args)
+    assert cfg['physics_test']['pino']['controls'] == ['raw'] and cfg['physics_test']['pino']['batch_size'] == 4
+    assert (cfg['training']['optimizer'], cfg['training']['learning_rate']) == ('Adam', 3e-4)
+    assert cfg['training']['scheduler']['type'] == 'RIGNOThreePhase'
+    assert cfg['model']['parameters']['width'] == 32 and cfg['training']['soap']['precondition_frequency'] == 5
+    model = pino.build_screen_model(cfg, prescribed_inputs(n=20)[0], torch.device('cpu'))
+    assert isinstance(pino.build_optimizer(cfg, model.parameters()), torch.optim.Adam)
+
+    resume = tmp_path / 'resume with spaces'
+    assert launch(RESUME_RUN_DIR=str(resume))[3:] == ['--resume', '--output-dir', str(resume)]
