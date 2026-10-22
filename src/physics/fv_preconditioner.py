@@ -132,14 +132,6 @@ class MGOneCycleInverse(nn.Module):
             level = len(self.level_shapes) - 1
             diagonal = matrix.diagonal().reshape(nx, ny, order="F").copy()
             self.register_buffer(f"diagonal_{level}", torch.from_numpy(diagonal))
-            if nx * ny <= coarse_max_unknowns or min(nx, ny) <= 2:
-                # Sparse matrices use Fortran order; the Torch coarse action uses (x,y).reshape.
-                permutation = np.arange(nx * ny).reshape(nx, ny, order="F").ravel()
-                dense = matrix.tocsr()[permutation][:, permutation].toarray()
-                chol = np.linalg.cholesky(dense)
-                coarse_inverse = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(nx * ny)))
-                self.register_buffer("coarse_inverse", torch.from_numpy(coarse_inverse))
-                break
             entries = matrix.tocoo()
             row_x, row_y = entries.row % nx, entries.row // nx
             col_x, col_y = entries.col % nx, entries.col // nx
@@ -148,7 +140,17 @@ class MGOneCycleInverse(nn.Module):
             if np.any(np.abs(col_x - row_x) > 1) or np.any(np.abs(col_y - row_y) > 1):
                 raise ValueError("MG Galerkin hierarchy requires a local nine-point stencil")
             coefficients[offsets, row_x, row_y] = entries.data
+            # Registered on every level: space_time needs the fine operator even
+            # when the whole hierarchy is one directly solved level.
             self.register_buffer(f"stencil_{level}", torch.from_numpy(coefficients))
+            if nx * ny <= coarse_max_unknowns or min(nx, ny) <= 2:
+                # Sparse matrices use Fortran order; the Torch coarse action uses (x,y).reshape.
+                permutation = np.arange(nx * ny).reshape(nx, ny, order="F").ravel()
+                dense = matrix.tocsr()[permutation][:, permutation].toarray()
+                chol = np.linalg.cholesky(dense)
+                coarse_inverse = np.linalg.solve(chol.T, np.linalg.solve(chol, np.eye(nx * ny)))
+                self.register_buffer("coarse_inverse", torch.from_numpy(coarse_inverse))
+                break
             coarse_x = x[np.unique(np.r_[np.arange(0, len(x), 2), len(x) - 1])]
             coarse_y = y[np.unique(np.r_[np.arange(0, len(y), 2), len(y) - 1])]
             px = self._interpolation(x, coarse_x)[:-1, :-1]
@@ -194,3 +196,23 @@ class MGOneCycleInverse(nn.Module):
         if residual.shape[-2:] != self.free_shape:
             raise ValueError(f"Expected free field {self.free_shape}, got {tuple(residual.shape)}")
         return self._cycle(residual * self.capacity, 0)
+
+    def space_time(self, residuals: torch.Tensor) -> torch.Tensor:
+        """Inexact block forward substitution z_n = P(r_n + B z_{n-1}), z_0 = 0, on (...,time,Nx-1,Ny).
+
+        ExactCNInverse.space_time with each interval solve replaced by one V-cycle P.
+        B = 2 - A_hat comes from the cycle's own fine operator S = capacity*A_hat,
+        so it shares the residual's capacity-divided scaling, and padding the
+        eliminated right wall with zero keeps the correction homogeneous there.
+        No step is detached: autograd differentiates the whole coupled sweep
+        through the true adjoint of each V-cycle.
+        """
+        if residuals.ndim < 3 or residuals.shape[-3] < 1:
+            raise ValueError("A space-time residual requires a nonempty time dimension")
+        previous = torch.zeros_like(residuals[..., 0, :, :])
+        corrections = []
+        for residual in residuals.unbind(dim=-3):
+            coupled = 2 * previous - self._action(previous, 0) / self.capacity
+            previous = self(residual + coupled)
+            corrections.append(previous)
+        return torch.stack(corrections, dim=-3)

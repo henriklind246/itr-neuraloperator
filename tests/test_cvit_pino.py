@@ -21,7 +21,7 @@ from src.operators.train_pino import (
     step_forcing_profile, evaluation_query_times, autoregressive_step,
 )
 from src.physics.boundary_forcing import reconstruct_qL
-from src.physics.fv_preconditioner import ExactCNInverse
+from src.physics.fv_preconditioner import ExactCNInverse, MGOneCycleInverse
 from src.physics.fv_residual import build_homogeneous_cn_geom
 
 
@@ -45,7 +45,8 @@ def config(model_type='cvit', residual_mode='one_step'):
     cfg['physics_test']['model_type'] = model_type
     cfg['physics_test']['pino'].update(residual_mode='autoregressive' if residual_mode == 'mg' else residual_mode,prefix_steps=2)
     if residual_mode == 'space_time':
-        cfg['physics_test']['pino'].update(controls=['raw','spatial_exact','exact'],checkpoint_keep_all=False)
+        cfg['physics_test']['pino'].update(controls=['raw','spatial_exact','exact','mg'],checkpoint_keep_all=False)
+        cfg['physics_test']['mg']['solver']['coarse_max_unknowns'] = 4
     elif residual_mode in {'autoregressive', 'mg'}:
         cfg['physics_test']['pino'].update(controls=['mg' if residual_mode == 'mg' else 'exact'],checkpoint_keep_all=False,ic_weight=0.0)
         cfg['physics_test']['mg']['solver']['coarse_max_unknowns'] = 4
@@ -373,7 +374,10 @@ def test_fno_screen_uses_full_horizon_forcing_original_ic_and_absolute_queries()
     handle.remove()
 
 
-def test_prefix_exact_loss_has_same_cvit_parameter_gradients_as_trajectory_mse():
+@pytest.mark.parametrize('objective', ['exact', 'mg'])
+def test_prefix_exact_loss_has_same_cvit_parameter_gradients_as_trajectory_mse(objective):
+    # A one-level MG hierarchy is a direct spatial solve, so its forward
+    # substitution must reproduce the exact-inverse identity through the network.
     cfg = config(residual_mode='space_time')
     inputs,_ = prescribed_inputs()
     params = inputs['params'][:1].tolist()
@@ -386,9 +390,11 @@ def test_prefix_exact_loss_has_same_cvit_parameter_gradients_as_trajectory_mse()
     known_ic = ic.double()
     states = torch.stack([known_ic,*predictions],dim=1)
     geom = build_homogeneous_cn_geom(inputs['x'],inputs['y'],1,.005,sigma_global=10)
-    inverse = ExactCNInverse(geom)
+    inverse = ExactCNInverse(geom) if objective == 'exact' else MGOneCycleInverse(geom,coarse_max_unknowns=12)
+    if objective == 'mg':
+        assert inverse.level_shapes == [(3,4)]
     boundaries = [make_boundary(params,[n],inputs,torch.device('cpu'),torch.float64) for n in range(2)]
-    loss,_,_ = prefix_cn_objective(states,geom,boundaries,inverse,'exact')
+    loss,_,_ = prefix_cn_objective(states,geom,boundaries,inverse,objective)
     reference_params = copy.deepcopy(params)
     reference_params[0]['T0'] = known_ic[0].numpy()*10+295
     reference = development_references(inputs,reference_params,[0,.005,.01])
@@ -399,6 +405,76 @@ def test_prefix_exact_loss_has_same_cvit_parameter_gradients_as_trajectory_mse()
     expected = torch.autograd.grad(direct,tuple(model.parameters()))
     for a,b in zip(actual,expected):
         torch.testing.assert_close(a,b,rtol=1e-10,atol=1e-11)
+
+
+def test_space_time_mg_loss_parameter_gradient_matches_finite_differences():
+    torch.manual_seed(7)
+    cfg = config('fno', residual_mode='space_time')
+    inputs,_ = prescribed_inputs(n=8)
+    params = inputs['params'][:2].tolist()
+    model = build_screen_model(cfg,inputs,torch.device('cpu')).double()
+    (spatial,sequence,horizon),ic = model_inputs(params,cfg,inputs,torch.device('cpu'))
+    latent,ic = (spatial.double(),sequence.double(),horizon),ic.double()
+    geom = build_homogeneous_cn_geom(inputs['x'],inputs['y'],1,.005,sigma_global=10)
+    mg = MGOneCycleInverse(geom,coarse_max_unknowns=4)
+    assert len(mg.level_shapes) == 3
+    steps = 4
+    boundaries = [make_boundary(params,np.full(2,n),inputs,torch.device('cpu'),torch.float64)
+                  for n in range(steps)]
+
+    def loss():
+        predictions = [decode_grid(model,latent,torch.empty(1,64,2),[n*.005],8,8,64)
+                       for n in range(1,steps+1)]
+        return prefix_cn_objective(torch.stack([ic,*predictions],dim=1),geom,boundaries,mg,'mg')[0]
+
+    parameters = list(model.parameters())
+    direction = [torch.randn_like(p) for p in parameters]
+    gradient = torch.autograd.grad(loss(),parameters,allow_unused=True)
+    directional = sum((g*d).sum() for g,d in zip(gradient,direction) if g is not None)
+
+    def shifted(scale):
+        with torch.no_grad():
+            for p,d in zip(parameters,direction):
+                p.add_(scale*d)
+            value = loss()
+            for p,d in zip(parameters,direction):
+                p.sub_(scale*d)
+        return value
+
+    # Perturbing the weights moves every predicted state, including its role as
+    # the previous state of the next interval, so any detachment would show here.
+    epsilon = 1e-6
+    central = (shifted(epsilon)-shifted(-epsilon))/(2*epsilon)
+    assert directional.abs() > 0
+    torch.testing.assert_close(directional,central,rtol=1e-6,atol=0)
+
+
+def test_space_time_mg_control_trains_through_the_mg_forward_substitution(tmp_path,monkeypatch):
+    import src.operators.train_pino as pino
+    inputs,_ = prescribed_inputs()
+    data = tmp_path/'data'
+    data.mkdir()
+    normalization = save_inputs(data,inputs)
+    phase0 = tmp_path/'phase0'
+    phase0.mkdir()
+    (phase0/'final_metrics.json').write_text(json.dumps(dict(stage='phase0_direct_state',passed=True)))
+    used = []
+    original = pino.prefix_cn_objective
+    def record(states,geom,boundaries,inverse,objective):
+        used.append((objective,type(inverse),states.requires_grad))
+        return original(states,geom,boundaries,inverse,objective)
+    monkeypatch.setattr(pino,'prefix_cn_objective',record)
+    cfg = config('fno',residual_mode='space_time')
+    output = tmp_path/'screen'
+    result = run_screen(cfg,data,output,phase0,normalization_path=normalization,smoke=True)
+    assert {(objective,kind) for objective,kind,_ in used} == {
+        ('raw',ExactCNInverse),('spatial_exact',ExactCNInverse),('exact',ExactCNInverse),
+        ('mg',MGOneCycleInverse)}
+    assert all(requires_grad for *_,requires_grad in used)
+    protocol = yaml.safe_load((output/'config_used.yaml').read_text())['physics_test']['protocol']
+    assert protocol['mg_settings'] == cfg['physics_test']['mg']
+    assert 'forward_substitution' in protocol['preconditioner']
+    assert result['controls']['mg']['update'] == 2
 
 
 def test_time_step_decoder_uses_current_state_and_spatial_queries_only():

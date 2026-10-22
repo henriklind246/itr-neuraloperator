@@ -166,15 +166,19 @@ def cn_objective(previous, following, geom, bc, inverse, objective):
 
 
 def prefix_cn_objective(states, geom, boundaries, inverse, objective):
-    """CN loss from an exact IC, with full temporal gradients for the block inverse."""
-    if objective not in {"raw", "spatial_exact", "exact"}:
+    """CN loss from an exact IC, with full temporal gradients for the block inverses.
+
+    exact solves the anchored block system with ExactCNInverse; mg is its
+    inexact forward substitution with one MGOneCycleInverse V-cycle per interval.
+    """
+    if objective not in {"raw", "spatial_exact", "exact", "mg"}:
         raise ValueError(f"Unsupported prefix objective {objective!r}")
     residuals = torch.stack([
         cn_step_residual(states[:, n], states[:, n + 1], geom, bc,
                          detach_previous=objective == "spatial_exact")
         for n, bc in enumerate(boundaries)
     ], dim=1)
-    transformed = (inverse.space_time(residuals) if objective == "exact"
+    transformed = (inverse.space_time(residuals) if objective in {"exact", "mg"}
                    else inverse(residuals) if objective == "spatial_exact" else residuals)
     return transformed.square().mean(), residuals, transformed
 
@@ -821,7 +825,7 @@ def run_control(objective, initial_state, config, inputs, stream, references, ou
                 states = torch.stack([ic, *predictions], dim=1)
                 boundaries = [make_boundary(params, np.full(len(params), n), inputs, device, ic.dtype)
                               for n in range(pino["prefix_steps"])]
-                physics, residual, transformed = prefix_cn_objective(states, geom, boundaries, inverse, objective)
+                physics, residual, transformed = prefix_cn_objective(states, geom, boundaries, training_inverse, objective)
             else:
                 with torch.no_grad():
                     previous = decode_grid(model, latent, coords, intervals * inputs["dt"], nx, ny,
@@ -913,7 +917,7 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
     mode = pino.get("residual_mode", "one_step")
     controls = pino.get("controls", ["raw", "exact"])
     online_mg = stage == "online" and mode == "autoregressive" and controls == ["mg"]
-    allowed = {"raw", "exact", "spatial_exact"} if mode == "space_time" else {"raw", "exact"}
+    allowed = {"raw", "exact", "spatial_exact", "mg"} if mode == "space_time" else {"raw", "exact"}
     single_autoregressive = mode == "autoregressive" and controls in (["exact"], ["mg"])
     if mode not in {"one_step", "space_time", "autoregressive"} or (not single_autoregressive and not {"raw", "exact"} <= set(controls) <= allowed) or len(set(controls)) != len(controls):
         raise ValueError("Use unique raw/exact controls, or an exact-only/MG-only autoregressive screen")
@@ -1035,8 +1039,9 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         total_solver_steps=int(round(inputs["t_final"] / inputs["dt"])),
         temporal_gradient_policy="detached_current_state_input_and_residual; mean_step_loss_gradients" if mode == "autoregressive" else "full_prefix_graph; spatial_exact alone detaches previous states" if mode == "space_time" else "detached_previous_state",
         input_encoding=("current_state_and_exact_interval_average_flux_FNO_tokens" if model_type == "fno" else "current_state_and_exact_interval_average_flux_MLP_tokens_xy_decoder") if mode == "autoregressive" else "full_horizon_forcing_tokens_and_IC_query_time_cond" if model_type == "fno" else "full_horizon_forcing_image_and_IC_coordinate_time_decoder",
-        preconditioner="one_Torch_geometric_MG_V_cycle" if mg_only else "cached_exact_spatial_CN_inverse" if mode == "autoregressive" else "exact_CN_inverse",
-        mg_settings=config["physics_test"].get("mg") if mg_only else None,
+        preconditioner="one_Torch_geometric_MG_V_cycle" if mg_only else "cached_exact_spatial_CN_inverse" if mode == "autoregressive"
+                       else "exact_CN_inverse; mg: one_MG_V_cycle_per_interval_forward_substitution" if "mg" in controls else "exact_CN_inverse",
+        mg_settings=config["physics_test"].get("mg") if "mg" in controls else None,
         historical_exact_metrics=historical,
         gate_policy="registered_final_update_evidence_no_accuracy_gate" if online_mg else "absolute_fit_and_within_registered_factor_of_historical_exact" if mg_only and historical is not None else "absolute_prefix_and_first_step_fit_only_no_raw_comparison" if single_autoregressive else "matched_raw_exact_improvement",
         online_sampling=pino.get("online_sampling", "precomputed"),
@@ -1145,7 +1150,8 @@ def finish_screen(config, metrics, histories, output, protocol_sha):
         return summary
     autoregressive = pino.get("residual_mode") == "autoregressive"
     raw = metrics.get("raw")
-    candidate = "mg" if "mg" in metrics else "exact"
+    # A space_time mg control is recorded beside the matched raw/exact gate, not gated.
+    candidate = "mg" if autoregressive and "mg" in metrics else "exact"
     full_gate = None if autoregressive else cvit_gate(raw, metrics["exact"], pino, config["physics_test"]["stage"])
     prefix_gate = None
     if pino.get("residual_mode", "one_step") in {"space_time", "autoregressive"}:

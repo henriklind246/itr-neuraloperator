@@ -33,6 +33,19 @@ def solver_and_geom(n=7, *, integral=True, layered=False, sigma=7.25):
     return sim, geom
 
 
+def direct_mg(geom):
+    """A one-level hierarchy, whose V-cycle is the cached direct solve of the fine system."""
+    mg = MGOneCycleInverse(geom, coarse_max_unknowns=(geom.Nx - 1) * geom.Ny)
+    assert mg.level_shapes == [(geom.Nx - 1, geom.Ny)]
+    return mg
+
+
+def zero_boundary(geom):
+    zero = torch.zeros((1, geom.Ny), dtype=torch.float64)
+    return FullBCData(T_right_tilde=torch.tensor(0.0, dtype=torch.float64),
+                      qL_n=zero, qL_np1=zero, qL_int=zero)
+
+
 def boundary(sim, *, mu=296.0, sigma=7.25, time=0.075):
     return FullBCData(
         T_right_tilde=torch.tensor((300 - mu) / sigma, dtype=torch.float64),
@@ -173,9 +186,12 @@ def test_fixed_inverse_rejects_batched_geometry():
 
 @pytest.mark.parametrize('layered,n', [(False,7), (True,8)])
 @pytest.mark.parametrize('integral', [False,True])
-def test_space_time_inverse_recovers_trajectory_error_and_mse_gradient(layered,n,integral):
+@pytest.mark.parametrize('build_inverse', [ExactCNInverse, direct_mg], ids=['exact', 'mg_direct_solve'])
+def test_space_time_inverse_recovers_trajectory_error_and_mse_gradient(layered,n,integral,build_inverse):
+    # direct_mg replaces the V-cycle by an exact spatial solve, so its forward
+    # substitution must give the FV trajectory error exactly, as ExactCNInverse does.
     sim, geom = solver_and_geom(n, layered=layered, integral=integral)
-    inverse = ExactCNInverse(geom)
+    inverse = build_inverse(geom)
     rng = np.random.default_rng(19)
     initial = 300 + rng.normal(size=(n,n))
     initial[-1] = 300
@@ -215,11 +231,68 @@ def test_space_time_sparse_inverse_transpose_and_higher_derivative():
     torch.testing.assert_close(gradient,expected,rtol=1e-12,atol=1e-12)
 
 
-def test_space_time_inverse_requires_a_nonempty_time_axis():
+@pytest.mark.parametrize('build_inverse', [ExactCNInverse, MGOneCycleInverse])
+def test_space_time_inverse_requires_a_nonempty_time_axis(build_inverse):
     _,geom = solver_and_geom(4)
-    inverse = ExactCNInverse(geom)
+    inverse = build_inverse(geom)
     with pytest.raises(ValueError,match='time dimension'):
         inverse.space_time(torch.zeros(1,0,3,4))
+
+
+@pytest.mark.parametrize('n,steps,coarse', [(9, 5, 4), (100, 60, 64)])
+def test_mg_space_time_is_one_cycle_forward_substitution_with_the_residual_explicit_operator(
+        n, steps, coarse):
+    # B must be the residual's own explicit CN action with zero boundary data
+    # and a zero right-wall correction, on the 100x100 benchmark grid included.
+    _, geom = solver_and_geom(n)
+    mg = MGOneCycleInverse(geom, coarse_max_unknowns=coarse)
+    assert len(mg.level_shapes) >= 3
+    residuals = torch.randn((2, steps, n - 1, n), generator=torch.Generator().manual_seed(5),
+                            dtype=torch.float64)
+    previous = torch.zeros((2, n - 1, n), dtype=torch.float64)
+    expected = []
+    for residual in residuals.unbind(dim=1):
+        padded = torch.cat((previous, torch.zeros((2, 1, n), dtype=torch.float64)), dim=1)
+        coupled = explicit_cn_rhs(padded, geom, zero_boundary(geom), detach_previous=False)
+        previous = mg(residual + coupled)
+        expected.append(previous)
+    actual = mg.space_time(residuals)
+    torch.testing.assert_close(actual, torch.stack(expected, dim=1), rtol=1e-12, atol=1e-12)
+    assert not torch.allclose(actual[:, 1:], mg(residuals)[:, 1:], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize('pre,post', [(2, 2), (1, 3)])
+def test_mg_space_time_backward_is_the_adjoint_of_the_actual_coupled_cycles(pre, post):
+    _, geom = solver_and_geom(6)
+    mg = MGOneCycleInverse(geom, pre_smooth=pre, post_smooth=post, coarse_max_unknowns=4)
+    assert len(mg.level_shapes) == 3
+    nx, ny, steps = 5, 6, 3
+    n = nx * ny
+    basis = torch.eye(n, dtype=torch.float64).reshape(n, nx, ny)
+    cycle = mg(basis).reshape(n, n).T
+    padded = torch.cat((basis, torch.zeros((n, 1, ny), dtype=torch.float64)), dim=1)
+    implicit = implicit_cn_action(padded, geom).reshape(n, n).T
+    propagator = cycle @ (2 * torch.eye(n, dtype=torch.float64) - implicit)
+    # Block lower-triangular in time: block (row, column) is (P B)^(row - column) P.
+    expected = torch.cat([torch.cat([
+        torch.linalg.matrix_power(propagator, row - column) @ cycle if row >= column
+        else torch.zeros((n, n), dtype=torch.float64) for column in range(steps)], dim=1)
+        for row in range(steps)])
+    space_time_basis = torch.eye(steps * n, dtype=torch.float64).reshape(steps * n, steps, nx, ny)
+    actual = mg.space_time(space_time_basis).reshape(steps * n, steps * n).T
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    # Unequal smoothing makes the V-cycle nonsymmetric, so a backward that
+    # assumed P^T = M P M^{-1} would be wrong there; autograd must not assume it.
+    capacity = torch.diag(mg.capacity.flatten())
+    weighted = capacity @ cycle @ torch.linalg.inv(capacity)
+    assert torch.allclose(cycle.T, weighted, rtol=1e-10, atol=1e-12) == (pre == post)
+    residual = torch.randn((2, steps, nx, ny), dtype=torch.float64, requires_grad=True)
+    weights = torch.randn_like(residual)
+    gradient = torch.autograd.grad((mg.space_time(residual) * weights).sum(), residual)[0]
+    torch.testing.assert_close(gradient.reshape(2, -1), weights.reshape(2, -1) @ expected,
+                               rtol=1e-12, atol=1e-12)
+    assert torch.autograd.gradcheck(mg.space_time, (residual[:1].detach().requires_grad_(),))
+    assert torch.autograd.gradgradcheck(mg.space_time, (residual[:1].detach().requires_grad_(),))
 
 
 def test_mg_hierarchy_actual_adjoint_and_second_derivative():
@@ -254,12 +327,13 @@ def test_one_mg_cycle_recovers_smooth_oscillatory_mixed_and_boundary_errors(n):
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason='MPS unavailable')
-def test_mg_mps_forward_backward_stay_on_device(monkeypatch):
+@pytest.mark.parametrize('method', ['forward', 'space_time'])
+def test_mg_mps_forward_backward_stay_on_device(monkeypatch, method):
     _, geom = solver_and_geom(100)
     cpu = MGOneCycleInverse(geom).float()
     mg = MGOneCycleInverse(geom).to(device='mps', dtype=torch.float32)
-    residual = torch.randn(2,99,100, requires_grad=True)
-    expected = cpu(residual)
+    residual = torch.randn(2,3,99,100, requires_grad=True)
+    expected = getattr(cpu, method)(residual)
     expected_grad = torch.autograd.grad(expected.square().mean(), residual)[0]
     gpu_input = residual.detach().to('mps').requires_grad_()
     def forbidden(*args, **kwargs):
@@ -267,7 +341,7 @@ def test_mg_mps_forward_backward_stay_on_device(monkeypatch):
     with monkeypatch.context() as guarded:
         guarded.setattr(torch.Tensor, 'cpu', forbidden)
         guarded.setattr(torch.Tensor, 'numpy', forbidden)
-        actual = mg(gpu_input)
+        actual = getattr(mg, method)(gpu_input)
         actual_grad = torch.autograd.grad(actual.square().mean(), gpu_input)[0]
     torch.testing.assert_close(actual.cpu(), expected, rtol=3e-5, atol=1e-6)
     torch.testing.assert_close(actual_grad.cpu(), expected_grad, rtol=3e-5, atol=1e-8)

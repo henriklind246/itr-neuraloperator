@@ -29,6 +29,26 @@ physics_test:
     min_final_error_ratio: 5.0
     log_every: 25
 
+  # Solution-space Hessian of the space-time CN loss (scripts/diagnose_space_time_conditioning.py).
+  conditioning:
+    grid_sizes: [24, 32]
+    horizons: [1, 30, 60, 120]
+    # Matrix-free rerun on the dataset grid; [] skips it. Each D variant takes
+    # several minutes there, so the full set runs only on grid_sizes.
+    benchmark_grid_horizons: [60]
+    benchmark_grid_configurations: [A_none, B_spatial_mg, C_spatial_exact, D_truncated_L5,
+                                    D_sequential_mg, exact_space_time]
+    truncation_lags: [1, 5, 10, 20]
+    dt: null  # null keeps the benchmark generator's solver dt
+    modes: 4
+    # Lanczos stopping tolerances; the softest modes cluster tightly on the
+    # dataset grid, where 1e-10 costs ~3x the steps for the same 7 digits.
+    max_tolerance: 1.0e-6
+    min_tolerance: 1.0e-8
+    seed: 1701
+    validation_grid_size: 12
+    validation_horizon: 12
+
   cvit:
     emb_dim: 256
     dec_emb_dim: null
