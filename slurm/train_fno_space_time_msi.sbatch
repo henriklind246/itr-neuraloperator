@@ -56,13 +56,21 @@ VALIDATE_EVERY="${VALIDATE_EVERY:-500}"
 FULL_VALIDATE_EVERY="${FULL_VALIDATE_EVERY:-1000}"
 VALIDATION_CASES="${VALIDATION_CASES:-128}"
 SEED="${SEED:-42}"
+# Physics warm-up: during the first PHYSICS_WARMUP_UPDATES updates each problem
+# batch is reused for PHYSICS_WARMUP_RESAMPLE_EVERY updates (archive used 500/50).
+PHYSICS_WARMUP_UPDATES="${PHYSICS_WARMUP_UPDATES:-0}"
+PHYSICS_WARMUP_RESAMPLE_EVERY="${PHYSICS_WARMUP_RESAMPLE_EVERY:-1}"
 ALLOCATION_SECONDS="${ALLOCATION_SECONDS:-28800}"  # keep equal to --time for the startup fit estimate
 
 case "$CONTROL" in
     mg|spatial_mg|spatial_mg_detached) GATE_DIR="$PHASE4_DIR" ;;
     *) GATE_DIR="$PHASE0_DIR" ;;
 esac
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-fno_st_${CONTROL}_${OPTIMIZER}_lr${LEARNING_RATE}_bs${BATCH_SIZE}_n${PREFIX_STEPS}_u${UPDATES}_s${SEED}}"
+WARMUP_TAG=""
+if [[ "$PHYSICS_WARMUP_UPDATES" != 0 ]]; then
+    WARMUP_TAG="_pw${PHYSICS_WARMUP_UPDATES}x${PHYSICS_WARMUP_RESAMPLE_EVERY}"
+fi
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-fno_st_${CONTROL}_${OPTIMIZER}_lr${LEARNING_RATE}_bs${BATCH_SIZE}_n${PREFIX_STEPS}_u${UPDATES}_s${SEED}${WARMUP_TAG}}"
 RUN_DIR="${RUN_DIR:-$PERSISTENT_RUNS/${EXPERIMENT_NAME}_${SLURM_JOB_ID:?}}"
 export BENCHMARK=forcing_homogeneous
 export REPRESENTATION=temporal_encoder
@@ -80,6 +88,7 @@ mkdir -p "$PERSISTENT_RUNS"
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_DIR=$PROJECT_DIR DATA_DIR=$DATA_DIR GATE_DIR=$GATE_DIR NORMALIZATION_PATH=${NORMALIZATION_PATH:-<frozen from DATA_DIR>}"
 echo "CONTROL=$CONTROL OPTIMIZER=$OPTIMIZER LEARNING_RATE=$LEARNING_RATE SCHEDULER=$SCHEDULER BATCH_SIZE=$BATCH_SIZE UPDATES=$UPDATES PREFIX_STEPS=$PREFIX_STEPS"
+echo "PHYSICS_WARMUP_UPDATES=$PHYSICS_WARMUP_UPDATES PHYSICS_WARMUP_RESAMPLE_EVERY=$PHYSICS_WARMUP_RESAMPLE_EVERY"
 echo "Trailing overrides (applied last): $*"
 nvidia-smi
 
@@ -107,6 +116,8 @@ else
         physics_test.pino.validation_rollout_steps=60 physics_test.pino.validation_batch_size=8
         physics_test.pino.compact_metrics=true physics_test.pino.log_every=50
         "physics_test.pino.seed=$SEED" physics_test.pino.ic_weight=0.0
+        "physics_test.pino.physics_warmup_updates=$PHYSICS_WARMUP_UPDATES"
+        "physics_test.pino.physics_warmup_resample_every=$PHYSICS_WARMUP_RESAMPLE_EVERY"
         physics_test.pino.checkpoint_keep_all=false
         'physics_test.pino.startup_profile_updates=[50,100]'
         "physics_test.pino.allocation_seconds=$ALLOCATION_SECONDS"

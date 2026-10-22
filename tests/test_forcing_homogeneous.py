@@ -329,6 +329,8 @@ def test_online_space_time_fno_trains_validates_and_resumes(homogeneous_files, t
     (lambda c: c['model']['parameters'].update(dropout=.1), 1, 'dropout'),
     (lambda c: c['physics_test']['pino'].update(time_chunk_size=0), 1, 'time_chunk_size'),
     (lambda c: c['physics_test']['pino'].update(validation_seed=42), 1, 'independent seed'),
+    (lambda c: c['physics_test']['pino'].update(physics_warmup_updates=-1), 1, 'physics_warmup_updates'),
+    (lambda c: c['physics_test']['pino'].update(physics_warmup_resample_every=0), 1, 'physics_warmup_resample_every'),
 ])
 def test_online_space_time_rejects_invalid_runs_before_creating_artifacts(homogeneous_files, tmp_path,
                                                                          mutate, gate_index, match):
@@ -401,15 +403,21 @@ exec bash "$LAUNCHER" "$@"
     scheduler = pino.build_scheduler(cfg, optimizer)
     assert scheduler.lr_for_update(250) == pytest.approx(1e-3 * .9)
 
+    assert (pino_cfg['physics_warmup_updates'], pino_cfg['physics_warmup_resample_every']) == (0, 1)
+
     norm = tmp_path / 'normalization with spaces.json'
     args = launch('model.parameters.width=32', 'training.soap.precondition_frequency=5',
                   CONTROL='raw', OPTIMIZER='Adam', LEARNING_RATE='3e-4', SCHEDULER='RIGNOThreePhase',
-                  BATCH_SIZE='4', NORMALIZATION_PATH=str(norm))
+                  BATCH_SIZE='4', NORMALIZATION_PATH=str(norm),
+                  PHYSICS_WARMUP_UPDATES='500', PHYSICS_WARMUP_RESAMPLE_EVERY='50')
     assert args[args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase0_raw_exact_20261001')
     assert args[args.index('--normalization') + 1] == str(norm)
+    assert args[args.index('--output-dir') + 1].endswith('_s42_pw500x50_77')
     assert args[-2:] == ['model.parameters.width=32', 'training.soap.precondition_frequency=5']
     cfg = resolved(args)
     assert cfg['physics_test']['pino']['controls'] == ['raw'] and cfg['physics_test']['pino']['batch_size'] == 4
+    assert (cfg['physics_test']['pino']['physics_warmup_updates'],
+            cfg['physics_test']['pino']['physics_warmup_resample_every']) == (500, 50)
     assert (cfg['training']['optimizer'], cfg['training']['learning_rate']) == ('Adam', 3e-4)
     assert cfg['training']['scheduler']['type'] == 'RIGNOThreePhase'
     assert cfg['model']['parameters']['width'] == 32 and cfg['training']['soap']['precondition_frequency'] == 5
@@ -418,3 +426,58 @@ exec bash "$LAUNCHER" "$@"
 
     resume = tmp_path / 'resume with spaces'
     assert launch(RESUME_RUN_DIR=str(resume))[3:] == ['--resume', '--output-dir', str(resume)]
+
+
+@pytest.mark.parametrize('warmup_updates,resample_every,expected', [
+    (100, 3, [0, 3]), (2, 3, [0, 2, 3, 4, 5]), (0, 50, [0, 1, 2, 3, 4, 5])])
+def test_physics_warmup_resampling_cadence_matches_the_archived_trainer(warmup_updates, resample_every, expected):
+    # The archived trainer's own cases: fresh draws at 0, R, 2R, ... during warm-up, every update after.
+    assert [u for u in range(6) if pino._should_resample_online_batch(u, warmup_updates, resample_every)] == expected
+
+
+def test_physics_warmup_holds_batches_then_resamples_and_resumes_inside_a_hold(homogeneous_files, tmp_path, monkeypatch):
+    inputs, data, norm, gates = homogeneous_files
+    cfg = space_time_config()
+    cfg['physics_test']['pino'].update(physics_warmup_updates=3, physics_warmup_resample_every=2)
+    draws = []
+    draw = pino.draw_online_batch
+    def record(inputs, generators, count, assignments=None):
+        if count == cfg['physics_test']['pino']['batch_size']:
+            draws.append(count)
+        return draw(inputs, generators, count, assignments)
+    monkeypatch.setattr(pino, 'draw_online_batch', record)
+    baseline, restarted = tmp_path / 'baseline', tmp_path / 'restart'
+    def run(output):
+        return pino.run_screen(cfg, data, output, gates[1], 'online', None, norm, smoke=True)
+    assert run(baseline)['status'] == 'complete'
+    # Update 1 draws, 2 reuses it, 3 draws, 4 is past the warm-up and draws.
+    assert len(draws) == 3
+    manifest = [json.loads(line) for line in (baseline / 'mg/training_manifest.jsonl').read_text().splitlines()]
+    assert [row['resampled'] for row in manifest] == [True, False, True, True]
+    assert manifest[1]['problems'] == manifest[0]['problems']
+    assert len({json.dumps(row['problems'], sort_keys=True) for row in manifest}) == 3
+    original = pino.space_time_backward
+    def interrupt(*args):
+        value = original(*args)
+        signal.raise_signal(signal.SIGUSR1)
+        return value
+    monkeypatch.setattr(pino, 'space_time_backward', interrupt)
+    assert run(restarted)['status'] == 'interrupted'
+    monkeypatch.setattr(pino, 'space_time_backward', original)
+    held = torch.load(restarted / 'mg/checkpoint_latest.pt', weights_only=False)
+    assert held['successful_updates'] == 1 and held['online_state']['held_problems'] is not None
+    assert pino.resume_screen(restarted)['status'] == 'complete'
+    a, b = (torch.load(output / 'mg/checkpoint_final.pt', weights_only=False) for output in (baseline, restarted))
+    for key in ('model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'sampler_rng_states'):
+        assert_same_state(a[key], b[key])
+    assert (baseline / 'mg/training_manifest.jsonl').read_bytes() == (restarted / 'mg/training_manifest.jsonl').read_bytes()
+
+
+def test_physics_warmup_is_rejected_where_nothing_is_resampled(homogeneous_files, tmp_path):
+    _, data, norm, gates = homogeneous_files
+    cfg = config(residual_mode='autoregressive')
+    cfg['benchmark']['name'] = 'forcing_homogeneous'
+    cfg['physics_test']['pino']['physics_warmup_updates'] = 10
+    with pytest.raises(ValueError, match='physics_warmup_updates holds online'):
+        pino.run_screen(cfg, data, tmp_path / 'fixed', gates[0], normalization_path=norm, smoke=True)
+    assert not (tmp_path / 'fixed').exists()

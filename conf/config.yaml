@@ -99,6 +99,13 @@ physics_test:
     forcing_a_ref: 300.0
     log_every: 25
     causal_warmup_updates: 0
+    # Physics warm-up for online per_update runs (the archived trainer's
+    # warmup.steps/resample_every, e.g. 500/50): during the first
+    # physics_warmup_updates updates each drawn problem batch is reused for
+    # physics_warmup_resample_every consecutive updates; afterwards every update
+    # draws fresh problems. 0 disables it.
+    physics_warmup_updates: 0
+    physics_warmup_resample_every: 1
     evaluation_times: [0.0, 0.005, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3]
     gate_error_ratio: 1.5
     gate_compare_first_step_baselines: true

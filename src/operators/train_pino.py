@@ -329,6 +329,13 @@ def online_generators(seed):
             (("main", 100), ("ic_family", 300), ("ic_params", 400), ("forcing_params", 500))}
 
 
+def _should_resample_online_batch(completed_updates, warmup_updates, resample_every):
+    """Physics warm-up: hold each drawn batch for resample_every updates until warmup_updates."""
+    if completed_updates < warmup_updates:
+        return completed_updates % resample_every == 0
+    return True
+
+
 def draw_online_batch(inputs, generators, count, assignments=None):
     nx, ny = len(inputs["x"]), len(inputs["y"])
     grids = dict(X=np.broadcast_to(inputs["x"][:, None], (nx, ny)),
@@ -643,10 +650,11 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
     geom = replace(precise, **{name: value.to(device=device, dtype=torch.float32 if value.is_floating_point() else value.dtype)
                     for name, value in vars(precise).items() if torch.is_tensor(value)})
     generators = online_generators(pino["seed"])
+    # held_problems is checkpointed so a resume inside a warm-up hold reuses the same batch.
     state = dict(successful_updates=0, elapsed_seconds=0.0, window=[], profile_durations=[],
                  runtime_reports=[], validation_times=dict(prefix=0.0, full=0.0),
                  pending_validation=True, validation_progress=None, evaluations=[],
-                 manifest_position=0, metrics_position=0)
+                 manifest_position=0, metrics_position=0, held_problems=None)
     fields = ("update", "physics_loss", "raw_residual_rms", "gradient_norm", "learning_rate", "seconds_per_update")
     if time_conditioned:
         fields += ("ic_loss",)
@@ -741,8 +749,12 @@ def run_online_mg(initial_state, config, inputs, stream, references, output, dev
                     break
                 synchronize(device)
                 update_start = time.perf_counter()
-                params = draw_online_batch(inputs, generators, pino["batch_size"])
-                manifest.write(json.dumps(dict(update=update + 1,
+                resampled = state["held_problems"] is None or _should_resample_online_batch(
+                    update, pino["physics_warmup_updates"], pino["physics_warmup_resample_every"])
+                if resampled:
+                    state["held_problems"] = draw_online_batch(inputs, generators, pino["batch_size"])
+                params = state["held_problems"]
+                manifest.write(json.dumps(dict(update=update + 1, resampled=resampled,
                                problems=[{k: v for k, v in p.items() if k != "T0"} for p in params]),
                                default=lambda value: value.tolist()) + "\n")
                 manifest.flush()
@@ -1008,15 +1020,19 @@ def run_screen(config, data_dir, output, phase0_dir, stage="fixed", fixed_screen
         raise ValueError("Per-update sampling requires online autoregressive MG or one control of an online space_time FNO run")
     if pino["forcing_a_ref"] <= 0:
         raise ValueError("forcing_a_ref must be positive")
+    if pino["physics_warmup_updates"] and not online:
+        raise ValueError("physics_warmup_updates holds online per_update batches; fixed and precomputed screens have none")
     if online:
         if not per_update or not pino.get("compact_metrics"):
             raise ValueError("Online per-update training requires per_update sampling and compact_metrics")
         if online_mg and normalization_path is None:
             raise ValueError("Online MG requires the already-frozen normalization file")
         for key in ("online_updates", "online_validate_every", "full_validate_every", "batch_size", "validation_batch_size", "log_every",
-                    *(("time_chunk_size",) if online_space_time else ())):
+                    "physics_warmup_resample_every", *(("time_chunk_size",) if online_space_time else ())):
             if not isinstance(pino[key], int) or pino[key] < 1:
                 raise ValueError(f"{key} must be a positive integer")
+        if not isinstance(pino["physics_warmup_updates"], int) or pino["physics_warmup_updates"] < 0:
+            raise ValueError("physics_warmup_updates must be a non-negative integer")
         if pino["full_validate_every"] % pino["online_validate_every"]:
             raise ValueError("full_validate_every must be a multiple of online_validate_every")
         if pino["validation_seed"] == pino["seed"]:
