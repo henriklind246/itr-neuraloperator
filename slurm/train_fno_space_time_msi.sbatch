@@ -20,7 +20,7 @@
 # streams, so one job per CONTROL/OPTIMIZER gives matched comparisons.
 #
 #   sbatch --export=ALL,CONTROL=spatial_mg,OPTIMIZER=Adam,LEARNING_RATE=3e-4 slurm/train_fno_space_time_msi.sbatch
-#   sbatch slurm/train_fno_space_time_msi.sbatch model.parameters.width=32 training.soap.precondition_frequency=5
+#   sbatch slurm/train_fno_space_time_msi.sbatch model.parameters.width=32 training.ss_esoap.check_interval=5
 #   sbatch --export=ALL,RESUME_RUN_DIR=$HOME/fno_runs/<run> slurm/train_fno_space_time_msi.sbatch
 #
 # Trailing arguments are dotted config overrides applied after the defaults below.
@@ -40,16 +40,20 @@ PHASE4_DIR="${PHASE4_DIR:-$PROJECT_DIR/runs/physics_test_phase4_direct_state_mg_
 PERSISTENT_RUNS="${PERSISTENT_RUNS:-$HOME/fno_runs}"
 
 CONTROL="${CONTROL:-mg}"                    # raw | exact | spatial_exact | spatial_mg | spatial_mg_detached | mg
-OPTIMIZER="${OPTIMIZER:-SOAP}"              # SOAP | Adam | AdamW
-LEARNING_RATE="${LEARNING_RATE:-0.001}"
+OPTIMIZER="${OPTIMIZER:-SSESOAP}"           # SSESOAP | SOAP | Adam | AdamW
+# Conservative end of the paper's LR sweep: fresh batches make secants noisy,
+# and the local N-D FNO extension can amplify updates by tau_min**(-1/2).
+LEARNING_RATE="${LEARNING_RATE:-0.0001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 SCHEDULER="${SCHEDULER:-PICViTExponential}" # PICViTExponential | RIGNOThreePhase | CosineWarmRestarts | StepLR
-DECAY_EVERY="${DECAY_EVERY:-250}"           # PICViTExponential; schedule lengths count optimizer updates
+# Local 10k-update schedule, not a paper prescription: 20 decay periods leave
+# LR at ~1.22e-5, avoiding a long plateau at the 1e-5 floor.
+DECAY_EVERY="${DECAY_EVERY:-500}"           # PICViTExponential; schedule lengths count optimizer updates
 DECAY_RATE="${DECAY_RATE:-0.9}"
 MIN_LR="${MIN_LR:-0.00001}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-UPDATES="${UPDATES:-5000}"
+UPDATES="${UPDATES:-10000}"
 PREFIX_STEPS="${PREFIX_STEPS:-60}"
 TIME_CHUNK_SIZE="${TIME_CHUNK_SIZE:-4}"
 VALIDATE_EVERY="${VALIDATE_EVERY:-500}"
@@ -99,6 +103,12 @@ else
     overrides=(
         training.device=cuda "training.optimizer=$OPTIMIZER" "training.learning_rate=$LEARNING_RATE"
         "training.weight_decay=$WEIGHT_DECAY" "training.grad_clip=$GRAD_CLIP"
+        # arXiv:2608.29448v1 Appendix C.4, Table 6; adaptive gamma is internal.
+        'training.ss_esoap.betas=[0.9,0.95]' training.ss_esoap.eps=1e-8
+        training.ss_esoap.check_interval=1 training.ss_esoap.trigger_threshold=0.2
+        # Retain the local numerical safeguard and FNO tensor-size limit.
+        training.ss_esoap.warmup_steps=0 training.ss_esoap.tau_min=0.001
+        training.ss_esoap.max_precond_dim=2048
         'training.soap.betas=[0.95,0.95]' training.soap.shampoo_beta=0.95
         training.soap.eps=1e-8 training.soap.precondition_frequency=10
         training.soap.max_precond_dim=2048 training.soap.merge_dims=false

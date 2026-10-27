@@ -18,6 +18,7 @@ from scripts.run_train_fixed import _apply_override, _parse_override_value
 import src.operators.train_pino as pino
 from src.operators.fno2d import FNO2d
 from src.operators.soap import SOAP
+from src.operators.ss_esoap import SSESOAP
 from src.operators.train import load_config
 from src.physics.fv_residual import build_homogeneous_cn_geom, cn_step_residual
 from tests.test_cvit_pino import config, save_inputs
@@ -387,21 +388,26 @@ exec bash "$LAUNCHER" "$@"
     assert args[args.index('--stage') + 1] == 'online'
     assert Path(args[args.index('--data-dir') + 1]) == project / 'data/forcing_homogeneous'
     assert Path(args[args.index('--phase0-dir') + 1]) == project / 'runs/physics_test_phase4_direct_state_mg_20261002'
-    assert Path(args[args.index('--output-dir') + 1]) == tmp_path / 'runs/fno_st_mg_SOAP_lr0.001_bs8_n60_u5000_s42_77'
+    assert Path(args[args.index('--output-dir') + 1]) == tmp_path / 'runs/fno_st_mg_SSESOAP_lr0.0001_bs8_n60_u10000_s42_77'
     assert '--normalization' not in args
     cfg = resolved(args)
     pino_cfg = cfg['physics_test']['pino']
     assert cfg['physics_test']['model_type'] == 'fno'
     assert (pino_cfg['residual_mode'], pino_cfg['controls'], pino_cfg['online_sampling']) == ('space_time', ['mg'], 'per_update')
-    assert (pino_cfg['prefix_steps'], pino_cfg['batch_size'], pino_cfg['online_updates']) == (60, 8, 5000)
+    assert (pino_cfg['prefix_steps'], pino_cfg['batch_size'], pino_cfg['online_updates']) == (60, 8, 10000)
     assert (pino_cfg['time_chunk_size'], pino_cfg['validation_cases'], pino_cfg['ic_weight']) == (4, 128, 0.0)
     assert cfg['model']['parameters']['hard_right_dirichlet'] and cfg['model']['parameters']['dropout'] == 0
     model = pino.build_screen_model(cfg, prescribed_inputs(n=20)[0], torch.device('cpu'))
     assert isinstance(model, FNO2d)
     optimizer = pino.build_optimizer(cfg, model.parameters())
-    assert isinstance(optimizer, SOAP) and optimizer.param_groups[0]['lr'] == pytest.approx(1e-3)
+    assert isinstance(optimizer, SSESOAP) and optimizer.param_groups[0]['lr'] == pytest.approx(1e-4)
+    group = optimizer.param_groups[0]
+    assert group['betas'] == (.9, .95) and group['eps'] == pytest.approx(1e-8)
+    assert group['check_interval'] == 1 and group['trigger_threshold'] == .2
+    assert group['warmup_steps'] == 0 and group['tau_min'] == .001
     scheduler = pino.build_scheduler(cfg, optimizer)
-    assert scheduler.lr_for_update(250) == pytest.approx(1e-3 * .9)
+    assert scheduler.lr_for_update(500) == pytest.approx(1e-4 * .9)
+    assert scheduler.lr_for_update(pino_cfg['online_updates']) == pytest.approx(1e-4 * .9 ** 20)
 
     assert (pino_cfg['physics_warmup_updates'], pino_cfg['physics_warmup_resample_every']) == (0, 1)
 
