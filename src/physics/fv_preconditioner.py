@@ -91,13 +91,15 @@ class ExactCNInverse(nn.Module):
             raise ValueError(f"Expected free field {self.free_shape}, got {tuple(residual.shape)}")
         return _SparseSolve.apply(residual, self.factor, False)
 
-    def space_time(self, residuals: torch.Tensor) -> torch.Tensor:
+    def space_time(self, residuals: torch.Tensor, *, detach_previous=False) -> torch.Tensor:
         """Solve the anchored CN block system on (...,time,Nx-1,Ny)."""
         if residuals.ndim < 3 or residuals.shape[-3] < 1:
             raise ValueError("A space-time residual requires a nonempty time dimension")
         previous = torch.zeros_like(residuals[..., 0, :, :])
         corrections = []
         for residual in residuals.unbind(dim=-3):
+            if detach_previous:
+                previous = previous.detach()
             coupled = _SparseMultiply.apply(previous, self.explicit_matrix, False)
             previous = self(residual + coupled)
             corrections.append(previous)
@@ -197,21 +199,24 @@ class MGOneCycleInverse(nn.Module):
             raise ValueError(f"Expected free field {self.free_shape}, got {tuple(residual.shape)}")
         return self._cycle(residual * self.capacity, 0)
 
-    def space_time(self, residuals: torch.Tensor) -> torch.Tensor:
+    def space_time(self, residuals: torch.Tensor, *, detach_previous=False) -> torch.Tensor:
         """Inexact block forward substitution z_n = P(r_n + B z_{n-1}), z_0 = 0, on (...,time,Nx-1,Ny).
 
         ExactCNInverse.space_time with each interval solve replaced by one V-cycle P.
         B = 2 - A_hat comes from the cycle's own fine operator S = capacity*A_hat,
         so it shares the residual's capacity-divided scaling, and padding the
         eliminated right wall with zero keeps the correction homogeneous there.
-        No step is detached: autograd differentiates the whole coupled sweep
-        through the true adjoint of each V-cycle.
+        Detaching previous corrections changes only the backward sweep. The
+        residual must independently detach previous predictions for the paired
+        semi-gradient approximation; either barrier alone breaks cancellation.
         """
         if residuals.ndim < 3 or residuals.shape[-3] < 1:
             raise ValueError("A space-time residual requires a nonempty time dimension")
         previous = torch.zeros_like(residuals[..., 0, :, :])
         corrections = []
         for residual in residuals.unbind(dim=-3):
+            if detach_previous:
+                previous = previous.detach()
             coupled = 2 * previous - self._action(previous, 0) / self.capacity
             previous = self(residual + coupled)
             corrections.append(previous)

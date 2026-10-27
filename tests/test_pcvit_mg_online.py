@@ -226,14 +226,14 @@ def test_signal_resume_matches_uninterrupted_and_reuses_reference_cache(interrup
         target_calls = 62 if interruption == 'prefix_validation' else 60 if interruption == 'validation_batch_boundary' else 1
         if not triggered and (interruption == 'training' or (not torch.is_grad_enabled() and len(validation_calls) == target_calls)):
             triggered.append(True)
-            os.kill(os.getpid(), signal.SIGUSR1)
+            signal.getsignal(getattr(signal, 'SIGUSR1', signal.SIGINT))(getattr(signal, 'SIGUSR1', signal.SIGINT), None)
         return result
     name = 'autoregressive_backward' if interruption == 'training' else 'autoregressive_step'
-    prior_handler = signal.getsignal(signal.SIGUSR1)
+    prior_handler = signal.getsignal(getattr(signal, 'SIGUSR1', signal.SIGINT))
     monkeypatch.setattr(pino, name, interrupt)
     result = run_online(cfg, online_inputs, restarted)
     assert result['status'] == 'interrupted' and result_exit_code(result) == 75
-    assert signal.getsignal(signal.SIGUSR1) == prior_handler
+    assert signal.getsignal(getattr(signal, 'SIGUSR1', signal.SIGINT)) == prior_handler
     checkpoint = load_checkpoint(restarted, 'checkpoint_latest.pt')
     if interruption == 'training':
         assert checkpoint['successful_updates'] == 1
@@ -389,8 +389,8 @@ exec bash "$LAUNCHER"
     assert _parse_override_value(exact_overrides['physics_test.pino.controls']) == ['exact']
     assert exact_overrides['physics_test.pino.fixed_updates'] == '1000'
     assert exact_overrides['physics_test.pino.online_sampling'] == 'precomputed'
-    assert exact_args[exact_args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase0_raw_exact_20261001')
-    assert fixed_args[fixed_args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase4_direct_state_mg_20261002')
+    assert Path(exact_args[exact_args.index('--phase0-dir') + 1]) == project / 'runs/physics_test_phase0_raw_exact_20261001'
+    assert Path(fixed_args[fixed_args.index('--phase0-dir') + 1]) == project / 'runs/physics_test_phase4_direct_state_mg_20261002'
     assert exact_args[exact_args.index('--output-dir') + 1] == fixed_args[fixed_args.index('--exact-screen-dir') + 1]
     assert exact_args[exact_args.index('--normalization') + 1] == fixed_args[fixed_args.index('--normalization') + 1]
     assert {key: value for key, value in exact_overrides.items() if key != 'physics_test.pino.controls'} == {
@@ -399,7 +399,7 @@ exec bash "$LAUNCHER"
     assert fixed_overrides['physics_test.pino.online_sampling'] == 'precomputed'
     assert fixed_args[fixed_args.index('--output-dir') + 1] == args[args.index('--fixed-screen-dir') + 1]
     assert args[:3] == ['python', '-u', 'scripts/run_train_pino.py']
-    assert args[args.index('--data-dir') + 1] == str(project / 'data/physics_test_single_development_20261001')
+    assert Path(args[args.index('--data-dir') + 1]) == project / 'data/physics_test_single_development_20261001'
     overrides = dict(arg.split('=', 1) for arg in args if '=' in arg)
     for key in ('physics_test.model_type', 'physics_test.pino.prefix_steps', 'training.optimizer',
                 'physics_test.cvit.forcing_num_tokens', 'physics_test.cvit.hard_right_dirichlet'):

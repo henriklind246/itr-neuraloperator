@@ -15,7 +15,7 @@ from src.operators.train_pino import run_screen, resume_screen
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Physics screens and online CViT–MG evidence runs")
+    parser = argparse.ArgumentParser(description="Physics screens and online CViT/FNO formulation comparisons")
     parser.add_argument("--config")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--stage", choices=("fixed", "online"), default="fixed")
@@ -34,12 +34,14 @@ def main():
         result = resume_screen(args.output_dir)
         print(result)
         return result_exit_code(result)
-    if args.data_dir is None or args.phase0_dir is None:
-        parser.error("Fresh screens require --data-dir and --phase0-dir")
     config = copy.deepcopy(load_config(args.config))
     for raw in args.overrides:
         key, value = raw.split("=", 1)
         _apply_override(config, key, _parse_override_value(value))
+    if args.data_dir is None:
+        parser.error("Fresh screens require --data-dir")
+    if args.phase0_dir is None and not config["physics_test"]["pino"].get("formulation_comparison"):
+        parser.error("Gated screens require --phase0-dir")
     if not getattr(problem_from_config(config), "supports_physics_only", False):
         raise ValueError("Select a homogeneous physics-only benchmark with BENCHMARK")
     try:

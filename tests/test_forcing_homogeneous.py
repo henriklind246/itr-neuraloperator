@@ -1,7 +1,7 @@
 import copy
 import csv
 import json
-from itertools import product
+from itertools import count, product
 import os
 from pathlib import Path
 import signal
@@ -172,7 +172,7 @@ def test_online_training_validation_and_resume(homogeneous_files, tmp_path, monk
         result = original(*args)
         calls.append(1)
         if len(calls) == 1:
-            signal.raise_signal(signal.SIGUSR1)
+            signal.getsignal(getattr(signal, 'SIGUSR1', signal.SIGINT))(getattr(signal, 'SIGUSR1', signal.SIGINT), None)
         return result
     monkeypatch.setattr(pino, 'autoregressive_backward', interrupt)
     assert run(restarted)['status'] == 'interrupted'
@@ -287,7 +287,7 @@ def test_online_space_time_fno_trains_validates_and_resumes(homogeneous_files, t
     assert set(result['controls']) == {control} and calls == [control] * 4
     def interrupt(*args):
         value = original(*args)
-        signal.raise_signal(signal.SIGUSR1)
+        signal.getsignal(getattr(signal, 'SIGUSR1', signal.SIGINT))(getattr(signal, 'SIGUSR1', signal.SIGINT), None)
         return value
     monkeypatch.setattr(pino, 'space_time_backward', interrupt)
     assert run(restarted)['status'] == 'interrupted'
@@ -385,9 +385,9 @@ exec bash "$LAUNCHER" "$@"
     args = launch()
     assert args[:3] == ['python', '-u', 'scripts/run_train_pino.py']
     assert args[args.index('--stage') + 1] == 'online'
-    assert args[args.index('--data-dir') + 1] == str(project / 'data/forcing_homogeneous')
-    assert args[args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase4_direct_state_mg_20261002')
-    assert args[args.index('--output-dir') + 1] == str(tmp_path / 'runs/fno_st_mg_SOAP_lr0.001_bs8_n60_u5000_s42_77')
+    assert Path(args[args.index('--data-dir') + 1]) == project / 'data/forcing_homogeneous'
+    assert Path(args[args.index('--phase0-dir') + 1]) == project / 'runs/physics_test_phase4_direct_state_mg_20261002'
+    assert Path(args[args.index('--output-dir') + 1]) == tmp_path / 'runs/fno_st_mg_SOAP_lr0.001_bs8_n60_u5000_s42_77'
     assert '--normalization' not in args
     cfg = resolved(args)
     pino_cfg = cfg['physics_test']['pino']
@@ -410,7 +410,7 @@ exec bash "$LAUNCHER" "$@"
                   CONTROL='raw', OPTIMIZER='Adam', LEARNING_RATE='3e-4', SCHEDULER='RIGNOThreePhase',
                   BATCH_SIZE='4', NORMALIZATION_PATH=str(norm),
                   PHYSICS_WARMUP_UPDATES='500', PHYSICS_WARMUP_RESAMPLE_EVERY='50')
-    assert args[args.index('--phase0-dir') + 1] == str(project / 'runs/physics_test_phase0_raw_exact_20261001')
+    assert Path(args[args.index('--phase0-dir') + 1]) == project / 'runs/physics_test_phase0_raw_exact_20261001'
     assert args[args.index('--normalization') + 1] == str(norm)
     assert args[args.index('--output-dir') + 1].endswith('_s42_pw500x50_77')
     assert args[-2:] == ['model.parameters.width=32', 'training.soap.precondition_frequency=5']
@@ -459,7 +459,7 @@ def test_physics_warmup_holds_batches_then_resamples_and_resumes_inside_a_hold(h
     original = pino.space_time_backward
     def interrupt(*args):
         value = original(*args)
-        signal.raise_signal(signal.SIGUSR1)
+        signal.getsignal(getattr(signal, 'SIGUSR1', signal.SIGINT))(getattr(signal, 'SIGUSR1', signal.SIGINT), None)
         return value
     monkeypatch.setattr(pino, 'space_time_backward', interrupt)
     assert run(restarted)['status'] == 'interrupted'
@@ -481,3 +481,274 @@ def test_physics_warmup_is_rejected_where_nothing_is_resampled(homogeneous_files
     with pytest.raises(ValueError, match='physics_warmup_updates holds online'):
         pino.run_screen(cfg, data, tmp_path / 'fixed', gates[0], normalization_path=norm, smoke=True)
     assert not (tmp_path / 'fixed').exists()
+
+
+@pytest.mark.parametrize('objective', ['raw', 'exact', 'mg'])
+@pytest.mark.parametrize('model_type,optimizer', [('cvit', 'SOAP'), ('fno', 'SOAP'), ('fno', 'SSESOAP')])
+def test_formulation_comparison_matches_architecture_streams_and_budgets(homogeneous_files, tmp_path, objective, model_type, optimizer):
+    _, data, norm, _ = homogeneous_files
+    cfg = online_config(model_type)
+    cfg['training']['optimizer'] = optimizer
+    cfg['physics_test']['pino'].update(formulation_comparison=True, controls=[objective])
+    outputs = []
+    for mode in ('autoregressive', 'time_conditioned'):
+        cfg['physics_test']['pino']['residual_mode'] = mode
+        output = tmp_path / mode
+        result = pino.run_screen(cfg, data, output, stage='online', normalization_path=norm)
+        assert result['status'] == 'complete'
+        assert result['sampled_cases'] == 4
+        assert result['case_interval_residual_evaluations'] == 8
+        assert result['formulation_comparison'] and not result['accuracy_gate_applied']
+        frozen = yaml.safe_load((output / 'config_used.yaml').read_text())
+        protocol = frozen['physics_test']['protocol']
+        assert protocol['prefix_horizon'] == .01
+        if model_type == 'cvit':
+            assert protocol['resolved_cvit_kwargs']['use_time_query']
+        else:
+            assert protocol['resolved_cvit_kwargs'] is None
+            assert protocol['resolved_fno_dims']['cond_static_dim'] == 1
+            assert 'FNO_tokens' in protocol['input_encoding']
+        assert protocol['prerequisites'] == []
+        rows = json.loads((output / objective / 'val_pairs_000002.json').read_text())
+        assert {r['time'] for r in rows} == {0, .005, .01, .015, .02}
+        assert all(r['rmse_K'] == 0 for r in rows if r['time'] == 0)
+        assert all(r['right_wall_rmse_K'] == 0 for r in rows)
+        checkpoint = torch.load(output / objective / 'checkpoint_final.pt', weights_only=False)
+        assert checkpoint['scheduler_state_dict']['next_update'] == 2
+        assert checkpoint['optimizer_state_dict']['state']
+        if optimizer == 'SSESOAP':
+            source = 'src/operators/ss_esoap.py'
+            assert source in protocol['source_sha256']
+            assert (output / 'source_snapshot' / source).is_file()
+        assert np.isfinite(result['controls'][objective]['full_trajectory_rmse_K'])
+        outputs.append(output)
+    a, b = outputs
+    assert_same_state(torch.load(a / 'initial_state.pt', weights_only=True),
+                      torch.load(b / 'initial_state.pt', weights_only=True))
+    assert_same_state(np.load(a / 'validation_inputs.npy', allow_pickle=True).tolist(),
+                      np.load(b / 'validation_inputs.npy', allow_pickle=True).tolist())
+    np.testing.assert_array_equal(np.load(a / 'validation_references.npy'), np.load(b / 'validation_references.npy'))
+    assert (a / objective / 'training_manifest.jsonl').read_text() == (b / objective / 'training_manifest.jsonl').read_text()
+
+
+@pytest.mark.parametrize('interruption', ['training', 'validation'])
+@pytest.mark.parametrize('model_type,optimizer', [('cvit', 'SOAP'), ('fno', 'SOAP'), ('fno', 'SSESOAP')])
+@pytest.mark.parametrize('detach_previous', [True, False])
+def test_time_conditioned_comparison_resume(homogeneous_files, tmp_path, monkeypatch, interruption, model_type, detach_previous, optimizer):
+    clock_ticks = count()
+    monkeypatch.setattr(pino.time, 'perf_counter', lambda: next(clock_ticks))
+    _, data, norm, _ = homogeneous_files
+    cfg = online_config(model_type)
+    cfg['training']['optimizer'] = optimizer
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned')
+    cfg['physics_test']['pino']['detach_previous_predictions'] = detach_previous
+    def run(output):
+        return pino.run_screen(cfg, data, output, stage='online', normalization_path=norm)
+    baseline, resumed = tmp_path / 'baseline', tmp_path / 'resumed'
+    assert run(baseline)['status'] == 'complete'
+    name = 'time_conditioned_backward' if interruption == 'training' else 'decode_evolution'
+    original = getattr(pino, name)
+    calls = []
+    def interrupt(*args):
+        result = original(*args)
+        calls.append(1)
+        if len(calls) == 1:
+            stop_signal = getattr(signal, 'SIGUSR1', signal.SIGINT)
+            signal.getsignal(stop_signal)(stop_signal, None)
+        return result
+    monkeypatch.setattr(pino, name, interrupt)
+    assert run(resumed)['status'] == 'interrupted'
+    monkeypatch.setattr(pino, name, original)
+    assert pino.resume_screen(resumed)['status'] == 'complete'
+    a, b = load_checkpoint(baseline), load_checkpoint(resumed)
+    for key in ('model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'sampler_rng_states'):
+        assert_same_state(a[key], b[key])
+    assert_same_state(json.loads((baseline / 'mg/val_pairs_000002.json').read_text()),
+                      json.loads((resumed / 'mg/val_pairs_000002.json').read_text()))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize('optimizer', ['SSESOAP'])
+def test_structured_optimizer_time_conditioned_fno_cuda_smoke(homogeneous_files, tmp_path, optimizer):
+    _, data, norm, _ = homogeneous_files
+    cfg = online_config('fno')
+    cfg['training'].update(optimizer=optimizer, device='cuda')
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned',
+        detach_previous_predictions=False, space_time_preconditioning=True)
+    output = tmp_path / 'cuda'
+    result = pino.run_screen(cfg, data, output, stage='online', normalization_path=norm)
+    assert result['status'] == 'complete'
+    checkpoint = load_checkpoint(output)
+    momentum = 'momentum'
+    factors = 'bases'
+    assert all(state['step'] == 2 for state in checkpoint['optimizer_state_dict']['state'].values())
+    spectral = [state for state in checkpoint['optimizer_state_dict']['state'].values()
+                if state[momentum].ndim == 5]
+    assert spectral and all(len(state[factors]) == 5 for state in spectral)
+    assert np.isfinite(result['controls']['mg']['full_trajectory_rmse_K'])
+
+
+@pytest.mark.parametrize('model_type', ['cvit', 'fno'])
+@pytest.mark.parametrize('detach_previous', [True, False])
+@pytest.mark.parametrize('objective', ['raw', 'exact', 'mg'])
+def test_time_conditioned_gradient_matches_trajectory_objective(model_type, detach_previous, objective):
+    inputs, _ = prescribed_inputs()
+    cfg = online_config(model_type)
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned')
+    cfg['physics_test']['pino']['detach_previous_predictions'] = detach_previous
+    model = pino.build_screen_model(cfg, inputs, torch.device('cpu'))
+    reference = copy.deepcopy(model)
+    params = list(inputs['params'][:2])
+    x, y = torch.meshgrid(torch.tensor(inputs['x'], dtype=torch.float32),
+                          torch.tensor(inputs['y'], dtype=torch.float32), indexing='ij')
+    coords = torch.stack((x, y), -1).reshape(1, -1, 2)
+    geom = build_homogeneous_cn_geom(inputs['x'], inputs['y'], 1, inputs['dt'], sigma_global=10)
+    inverse = (pino.MGOneCycleInverse(geom, coarse_max_unknowns=4) if objective == 'mg'
+               else pino.ExactCNInverse(geom) if objective == 'exact' else None)
+    loss, _, _ = pino.time_conditioned_backward(model, params, cfg, inputs, coords, geom, inverse, objective)
+    forcing, initial = pino.model_inputs(params, cfg, inputs, coords.device)
+    latent = forcing if model_type == 'fno' else reference.encode(forcing, initial[:, None])
+    states = [initial] + [pino.decode_evolution(reference, latent, initial, coords, n * inputs['dt'], cfg, inputs)
+                          for n in (1, 2)]
+    residuals = [cn_step_residual(states[n], states[n + 1], geom,
+                    pino.make_boundary(params, [n, n], inputs, coords.device, torch.float32),
+                    detach_previous=detach_previous) for n in (0, 1)]
+    losses = [(inverse(r) if inverse is not None else r).square().mean() for r in residuals]
+    expected = torch.stack(losses).mean()
+    expected.backward()
+    torch.testing.assert_close(loss, expected)
+    for actual, wanted in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.grad, wanted.grad, atol=1e-6, rtol=1e-5)
+    branches = (model.temporal_encoder, model.cond_mlp, model.spectral_layers) if model_type == 'fno' else (
+        model.forcing_encoder, model.decoder.time_film)
+    for branch in branches:
+        assert sum(p.grad.abs().sum() for p in branch.parameters() if p.grad is not None) > 0
+    latent = forcing if model_type == 'fno' else model.encode(forcing, initial[:, None])
+    zero = pino.decode_evolution(model, latent, initial, coords, 0., cfg, inputs)
+    torch.testing.assert_close(zero, initial, atol=0, rtol=0)
+    arbitrary = pino.decode_evolution(model, latent, initial, coords, .0073, cfg, inputs)
+    assert torch.isfinite(arbitrary).all()
+    torch.testing.assert_close(arbitrary[:, -1], initial[:, -1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('objective', ['raw', 'exact', 'mg'])
+def test_cn_objective_can_differentiate_previous_prediction(objective):
+    inputs, _ = prescribed_inputs()
+    geom = build_homogeneous_cn_geom(inputs['x'], inputs['y'], 1, inputs['dt'], sigma_global=10)
+    inverse = (pino.MGOneCycleInverse(geom, coarse_max_unknowns=4) if objective == 'mg'
+               else pino.ExactCNInverse(geom) if objective == 'exact' else None)
+    previous = torch.randn(2, 4, 4, requires_grad=True)
+    following = torch.randn(2, 4, 4, requires_grad=True)
+    bc = pino.make_boundary(inputs['params'][:2], [1, 1], inputs, torch.device('cpu'), torch.float32)
+    detached = pino.cn_objective(previous, following, geom, bc, inverse, objective)[0]
+    full = pino.cn_objective(previous, following, geom, bc, inverse, objective, detach_previous=False)[0]
+    torch.testing.assert_close(detached, full, atol=0, rtol=0)
+    old_previous, old_following = torch.autograd.grad(detached, (previous, following), allow_unused=True)
+    new_previous, new_following = torch.autograd.grad(full, (previous, following))
+    assert old_previous is None
+    assert torch.isfinite(new_previous).all() and new_previous.abs().sum() > 0
+    torch.testing.assert_close(old_following, new_following, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('objective', ['exact', 'mg'])
+@pytest.mark.parametrize('detach_previous', [False, True])
+def test_time_conditioned_space_time_checkpointed_gradient_matches_full_graph(objective, detach_previous):
+    inputs, _ = prescribed_inputs(n=8)
+    cfg = online_config('fno')
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned',
+        detach_previous_predictions=detach_previous, space_time_preconditioning=True, prefix_steps=4)
+    model = pino.build_screen_model(cfg, inputs, torch.device('cpu'))
+    reference = copy.deepcopy(model)
+    params = list(inputs['params'][:2])
+    x, y = torch.meshgrid(torch.tensor(inputs['x'], dtype=torch.float32),
+                          torch.tensor(inputs['y'], dtype=torch.float32), indexing='ij')
+    coords = torch.stack((x, y), -1).reshape(1, -1, 2)
+    geom = build_homogeneous_cn_geom(inputs['x'], inputs['y'], 1, inputs['dt'], sigma_global=10)
+    inverse = (pino.MGOneCycleInverse(geom, coarse_max_unknowns=4) if objective == 'mg'
+               else pino.ExactCNInverse(geom))
+    actual, residual, transformed = pino.time_conditioned_backward(
+        model, params, cfg, inputs, coords, geom, inverse, objective)
+    latent, initial = pino.model_inputs(params, cfg, inputs, coords.device)
+    states = torch.stack([initial] + [pino.decode_evolution(reference, latent, initial, coords,
+        n * inputs['dt'], cfg, inputs) for n in range(1, 5)], dim=1)
+    boundaries = [pino.make_boundary(params, [n, n], inputs, coords.device, torch.float32) for n in range(4)]
+    expected, expected_residual, expected_transformed = pino.prefix_cn_objective(
+        states, geom, boundaries, inverse, objective, detach_previous=detach_previous)
+    expected.backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(residual, expected_residual)
+    torch.testing.assert_close(transformed, expected_transformed)
+    full_values = pino.prefix_cn_objective(states, geom, boundaries, inverse, objective)
+    for value, full_value in zip((actual, residual, transformed), full_values):
+        torch.testing.assert_close(value, full_value, rtol=0, atol=0)
+    for value, wanted in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(value.grad, wanted.grad, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize('detach_previous', [False, True])
+@pytest.mark.parametrize('optimizer', ['SOAP', 'SSESOAP'])
+def test_time_conditioned_space_time_resume_preserves_full_gradient_protocol(homogeneous_files, tmp_path, monkeypatch, detach_previous, optimizer):
+    _, data, norm, _ = homogeneous_files
+    cfg = online_config('fno')
+    cfg['training']['optimizer'] = optimizer
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned',
+        detach_previous_predictions=detach_previous, space_time_preconditioning=True)
+    baseline, interrupted = tmp_path / 'baseline', tmp_path / 'interrupted'
+    assert pino.run_screen(cfg, data, baseline, stage='online', normalization_path=norm)['status'] == 'complete'
+    original = pino.time_conditioned_backward
+
+    def stop_after_update(*args):
+        result = original(*args)
+        stop_signal = getattr(signal, 'SIGUSR1', signal.SIGINT)
+        signal.getsignal(stop_signal)(stop_signal, None)
+        return result
+
+    monkeypatch.setattr(pino, 'time_conditioned_backward', stop_after_update)
+    assert pino.run_screen(cfg, data, interrupted, stage='online', normalization_path=norm)['status'] == 'interrupted'
+    monkeypatch.setattr(pino, 'time_conditioned_backward', original)
+    assert pino.resume_screen(interrupted)['status'] == 'complete'
+    expected, actual = load_checkpoint(baseline), load_checkpoint(interrupted)
+    for key in ('model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'sampler_rng_states'):
+        assert_same_state(actual[key], expected[key])
+    protocol = actual['config']['physics_test']['protocol']
+    assert protocol['activation_checkpointing']
+    assert protocol['temporal_gradient_policy'] == (
+        'detached_previous_prediction_and_correction_with_activation_recomputation' if detach_previous
+        else 'full_space_time_graph_with_activation_recomputation')
+    assert protocol['preconditioner'] == 'space_time_MG_V_cycle_forward_substitution'
+
+
+def test_space_time_screen_can_pause_after_validation_without_an_extra_update(homogeneous_files, tmp_path, monkeypatch):
+    _, data, norm, _ = homogeneous_files
+    cfg = online_config('fno')
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned',
+        detach_previous_predictions=True, space_time_preconditioning=True,
+        online_validate_every=1, full_validate_every=1)
+    evaluate = pino.evaluate_online_mg
+    calls = count()
+
+    def pause_after_first_trained_validation(*args, **kwargs):
+        result = evaluate(*args, **kwargs)
+        if next(calls) == 1:
+            stop_signal = getattr(signal, 'SIGUSR1', signal.SIGINT)
+            signal.getsignal(stop_signal)(stop_signal, None)
+        return result
+
+    monkeypatch.setattr(pino, 'evaluate_online_mg', pause_after_first_trained_validation)
+    output = tmp_path / 'screen'
+    result = pino.run_screen(cfg, data, output, stage='online', normalization_path=norm)
+    assert result['status'] == 'interrupted' and result['successful_updates'] == 1
+    checkpoint = load_checkpoint(output, 'checkpoint_latest.pt')
+    assert not checkpoint['online_state']['pending_validation']
+    assert (output / 'mg/validation_000001.json').exists()
+    monkeypatch.setattr(pino, 'evaluate_online_mg', evaluate)
+    assert pino.resume_screen(output)['successful_updates'] == 2
+
+
+def test_fno_comparison_requires_its_own_hard_wall(homogeneous_files, tmp_path):
+    _, data, norm, _ = homogeneous_files
+    cfg = online_config('fno')
+    cfg['physics_test']['pino'].update(formulation_comparison=True, residual_mode='time_conditioned')
+    cfg['model']['parameters']['hard_right_dirichlet'] = False
+    with pytest.raises(ValueError, match='hard_right_dirichlet=true'):
+        pino.run_screen(cfg, data, tmp_path / 'invalid', stage='online', normalization_path=norm)

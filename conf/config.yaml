@@ -70,6 +70,9 @@ physics_test:
     hard_right_dirichlet: true
   pino:
     residual_mode: one_step
+    formulation_comparison: false
+    detach_previous_predictions: true
+    space_time_preconditioning: false
     prefix_steps: 5
     # space_time controls: raw | exact | spatial_exact | spatial_mg | spatial_mg_detached | mg.
     # An online per_update space_time FNO run trains exactly one of them; its
@@ -184,6 +187,14 @@ training:
     step_size: 50
     gamma: 0.5
   optimizer: "AdamW"
+  ss_esoap:
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    check_interval: 1
+    trigger_threshold: 0.2
+    warmup_steps: 0
+    tau_min: 0.001
+    max_precond_dim: 2048
   # SOAP optimizer knobs (Vyas et al. 2024; used only when optimizer: "SOAP").
   # lr / weight_decay come from training.learning_rate / training.weight_decay.
   # Spectral weights are 5-D real tensors; per-dimension preconditioners handle

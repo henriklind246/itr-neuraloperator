@@ -187,7 +187,8 @@ def test_fixed_inverse_rejects_batched_geometry():
 @pytest.mark.parametrize('layered,n', [(False,7), (True,8)])
 @pytest.mark.parametrize('integral', [False,True])
 @pytest.mark.parametrize('build_inverse', [ExactCNInverse, direct_mg], ids=['exact', 'mg_direct_solve'])
-def test_space_time_inverse_recovers_trajectory_error_and_mse_gradient(layered,n,integral,build_inverse):
+@pytest.mark.parametrize('detach_previous', [False, True])
+def test_space_time_inverse_recovers_trajectory_error_and_mse_gradient(layered,n,integral,build_inverse,detach_previous):
     # direct_mg replaces the V-cycle by an exact spatial solve, so its forward
     # substitution must give the FV trajectory error exactly, as ExactCNInverse does.
     sim, geom = solver_and_geom(n, layered=layered, integral=integral)
@@ -206,12 +207,29 @@ def test_space_time_inverse_recovers_trajectory_error_and_mse_gradient(layered,n
     states = torch.cat((reference[None,:1].expand(2,-1,-1,-1),
                         torch.cat((predicted,wall),dim=-2)),dim=1)
     residuals = torch.stack([cn_step_residual(states[:,step],states[:,step+1],geom,
-                    boundary(sim,time=step*sim.dt),detach_previous=False) for step in range(5)],dim=1)
-    corrections = inverse.space_time(residuals)
+                    boundary(sim,time=step*sim.dt),detach_previous=detach_previous) for step in range(5)],dim=1)
+    corrections = inverse.space_time(residuals, detach_previous=detach_previous)
     torch.testing.assert_close(corrections,errors,rtol=1e-12,atol=1e-12)
     actual = torch.autograd.grad(.5*corrections.square().sum(),errors,retain_graph=True)[0]
     torch.testing.assert_close(actual,errors,rtol=1e-12,atol=1e-12)
     assert not torch.allclose(inverse(residuals)[:,1:],errors[:,1:],rtol=1e-3,atol=1e-3)
+
+
+@pytest.mark.parametrize('pre,post', [(2, 2), (1, 3)])
+def test_detached_space_time_mg_preserves_values_and_has_block_diagonal_residual_jacobian(pre, post):
+    _, geom = solver_and_geom(6)
+    mg = MGOneCycleInverse(geom, pre_smooth=pre, post_smooth=post, coarse_max_unknowns=4)
+    residual = torch.randn(2, 4, 5, 6, dtype=torch.float64, requires_grad=True)
+    weights = torch.randn_like(residual)
+    full = mg.space_time(residual)
+    detached = mg.space_time(residual, detach_previous=True)
+    torch.testing.assert_close(detached, full, rtol=0, atol=0)
+    cycle = mg(torch.eye(30, dtype=torch.float64).reshape(30, 5, 6)).reshape(30, 30).T
+    expected = (weights.flatten(-2) @ cycle).reshape_as(residual)
+    actual = torch.autograd.grad((detached * weights).sum(), residual)[0]
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    full_gradient = torch.autograd.grad((full * weights).sum(), residual)[0]
+    assert not torch.allclose(actual[:, :-1], full_gradient[:, :-1], rtol=1e-3, atol=1e-3)
 
 
 def test_space_time_sparse_inverse_transpose_and_higher_derivative():

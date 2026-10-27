@@ -516,8 +516,9 @@ def test_two_pass_space_time_backward_equals_the_full_graph_gradient(objective,i
     inverse = MGOneCycleInverse(geom,coarse_max_unknowns=4) if objective in pino.MG_OBJECTIVES else ExactCNInverse(geom)
     first = 0 if ic_weight else 1
     times = np.arange(first,6)*.005
+    # Batched BLAS/FFT kernels may differ from single-query kernels by float64 roundoff.
     torch.testing.assert_close(pino.decode_times(model,latent,times[:3]),
-        torch.stack([decode_grid(model,latent,None,[t],8,8,1) for t in times[:3]],dim=1),rtol=0,atol=0)
+        torch.stack([decode_grid(model,latent,None,[t],8,8,1) for t in times[:3]],dim=1),rtol=1e-12,atol=1e-14)
     fields = pino.decode_times(model,latent,times)
     boundaries = [make_boundary(params,np.full(2,n),inputs,torch.device('cpu'),torch.float64) for n in range(5)]
     physics = prefix_cn_objective(torch.cat((ic[:,None],fields[:,1-first:]),dim=1),geom,boundaries,inverse,objective)[0]

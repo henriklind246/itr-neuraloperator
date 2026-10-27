@@ -37,6 +37,7 @@ from src.physics.boundary_forcing import FORCING_TEMPORAL_SAMPLES
 from src.operators.distributed import DistInfo, get_dist_info
 from src.operators.fno2d import FNO2d
 from src.operators.soap import SOAP
+from src.operators.ss_esoap import SSESOAP
 from src.operators.losses import (
     EPS_JUMP,
     SpatiallyWeightedMSE,
@@ -579,6 +580,11 @@ def resolve_num_workers(config: dict, world_size: int) -> int:
 def build_optimizer(config: dict, params) -> torch.optim.Optimizer:
     training_cfg = config["training"]
     optimizer_name = training_cfg.get("optimizer", "Adam")
+
+    if optimizer_name == "SSESOAP":
+        return SSESOAP(params, lr=training_cfg["learning_rate"],
+                      weight_decay=training_cfg["weight_decay"],
+                      **(training_cfg.get("ss_esoap") or {}))
 
     if optimizer_name == "SOAP":
         soap_cfg = training_cfg.get("soap", None) or {}
