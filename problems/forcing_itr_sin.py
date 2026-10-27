@@ -212,6 +212,8 @@ class ForcingItrSinProblem(ForcingProblem):
         )
         y_grid = np.asarray(base_kwargs["y_grid"], dtype=np.float64)
         ramp = base_kwargs.get("ramp_seconds")
+        if ramp is None:
+            ramp = self.default_ramp_seconds
         t_ramp = (
             float(ramp)
             if ramp is not None
@@ -280,3 +282,36 @@ class ForcingItrSinProblem(ForcingProblem):
             parent["cond_static"]
         )
         return parent
+
+
+class ForcingItrSinLongProblem(ForcingItrSinProblem):
+    """B5: sinusoidal ITR with boundary forcing stretched from 0.3 s to 3 s."""
+
+    name = "forcing_itr_sin_long"
+    default_t_final = 3.0
+    default_save_stride = 20
+    default_ramp_seconds = 0.1
+    required_observation_times = (0.7, 1.5, 3.0)
+
+    def sample_sim_params(self, rng, rng_profile, grids, time_cfg) -> list[dict]:
+        # Sample on the original clock so dt-dependent pulse-width bounds and
+        # RNG draws stay paired with the short-horizon benchmark.
+        reference_time_cfg = dict(
+            time_cfg, dt=0.005, t_final=0.3, t_on=0.0, t_off=0.2,
+        )
+        params = super().sample_sim_params(
+            rng, rng_profile, grids, reference_time_cfg
+        )
+        for entry in params:
+            temporal = entry["temporal_params"]
+            for key in ("t_on", "t_off", "t0", "tau"):
+                if key in temporal:
+                    temporal[key] *= 10.0
+            for key in ("t_list", "dt_list", "tau_list"):
+                if key in temporal:
+                    temporal[key] = [10.0 * value for value in temporal[key]]
+            if "f" in temporal:
+                temporal["f"] /= 10.0
+            entry["forcing_time_scale"] = 10.0
+            entry["forcing_sample_key"] += ":time_scale=10"
+        return params

@@ -286,7 +286,7 @@ def save_dataset(
 
 def generate_sim_data(
     num_sims: int = 2000,
-    save_stride: int = 2,
+    save_stride: int | None = None,
     save_dir: Path | str | None = None,
     benchmark: str | None = None,
     nx: int = 100,
@@ -298,6 +298,10 @@ def generate_sim_data(
 ) -> None:
     benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
     spec = get_problem(benchmark)
+    if save_stride is None:
+        save_stride = spec.default_save_stride
+    if ramp_seconds is None:
+        ramp_seconds = spec.default_ramp_seconds
 
     seeds = resolve_seed_streams(rng_seed)
     rng = np.random.default_rng(seeds["ic_params"])
@@ -305,7 +309,7 @@ def generate_sim_data(
 
     setup = build_base_setup(
         num_sims=num_sims, save_stride=save_stride, nx=nx, ny=ny,
-        dt=dt,
+        dt=dt, t_final=spec.default_t_final,
         ramp_seconds=ramp_seconds, lhs_seed=seeds["lhs"], ic_families=ic_families,
         forcing_profile_seed=seeds["forcing_profile"],
     )
@@ -394,9 +398,10 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
     parser.add_argument(
         "--save-stride",
         type=int,
-        default=2,
+        default=None,
         help=(
-            "Snapshot decimation stride. Default 2. Use 1 for the "
+            "Snapshot decimation stride. Defaults to the benchmark's stride "
+            "(20 for B5, otherwise 2). Use 1 for the "
             "physics-informed FV-residual set (consecutive snapshots one solver "
             "step dt apart; CN-exact). Note Nt_saved ~doubles and the all-to-all "
             "pair count is quadratic in Nt_saved -- generate a SMALL save-stride=1 "
@@ -409,7 +414,8 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         default=None,
         help=(
             "Physical startup-ramp width (seconds) applied to q_L so q_L(0)=0. "
-            "Defaults to 2*dt. The resolved value is persisted with the dataset."
+            "Defaults to the benchmark's ramp (0.1 s for B5, otherwise 2*dt). "
+            "The resolved value is persisted with the dataset."
         ),
     )
     parser.add_argument(

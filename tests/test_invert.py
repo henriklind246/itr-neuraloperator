@@ -1857,23 +1857,29 @@ def test_joint_grid_round_trips_through_the_artifact_at_schema_4(monkeypatch, tm
 
 
 @pytest.mark.parametrize("profile_index", [None, 0])
-def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_path, capsys, profile_index):
+@pytest.mark.parametrize("benchmark", ["forcing_itr_sin", "forcing_itr_sin_long"])
+def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_path, capsys, profile_index, benchmark):
     import csv
     from types import SimpleNamespace
+    from problems.registry import get_problem
 
-    adapter = ForcingItrSinAdapter()
+    config = {"benchmark": {"name": benchmark, "representation": "temporal_encoder"}}
+    adapter = InverseAdapter.from_config(config)
+    problem = get_problem(benchmark)
+    observation_times = np.array(problem.required_observation_times)
     obs = _fake_observation_set()
+    obs.observation_times = observation_times
     obs.targets.fill_(1000.0)
     obs.targets[:, 0, :2, 0] = torch.tensor([[300., 302.], [304., 306.], [308., 310.]])
     obs.mask = torch.zeros(obs.targets.shape[1:3], dtype=torch.bool)
     obs.mask[0, :2] = True
     clean = inv.apply_sensor_mask(obs.targets, obs.mask).numpy().astype(np.float64).copy()
     ds = SimpleNamespace(
-        t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
+        problem=problem, t_grid=np.r_[0.0, observation_times], Nt=4, Nx=obs.Nx,
         y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
     )
     loaded = SimpleNamespace(
-        config={"benchmark": {"name": "forcing_itr_sin", "representation": "temporal_encoder"}},
+        config=config,
         mu_global=0.0, sigma_global=1.0, model=None,
     )
     monkeypatch.setattr(inv, "load_checkpoint", lambda *a, **k: loaded)
@@ -1881,7 +1887,12 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
     monkeypatch.setattr(ForcingItrSinAdapter, "validate_dataset", lambda *a: None)
     monkeypatch.setattr(ForcingItrSinAdapter, "fv_base_kwargs", lambda *a, **k: {"y_grid": obs.y_grid.numpy()})
     monkeypatch.setattr(inv, "build_dataset_from_dir", lambda *a, **k: ds)
-    monkeypatch.setattr(inv, "build_observation_set", lambda *a, **k: obs)
+    def build_observations(dataset, sid, time_indices, **kwargs):
+        assert time_indices == [1, 2, 3]
+        np.testing.assert_array_equal(kwargs["observation_times"], observation_times)
+        return obs
+
+    monkeypatch.setattr(inv, "build_observation_set", build_observations)
     monkeypatch.setattr(inv, "_checkpoint_fingerprint", lambda *a: "test")
     monkeypatch.setattr(inv, "_dataset_fingerprint", lambda *a: "test")
     monkeypatch.setattr(inv, "load_surrogate_calibration", lambda *a, **k: {"local_gate_pass": True, "sigma_fno_norm": 0.1})
@@ -1932,10 +1943,12 @@ def test_cli_reports_parameter_errors_and_requested_profiles(monkeypatch, tmp_pa
 
 def test_cli_joint_nll_grid_writes_the_block_and_guards_bad_invocations(monkeypatch, tmp_path):
     from types import SimpleNamespace
+    from problems.registry import get_problem
 
     adapter = ForcingItrSinAdapter()
     obs = _fake_observation_set()
     ds = SimpleNamespace(
+        problem=get_problem("forcing_itr_sin"),
         t_grid=np.array([0.0, 0.07, 0.15, 0.30]), Nt=4, Nx=obs.Nx,
         y_grid=obs.y_grid.numpy(), _split_ids={"test": [0]},
     )

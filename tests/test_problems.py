@@ -39,6 +39,9 @@ CONTRACTS = {
     ("forcing_itr_sin", "temporal_encoder"): dict(
         in_ch=5, cond=11, token=3, t_stats=2, s_y=3, aug=True,
     ),
+    ("forcing_itr_sin_long", "temporal_encoder"): dict(
+        in_ch=5, cond=11, token=3, t_stats=2, s_y=3, aug=True,
+    ),
     ("source", "temporal_encoder"): dict(
         in_ch=4, cond=6, token=3, t_stats=3, s_y=3, aug=False,
     ),

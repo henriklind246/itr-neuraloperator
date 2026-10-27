@@ -21,9 +21,9 @@ from src.physics.internal_source import (
 
 
 
-def _dataset(spec, params, grids, representation="temporal_encoder"):
+def _dataset(spec, params, grids, representation="temporal_encoder", time_scale=1.0):
     n = len(params)
-    t_grid = np.array([0.0, 0.07, 0.15, 0.30], dtype=np.float32)
+    t_grid = np.array([0.0, 0.07, 0.15, 0.30], dtype=np.float32) * time_scale
     trajectories = np.zeros(
         (n, len(t_grid), grids["X"].shape[0], grids["X"].shape[1]),
         dtype=np.float32,
@@ -39,7 +39,7 @@ def _dataset(spec, params, grids, representation="temporal_encoder"):
         sigma_global=1.0,
         problem=get_problem(spec.name, representation),
         dt=0.005,
-        ramp_seconds=0.01,
+        ramp_seconds=0.01 * time_scale,
     )
 
 
@@ -100,6 +100,79 @@ def test_forcing_itr_sin_provenance_schema_and_bounds():
         A = float(profile["R_c_A"])
         assert 0.0 <= A <= R_PEAK_MAX - R_base + 1e-9
     spec.validate_schema(np.asarray(spatial, dtype=object), np.arange(len(spatial)))
+
+
+def test_b5_stretches_every_forcing_family_and_preserves_conditioning():
+    from src.physics.boundary_forcing import build_qL, build_qL_integral
+
+    _, short, _, reference, grids, time_cfg = _sample_pair_sin(num_sims=64)
+    long = get_problem("forcing_itr_sin_long")
+    stretched = long.sample_sim_params(
+        np.random.default_rng(0), np.random.default_rng(1), grids,
+        dict(time_cfg, t_final=3.0),
+    )
+    assert {p["temporal_family"] for p in reference} == {
+        "sin", "exp", "pulse_train", "exp_train",
+    }
+    short_ds = _dataset(short, reference, grids)
+    long_ds = _dataset(long, stretched, grids, time_scale=10.0)
+    times = np.linspace(0.0, 0.3, 97)
+    for sid, (old, new) in enumerate(zip(reference, stretched)):
+        for key in ("R_c", "R_c_base", "R_c_A", "spatial_family", "spatial_params"):
+            assert old[key] == new[key]
+        np.testing.assert_array_equal(old["T0"], new["T0"])
+        assert new["forcing_time_scale"] == 10.0
+        fields = ("temporal_family", "temporal_params", "spatial_family", "spatial_params")
+        old_kwargs = {key: old[key] for key in fields}
+        new_kwargs = {key: new[key] for key in fields}
+        old_flux, _ = build_qL(**old_kwargs, y_grid=grids["y_grid"], t_ramp=0.01)
+        new_flux, _ = build_qL(**new_kwargs, y_grid=grids["y_grid"], t_ramp=0.1)
+        np.testing.assert_allclose(
+            [new_flux(10.0 * t) for t in times],
+            [old_flux(t) for t in times], rtol=1e-10, atol=1e-10,
+        )
+        old_integral, _ = build_qL_integral(**old_kwargs, y_grid=grids["y_grid"], t_ramp=0.01)
+        new_integral, _ = build_qL_integral(**new_kwargs, y_grid=grids["y_grid"], t_ramp=0.1)
+        np.testing.assert_allclose(new_integral(0.0, 3.0), 10.0 * old_integral(0.0, 0.3))
+        old_item = short.build_item(short_ds, sid, 0, 3)
+        new_item = long.build_item(long_ds, sid, 0, 3)
+        for key in ("spatial", "cond_static", "forcing_seq"):
+            np.testing.assert_allclose(new_item[key], old_item[key], rtol=1e-4, atol=1e-5)
+
+
+def test_b5_generation_and_inverse_use_600_steps_and_31_snapshots(tmp_path, monkeypatch):
+    from data.generate_dataset import main as generate_main
+    from src.operators.train import load_config
+
+    monkeypatch.setenv("BENCHMARK", "forcing_itr_sin_long")
+    config = load_config()
+    spec = get_problem(config["benchmark"]["name"])
+    assert config["data"]["t_final"] == spec.default_t_final == 3.0
+    assert config["data"]["save_stride"] == spec.default_save_stride == 20
+    assert config["data"]["ramp_seconds"] == spec.default_ramp_seconds == 0.1
+    generate_main([
+        "--num-sims", "1", "--nx", "12", "--ny", "12",
+        "--save-dir", str(tmp_path),
+    ])
+    ds = invert.build_dataset_from_dir(
+        str(tmp_path), config, mu_global=300.0, sigma_global=1.0,
+        n_invert=1, n_calibration=0,
+    )
+    assert ds.trajectories.shape == (1, 31, 12, 12)
+    np.testing.assert_allclose(ds.t_grid, np.linspace(0.0, 3.0, 31))
+    assert ds.dt == 0.005
+    assert ds.ramp_seconds == 0.1
+    indices, _ = invert.resolve_observation_times(ds.t_grid, spec.required_observation_times)
+    assert indices == [7, 15, 30]
+    adapter = InverseAdapter.from_config(config)
+    adapter.validate_dataset(ds)
+    params = ds.sim_params[0]
+    theta = adapter.theta_from_sim_params(params, dtype=torch.float64)
+    solver = adapter.build_fv_solver(ds, params, theta)
+    assert len(solver.t) - 1 == 600
+    assert solver.dt == 0.005
+    _, _, _, expected = solver.solve(T0=params["T0"], store_trajectory=True)
+    np.testing.assert_array_equal(ds.trajectories[0], expected[::20].astype(np.float32))
 
 
 def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout():

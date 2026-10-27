@@ -120,6 +120,9 @@ class ProblemSpec(ABC):
 
     name: str
     dims: ProblemDims
+    default_t_final: float = 0.3
+    default_save_stride: int = 2
+    default_ramp_seconds: float | None = None
 
     #: Only the scalar-R_c forcing benchmark supports duplicating normalized
     #: ITR and lead-time values as spatial fields. The discontinuous material-

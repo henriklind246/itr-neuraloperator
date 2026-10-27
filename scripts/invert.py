@@ -1,6 +1,7 @@
 """Inverse estimation for scalar and sinusoidal interface resistance.
 
-Supports forcing, forcing_itr_sin and source_itr_sin via InverseAdapter.
+Supports forcing, forcing_itr_sin, B5 (forcing_itr_sin_long), and source_itr_sin
+via InverseAdapter.
 Sinusoidal profiles use theta=(R_base, A), with A bounded by R_PEAK_MAX-R_base.
 The trained model is frozen; only interface conditioning is optimized.
 Sensor noise, surrogate-error calibration, profile likelihood, FV refinement
@@ -383,7 +384,7 @@ def prepare_inversion_dataset(
     out_dir: str,
     nx: int = 100,
     ny: int = 100,
-    save_stride: int = 2,
+    save_stride: int | None = None,
     dataset_seed: int = INVERSION_DATASET_SEED,
     generate_fn=None,
 ) -> dict[str, object]:
@@ -2235,7 +2236,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             out_dir=generate_dir,
             nx=int(data_cfg.get("nx", 100)),
             ny=int(data_cfg.get("ny", 100)),
-            save_stride=int(data_cfg.get("save_stride", 2)),
+            save_stride=data_cfg.get("save_stride"),
             dataset_seed=args.dataset_seed,
         )
         data_dir = partition["data_dir"]
@@ -2266,7 +2267,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         observation_times = np.asarray(ds.t_grid, dtype=np.float64)[time_indices]
     else:
         time_indices, observation_times = resolve_observation_times(
-            ds.t_grid, PAPER_OBSERVATION_TIMES
+            ds.t_grid,
+            getattr(ds.problem, "required_observation_times", PAPER_OBSERVATION_TIMES),
         )
 
     sensor_y = (

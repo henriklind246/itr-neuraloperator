@@ -22,6 +22,7 @@ from src.physics.internal_source import (
 
 
 SIN_PARAM_NAMES = ("R_base", "A")
+DEFAULT_INVERSE_BENCHMARK = "forcing_itr_sin_long"
 RELATIVE_ERROR_FLOOR_FRACTION = 1e-6
 
 
@@ -105,10 +106,13 @@ class InverseAdapter(ABC):
             "source_itr_sin": SourceItrSinAdapter,
             "forcing": ForcingAdapter,
             "forcing_itr_sin": ForcingItrSinAdapter,
+            DEFAULT_INVERSE_BENCHMARK: ForcingItrSinAdapter,
         }
         adapter_cls = adapters.get(name)
         if adapter_cls is not None:
-            return adapter_cls()
+            adapter = adapter_cls()
+            adapter.benchmark = name
+            return adapter
         raise ValueError(
             f"Unsupported inverse benchmark {name!r}; expected one of "
             f"{sorted(adapters)}."

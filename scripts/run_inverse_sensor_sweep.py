@@ -27,7 +27,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.inverse_adapters import (
-    InverseAdapter, RELATIVE_ERROR_FLOOR_FRACTION, relative_error_percent,
+    DEFAULT_INVERSE_BENCHMARK, InverseAdapter,
+    RELATIVE_ERROR_FLOOR_FRACTION, relative_error_percent,
 )
 from scripts.invert import (  # noqa: E402
     CALIBRATION_FLOOR,
@@ -60,7 +61,7 @@ NOISE_SEED = 0
 # training corpus (see scripts/invert.prepare_inversion_dataset).
 N_CASES = 16
 
-BENCHMARKS = ("forcing", "forcing_itr_sin", "source_itr_sin")
+BENCHMARKS = ("forcing", "forcing_itr_sin", "source_itr_sin", DEFAULT_INVERSE_BENCHMARK)
 REQUIRED_DATA_FILES = (
     "trajectories.npy",
     "x_grid.npy",
@@ -188,7 +189,7 @@ def prepare_sweep_dataset(
             out_dir=str(out_dir / "inversion_data"),
             nx=int(data_cfg.get("nx", 100)),
             ny=int(data_cfg.get("ny", 100)),
-            save_stride=int(data_cfg.get("save_stride", 2)),
+            save_stride=data_cfg.get("save_stride"),
             dataset_seed=INVERSION_DATASET_SEED,
         )
         resolved = Path(partition["data_dir"]).resolve()
@@ -1215,7 +1216,7 @@ def run_sweep(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--benchmark", required=True, choices=sorted(BENCHMARKS)
+        "--benchmark", default=DEFAULT_INVERSE_BENCHMARK, choices=sorted(BENCHMARKS)
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument(

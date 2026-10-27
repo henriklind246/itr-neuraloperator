@@ -237,7 +237,10 @@ def test_cli_data_dir_optional_and_overrides(tmp_path):
         "forcing",
         "forcing_itr_sin",
         "source_itr_sin",
+        "forcing_itr_sin_long",
     }
+    default = sweep._build_parser().parse_args(["--checkpoint", "model.pt"])
+    assert default.benchmark == "forcing_itr_sin_long"
 
     args = sweep._build_parser().parse_args(
         [

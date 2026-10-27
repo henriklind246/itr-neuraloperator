@@ -1,4 +1,4 @@
-"""Compare inverse runtime for a forcing_itr_sin FNO and the FV solver.
+"""Compare inverse runtime for a B5 forcing_itr_sin_long FNO and the FV solver.
 
 The diagnostic generates three held-out finite-volume simulations and solves
 the same noisy inverse problem with three pathways: FNO + Adam/L-BFGS,
@@ -30,7 +30,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from data.generate_dataset import generate_sim_data  # noqa: E402
 from scripts.invert import (  # noqa: E402
     INVERSION_DATASET_SEED,
-    PAPER_OBSERVATION_TIMES,
     _checkpoint_fingerprint,
     _data_loss,
     _masked_half_mse,
@@ -42,10 +41,14 @@ from scripts.invert import (  # noqa: E402
     load_checkpoint,
     resolve_observation_times,
 )
-from scripts.inverse_adapters import ForcingItrSinAdapter, relative_error_percent  # noqa: E402
+from scripts.inverse_adapters import (  # noqa: E402
+    DEFAULT_INVERSE_BENCHMARK, ForcingItrSinAdapter, InverseAdapter,
+    relative_error_percent,
+)
+from problems.registry import get_problem  # noqa: E402
 
 
-BENCHMARK = "forcing_itr_sin"
+BENCHMARK = DEFAULT_INVERSE_BENCHMARK
 REPRESENTATION = "temporal_encoder"
 METHODS = (
     "fno_adam_lbfgs",
@@ -156,7 +159,7 @@ def generate_ground_truth_dataset(
         benchmark=BENCHMARK,
         nx=int(data_cfg.get("nx", 100)),
         ny=int(data_cfg.get("ny", 100)),
-        save_stride=int(data_cfg.get("save_stride", 2)),
+        save_stride=data_cfg.get("save_stride"),
         rng_seed=INVERSION_DATASET_SEED,
     )
 
@@ -640,7 +643,7 @@ def run_comparison(
 
     loaded = load_checkpoint(str(checkpoint), device=device)
     validate_checkpoint_config(loaded.config)
-    adapter = ForcingItrSinAdapter()
+    adapter = InverseAdapter.from_config(loaded.config)
     adapter.validate_model(loaded)
 
     _prepare_out_dir(out_dir)
@@ -657,7 +660,7 @@ def run_comparison(
     adapter.validate_dataset(ds)
 
     time_indices, observation_times = resolve_observation_times(
-        ds.t_grid, PAPER_OBSERVATION_TIMES
+        ds.t_grid, get_problem(BENCHMARK).required_observation_times
     )
     requested_y = np.linspace(
         float(ds.y_grid[0]), float(ds.y_grid[-1]), SENSOR_COUNT

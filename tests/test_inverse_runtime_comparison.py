@@ -13,7 +13,7 @@ from scripts.inverse_adapters import ForcingItrSinAdapter
 def _config(benchmark=runtime.BENCHMARK, representation=runtime.REPRESENTATION):
     return {
         "benchmark": {"name": benchmark, "representation": representation},
-        "data": {"nx": 24, "ny": 20, "save_stride": 2},
+        "data": {"nx": 24, "ny": 20, "save_stride": 20},
     }
 
 
@@ -68,10 +68,11 @@ def _case_rows():
         ("forcing_itr", "temporal_encoder"),
         ("source_itr_sin", "temporal_encoder"),
         ("forcing_itr_sin", "bins"),
+        ("forcing_itr_sin", "temporal_encoder"),
     ],
 )
 def test_checkpoint_validation_is_exact(benchmark, representation):
-    with pytest.raises(ValueError, match="requires forcing_itr_sin/temporal_encoder"):
+    with pytest.raises(ValueError, match="requires forcing_itr_sin_long/temporal_encoder"):
         runtime.validate_checkpoint_config(_config(benchmark, representation))
 
     runtime.validate_checkpoint_config(_config())
@@ -85,7 +86,7 @@ def test_parser_defaults_to_normalized_noise_std_point_zero_one():
     assert runtime.SENSOR_COUNT == 8
 
 
-def test_ground_truth_generation_is_three_fv_forcing_itr_sin_cases(tmp_path):
+def test_ground_truth_generation_is_three_fv_b5_cases(tmp_path):
     calls = {}
 
     def fake_generate(**kwargs):
@@ -98,10 +99,10 @@ def test_ground_truth_generation_is_three_fv_forcing_itr_sin_cases(tmp_path):
     assert calls == {
         "num_sims": 3,
         "save_dir": tmp_path / "inversion_data",
-        "benchmark": "forcing_itr_sin",
+        "benchmark": "forcing_itr_sin_long",
         "nx": 24,
         "ny": 20,
-        "save_stride": 2,
+        "save_stride": 20,
         "rng_seed": 1,
     }
 
@@ -256,7 +257,7 @@ def test_outputs_have_compact_schemas_and_precise_noise_protocol(tmp_path):
         sigma_global=4.0,
         ds=ds,
         requested_y=np.linspace(0.0, 1.0, 8),
-        observation_times=np.array(runtime.PAPER_OBSERVATION_TIMES),
+        observation_times=np.array([0.7, 1.5, 3.0]),
         starts_u=runtime.lhs_starts(ForcingItrSinAdapter()),
     )
     protocol_path.write_text(json.dumps(protocol))

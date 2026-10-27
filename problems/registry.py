@@ -4,7 +4,7 @@ from problems.base import ProblemSpec
 from problems.diffusion_forcing_single import DiffusionForcingSingleProblem
 from problems.forcing import ForcingProblem
 from problems.forcing_homogeneous import ForcingHomogeneousProblem
-from problems.forcing_itr_sin import ForcingItrSinProblem
+from problems.forcing_itr_sin import ForcingItrSinLongProblem, ForcingItrSinProblem
 from problems.interfaces import InterfacesProblem
 from problems.source import SourceProblem
 from problems.source_itr_sin import SourceItrSinProblem
@@ -15,6 +15,7 @@ REGISTRY: dict[str, type[ProblemSpec]] = {
     "forcing_homogeneous": ForcingHomogeneousProblem,
     "forcing": ForcingProblem,
     "forcing_itr_sin": ForcingItrSinProblem,
+    "forcing_itr_sin_long": ForcingItrSinLongProblem,
     "interfaces": InterfacesProblem,
     "source": SourceProblem,
     "source_itr_sin": SourceItrSinProblem,
