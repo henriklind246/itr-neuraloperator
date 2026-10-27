@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=fno_train_fixed_ddp
 #SBATCH --partition=msigpu
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:a100:2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=10
 #SBATCH --mem=128G
-#SBATCH --time=06:00:00
+#SBATCH --time=04:00:00
 #SBATCH --tmp=50G
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err

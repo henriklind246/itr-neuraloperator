@@ -100,13 +100,32 @@ class TestLoadConfig:
         assert "training" in cfg
         assert "data" in cfg
 
-    def test_forcing_spatial_input_defaults_are_disabled(self):
+    @pytest.mark.parametrize("benchmark", ["forcing", "forcing_itr_sin_long"])
+    def test_forcing_screen_defaults(self, monkeypatch, benchmark):
+        monkeypatch.setenv("BENCHMARK", benchmark)
         cfg = load_config()
         assert cfg["benchmark"]["spatial_input"] == {
             "itr": False,
             "lead_time": False,
-            "material_side": False,
+            "material_side": True,
         }
+        assert cfg["benchmark"]["spatial_conditioning"] == "full"
+        assert cfg["benchmark"]["spatial_profile_bins"] == 8
+        model = cfg["model"]["parameters"]
+        assert model["forcing_spatial_mode"] == "boundary_extender"
+        assert model["forcing_cond_mode"] == "both"
+        assert model["forcing_extender_grid_size"] == 16
+        assert model["forcing_extender_heads"] == 4
+        assert model["forcing_extender_depth"] == 1
+        training = cfg["training"]
+        assert training["seeds"] == [32]
+        assert training["epochs"] == 41
+        assert training["batch_size"] == 512
+        assert training["learning_rate"] == 0.0028
+        assert training["validate_every"] == 5
+        assert training["n_snapshots"] == 20
+        assert training["scheduler"]["warmup_fraction"] == 0.05
+        assert training["scheduler"]["cosine_fraction"] == 0.85
 
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):

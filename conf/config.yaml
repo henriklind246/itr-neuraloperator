@@ -248,7 +248,7 @@ training:
   # Keep selective adaptation deliberately narrow: full updates every weight;
   # boundary_extender freezes the backbone and updates only that existing module.
   trainable_scope: "full"
-  seeds: [42]
+  seeds: [32]
   # DataLoader workers per rank. `null` derives from SLURM_CPUS_PER_TASK /
   # world_size at runtime; set an int to override.
   num_workers: null

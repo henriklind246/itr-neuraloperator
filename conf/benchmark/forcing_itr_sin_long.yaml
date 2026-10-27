@@ -3,6 +3,12 @@ benchmark:
   rc_channel_mode: broadcast
   spatial_conditioning: full
   spatial_profile_bins: 8
+  spatial_input:
+    material_side: true
+
+model:
+  parameters:
+    forcing_spatial_mode: boundary_extender
 
 data:
   t_final: 3.0

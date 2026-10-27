@@ -1302,6 +1302,29 @@ def test_forcing_adapter_one_dimensional_uq_smoke():
     assert result.theta_hat.shape == (1,)
 
 
+@pytest.mark.parametrize("benchmark", ["forcing", "forcing_itr_sin_long"])
+@pytest.mark.parametrize("material_side", [False, True])
+def test_inverse_validation_respects_checkpoint_spatial_inputs(benchmark, material_side):
+    from types import SimpleNamespace
+    from data.dataset import problem_from_config
+
+    config = {"benchmark": {
+        "name": benchmark,
+        "spatial_input": {"material_side": material_side},
+    }}
+    dims = problem_from_config(config).dims
+    model = SimpleNamespace(
+        in_channels=dims.in_channels, cond_static_dim=dims.cond_static_dim,
+        s_y_channel=dims.s_y_channel,
+    )
+    loaded = SimpleNamespace(config=config, dims=dims, model=model)
+    adapter = InverseAdapter.from_config(config)
+    adapter.validate_model(loaded)
+    model.in_channels += 1
+    with pytest.raises(ValueError, match="in_channels"):
+        adapter.validate_model(loaded)
+
+
 def test_inverse_adapter_dispatch_and_validation(tiny_fv_dataset):
     from types import SimpleNamespace
     from problems.registry import get_problem

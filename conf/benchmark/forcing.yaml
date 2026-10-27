@@ -7,6 +7,12 @@ benchmark:
   name: forcing
   spatial_conditioning: full
   spatial_profile_bins: 8
+  spatial_input:
+    material_side: true
+
+model:
+  parameters:
+    forcing_spatial_mode: boundary_extender
 
 training:
   loss:

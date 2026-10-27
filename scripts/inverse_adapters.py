@@ -8,7 +8,7 @@ import torch
 
 from problems.forcing import RC_RANGE
 from problems.forcing import ForcingProblem
-from problems.registry import get_problem
+from data.dataset import problem_from_config
 from problems import source_itr_sin
 from problems.source_itr_sin import RC_Y_CHANNEL
 from src.physics.fv_solver_2d import Layer2D
@@ -216,7 +216,7 @@ class InverseAdapter(ABC):
             else config.get("representation", {}).get("name")
         )
         representation = representation or "temporal_encoder"
-        expected = get_problem(self.benchmark, representation).dims
+        expected = problem_from_config(config).dims
         dims = loaded_model.dims
         if dims.in_channels != expected.in_channels:
             raise ValueError(
