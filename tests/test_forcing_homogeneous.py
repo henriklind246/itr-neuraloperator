@@ -267,12 +267,14 @@ RIGNO = dict(type='RIGNOThreePhase', warmup_fraction=.25, cosine_fraction=.5, ex
              init_lr_ratio=.1, cosine_floor_lr_ratio=.1, final_lr_ratio=.05)
 
 
-@pytest.mark.parametrize('control,optimizer,scheduler,ic_weight', [
-    ('mg', 'SOAP', None, 0.0), ('spatial_mg_detached', 'Adam', RIGNO, 0.0), ('raw', 'AdamW', None, 0.5)])
+@pytest.mark.parametrize('control,optimizer,scheduler,ic_weight,local_kernel', [
+    ('mg', 'SOAP', None, 0.0, 0), ('spatial_mg_detached', 'Adam', RIGNO, 0.0, 0), ('raw', 'AdamW', None, 0.5, 0),
+    ('mg', 'SSESOAP', None, 0.0, 3)])
 def test_online_space_time_fno_trains_validates_and_resumes(homogeneous_files, tmp_path, monkeypatch,
-                                                            control, optimizer, scheduler, ic_weight):
+                                                            control, optimizer, scheduler, ic_weight, local_kernel):
     inputs, data, norm, gates = homogeneous_files
     cfg = space_time_config(control, optimizer, scheduler, ic_weight)
+    cfg['model']['parameters']['local_branch_kernel_size'] = local_kernel
     gate = gates[1] if control in pino.MG_OBJECTIVES else gates[0]
     baseline, restarted = tmp_path / 'baseline', tmp_path / 'restart'
     def run(output):
@@ -302,6 +304,11 @@ def test_online_space_time_fno_trains_validates_and_resumes(homogeneous_files, t
     frozen = yaml.safe_load((baseline / 'config_used.yaml').read_text())
     protocol = frozen['physics_test']['protocol']
     assert frozen['training']['epochs'] == 4
+    assert frozen['model']['parameters']['local_branch_kernel_size'] == local_kernel
+    local = {k: v for k, v in a['model_state_dict'].items() if k.startswith('local_layers.')}
+    assert bool(local) == bool(local_kernel)
+    initial = torch.load(baseline / 'initial_state.pt', weights_only=True)
+    assert all(not torch.equal(value, initial[key]) for key, value in local.items())
     assert protocol['preconditioner'] == {control: pino.PREFIX_PRECONDITIONERS[control]}
     assert protocol['gate_policy'] == 'registered_final_update_evidence_no_accuracy_gate'
     assert 'recomputed per time chunk' in protocol['temporal_gradient_policy']
@@ -410,15 +417,16 @@ exec bash "$LAUNCHER" "$@"
     assert scheduler.lr_for_update(pino_cfg['online_updates']) == pytest.approx(1e-4 * .9 ** 20)
 
     assert (pino_cfg['physics_warmup_updates'], pino_cfg['physics_warmup_resample_every']) == (0, 1)
+    assert cfg['model']['parameters']['local_branch_kernel_size'] == 0 and not hasattr(model, 'local_layers')
 
     norm = tmp_path / 'normalization with spaces.json'
     args = launch('model.parameters.width=32', 'training.soap.precondition_frequency=5',
                   CONTROL='raw', OPTIMIZER='Adam', LEARNING_RATE='3e-4', SCHEDULER='RIGNOThreePhase',
                   BATCH_SIZE='4', NORMALIZATION_PATH=str(norm),
-                  PHYSICS_WARMUP_UPDATES='500', PHYSICS_WARMUP_RESAMPLE_EVERY='50')
+                  PHYSICS_WARMUP_UPDATES='500', PHYSICS_WARMUP_RESAMPLE_EVERY='50', LOCAL_BRANCH_KERNEL='3')
     assert Path(args[args.index('--phase0-dir') + 1]) == project / 'runs/physics_test_phase0_raw_exact_20261001'
     assert args[args.index('--normalization') + 1] == str(norm)
-    assert args[args.index('--output-dir') + 1].endswith('_s42_pw500x50_77')
+    assert args[args.index('--output-dir') + 1].endswith('_s42_pw500x50_lc3_77')
     assert args[-2:] == ['model.parameters.width=32', 'training.soap.precondition_frequency=5']
     cfg = resolved(args)
     assert cfg['physics_test']['pino']['controls'] == ['raw'] and cfg['physics_test']['pino']['batch_size'] == 4
@@ -427,8 +435,10 @@ exec bash "$LAUNCHER" "$@"
     assert (cfg['training']['optimizer'], cfg['training']['learning_rate']) == ('Adam', 3e-4)
     assert cfg['training']['scheduler']['type'] == 'RIGNOThreePhase'
     assert cfg['model']['parameters']['width'] == 32 and cfg['training']['soap']['precondition_frequency'] == 5
+    assert cfg['model']['parameters']['local_branch_kernel_size'] == 3
     model = pino.build_screen_model(cfg, prescribed_inputs(n=20)[0], torch.device('cpu'))
     assert isinstance(pino.build_optimizer(cfg, model.parameters()), torch.optim.Adam)
+    assert len(model.local_layers) == model.n_layers
 
     resume = tmp_path / 'resume with spaces'
     assert launch(RESUME_RUN_DIR=str(resume))[3:] == ['--resume', '--output-dir', str(resume)]

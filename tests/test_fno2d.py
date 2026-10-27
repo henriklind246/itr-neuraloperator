@@ -5,6 +5,7 @@ from src.operators.fno2d import (
     BoundaryForcingExtender,
     ConditionalInstanceNorm2d,
     FNO2d,
+    LocalConvBranch2d,
     TemporalForcingEncoder,
 )
 
@@ -1133,3 +1134,105 @@ class TestHardRightDirichlet:
         assert list(unexpected) == []
         assert set(missing) == {"t_right_norm"}
         assert float(hard.t_right_norm) == pytest.approx(0.9)
+
+
+class TestLocalConvBranch:
+    @staticmethod
+    def _model(**kw):
+        base = dict(
+            modes1=2, modes2=2, width=8,
+            in_channels=SPATIAL_IN_CHANNELS, out_channels=1, n_layers=2,
+            cond_static_dim=COND_STATIC_DIM, temporal_token_dim=TEMPORAL_TOKEN_DIM,
+            temporal_hidden=16, forcing_embed_dim=16, forcing_spatial_dim=4,
+            padding_mode="replicate", cin_exclude_padding=True,
+        )
+        base.update(kw)
+        return FNO2d(**base)
+
+    @staticmethod
+    def _inputs(b=2, nx=11, ny=11):
+        return (
+            torch.randn(b, nx, ny, SPATIAL_IN_CHANNELS),
+            torch.randn(b, COND_STATIC_DIM),
+            torch.randn(b, TEMPORAL_SAMPLES, TEMPORAL_TOKEN_DIM),
+        )
+
+    def test_default_registers_no_local_branch(self):
+        model = self._model()
+        assert model.local_branch_kernel_size == 0
+        assert not hasattr(model, "local_layers")
+        assert not any(key.startswith("local_layers.") for key in model.state_dict())
+
+    @pytest.mark.parametrize("kernel_size", [3, 5])
+    def test_every_block_gets_a_gated_depthwise_separable_branch(self, kernel_size):
+        width, n_layers = 8, 2
+        model = self._model(local_branch_kernel_size=kernel_size)
+        assert len(model.local_layers) == n_layers
+        for branch in model.local_layers:
+            assert isinstance(branch, LocalConvBranch2d)
+            assert branch.depthwise.weight.shape == (width, 1, kernel_size, kernel_size)
+            assert branch.depthwise.groups == width
+            assert branch.depthwise.padding_mode == model.padding_mode == "replicate"
+            assert branch.pointwise.weight.shape == (width, width, 1, 1)
+            assert branch.depthwise.bias is None and branch.pointwise.bias is None
+            assert torch.equal(branch.gate.detach(), torch.tensor([0.1]))
+        added = sum(p.numel() for p in model.local_layers.parameters())
+        assert added == n_layers * (width * kernel_size ** 2 + width ** 2 + 1)
+
+    @pytest.mark.parametrize("kernel_size", [3, 5])
+    def test_branch_mixes_only_the_kernel_neighborhood(self, kernel_size):
+        torch.manual_seed(0)
+        branch = LocalConvBranch2d(4, kernel_size=kernel_size, padding_mode="replicate")
+        x = torch.randn(1, 4, 11, 11)
+        bumped = x.clone()
+        bumped[0, :, 5, 5] += 1.0
+        with torch.no_grad():
+            delta = (branch(bumped) - branch(x)).abs().amax(dim=(0, 1))
+        assert delta.shape == (11, 11)
+        radius = kernel_size // 2
+        inside = torch.zeros(11, 11, dtype=torch.bool)
+        inside[5 - radius:6 + radius, 5 - radius:6 + radius] = True
+        assert (delta[inside] > 1e-4).all()
+        assert (delta[~inside] < 1e-6).all()
+
+    def test_shares_plain_fno_init_and_zero_gate_is_exactly_the_plain_fno(self):
+        torch.manual_seed(5)
+        plain = self._model().eval()
+        torch.manual_seed(5)
+        local = self._model(local_branch_kernel_size=3, local_branch_gate_init=0.0).eval()
+        shared = {
+            key: value for key, value in local.state_dict().items()
+            if not key.startswith("local_layers.")
+        }
+        assert plain.state_dict().keys() == shared.keys()
+        assert all(torch.equal(value, shared[key]) for key, value in plain.state_dict().items())
+
+        inputs = self._inputs()
+        with torch.no_grad():
+            expected = plain(*inputs)
+            assert torch.equal(local(*inputs), expected)
+            for branch in local.local_layers:
+                branch.gate.fill_(0.1)
+            assert not torch.allclose(local(*inputs), expected)
+
+    def test_every_branch_parameter_receives_gradient(self):
+        torch.manual_seed(0)
+        model = self._model(local_branch_kernel_size=3)
+        model(*self._inputs()).square().mean().backward()
+        for name, parameter in model.local_layers.named_parameters():
+            assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            (dict(local_branch_kernel_size=4), "local_branch_kernel_size"),
+            (dict(local_branch_kernel_size=-3), "local_branch_kernel_size"),
+            (dict(local_branch_kernel_size=True), "local_branch_kernel_size"),
+            (dict(local_branch_kernel_size=3.0), "local_branch_kernel_size"),
+            (dict(local_branch_kernel_size=3, local_branch_gate_init=float("nan")),
+             "local_branch_gate_init"),
+        ],
+    )
+    def test_rejects_invalid_local_branch_config(self, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            self._model(**overrides)

@@ -681,6 +681,8 @@ def eval_all_seeds(
             padding_mode=model_cfg.get("padding_mode", "zeros"),
             cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
             hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
+            local_branch_kernel_size=model_cfg.get("local_branch_kernel_size", 0),
+            local_branch_gate_init=model_cfg.get("local_branch_gate_init", 0.1),
         )
         fno.load_state_dict(ckpt['model_state'])
         fno.to(device)
@@ -1278,6 +1280,8 @@ def write_test_records(
         padding_mode=model_cfg.get("padding_mode", "zeros"),
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
         hard_right_dirichlet=model_cfg.get("hard_right_dirichlet", False),
+        local_branch_kernel_size=model_cfg.get("local_branch_kernel_size", 0),
+        local_branch_gate_init=model_cfg.get("local_branch_gate_init", 0.1),
     )
     fno.load_state_dict(ckpt["model_state"])
     fno.to(device)

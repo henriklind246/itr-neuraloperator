@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,6 +38,11 @@ import torch.nn.functional as F
 #   - physics_extender: the same extender with a learned, diffusion-inspired
 #     per-head relative-y attention bias. The signed coefficient depends on
 #     normalized query depth, lead time, interface crossing, and scalar R_c.
+# local_branch_kernel_size > 0 turns every Fourier block into an FNO-LC block,
+#   x <- GELU(CIN(K(x) + W(x) + alpha * P(D(x)))),
+# with D a depthwise k x k convolution, P a 1x1 channel mix and alpha a learned
+# per-block gate (LocalConvBranch2d). CIN and activation placement are those of
+# the plain block.
 
 
 # --------- SpectralConv2d ---------
@@ -106,6 +113,38 @@ class SpectralConv2d(nn.Module):
 
         # IFFT back to physical space
         return torch.fft.irfft2(out_ft, s=(Nx, Ny), dim=(-2, -1))
+
+
+# --------- Local convolution branch (FNO-LC) ---------
+
+class LocalConvBranch2d(nn.Module):
+    """Gated depthwise-separable convolution ``alpha * P(D(x))``.
+
+    ``D`` is a depthwise ``k x k`` convolution and ``P`` a 1x1 channel mix. The
+    branch runs beside a Fourier block's spectral and pointwise paths and adds
+    the neighborhood-scale mixing that neither the mode-truncated spectral path
+    nor the pointwise path provides. Neither convolution has a bias: the
+    conditional instance norm after the block sum removes per-channel constants.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        gate_init: float = 0.1,
+        padding_mode: str = "zeros",
+    ):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            channels, channels, kernel_size, padding=kernel_size // 2,
+            groups=channels, bias=False, padding_mode=padding_mode,
+        )
+        self.pointwise = nn.Conv2d(channels, channels, 1, bias=False)
+        self.gate = nn.Parameter(torch.full((1,), float(gate_init)))
+
+    def forward(self, x):
+        # x: (B, C, Nx, Ny) -> (B, C, Nx, Ny)
+        return self.gate * self.pointwise(self.depthwise(x))
 
 
 # --------- Conditional Instance Normalization ---------
@@ -509,6 +548,10 @@ class FNO2d(nn.Module):
     ``physics_extender`` adds a diffusion-inspired geometry bias to the same
     cross-attention blocks. In every case linear_p receives
     (in_channels + K) channels.
+
+    ``local_branch_kernel_size > 0`` adds a ``LocalConvBranch2d`` to every
+    Fourier block (FNO-LC); the default 0 registers nothing, so plain-FNO
+    state dicts are unchanged.
     """
 
     # NOTE: the in_channels / cond_static_dim / temporal_token_dim defaults below
@@ -546,6 +589,8 @@ class FNO2d(nn.Module):
         cin_exclude_padding: bool = False,
         hard_right_dirichlet: bool = False,
         t_right_norm: float = 0.0,
+        local_branch_kernel_size: int = 0,
+        local_branch_gate_init: float = 0.1,
     ):
         super().__init__()
         self.modes1 = modes1
@@ -641,6 +686,27 @@ class FNO2d(nn.Module):
             )
         self.padding_mode = padding_mode
         self.cin_exclude_padding = cin_exclude_padding
+        if (
+            isinstance(local_branch_kernel_size, bool)
+            or not isinstance(local_branch_kernel_size, int)
+            or local_branch_kernel_size < 0
+            or (local_branch_kernel_size > 0 and local_branch_kernel_size % 2 == 0)
+        ):
+            raise ValueError(
+                "local_branch_kernel_size must be 0 (no local branch) or a positive "
+                f"odd integer, got {local_branch_kernel_size!r}"
+            )
+        if (
+            isinstance(local_branch_gate_init, bool)
+            or not isinstance(local_branch_gate_init, (int, float))
+            or not math.isfinite(local_branch_gate_init)
+        ):
+            raise ValueError(
+                "local_branch_gate_init must be a finite number, "
+                f"got {local_branch_gate_init!r}"
+            )
+        self.local_branch_kernel_size = local_branch_kernel_size
+        self.local_branch_gate_init = float(local_branch_gate_init)
 
         # Hard right-Dirichlet output constraint: overwrite the right wall face
         # T[:, Nx-1, :] with the (normalized) fixed boundary temperature so the
@@ -723,14 +789,29 @@ class FNO2d(nn.Module):
         self.activation = nn.GELU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        # Register the optional MLPs after every shared parameter has been
-        # initialized. Otherwise their random hidden layers would advance the
-        # RNG and invalidate same-seed ordinary-vs-physics initialization.
+        # Register the optional modules after every shared parameter has been
+        # initialized. Otherwise their random weights would advance the RNG and
+        # invalidate same-seed initialization against the model without them
+        # (ordinary vs physics extender, FNO vs FNO-LC). The local branches come
+        # last so toggling them leaves every other configuration's init intact.
         if forcing_spatial_mode == "physics_extender":
             self.boundary_extender.enable_diffusion_geometry_bias(
                 hidden_dim=forcing_extender_physics_hidden,
                 interface_x_norm=forcing_extender_interface_x_norm,
             )
+        if local_branch_kernel_size:
+            # padding_mode follows the domain pad, so the branch extends features
+            # past the unpadded x=0 and y=0 edges the way the pad extends them
+            # past the far edges.
+            self.local_layers = nn.ModuleList([
+                LocalConvBranch2d(
+                    width,
+                    kernel_size=local_branch_kernel_size,
+                    gate_init=local_branch_gate_init,
+                    padding_mode=padding_mode,
+                )
+                for _ in range(n_layers)
+            ])
 
     def _padding_for_shape(self, Nx: int, Ny: int) -> tuple[int, int]:
         if self.padding_reference_resolution is None:
@@ -813,6 +894,8 @@ class FNO2d(nn.Module):
 
             x1 = self.spectral_layers[l](x)
             x2 = self.conv_layers[l](x)
+            if self.local_branch_kernel_size:
+                x2 = x2 + self.local_layers[l](x)
             x = x1 + x2
             valid_shape = (Nx0, Ny0) if self.cin_exclude_padding else None
             x = self.cin_layers[l](x, gamma, beta, valid_shape=valid_shape)

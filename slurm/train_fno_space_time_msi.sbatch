@@ -21,6 +21,7 @@
 #
 #   sbatch --export=ALL,CONTROL=spatial_mg,OPTIMIZER=Adam,LEARNING_RATE=3e-4 slurm/train_fno_space_time_msi.sbatch
 #   sbatch slurm/train_fno_space_time_msi.sbatch model.parameters.width=32 training.ss_esoap.check_interval=5
+#   sbatch --export=ALL,LOCAL_BRANCH_KERNEL=3,UPDATES=1000 slurm/train_fno_space_time_msi.sbatch
 #   sbatch --export=ALL,RESUME_RUN_DIR=$HOME/fno_runs/<run> slurm/train_fno_space_time_msi.sbatch
 #
 # Trailing arguments are dotted config overrides applied after the defaults below.
@@ -64,6 +65,10 @@ SEED="${SEED:-42}"
 # batch is reused for PHYSICS_WARMUP_RESAMPLE_EVERY updates (archive used 500/50).
 PHYSICS_WARMUP_UPDATES="${PHYSICS_WARMUP_UPDATES:-0}"
 PHYSICS_WARMUP_RESAMPLE_EVERY="${PHYSICS_WARMUP_RESAMPLE_EVERY:-1}"
+# FNO-LC: an odd kernel size adds a gated depthwise-separable local conv to
+# every Fourier block (3 = FNO-LC-S3, 5 = FNO-LC-S5); 0 keeps the plain FNO.
+# Same-SEED jobs still share the plain FNO's initial weights.
+LOCAL_BRANCH_KERNEL="${LOCAL_BRANCH_KERNEL:-0}"
 ALLOCATION_SECONDS="${ALLOCATION_SECONDS:-28800}"  # keep equal to --time for the startup fit estimate
 
 case "$CONTROL" in
@@ -74,7 +79,11 @@ WARMUP_TAG=""
 if [[ "$PHYSICS_WARMUP_UPDATES" != 0 ]]; then
     WARMUP_TAG="_pw${PHYSICS_WARMUP_UPDATES}x${PHYSICS_WARMUP_RESAMPLE_EVERY}"
 fi
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-fno_st_${CONTROL}_${OPTIMIZER}_lr${LEARNING_RATE}_bs${BATCH_SIZE}_n${PREFIX_STEPS}_u${UPDATES}_s${SEED}${WARMUP_TAG}}"
+LOCAL_TAG=""
+if [[ "$LOCAL_BRANCH_KERNEL" != 0 ]]; then
+    LOCAL_TAG="_lc${LOCAL_BRANCH_KERNEL}"
+fi
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-fno_st_${CONTROL}_${OPTIMIZER}_lr${LEARNING_RATE}_bs${BATCH_SIZE}_n${PREFIX_STEPS}_u${UPDATES}_s${SEED}${WARMUP_TAG}${LOCAL_TAG}}"
 RUN_DIR="${RUN_DIR:-$PERSISTENT_RUNS/${EXPERIMENT_NAME}_${SLURM_JOB_ID:?}}"
 export BENCHMARK=forcing_homogeneous
 export REPRESENTATION=temporal_encoder
@@ -92,7 +101,7 @@ mkdir -p "$PERSISTENT_RUNS"
 echo "Job $SLURM_JOB_ID started on $(hostname) at $(date)"
 echo "PROJECT_DIR=$PROJECT_DIR DATA_DIR=$DATA_DIR GATE_DIR=$GATE_DIR NORMALIZATION_PATH=${NORMALIZATION_PATH:-<frozen from DATA_DIR>}"
 echo "CONTROL=$CONTROL OPTIMIZER=$OPTIMIZER LEARNING_RATE=$LEARNING_RATE SCHEDULER=$SCHEDULER BATCH_SIZE=$BATCH_SIZE UPDATES=$UPDATES PREFIX_STEPS=$PREFIX_STEPS"
-echo "PHYSICS_WARMUP_UPDATES=$PHYSICS_WARMUP_UPDATES PHYSICS_WARMUP_RESAMPLE_EVERY=$PHYSICS_WARMUP_RESAMPLE_EVERY"
+echo "PHYSICS_WARMUP_UPDATES=$PHYSICS_WARMUP_UPDATES PHYSICS_WARMUP_RESAMPLE_EVERY=$PHYSICS_WARMUP_RESAMPLE_EVERY LOCAL_BRANCH_KERNEL=$LOCAL_BRANCH_KERNEL"
 echo "Trailing overrides (applied last): $*"
 nvidia-smi
 
@@ -116,6 +125,7 @@ else
         "training.scheduler.type=$SCHEDULER" "training.scheduler.decay_every=$DECAY_EVERY"
         "training.scheduler.decay_rate=$DECAY_RATE" "training.scheduler.min_lr=$MIN_LR"
         physics_test.model_type=fno model.parameters.hard_right_dirichlet=true model.parameters.dropout=0.0
+        "model.parameters.local_branch_kernel_size=$LOCAL_BRANCH_KERNEL"
         physics_test.pino.residual_mode=space_time "physics_test.pino.controls=[\"$CONTROL\"]"
         "physics_test.pino.prefix_steps=$PREFIX_STEPS" "physics_test.pino.time_chunk_size=$TIME_CHUNK_SIZE"
         "physics_test.pino.batch_size=$BATCH_SIZE" "physics_test.pino.online_updates=$UPDATES"

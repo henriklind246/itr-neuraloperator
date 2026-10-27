@@ -498,12 +498,14 @@ def test_spatial_mg_controls_differ_only_in_previous_state_gradients():
     assert not torch.allclose(full_gradient[:,1:-1],detached_gradient[:,1:-1])
 
 
+@pytest.mark.parametrize('local_kernel', [0, 3])
 @pytest.mark.parametrize('ic_weight', [0.0, 0.5])
 @pytest.mark.parametrize('objective', ['raw','spatial_exact','exact','spatial_mg','spatial_mg_detached','mg'])
-def test_two_pass_space_time_backward_equals_the_full_graph_gradient(objective,ic_weight,monkeypatch):
+def test_two_pass_space_time_backward_equals_the_full_graph_gradient(objective,ic_weight,local_kernel,monkeypatch):
     import src.operators.train_pino as pino
     torch.manual_seed(3)
     cfg = config('fno',residual_mode='space_time')
+    cfg['model']['parameters']['local_branch_kernel_size'] = local_kernel
     # Five intervals in chunks of two leave a remainder chunk.
     cfg['physics_test']['pino'].update(prefix_steps=5,time_chunk_size=2,ic_weight=ic_weight)
     inputs,_ = prescribed_inputs(n=8)

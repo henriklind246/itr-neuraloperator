@@ -159,6 +159,8 @@ model:
     padding_reference_resolution: 100  # scale FNO pad cells with grid resolution; set = training grid (null = fixed pad=8)
     padding_mode: replicate       # boundary extension for the FNO domain pad: zeros|replicate|reflect
     cin_exclude_padding: true     # compute CIN instance stats over the unpadded region only
+    local_branch_kernel_size: 0   # FNO-LC: odd k adds a gated depthwise-separable kxk conv to every Fourier block (0 = plain FNO; pads like padding_mode)
+    local_branch_gate_init: 0.1   # FNO-LC: initial learned gate of each block's local branch
     hard_right_dirichlet: false   # overwrite right wall face with the fixed BC temperature (exact BC)
     hard_right_dirichlet_t_right: 300.0  # right-wall Dirichlet value in Kelvin (normalized at build time)
 

@@ -1783,6 +1783,8 @@ def run_one_seed(
         cin_exclude_padding=model_cfg.get("cin_exclude_padding", False),
         hard_right_dirichlet=hard_rd,
         t_right_norm=t_right_norm,
+        local_branch_kernel_size=model_cfg.get("local_branch_kernel_size", 0),
+        local_branch_gate_init=model_cfg.get("local_branch_gate_init", 0.1),
     )
 
     # --- Resume state ---
