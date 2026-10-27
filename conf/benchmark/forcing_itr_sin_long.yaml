@@ -1,0 +1,18 @@
+benchmark:
+  name: forcing_itr_sin_long
+  rc_channel_mode: broadcast
+  spatial_conditioning: full
+  spatial_profile_bins: 8
+
+data:
+  t_final: 3.0
+  dt: 0.005
+  save_stride: 20
+  ramp_seconds: 0.1
+
+training:
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.05
+    interface_weight: 15.0
+    per_sample_interface_x: false
