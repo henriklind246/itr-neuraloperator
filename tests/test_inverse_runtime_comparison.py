@@ -13,7 +13,7 @@ from scripts.inverse_adapters import ForcingItrSinAdapter
 def _config(benchmark=runtime.BENCHMARK, representation=runtime.REPRESENTATION):
     return {
         "benchmark": {"name": benchmark, "representation": representation},
-        "data": {"nx": 24, "ny": 20, "save_stride": 20},
+        "data": {"nx": 24, "ny": 20, "save_stride": None},
     }
 
 
@@ -102,7 +102,7 @@ def test_ground_truth_generation_is_three_fv_b5_cases(tmp_path):
         "benchmark": "forcing_itr_sin_long",
         "nx": 24,
         "ny": 20,
-        "save_stride": 20,
+        "save_stride": None,
         "rng_seed": 1,
     }
 
@@ -233,7 +233,8 @@ def test_summary_uses_paired_medians_and_fv_speedup_baseline():
     ] == pytest.approx(0.2)
 
 
-def test_outputs_have_compact_schemas_and_precise_noise_protocol(tmp_path):
+@pytest.mark.parametrize("irregular_snapshots", [False, True])
+def test_outputs_have_compact_schemas_and_precise_noise_protocol(tmp_path, irregular_snapshots):
     case_rows = _case_rows()
     summary_rows = runtime.summarize_rows(case_rows)
     case_path = tmp_path / "inverse_runtime_cases.csv"
@@ -245,7 +246,8 @@ def test_outputs_have_compact_schemas_and_precise_noise_protocol(tmp_path):
     ds = SimpleNamespace(
         Nx=24,
         Ny=20,
-        t_grid=np.array([0.0, 0.01, 0.02]),
+        t_grid=(np.rint(np.linspace(0, 1400, 31)) * 0.005
+                if irregular_snapshots else np.array([0.0, 0.01, 0.02])),
         dt=0.005,
     )
     protocol = runtime._protocol(
@@ -257,7 +259,7 @@ def test_outputs_have_compact_schemas_and_precise_noise_protocol(tmp_path):
         sigma_global=4.0,
         ds=ds,
         requested_y=np.linspace(0.0, 1.0, 8),
-        observation_times=np.array([0.7, 1.5, 3.0]),
+        observation_times=np.array([1.635, 3.5, 7.0]),
         starts_u=runtime.lhs_starts(ForcingItrSinAdapter()),
     )
     protocol_path.write_text(json.dumps(protocol))
@@ -267,6 +269,11 @@ def test_outputs_have_compact_schemas_and_precise_noise_protocol(tmp_path):
     with summary_path.open(newline="") as handle:
         stored_summary = list(csv.DictReader(handle))
     stored_protocol = json.loads(protocol_path.read_text())
+    grid = stored_protocol["grid"]
+    assert grid["save_stride"] == (None if irregular_snapshots else 2)
+    assert grid["saved_step_indices"] == np.rint(ds.t_grid / ds.dt).astype(int).tolist()
+    assert grid["t_final"] == float(ds.t_grid[-1])
+    assert grid["dt"] == 0.005
 
     assert len(stored_cases) == 9
     assert tuple(stored_cases[0]) == runtime.CASE_COLUMNS

@@ -11,10 +11,11 @@ model:
     forcing_spatial_mode: boundary_extender
 
 data:
-  t_final: 3.0
+  t_final: 7.0
   dt: 0.005
-  save_stride: 20
-  ramp_seconds: 0.1
+  save_stride: null
+  saved_snapshots: 31
+  ramp_seconds: 0.23333333333333334
 
 training:
   loss:

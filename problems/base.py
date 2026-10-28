@@ -122,6 +122,7 @@ class ProblemSpec(ABC):
     dims: ProblemDims
     default_t_final: float = 0.3
     default_save_stride: int = 2
+    default_saved_snapshots: int | None = None
     default_ramp_seconds: float | None = None
 
     #: Only the scalar-R_c forcing benchmark supports duplicating normalized

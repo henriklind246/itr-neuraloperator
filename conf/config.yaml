@@ -264,6 +264,7 @@ data:
   t_final: 0.3
   dt: 0.005
   save_stride: 2
+  saved_snapshots: null
   ramp_seconds: null
   t_grid_path: null
   x_grid_path: null

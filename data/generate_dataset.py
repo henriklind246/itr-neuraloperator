@@ -224,6 +224,7 @@ def run_solves(
     Nx: int,
     Ny: int,
     verbose: bool = True,
+    snapshot_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Solve every ``sim_params`` entry and stack decimated trajectories.
 
@@ -237,7 +238,8 @@ def run_solves(
     for i, params in enumerate(sim_params):
         sim = spec.configure_solver(params, base_kwargs)
         t, x, y, T_hist = sim.solve(T0=params["T0"], store_trajectory=True)
-        trajectories[i] = T_hist[::save_stride].astype(np.float32)
+        selection = slice(None, None, save_stride) if snapshot_indices is None else snapshot_indices
+        trajectories[i] = T_hist[selection].astype(np.float32)
         if verbose:
             print(f"Finished simulation {i}", flush=True)
     return trajectories, t, x, y
@@ -254,11 +256,13 @@ def save_dataset(
     trajectories: np.ndarray,
     sim_params: list[dict],
     meta: dict | None = None,
+    snapshot_indices: np.ndarray | None = None,
 ) -> Path:
     """Write the standard dataset .npy files and return the save directory."""
     x_grid = x.astype(np.float32)
     y_grid = y.astype(np.float32)
-    t_grid = t[::save_stride].astype(np.float32)
+    selection = slice(None, None, save_stride) if snapshot_indices is None else snapshot_indices
+    t_grid = t[selection].astype(np.float32)
 
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -298,6 +302,7 @@ def generate_sim_data(
 ) -> None:
     benchmark = benchmark or os.environ.get("BENCHMARK", "forcing")
     spec = get_problem(benchmark)
+    saved_snapshots = spec.default_saved_snapshots if save_stride is None else None
     if save_stride is None:
         save_stride = spec.default_save_stride
     if ramp_seconds is None:
@@ -313,6 +318,11 @@ def generate_sim_data(
         ramp_seconds=ramp_seconds, lhs_seed=seeds["lhs"], ic_families=ic_families,
         forcing_profile_seed=seeds["forcing_profile"],
     )
+    snapshot_indices = None
+    if saved_snapshots is not None:
+        _, solver_times = build_time_grid(spec.default_t_final, setup["dt"], explicit_dt=True)
+        snapshot_indices = np.rint(np.linspace(0, len(solver_times) - 1, saved_snapshots)).astype(int)
+        setup["Nt_saved"] = len(snapshot_indices)
 
     print(f"Benchmark: {benchmark}", flush=True)
     print("Building simulation parameters.", flush=True)
@@ -335,11 +345,13 @@ def generate_sim_data(
     trajectories, t, x, y = run_solves(
         spec, sim_params, setup["base_kwargs"], save_stride,
         setup["Nt_saved"], setup["Nx"], setup["Ny"],
+        snapshot_indices=snapshot_indices,
     )
 
     required_times = getattr(spec, "required_observation_times", ())
     if required_times:
-        saved_times = np.asarray(t, dtype=np.float64)[::save_stride]
+        selection = slice(None, None, save_stride) if snapshot_indices is None else snapshot_indices
+        saved_times = np.asarray(t, dtype=np.float64)[selection]
         for requested in required_times:
             if not np.any(np.isclose(saved_times, requested, rtol=0.0, atol=1e-10)):
                 raise ValueError(
@@ -371,7 +383,7 @@ def generate_sim_data(
     save_path = Path(save_dir) if save_dir is not None else DATA_DIR
     save_dataset(
         save_path, x, y, t, save_stride, setup["dt"], setup["t_ramp"],
-        trajectories, sim_params, meta=meta,
+        trajectories, sim_params, meta=meta, snapshot_indices=snapshot_indices,
     )
 
 def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
@@ -400,8 +412,8 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         type=int,
         default=None,
         help=(
-            "Snapshot decimation stride. Defaults to the benchmark's stride "
-            "(20 for B5, otherwise 2). Use 1 for the "
+            "Snapshot decimation stride. Defaults to the benchmark's schedule "
+            "(31 snapshots on the nearest solver steps for B5, otherwise stride 2). Use 1 for the "
             "physics-informed FV-residual set (consecutive snapshots one solver "
             "step dt apart; CN-exact). Note Nt_saved ~doubles and the all-to-all "
             "pair count is quadratic in Nt_saved -- generate a SMALL save-stride=1 "
@@ -414,7 +426,7 @@ def main(argv: list[str] | None = None, generate_fn=generate_sim_data) -> int:
         default=None,
         help=(
             "Physical startup-ramp width (seconds) applied to q_L so q_L(0)=0. "
-            "Defaults to the benchmark's ramp (0.1 s for B5, otherwise 2*dt). "
+            "Defaults to the benchmark's ramp (7/30 s for B5, otherwise 2*dt). "
             "The resolved value is persisted with the dataset."
         ),
     )

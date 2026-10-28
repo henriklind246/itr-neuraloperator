@@ -109,47 +109,50 @@ def test_b5_stretches_every_forcing_family_and_preserves_conditioning():
     long = get_problem("forcing_itr_sin_long")
     stretched = long.sample_sim_params(
         np.random.default_rng(0), np.random.default_rng(1), grids,
-        dict(time_cfg, t_final=3.0),
+        dict(time_cfg, t_final=7.0),
     )
     assert {p["temporal_family"] for p in reference} == {
         "sin", "exp", "pulse_train", "exp_train",
     }
     short_ds = _dataset(short, reference, grids)
-    long_ds = _dataset(long, stretched, grids, time_scale=10.0)
+    long_ds = _dataset(long, stretched, grids, time_scale=7.0 / 0.3)
     times = np.linspace(0.0, 0.3, 97)
     for sid, (old, new) in enumerate(zip(reference, stretched)):
         for key in ("R_c", "R_c_base", "R_c_A", "spatial_family", "spatial_params"):
             assert old[key] == new[key]
         np.testing.assert_array_equal(old["T0"], new["T0"])
-        assert new["forcing_time_scale"] == 10.0
+        assert new["forcing_time_scale"] == 7.0 / 0.3
         fields = ("temporal_family", "temporal_params", "spatial_family", "spatial_params")
         old_kwargs = {key: old[key] for key in fields}
         new_kwargs = {key: new[key] for key in fields}
         old_flux, _ = build_qL(**old_kwargs, y_grid=grids["y_grid"], t_ramp=0.01)
-        new_flux, _ = build_qL(**new_kwargs, y_grid=grids["y_grid"], t_ramp=0.1)
+        new_flux, _ = build_qL(**new_kwargs, y_grid=grids["y_grid"], t_ramp=0.01 * 7.0 / 0.3)
         np.testing.assert_allclose(
-            [new_flux(10.0 * t) for t in times],
+            [new_flux((7.0 / 0.3) * t) for t in times],
             [old_flux(t) for t in times], rtol=1e-10, atol=1e-10,
         )
         old_integral, _ = build_qL_integral(**old_kwargs, y_grid=grids["y_grid"], t_ramp=0.01)
-        new_integral, _ = build_qL_integral(**new_kwargs, y_grid=grids["y_grid"], t_ramp=0.1)
-        np.testing.assert_allclose(new_integral(0.0, 3.0), 10.0 * old_integral(0.0, 0.3))
+        new_integral, _ = build_qL_integral(**new_kwargs, y_grid=grids["y_grid"], t_ramp=0.01 * 7.0 / 0.3)
+        np.testing.assert_allclose(new_integral(0.0, 7.0), (7.0 / 0.3) * old_integral(0.0, 0.3))
         old_item = short.build_item(short_ds, sid, 0, 3)
         new_item = long.build_item(long_ds, sid, 0, 3)
         for key in ("spatial", "cond_static", "forcing_seq"):
             np.testing.assert_allclose(new_item[key], old_item[key], rtol=1e-4, atol=1e-5)
 
 
-def test_b5_generation_and_inverse_use_600_steps_and_31_snapshots(tmp_path, monkeypatch):
+def test_b5_generation_and_inverse_use_1400_steps_and_31_snapshots(tmp_path, monkeypatch):
     from data.generate_dataset import main as generate_main
+    from data.dataset import assert_dataset_problem_version
     from src.operators.train import load_config
 
     monkeypatch.setenv("BENCHMARK", "forcing_itr_sin_long")
     config = load_config()
     spec = get_problem(config["benchmark"]["name"])
-    assert config["data"]["t_final"] == spec.default_t_final == 3.0
-    assert config["data"]["save_stride"] == spec.default_save_stride == 20
-    assert config["data"]["ramp_seconds"] == spec.default_ramp_seconds == 0.1
+    assert config["data"]["t_final"] == spec.default_t_final == 7.0
+    assert config["data"]["save_stride"] is None
+    assert config["data"]["saved_snapshots"] == spec.default_saved_snapshots == 31
+    assert config["data"]["ramp_seconds"] == pytest.approx(spec.default_ramp_seconds)
+    assert spec.default_ramp_seconds == pytest.approx(7.0 / 30.0)
     generate_main([
         "--num-sims", "1", "--nx", "12", "--ny", "12",
         "--save-dir", str(tmp_path),
@@ -159,9 +162,12 @@ def test_b5_generation_and_inverse_use_600_steps_and_31_snapshots(tmp_path, monk
         n_invert=1, n_calibration=0,
     )
     assert ds.trajectories.shape == (1, 31, 12, 12)
-    np.testing.assert_allclose(ds.t_grid, np.linspace(0.0, 3.0, 31))
+    saved_steps = np.rint(np.linspace(0, 1400, 31)).astype(int)
+    np.testing.assert_allclose(ds.t_grid, saved_steps * 0.005)
+    assert set(np.diff(saved_steps)) == {46, 47}
+    np.testing.assert_allclose(ds.t_grid, np.linspace(0.0, 7.0, 31), atol=0.0025)
     assert ds.dt == 0.005
-    assert ds.ramp_seconds == 0.1
+    assert ds.ramp_seconds == pytest.approx(7.0 / 30.0)
     indices, _ = invert.resolve_observation_times(ds.t_grid, spec.required_observation_times)
     assert indices == [7, 15, 30]
     adapter = InverseAdapter.from_config(config)
@@ -169,10 +175,15 @@ def test_b5_generation_and_inverse_use_600_steps_and_31_snapshots(tmp_path, monk
     params = ds.sim_params[0]
     theta = adapter.theta_from_sim_params(params, dtype=torch.float64)
     solver = adapter.build_fv_solver(ds, params, theta)
-    assert len(solver.t) - 1 == 600
+    assert len(solver.t) - 1 == 1400
     assert solver.dt == 0.005
     _, _, _, expected = solver.solve(T0=params["T0"], store_trajectory=True)
-    np.testing.assert_array_equal(ds.trajectories[0], expected[::20].astype(np.float32))
+    np.testing.assert_array_equal(ds.trajectories[0], expected[saved_steps].astype(np.float32))
+    meta = assert_dataset_problem_version(spec, tmp_path / "t_grid.npy")
+    assert meta["problem_version"] == "forcing-itr-sin-long-7s-v1"
+    (tmp_path / "meta.npy").unlink()
+    with pytest.raises(ValueError, match="regenerate"):
+        assert_dataset_problem_version(spec, tmp_path / "t_grid.npy")
 
 
 def test_forcing_itr_sin_inherits_forcing_tensors_and_cond_layout():

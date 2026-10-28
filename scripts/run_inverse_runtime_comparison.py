@@ -519,6 +519,8 @@ def _protocol(
     observation_times: np.ndarray,
     starts_u: np.ndarray,
 ) -> dict:
+    saved_steps = np.rint(np.asarray(ds.t_grid) / float(ds.dt)).astype(int)
+    strides = np.diff(saved_steps)
     return {
         "schema_version": 1,
         "diagnostic": "representative paired runtime comparison",
@@ -531,7 +533,10 @@ def _protocol(
         "grid": {
             "nx": int(ds.Nx),
             "ny": int(ds.Ny),
-            "save_stride": int(round(float(ds.t_grid[1] - ds.t_grid[0]) / float(ds.dt))),
+            "save_stride": int(strides[0]) if np.all(strides == strides[0]) else None,
+            "saved_step_indices": saved_steps.tolist(),
+            "dt": float(ds.dt),
+            "t_final": float(ds.t_grid[-1]),
         },
         "cases": {"count": N_CASES, "dataset_seed": INVERSION_DATASET_SEED},
         "observations": {

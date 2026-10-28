@@ -285,13 +285,16 @@ class ForcingItrSinProblem(ForcingProblem):
 
 
 class ForcingItrSinLongProblem(ForcingItrSinProblem):
-    """B5: sinusoidal ITR with boundary forcing stretched from 0.3 s to 3 s."""
+    """B5: sinusoidal ITR with boundary forcing stretched from 0.3 s to 7 s."""
 
     name = "forcing_itr_sin_long"
-    default_t_final = 3.0
-    default_save_stride = 20
-    default_ramp_seconds = 0.1
-    required_observation_times = (0.7, 1.5, 3.0)
+    default_t_final = 7.0
+    default_saved_snapshots = 31
+    forcing_time_scale = default_t_final / 0.3
+    default_ramp_seconds = 0.01 * forcing_time_scale
+    problem_version = "forcing-itr-sin-long-7s-v1"
+    # The first ideal observation (7 * 0.07 / 0.3) is between FV steps.
+    required_observation_times = (1.635, 3.5, 7.0)
 
     def sample_sim_params(self, rng, rng_profile, grids, time_cfg) -> list[dict]:
         # Sample on the original clock so dt-dependent pulse-width bounds and
@@ -306,12 +309,12 @@ class ForcingItrSinLongProblem(ForcingItrSinProblem):
             temporal = entry["temporal_params"]
             for key in ("t_on", "t_off", "t0", "tau"):
                 if key in temporal:
-                    temporal[key] *= 10.0
+                    temporal[key] *= self.forcing_time_scale
             for key in ("t_list", "dt_list", "tau_list"):
                 if key in temporal:
-                    temporal[key] = [10.0 * value for value in temporal[key]]
+                    temporal[key] = [self.forcing_time_scale * value for value in temporal[key]]
             if "f" in temporal:
-                temporal["f"] /= 10.0
-            entry["forcing_time_scale"] = 10.0
-            entry["forcing_sample_key"] += ":time_scale=10"
+                temporal["f"] /= self.forcing_time_scale
+            entry["forcing_time_scale"] = self.forcing_time_scale
+            entry["forcing_sample_key"] += f":time_scale={self.forcing_time_scale:.17g}"
         return params
