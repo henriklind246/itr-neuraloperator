@@ -34,9 +34,7 @@ LEAD_BINS = 12
 # all benchmarks; benchmark extras are appended when present and varying.
 BASE_COND_COLS = ["t_s", "t_bar", "R_c"]
 BENCHMARK_COND_COLS = {
-    "diffusion_forcing_single": ["amplitude", "frequency", "absolute_time"],
     "forcing": [],
-    "forcing_homogeneous": ["absolute_time"],
     "forcing_itr_sin": ["R_c_base", "R_c_A"],
     "forcing_itr_sin_long": ["R_c_base", "R_c_A"],
     "interfaces": ["interface_x"],
@@ -53,9 +51,7 @@ BENCHMARK_COND_COLS = {
 STRAT_METRICS = ["rel_l2", "rmse_K", "sigma_nrmse_pct", "nrmse"]
 
 TAIL_CATEGORICAL_COLS = {
-    "diffusion_forcing_single": ("ic_family",),
     "forcing": ("temporal_family", "spatial_family"),
-    "forcing_homogeneous": ("temporal_family", "spatial_family"),
     "forcing_itr_sin": ("temporal_family", "spatial_family"),
     "forcing_itr_sin_long": ("temporal_family", "spatial_family"),
     "source": ("regime",),
@@ -215,16 +211,13 @@ def report_xh_deciles(latest: pd.DataFrame, benchmark: str) -> None:
 
 def report_structure(latest: pd.DataFrame, benchmark: str) -> None:
     print(f"\n=== 4. Structure breakdown for benchmark={benchmark!r} (final epoch) ===")
-    if benchmark in ("forcing", "forcing_itr_sin", "forcing_itr_sin_long", "forcing_homogeneous") and {
+    if benchmark in ("forcing", "forcing_itr_sin", "forcing_itr_sin_long") and {
         "temporal_family", "spatial_family"
     } <= set(latest.columns):
         agg = latest.groupby(["temporal_family", "spatial_family"])["rel_l2"].agg(
             ["mean", "median", "count"]
         )
         print(agg.sort_values("mean").to_string(float_format=lambda x: f"{x:.4f}"))
-    elif benchmark == "diffusion_forcing_single" and "ic_family" in latest:
-        metrics = _present_strat_metrics(latest)
-        print(latest.groupby("ic_family")[metrics].mean().to_string(float_format=lambda x: f"{x:.4f}"))
     elif benchmark == "interfaces" and _is_varying_numeric(latest, "interface_x"):
         bins = pd.qcut(latest["interface_x"], 5, duplicates="drop")
         agg = latest.groupby(bins, observed=True)["rel_l2"].agg(["mean", "median", _quantile(0.99)])
@@ -576,19 +569,8 @@ def plot_interface_ratio(latest: pd.DataFrame, out: Path) -> None:
 
 def plot_structure(latest: pd.DataFrame, benchmark: str, out: Path) -> None:
     """Benchmark-specific final plot (the 5th figure)."""
-    if benchmark in ("forcing", "forcing_itr_sin", "forcing_itr_sin_long", "forcing_homogeneous"):
+    if benchmark in ("forcing", "forcing_itr_sin", "forcing_itr_sin_long"):
         _plot_ic_family_heatmap(latest, out)
-    elif benchmark == "diffusion_forcing_single":
-        metrics = _present_strat_metrics(latest)
-        grouped = latest.groupby("ic_family")[metrics].mean()
-        fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4), squeeze=False)
-        for ax, metric in zip(axes[0], metrics):
-            grouped[metric].plot.bar(ax=ax)
-            ax.set_ylabel(metric)
-            ax.set_xlabel("IC family")
-        fig.tight_layout()
-        fig.savefig(out / "05_ic_family_errors.png", dpi=130)
-        plt.close(fig)
     elif benchmark == "interfaces":
         _plot_error_vs_interface_x(latest, out)
     elif benchmark in ("source", "source_itr_sin"):

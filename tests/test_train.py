@@ -515,7 +515,6 @@ class TestValidate:
             "regime",
             "spatial_family",
             "temporal_family",
-            "ic_family",
             "x_h",
             "y_h",
             "R_c_A",

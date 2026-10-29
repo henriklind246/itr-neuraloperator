@@ -1,4 +1,3 @@
-import copy
 import hashlib
 import json
 import warnings
@@ -277,21 +276,6 @@ def collate_fn(batch: list[dict]) -> dict:
     return {k: torch.stack([item[k] for item in batch]) for k in keys}
 
 
-def _dataset_with_pairs(dataset: SnapshotPairDataset, pairs: list[tuple[int, int, int]]) -> SnapshotPairDataset:
-    out = copy.copy(dataset)
-    out._pairs = list(pairs)
-    out._lead_times = np.array(
-        [float(out.t_grid[j] - out.t_grid[s]) for _, s, j in out._pairs],
-        dtype=np.float32,
-    )
-    out._active_len = len(out._pairs)
-    # Fresh worker-local cache on the copy so train/val don't share a mutable dict
-    # (only benchmarks with a lazy a(t) callable cache populate this).
-    if hasattr(out, "_q_callables"):
-        out._q_callables = {}
-    return out
-
-
 def long_lead_pairs(dataset: SnapshotPairDataset) -> list[tuple[int, int, int]]:
     """Return only full-span pairs: source at the first snapshot (t=0) and target
     at the last snapshot (t_final). One per sim; the maximum-lead pair."""
@@ -441,26 +425,6 @@ def apply_protocol_pairs(dataset: SnapshotPairDataset, tagged: list[dict]) -> No
     )
     dataset._pair_tags = list(tagged)
     dataset._active_len = len(dataset._pairs)
-
-
-def one_step_physics_view(dataset: SnapshotPairDataset) -> SnapshotPairDataset:
-    """Restrict `dataset` to consecutive one-step pairs (`j == s+1` in t_indices):
-    O(Nt) pairs per sim instead of the O(Nt^2) all-to-all corpus. This is the W1
-    physics-residual supply.
-
-    The caller MUST pass a `save_stride=1` dataset with every snapshot retained
-    (`n_snapshots=None`) so that adjacent `t_indices` are exactly one solver step
-    `dt` apart — the CN-exact spacing the interior residual assumes. With a
-    subsampled or strided grid the "one-step" pair would span several solver steps
-    and the residual would be wrong.
-    """
-    t_idx = dataset.t_indices
-    pairs = [
-        (int(sim_id), int(t_idx[i]), int(t_idx[i + 1]))
-        for sim_id in dataset.sim_ids
-        for i in range(len(t_idx) - 1)
-    ]
-    return _dataset_with_pairs(dataset, pairs)
 
 
 # --------- LOAD RAW SIM. DATA --------

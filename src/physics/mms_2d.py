@@ -9,7 +9,18 @@ Three test cases:
 
 import numpy as np
 from src.physics.fv_solver_2d import FVSolver2D, Layer2D
-from src.physics.fv_residual import _quadratic_trace_weights
+
+
+def _quadratic_trace_weights(
+    nodes: np.ndarray, x_eval: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    nodes = np.asarray(nodes, dtype=np.float64)
+    vandermonde = np.stack((np.ones(3), nodes, nodes ** 2), axis=1)
+    inverse = np.linalg.inv(vandermonde)
+    return (
+        np.array([1.0, x_eval, x_eval ** 2]) @ inverse,
+        np.array([0.0, 1.0, 2.0 * x_eval]) @ inverse,
+    )
 
 
 def run_interface_trace_reconstruction_mms(N: int) -> tuple[float, float]:
